@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pylon"
+version = "0.1.0"
+description = "Async PostgreSQL mapper build on typed Python dataclasses."
+readme = "README.md"
+license = { text = "Proprietary" }
+requires-python = ">=3.13"
+dependencies = [
+    "asyncpg>=0.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pylon = "pylon.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pylon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
