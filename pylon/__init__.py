@@ -1,8 +1,65 @@
 from .client import AsyncTransaction, Client, create_async_client
 from .config import Config, DatabaseConfig, ModelConfig, SearchConfig
+from .datatypes import Object
 from .exceptions import PylonError
 
+# ── Schema decorators ──────────────────────────────────────────────────────────
+# ── Schema base types & introspection ─────────────────────────────────────────
+# ── Field annotations ──────────────────────────────────────────────────────────
+# ── Constraints ────────────────────────────────────────────────────────────────
+# ── Indexes ────────────────────────────────────────────────────────────────────
+# ── Built-in scalars ───────────────────────────────────────────────────────────
+from .schema import (
+    JSON,
+    UUID,
+    BaseObject,
+    Bool,
+    Bytes,
+    Computed,
+    DateTime,
+    Decimal,
+    Default,
+    Description,
+    Duration,
+    Enum,
+    Exclusive,
+    Expression,
+    FieldMeta,
+    Float32,
+    Float64,
+    Index,
+    Int16,
+    Int32,
+    Int64,
+    Link,
+    LocalDate,
+    LocalDateTime,
+    LocalTime,
+    MaxExValue,
+    MaxLen,
+    MaxValue,
+    MinExValue,
+    MinLen,
+    MinValue,
+    MultiLink,
+    Now,
+    OneOf,
+    Property,
+    PylonConfig,
+    Regexp,
+    Scalar,
+    Str,
+    abstract,
+    enum,
+    interface,
+    lazy,
+    scalar,
+    through,
+    type,  # shadows builtins.type intentionally  # noqa: A001
+)
+
 __all__ = [
+    # Client
     "AsyncTransaction",
     "Client",
     "Config",
@@ -11,4 +68,57 @@ __all__ = [
     "PylonError",
     "SearchConfig",
     "create_async_client",
+    # Schema — decorators
+    "abstract",
+    "enum",
+    "interface",
+    "scalar",
+    "type",
+    # Schema — base types & introspection
+    "BaseObject",
+    "Enum",
+    "FieldMeta",
+    "Object",
+    "PylonConfig",
+    "Scalar",
+    "lazy",
+    # Schema — field annotations
+    "Computed",
+    "Link",
+    "MultiLink",
+    "Property",
+    "through",
+    # Schema — constraints
+    "Default",
+    "Description",
+    "Exclusive",
+    "Expression",
+    "MaxExValue",
+    "MaxLen",
+    "MaxValue",
+    "MinExValue",
+    "MinLen",
+    "MinValue",
+    "Now",
+    "OneOf",
+    "Regexp",
+    # Schema — indexes
+    "Index",
+    # Schema — built-in scalars
+    "Bool",
+    "Bytes",
+    "DateTime",
+    "Decimal",
+    "Duration",
+    "Float32",
+    "Float64",
+    "Int16",
+    "Int32",
+    "Int64",
+    "JSON",
+    "LocalDate",
+    "LocalDateTime",
+    "LocalTime",
+    "Str",
+    "UUID",
 ]

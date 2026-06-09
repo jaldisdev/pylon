@@ -1,0 +1,423 @@
+from __future__ import annotations
+
+import copy
+import dataclasses
+import re
+import sys
+import types
+import typing
+import uuid
+from typing import Any
+
+from . import _collector
+from ._constraints import Default, Description, Exclusive, Expression
+from ._fields import (
+    ComputedAnnotation,
+    LinkAnnotation,
+    MultiLinkAnnotation,
+    PropertyAnnotation,
+)
+from ._indexes import Index
+from ._meta import MISSING, FieldMeta, PylonConfig
+from ._scalars import SHORTHAND_MAP
+from ._scalars import UUID as PylonUUID
+
+_PASCAL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+# ── Optional unwrapping ────────────────────────────────────────────────────────
+
+
+def _unwrap_optional(annotation: Any) -> tuple[bool, Any]:
+    """Return (is_nullable, inner_annotation) for any T | None form."""
+    # Python 3.10+ union syntax: X | None → types.UnionType
+    if isinstance(annotation, types.UnionType):
+        args = typing.get_args(annotation)
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1 and len(non_none) < len(args):
+            return True, non_none[0]
+        return False, annotation
+
+    # typing.Optional[X] / typing.Union[X, None]
+    if typing.get_origin(annotation) is typing.Union:
+        args = typing.get_args(annotation)
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1 and len(non_none) < len(args):
+            return True, non_none[0]
+
+    return False, annotation
+
+
+# ── Default resolution ─────────────────────────────────────────────────────────
+
+
+def _resolve_default(
+    cls_default: Any,
+    constraints: list[Any],
+) -> tuple[Any, Any]:
+    """Return (default_value, default_factory).
+
+    Rules:
+    - Default(Now) in constraints → Python side uses None (server sets the value).
+    - Mutable class-level default → factory that deepcopies the captured value.
+    - Plain scalar default → returned as-is.
+    - No default → (MISSING, MISSING).
+    """
+    for c in constraints:
+        if isinstance(c, Default):
+            return None, MISSING
+
+    if cls_default is MISSING:
+        return MISSING, MISSING
+
+    if isinstance(cls_default, list | dict | set):
+        captured = copy.deepcopy(cls_default)
+        return MISSING, lambda v=captured: copy.deepcopy(v)
+
+    return cls_default, MISSING
+
+
+# ── Annotation → FieldMeta ─────────────────────────────────────────────────────
+
+
+def _annotation_to_meta(
+    name: str,
+    annotation: Any,
+    nullable: bool,
+    cls_default: Any,
+) -> FieldMeta:
+    if isinstance(annotation, PropertyAnnotation):
+        description = next(
+            (c.text for c in annotation.constraints if isinstance(c, Description)), None
+        )
+        constraints = [
+            c for c in annotation.constraints if not isinstance(c, Description)
+        ]
+        default, factory = _resolve_default(cls_default, annotation.constraints)
+        return FieldMeta(
+            name=name,
+            kind="property",
+            scalar_type=annotation.scalar_type,
+            nullable=nullable,
+            constraints=constraints,
+            default=default,
+            default_factory=factory,
+            description=description,
+        )
+
+    if isinstance(annotation, LinkAnnotation):
+        description = next(
+            (c.text for c in annotation.constraints if isinstance(c, Description)), None
+        )
+        constraints = [
+            c for c in annotation.constraints if not isinstance(c, Description)
+        ]
+        return FieldMeta(
+            name=name,
+            kind="link",
+            scalar_type=None,
+            nullable=nullable,
+            constraints=constraints,
+            default=None if nullable else MISSING,
+            default_factory=MISSING,
+            description=description,
+            link_target=annotation.target_type,
+        )
+
+    if isinstance(annotation, MultiLinkAnnotation):
+        return FieldMeta(
+            name=name,
+            kind="multilink",
+            scalar_type=None,
+            nullable=nullable,
+            constraints=[],
+            default=MISSING,
+            default_factory=list,
+            link_target=annotation.target_type,
+            through=annotation.through_type,
+        )
+
+    if isinstance(annotation, ComputedAnnotation):
+        return FieldMeta(
+            name=name,
+            kind="computed",
+            scalar_type=annotation.return_type,
+            nullable=True,
+            constraints=[],
+            default=None,
+            default_factory=MISSING,
+            expression=annotation.expression,
+        )
+
+    # Shorthand: raw Python type (str, int, bool, uuid.UUID, …).
+    scalar_type = SHORTHAND_MAP.get(annotation, annotation)
+    default, factory = _resolve_default(cls_default, [])
+    return FieldMeta(
+        name=name,
+        kind="property",
+        scalar_type=scalar_type,
+        nullable=nullable,
+        constraints=[],
+        default=default,
+        default_factory=factory,
+    )
+
+
+# ── Dataclass preparation ──────────────────────────────────────────────────────
+
+
+def _prepare_dataclass(cls: type, field_metas: dict[str, FieldMeta]) -> None:
+    """Inject dataclasses.field() specs into the class dict before @dataclass runs.
+
+    @dataclass only understands mutable defaults when expressed as
+    field(default_factory=...). This function converts them, and also injects
+    field(default=None) for nullable fields that have no explicit class-level
+    attribute.
+    """
+    for name, meta in field_metas.items():
+        if meta.kind == "computed":
+            setattr(cls, name, dataclasses.field(init=False, default=None))
+            continue
+
+        if meta.kind == "multilink":
+            # Always an empty list at construction time; the query populates it.
+            setattr(cls, name, dataclasses.field(default_factory=list))
+            continue
+
+        if meta.default_factory is not MISSING:
+            setattr(cls, name, dataclasses.field(default_factory=meta.default_factory))
+            continue
+
+        current = cls.__dict__.get(name, MISSING)
+
+        if meta.default is not MISSING and current is MISSING:
+            # The meta carries a resolved default (None for nullable fields or
+            # Default(Now) constraints) but no class attribute exists yet.
+            setattr(cls, name, dataclasses.field(default=meta.default))
+            continue
+
+        if meta.nullable and current is MISSING:
+            # Optional annotation (e.g. name: str | None) with no explicit
+            # default: inject implicit None.
+            setattr(cls, name, dataclasses.field(default=None))
+
+
+# ── Module / table inference ───────────────────────────────────────────────────
+
+
+def _infer_module(cls: type) -> str:
+    """Infer the Pylon module name from the class's defining Python module.
+
+    Checks for a __pylon_module__ variable in the defining file first, then
+    falls back to the last component of the dotted module path.
+    """
+    defining = sys.modules.get(cls.__module__)
+    if defining is not None:
+        override = getattr(defining, "__pylon_module__", None)
+        if isinstance(override, str):
+            return override
+    module_path = cls.__module__ or "default"
+    return module_path.rpartition(".")[-1] or module_path
+
+
+def _to_table_name(module: str, type_name: str) -> str:
+    """Derive the PostgreSQL table name: {module}_{snake_case_type_name}.
+
+    Examples:
+        module='account', type_name='Account'       → 'account_account'
+        module='account', type_name='AccountProfile' → 'account_account_profile'
+    """
+    snake = _PASCAL_RE.sub("_", type_name).lower()
+    return f"{module}_{snake}"
+
+
+# ── Pylon base detection and id injection ─────────────────────────────────────
+
+
+def _has_pylon_base(cls: type) -> bool:
+    for base in cls.__mro__[1:]:
+        if hasattr(base, "__pylon_config__"):
+            return True
+    return False
+
+
+def _inject_id(cls: type) -> None:
+    """Prepend id: uuid.UUID | None to the class annotations.
+
+    The id is generated by PostgreSQL (uuidv7) on INSERT; at construction time
+    it is None. Query results always carry a populated id.
+    """
+    existing = cls.__dict__.get("__annotations__", {})
+    cls.__annotations__ = {"id": uuid.UUID | None} | existing
+
+
+# ── Annotation collection ──────────────────────────────────────────────────────
+
+
+def _collect_annotations(cls: type) -> dict[str, Any]:
+    """Return the class's own annotations with string annotations resolved.
+
+    Uses typing.get_type_hints() with include_extras=True so that
+    Annotated[T, ...] metadata (e.g. pylon.lazy) is preserved. Falls back to
+    the raw __annotations__ dict if resolution fails (e.g. unresolvable forward
+    references at this point in the import cycle).
+    """
+    own_names = set(cls.__dict__.get("__annotations__", {}).keys())
+    if not own_names:
+        return {}
+    try:
+        all_hints = typing.get_type_hints(cls, include_extras=True)
+        return {k: v for k, v in all_hints.items() if k in own_names}
+    except Exception:
+        return {k: v for k, v in cls.__dict__.get("__annotations__", {}).items()}
+
+
+# ── Core builder ───────────────────────────────────────────────────────────────
+
+
+def _build_type(
+    cls: type,
+    *,
+    abstract: bool = False,
+    materialized: bool = True,
+    module: str | None = None,
+    name: str | None = None,
+    table: str | None = None,
+) -> type:
+    # Drain class-body expressions that were registered during the class body.
+    exprs = _collector.drain()
+
+    class_indexes = [e for e in exprs if isinstance(e, Index)]
+    class_constraints = [e for e in exprs if isinstance(e, (Exclusive, Expression))]
+    class_desc_exprs = [e for e in exprs if isinstance(e, Description)]
+
+    description = (
+        class_desc_exprs[0].text
+        if class_desc_exprs
+        else ((cls.__doc__ or "").strip() or None)
+    )
+
+    # Inject the id field when no parent Pylon type already provides one.
+    if not _has_pylon_base(cls):
+        _inject_id(cls)
+
+    annotations = _collect_annotations(cls)
+
+    field_metas: dict[str, FieldMeta] = {}
+    for field_name, annotation in annotations.items():
+        if field_name.startswith("_"):
+            continue
+        nullable, inner = _unwrap_optional(annotation)
+        cls_default = cls.__dict__.get(field_name, MISSING)
+        field_metas[field_name] = _annotation_to_meta(
+            field_name, inner, nullable, cls_default
+        )
+
+    _prepare_dataclass(cls, field_metas)
+    dataclasses.dataclass(cls, kw_only=True)
+
+    resolved_module = module or _infer_module(cls)
+    resolved_name = name or cls.__name__
+    resolved_table = table or _to_table_name(resolved_module, resolved_name)
+
+    cls.__pylon_config__ = PylonConfig(
+        module=resolved_module,
+        name=resolved_name,
+        table=resolved_table,
+        abstract=abstract,
+        materialized=materialized,
+        fields=field_metas,
+        constraints=class_constraints,
+        indexes=class_indexes,
+        description=description,
+    )
+
+    return cls
+
+
+# ── Public decorators ──────────────────────────────────────────────────────────
+
+
+def type_decorator(
+    cls: type | None = None,
+    *,
+    abstract: bool = False,
+    materialized: bool = True,
+    module: str | None = None,
+    name: str | None = None,
+    table: str | None = None,
+) -> Any:
+    """@pylon.type — concrete, table-backed schema type.
+
+    Can be used with or without arguments::
+
+        @pylon.type
+        class Product: ...
+
+        @pylon.type(module='catalog', table='catalog_items')
+        class Product: ...
+    """
+
+    def _wrap(c: type) -> type:
+        return _build_type(
+            c,
+            abstract=abstract,
+            materialized=materialized,
+            module=module,
+            name=name,
+            table=table,
+        )
+
+    return _wrap(cls) if cls is not None else _wrap
+
+
+def abstract_decorator(
+    cls: type | None = None,
+    *,
+    module: str | None = None,
+    name: str | None = None,
+) -> Any:
+    """@pylon.abstract — abstract base type; no DB object is created.
+
+    Fields and constraints defined here are inherited by concrete subtypes.
+
+    Usage::
+
+        @pylon.abstract
+        class Auditable:
+            created_at: Property[pylon.DateTime, Default(Now)]
+            updated_at: Property[pylon.DateTime, Default(Now)]
+    """
+
+    def _wrap(c: type) -> type:
+        return _build_type(
+            c, abstract=True, materialized=False, module=module, name=name
+        )
+
+    return _wrap(cls) if cls is not None else _wrap
+
+
+def interface_decorator(
+    cls: type | None = None,
+    *,
+    module: str | None = None,
+    name: str | None = None,
+) -> Any:
+    """@pylon.interface — abstract type materialised as a PostgreSQL view.
+
+    Combine abstract=True with materialized=True. Useful for shared query
+    surfaces across unrelated concrete types.
+
+    Usage::
+
+        @pylon.interface
+        class Publishable:
+            published_at: Property[pylon.DateTime] | None
+    """
+
+    def _wrap(c: type) -> type:
+        return _build_type(
+            c, abstract=True, materialized=True, module=module, name=name
+        )
+
+    return _wrap(cls) if cls is not None else _wrap
