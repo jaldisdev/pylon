@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from typing import Any
+
+import asyncpg
+
+from pylon.config import Config
+from pylon.exceptions import (
+    ClientConnectionClosedError,
+    ConnectionFailedError,
+    ConnectionTimeoutError,
+    InterfaceError,
+    InternalServerError,
+    NoDataError,
+    ResultCardinalityError,
+    TransactionDeadlockError,
+    TransactionSerializationError,
+)
+
+try:
+    from pylon_core import compile_pyql  # Rust extension (maturin)
+except ImportError:  # pragma: no cover — absent until the crate is built
+
+    def compile_pyql(pyql: str) -> tuple[str, list[Any]]:  # type: ignore[misc]
+        raise InternalServerError(
+            "pylon-core Rust extension is not installed. "
+            "Run `maturin develop` inside the pylon-core directory."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Transaction
+# ---------------------------------------------------------------------------
+
+
+class AsyncTransaction:
+    """Wraps an asyncpg connection inside an explicit transaction.
+
+    Obtain one via :meth:`Client.transaction`, never construct directly.
+
+    ``_retry_exc`` is set by ``__aexit__`` when the failure is retriable
+    (serialisation failure or deadlock).  :class:`RetryingTransaction`
+    inspects this flag in ``__anext__`` to decide whether to loop again.
+    """
+
+    def __init__(
+        self, conn: asyncpg.Connection, isolation: str = "serializable"
+    ) -> None:
+        self._conn = conn
+        self._isolation = isolation
+        self._tx: asyncpg.transaction.Transaction | None = None
+        self._retry_exc: Exception | None = None
+
+    async def __aenter__(self) -> "AsyncTransaction":
+        self._tx = self._conn.transaction(isolation=self._isolation)
+        await self._tx.start()
+        return self
+
+    async def __aexit__(
+        self, exc_type: type | None, exc: BaseException | None, tb: object
+    ) -> bool:
+        if self._tx is None:
+            return False
+
+        if exc_type is None:
+            # Happy path — attempt commit.
+            try:
+                await self._tx.commit()
+            except asyncpg.SerializationFailureError as e:
+                mapped = TransactionSerializationError(str(e))
+                self._retry_exc = mapped
+                raise mapped from e
+            except asyncpg.DeadlockDetectedError as e:
+                mapped = TransactionDeadlockError(str(e))
+                self._retry_exc = mapped
+                raise mapped from e
+        else:
+            # Always roll back on any error.
+            await self._tx.rollback()
+            # Re-map asyncpg-native retriable errors to Pylon exceptions.
+            if isinstance(exc, asyncpg.SerializationFailureError):
+                mapped = TransactionSerializationError(str(exc))
+                self._retry_exc = mapped
+                raise mapped from exc
+            if isinstance(exc, asyncpg.DeadlockDetectedError):
+                mapped = TransactionDeadlockError(str(exc))
+                self._retry_exc = mapped
+                raise mapped from exc
+            # Already a Pylon retriable exception — record it for the iterator.
+            if isinstance(
+                exc, (TransactionSerializationError, TransactionDeadlockError)
+            ):
+                self._retry_exc = exc  # type: ignore[assignment]
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Query helpers — identical signatures to Client
+    # ------------------------------------------------------------------
+
+    async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
+        """Execute *pyql* and return all results as a list."""
+        sql, params = _transpile(pyql, kwargs)
+        return list(await self._conn.fetch(sql, *params))
+
+    async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
+        """Return at most one result, or ``None``."""
+        sql, params = _transpile(pyql, kwargs)
+        rows = await self._conn.fetch(sql, *params)
+        if len(rows) > 1:
+            raise ResultCardinalityError(
+                f"query_single expected at most one result, got {len(rows)}."
+            )
+        return rows[0] if rows else None
+
+    async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
+        """Return exactly one result; raise if the set is empty or has >1 row."""
+        result = await self.query_single(pyql, **kwargs)
+        if result is None:
+            raise NoDataError("query_required_single returned an empty result set.")
+        return result
+
+    async def execute(self, pyql: str, **kwargs: Any) -> None:
+        """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
+        sql, params = _transpile(pyql, kwargs)
+        await self._conn.execute(sql, *params)
+
+    async def query_json(self, pyql: str, **kwargs: Any) -> str:
+        """Execute *pyql* and return all results serialised as a JSON string.
+
+        Returns ``"[]"`` when the result set is empty.
+        """
+        sql, params = _transpile(pyql, kwargs)
+        return (
+            await self._conn.fetchval(
+                f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
+            )
+            or "[]"
+        )
+
+    async def query_single_json(self, pyql: str, **kwargs: Any) -> str | None:
+        """Return at most one result as a JSON string, or ``None``."""
+        sql, params = _transpile(pyql, kwargs)
+        rows = await self._conn.fetch(sql, *params)
+        if len(rows) > 1:
+            raise ResultCardinalityError(
+                f"query_single_json expected at most one result, got {len(rows)}."
+            )
+        if not rows:
+            return None
+        return await self._conn.fetchval(
+            f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
+        )
+
+    async def query_required_single_json(self, pyql: str, **kwargs: Any) -> str:
+        """Return exactly one result as a JSON string; raise if the set is empty."""
+        result = await self.query_single_json(pyql, **kwargs)
+        if result is None:
+            raise NoDataError(
+                "query_required_single_json returned an empty result set."
+            )
+        return result
+
+
+# ---------------------------------------------------------------------------
+# RetryingTransaction
+# ---------------------------------------------------------------------------
+
+
+class RetryingTransaction:
+    """Async iterator returned by :meth:`Client.transaction`.
+
+    Each call to ``__anext__`` acquires a fresh pool connection and yields
+    an :class:`AsyncTransaction`.  After ``async with tx:`` exits, the
+    iterator inspects ``tx._retry_exc``:
+
+    - ``None``  → committed successfully → ``StopAsyncIteration``
+    - retriable exception → back-off and yield a new transaction
+    - budget exhausted → re-raise the last retriable exception
+
+    Do not construct directly — use ``client.transaction()``.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, *, attempts: int, isolation: str) -> None:
+        self._pool = pool
+        self._attempts = attempts
+        self._isolation = isolation
+        self._attempt = 0
+        self._prev_tx: AsyncTransaction | None = None
+
+    def __aiter__(self) -> "RetryingTransaction":
+        return self
+
+    async def __anext__(self) -> AsyncTransaction:
+        # Inspect the outcome of the previous attempt.
+        if self._prev_tx is not None:
+            if self._prev_tx._retry_exc is None:
+                # Committed cleanly — release the connection and stop.
+                await self._pool.release(self._prev_tx._conn)
+                raise StopAsyncIteration
+
+            # Retriable failure — release the connection before deciding.
+            await self._pool.release(self._prev_tx._conn)
+
+            if self._attempt >= self._attempts:
+                raise self._prev_tx._retry_exc
+
+            # Exponential back-off: attempt 1 → 0 ms, 2 → 100 ms, 3 → 200 ms, …
+            await asyncio.sleep((self._attempt - 1) * 0.1)
+
+        conn: asyncpg.Connection = await self._pool.acquire()
+        tx = AsyncTransaction(conn, isolation=self._isolation)
+        self._prev_tx = tx
+        self._attempt += 1
+        return tx
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+
+class Client:
+    """Async Pylon client — asyncpg pool wrapper with PyQL transpilation.
+
+    Args:
+        config: A :class:`~pylon.config.Config` instance.  When omitted the
+                client attempts to load ``pylon.toml`` from the working tree.
+    """
+
+    def __init__(self, config: Config | None = None) -> None:
+        if config is None:
+            from pylon.config import load_config
+
+            config = load_config()
+        self._config = config
+        self._pool: asyncpg.Pool | None = None
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def ensure_connected(self) -> None:
+        """Initialise the connection pool if it has not been created yet.
+
+        Safe to call multiple times; subsequent calls are no-ops.
+        """
+        async with self._lock:
+            if self._pool is not None:
+                return
+            dsn = self._config.database.dsn or _build_dsn(self._config.database)
+            # Swap the pylon:// scheme for postgresql:// if present.
+            dsn = dsn.replace("pylon://", "postgresql://", 1)
+            try:
+                self._pool = await asyncpg.create_pool(
+                    dsn,
+                    min_size=self._config.database.pool_min_size,
+                    max_size=self._config.database.pool_max_size,
+                )
+            except asyncpg.InvalidCatalogNameError as exc:
+                raise ConnectionFailedError(str(exc)) from exc
+            except (OSError, asyncpg.CannotConnectNowError) as exc:
+                raise ConnectionFailedError(str(exc)) from exc
+            except asyncio.TimeoutError as exc:
+                raise ConnectionTimeoutError(
+                    "Timed out while connecting to PostgreSQL."
+                ) from exc
+
+    async def aclose(self) -> None:
+        """Close the connection pool and release all resources."""
+        async with self._lock:
+            if self._pool is not None:
+                await self._pool.close()
+                self._pool = None
+
+    # Support ``async with Client(config) as client:``
+    async def __aenter__(self) -> "Client":
+        await self.ensure_connected()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _require_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            raise ClientConnectionClosedError(
+                "Client is not connected. Call await client.ensure_connected() first."
+            )
+        return self._pool
+
+    # ------------------------------------------------------------------
+    # Query interface
+    # ------------------------------------------------------------------
+
+    async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
+        """Execute *pyql* and return all matching objects as a list."""
+        pool = self._require_pool()
+        sql, params = _transpile(pyql, kwargs)
+        try:
+            async with pool.acquire() as conn:
+                return list(await conn.fetch(sql, *params))
+        except asyncpg.SerializationFailureError as exc:
+            raise TransactionSerializationError(str(exc)) from exc
+        except asyncpg.DeadlockDetectedError as exc:
+            raise TransactionDeadlockError(str(exc)) from exc
+
+    async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
+        """Execute *pyql* and return at most one result, or ``None``.
+
+        Raises :class:`~pylon.exceptions.ResultCardinalityError` if more
+        than one object matches.
+        """
+        pool = self._require_pool()
+        sql, params = _transpile(pyql, kwargs)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        if len(rows) > 1:
+            raise ResultCardinalityError(
+                f"query_single expected at most one result, got {len(rows)}."
+            )
+        return rows[0] if rows else None
+
+    async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
+        """Execute *pyql* and return exactly one result.
+
+        Raises :class:`~pylon.exceptions.NoDataError` if the set is empty.
+        Raises :class:`~pylon.exceptions.ResultCardinalityError` if >1 row.
+        """
+        result = await self.query_single(pyql, **kwargs)
+        if result is None:
+            raise NoDataError("query_required_single returned an empty result set.")
+        return result
+
+    async def execute(self, pyql: str, **kwargs: Any) -> None:
+        """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
+        pool = self._require_pool()
+        sql, params = _transpile(pyql, kwargs)
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute(sql, *params)
+            except asyncpg.SerializationFailureError as exc:
+                raise TransactionSerializationError(str(exc)) from exc
+            except asyncpg.DeadlockDetectedError as exc:
+                raise TransactionDeadlockError(str(exc)) from exc
+
+    async def query_json(self, pyql: str, **kwargs: Any) -> str:
+        """Execute *pyql* and return all results serialised as a JSON string.
+
+        Returns ``"[]"`` when the result set is empty.
+        """
+        pool = self._require_pool()
+        sql, params = _transpile(pyql, kwargs)
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
+            )
+
+    async def query_single_json(self, pyql: str, **kwargs: Any) -> str | None:
+        """Execute *pyql* and return at most one result as a JSON string, or ``None``.
+
+        Raises :class:`~pylon.exceptions.ResultCardinalityError` if more than one
+        object matches.
+        """
+        pool = self._require_pool()
+        sql, params = _transpile(pyql, kwargs)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        if len(rows) > 1:
+            raise ResultCardinalityError(
+                f"query_single_json expected at most one result, got {len(rows)}."
+            )
+        if not rows:
+            return None
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
+            )
+
+    async def query_required_single_json(self, pyql: str, **kwargs: Any) -> str:
+        """Execute *pyql* and return exactly one result as a JSON string.
+
+        Raises :class:`~pylon.exceptions.NoDataError` if the set is empty.
+        Raises :class:`~pylon.exceptions.ResultCardinalityError` if >1 row.
+        """
+        result = await self.query_single_json(pyql, **kwargs)
+        if result is None:
+            raise NoDataError(
+                "query_required_single_json returned an empty result set."
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # Transaction
+    # ------------------------------------------------------------------
+
+    def transaction(
+        self,
+        *,
+        attempts: int = 3,
+        isolation: str = "serializable",
+    ) -> RetryingTransaction:
+        """Return an async iterator that drives a retrying transaction loop.
+
+        Each iteration yields a fresh :class:`AsyncTransaction`.  Wrap it in
+        ``async with tx:`` to commit or roll back.  On a serialisation failure
+        or deadlock the iterator retries automatically up to *attempts* times,
+        with exponential back-off between attempts (0 ms, 100 ms, 200 ms, …).
+
+        Args:
+            attempts:  Maximum number of attempts before re-raising (default 3).
+            isolation: PostgreSQL isolation level — ``"serializable"`` (default),
+                       ``"repeatable_read"``, or ``"read_committed"``.
+
+        Usage::
+
+            async for tx in client.transaction():
+                async with tx:
+                    obj = await tx.query_single('SELECT ...')
+                    await tx.execute('INSERT ...')
+
+        With custom retry budget::
+
+            async for tx in client.transaction(attempts=5, isolation="repeatable_read"):
+                async with tx:
+                    ...
+        """
+        if attempts < 1:
+            raise InterfaceError("attempts must be >= 1.")
+        return RetryingTransaction(
+            self._require_pool(), attempts=attempts, isolation=isolation
+        )
+
+    # ------------------------------------------------------------------
+    # Raw access (escape hatch)
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def raw_connection(self) -> AsyncGenerator[asyncpg.Connection, None]:
+        """Yield a raw asyncpg connection for queries outside PyQL.
+
+        Use sparingly — this bypasses the transpiler entirely.
+        """
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            yield conn  # type: ignore[misc]
+
+    # ------------------------------------------------------------------
+    # Repr
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        state = "connected" if self._pool is not None else "disconnected"
+        db = self._config.database
+        target = db.dsn or f"{db.host}:{db.port}/{db.name}"
+        return f"<Client [{state}] {target}>"
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience
+# ---------------------------------------------------------------------------
+
+
+def create_async_client(config: Config | None = None) -> Client:
+    """Return a new :class:`Client` instance.
+
+    The pool is *not* initialised here; call
+    ``await client.ensure_connected()`` (or use the client as an async
+    context manager) before issuing queries.
+
+    Args:
+        config: Optional :class:`~pylon.config.Config`.  Omit to auto-load
+                ``pylon.toml`` from the working tree.
+    """
+    return Client(config)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _transpile(pyql: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+    """Delegate PyQL → SQL transpilation to the pylon-core Rust extension.
+
+    Returns a ``(sql, positional_params)`` pair ready for asyncpg.
+    """
+    if not isinstance(pyql, str):
+        raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
+    return compile_pyql(pyql)  # kwargs forwarding TBD once the Rust ABI is settled
+
+
+def _build_dsn(db: Any) -> str:
+    """Construct a DSN string from discrete :class:`~pylon.config.DatabaseConfig` fields."""
+    password_part = f":{db.password}" if db.password else ""
+    return f"postgresql://{db.user}{password_part}@{db.host}:{db.port}/{db.name}"
