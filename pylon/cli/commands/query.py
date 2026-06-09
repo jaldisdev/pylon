@@ -5,35 +5,19 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
-# --- intro banner -------------------------------------------------------------
+from ..banner import print_banner
 
-_LOGO_COLOR = "\x1b[38;2;204;68;204m"  # #CC44CC
+# --- colours ------------------------------------------------------------------
+
 _INFO_COLOR = "\x1b[38;2;136;120;168m"  # #8878A8
+_BOLD_RED = "\x1b[1;31m"
+_RED = "\x1b[38;5;208m"  # type names
+_YELLOW = "\x1b[38;5;178m"  # keys and UUIDs
+_GREEN = "\x1b[38;5;107m"  # string values
+_BLUE = "\x1b[38;2;96;135;176m"  # outer braces (#6087B0)
+_BOLD_WHITE = "\x1b[1;37m"
+_DIM = "\x1b[2m"
 _RESET = "\x1b[0m"
-
-_LOGO_LINES = [
-    "  ██████╗  ██╗   ██╗██╗      ██████╗ ███╗  ██╗",
-    "  ██╔══██╗ ╚██╗ ██╔╝██║     ██╔═══██╗████╗ ██║",
-    "  ██████╔╝  ╚████╔╝ ██║     ██║   ██║██╔██╗██║",
-    " ██╔═══╝    ╚██╔╝  ██║     ██║   ██║██║╚████║",
-    " ██║         ██║   ███████╗╚██████╔╝██║ ╚███║",
-    " ╚═╝         ╚═╝   ╚══════╝ ╚═════╝ ╚═╝  ╚══╝",
-]
-
-
-def _print_banner() -> None:
-    try:
-        from importlib.metadata import version as _version
-
-        __version__ = _version("pylon")
-    except Exception:
-        __version__ = "(development)"
-    for line in _LOGO_LINES:
-        click.echo(f"{_LOGO_COLOR}{line}{_RESET}")
-    click.echo()
-    click.echo(f"{_INFO_COLOR}Pylon {__version__}{_RESET}")
-    click.echo(f"{_INFO_COLOR}Type \\help for help, \\quit to quit.{_RESET}")
-    click.echo()
 
 
 # --- help text ----------------------------------------------------------------
@@ -71,7 +55,7 @@ def repl(*, as_json: bool = False) -> None:
     Statements are terminated by a semicolon. Type \\help for help,
     \\quit or Ctrl-D to exit.
     """
-    _print_banner()
+    print_banner(info_line="Type \\help for help, \\quit to quit.")
 
     session: PromptSession[str] = PromptSession(
         multiline=True,
@@ -111,14 +95,6 @@ def _execute(pyql: str, *, as_json: bool) -> None:
 
 
 # --- result formatting --------------------------------------------------------
-
-_BOLD_RED = "\x1b[1;31m"
-_RED = "\x1b[38;5;208m"  # type names
-_YELLOW = "\x1b[38;5;178m"  # keys and UUIDs
-_GREEN = "\x1b[38;5;107m"  # string values
-_BLUE = "\x1b[38;2;96;135;176m"  # outer braces (#6087B0)
-_BOLD_WHITE = "\x1b[1;37m"
-_DIM = "\x1b[2m"
 
 
 def _type(s: str) -> str:

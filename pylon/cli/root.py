@@ -1,8 +1,11 @@
 import click
 
+from pylon.config import load_config
+
 from .commands.migrations import migration
 from .commands.query import repl
 from .commands.version import version
+from .config import NO_CONFIG_HINT, _print_error, requires_config
 
 
 @click.group(invoke_without_command=True)
@@ -13,7 +16,16 @@ def cli(ctx: click.Context) -> None:
     Run without a subcommand to start an interactive PyQL session.
     """
     ctx.ensure_object(dict)
+
+    try:
+        ctx.obj["config"] = load_config()
+    except FileNotFoundError:
+        ctx.obj["config"] = None
+
     if ctx.invoked_subcommand is None:
+        if ctx.obj["config"] is None:
+            _print_error("no pylon.toml found", NO_CONFIG_HINT)
+            ctx.exit(1)
         repl()
 
 

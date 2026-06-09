@@ -1,5 +1,7 @@
 import click
 
+from ..config import requires_config
+
 
 @click.group()
 def migration() -> None:
@@ -7,6 +9,7 @@ def migration() -> None:
 
 
 @migration.command()
+@requires_config
 def create() -> None:
     """Create a new migration file.
 
@@ -19,6 +22,7 @@ def create() -> None:
 
 
 @migration.command("list")
+@requires_config
 def list_migrations() -> None:
     """List all available migration files."""
     click.echo("Listing migrations...")
@@ -32,6 +36,7 @@ def list_migrations() -> None:
     default=False,
     help="Preview the SQL that would be executed without applying it.",
 )
+@requires_config
 def migrate(dry_run: bool) -> None:
     """Apply all pending migrations."""
     if dry_run:
