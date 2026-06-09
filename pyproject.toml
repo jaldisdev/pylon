@@ -11,13 +11,15 @@ license = { text = "Proprietary" }
 requires-python = ">=3.13"
 dependencies = [
     "asyncpg>=0.31",
+    "click>=8.1",
+    "prompt_toolkit>=3.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
 [project.scripts]
-pylon = "pylon.cli:main"
+pylon = 'pylon.cli:cli'
 
 [tool.hatch.build.targets.wheel]
 packages = ["pylon"]
