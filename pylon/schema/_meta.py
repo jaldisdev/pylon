@@ -23,6 +23,8 @@ class FieldMeta:
     through: Any = None  # intermediate type for MultiLink with link properties
     # computed
     expression: str | None = None
+    # mutation rewrites declared inside Property[T, Rewrite(...)]
+    rewrites: list[Any] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -37,4 +39,5 @@ class PylonConfig:
     fields: dict[str, FieldMeta] = dataclasses.field(default_factory=dict)
     constraints: list[Any] = dataclasses.field(default_factory=list)
     indexes: list[Any] = dataclasses.field(default_factory=list)
+    triggers: list[Any] = dataclasses.field(default_factory=list)
     description: str | None = None

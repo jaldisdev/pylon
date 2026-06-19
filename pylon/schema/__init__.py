@@ -28,6 +28,7 @@ from ._enums import enum_decorator as enum
 from ._fields import Computed, Link, MultiLink, Property, through
 from ._indexes import Index
 from ._lazy import lazy
+from ._triggers import On, Rewrite, Timing, Trigger
 from ._meta import FieldMeta, PylonConfig
 from ._scalars import (
     JSON,
@@ -83,6 +84,11 @@ __all__ = [
     "Regexp",
     # Indexes
     "Index",
+    # Triggers & rewrites
+    "On",
+    "Timing",
+    "Trigger",
+    "Rewrite",
     # Built-in scalars
     "Bool",
     "Bytes",
