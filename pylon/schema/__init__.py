@@ -1,4 +1,5 @@
 from ._base import BaseObject
+from ._export import export
 from ._constraints import (
     Default,
     Description,
@@ -111,4 +112,6 @@ __all__ = [
     "PylonConfig",
     # Lazy forward references
     "lazy",
+    # Schema export
+    "export",
 ]
