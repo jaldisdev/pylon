@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/pylon-core", "crates/pylon-py"]
+resolver = "2"
