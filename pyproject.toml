@@ -11,12 +11,12 @@ license = { text = "Proprietary" }
 requires-python = ">=3.13"
 dependencies = [
     "asyncpg>=0.31",
-    "click>=8.1",
-    "prompt_toolkit>=3.0",
+    "click>=8.4.1",
+    "prompt_toolkit>=3.0.52",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=9.1.1"]
 
 [project.scripts]
 pylon = 'pylon.cli:cli'
