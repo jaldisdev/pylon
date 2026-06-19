@@ -12,7 +12,7 @@ requires-python = ">=3.13"
 dependencies = [
     "asyncpg>=0.31",
     "click>=8.1",
-    "prompt_toolkit>=3.0",
+    "prompt_toolkit>=3.0.52",
 ]
 
 [project.optional-dependencies]
