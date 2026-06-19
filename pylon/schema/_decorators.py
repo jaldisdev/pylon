@@ -18,6 +18,7 @@ from ._fields import (
     PropertyAnnotation,
 )
 from ._indexes import Index
+from ._triggers import Rewrite, Trigger
 from ._meta import MISSING, FieldMeta, PylonConfig
 from ._scalars import SHORTHAND_MAP
 from ._scalars import UUID as PylonUUID
@@ -90,8 +91,10 @@ def _annotation_to_meta(
         description = next(
             (c.text for c in annotation.constraints if isinstance(c, Description)), None
         )
+        rewrites = [c for c in annotation.constraints if isinstance(c, Rewrite)]
         constraints = [
-            c for c in annotation.constraints if not isinstance(c, Description)
+            c for c in annotation.constraints
+            if not isinstance(c, (Description, Rewrite))
         ]
         default, factory = _resolve_default(cls_default, annotation.constraints)
         return FieldMeta(
@@ -103,14 +106,17 @@ def _annotation_to_meta(
             default=default,
             default_factory=factory,
             description=description,
+            rewrites=rewrites,
         )
 
     if isinstance(annotation, LinkAnnotation):
         description = next(
             (c.text for c in annotation.constraints if isinstance(c, Description)), None
         )
+        rewrites = [c for c in annotation.constraints if isinstance(c, Rewrite)]
         constraints = [
-            c for c in annotation.constraints if not isinstance(c, Description)
+            c for c in annotation.constraints
+            if not isinstance(c, (Description, Rewrite))
         ]
         return FieldMeta(
             name=name,
@@ -122,6 +128,7 @@ def _annotation_to_meta(
             default_factory=MISSING,
             description=description,
             link_target=annotation.target_type,
+            rewrites=rewrites,
         )
 
     if isinstance(annotation, MultiLinkAnnotation):
@@ -289,6 +296,7 @@ def _build_type(
 
     class_indexes = [e for e in exprs if isinstance(e, Index)]
     class_constraints = [e for e in exprs if isinstance(e, (Exclusive, Expression))]
+    class_triggers = [e for e in exprs if isinstance(e, Trigger)]
     class_desc_exprs = [e for e in exprs if isinstance(e, Description)]
 
     description = (
@@ -329,6 +337,7 @@ def _build_type(
         fields=field_metas,
         constraints=class_constraints,
         indexes=class_indexes,
+        triggers=class_triggers,
         description=description,
     )
 

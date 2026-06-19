@@ -19,7 +19,11 @@ from pylon.schema import (
     MinValue,
     MultiLink,
     Now,
+    On,
     Property,
+    Rewrite,
+    Timing,
+    Trigger,
     through,
 )
 from pylon.schema._scalars import PG_TYPE_MAP, SHORTHAND_MAP
@@ -688,3 +692,179 @@ class TestScalarMaps:
     )
     def test_pg_type_map(self, pylon_type, pg_type):
         assert PG_TYPE_MAP[pylon_type] == pg_type
+
+
+# ---------------------------------------------------------------------------
+# Triggers
+# ---------------------------------------------------------------------------
+
+
+class TestTrigger:
+    def test_trigger_stored_in_config(self):
+        @pylon.type
+        class T:
+            name: str
+            Trigger(on=On.Insert, timing=Timing.After, handler=".do_something")
+
+        assert len(T.__pylon_config__.triggers) == 1
+
+    def test_trigger_attributes(self):
+        @pylon.type
+        class T:
+            name: str
+            Trigger(on=On.Delete, timing=Timing.Before, handler=".cleanup")
+
+        t = T.__pylon_config__.triggers[0]
+        assert t.on == On.Delete
+        assert t.timing == Timing.Before
+        assert t.handler == ".cleanup"
+
+    def test_trigger_combined_events(self):
+        @pylon.type
+        class T:
+            name: str
+            Trigger(on=On.Insert | On.Update, timing=Timing.After, handler=".expr")
+
+        t = T.__pylon_config__.triggers[0]
+        assert On.Insert in t.on
+        assert On.Update in t.on
+        assert On.Delete not in t.on
+
+    def test_multiple_triggers(self):
+        @pylon.type
+        class T:
+            name: str
+            Trigger(on=On.Insert, timing=Timing.After, handler=".on_insert")
+            Trigger(on=On.Delete, timing=Timing.Before, handler=".on_delete")
+
+        assert len(T.__pylon_config__.triggers) == 2
+
+    def test_trigger_not_in_constraints_or_indexes(self):
+        @pylon.type
+        class T:
+            name: str
+            Trigger(on=On.Insert, timing=Timing.After, handler=".expr")
+
+        assert len(T.__pylon_config__.constraints) == 0
+        assert len(T.__pylon_config__.indexes) == 0
+
+    def test_trigger_alongside_index_and_constraint(self):
+        @pylon.type
+        class T:
+            name: str
+            slug: str
+            Index("name")
+            Exclusive(("name", "slug"))
+            Trigger(on=On.Update, timing=Timing.After, handler=".expr")
+
+        cfg = T.__pylon_config__
+        assert len(cfg.indexes) == 1
+        assert len(cfg.constraints) == 1
+        assert len(cfg.triggers) == 1
+
+    def test_timing_insteadof(self):
+        @pylon.type
+        class T:
+            name: str
+            Trigger(on=On.Insert, timing=Timing.InsteadOf, handler=".expr")
+
+        assert T.__pylon_config__.triggers[0].timing == Timing.InsteadOf
+
+    def test_on_flags_all_three(self):
+        combined = On.Insert | On.Update | On.Delete
+        assert On.Insert in combined
+        assert On.Update in combined
+        assert On.Delete in combined
+
+    def test_repr(self):
+        t = Trigger.__new__(Trigger)
+        t.on = On.Insert
+        t.timing = Timing.After
+        t.handler = ".expr"
+        assert "Trigger" in repr(t)
+
+
+# ---------------------------------------------------------------------------
+# Mutation rewrites
+# ---------------------------------------------------------------------------
+
+
+class TestMutationRewrite:
+    def test_rewrite_stored_in_field(self):
+        @pylon.type
+        class T:
+            name: Property[str, Rewrite(On.Insert, '.name ++ " (created)"')]
+
+        f = T.__pylon_config__.fields["name"]
+        assert len(f.rewrites) == 1
+
+    def test_rewrite_attributes(self):
+        @pylon.type
+        class T:
+            name: Property[str, Rewrite(On.Update, '.name ++ " (updated)"')]
+
+        r = T.__pylon_config__.fields["name"].rewrites[0]
+        assert r.on == On.Update
+        assert r.handler == '.name ++ " (updated)"'
+
+    def test_rewrite_not_in_constraints(self):
+        @pylon.type
+        class T:
+            name: Property[str, MaxLen(50), Rewrite(On.Insert, ".name")]
+
+        f = T.__pylon_config__.fields["name"]
+        assert not any(isinstance(c, Rewrite) for c in f.constraints)
+        assert any(isinstance(c, MaxLen) for c in f.constraints)
+
+    def test_multiple_rewrites_on_same_field(self):
+        @pylon.type
+        class T:
+            name: Property[
+                str,
+                Rewrite(On.Insert, '.name ++ " (created)"'),
+                Rewrite(On.Update, '.name ++ " (updated)"'),
+            ]
+
+        f = T.__pylon_config__.fields["name"]
+        assert len(f.rewrites) == 2
+        ons = {r.on for r in f.rewrites}
+        assert On.Insert in ons
+        assert On.Update in ons
+
+    def test_delete_rewrite_on_field(self):
+        @pylon.type
+        class T:
+            group: Property[
+                str,
+                Rewrite(On.Delete, "update T set { deleted_at := datetime_current() }"),
+            ]
+
+        r = T.__pylon_config__.fields["group"].rewrites[0]
+        assert r.on == On.Delete
+
+    def test_rewrites_empty_by_default(self):
+        f = Product.__pylon_config__.fields["name"]
+        assert f.rewrites == []
+
+    def test_rewrite_on_link(self):
+        @pylon.type
+        class T:
+            ref: Link[Category, Rewrite(On.Update, ".expr")]
+
+        f = T.__pylon_config__.fields["ref"]
+        assert len(f.rewrites) == 1
+        assert f.rewrites[0].on == On.Update
+
+    def test_rewrite_does_not_affect_constraints_count(self):
+        @pylon.type
+        class T:
+            name: Property[str, MaxLen(10), Rewrite(On.Insert, ".name")]
+
+        f = T.__pylon_config__.fields["name"]
+        assert len(f.constraints) == 1
+        assert isinstance(f.constraints[0], MaxLen)
+
+    def test_repr(self):
+        r = Rewrite(On.Insert, ".expr")
+        assert "Rewrite" in repr(r)
+        assert "Insert" in repr(r)
