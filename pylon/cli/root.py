@@ -2,6 +2,7 @@ import click
 
 from pylon.config import load_config
 
+from .commands.database import database
 from .commands.migrations import migration
 from .commands.query import repl
 from .commands.version import version
@@ -31,6 +32,7 @@ def cli(ctx: click.Context) -> None:
 
 # --- groups -------------------------------------------------------------------
 
+cli.add_command(database)
 cli.add_command(migration)
 
 

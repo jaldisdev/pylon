@@ -1,6 +1,8 @@
 use std::sync::OnceLock;
 
 mod registry;
+pub mod ddl;
+pub use ddl::export_stdlib;
 
 // ── Type system ──────────────────────────────────────────────────────────────
 
@@ -40,6 +42,40 @@ pub enum PylonType {
     Tuple(Vec<PylonType>),
 }
 
+// ── PylonFunction definition ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlLanguage {
+    Sql,
+    PlPgSql,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FnVolatility {
+    Immutable,
+    Stable,
+}
+
+/// The SQL definition for one `_pylon` schema function overload.
+///
+/// Each `FnDescriptor` with `ImplStrategy::PylonFunction(def)` installs a
+/// separate overload in PostgreSQL — PG resolves them by argument types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PylonFnDef {
+    /// Unqualified name in the `_pylon` schema, e.g. `"to_bool"`.
+    pub name: &'static str,
+    pub language: SqlLanguage,
+    pub volatility: FnVolatility,
+    /// When false the function is called even when arguments are NULL.
+    /// Required for optional `msg` parameters that legitimately accept NULL.
+    pub strict: bool,
+    /// Override for the PostgreSQL RETURNS clause. When `None`, derived from
+    /// the owning `FnDescriptor`'s `return_type`.
+    pub returns_override: Option<&'static str>,
+    /// SQL body — the content between `$$` delimiters.
+    pub body: &'static str,
+}
+
 // ── Implementation strategy ──────────────────────────────────────────────────
 
 /// How the transpiler should emit a stdlib function call.
@@ -51,8 +87,12 @@ pub enum ImplStrategy {
     SqlExpression(&'static str),
     /// Maps to a SQL infix operator; transpiler emits `$1 op $2`.
     SqlOperator(&'static str),
-    /// Installs a function in the `_pylon` schema.
-    PylonFunction(&'static str),
+    /// Installs a function in the `_pylon` schema via `export_stdlib()`.
+    PylonFunction(PylonFnDef),
+    /// Special transpiler rewriting — no `_pylon` function is installed.
+    /// The transpiler substitutes type-specific PG expressions at compile time
+    /// (e.g. `range` → `int8range(...)`, `multirange` → `int8multirange(...)`).
+    TranspilerIntrinsic(&'static str),
 }
 
 // ── Parameter ────────────────────────────────────────────────────────────────

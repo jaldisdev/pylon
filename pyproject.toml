@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "pylon"
@@ -21,8 +21,10 @@ dev = ["pytest>=9.1.1"]
 [project.scripts]
 pylon = 'pylon.cli:cli'
 
-[tool.hatch.build.targets.wheel]
-packages = ["pylon"]
+[tool.maturin]
+manifest-path = "crates/pylon-py/Cargo.toml"
+python-packages = ["pylon"]
+module-name = "pylon._core"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
