@@ -347,9 +347,11 @@ def _to_pg_type(scalar_type: Any) -> str:
             return PG_TYPE_MAP.get(base, "text")
         return "text"
 
-    # Enum type → stored as text (the PostgreSQL ENUM type is declared separately)
+    # Enum type → schema-qualified PostgreSQL ENUM type reference
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonEnum):
-        return scalar_type.__name__.lower()
+        mod = getattr(scalar_type, "__pylon_module__", None) or \
+            (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+        return f'"{mod.replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
 
     # Generic Python types (list[str], dict, etc.) → jsonb
     origin = typing.get_origin(scalar_type)
@@ -474,7 +476,7 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
             name="id",
             pg_type="uuid",
             nullable=False,
-            default_sql="gen_random_uuid()",
+            default_sql="uuidv7()",
             description=meta.description,
             check_constraints=[],
             is_exclusive=True,

@@ -244,15 +244,14 @@ def _infer_module(cls: type) -> str:
     return module_path.rpartition(".")[-1] or module_path
 
 
-def _to_table_name(module: str, type_name: str) -> str:
-    """Derive the PostgreSQL table name: {module}_{snake_case_type_name}.
+def _to_table_name(type_name: str) -> str:
+    """Return the PostgreSQL table name for a type.
 
-    Examples:
-        module='account', type_name='Account'       → 'account_account'
-        module='account', type_name='AccountProfile' → 'account_account_profile'
+    The table name is the type's own name, preserving PascalCase.  The module
+    maps to the PostgreSQL schema, so account::Account → account."Account".
+    The caller is responsible for schema-qualifying the name in DDL.
     """
-    snake = _PASCAL_RE.sub("_", type_name).lower()
-    return f"{module}_{snake}"
+    return type_name
 
 
 # ── Pylon base detection and id injection ─────────────────────────────────────
@@ -347,7 +346,7 @@ def _build_type(
 
     resolved_module = module or _infer_module(cls)
     resolved_name = name or cls.__name__
-    resolved_table = table or _to_table_name(resolved_module, resolved_name)
+    resolved_table = table or _to_table_name(resolved_name)
 
     cls.__pylon_config__ = PylonConfig(
         module=resolved_module,
