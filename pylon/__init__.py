@@ -1,3 +1,4 @@
+from ._finalize import finalize
 from .client import AsyncTransaction, Client, create_async_client
 from .config import Config, DatabaseConfig, ModelConfig, SearchConfig
 from .datatypes import Object
@@ -62,6 +63,8 @@ from .schema import (
 )
 
 __all__ = [
+    # Startup
+    "finalize",
     # Client
     "AsyncTransaction",
     "Client",

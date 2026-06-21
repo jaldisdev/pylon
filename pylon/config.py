@@ -7,6 +7,24 @@ from typing import Literal
 
 import tomllib
 
+
+# ---------------------------------------------------------------------------
+# ProjectConfig
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class ProjectConfig:
+    """Project-level settings from the ``[project]`` TOML section.
+
+    *schema_dir* is resolved to an absolute path relative to the directory
+    that contains ``pylon.toml``.
+    """
+
+    schema_dir: Path
+    pyql: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # DatabaseConfig
 # ---------------------------------------------------------------------------
@@ -92,6 +110,7 @@ class Config:
     """
 
     database: DatabaseConfig
+    project: ProjectConfig | None = None
     search: SearchConfig | SearchRegistry | None = None
     models: ModelConfig | ModelRegistry | None = None
 
@@ -220,7 +239,7 @@ def load_config(path: str | Path | None = None) -> Config:
         KeyError / ValueError: When required keys are absent or invalid.
 
     Notes:
-        ``[project]`` is silently ignored at runtime.
+        ``[project]`` is required and must include ``schema-dir``.
 
         ``[search]`` and ``[models]`` are always normalised to the registry
         (dict) form internally, even when only a single connection is defined.
@@ -299,11 +318,30 @@ def load_config(path: str | Path | None = None) -> Config:
 
         models = model_registry if model_registry else None
 
-    return Config(database=database, search=search, models=models)
+    # ------------------------------------------------------------------
+    # [project]
+    # ------------------------------------------------------------------
+    raw_project = raw.get("project")
+    if not isinstance(raw_project, dict):
+        raise KeyError("pylon.toml: required section [project] is missing or invalid.")
+
+    schema_dir_raw = raw_project.get("schema-dir")
+    if not schema_dir_raw:
+        raise KeyError("pylon.toml: [project] requires 'schema-dir'.")
+
+    schema_dir = (toml_path.parent / str(schema_dir_raw)).resolve()
+    pyql_raw = raw_project.get("pyql")
+    project = ProjectConfig(
+        schema_dir=schema_dir,
+        pyql=str(pyql_raw) if pyql_raw is not None else None,
+    )
+
+    return Config(database=database, project=project, search=search, models=models)
 
 
 __all__ = [
     "Config",
+    "ProjectConfig",
     "DatabaseConfig",
     "SearchConfig",
     "ModelConfig",

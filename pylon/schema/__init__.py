@@ -1,5 +1,6 @@
 from ._base import BaseObject
 from ._export import export
+from ._walker import SchemaError
 from ._globals import Global, GlobalDescriptor, collect_module_globals
 from ._constraints import (
     Default,
@@ -119,4 +120,6 @@ __all__ = [
     "Global",
     "GlobalDescriptor",
     "collect_module_globals",
+    # Schema validation
+    "SchemaError",
 ]
