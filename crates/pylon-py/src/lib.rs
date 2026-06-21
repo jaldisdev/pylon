@@ -294,6 +294,15 @@ fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
     core::export::export_schema(&schema.inner).map_err(pyql_err)
 }
 
+/// Generate the complete `_pylon` schema DDL from the stdlib registry.
+///
+/// Returns a SQL string ready to be applied to a PostgreSQL database. Every
+/// statement is `CREATE OR REPLACE FUNCTION` so the call is idempotent.
+#[pyfunction]
+fn export_stdlib() -> String {
+    core::stdlib::export_stdlib()
+}
+
 /// Deserialize asyncpg Records into Python objects using the shape embedded in query.
 ///
 /// The top-level result is always a list since PyQL select is set-valued.
@@ -368,6 +377,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Functions
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
 
     Ok(())
