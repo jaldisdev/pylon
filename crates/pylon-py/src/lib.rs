@@ -3,7 +3,6 @@ use pyo3::PyTypeInfo;
 use pylon_core as core;
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
-// Compilation errors
 
 pyo3::create_exception!(
     pylon._core,
@@ -60,8 +59,6 @@ pyo3::create_exception!(
     "Failure compiling a schema-level PyQL fragment during schema export."
 );
 
-// Execution errors
-
 pyo3::create_exception!(
     pylon._core,
     PylonExecutionError,
@@ -93,70 +90,81 @@ pyo3::create_exception!(
     "Invalid value for a type (e.g. out-of-range, bad format)."
 );
 
-// ── Enums ──────────────────────────────────────────────────────────────────────
-
-#[pyclass(eq, frozen, from_py_object, module = "pylon._core")]
-#[derive(Clone, PartialEq)]
-pub enum CardinalityMode {
-    Required,
-    Optional,
-    Many,
-}
-
-impl From<CardinalityMode> for core::schema::CardinalityMode {
-    fn from(v: CardinalityMode) -> Self {
-        match v {
-            CardinalityMode::Required => core::schema::CardinalityMode::Required,
-            CardinalityMode::Optional => core::schema::CardinalityMode::Optional,
-            CardinalityMode::Many => core::schema::CardinalityMode::Many,
-        }
-    }
-}
-
-#[pyclass(eq, frozen, from_py_object, module = "pylon._core")]
-#[derive(Clone, PartialEq)]
-pub enum FieldKind {
-    Scalar,
-    Link,
-    MultiLink,
-    Computed,
-}
-
-impl From<FieldKind> for core::schema::FieldKind {
-    fn from(v: FieldKind) -> Self {
-        match v {
-            FieldKind::Scalar => core::schema::FieldKind::Scalar,
-            FieldKind::Link => core::schema::FieldKind::Link,
-            FieldKind::MultiLink => core::schema::FieldKind::MultiLink,
-            FieldKind::Computed => core::schema::FieldKind::Computed,
-        }
-    }
-}
-
-// ── Schema descriptor types ────────────────────────────────────────────────────
+// ── Mutation rewrite ───────────────────────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
-pub struct FieldDescriptor {
-    inner: core::schema::FieldDescriptor,
+pub struct RewriteEntry {
+    inner: core::schema::RewriteEntry,
 }
 
 #[pymethods]
-impl FieldDescriptor {
+impl RewriteEntry {
     #[new]
+    fn new(on: u8, handler: String) -> Self {
+        Self {
+            inner: core::schema::RewriteEntry { on, handler },
+        }
+    }
+
+    #[getter]
+    fn on(&self) -> u8 {
+        self.inner.on
+    }
+
+    #[getter]
+    fn handler(&self) -> &str {
+        &self.inner.handler
+    }
+}
+
+// ── Field descriptors ──────────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct PropertyDescriptor {
+    inner: core::schema::PropertyDescriptor,
+}
+
+#[pymethods]
+impl PropertyDescriptor {
+    #[new]
+    #[pyo3(signature = (
+        name,
+        pg_type,
+        nullable,
+        *,
+        default_sql = None,
+        description = None,
+        check_constraints = None,
+        is_exclusive = false,
+        is_pk = false,
+        rewrites = None
+    ))]
     fn new(
         name: String,
-        kind: FieldKind,
-        cardinality: CardinalityMode,
-        target: Option<String>,
-        scalar_type: Option<String>,
+        pg_type: String,
+        nullable: bool,
+        default_sql: Option<String>,
+        description: Option<String>,
+        check_constraints: Option<Vec<String>>,
+        is_exclusive: bool,
+        is_pk: bool,
+        rewrites: Option<Vec<PyRef<RewriteEntry>>>,
     ) -> Self {
         Self {
-            inner: core::schema::FieldDescriptor {
+            inner: core::schema::PropertyDescriptor {
                 name,
-                kind: kind.into(),
-                cardinality: cardinality.into(),
-                target,
-                scalar_type,
+                pg_type,
+                nullable,
+                default_sql,
+                description,
+                check_constraints: check_constraints.unwrap_or_default(),
+                is_exclusive,
+                is_pk,
+                rewrites: rewrites
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|r| r.inner.clone())
+                    .collect(),
             },
         }
     }
@@ -165,30 +173,426 @@ impl FieldDescriptor {
     fn name(&self) -> &str {
         &self.inner.name
     }
+
+    #[getter]
+    fn pg_type(&self) -> &str {
+        &self.inner.pg_type
+    }
+
+    #[getter]
+    fn nullable(&self) -> bool {
+        self.inner.nullable
+    }
+
+    #[getter]
+    fn default_sql(&self) -> Option<&str> {
+        self.inner.default_sql.as_deref()
+    }
+
+    #[getter]
+    fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
+
+    #[getter]
+    fn check_constraints(&self) -> Vec<String> {
+        self.inner.check_constraints.clone()
+    }
+
+    #[getter]
+    fn is_exclusive(&self) -> bool {
+        self.inner.is_exclusive
+    }
+
+    #[getter]
+    fn is_pk(&self) -> bool {
+        self.inner.is_pk
+    }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
+pub struct LinkDescriptor {
+    inner: core::schema::LinkDescriptor,
+}
+
+#[pymethods]
+impl LinkDescriptor {
+    #[new]
+    #[pyo3(signature = (
+        name,
+        target,
+        nullable,
+        *,
+        description = None,
+        is_exclusive = false,
+        rewrites = None
+    ))]
+    fn new(
+        name: String,
+        target: String,
+        nullable: bool,
+        description: Option<String>,
+        is_exclusive: bool,
+        rewrites: Option<Vec<PyRef<RewriteEntry>>>,
+    ) -> Self {
+        Self {
+            inner: core::schema::LinkDescriptor {
+                name,
+                target,
+                nullable,
+                description,
+                is_exclusive,
+                rewrites: rewrites
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|r| r.inner.clone())
+                    .collect(),
+            },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    #[getter]
+    fn target(&self) -> &str {
+        &self.inner.target
+    }
+
+    #[getter]
+    fn nullable(&self) -> bool {
+        self.inner.nullable
+    }
+
+    #[getter]
+    fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
+
+    #[getter]
+    fn is_exclusive(&self) -> bool {
+        self.inner.is_exclusive
+    }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct MultiLinkDescriptor {
+    inner: core::schema::MultiLinkDescriptor,
+}
+
+#[pymethods]
+impl MultiLinkDescriptor {
+    #[new]
+    #[pyo3(signature = (
+        name,
+        target,
+        *,
+        through = None,
+        nullable = false,
+        description = None
+    ))]
+    fn new(
+        name: String,
+        target: String,
+        through: Option<String>,
+        nullable: bool,
+        description: Option<String>,
+    ) -> Self {
+        Self {
+            inner: core::schema::MultiLinkDescriptor {
+                name,
+                target,
+                through,
+                nullable,
+                description,
+            },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    #[getter]
+    fn target(&self) -> &str {
+        &self.inner.target
+    }
+
+    #[getter]
+    fn through(&self) -> Option<&str> {
+        self.inner.through.as_deref()
+    }
+
+    #[getter]
+    fn nullable(&self) -> bool {
+        self.inner.nullable
+    }
+
+    #[getter]
+    fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct ComputedDescriptor {
+    inner: core::schema::ComputedDescriptor,
+}
+
+#[pymethods]
+impl ComputedDescriptor {
+    #[new]
+    #[pyo3(signature = (name, expression, *, return_type = None))]
+    fn new(name: String, expression: String, return_type: Option<String>) -> Self {
+        Self {
+            inner: core::schema::ComputedDescriptor {
+                name,
+                expression,
+                return_type,
+            },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    #[getter]
+    fn expression(&self) -> &str {
+        &self.inner.expression
+    }
+
+    #[getter]
+    fn return_type(&self) -> Option<&str> {
+        self.inner.return_type.as_deref()
+    }
+}
+
+// ── Type-level constructs ──────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct IndexDescriptor {
+    inner: core::schema::IndexDescriptor,
+}
+
+#[pymethods]
+impl IndexDescriptor {
+    #[new]
+    #[pyo3(signature = (
+        fields,
+        *,
+        expression = None,
+        unique = false,
+        unless = None
+    ))]
+    fn new(
+        fields: Vec<String>,
+        expression: Option<String>,
+        unique: bool,
+        unless: Option<String>,
+    ) -> Self {
+        Self {
+            inner: core::schema::IndexDescriptor {
+                fields,
+                expression,
+                unique,
+                unless,
+            },
+        }
+    }
+
+    #[getter]
+    fn fields(&self) -> Vec<String> {
+        self.inner.fields.clone()
+    }
+
+    #[getter]
+    fn expression(&self) -> Option<&str> {
+        self.inner.expression.as_deref()
+    }
+
+    #[getter]
+    fn unique(&self) -> bool {
+        self.inner.unique
+    }
+
+    #[getter]
+    fn unless(&self) -> Option<&str> {
+        self.inner.unless.as_deref()
+    }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct TriggerDescriptor {
+    inner: core::schema::TriggerDescriptor,
+}
+
+#[pymethods]
+impl TriggerDescriptor {
+    #[new]
+    fn new(on: u8, timing: String, handler: String) -> Self {
+        Self {
+            inner: core::schema::TriggerDescriptor { on, timing, handler },
+        }
+    }
+
+    #[getter]
+    fn on(&self) -> u8 {
+        self.inner.on
+    }
+
+    #[getter]
+    fn timing(&self) -> &str {
+        &self.inner.timing
+    }
+
+    #[getter]
+    fn handler(&self) -> &str {
+        &self.inner.handler
+    }
+}
+
+/// Composite UNIQUE constraint across multiple fields.
+#[pyclass(module = "pylon._core", frozen)]
+pub struct ExclusiveConstraint {
+    inner: core::schema::TypeConstraint,
+}
+
+#[pymethods]
+impl ExclusiveConstraint {
+    #[new]
+    #[pyo3(signature = (fields, *, unless = None))]
+    fn new(fields: Vec<String>, unless: Option<String>) -> Self {
+        Self {
+            inner: core::schema::TypeConstraint::Exclusive { fields, unless },
+        }
+    }
+
+    #[getter]
+    fn fields(&self) -> Vec<String> {
+        match &self.inner {
+            core::schema::TypeConstraint::Exclusive { fields, .. } => fields.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[getter]
+    fn unless(&self) -> Option<&str> {
+        match &self.inner {
+            core::schema::TypeConstraint::Exclusive { unless, .. } => unless.as_deref(),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Arbitrary CHECK constraint expressed as a PyQL boolean expression.
+#[pyclass(module = "pylon._core", frozen)]
+pub struct ExpressionConstraint {
+    inner: core::schema::TypeConstraint,
+}
+
+#[pymethods]
+impl ExpressionConstraint {
+    #[new]
+    fn new(expr: String) -> Self {
+        Self {
+            inner: core::schema::TypeConstraint::Expression { expr },
+        }
+    }
+
+    #[getter]
+    fn expr(&self) -> &str {
+        match &self.inner {
+            core::schema::TypeConstraint::Expression { expr } => expr.as_str(),
+            _ => unreachable!(),
+        }
+    }
+}
+
+// ── Type descriptor ────────────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
 pub struct TypeDescriptor {
-    inner: core::schema::TypeDescriptor,
+    pub(crate) inner: core::schema::TypeDescriptor,
 }
 
 #[pymethods]
 impl TypeDescriptor {
-    /// `abstract_` corresponds to Python keyword argument `abstract`.
     #[new]
-    #[pyo3(signature = (name, fields, *, abstract_ = false, materialized = true))]
+    #[pyo3(signature = (
+        name,
+        module,
+        table,
+        properties,
+        links,
+        multilinks,
+        computed,
+        *,
+        abstract_ = false,
+        materialized = true,
+        description = None,
+        parents = None,
+        interfaces = None,
+        exclusive_constraints = None,
+        expression_constraints = None,
+        indexes = None,
+        triggers = None
+    ))]
     fn new(
         name: String,
-        fields: Vec<PyRef<FieldDescriptor>>,
+        module: String,
+        table: String,
+        properties: Vec<PyRef<PropertyDescriptor>>,
+        links: Vec<PyRef<LinkDescriptor>>,
+        multilinks: Vec<PyRef<MultiLinkDescriptor>>,
+        computed: Vec<PyRef<ComputedDescriptor>>,
         abstract_: bool,
         materialized: bool,
+        description: Option<String>,
+        parents: Option<Vec<String>>,
+        interfaces: Option<Vec<String>>,
+        exclusive_constraints: Option<Vec<PyRef<ExclusiveConstraint>>>,
+        expression_constraints: Option<Vec<PyRef<ExpressionConstraint>>>,
+        indexes: Option<Vec<PyRef<IndexDescriptor>>>,
+        triggers: Option<Vec<PyRef<TriggerDescriptor>>>,
     ) -> Self {
+        let mut constraints: Vec<core::schema::TypeConstraint> = Vec::new();
+        for c in exclusive_constraints.unwrap_or_default().iter() {
+            constraints.push(c.inner.clone());
+        }
+        for c in expression_constraints.unwrap_or_default().iter() {
+            constraints.push(c.inner.clone());
+        }
+
         Self {
             inner: core::schema::TypeDescriptor {
                 name,
-                fields: fields.iter().map(|f| f.inner.clone()).collect(),
+                module,
+                table,
                 abstract_,
                 materialized,
+                description,
+                parents: parents.unwrap_or_default(),
+                interfaces: interfaces.unwrap_or_default(),
+                properties: properties.iter().map(|p| p.inner.clone()).collect(),
+                links: links.iter().map(|l| l.inner.clone()).collect(),
+                multilinks: multilinks.iter().map(|m| m.inner.clone()).collect(),
+                computed: computed.iter().map(|c| c.inner.clone()).collect(),
+                constraints,
+                indexes: indexes
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|i| i.inner.clone())
+                    .collect(),
+                triggers: triggers
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|t| t.inner.clone())
+                    .collect(),
             },
         }
     }
@@ -197,7 +601,44 @@ impl TypeDescriptor {
     fn name(&self) -> &str {
         &self.inner.name
     }
+
+    #[getter]
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
+
+    #[getter]
+    fn table(&self) -> &str {
+        &self.inner.table
+    }
+
+    #[getter]
+    fn abstract_(&self) -> bool {
+        self.inner.abstract_
+    }
+
+    #[getter]
+    fn materialized(&self) -> bool {
+        self.inner.materialized
+    }
+
+    #[getter]
+    fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
+
+    #[getter]
+    fn parents(&self) -> Vec<String> {
+        self.inner.parents.clone()
+    }
+
+    #[getter]
+    fn interfaces(&self) -> Vec<String> {
+        self.inner.interfaces.clone()
+    }
 }
+
+// ── Scalar / enum / global descriptors ────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
 pub struct ScalarDescriptor {
@@ -207,20 +648,21 @@ pub struct ScalarDescriptor {
 #[pymethods]
 impl ScalarDescriptor {
     #[new]
+    #[pyo3(signature = (name, module, base, pg_type, *, check_constraints = None))]
     fn new(
         name: String,
+        module: String,
         base: String,
         pg_type: String,
-        constraints: Vec<String>,
-        module: String,
+        check_constraints: Option<Vec<String>>,
     ) -> Self {
         Self {
             inner: core::schema::ScalarDescriptor {
                 name,
+                module,
                 base,
                 pg_type,
-                constraints,
-                module,
+                check_constraints: check_constraints.unwrap_or_default(),
             },
         }
     }
@@ -228,6 +670,56 @@ impl ScalarDescriptor {
     #[getter]
     fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    #[getter]
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
+
+    #[getter]
+    fn base(&self) -> &str {
+        &self.inner.base
+    }
+
+    #[getter]
+    fn pg_type(&self) -> &str {
+        &self.inner.pg_type
+    }
+
+    #[getter]
+    fn check_constraints(&self) -> Vec<String> {
+        self.inner.check_constraints.clone()
+    }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct EnumDescriptor {
+    inner: core::schema::EnumDescriptor,
+}
+
+#[pymethods]
+impl EnumDescriptor {
+    #[new]
+    fn new(name: String, module: String, members: Vec<String>) -> Self {
+        Self {
+            inner: core::schema::EnumDescriptor { name, module, members },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    #[getter]
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
+
+    #[getter]
+    fn members(&self) -> Vec<String> {
+        self.inner.members.clone()
     }
 }
 
@@ -294,27 +786,62 @@ pub struct SchemaDescriptor {
 #[pymethods]
 impl SchemaDescriptor {
     #[new]
-    #[pyo3(signature = (types, scalars, *, globals = None))]
+    #[pyo3(signature = (*, types = None, scalars = None, enums = None, globals = None))]
     fn new(
-        types: Vec<PyRef<TypeDescriptor>>,
-        scalars: Vec<PyRef<ScalarDescriptor>>,
+        types: Option<Vec<PyRef<TypeDescriptor>>>,
+        scalars: Option<Vec<PyRef<ScalarDescriptor>>>,
+        enums: Option<Vec<PyRef<EnumDescriptor>>>,
         globals: Option<Vec<PyRef<GlobalDescriptor>>>,
     ) -> Self {
         Self {
             inner: core::schema::SchemaDescriptor {
-                types: types.iter().map(|t| t.inner.clone()).collect(),
-                scalars: scalars.iter().map(|s| s.inner.clone()).collect(),
+                types: types
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|t| t.inner.clone())
+                    .collect(),
+                scalars: scalars
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.inner.clone())
+                    .collect(),
+                enums: enums
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| e.inner.clone())
+                    .collect(),
                 globals: globals
-                    .map(|g| g.iter().map(|gd| gd.inner.clone()).collect())
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|g| g.inner.clone())
+                    .collect(),
             },
         }
+    }
+
+    #[getter]
+    fn type_count(&self) -> usize {
+        self.inner.types.len()
+    }
+
+    #[getter]
+    fn scalar_count(&self) -> usize {
+        self.inner.scalars.len()
+    }
+
+    #[getter]
+    fn enum_count(&self) -> usize {
+        self.inner.enums.len()
+    }
+
+    #[getter]
+    fn global_count(&self) -> usize {
+        self.inner.globals.len()
     }
 }
 
 // ── Query types ────────────────────────────────────────────────────────────────
 
-/// The output of a successful PyQL compilation. Immutable and safe to cache.
 #[pyclass(module = "pylon._core", frozen)]
 pub struct CompiledQuery {
     inner: core::query::CompiledQuery,
@@ -322,23 +849,19 @@ pub struct CompiledQuery {
 
 #[pymethods]
 impl CompiledQuery {
-    /// PostgreSQL SQL string ready for execution.
     #[getter]
     fn sql(&self) -> &str {
         &self.inner.sql
     }
 
-    /// Positional bound parameters ($1, $2, …).
     #[getter]
     fn params<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
-        // TODO: convert QueryParam variants to Python scalar types
         pyo3::types::PyList::empty(py)
     }
 }
 
 // ── Public functions ───────────────────────────────────────────────────────────
 
-/// Compile a PyQL string to SQL against schema. Raises PyQLError on failure.
 #[pyfunction]
 fn compile(query: &str, schema: &SchemaDescriptor) -> PyResult<CompiledQuery> {
     core::query::compile(query, &schema.inner)
@@ -346,24 +869,16 @@ fn compile(query: &str, schema: &SchemaDescriptor) -> PyResult<CompiledQuery> {
         .map_err(pyql_err)
 }
 
-/// Export the full schema as a PostgreSQL DDL string. Raises PyQLError on failure.
 #[pyfunction]
 fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
     core::export::export_schema(&schema.inner).map_err(pyql_err)
 }
 
-/// Generate the complete `_pylon` schema DDL from the stdlib registry.
-///
-/// Returns a SQL string ready to be applied to a PostgreSQL database. Every
-/// statement is `CREATE OR REPLACE FUNCTION` so the call is idempotent.
 #[pyfunction]
 fn export_stdlib() -> String {
     core::stdlib::export_stdlib()
 }
 
-/// Deserialize asyncpg Records into Python objects using the shape embedded in query.
-///
-/// The top-level result is always a list since PyQL select is set-valued.
 #[pyfunction]
 fn deserialize(
     _records: &Bound<'_, PyAny>,
@@ -401,7 +916,7 @@ fn pyql_err(err: core::error::PyQLError) -> PyErr {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
 
-    // Exceptions — compilation (base before derived)
+    // Exceptions — compilation
     m.add("PyQLError", PyQLError::type_object(py))?;
     m.add("PyQLSyntaxError", PyQLSyntaxError::type_object(py))?;
     m.add("PyQLTypeError", PyQLTypeError::type_object(py))?;
@@ -412,21 +927,30 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PyQLCardinalityError", PyQLCardinalityError::type_object(py))?;
     m.add("PyQLFragmentError", PyQLFragmentError::type_object(py))?;
 
-    // Exceptions — execution (base before derived)
+    // Exceptions — execution
     m.add("PylonExecutionError", PylonExecutionError::type_object(py))?;
     m.add("PylonConstraintViolationError", PylonConstraintViolationError::type_object(py))?;
     m.add("PylonCardinalityViolationError", PylonCardinalityViolationError::type_object(py))?;
     m.add("PylonMissingRequiredError", PylonMissingRequiredError::type_object(py))?;
     m.add("PylonInvalidValueError", PylonInvalidValueError::type_object(py))?;
 
-    // Enums
-    m.add_class::<CardinalityMode>()?;
-    m.add_class::<FieldKind>()?;
+    // Field descriptors
+    m.add_class::<RewriteEntry>()?;
+    m.add_class::<PropertyDescriptor>()?;
+    m.add_class::<LinkDescriptor>()?;
+    m.add_class::<MultiLinkDescriptor>()?;
+    m.add_class::<ComputedDescriptor>()?;
 
-    // Schema descriptor types
-    m.add_class::<FieldDescriptor>()?;
+    // Type-level constructs
+    m.add_class::<IndexDescriptor>()?;
+    m.add_class::<TriggerDescriptor>()?;
+    m.add_class::<ExclusiveConstraint>()?;
+    m.add_class::<ExpressionConstraint>()?;
+
+    // Top-level descriptors
     m.add_class::<TypeDescriptor>()?;
     m.add_class::<ScalarDescriptor>()?;
+    m.add_class::<EnumDescriptor>()?;
     m.add_class::<GlobalDescriptor>()?;
     m.add_class::<SchemaDescriptor>()?;
 

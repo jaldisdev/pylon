@@ -12,6 +12,7 @@ from pylon.config import (
     Config,
     DatabaseConfig,
     ModelConfig,
+    ProjectConfig,
     SearchConfig,
     load_config,
 )
@@ -114,6 +115,9 @@ class TestConfigNormalisation:
     def _db(self) -> DatabaseConfig:
         return DatabaseConfig(dsn="pylon://u:p@h:5432/db")
 
+    def _project(self) -> ProjectConfig:
+        return ProjectConfig(schema_dir=Path("/tmp/schema"))
+
     def test_search_none(self):
         c = Config(database=self._db())
         assert c.search_registry == {}
@@ -184,6 +188,9 @@ class TestLoadConfig:
     def test_password_env(self, toml_dir, monkeypatch):
         monkeypatch.setenv("MY_PW", "env_password")
         d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
             [database]
             host = "localhost"
             port = 5432
@@ -196,6 +203,9 @@ class TestLoadConfig:
 
     def test_search_section(self, toml_dir):
         d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
             [database]
             host = "localhost"
             port = 5432
@@ -214,6 +224,9 @@ class TestLoadConfig:
 
     def test_search_named_branch(self, toml_dir):
         d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
             [database]
             host = "localhost"
             port = 5432
@@ -235,6 +248,9 @@ class TestLoadConfig:
     def test_models_section(self, toml_dir, monkeypatch):
         monkeypatch.setenv("OPENAI_KEY", "sk-xxx")
         d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
             [database]
             host = "localhost"
             port = 5432
@@ -255,6 +271,9 @@ class TestLoadConfig:
         monkeypatch.setenv("OPENAI_KEY", "sk-openai")
         monkeypatch.setenv("MISTRAL_KEY", "sk-mistral")
         d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
             [database]
             host = "localhost"
             port = 5432
@@ -281,6 +300,9 @@ class TestLoadConfig:
     def test_database_branch_tables_ignored_in_base(self, toml_dir):
         """Branch sub-tables in [database] must not pollute the base config."""
         d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
             [database]
             host = "localhost"
             port = 5432
@@ -311,7 +333,7 @@ class TestLoadConfig:
         with pytest.raises(FileNotFoundError):
             load_config(tmp_path / "nonexistent" / "pylon.toml")
 
-    def test_project_section_ignored(self, toml_dir):
+    def test_project_section_parsed(self, toml_dir, tmp_path):
         d = toml_dir("""
             [project]
             schema-dir = "dbschema"
@@ -323,9 +345,52 @@ class TestLoadConfig:
             name = "mydb"
             user = "myuser"
         """)
-        # Should not raise; project section is silently ignored.
         cfg = load_config(d / "pylon.toml")
         assert cfg.database.name == "mydb"
+        assert cfg.project is not None
+        assert cfg.project.schema_dir == (d / "dbschema").resolve()
+        assert cfg.project.pyql == "1.0.0"
+
+    def test_project_schema_dir_without_pyql(self, toml_dir):
+        d = toml_dir("""
+            [project]
+            schema-dir = "schema"
+
+            [database]
+            host = "localhost"
+            port = 5432
+            name = "mydb"
+            user = "myuser"
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.project is not None
+        assert cfg.project.schema_dir.name == "schema"
+        assert cfg.project.pyql is None
+
+    def test_missing_project_raises(self, toml_dir):
+        d = toml_dir("""
+            [database]
+            host = "localhost"
+            port = 5432
+            name = "mydb"
+            user = "myuser"
+        """)
+        with pytest.raises(KeyError, match="project"):
+            load_config(d / "pylon.toml")
+
+    def test_missing_schema_dir_raises(self, toml_dir):
+        d = toml_dir("""
+            [project]
+            pyql = "1.0.0"
+
+            [database]
+            host = "localhost"
+            port = 5432
+            name = "mydb"
+            user = "myuser"
+        """)
+        with pytest.raises(KeyError, match="schema-dir"):
+            load_config(d / "pylon.toml")
 
     def test_full_example(self, toml_dir, monkeypatch):
         monkeypatch.setenv("PYLON_DB_PASSWORD", "db_pw")

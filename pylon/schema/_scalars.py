@@ -199,6 +199,8 @@ def scalar(
     def _decorator(cls: type[Scalar]) -> type[Scalar]:
         cls.__pylon_base__ = base_type
         cls.__pylon_constraints__ = ()
+        from . import _registry
+        _registry.register_scalar(cls)
         return cls
 
     return _decorator

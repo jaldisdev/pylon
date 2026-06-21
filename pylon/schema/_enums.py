@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum as _stdlib_enum
+import sys
 from typing import Any
 
 
@@ -29,6 +30,25 @@ def enum_decorator(*members: str) -> Any:
     """
 
     def _decorator(cls: type) -> type[Enum]:
-        return Enum(cls.__name__, {m: m for m in members})  # type: ignore[call-overload]
+        new_enum: type[Enum] = Enum(cls.__name__, {m: m for m in members})  # type: ignore[call-overload]
+        # Preserve the defining module so the walker can infer the pylon module.
+        new_enum.__module__ = cls.__module__
+
+        # Infer and attach the pylon module name (same logic as _decorators._infer_module).
+        defining = sys.modules.get(cls.__module__)
+        if defining is not None:
+            override = getattr(defining, "__pylon_module__", None)
+            pylon_module: str = (
+                override
+                if isinstance(override, str)
+                else (cls.__module__ or "default").rpartition(".")[-1] or "default"
+            )
+        else:
+            pylon_module = (cls.__module__ or "default").rpartition(".")[-1] or "default"
+        new_enum.__pylon_module__ = pylon_module  # type: ignore[attr-defined]
+
+        from . import _registry
+        _registry.register_enum(new_enum)
+        return new_enum
 
     return _decorator
