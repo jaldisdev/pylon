@@ -214,38 +214,48 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("std", "datetime_shift",          vec![p("dt", Datetime), p("delta", Duration)], Datetime, E("$1 + $2")),
         f("std", "duration_get",            vec![p("d", Duration), p("el", Str)],    Float64,  PF("duration_get")),
         f("std", "duration_to_seconds",     vec![p("d", Duration)],                  Decimal,  E("extract(epoch from $1)")),
-        f("std", "to_datetime",             vec![p("s", Str), p("fmt", Str)],        Datetime, E("to_timestamp($1, $2)")),
-        f("std", "to_datetime",             vec![p("year", Int64), p("month", Int64), p("day", Int64), p("hour", Int64), p("min", Int64), p("sec", Float64), p("timezone", Str)], Datetime, PF("to_datetime")),
-        fc("std", "to_datetime",            vec![p("epoch_seconds", Decimal)],        Datetime, E("to_timestamp($1)")),
+        f( "std", "to_datetime",             vec![p("s", Str), p("fmt", Str)],        Datetime, E("to_timestamp($1, $2)")),
+        f( "std", "to_datetime",             vec![p("year", Int64), p("month", Int64), p("day", Int64), p("hour", Int64), p("min", Int64), p("sec", Float64), p("timezone", Str)], Datetime, PF("to_datetime")),
+        // Single-arg str overload — ISO 8601 parsing; cast target for str → datetime.
+        fc("std", "to_datetime",            vec![p("s", Str)],                        Datetime, PF("to_datetime")),
+        f( "std", "to_datetime",            vec![p("epoch_seconds", Decimal)],        Datetime, E("to_timestamp($1)")),
         f("std", "to_duration",             vec![p("hours", Int64), p("minutes", Int64), p("seconds", Float64)], Duration, PF("to_duration")),
 
         // ── std:: type conversion ────────────────────────────────────────────
         // to_str: format-arg overloads are callable-only (cast syntax has no slot for a format string).
         f( "std", "to_str",    vec![p("v", Datetime), p("fmt", Str)], Str,     E("to_char($1, $2)")),
         fc("std", "to_str",    vec![p("v", Datetime)],                Str,     E("$1::text")),
+        fc("std", "to_str",    vec![p("v", Int16)],                   Str,     E("$1::text")),
+        fc("std", "to_str",    vec![p("v", Int32)],                   Str,     E("$1::text")),
         fc("std", "to_str",    vec![p("v", Int64)],                   Str,     E("$1::text")),
+        fc("std", "to_str",    vec![p("v", Float32)],                 Str,     E("$1::text")),
         fc("std", "to_str",    vec![p("v", Float64)],                 Str,     E("$1::text")),
         fc("std", "to_str",    vec![p("v", Decimal)],                 Str,     E("$1::text")),
+        fc("std", "to_str",    vec![p("v", BigInt)],                  Str,     E("$1::text")),
         fc("std", "to_str",    vec![p("v", Bool)],                    Str,     E("$1::text")),
         fc("std", "to_str",    vec![p("v", Json)],                    Str,     E("$1::text")),
         f( "std", "to_str",    vec![p("v", Bytes), p("encoding", Str)], Str,   PF("to_str_bytes")),
         fc("std", "to_str",    vec![p("v", Duration)],                Str,     E("$1::text")),
         fc("std", "to_str",    vec![p("v", Uuid)],                    Str,     E("$1::text")),
         fc("std", "to_int16",  vec![p("s", Str)],                     Int16,   E("$1::int2")),
-        fc("std", "to_int16",  vec![p("b", Bool)],                    Int16,   E("$1::int2")),
+        f( "std", "to_int16",  vec![p("b", Bool)],                    Int16,   E("$1::int2")),  // bool→int16 is a Sql cast, not Function
         fc("std", "to_int32",  vec![p("s", Str)],                     Int32,   E("$1::int4")),
-        fc("std", "to_int32",  vec![p("b", Bool)],                    Int32,   E("$1::int4")),
+        f( "std", "to_int32",  vec![p("b", Bool)],                    Int32,   E("$1::int4")),  // bool→int32 is a Sql cast, not Function
         fc("std", "to_int64",  vec![p("s", Str)],                     Int64,   E("$1::int8")),
-        fc("std", "to_int64",  vec![p("b", Bool)],                    Int64,   E("$1::int8")),
+        f( "std", "to_int64",  vec![p("b", Bool)],                    Int64,   E("$1::int8")),  // bool→int64 is a Sql cast, not Function
         fc("std", "to_float32",vec![p("s", Str)],                     Float32, E("$1::float4")),
-        fc("std", "to_float32",vec![p("n", Int64)],                   Float32, E("$1::float4")),
+        f( "std", "to_float32",vec![p("n", Int64)],                   Float32, E("$1::float4")),  // int64→float32 absent from cast matrix
         fc("std", "to_float64",vec![p("s", Str)],                     Float64, E("$1::float8")),
-        fc("std", "to_float64",vec![p("n", Int64)],                   Float64, E("$1::float8")),
+        f( "std", "to_float64",vec![p("n", Int64)],                   Float64, E("$1::float8")),  // int64→float64 absent from cast matrix
         fc("std", "to_decimal",vec![p("s", Str)],                     Decimal, E("$1::numeric")),
-        fc("std", "to_decimal",vec![p("n", Int64)],                   Decimal, E("$1::numeric")),
+        f( "std", "to_decimal",vec![p("n", Int64)],                   Decimal, E("$1::numeric")),  // int64→decimal is Implicit, not Function
         fc("std", "to_bigint", vec![p("s", Str)],                     BigInt,  E("$1::numeric")),
-        fc("std", "to_bigint", vec![p("n", Int64)],                   BigInt,  E("$1::numeric")),
+        f( "std", "to_bigint", vec![p("n", Int64)],                   BigInt,  E("$1::numeric")),  // int64→bigint is Implicit, not Function
         fc("std", "to_bool",   vec![p("s", Str)],                     Bool,    E("$1::bool")),
+        // int → bool: PG has no native int::bool cast; _pylon.to_bool handles 0 → false, else true.
+        fc("std", "to_bool",   vec![p("n", Int16)],                   Bool,    PF("to_bool")),
+        fc("std", "to_bool",   vec![p("n", Int32)],                   Bool,    PF("to_bool")),
+        fc("std", "to_bool",   vec![p("n", Int64)],                   Bool,    PF("to_bool")),
 
         // ── math:: ───────────────────────────────────────────────────────────
         f("math", "pi",         vec![],                                     Float64, E("pi()")),
@@ -278,10 +288,10 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("cal", "to_local_datetime",     vec![p("dt", Datetime), p("timezone", Str)], LocalDatetime, E("$1 AT TIME ZONE $2")),
         f("cal", "to_local_datetime",     vec![p("year", Int64), p("month", Int64), p("day", Int64), p("hour", Int64), p("min", Int64), p("sec", Float64)], LocalDatetime, E("make_timestamp($1,$2,$3,$4,$5,$6)")),
         f("cal", "to_local_datetime",     vec![p("s", Str), p("fmt", Str)],            LocalDatetime, E("to_timestamp($1,$2)::timestamp")),
-        fc("cal", "to_local_date",        vec![p("dt", LocalDatetime)],                LocalDate,     E("$1::date")),
+        f( "cal", "to_local_date",        vec![p("dt", LocalDatetime)],                LocalDate,     E("$1::date")),
         f( "cal", "to_local_date",        vec![p("year", Int64), p("month", Int64), p("day", Int64)], LocalDate, E("make_date($1,$2,$3)")),
         f( "cal", "to_local_date",        vec![p("s", Str), p("fmt", Str)],            LocalDate,     E("to_date($1,$2)")),
-        fc("cal", "to_local_time",        vec![p("dt", LocalDatetime)],                LocalTime,     E("$1::time")),
+        f( "cal", "to_local_time",        vec![p("dt", LocalDatetime)],                LocalTime,     E("$1::time")),
         f( "cal", "to_local_time",        vec![p("hour", Int64), p("min", Int64), p("sec", Float64)], LocalTime, E("make_time($1,$2,$3)")),
         f( "cal", "to_local_time",        vec![p("s", Str), p("fmt", Str)],            LocalTime,     E("to_timestamp($1,$2)::time")),
         // PylonFunction because PG extract requires a keyword field name, not a text argument.

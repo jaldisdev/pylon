@@ -1,3 +1,4 @@
+pub mod cast;
 pub mod error;
 pub mod export;
 pub mod query;
