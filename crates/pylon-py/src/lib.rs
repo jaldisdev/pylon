@@ -231,6 +231,59 @@ impl ScalarDescriptor {
     }
 }
 
+#[pyclass(module = "pylon._core", frozen)]
+pub struct GlobalDescriptor {
+    inner: core::schema::GlobalDescriptor,
+}
+
+#[pymethods]
+impl GlobalDescriptor {
+    #[new]
+    #[pyo3(signature = (name, module, scalar_type, required, *, default_expr = None))]
+    fn new(
+        name: String,
+        module: String,
+        scalar_type: String,
+        required: bool,
+        default_expr: Option<String>,
+    ) -> Self {
+        Self {
+            inner: core::schema::GlobalDescriptor {
+                name,
+                module,
+                scalar_type,
+                required,
+                default_expr,
+            },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    #[getter]
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
+
+    #[getter]
+    fn scalar_type(&self) -> &str {
+        &self.inner.scalar_type
+    }
+
+    #[getter]
+    fn required(&self) -> bool {
+        self.inner.required
+    }
+
+    #[getter]
+    fn default_expr(&self) -> Option<&str> {
+        self.inner.default_expr.as_deref()
+    }
+}
+
 /// Opaque Rust value built by the Python schema registry. Treat as immutable;
 /// recreate after schema changes.
 #[pyclass(module = "pylon._core", frozen)]
@@ -241,14 +294,19 @@ pub struct SchemaDescriptor {
 #[pymethods]
 impl SchemaDescriptor {
     #[new]
+    #[pyo3(signature = (types, scalars, *, globals = None))]
     fn new(
         types: Vec<PyRef<TypeDescriptor>>,
         scalars: Vec<PyRef<ScalarDescriptor>>,
+        globals: Option<Vec<PyRef<GlobalDescriptor>>>,
     ) -> Self {
         Self {
             inner: core::schema::SchemaDescriptor {
                 types: types.iter().map(|t| t.inner.clone()).collect(),
                 scalars: scalars.iter().map(|s| s.inner.clone()).collect(),
+                globals: globals
+                    .map(|g| g.iter().map(|gd| gd.inner.clone()).collect())
+                    .unwrap_or_default(),
             },
         }
     }
@@ -369,6 +427,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FieldDescriptor>()?;
     m.add_class::<TypeDescriptor>()?;
     m.add_class::<ScalarDescriptor>()?;
+    m.add_class::<GlobalDescriptor>()?;
     m.add_class::<SchemaDescriptor>()?;
 
     // Query types
