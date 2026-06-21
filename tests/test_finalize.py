@@ -523,7 +523,9 @@ class TestPgTypeResolution:
         class Power(pylon.Enum):
             pass
 
-        assert _to_pg_type(Power) == "power"
+        pg = _to_pg_type(Power)
+        # Schema-qualified: "module"."Power" — module derived from __pylon_module__
+        assert pg.endswith('"."Power"')
 
     def test_generic_list(self):
         assert _to_pg_type(list[str]) in ("text[]",)

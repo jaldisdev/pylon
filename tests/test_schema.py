@@ -587,14 +587,14 @@ class TestInheritance:
 
 class TestNaming:
     def test_single_word(self):
-        assert Category.__pylon_config__.table.endswith("_category")
+        assert Category.__pylon_config__.table == "Category"
 
-    def test_pascal_to_snake(self):
+    def test_pascal_case_preserved(self):
         @pylon.type(module="account")
         class AccountProfile:
             name: str
 
-        assert AccountProfile.__pylon_config__.table == "account_account_profile"
+        assert AccountProfile.__pylon_config__.table == "AccountProfile"
 
     def test_table_override(self):
         @pylon.type(module="shop", table="shop_items")
