@@ -4,6 +4,9 @@ import dataclasses
 import decimal
 import inspect
 
+import types as _types
+import uuid
+
 import pytest
 
 import pylon.schema as pylon
@@ -868,3 +871,128 @@ class TestMutationRewrite:
         r = Rewrite(On.Insert, ".expr")
         assert "Rewrite" in repr(r)
         assert "Insert" in repr(r)
+
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+
+from pylon.schema._globals import GlobalAnnotation, GlobalDescriptor, collect_module_globals
+import dataclasses
+
+MISSING = dataclasses.MISSING
+
+
+def _make_globals_module(**annotations) -> _types.ModuleType:
+    m = _types.ModuleType("test_schema_globals")
+    m.__annotations__ = annotations
+    return m
+
+
+class TestGlobal:
+    def test_required_annotation(self):
+        ann = pylon.Global[pylon.UUID]
+        assert isinstance(ann, GlobalAnnotation)
+        assert ann.required is True
+        assert ann.scalar_type is pylon.UUID
+
+    def test_optional_annotation(self):
+        ann = pylon.Global[pylon.UUID | None]
+        assert isinstance(ann, GlobalAnnotation)
+        assert ann.required is False
+        assert ann.scalar_type is pylon.UUID
+
+    def test_str_type(self):
+        ann = pylon.Global[pylon.Str]
+        assert ann.scalar_type is pylon.Str
+        assert ann.required is True
+
+    def test_repr_contains_type(self):
+        ann = pylon.Global[pylon.UUID]
+        assert "GlobalAnnotation" in repr(ann)
+        assert "required=True" in repr(ann)
+
+    def test_collect_required(self):
+        m = _make_globals_module(current_user_id=pylon.Global[pylon.UUID])
+        result = collect_module_globals(m)
+        assert len(result) == 1
+        d = result[0]
+        assert d.name == "current_user_id"
+        assert d.required is True
+        assert d.scalar_type is pylon.UUID
+        assert d.default is MISSING
+
+    def test_collect_optional(self):
+        m = _make_globals_module(current_user_id=pylon.Global[pylon.UUID | None])
+        result = collect_module_globals(m)
+        assert result[0].required is False
+
+    def test_collect_with_default(self):
+        default_val = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        m = _make_globals_module(current_tenant_id=pylon.Global[pylon.UUID | None])
+        m.current_tenant_id = default_val
+        result = collect_module_globals(m)
+        assert len(result) == 1
+        assert result[0].default is default_val
+
+    def test_collect_multiple(self):
+        m = _make_globals_module(
+            current_user_id=pylon.Global[pylon.UUID],
+            current_tenant_id=pylon.Global[pylon.UUID | None],
+        )
+        result = collect_module_globals(m)
+        assert len(result) == 2
+        names = {d.name for d in result}
+        assert names == {"current_user_id", "current_tenant_id"}
+
+    def test_private_annotations_skipped(self):
+        m = _make_globals_module(
+            _private=pylon.Global[pylon.Str],
+            public=pylon.Global[pylon.Str],
+        )
+        result = collect_module_globals(m)
+        assert len(result) == 1
+        assert result[0].name == "public"
+
+    def test_non_global_annotations_ignored(self):
+        m = _make_globals_module(
+            some_var=str,
+            current_user=pylon.Global[pylon.UUID],
+        )
+        result = collect_module_globals(m)
+        assert len(result) == 1
+        assert result[0].name == "current_user"
+
+    def test_module_name_inferred_from_dotted_path(self):
+        m = _types.ModuleType("pylon_app.schema.user")
+        m.__annotations__ = {"x": pylon.Global[pylon.Str]}
+        result = collect_module_globals(m)
+        assert result[0].module == "user"
+
+    def test_pylon_module_override(self):
+        m = _make_globals_module(x=pylon.Global[pylon.Str])
+        m.__pylon_module__ = "auth"
+        result = collect_module_globals(m)
+        assert result[0].module == "auth"
+
+    def test_module_name_default_module_fallback(self):
+        m = _make_globals_module(x=pylon.Global[pylon.Str])
+        m.__name__ = "default"
+        result = collect_module_globals(m)
+        assert result[0].module == "default"
+
+    def test_empty_module_returns_empty_list(self):
+        m = _make_globals_module()
+        assert collect_module_globals(m) == []
+
+    def test_global_descriptor_repr(self):
+        d = GlobalDescriptor(name="x", module="user", scalar_type=pylon.UUID, required=True)
+        r = repr(d)
+        assert "GlobalDescriptor" in r
+        assert "'x'" in r
+        assert "required=True" in r
+
+    def test_global_descriptor_repr_with_default(self):
+        d = GlobalDescriptor(name="x", module="user", scalar_type=pylon.UUID, required=False, default="abc")
+        assert "default='abc'" in repr(d)

@@ -1,5 +1,6 @@
 from ._base import BaseObject
 from ._export import export
+from ._globals import Global, GlobalDescriptor, collect_module_globals
 from ._constraints import (
     Default,
     Description,
@@ -114,4 +115,8 @@ __all__ = [
     "lazy",
     # Schema export
     "export",
+    # Globals
+    "Global",
+    "GlobalDescriptor",
+    "collect_module_globals",
 ]

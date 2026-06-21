@@ -48,8 +48,23 @@ pub struct ScalarDescriptor {
 }
 
 #[derive(Debug, Clone)]
+pub struct GlobalDescriptor {
+    /// Variable name, e.g. `current_user_id`.
+    pub name: String,
+    /// Pylon module, e.g. `user` (from `schema/user.py`).
+    pub module: String,
+    /// Pylon scalar type name, e.g. `UUID`, `Str`, `Int64`.
+    pub scalar_type: String,
+    /// True when the global must be set on every session; false when optional.
+    pub required: bool,
+    /// SQL/PyQL expression for the default value, if any.
+    pub default_expr: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SchemaDescriptor {
     pub types: Vec<TypeDescriptor>,
     /// User-defined custom scalars only; built-in scalars are known to pylon-core natively.
     pub scalars: Vec<ScalarDescriptor>,
+    pub globals: Vec<GlobalDescriptor>,
 }

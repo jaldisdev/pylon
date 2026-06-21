@@ -13,6 +13,9 @@ from .schema import (
     JSON,
     UUID,
     BaseObject,
+    Global,
+    GlobalDescriptor,
+    collect_module_globals,
     Bool,
     Bytes,
     Computed,
@@ -104,6 +107,10 @@ __all__ = [
     "Regexp",
     # Schema — indexes
     "Index",
+    # Schema — globals
+    "Global",
+    "GlobalDescriptor",
+    "collect_module_globals",
     # Schema — built-in scalars
     "Bool",
     "Bytes",
