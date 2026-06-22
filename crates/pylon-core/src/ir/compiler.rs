@@ -369,18 +369,8 @@ impl<'a> Compiler<'a> {
         module: &str,
     ) -> Result<Vec<IrShapeField>, PyQLError> {
         if elements.is_empty() {
-            // No explicit shape: include all scalar properties.
-            return Ok(td
-                .properties
-                .iter()
-                .map(|p| {
-                    IrShapeField::Scalar(IrScalarField {
-                        alias: p.name.clone(),
-                        column: p.name.clone(),
-                        pg_type: p.pg_type.clone(),
-                    })
-                })
-                .collect());
+            // No explicit shape: implicit { id } only, matching Gel semantics.
+            return Ok(Self::pk_returning(td));
         }
 
         elements.iter().map(|el| self.compile_shape_element(el, td, alias, module)).collect()

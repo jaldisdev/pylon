@@ -58,7 +58,9 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
             short = type_name.split("::")[-1]
             cls = registry.get(short)
             if cls is not None:
-                return cls(**kwargs)
+                obj = object.__new__(cls)
+                obj.__dict__.update(kwargs)
+                return obj
         return kwargs
 
     if kind == "array":

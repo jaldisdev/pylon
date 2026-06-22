@@ -124,6 +124,7 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
     # Only show fields that were actually selected (exclude __type__ discriminator).
     shape = compiled.shape
     selected = {f["name"] for f in shape.get("fields", []) if f["name"] != "__type__"}
+    type_name = shape.get("type_name") or ""
 
     display = []
     for obj in results:
@@ -133,7 +134,7 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
                 for f in dataclasses.fields(obj)
                 if f.name in selected
             }
-            d["__type__"] = type(obj).__name__
+            d["__type__"] = type_name or type(obj).__name__
         elif isinstance(obj, dict):
             d = {k: v for k, v in obj.items() if k == "__type__" or k in selected}
         else:
