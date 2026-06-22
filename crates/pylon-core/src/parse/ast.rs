@@ -1,0 +1,257 @@
+// AST nodes for PyQL queries.
+// Follows Gel's edb/edgeql/ast.py but trimmed to Pylon's subset.
+
+// ── Statements ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Select(SelectStmt),
+    Insert(InsertStmt),
+    Update(UpdateStmt),
+    Delete(DeleteStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectStmt {
+    pub result: Expr,
+    pub filter: Option<Expr>,
+    pub order_by: Vec<SortExpr>,
+    pub offset: Option<Expr>,
+    pub limit: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertStmt {
+    pub subject: ObjectRef,
+    pub shape: Vec<ShapeElement>,
+    pub unless_conflict: Option<UnlessConflict>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnlessConflict {
+    pub on: Option<Expr>,
+    pub else_: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    pub subject: Expr,
+    pub filter: Option<Expr>,
+    pub shape: Vec<ShapeElement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    pub subject: Expr,
+    pub filter: Option<Expr>,
+}
+
+// ── Expressions ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Path(Path),
+    Shape(Box<ShapeExpr>),
+    BinOp(Box<BinOp>),
+    UnaryOp(Box<UnaryOp>),
+    FunctionCall(FunctionCall),
+    TypeCast(Box<TypeCast>),
+    IfElse(Box<IfElse>),
+    Literal(Literal),
+    Parameter(String),
+    Tuple(Vec<Expr>),
+    NamedTuple(Vec<(String, Expr)>),
+    Array(Vec<Expr>),
+}
+
+// ── Paths ──────────────────────────────────────────────────────────────────────
+
+/// A traversal from a root type or property/link through zero or more steps.
+/// `partial = true` when the path starts with `.`, meaning it is relative to
+/// the current object (__subject__) rather than an absolute type reference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Path {
+    pub steps: Vec<PathStep>,
+    pub partial: bool,
+}
+
+impl Path {
+    pub fn absolute(name: impl Into<String>) -> Self {
+        Path {
+            steps: vec![PathStep::Name(name.into())],
+            partial: false,
+        }
+    }
+
+    pub fn relative(name: impl Into<String>) -> Self {
+        Path {
+            steps: vec![PathStep::Name(name.into())],
+            partial: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathStep {
+    /// A property or link name: `.name`, `posts`
+    Name(String),
+    /// Type intersection filter: `[is TypeName]`
+    TypeIntersection(ObjectRef),
+    /// Link property access: `@source` in a link context
+    LinkProp(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectRef {
+    pub module: Option<String>,
+    pub name: String,
+}
+
+impl ObjectRef {
+    pub fn unqualified(name: impl Into<String>) -> Self {
+        ObjectRef { module: None, name: name.into() }
+    }
+    pub fn qualified(module: impl Into<String>, name: impl Into<String>) -> Self {
+        ObjectRef { module: Some(module.into()), name: name.into() }
+    }
+}
+
+// ── Shapes ─────────────────────────────────────────────────────────────────────
+
+/// A shape expression: `Expr { element, element, ... }`.
+/// `expr = None` only in INSERT bodies where the subject is implicit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeExpr {
+    pub expr: Option<Expr>,
+    pub elements: Vec<ShapeElement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeElement {
+    /// Relative path being shaped, e.g. `.name` or `.posts`.
+    pub path: Path,
+    /// Nested shape for links: `.posts { title, body }`.
+    pub nested: Option<Vec<ShapeElement>>,
+    /// Computed override: `.total := .price * .qty`.
+    pub compexpr: Option<Expr>,
+    /// Per-element link modifiers.
+    pub filter: Option<Expr>,
+    pub order_by: Vec<SortExpr>,
+    pub offset: Option<Expr>,
+    pub limit: Option<Expr>,
+}
+
+// ── Operators ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinOp {
+    pub left: Expr,
+    pub op: BinOpKind,
+    pub right: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinOpKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    FloorDiv,
+    Mod,
+    Pow,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    Like,
+    Ilike,
+    NotLike,
+    NotIlike,
+    In,
+    NotIn,
+    Coalesce,
+    Concat,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnaryOp {
+    pub op: UnaryOpKind,
+    pub operand: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryOpKind {
+    Not,
+    Minus,
+    Exists,
+    Distinct,
+}
+
+// ── Function calls ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionCall {
+    pub module: Option<String>,
+    pub name: String,
+    pub args: Vec<Expr>,
+    pub kwargs: Vec<(String, Expr)>,
+}
+
+// ── Type cast ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeCast {
+    pub expr: Expr,
+    pub ty: TypeExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeExpr {
+    pub module: Option<String>,
+    pub name: String,
+}
+
+// ── If / Else ──────────────────────────────────────────────────────────────────
+
+/// EdgeQL / PyQL `expr IF cond ELSE expr` ternary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfElse {
+    pub if_expr: Expr,
+    pub condition: Expr,
+    pub else_expr: Expr,
+}
+
+// ── Literals ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+// ── Sort ───────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortExpr {
+    pub expr: Expr,
+    pub direction: SortDirection,
+    pub nones: NonesOrder,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NonesOrder {
+    First,
+    Last,
+}
