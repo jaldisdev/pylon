@@ -145,20 +145,6 @@ class TestHydrate:
 
         assert result is records
 
-    def test_returns_records_when_deserialize_fails(self):
-        from pylon.client import _hydrate
-
-        records = ["row1", "row2"]
-        compiled = self._make_compiled()
-        with (
-            patch("pylon.query._get_schema", return_value=MagicMock()),
-            patch("pylon.schema.schema_snapshot", return_value=([], [], [])),
-            patch("pylon.query.deserialize", side_effect=NotImplementedError),
-        ):
-            result = _hydrate(records, compiled)
-
-        assert result == records
-
     def test_returns_deserialized_objects(self):
         from pylon.client import _hydrate
 

@@ -42,7 +42,7 @@ pub enum ShapeNode {
 /// Opaque handle to the output shape of a compiled query.
 #[derive(Debug, Clone)]
 pub struct ShapeDescriptor {
-    pub(crate) root: ShapeNode,
+    pub root: ShapeNode,
 }
 
 /// Typed query parameter value produced during compilation.

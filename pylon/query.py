@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pylon._core import CompiledQuery, SchemaDescriptor
@@ -22,15 +22,55 @@ def compile(query: str, *, schema: SchemaDescriptor | None = None) -> CompiledQu
 def deserialize(
     records: list,
     query: CompiledQuery,
-    registry: object,
+    registry: dict[str, type],
 ) -> list:
     """Decode asyncpg Records into Python objects using the shape embedded in query.
 
-    The top-level result is always a list since PyQL select is always set-valued.
+    Each record must have a ``result`` column containing the anonymous PostgreSQL
+    record tuple produced by the compiled SQL.  The shape descriptor in ``query``
+    drives the decoding; ``registry`` maps short type names to dataclass types.
     """
-    from pylon._core import deserialize as _core_deserialize
+    shape = query.shape
+    return [_decode(record["result"], shape, registry) for record in records]
 
-    return _core_deserialize(records, query, registry)
+
+def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
+    kind = node["kind"]
+
+    if kind == "scalar":
+        return value[node["position"]]
+
+    if kind == "object":
+        pos = node["position"]
+        # Root object sits at the top level; nested objects are at a tuple position.
+        obj_tuple = value if pos == 0 else value[pos]
+        if obj_tuple is None:
+            return None
+        fields = node["fields"]
+        # fields[0] is always __type__ (the discriminator string); skip it.
+        kwargs = {
+            f["name"]: _decode(obj_tuple, f, registry)
+            for f in fields
+            if f["name"] != "__type__"
+        }
+        type_name = node.get("type_name")
+        if type_name:
+            short = type_name.split("::")[-1]
+            cls = registry.get(short)
+            if cls is not None:
+                return cls(**kwargs)
+        return kwargs
+
+    if kind == "array":
+        arr = value[node["position"]] or []
+        element = node["element"]
+        # Array elements are anonymous records; decode each one as a root object.
+        return [_decode(item, {**element, "position": 0}, registry) for item in arr]
+
+    if kind == "tuple":
+        return tuple(_decode(value, e, registry) for e in node["elements"])
+
+    raise ValueError(f"unknown shape node kind: {kind!r}")
 
 
 def _get_schema() -> SchemaDescriptor:

@@ -944,6 +944,13 @@ impl CompiledQuery {
         pyo3::types::PyList::new(py, self.inner.param_names.iter().map(|s| s.as_str()))
             .expect("infallible: strings are always valid Python objects")
     }
+
+    /// Shape descriptor as a nested Python dict.
+    /// Walk this alongside each ``result`` column from asyncpg to decode records.
+    #[getter]
+    fn shape<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
+        shape_node_to_py(py, &self.inner.shape.root)
+    }
 }
 
 // ── Public functions ───────────────────────────────────────────────────────────
@@ -965,13 +972,55 @@ fn export_stdlib() -> String {
     core::stdlib::export_stdlib()
 }
 
-#[pyfunction]
-fn deserialize(
-    _records: &Bound<'_, PyAny>,
-    _query: &CompiledQuery,
-    _registry: &Bound<'_, PyAny>,
-) -> PyResult<Py<PyAny>> {
-    todo!("Deserializer not yet implemented")
+// ── Shape conversion ───────────────────────────────────────────────────────────
+
+fn shape_node_to_py<'py>(
+    py: Python<'py>,
+    node: &core::query::ShapeNode,
+) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
+    use pyo3::types::{PyDict, PyList};
+    use core::query::{Cardinality, ShapeNode};
+
+    let d = PyDict::new(py);
+    match node {
+        ShapeNode::Scalar { name, position } => {
+            d.set_item("kind", "scalar")?;
+            d.set_item("name", name.as_str())?;
+            d.set_item("position", position)?;
+        }
+        ShapeNode::Object { name, type_name, position, cardinality, fields } => {
+            d.set_item("kind", "object")?;
+            d.set_item("name", name.as_str())?;
+            d.set_item("type_name", type_name.as_deref())?;
+            d.set_item("position", position)?;
+            d.set_item("cardinality", match cardinality {
+                Cardinality::Required => "required",
+                Cardinality::Optional => "optional",
+                Cardinality::Many    => "many",
+            })?;
+            let py_fields = PyList::new(
+                py,
+                fields.iter().map(|f| shape_node_to_py(py, f)).collect::<PyResult<Vec<_>>>()?,
+            )?;
+            d.set_item("fields", py_fields)?;
+        }
+        ShapeNode::Array { name, position, element } => {
+            d.set_item("kind", "array")?;
+            d.set_item("name", name.as_str())?;
+            d.set_item("position", position)?;
+            d.set_item("element", shape_node_to_py(py, element)?)?;
+        }
+        ShapeNode::Tuple { position, elements } => {
+            d.set_item("kind", "tuple")?;
+            d.set_item("position", position)?;
+            let py_elems = PyList::new(
+                py,
+                elements.iter().map(|e| shape_node_to_py(py, e)).collect::<PyResult<Vec<_>>>()?,
+            )?;
+            d.set_item("elements", py_elems)?;
+        }
+    }
+    Ok(d.into_any())
 }
 
 // ── Error conversion ───────────────────────────────────────────────────────────
@@ -1050,7 +1099,5 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
-    m.add_function(wrap_pyfunction!(deserialize, m)?)?;
-
     Ok(())
 }
