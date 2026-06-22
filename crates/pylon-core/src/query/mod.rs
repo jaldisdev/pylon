@@ -1,5 +1,6 @@
 use crate::error::PyQLError;
 use crate::schema::SchemaDescriptor;
+use crate::{ir, parse, sql};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cardinality {
@@ -17,7 +18,9 @@ pub enum ShapeNode {
     /// Object shape.
     /// `type_name = Some(s)` → named schema type decoded to a registered dataclass.
     /// `type_name = None`    → free type decoded to Pylon's generic Object dataclass.
+    /// `name` is the field name within the parent (empty string for the root).
     Object {
+        name: String,
         type_name: Option<String>,
         position: usize,
         cardinality: Cardinality,
@@ -70,6 +73,13 @@ pub struct CompiledQuery {
 ///
 /// Synchronous — compilation is CPU-bound; async lives at the DB execution layer.
 /// Raises `PyQLError` on any grammar, type, or resolution failure.
-pub fn compile(_query: &str, _schema: &SchemaDescriptor) -> Result<CompiledQuery, PyQLError> {
-    todo!("PyQL compilation not yet implemented")
+pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, PyQLError> {
+    let ast = parse::parse(query)?;
+    let ir_out = ir::compile(&ast, schema)?;
+    let sql_out = sql::emit(&ir_out);
+    Ok(CompiledQuery {
+        sql: sql_out.sql,
+        params: Vec::new(), // parameter binding from ir_out.params resolved at execution time
+        shape: sql_out.shape,
+    })
 }
