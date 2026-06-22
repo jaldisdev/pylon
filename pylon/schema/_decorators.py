@@ -10,7 +10,7 @@ import uuid
 from typing import Any
 
 from . import _collector
-from ._constraints import Default, Description, Exclusive, Expression
+from ._constraints import Default, Description, Exclusive, Expression, Readonly
 from ._fields import (
     ComputedAnnotation,
     LinkAnnotation,
@@ -109,9 +109,10 @@ def _annotation_to_meta(
             (c.text for c in annotation.constraints if isinstance(c, Description)), None
         )
         rewrites = [c for c in annotation.constraints if isinstance(c, Rewrite)]
+        is_readonly = any(c is Readonly for c in annotation.constraints)
         constraints = [
             c for c in annotation.constraints
-            if not isinstance(c, (Description, Rewrite))
+            if not isinstance(c, (Description, Rewrite)) and c is not Readonly
         ]
         default, factory = _resolve_default(cls_default, annotation.constraints)
         return FieldMeta(
@@ -124,6 +125,7 @@ def _annotation_to_meta(
             default_factory=factory,
             description=description,
             rewrites=rewrites,
+            is_readonly=is_readonly,
         )
 
     if isinstance(annotation, LinkAnnotation):
@@ -131,9 +133,10 @@ def _annotation_to_meta(
             (c.text for c in annotation.constraints if isinstance(c, Description)), None
         )
         rewrites = [c for c in annotation.constraints if isinstance(c, Rewrite)]
+        is_readonly = any(c is Readonly for c in annotation.constraints)
         constraints = [
             c for c in annotation.constraints
-            if not isinstance(c, (Description, Rewrite))
+            if not isinstance(c, (Description, Rewrite)) and c is not Readonly
         ]
         return FieldMeta(
             name=name,
@@ -147,6 +150,7 @@ def _annotation_to_meta(
             link_target=annotation.target_type,
             rewrites=rewrites,
             on_delete=list(annotation.on_delete),
+            is_readonly=is_readonly,
         )
 
     if isinstance(annotation, MultiLinkAnnotation):

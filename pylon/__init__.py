@@ -53,6 +53,7 @@ from .schema import (
     Now,
     OnDelete,
     OneOf,
+    Readonly,
     Property,
     PylonConfig,
     Regexp,
@@ -126,6 +127,7 @@ __all__ = [
     "MinValue",
     "Now",
     "OneOf",
+    "Readonly",
     "Regexp",
     # Schema — indexes
     "Index",

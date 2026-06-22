@@ -190,6 +190,7 @@ impl PropertyDescriptor {
         check_constraints = None,
         is_exclusive = false,
         is_pk = false,
+        is_readonly = false,
         rewrites = None
     ))]
     fn new(
@@ -201,6 +202,7 @@ impl PropertyDescriptor {
         check_constraints: Option<Vec<String>>,
         is_exclusive: bool,
         is_pk: bool,
+        is_readonly: bool,
         rewrites: Option<Vec<PyRef<RewriteEntry>>>,
     ) -> Self {
         Self {
@@ -213,6 +215,7 @@ impl PropertyDescriptor {
                 check_constraints: check_constraints.unwrap_or_default(),
                 is_exclusive,
                 is_pk,
+                is_readonly,
                 rewrites: rewrites
                     .unwrap_or_default()
                     .iter()
@@ -261,6 +264,11 @@ impl PropertyDescriptor {
     fn is_pk(&self) -> bool {
         self.inner.is_pk
     }
+
+    #[getter]
+    fn is_readonly(&self) -> bool {
+        self.inner.is_readonly
+    }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -278,6 +286,7 @@ impl LinkDescriptor {
         *,
         description = None,
         is_exclusive = false,
+        is_readonly = false,
         rewrites = None,
         on_delete = None
     ))]
@@ -287,6 +296,7 @@ impl LinkDescriptor {
         nullable: bool,
         description: Option<String>,
         is_exclusive: bool,
+        is_readonly: bool,
         rewrites: Option<Vec<PyRef<RewriteEntry>>>,
         on_delete: Option<Vec<PyRef<OnDeletePolicy>>>,
     ) -> Self {
@@ -297,6 +307,7 @@ impl LinkDescriptor {
                 nullable,
                 description,
                 is_exclusive,
+                is_readonly,
                 rewrites: rewrites
                     .unwrap_or_default()
                     .iter()
@@ -334,6 +345,11 @@ impl LinkDescriptor {
     #[getter]
     fn is_exclusive(&self) -> bool {
         self.inner.is_exclusive
+    }
+
+    #[getter]
+    fn is_readonly(&self) -> bool {
+        self.inner.is_readonly
     }
 }
 

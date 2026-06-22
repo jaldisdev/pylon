@@ -27,6 +27,8 @@ class FieldMeta:
     rewrites: list[Any] = dataclasses.field(default_factory=list)
     # deletion policies declared inside Link[T, OnDelete(...)] or MultiLink[T, OnDelete(...)]
     on_delete: list[Any] = dataclasses.field(default_factory=list)
+    # transpiler-level read-only flag; does not affect PostgreSQL
+    is_readonly: bool = False
 
 
 @dataclasses.dataclass

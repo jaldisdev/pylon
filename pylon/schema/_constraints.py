@@ -191,6 +191,17 @@ class Exclusive(_FieldConstraint):
         return f"Exclusive({', '.join(parts)})"
 
 
+class Readonly(_FieldConstraint):
+    """Marks a property or link as read-only in PyQL.
+
+    The field can still be written at the database level; the transpiler rejects
+    any PyQL update that tries to assign to it.  Used as a bare class reference::
+
+        created_by: Link[User, Readonly]
+        slug: Property[str, Readonly, MaxLen(120)]
+    """
+
+
 class Expression(_FieldConstraint):
     """Arbitrary PyQL boolean expression declared in the class body.
 
