@@ -957,7 +957,29 @@ mod tests {
         );
         assert!(out.sql.contains("SET"));
         assert!(out.sql.contains("\"slug\""));
-        assert!(out.sql.contains("str_lower("));
+        // Rewrite references .name which is also being SET to $name ($2).
+        // After substitute_col_refs, the rewrite should use $2, not the pre-update column.
+        // $1 = id (filter), $2 = name (assignment)
+        assert!(out.sql.contains("str_lower($2)"),
+            "rewrite must use new name value ($2), got:\n{}", out.sql);
+        assert!(!out.sql.contains("str_lower(\"t0\".\"name\")"),
+            "rewrite must not use pre-update column ref");
+    }
+
+    #[test]
+    fn test_update_rewrite_unrelated_property_uses_row_value() {
+        // If the rewrite references a property NOT being SET, it should read
+        // the current row value (ColumnRef), not a parameter.
+        let schema = make_schema_with_rewrite();
+        // SET age only — slug rewrite references .name which is NOT being SET.
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { age := $age }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"slug\""));
+        // .name is not being SET, so rewrite sees the current row value.
+        assert!(out.sql.contains("str_lower(\"t0\".\"name\")"),
+            "rewrite must use current row value when name is not being SET, got:\n{}", out.sql);
     }
 
     #[test]
