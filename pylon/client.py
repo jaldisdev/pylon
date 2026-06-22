@@ -495,8 +495,7 @@ def _transpile(
     """Compile PyQL to SQL via the pylon-core Rust extension.
 
     Returns ``(sql, positional_params, compiled)`` ready for asyncpg.
-    kwargs values are passed positionally in insertion order; the Rust ABI
-    will expose ordered param names once the compiler is complete.
+    The Rust compiler's ``param_names`` determines the $1/$2/… binding order.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
@@ -508,7 +507,11 @@ def _transpile(
         raise InternalServerError(
             f"PyQL compiler is not yet available: {exc}"
         ) from exc
-    return compiled.sql, list(kwargs.values()), compiled
+    try:
+        params = [kwargs[n] for n in compiled.param_names]
+    except KeyError as exc:
+        raise InterfaceError(f"Missing query parameter: {exc}") from exc
+    return compiled.sql, params, compiled
 
 
 def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:

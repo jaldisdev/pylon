@@ -63,7 +63,10 @@ pub enum QueryParam {
 pub struct CompiledQuery {
     /// PostgreSQL SQL string ready for execution.
     pub sql: String,
-    /// Positional bound parameters ($1, $2, …).
+    /// Ordered parameter names matching $1, $2, … in the SQL.
+    /// The client uses this to map kwargs to positional arguments.
+    pub param_names: Vec<String>,
+    /// Typed bound parameters — populated at execution time, empty after compilation.
     pub params: Vec<QueryParam>,
     /// Opaque shape handle — consumed by the Rust deserializer.
     pub shape: ShapeDescriptor,
@@ -79,7 +82,8 @@ pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, 
     let sql_out = sql::emit(&ir_out);
     Ok(CompiledQuery {
         sql: sql_out.sql,
-        params: Vec::new(), // parameter binding from ir_out.params resolved at execution time
+        param_names: ir_out.params,
+        params: Vec::new(),
         shape: sql_out.shape,
     })
 }
