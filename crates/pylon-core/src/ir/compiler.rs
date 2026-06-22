@@ -12,10 +12,10 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrBinOp, IrComputedField, IrDelete, IrExpr, IrFunctionCall, IrIfElse, IrInsert, IrLiteral,
-    IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrRewrite, IrScalarField, IrSelect,
-    IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp,
-    IrUpdate,
+    IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFunctionCall, IrIfElse, IrInsert,
+    IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrRewrite, IrScalarField,
+    IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast,
+    IrUnaryOp, IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -247,12 +247,15 @@ impl<'a> Compiler<'a> {
                 expr: substitute_col_refs(rw.expr, &assignment_map),
             })
             .collect();
+        let unless_conflict = ins.unless_conflict.as_ref()
+            .map(|uc| self.compile_conflict(uc, td))
+            .transpose()?;
         let returning = Self::pk_returning(td);
 
         Ok(IrInsert {
             target,
             assignments,
-            unless_conflict: None,
+            unless_conflict,
             rewrites,
             returning,
         })
@@ -616,6 +619,49 @@ impl<'a> Compiler<'a> {
         }
 
         Err(self.field_err(field_name, &td.name))
+    }
+
+    /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.
+    fn compile_conflict(
+        &mut self,
+        uc: &ast::UnlessConflict,
+        td: &TypeDescriptor,
+    ) -> Result<IrConflict, PyQLError> {
+        // ON clause: compile with empty alias → bare column name (`"col"` not `"t0"."col"`)
+        // so the emitter produces `ON CONFLICT ("name")` not `ON CONFLICT ("t0"."name")`.
+        let on = uc.on.as_ref()
+            .map(|e| self.compile_expr(e, td, ""))
+            .transpose()?;
+        let do_update = uc.else_.as_ref()
+            .map(|e| self.compile_conflict_else(e))
+            .transpose()?;
+        Ok(IrConflict { on, do_update })
+    }
+
+    /// Compile the ELSE clause of UNLESS CONFLICT, which must be `(UPDATE Type SET { … })`.
+    ///
+    /// Assignments are compiled with an empty table alias so ColumnRefs emit as bare
+    /// column names — valid in PostgreSQL's `DO UPDATE SET` context, where bare names
+    /// reference the existing (conflicting) row.
+    fn compile_conflict_else(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+        let Expr::SubQuery(stmt) = expr else {
+            return Err(self.type_err(
+                "UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)",
+            ));
+        };
+        let Stmt::Update(upd) = stmt.as_ref() else {
+            return Err(self.type_err(
+                "UNLESS CONFLICT ELSE must be an UPDATE expression",
+            ));
+        };
+        let type_name = self.expr_as_type_name(&upd.subject)?;
+        let upd_td = self.resolve_type(&type_name)?;
+        // Filter on the ELSE UPDATE is ignored — PostgreSQL infers the conflicting
+        // row from the ON CONFLICT target automatically.
+        self.compile_assignments(&upd.shape, upd_td, "")
     }
 
     /// Compile `(SELECT TargetType FILTER …)` as a scalar subquery for use in a

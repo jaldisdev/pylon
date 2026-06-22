@@ -112,12 +112,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 vals.join(",\n"),
             );
             if let Some(conflict) = &ins.unless_conflict {
-                match (&conflict.on, &conflict.else_) {
-                    (None, None) => sql.push_str(" ON CONFLICT DO NOTHING"),
-                    (Some(on_expr), None) => sql.push_str(
-                        &format!(" ON CONFLICT ({}) DO NOTHING", emit_expr(on_expr))),
-                    _ => {}
-                }
+                emit_conflict(&mut sql, conflict);
             }
             sql.push_str("\n    RETURNING *");
             sql
@@ -164,6 +159,36 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
     }
 }
 
+// ── Conflict helper ─────────────────────────────────────────────────────────
+
+use crate::ir::IrConflict;
+
+fn emit_conflict(sql: &mut String, conflict: &IrConflict) {
+    let on_sql = conflict.on.as_ref().map(|e| format!("({})", emit_expr(e)));
+    match (&on_sql, &conflict.do_update) {
+        (None, None) => sql.push_str(" ON CONFLICT DO NOTHING"),
+        (Some(on), None) => sql.push_str(&format!(" ON CONFLICT {} DO NOTHING", on)),
+        (None, Some(updates)) => {
+            sql.push_str(&format!(" ON CONFLICT DO UPDATE SET {}", do_update_sets(updates)));
+        }
+        (Some(on), Some(updates)) => {
+            sql.push_str(&format!(
+                " ON CONFLICT {} DO UPDATE SET {}",
+                on,
+                do_update_sets(updates),
+            ));
+        }
+    }
+}
+
+fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
+    updates
+        .iter()
+        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ── INSERT ──────────────────────────────────────────────────────────────────
 
 fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
@@ -192,13 +217,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
     );
 
     if let Some(conflict) = &ins.unless_conflict {
-        match (&conflict.on, &conflict.else_) {
-            (None, None) => sql.push_str(" ON CONFLICT DO NOTHING"),
-            (Some(on_expr), None) => {
-                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", emit_expr(on_expr)))
-            }
-            _ => {} // ON CONFLICT ... DO UPDATE handled in a later phase
-        }
+        emit_conflict(&mut sql, conflict);
     }
 
     let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
@@ -980,6 +999,42 @@ mod tests {
         // .name is not being SET, so rewrite sees the current row value.
         assert!(out.sql.contains("str_lower(\"t0\".\"name\")"),
             "rewrite must use current row value when name is not being SET, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_unless_conflict_do_nothing() {
+        let out = compile_and_emit("INSERT Person { name := $name } UNLESS CONFLICT");
+        assert!(out.sql.contains("ON CONFLICT DO NOTHING"));
+    }
+
+    #[test]
+    fn test_unless_conflict_on_do_nothing() {
+        let out = compile_and_emit("INSERT Person { name := $name } UNLESS CONFLICT ON .name");
+        assert!(out.sql.contains("ON CONFLICT (\"name\") DO NOTHING"));
+    }
+
+    #[test]
+    fn test_unless_conflict_do_update() {
+        let out = compile_and_emit(
+            "INSERT Person { name := $name, age := $age } \
+             UNLESS CONFLICT ON .name \
+             ELSE (UPDATE Person SET { age := $age })",
+        );
+        assert!(out.sql.contains("ON CONFLICT (\"name\") DO UPDATE SET"));
+        assert!(out.sql.contains("\"age\" = $2"));
+        // The param $age is shared — same index as in the INSERT VALUES
+        assert!(!out.sql.contains("DO NOTHING"));
+    }
+
+    #[test]
+    fn test_unless_conflict_do_update_no_on() {
+        let out = compile_and_emit(
+            "INSERT Person { name := $name } \
+             UNLESS CONFLICT \
+             ELSE (UPDATE Person SET { age := 0 })",
+        );
+        assert!(out.sql.contains("ON CONFLICT DO UPDATE SET"));
+        assert!(out.sql.contains("\"age\" = 0"));
     }
 
     #[test]
