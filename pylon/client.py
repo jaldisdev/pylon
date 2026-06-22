@@ -515,11 +515,7 @@ def _transpile(
 
 
 def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
-    """Decode asyncpg Records into Python dataclass instances.
-
-    Falls back to the raw record list when the SchemaDescriptor singleton is not
-    installed or the Rust deserializer is not yet implemented.
-    """
+    """Decode asyncpg Records into Python dataclass instances."""
     from pylon.query import _get_schema, deserialize
     from pylon.schema import schema_snapshot
 
@@ -529,10 +525,7 @@ def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
         return records
     types, _, _ = schema_snapshot()
     registry = {t.__name__: t for t in types}
-    try:
-        return deserialize(records, compiled, registry)
-    except Exception:
-        return records
+    return deserialize(records, compiled, registry)
 
 
 def _build_dsn(db: Any) -> str:
