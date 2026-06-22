@@ -1,9 +1,14 @@
+import asyncio
+import dataclasses
 import re
 
 import click
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+
+import pylon
+from pylon.client import create_async_client
 
 from ..banner import print_banner
 
@@ -55,43 +60,86 @@ def repl(*, as_json: bool = False) -> None:
     Statements are terminated by a semicolon. Type \\help for help,
     \\quit or Ctrl-D to exit.
     """
+    try:
+        pylon.finalize()
+    except Exception as e:
+        click.echo(f"{_BOLD_RED}error:{_RESET} could not load schema: {e}", err=True)
+        return
+
     print_banner(info_line="Type \\help for help, \\quit to quit.")
 
+    asyncio.run(_async_repl(as_json=as_json))
+
+
+async def _async_repl(*, as_json: bool) -> None:
     session: PromptSession[str] = PromptSession(
         multiline=True,
         key_bindings=_make_bindings(),
         prompt_continuation="",
     )
 
-    while True:
+    async with create_async_client() as client:
+        while True:
+            try:
+                text = await session.prompt_async("pylon> ")
+            except KeyboardInterrupt:
+                click.echo()
+                click.echo(f"{_INFO_COLOR}Use \\quit or Ctrl-D to exit.{_RESET}")
+                continue
+            except EOFError:
+                click.echo()
+                break
+
+            stripped = text.strip()
+
+            if stripped == r"\quit":
+                break
+            elif stripped == r"\help":
+                click.echo(_HELP_TEXT)
+                continue
+
+            pyql = stripped.rstrip(";").strip()
+            if pyql:
+                await _execute(client, pyql, as_json=as_json)
+
+
+async def _execute(client, pyql: str, *, as_json: bool) -> None:
+    """Transpile and execute a single PyQL statement, printing the result."""
+    from pylon.query import compile as pyql_compile
+
+    if as_json:
         try:
-            text = session.prompt("pylon> ")
-        except KeyboardInterrupt:
-            click.echo()
-            click.echo(f"{_INFO_COLOR}Use \\quit or Ctrl-D to exit.{_RESET}")
-            continue
-        except EOFError:
-            click.echo()
-            break
+            click.echo(await client.query_json(pyql))
+        except Exception as e:
+            click.echo(f"{_BOLD_RED}error:{_RESET} {e}")
+        return
 
-        stripped = text.strip()
+    try:
+        compiled = pyql_compile(pyql)
+        results = await client.query(pyql)
+    except Exception as e:
+        click.echo(f"{_BOLD_RED}error:{_RESET} {e}")
+        return
 
-        if stripped == r"\quit":
-            break
-        elif stripped == r"\help":
-            click.echo(_HELP_TEXT)
-            continue
+    # Only show fields that were actually selected (exclude __type__ discriminator).
+    shape = compiled.shape
+    selected = {f["name"] for f in shape.get("fields", []) if f["name"] != "__type__"}
 
-        pyql = stripped.rstrip(";").strip()
-        if pyql:
-            _execute(pyql, as_json=as_json)
-
-
-def _execute(pyql: str, *, as_json: bool) -> None:
-    """Transpile and execute a single PyQL statement."""
-    # TODO: replace stub with real pylon-core results
-    results: list[dict] = []
-    click.echo(_format_results(results))
+    display = []
+    for obj in results:
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            d = {
+                f.name: getattr(obj, f.name)
+                for f in dataclasses.fields(obj)
+                if f.name in selected
+            }
+            d["__type__"] = type(obj).__name__
+        elif isinstance(obj, dict):
+            d = {k: v for k, v in obj.items() if k == "__type__" or k in selected}
+        else:
+            d = {"__type__": type(obj).__name__, "value": str(obj)}
+        display.append(d)
+    click.echo(_format_results(display))
 
 
 # --- result formatting --------------------------------------------------------
