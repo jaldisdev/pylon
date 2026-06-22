@@ -205,13 +205,14 @@ impl<'a> Compiler<'a> {
         };
 
         let assignments = self.compile_assignments(&ins.shape, td, &alias)?;
+        let module = td.module.clone();
+        let returning = self.compile_shape(&[], td, &alias, &module)?;
 
-        // For now: no RETURNING shape — add when SQL emitter needs it
         Ok(IrInsert {
             target,
             assignments,
             unless_conflict: None,
-            returning: vec![],
+            returning,
         })
     }
 
@@ -266,8 +267,10 @@ impl<'a> Compiler<'a> {
             .transpose()?;
 
         let assignments = self.compile_assignments(&upd.shape, td, &alias)?;
+        let module = td.module.clone();
+        let returning = self.compile_shape(&[], td, &alias, &module)?;
 
-        Ok(IrUpdate { target, filter, assignments, returning: vec![] })
+        Ok(IrUpdate { target, filter, assignments, returning })
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────────────
@@ -288,7 +291,10 @@ impl<'a> Compiler<'a> {
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
 
-        Ok(IrDelete { target, filter, returning: vec![] })
+        let module = td.module.clone();
+        let returning = self.compile_shape(&[], td, &alias, &module)?;
+
+        Ok(IrDelete { target, filter, returning })
     }
 
     // ── Shape compilation ─────────────────────────────────────────────────────────
