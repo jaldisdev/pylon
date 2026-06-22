@@ -937,9 +937,12 @@ impl CompiledQuery {
         &self.inner.sql
     }
 
+    /// Ordered parameter names matching $1, $2, … in the SQL.
+    /// Use this to map kwargs to positional arguments for asyncpg.
     #[getter]
-    fn params<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
-        pyo3::types::PyList::empty(py)
+    fn param_names<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
+        pyo3::types::PyList::new(py, self.inner.param_names.iter().map(|s| s.as_str()))
+            .expect("infallible: strings are always valid Python objects")
     }
 }
 

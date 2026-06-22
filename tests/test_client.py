@@ -63,9 +63,10 @@ class TestDatabaseConfigPoolSize:
 
 
 class TestTranspile:
-    def _make_compiled(self, sql: str = "SELECT 1"):
+    def _make_compiled(self, sql: str = "SELECT 1", param_names: list[str] | None = None):
         compiled = MagicMock()
         compiled.sql = sql
+        compiled.param_names = param_names if param_names is not None else []
         return compiled
 
     def test_non_str_raises_interface_error(self):
@@ -88,20 +89,39 @@ class TestTranspile:
     def test_kwargs_become_positional_params(self):
         from pylon.client import _transpile
 
-        compiled = self._make_compiled("SELECT $1")
+        compiled = self._make_compiled("SELECT $1", param_names=["x"])
         with patch("pylon.query.compile", return_value=compiled):
             sql, params, _ = _transpile("select $x", {"x": 99})
 
         assert params == [99]
 
-    def test_multiple_kwargs_order_preserved(self):
+    def test_multiple_kwargs_order_by_param_names(self):
         from pylon.client import _transpile
 
-        compiled = self._make_compiled("SELECT $1, $2")
+        # param_names determines order, not kwargs insertion order
+        compiled = self._make_compiled("SELECT $1, $2", param_names=["a", "b"])
         with patch("pylon.query.compile", return_value=compiled):
-            _, params, _ = _transpile("q", {"a": 1, "b": 2})
+            _, params, _ = _transpile("q", {"b": 2, "a": 1})
 
         assert params == [1, 2]
+
+    def test_param_names_reorders_kwargs(self):
+        from pylon.client import _transpile
+
+        # $1=age, $2=name — even though name comes first in kwargs
+        compiled = self._make_compiled("SELECT $1, $2", param_names=["age", "name"])
+        with patch("pylon.query.compile", return_value=compiled):
+            _, params, _ = _transpile("q", {"name": "Alice", "age": 30})
+
+        assert params == [30, "Alice"]
+
+    def test_missing_param_raises_interface_error(self):
+        from pylon.client import _transpile
+
+        compiled = self._make_compiled("SELECT $1", param_names=["name"])
+        with patch("pylon.query.compile", return_value=compiled):
+            with pytest.raises(InterfaceError, match="Missing query parameter"):
+                _transpile("select $name", {})
 
     def test_compile_failure_raises_internal_error(self):
         from pylon.client import _transpile
