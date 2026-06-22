@@ -446,12 +446,13 @@ mod tests {
     }
 
     #[test]
-    fn test_select_no_shape_returns_all_scalars() {
+    fn test_select_no_shape_returns_id_only() {
         let ir = compile("SELECT Person");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        // Should return all 3 properties (id, name, age)
-        assert_eq!(sel.shape.len(), 3);
-        assert!(sel.shape.iter().all(|f| matches!(f, IrShapeField::Scalar(_))));
+        // Bare SELECT Type returns only { id }, matching the upstream engine semantics.
+        assert_eq!(sel.shape.len(), 1);
+        let IrShapeField::Scalar(f) = &sel.shape[0] else { panic!() };
+        assert_eq!(f.alias, "id");
     }
 
     #[test]
