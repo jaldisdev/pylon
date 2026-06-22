@@ -122,7 +122,8 @@ impl<'a> Compiler<'a> {
     // ── SELECT ────────────────────────────────────────────────────────────────────
 
     fn compile_select(&mut self, sel: &ast::SelectStmt) -> Result<IrSelect, PyQLError> {
-        let (type_name, shape_elements) = self.extract_type_and_shape(&sel.result)?;
+        let (type_name, shape_elements, inner_stmt) =
+            self.extract_type_and_shape(&sel.result)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
         let source = IrSource {
@@ -157,18 +158,29 @@ impl<'a> Compiler<'a> {
             .map(|e| self.compile_expr(e, td, &alias))
             .transpose()?;
 
-        Ok(IrSelect { source, shape, filter, order_by, offset, limit })
+        // Compile the inner DML if this is a SELECT-over-DML / SELECT-over-SELECT.
+        let dml_source = inner_stmt
+            .map(|s| self.compile_stmt(s).map(Box::new))
+            .transpose()?;
+
+        Ok(IrSelect { source, shape, filter, order_by, offset, limit, dml_source })
     }
 
     /// Unwrap `Shape(expr, elements)` or bare `Path` from a SELECT result.
+    /// Returns (type_name, shape_elements, optional_inner_stmt).
+    /// The inner stmt is Some when the subject is `(INSERT …)` / `(SELECT …)` etc.
     fn extract_type_and_shape<'e>(
         &self,
         expr: &'e Expr,
-    ) -> Result<(String, &'e [ShapeElement]), PyQLError> {
+    ) -> Result<(String, &'e [ShapeElement], Option<&'e Stmt>), PyQLError> {
         match expr {
             Expr::Shape(s) => {
-                let type_name = match &s.expr {
-                    Some(inner) => self.expr_as_type_name(inner)?,
+                // s.expr is Option<Expr> (not Box), so use as_ref() not as_deref()
+                let (type_name, inner) = match s.expr.as_ref() {
+                    Some(Expr::SubQuery(stmt)) => {
+                        (self.dml_subject_type(stmt)?, Some(stmt.as_ref()))
+                    }
+                    Some(inner) => (self.expr_as_type_name(inner)?, None),
                     None => {
                         return Err(PyQLError::Type(PyQLTypeError {
                             message: "shape without subject expression".into(),
@@ -176,10 +188,27 @@ impl<'a> Compiler<'a> {
                         }))
                     }
                 };
-                Ok((type_name, &s.elements))
+                Ok((type_name, &s.elements, inner))
             }
-            // Bare `SELECT TypeName` — no shape; caller gets empty element list
-            _ => Ok((self.expr_as_type_name(expr)?, &[])),
+            // Bare `SELECT (DML)` without an outer shape
+            Expr::SubQuery(stmt) => {
+                Ok((self.dml_subject_type(stmt)?, &[], Some(stmt.as_ref())))
+            }
+            _ => Ok((self.expr_as_type_name(expr)?, &[], None)),
+        }
+    }
+
+    /// Extract the target type name from a DML or inner SELECT statement.
+    fn dml_subject_type(&self, stmt: &Stmt) -> Result<String, PyQLError> {
+        match stmt {
+            Stmt::Insert(ins) => Ok(ins.subject.name.clone()),
+            Stmt::Update(upd) => self.expr_as_type_name(&upd.subject),
+            Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
+            Stmt::Select(sel) => {
+                // SELECT-over-SELECT: get the type from the inner select's result
+                let (type_name, _, _) = self.extract_type_and_shape(&sel.result)?;
+                Ok(type_name)
+            }
         }
     }
 
@@ -208,7 +237,6 @@ impl<'a> Compiler<'a> {
         };
 
         let assignments = self.compile_assignments(&ins.shape, td, &alias)?;
-        let module = td.module.clone();
         // Compile INSERT rewrites; substitute column refs so they are valid in VALUES.
         let assignment_map: HashMap<String, IrExpr> =
             assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
@@ -219,7 +247,7 @@ impl<'a> Compiler<'a> {
                 expr: substitute_col_refs(rw.expr, &assignment_map),
             })
             .collect();
-        let returning = self.compile_shape(&[], td, &alias, &module)?;
+        let returning = Self::pk_returning(td);
 
         Ok(IrInsert {
             target,
@@ -281,10 +309,9 @@ impl<'a> Compiler<'a> {
             .transpose()?;
 
         let assignments = self.compile_assignments(&upd.shape, td, &alias)?;
-        let module = td.module.clone();
         // UPDATE rewrites reference the live row via the table alias — no substitution needed.
         let rewrites = self.compile_rewrites(td, &alias, 2)?;
-        let returning = self.compile_shape(&[], td, &alias, &module)?;
+        let returning = Self::pk_returning(td);
 
         Ok(IrUpdate { target, filter, assignments, rewrites, returning })
     }
@@ -307,8 +334,7 @@ impl<'a> Compiler<'a> {
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
 
-        let module = td.module.clone();
-        let returning = self.compile_shape(&[], td, &alias, &module)?;
+        let returning = Self::pk_returning(td);
 
         Ok(IrDelete { target, filter, returning })
     }
@@ -385,6 +411,7 @@ impl<'a> Compiler<'a> {
                 order_by: vec![],
                 offset: None,
                 limit: None,
+                dml_source: None,
             };
             return Ok(IrShapeField::SingleLink(IrSingleLinkField {
                 alias: field_name.to_string(),
@@ -434,6 +461,7 @@ impl<'a> Compiler<'a> {
                     .as_ref()
                     .map(|e| self.compile_expr(e, target_td, &sub_alias))
                     .transpose()?,
+                dml_source: None,
             };
 
             return Ok(IrShapeField::MultiLink(IrMultiLinkField {
@@ -513,6 +541,13 @@ impl<'a> Compiler<'a> {
                     position: Position { line: 0, col: 0 },
                 }))
             }
+
+            Expr::SubQuery(_) => Err(PyQLError::Type(PyQLTypeError {
+                message: "sub-statement (SELECT/INSERT/UPDATE/DELETE) used as expression is \
+                           only valid as the subject of a SELECT result"
+                    .into(),
+                position: Position { line: 0, col: 0 },
+            })),
         }
     }
 
@@ -599,6 +634,24 @@ impl<'a> Compiler<'a> {
             message: format!("type '{type_name}' has no field '{field}'"),
             position: Position { line: 0, col: 0 },
         }))
+    }
+
+    // ── Default returning (pk only, matching the upstream engine's bare DML behaviour) ────────────
+
+    /// For bare DML (not wrapped in SELECT) return only primary-key properties,
+    /// matching the upstream engine: `INSERT … ` returns `{ id }`, same for UPDATE/DELETE.
+    fn pk_returning(td: &TypeDescriptor) -> Vec<IrShapeField> {
+        td.properties
+            .iter()
+            .filter(|p| p.is_pk)
+            .map(|p| {
+                IrShapeField::Scalar(IrScalarField {
+                    alias: p.name.clone(),
+                    column: p.name.clone(),
+                    pg_type: p.pg_type.clone(),
+                })
+            })
+            .collect()
     }
 
     // ── Mutation rewrite compilation ─────────────────────────────────────────────

@@ -62,6 +62,9 @@ pub enum Expr {
     Tuple(Vec<Expr>),
     NamedTuple(Vec<(String, Expr)>),
     Array(Vec<Expr>),
+    /// A parenthesised statement used as an expression:
+    /// `(INSERT ...)`, `(UPDATE ...)`, `(DELETE ...)`, `(SELECT ...)`.
+    SubQuery(Box<Stmt>),
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────
