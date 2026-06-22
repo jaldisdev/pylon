@@ -149,9 +149,17 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql
         }
         IrStmt::Select(inner) => {
-            // SELECT-over-SELECT: emit the inner select as a subquery
-            let out = emit_select_stmt(inner);
-            format!("    {}", out.sql.replace('\n', "\n    "))
+            // SELECT-over-SELECT: expose raw columns so the outer SELECT can
+            // project its own shape from them, mirroring DML's RETURNING *.
+            let mut sql = format!(
+                "    SELECT * FROM {} AS {}",
+                source_ref(&inner.source),
+                qi(&inner.source.alias),
+            );
+            append_filter(&mut sql, &inner.filter);
+            append_order_by(&mut sql, &inner.order_by);
+            append_offset_limit(&mut sql, &inner.offset, &inner.limit);
+            sql
         }
     }
 }
@@ -950,6 +958,35 @@ mod tests {
         assert!(out.sql.contains("SET"));
         assert!(out.sql.contains("\"slug\""));
         assert!(out.sql.contains("str_lower("));
+    }
+
+    #[test]
+    fn test_select_over_select() {
+        let out = compile_and_emit(
+            "SELECT (SELECT Person FILTER .age > 18) { name }",
+        );
+        // Must use a CTE
+        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        // CTE exposes raw columns via SELECT *
+        assert!(out.sql.contains("SELECT *"));
+        assert!(out.sql.contains("FROM \"default\".\"Person\""));
+        // CTE carries the inner filter
+        assert!(out.sql.contains("WHERE"));
+        // Outer SELECT projects its own shape
+        assert!(out.sql.contains("'default::Person'::text"));
+        assert!(out.sql.contains("\"name\"::text"));
+    }
+
+    #[test]
+    fn test_select_over_select_with_outer_filter() {
+        let out = compile_and_emit(
+            "SELECT (SELECT Person FILTER .age > 18) { name } FILTER .name = $name",
+        );
+        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("SELECT *"));
+        // Both filters present: one inside CTE, one in outer SELECT
+        assert_eq!(out.sql.matches("WHERE").count(), 2);
+        assert!(out.sql.contains("$1"));
     }
 
     #[test]
