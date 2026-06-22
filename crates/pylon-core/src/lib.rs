@@ -5,4 +5,5 @@ pub mod ir;
 pub mod parse;
 pub mod query;
 pub mod schema;
+pub mod sql;
 pub mod stdlib;

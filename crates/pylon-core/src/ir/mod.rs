@@ -77,7 +77,7 @@ pub struct IrSingleLinkField {
 }
 
 /// A multi-valued link included in the output shape.
-/// Emitted as a LATERAL subquery with `json_agg`.
+/// Emitted as a correlated subquery using `array_agg(ROW(...)::record)`.
 #[derive(Debug, Clone)]
 pub struct IrMultiLinkField {
     pub alias: String,
