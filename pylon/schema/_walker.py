@@ -505,6 +505,10 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
     )
 
 
+def _make_on_delete_policies(on_delete: list[Any], _core: Any) -> list[Any]:
+    return [_core.OnDeletePolicy(side=od.side.name, action=od.action.name) for od in on_delete]
+
+
 def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
     from ._constraints import Exclusive
 
@@ -520,6 +524,7 @@ def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
         description=meta.description,
         is_exclusive=is_exclusive,
         rewrites=rewrites,
+        on_delete=_make_on_delete_policies(meta.on_delete, _core),
     )
 
 
@@ -530,6 +535,7 @@ def _make_multilink_desc(name: str, meta: Any, _core: Any) -> Any:
         through=meta.through,      # already a qualified string or None
         nullable=meta.nullable,
         description=meta.description,
+        on_delete=_make_on_delete_policies(meta.on_delete, _core),
     )
 
 

@@ -90,6 +90,59 @@ pyo3::create_exception!(
     "Invalid value for a type (e.g. out-of-range, bad format)."
 );
 
+// ── Deletion policy ────────────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct OnDeletePolicy {
+    inner: core::schema::OnDeletePolicy,
+}
+
+#[pymethods]
+impl OnDeletePolicy {
+    #[new]
+    fn new(side: &str, action: &str) -> PyResult<Self> {
+        let side = match side {
+            "Target" => core::schema::DeleteSide::Target,
+            "Source" => core::schema::DeleteSide::Source,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Unknown deletion side: {side:?}; expected 'Target' or 'Source'")
+            )),
+        };
+        let action = match action {
+            "Allow" => core::schema::DeleteAction::Allow,
+            "Restrict" => core::schema::DeleteAction::Restrict,
+            "DeferredRestrict" => core::schema::DeleteAction::DeferredRestrict,
+            "DeleteSource" => core::schema::DeleteAction::DeleteSource,
+            "DeleteTarget" => core::schema::DeleteAction::DeleteTarget,
+            "DeleteTargetIfOrphan" => core::schema::DeleteAction::DeleteTargetIfOrphan,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Unknown deletion action: {action:?}")
+            )),
+        };
+        Ok(Self { inner: core::schema::OnDeletePolicy { side, action } })
+    }
+
+    #[getter]
+    fn side(&self) -> &str {
+        match self.inner.side {
+            core::schema::DeleteSide::Target => "Target",
+            core::schema::DeleteSide::Source => "Source",
+        }
+    }
+
+    #[getter]
+    fn action(&self) -> &str {
+        match self.inner.action {
+            core::schema::DeleteAction::Allow => "Allow",
+            core::schema::DeleteAction::Restrict => "Restrict",
+            core::schema::DeleteAction::DeferredRestrict => "DeferredRestrict",
+            core::schema::DeleteAction::DeleteSource => "DeleteSource",
+            core::schema::DeleteAction::DeleteTarget => "DeleteTarget",
+            core::schema::DeleteAction::DeleteTargetIfOrphan => "DeleteTargetIfOrphan",
+        }
+    }
+}
+
 // ── Mutation rewrite ───────────────────────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -225,7 +278,8 @@ impl LinkDescriptor {
         *,
         description = None,
         is_exclusive = false,
-        rewrites = None
+        rewrites = None,
+        on_delete = None
     ))]
     fn new(
         name: String,
@@ -234,6 +288,7 @@ impl LinkDescriptor {
         description: Option<String>,
         is_exclusive: bool,
         rewrites: Option<Vec<PyRef<RewriteEntry>>>,
+        on_delete: Option<Vec<PyRef<OnDeletePolicy>>>,
     ) -> Self {
         Self {
             inner: core::schema::LinkDescriptor {
@@ -246,6 +301,11 @@ impl LinkDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|r| r.inner.clone())
+                    .collect(),
+                on_delete: on_delete
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| p.inner.clone())
                     .collect(),
             },
         }
@@ -291,7 +351,8 @@ impl MultiLinkDescriptor {
         *,
         through = None,
         nullable = false,
-        description = None
+        description = None,
+        on_delete = None
     ))]
     fn new(
         name: String,
@@ -299,6 +360,7 @@ impl MultiLinkDescriptor {
         through: Option<String>,
         nullable: bool,
         description: Option<String>,
+        on_delete: Option<Vec<PyRef<OnDeletePolicy>>>,
     ) -> Self {
         Self {
             inner: core::schema::MultiLinkDescriptor {
@@ -307,6 +369,11 @@ impl MultiLinkDescriptor {
                 through,
                 nullable,
                 description,
+                on_delete: on_delete
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| p.inner.clone())
+                    .collect(),
             },
         }
     }
@@ -933,6 +1000,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PylonCardinalityViolationError", PylonCardinalityViolationError::type_object(py))?;
     m.add("PylonMissingRequiredError", PylonMissingRequiredError::type_object(py))?;
     m.add("PylonInvalidValueError", PylonInvalidValueError::type_object(py))?;
+
+    // Deletion policy
+    m.add_class::<OnDeletePolicy>()?;
 
     // Field descriptors
     m.add_class::<RewriteEntry>()?;

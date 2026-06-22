@@ -146,6 +146,7 @@ def _annotation_to_meta(
             description=description,
             link_target=annotation.target_type,
             rewrites=rewrites,
+            on_delete=list(annotation.on_delete),
         )
 
     if isinstance(annotation, MultiLinkAnnotation):
@@ -159,6 +160,7 @@ def _annotation_to_meta(
             default_factory=list,
             link_target=annotation.target_type,
             through=annotation.through_type,
+            on_delete=list(annotation.on_delete),
         )
 
     if isinstance(annotation, ComputedAnnotation):

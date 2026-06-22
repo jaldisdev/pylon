@@ -28,7 +28,22 @@ from ._decorators import (
 )
 from ._enums import Enum
 from ._enums import enum_decorator as enum
-from ._fields import Computed, Link, MultiLink, Property, through
+from ._fields import (
+    Allow,
+    Computed,
+    DeferredRestrict,
+    DeleteSource,
+    DeleteTarget,
+    DeleteTargetIfOrphan,
+    Link,
+    MultiLink,
+    OnDelete,
+    Property,
+    Restrict,
+    Source,
+    Target,
+    through,
+)
 from ._indexes import Index
 from ._lazy import lazy
 from ._triggers import On, Rewrite, Timing, Trigger
@@ -71,6 +86,16 @@ __all__ = [
     "MultiLink",
     "Computed",
     "through",
+    # Deletion policies
+    "OnDelete",
+    "Target",
+    "Source",
+    "Allow",
+    "Restrict",
+    "DeferredRestrict",
+    "DeleteSource",
+    "DeleteTarget",
+    "DeleteTargetIfOrphan",
     # Constraints
     "Default",
     "Description",

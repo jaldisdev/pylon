@@ -1,3 +1,27 @@
+// ── Deletion policies ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteSide {
+    Target,
+    Source,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteAction {
+    Allow,
+    Restrict,
+    DeferredRestrict,
+    DeleteSource,
+    DeleteTarget,
+    DeleteTargetIfOrphan,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnDeletePolicy {
+    pub side: DeleteSide,
+    pub action: DeleteAction,
+}
+
 // ── Mutation rewrites ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -38,6 +62,7 @@ pub struct LinkDescriptor {
     /// True when a UNIQUE constraint applies to this FK column alone.
     pub is_exclusive: bool,
     pub rewrites: Vec<RewriteEntry>,
+    pub on_delete: Vec<OnDeletePolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +74,7 @@ pub struct MultiLinkDescriptor {
     pub through: Option<String>,
     pub nullable: bool,
     pub description: Option<String>,
+    pub on_delete: Vec<OnDeletePolicy>,
 }
 
 #[derive(Debug, Clone)]

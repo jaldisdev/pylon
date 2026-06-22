@@ -1,5 +1,5 @@
 use crate::error::PyQLError;
-use crate::schema::{SchemaDescriptor, TypeDescriptor, TypeConstraint};
+use crate::schema::{DeleteAction, DeleteSide, OnDeletePolicy, SchemaDescriptor, TypeDescriptor, TypeConstraint};
 use std::collections::{BTreeSet, HashMap};
 
 /// Export the full schema as a PostgreSQL DDL string.
@@ -31,7 +31,9 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_scalars(schema, &mut out);
     emit_tables(schema, &mut out);
     emit_fk_constraints(schema, &type_map, &mut out);
+    emit_link_source_triggers(schema, &type_map, &mut out);
     emit_junction_tables(schema, &type_map, &mut out);
+    emit_multilink_deletion_triggers(schema, &type_map, &mut out);
     emit_unique_indexes(schema, &mut out);
     emit_check_constraints(schema, &mut out);
     emit_plain_indexes(schema, &mut out);
@@ -188,6 +190,44 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
     out.push_str("\n);\n\n");
 }
 
+// ── Deletion policy helpers ────────────────────────────────────────────────────
+
+fn policy_for<'a>(policies: &'a [OnDeletePolicy], side: &DeleteSide) -> Option<&'a DeleteAction> {
+    policies.iter().find(|p| &p.side == side).map(|p| &p.action)
+}
+
+/// Returns the `ON DELETE …` / `DEFERRABLE …` suffix for a FK constraint
+/// based on the Target-side policy. `is_deferred` is set for DeferredRestrict.
+fn target_fk_suffix(policies: &[OnDeletePolicy]) -> String {
+    match policy_for(policies, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict) {
+        DeleteAction::Restrict => " ON DELETE RESTRICT".into(),
+        DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED".into(),
+        DeleteAction::DeleteSource => " ON DELETE CASCADE".into(),
+        DeleteAction::Allow => " ON DELETE SET NULL".into(),
+        _ => " ON DELETE RESTRICT".into(),
+    }
+}
+
+/// Returns the `ON DELETE …` suffix for the source FK in a junction table.
+///
+/// Always CASCADE: complex Source policies (DeleteTarget, DeleteTargetIfOrphan) are
+/// handled by triggers emitted in `emit_multilink_deletion_triggers`.
+fn source_jt_fk_suffix(_policies: &[OnDeletePolicy]) -> &'static str {
+    " ON DELETE CASCADE"
+}
+
+/// Returns the `ON DELETE …` suffix for the target FK in a junction table.
+fn target_jt_fk_suffix(policies: &[OnDeletePolicy]) -> String {
+    match policy_for(policies, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict) {
+        DeleteAction::Restrict => " ON DELETE RESTRICT".into(),
+        DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED".into(),
+        DeleteAction::Allow => " ON DELETE CASCADE".into(),
+        // DeleteSource on a multilink: junction ON DELETE CASCADE + trigger (emitted separately)
+        DeleteAction::DeleteSource => " ON DELETE CASCADE".into(),
+        _ => " ON DELETE RESTRICT".into(),
+    }
+}
+
 // ── Phase 5: FK constraints for single links ───────────────────────────────────
 
 fn emit_fk_constraints(
@@ -201,18 +241,84 @@ fn emit_fk_constraints(
         for l in &t.links {
             let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
             let cname = qi(&format!("{}_{}_fkey", t.table, l.name));
+            let suffix = target_fk_suffix(&l.on_delete);
             out.push_str(&format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id);\n",
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id){};\n",
                 qn(&t.module, &t.table),
                 cname,
                 qi(&l.name),
                 qn(tgt_module, tgt_table),
+                suffix,
             ));
             emitted = true;
         }
     }
     if emitted {
         out.push('\n');
+    }
+}
+
+// ── Trigger emit helper ────────────────────────────────────────────────────────
+
+fn emit_before_delete_trigger(
+    fn_qname: &str,
+    trigger_name: &str,
+    table_qname: &str,
+    body: &str,
+    out: &mut String,
+) {
+    out.push_str(&format!(
+        "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+         RETURNS trigger LANGUAGE plpgsql AS $$\n\
+         BEGIN\n"
+    ));
+    out.push_str(body);
+    out.push_str(&format!(
+        "\n    RETURN OLD;\nEND;\n$$;\n\n\
+         CREATE TRIGGER {trigger_name}\n\
+         BEFORE DELETE ON {table_qname}\n\
+         FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n"
+    ));
+}
+
+// ── Phase 5.5: source-side deletion triggers for single links ──────────────────
+
+fn emit_link_source_triggers(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    out: &mut String,
+) {
+    for t in &schema.types {
+        if t.abstract_ { continue; }
+        for l in &t.links {
+            let src_action = policy_for(&l.on_delete, &DeleteSide::Source)
+                .unwrap_or(&DeleteAction::Allow);
+            match src_action {
+                DeleteAction::Allow => continue,
+                DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan => {}
+                _ => continue,
+            }
+            let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
+            let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                "del_orphan"
+            } else {
+                "del_target"
+            };
+            let hash = fnv(&[&t.table, &l.name, suffix]);
+            let fname = format!("{}_{}_{}", t.table, l.name, &hash[..8]);
+            let fn_qname = qn(&t.module, &fname);
+            let tbl_qname = qn(&t.module, &t.table);
+            let tgt_qname = qn(tgt_module, tgt_table);
+            let col = qi(&l.name);
+
+            let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                format!("    IF NOT EXISTS (\n        SELECT 1 FROM {tbl_qname} WHERE {col} = OLD.{col} AND id != OLD.id\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.{col};\n    END IF;")
+            } else {
+                format!("    DELETE FROM {tgt_qname} WHERE id = OLD.{col};")
+            };
+
+            emit_before_delete_trigger(&fn_qname, &qi(&fname), &tbl_qname, &body, out);
+        }
     }
 }
 
@@ -227,20 +333,79 @@ fn emit_junction_tables(
         if t.abstract_ { continue; }
         for ml in &t.multilinks {
             let jt_name = format!("{}.{}", t.table, ml.name);
+            let src_suffix = source_jt_fk_suffix(&ml.on_delete);
             out.push_str(&format!(
-                "CREATE TABLE {} (\n    source uuid NOT NULL REFERENCES {}(id),\n",
+                "CREATE TABLE {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n",
                 qn(&t.module, &jt_name),
                 qn(&t.module, &t.table),
+                src_suffix,
             ));
             if let Some((tgt_module, tgt_table)) = type_map.get(&ml.target) {
+                let tgt_suffix = target_jt_fk_suffix(&ml.on_delete);
                 out.push_str(&format!(
-                    "    target uuid NOT NULL REFERENCES {}(id),\n",
+                    "    target uuid NOT NULL REFERENCES {}(id){},\n",
                     qn(tgt_module, tgt_table),
+                    tgt_suffix,
                 ));
             } else {
                 out.push_str("    target uuid NOT NULL,\n");
             }
             out.push_str("    PRIMARY KEY (source, target)\n);\n\n");
+        }
+    }
+}
+
+// ── Phase 6.5: multilink deletion policy triggers ──────────────────────────────
+
+fn emit_multilink_deletion_triggers(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    out: &mut String,
+) {
+    for t in &schema.types {
+        if t.abstract_ { continue; }
+        for ml in &t.multilinks {
+            let jt_name = format!("{}.{}", t.table, ml.name);
+            let jt_qname = qn(&t.module, &jt_name);
+
+            // Source-side: DeleteTarget / DeleteTargetIfOrphan
+            let src_action = policy_for(&ml.on_delete, &DeleteSide::Source)
+                .unwrap_or(&DeleteAction::Allow);
+            if matches!(src_action, DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan) {
+                if let Some((tgt_module, tgt_table)) = type_map.get(&ml.target) {
+                    let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                        "del_orphan"
+                    } else {
+                        "del_target"
+                    };
+                    let hash = fnv(&[&t.table, &ml.name, suffix]);
+                    let fname = format!("{}_{}_{}_{}", t.table, ml.name, suffix, &hash[..8]);
+                    let fn_qname = qn(&t.module, &fname);
+                    let tgt_qname = qn(tgt_module, tgt_table);
+
+                    let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                        format!("    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.target;\n    END IF;")
+                    } else {
+                        format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
+                    };
+
+                    emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, out);
+                }
+            }
+
+            // Target-side: DeleteSource — when target deleted (cascade removes junction row),
+            // also delete the source object.
+            let tgt_action = policy_for(&ml.on_delete, &DeleteSide::Target)
+                .unwrap_or(&DeleteAction::Restrict);
+            if matches!(tgt_action, DeleteAction::DeleteSource) {
+                let hash = fnv(&[&t.table, &ml.name, "del_source"]);
+                let fname = format!("{}_{}_{}", t.table, ml.name, &hash[..8]);
+                let fn_qname = qn(&t.module, &fname);
+                let src_qname = qn(&t.module, &t.table);
+
+                let body = format!("    DELETE FROM {src_qname} WHERE id = OLD.source;");
+                emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, out);
+            }
         }
     }
 }
