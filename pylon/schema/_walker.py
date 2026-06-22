@@ -501,6 +501,7 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         check_constraints=checks,
         is_exclusive=is_exclusive,
         is_pk=False,
+        is_readonly=meta.is_readonly,
         rewrites=rewrites,
     )
 
@@ -523,6 +524,7 @@ def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
         nullable=meta.nullable,
         description=meta.description,
         is_exclusive=is_exclusive,
+        is_readonly=meta.is_readonly,
         rewrites=rewrites,
         on_delete=_make_on_delete_policies(meta.on_delete, _core),
     )

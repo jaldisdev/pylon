@@ -15,6 +15,7 @@ from ._constraints import (
     MinValue,
     Now,
     OneOf,
+    Readonly,
     Regexp,
 )
 from ._decorators import (
@@ -109,6 +110,7 @@ __all__ = [
     "MinValue",
     "Now",
     "OneOf",
+    "Readonly",
     "Regexp",
     # Indexes
     "Index",

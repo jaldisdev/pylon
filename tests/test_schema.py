@@ -24,6 +24,7 @@ from pylon.schema import (
     Now,
     On,
     Property,
+    Readonly,
     Rewrite,
     Timing,
     Trigger,
@@ -256,6 +257,61 @@ class TestPropertyField:
     def test_default_now_optional_in_init(self):
         sig = inspect.signature(Auditable.__init__)
         assert sig.parameters["created_at"].default is None
+
+
+# ---------------------------------------------------------------------------
+# Readonly constraint
+# ---------------------------------------------------------------------------
+
+
+class TestReadonlyConstraint:
+    def test_property_is_readonly(self):
+        @pylon.type
+        class Immut:
+            slug: Property[str, Readonly]
+
+        f = Immut.__pylon_config__.fields["slug"]
+        assert f.is_readonly is True
+
+    def test_property_not_readonly_by_default(self):
+        @pylon.type
+        class Normal:
+            slug: str
+
+        assert Normal.__pylon_config__.fields["slug"].is_readonly is False
+
+    def test_readonly_removed_from_constraints(self):
+        @pylon.type
+        class WithReadonly:
+            code: Property[str, Readonly, MaxLen(10)]
+
+        constraints = WithReadonly.__pylon_config__.fields["code"].constraints
+        assert not any(c is Readonly for c in constraints)
+        assert any(isinstance(c, MaxLen) for c in constraints)
+
+    def test_link_is_readonly(self):
+        @pylon.type
+        class HasReadonlyLink:
+            owner: Link[Category, Readonly]
+
+        f = HasReadonlyLink.__pylon_config__.fields["owner"]
+        assert f.is_readonly is True
+
+    def test_link_not_readonly_by_default(self):
+        @pylon.type
+        class HasNormalLink:
+            ref: Link[Category]
+
+        assert HasNormalLink.__pylon_config__.fields["ref"].is_readonly is False
+
+    def test_readonly_coexists_with_exclusive_on_property(self):
+        @pylon.type
+        class Multi:
+            code: Property[str, Exclusive, Readonly]
+
+        f = Multi.__pylon_config__.fields["code"]
+        assert f.is_readonly is True
+        assert any(c is Exclusive for c in f.constraints)
 
 
 # ---------------------------------------------------------------------------

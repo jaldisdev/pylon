@@ -49,6 +49,8 @@ pub struct PropertyDescriptor {
     pub is_exclusive: bool,
     /// True when this column is the table primary key.
     pub is_pk: bool,
+    /// True when the transpiler should reject PyQL updates targeting this field.
+    pub is_readonly: bool,
     pub rewrites: Vec<RewriteEntry>,
 }
 
@@ -61,6 +63,8 @@ pub struct LinkDescriptor {
     pub description: Option<String>,
     /// True when a UNIQUE constraint applies to this FK column alone.
     pub is_exclusive: bool,
+    /// True when the transpiler should reject PyQL updates targeting this field.
+    pub is_readonly: bool,
     pub rewrites: Vec<RewriteEntry>,
     pub on_delete: Vec<OnDeletePolicy>,
 }
