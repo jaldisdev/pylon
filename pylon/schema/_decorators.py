@@ -196,6 +196,31 @@ def _annotation_to_meta(
 # ── Dataclass preparation ──────────────────────────────────────────────────────
 
 
+def _inject_repr(cls: type) -> None:
+    """Replace the dataclass-generated __repr__ with a conventional one.
+
+    Null values render as {} and the class name includes the module prefix
+    (e.g. ``default::Person {id: UUID('...'), name: 'Alice', age: {}}``).
+    Only attributes actually present in __dict__ are shown (partial shapes).
+    """
+    def __repr__(self) -> str:
+        cfg = getattr(type(self), "__pylon_config__", None)
+        qname = (
+            f"{cfg.module}::{cfg.name}" if cfg else type(self).__name__
+        )
+        pylon_type = vars(self).get("__pylon_type__")
+        if pylon_type:
+            qname = pylon_type
+        pairs = ", ".join(
+            f"{k}={{}}" if v is None else f"{k}={v!r}"
+            for k, v in vars(self).items()
+            if k != "__pylon_type__"
+        )
+        return f"{qname} {{{pairs}}}"
+
+    cls.__repr__ = __repr__  # type: ignore[method-assign]
+
+
 def _prepare_dataclass(cls: type, field_metas: dict[str, FieldMeta]) -> None:
     """Inject dataclasses.field() specs into the class dict before @dataclass runs.
 
@@ -349,6 +374,7 @@ def _build_type(
 
     _prepare_dataclass(cls, field_metas)
     dataclasses.dataclass(cls, kw_only=True)
+    _inject_repr(cls)
 
     resolved_module = module or _infer_module(cls)
     resolved_name = name or cls.__name__

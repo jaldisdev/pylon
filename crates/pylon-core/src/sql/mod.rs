@@ -443,8 +443,17 @@ fn emit_multi_link(
             let cond = format!("\"jt\".source = {}.id", qi(parent_alias));
             (from, cond)
         }
-        IrMultiLinkJoin::Through { .. } => {
-            todo!("Through link join not yet supported in SQL emitter")
+        IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
+            let from = format!(
+                "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
+                qn(module, junction_table),
+                source_ref(&sub.source),
+                qi(sub_alias),
+                qi(sub_alias),
+                qi(target_col),
+            );
+            let cond = format!("\"jt\".{} = {}.id", qi(source_col), qi(parent_alias));
+            (from, cond)
         }
     };
 
@@ -650,7 +659,7 @@ mod tests {
                             name: "id".into(),
                             pg_type: "uuid".into(),
                             nullable: false,
-                            default_sql: Some("gen_random_uuid()".into()),
+                            default_sql: Some("uuidv7()".into()),
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: true,
@@ -802,8 +811,8 @@ mod tests {
         let out = compile_and_emit("SELECT Person { name, company { name } }");
         assert!(out.sql.contains("'default::Company'::text"));
         assert!(out.sql.contains("FROM \"default\".\"Company\""));
-        // join condition: parent FK = target PK
-        assert!(out.sql.contains("\"company\" = "));
+        // join condition: parent FK column = target PK
+        assert!(out.sql.contains("\"company_id\" = "));
     }
 
     #[test]
@@ -813,6 +822,74 @@ mod tests {
         assert!(out.sql.contains("ARRAY[]::record[]"));
         assert!(out.sql.contains("'default::Post'::text"));
         assert!(out.sql.contains("\"Person.posts\""));
+    }
+
+    fn make_schema_with_through() -> SchemaDescriptor {
+        let id_prop = || PropertyDescriptor {
+            name: "id".into(), pg_type: "uuid".into(), nullable: false,
+            default_sql: Some("gen_random_uuid()".into()), description: None,
+            check_constraints: vec![], is_exclusive: true, is_pk: true,
+            is_readonly: true, rewrites: vec![],
+        };
+        let name_prop = || PropertyDescriptor {
+            name: "name".into(), pg_type: "text".into(), nullable: false,
+            default_sql: None, description: None, check_constraints: vec![],
+            is_exclusive: false, is_pk: false, is_readonly: false, rewrites: vec![],
+        };
+        SchemaDescriptor {
+            types: vec![
+                TypeDescriptor {
+                    name: "Person".into(), module: "default".into(), table: "Person".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), name_prop()],
+                    links: vec![],
+                    multilinks: vec![MultiLinkDescriptor {
+                        name: "friends".into(),
+                        target: "default::Person".into(),
+                        through: Some("default::PersonFriend".into()),
+                        nullable: false, description: None, on_delete: vec![],
+                    }],
+                    computed: vec![], constraints: vec![], indexes: vec![], triggers: vec![],
+                },
+                TypeDescriptor {
+                    name: "PersonFriend".into(), module: "default".into(), table: "PersonFriend".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop()],
+                    links: vec![
+                        LinkDescriptor {
+                            name: "person".into(), target: "default::Person".into(),
+                            nullable: false, description: None, is_exclusive: false,
+                            is_readonly: false, rewrites: vec![], on_delete: vec![],
+                        },
+                        LinkDescriptor {
+                            name: "friend".into(), target: "default::Person".into(),
+                            nullable: false, description: None, is_exclusive: false,
+                            is_readonly: false, rewrites: vec![], on_delete: vec![],
+                        },
+                    ],
+                    multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], triggers: vec![],
+                },
+            ],
+            scalars: vec![], enums: vec![], globals: vec![],
+        }
+    }
+
+    #[test]
+    fn test_select_through_multi_link() {
+        let schema = make_schema_with_through();
+        let ast = crate::parse::parse("SELECT Person { name, friends { name } }").unwrap();
+        let ir = crate::ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        // Junction table is the PersonFriend table, not the standard dotted name
+        assert!(out.sql.contains("\"default\".\"PersonFriend\""));
+        // Source FK column (person → Person) and target FK column (friend → Person)
+        assert!(out.sql.contains("\"friend\""));
+        assert!(out.sql.contains("\"person\""));
+        // Still emits array_agg pattern
+        assert!(out.sql.contains("array_agg(ROW("));
     }
 
     #[test]
@@ -1071,8 +1148,8 @@ mod tests {
         let out = compile_and_emit(
             "INSERT Person { name := $name, company := (SELECT Company FILTER .name = $co) }",
         );
-        // The company column should be assigned via a scalar subquery
-        assert!(out.sql.contains("\"company\""));
+        // The company FK column should be assigned via a scalar subquery
+        assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
         // The subquery must select the pk (id) of Company
         assert!(out.sql.contains("\"id\""));
@@ -1086,7 +1163,7 @@ mod tests {
         let out = compile_and_emit(
             "UPDATE Person FILTER .id = $id SET { company := (SELECT Company FILTER .name = $co) }",
         );
-        assert!(out.sql.contains("\"company\""));
+        assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
         assert!(out.sql.contains("FROM \"default\".\"Company\""));
     }
