@@ -129,8 +129,10 @@ pub struct IrInsert {
 
 #[derive(Debug, Clone)]
 pub struct IrConflict {
+    /// Column expression for `ON CONFLICT (col)`. None → any conflict.
     pub on: Option<IrExpr>,
-    pub else_: Option<IrSelect>,
+    /// `DO UPDATE SET` assignments. None → `DO NOTHING`.
+    pub do_update: Option<Vec<(String, IrExpr)>>,
 }
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────────
