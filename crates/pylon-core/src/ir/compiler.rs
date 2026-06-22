@@ -315,8 +315,19 @@ impl<'a> Compiler<'a> {
             .transpose()?;
 
         let assignments = self.compile_assignments(&upd.shape, td, &alias)?;
-        // UPDATE rewrites reference the live row via the table alias — no substitution needed.
-        let rewrites = self.compile_rewrites(td, &alias, 2)?;
+        // Substitute assignment expressions into rewrites so that when a rewrite
+        // references a property that is also being SET in this UPDATE, it sees
+        // the new value (e.g. $2) rather than the pre-update row value ("t0"."name").
+        // Properties not being SET keep their ColumnRef and read the current row value.
+        let assignment_map: HashMap<String, IrExpr> =
+            assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
+        let rewrites = self.compile_rewrites(td, &alias, 2)?
+            .into_iter()
+            .map(|rw| IrRewrite {
+                column: rw.column,
+                expr: substitute_col_refs(rw.expr, &assignment_map),
+            })
+            .collect();
         let returning = Self::pk_returning(td);
 
         Ok(IrUpdate { target, filter, assignments, rewrites, returning })
