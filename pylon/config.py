@@ -47,6 +47,8 @@ class DatabaseConfig:
     name: str | None = None
     user: str | None = None
     password: str | None = None
+    pool_min_size: int = 2
+    pool_max_size: int = 10
 
     def __post_init__(self) -> None:
         if self.dsn is None:
@@ -58,6 +60,12 @@ class DatabaseConfig:
                     f"DatabaseConfig: missing required fields when dsn is not "
                     f"provided: {', '.join(missing)}"
                 )
+        if self.pool_min_size < 1:
+            raise ValueError("DatabaseConfig: pool_min_size must be >= 1.")
+        if self.pool_max_size < self.pool_min_size:
+            raise ValueError(
+                "DatabaseConfig: pool_max_size must be >= pool_min_size."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +186,8 @@ def _build_database(raw: dict[str, object]) -> DatabaseConfig:
         name=str(raw["name"]),
         user=str(raw["user"]),
         password=password,
+        pool_min_size=int(raw.get("pool_min_size", 2)),  # type: ignore[arg-type]
+        pool_max_size=int(raw.get("pool_max_size", 10)),  # type: ignore[arg-type]
     )
 
 
@@ -216,7 +226,7 @@ _RESERVED_TOP_LEVEL = frozenset({"project", "database", "search", "models"})
 # Known scalar keys in each section — sub-tables within a section are named
 # connections/branches.
 _DATABASE_SCALAR_KEYS = frozenset(
-    {"host", "port", "name", "user", "password", "password_env"}
+    {"host", "port", "name", "user", "password", "password_env", "pool_min_size", "pool_max_size"}
 )
 _SEARCH_SCALAR_KEYS = frozenset({"host", "port", "user", "password", "password_env"})
 _MODELS_SCALAR_KEYS = frozenset(
