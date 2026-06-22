@@ -720,4 +720,34 @@ mod tests {
         assert!(out.sql.contains("ORDER BY"));
         assert!(out.sql.contains("LIMIT 10"));
     }
+
+    #[test]
+    fn test_insert_returning() {
+        let out = compile_and_emit("INSERT Person { name := 'Alice', age := 30 }");
+        assert!(out.sql.contains("INSERT INTO \"default\".\"Person\""));
+        assert!(out.sql.contains("RETURNING"));
+        assert!(out.sql.contains("'default::Person'::text"));
+        assert!(out.sql.contains(") AS result"));
+        // Shape root should be Required (single inserted row)
+        let ShapeNode::Object { cardinality, fields, .. } = &out.shape.root else { panic!() };
+        assert_eq!(*cardinality, Cardinality::Required);
+        assert!(fields.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name")));
+    }
+
+    #[test]
+    fn test_update_returning() {
+        let out = compile_and_emit("UPDATE Person FILTER .name = $name SET { age := 31 }");
+        assert!(out.sql.contains("UPDATE \"default\".\"Person\""));
+        assert!(out.sql.contains("SET"));
+        assert!(out.sql.contains("RETURNING"));
+        assert!(out.sql.contains("'default::Person'::text"));
+    }
+
+    #[test]
+    fn test_delete_returning() {
+        let out = compile_and_emit("DELETE Person FILTER .id = $id");
+        assert!(out.sql.contains("DELETE FROM \"default\".\"Person\""));
+        assert!(out.sql.contains("RETURNING"));
+        assert!(out.sql.contains("'default::Person'::text"));
+    }
 }
