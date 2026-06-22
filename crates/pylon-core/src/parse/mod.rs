@@ -4,11 +4,18 @@ mod parser;
 
 use crate::error::PyQLSyntaxError;
 
-pub use ast::Stmt;
+pub use ast::{Expr, Stmt};
 
 pub fn parse(input: &str) -> Result<Stmt, PyQLSyntaxError> {
     let tokens = lexer::Lexer::new(input).tokenize()?;
     parser::Parser::new(tokens).parse_stmt()
+}
+
+/// Parse a single PyQL expression (used for rewrite handlers, computed-field
+/// bodies, and constraint expressions stored as strings in the schema).
+pub fn parse_expr(input: &str) -> Result<Expr, PyQLSyntaxError> {
+    let tokens = lexer::Lexer::new(input).tokenize()?;
+    parser::Parser::new(tokens).parse_expr()
 }
 
 #[cfg(test)]
