@@ -749,7 +749,10 @@ impl Parser {
             });
         }
 
-        // Nested shape: `.link { ... }`
+        // Nested shape: `.link { ... }` or `.link: { ... }` (Gel-style colon optional)
+        if matches!(self.current(), Token::Colon) {
+            self.advance();
+        }
         if matches!(self.current(), Token::LBrace) {
             self.advance();
             let nested_elements = self.parse_shape_body()?;

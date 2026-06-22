@@ -62,7 +62,7 @@ class AsyncTransaction:
             # Happy path — attempt commit.
             try:
                 await self._tx.commit()
-            except asyncpg.SerializationFailureError as e:
+            except asyncpg.SerializationError as e:
                 mapped = TransactionSerializationError(str(e))
                 self._retry_exc = mapped
                 raise mapped from e
@@ -74,7 +74,7 @@ class AsyncTransaction:
             # Always roll back on any error.
             await self._tx.rollback()
             # Re-map asyncpg-native retriable errors to Pylon exceptions.
-            if isinstance(exc, asyncpg.SerializationFailureError):
+            if isinstance(exc, asyncpg.SerializationError):
                 mapped = TransactionSerializationError(str(exc))
                 self._retry_exc = mapped
                 raise mapped from exc
@@ -303,7 +303,7 @@ class Client:
         try:
             async with pool.acquire() as conn:
                 records = list(await conn.fetch(sql, *params))
-        except asyncpg.SerializationFailureError as exc:
+        except asyncpg.SerializationError as exc:
             raise TransactionSerializationError(str(exc)) from exc
         except asyncpg.DeadlockDetectedError as exc:
             raise TransactionDeadlockError(str(exc)) from exc
@@ -345,7 +345,7 @@ class Client:
         async with pool.acquire() as conn:
             try:
                 await conn.execute(sql, *params)
-            except asyncpg.SerializationFailureError as exc:
+            except asyncpg.SerializationError as exc:
                 raise TransactionSerializationError(str(exc)) from exc
             except asyncpg.DeadlockDetectedError as exc:
                 raise TransactionDeadlockError(str(exc)) from exc

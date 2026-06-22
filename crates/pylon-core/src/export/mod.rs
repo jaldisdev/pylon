@@ -174,7 +174,7 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
     // Link columns — uuid stubs; FK constraints added in phase 5
     for l in &t.links {
         let not_null = if l.nullable { "" } else { " NOT NULL" };
-        lines.push(format!("    {} uuid{}", qi(&l.name), not_null));
+        lines.push(format!("    {} uuid{}", qi(&format!("{}_id", l.name)), not_null));
     }
 
     // Primary key
@@ -246,7 +246,7 @@ fn emit_fk_constraints(
                 "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id){};\n",
                 qn(&t.module, &t.table),
                 cname,
-                qi(&l.name),
+                qi(&format!("{}_id", l.name)),
                 qn(tgt_module, tgt_table),
                 suffix,
             ));
@@ -309,7 +309,7 @@ fn emit_link_source_triggers(
             let fn_qname = qn(&t.module, &fname);
             let tbl_qname = qn(&t.module, &t.table);
             let tgt_qname = qn(tgt_module, tgt_table);
-            let col = qi(&l.name);
+            let col = qi(&format!("{}_id", l.name));
 
             let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
                 format!("    IF NOT EXISTS (\n        SELECT 1 FROM {tbl_qname} WHERE {col} = OLD.{col} AND id != OLD.id\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.{col};\n    END IF;")
@@ -431,7 +431,7 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
             if l.is_exclusive {
                 out.push_str(&format!(
                     "CREATE UNIQUE INDEX ON {} ({});\n",
-                    qname, qi(&l.name),
+                    qname, qi(&format!("{}_id", l.name)),
                 ));
                 emitted = true;
             }
@@ -585,7 +585,7 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
         // Columns: interface's own properties + link columns
         let cols: Vec<String> = t.properties.iter()
             .map(|p| qi(&p.name))
-            .chain(t.links.iter().map(|l| qi(&l.name)))
+            .chain(t.links.iter().map(|l| qi(&format!("{}_id", l.name))))
             .collect();
         let col_list = cols.join(", ");
 

@@ -60,6 +60,7 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
             if cls is not None:
                 obj = object.__new__(cls)
                 obj.__dict__.update(kwargs)
+                obj.__dict__["__pylon_type__"] = type_name
                 return obj
         return kwargs
 

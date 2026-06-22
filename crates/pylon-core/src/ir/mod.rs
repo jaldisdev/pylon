@@ -102,8 +102,17 @@ pub enum IrMultiLinkJoin {
         /// Schema module for quoting, e.g. `default`.
         module: String,
     },
-    /// Explicit through type — resolved at a later phase.
-    Through { through_type: String },
+    /// Explicit through type with resolved FK columns.
+    Through {
+        /// PostgreSQL table of the junction type.
+        junction_table: String,
+        /// Schema module of the junction type.
+        module: String,
+        /// Column on the junction table that references the source type's id.
+        source_col: String,
+        /// Column on the junction table that references the target type's id.
+        target_col: String,
+    },
 }
 
 /// A computed field: an expression aliased to a name.
@@ -280,7 +289,7 @@ mod tests {
                             name: "id".into(),
                             pg_type: "uuid".into(),
                             nullable: false,
-                            default_sql: Some("gen_random_uuid()".into()),
+                            default_sql: Some("uuidv7()".into()),
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: true,
@@ -430,7 +439,7 @@ mod tests {
         assert_eq!(sel.shape.len(), 2);
         let IrShapeField::SingleLink(link) = &sel.shape[1] else { panic!("expected SingleLink") };
         assert_eq!(link.alias, "company");
-        assert_eq!(link.fk_column, "company");
+        assert_eq!(link.fk_column, "company_id");
         assert_eq!(link.subquery.source.table, "company");
     }
 

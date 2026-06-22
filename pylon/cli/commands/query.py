@@ -134,7 +134,7 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
                 for f in dataclasses.fields(obj)
                 if f.name in selected
             }
-            d["__type__"] = type_name or type(obj).__name__
+            d["__type__"] = type_name or vars(obj).get("__pylon_type__") or type(obj).__name__
         elif isinstance(obj, dict):
             d = {k: v for k, v in obj.items() if k == "__type__" or k in selected}
         else:
@@ -167,6 +167,14 @@ def _value(v: object) -> str:
         return f"{_YELLOW}{str(v).lower()}{_RESET}"
     if v is None:
         return f"{_YELLOW}null{_RESET}"
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        qname = vars(v).get("__pylon_type__") or type(v).__name__
+        pairs = ", ".join(
+            f"{_key(k)}: {_value(val)}"
+            for k, val in vars(v).items()
+            if k != "__pylon_type__"
+        )
+        return f"{_type(qname)} {_brace('{')}{pairs}{_brace('}')}"
     return str(v)
 
 

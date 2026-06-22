@@ -284,11 +284,12 @@ impl<'a> Compiler<'a> {
                 } else if let Some(l) = Self::resolve_link(td, field_name) {
                     // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
                     // Compile as a scalar subquery returning the target pk (the FK uuid).
+                    let fk_col = format!("{}_id", l.name);
                     if let Expr::SubQuery(inner_stmt) = expr {
                         let ir_expr = self.compile_link_subquery(inner_stmt)?;
-                        return Ok((l.name.clone(), ir_expr));
+                        return Ok((fk_col, ir_expr));
                     }
-                    l.name.clone()
+                    fk_col
                 } else {
                     return Err(self.field_err(field_name, &td.name));
                 };
@@ -425,7 +426,7 @@ impl<'a> Compiler<'a> {
             };
             return Ok(IrShapeField::SingleLink(IrSingleLinkField {
                 alias: field_name.to_string(),
-                fk_column: l.name.clone(),
+                fk_column: format!("{}_id", l.name),
                 target_pk: "id".to_string(),
                 subquery,
             }));
@@ -439,9 +440,48 @@ impl<'a> Compiler<'a> {
             let sub_shape =
                 self.compile_shape(nested_elements, target_td, &sub_alias, &target_td.module.clone())?;
 
-            let join = IrMultiLinkJoin::Standard {
-                junction_table: format!("{}.{}", td.table, ml.name),
-                module: module.to_string(),
+            let join = if let Some(through_qname) = &ml.through {
+                let through_td = self.resolve_type(through_qname)?;
+                let source_qname = format!("{}::{}", td.module, td.name);
+                let source_col = through_td
+                    .links
+                    .iter()
+                    .find(|l| l.target == source_qname)
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "through type {through_qname} has no link to source type {source_qname}"
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }))?
+                    .name
+                    .clone();
+                // Skip source_col when searching for target_col to handle self-referential
+                // through types where both links point to the same type.
+                let target_col = through_td
+                    .links
+                    .iter()
+                    .find(|l| l.target == ml.target && l.name != source_col)
+                    .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "through type {through_qname} has no link to target type {}",
+                            ml.target
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }))?
+                    .name
+                    .clone();
+                IrMultiLinkJoin::Through {
+                    junction_table: through_td.table.clone(),
+                    module: through_td.module.clone(),
+                    source_col,
+                    target_col,
+                }
+            } else {
+                IrMultiLinkJoin::Standard {
+                    junction_table: format!("{}.{}", td.table, ml.name),
+                    module: module.to_string(),
+                }
             };
 
             let subquery = IrSelect {
