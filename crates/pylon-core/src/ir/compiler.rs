@@ -9,10 +9,13 @@ use crate::schema::{
     LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
 };
 
+use std::collections::HashMap;
+
 use super::{
-    IrBinOp, IrComputedField, IrDelete, IrExpr, IrIfElse, IrInsert, IrLiteral, IrMultiLinkField,
-    IrMultiLinkJoin, IrNulls, IrOutput, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField,
-    IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrBinOp, IrComputedField, IrDelete, IrExpr, IrFunctionCall, IrIfElse, IrInsert, IrLiteral,
+    IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrRewrite, IrScalarField, IrSelect,
+    IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp,
+    IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -206,12 +209,23 @@ impl<'a> Compiler<'a> {
 
         let assignments = self.compile_assignments(&ins.shape, td, &alias)?;
         let module = td.module.clone();
+        // Compile INSERT rewrites; substitute column refs so they are valid in VALUES.
+        let assignment_map: HashMap<String, IrExpr> =
+            assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
+        let rewrites = self.compile_rewrites(td, &alias, 1)?
+            .into_iter()
+            .map(|rw| IrRewrite {
+                column: rw.column,
+                expr: substitute_col_refs(rw.expr, &assignment_map),
+            })
+            .collect();
         let returning = self.compile_shape(&[], td, &alias, &module)?;
 
         Ok(IrInsert {
             target,
             assignments,
             unless_conflict: None,
+            rewrites,
             returning,
         })
     }
@@ -268,9 +282,11 @@ impl<'a> Compiler<'a> {
 
         let assignments = self.compile_assignments(&upd.shape, td, &alias)?;
         let module = td.module.clone();
+        // UPDATE rewrites reference the live row via the table alias — no substitution needed.
+        let rewrites = self.compile_rewrites(td, &alias, 2)?;
         let returning = self.compile_shape(&[], td, &alias, &module)?;
 
-        Ok(IrUpdate { target, filter, assignments, returning })
+        Ok(IrUpdate { target, filter, assignments, rewrites, returning })
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────────────
@@ -584,6 +600,32 @@ impl<'a> Compiler<'a> {
             position: Position { line: 0, col: 0 },
         }))
     }
+
+    // ── Mutation rewrite compilation ─────────────────────────────────────────────
+
+    /// Compile all active rewrites on `td`'s properties for the given event mask
+    /// (1 = INSERT, 2 = UPDATE). Uses `self` so the alias counter and param list
+    /// are shared with the surrounding statement.
+    fn compile_rewrites(
+        &mut self,
+        td: &TypeDescriptor,
+        alias: &str,
+        on_mask: u8,
+    ) -> Result<Vec<IrRewrite>, PyQLError> {
+        let mut out = Vec::new();
+        for prop in &td.properties {
+            for rw in &prop.rewrites {
+                if rw.on & on_mask == 0 {
+                    continue;
+                }
+                let expr_ast = crate::parse::parse_expr(&rw.handler)
+                    .map_err(PyQLError::Syntax)?;
+                let ir_expr = self.compile_expr(&expr_ast, td, alias)?;
+                out.push(IrRewrite { column: prop.name.clone(), expr: ir_expr });
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -628,4 +670,51 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         other => other, // pass through for user-defined types / domains
     }
     .to_string())
+}
+
+/// Walk an `IrExpr` tree and replace every `ColumnRef` whose column name appears
+/// in `bindings` with the bound expression.
+///
+/// Used for INSERT rewrites: the handler `lower(.name)` compiles to
+/// `FunctionCall(lower, [ColumnRef("name")])`. If `name := $1` in the INSERT,
+/// substituting produces `FunctionCall(lower, [Param(0)])`, which is valid in a
+/// VALUES clause.
+pub(super) fn substitute_col_refs(
+    expr: IrExpr,
+    bindings: &HashMap<String, IrExpr>,
+) -> IrExpr {
+    match expr {
+        IrExpr::ColumnRef { ref column, .. } => {
+            if let Some(replacement) = bindings.get(column) {
+                replacement.clone()
+            } else {
+                expr
+            }
+        }
+        IrExpr::BinOp(op) => IrExpr::BinOp(Box::new(IrBinOp {
+            left: substitute_col_refs(op.left, bindings),
+            op: op.op,
+            right: substitute_col_refs(op.right, bindings),
+        })),
+        IrExpr::UnaryOp(op) => IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: op.op,
+            operand: substitute_col_refs(op.operand, bindings),
+        })),
+        IrExpr::FunctionCall(f) => IrExpr::FunctionCall(IrFunctionCall {
+            schema: f.schema,
+            name: f.name,
+            args: f.args.into_iter().map(|a| substitute_col_refs(a, bindings)).collect(),
+        }),
+        IrExpr::TypeCast(c) => IrExpr::TypeCast(Box::new(IrTypeCast {
+            expr: substitute_col_refs(c.expr, bindings),
+            pg_type: c.pg_type,
+        })),
+        IrExpr::IfElse(ie) => IrExpr::IfElse(Box::new(IrIfElse {
+            condition: substitute_col_refs(ie.condition, bindings),
+            if_: substitute_col_refs(ie.if_, bindings),
+            else_: substitute_col_refs(ie.else_, bindings),
+        })),
+        // Literals, Params, Subqueries — no column refs to substitute
+        other => other,
+    }
 }

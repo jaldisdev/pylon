@@ -87,8 +87,22 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
 // ── INSERT ──────────────────────────────────────────────────────────────────
 
 fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
-    let cols: Vec<String> = ins.assignments.iter().map(|(c, _)| qi(c)).collect();
-    let vals: Vec<String> = ins.assignments.iter().map(|(_, e)| emit_expr(e)).collect();
+    // Rewrites override explicit assignments for the same column.
+    let rewrite_cols: std::collections::HashSet<&str> =
+        ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+
+    let mut cols: Vec<String> = ins.assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(c, _)| qi(c))
+        .collect();
+    let mut vals: Vec<String> = ins.assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(_, e)| emit_expr(e))
+        .collect();
+    for rw in &ins.rewrites {
+        cols.push(qi(&rw.column));
+        vals.push(emit_expr(&rw.expr));
+    }
 
     let mut sql = format!(
         "INSERT INTO {} ({}) VALUES ({})",
@@ -118,11 +132,14 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
 
 fn emit_update_stmt(upd: &IrUpdate) -> SqlOutput {
     let alias = &upd.target.alias;
-    let sets: Vec<String> = upd
+    let mut sets: Vec<String> = upd
         .assignments
         .iter()
         .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
         .collect();
+    for rw in &upd.rewrites {
+        sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
+    }
 
     let mut sql = format!(
         "UPDATE {} AS {}\nSET {}",
@@ -650,8 +667,12 @@ mod tests {
 
     fn compile_and_emit(query: &str) -> SqlOutput {
         let schema = make_schema();
+        compile_and_emit_with(query, &schema)
+    }
+
+    fn compile_and_emit_with(query: &str, schema: &SchemaDescriptor) -> SqlOutput {
         let ast = parse::parse(query).expect("parse failed");
-        let ir = ir::compile(&ast, &schema).expect("IR compile failed");
+        let ir = ir::compile(&ast, schema).expect("IR compile failed");
         emit(&ir)
     }
 
@@ -749,5 +770,66 @@ mod tests {
         assert!(out.sql.contains("DELETE FROM \"default\".\"Person\""));
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
+    }
+
+    fn make_schema_with_rewrite() -> SchemaDescriptor {
+        use crate::schema::RewriteEntry;
+        let mut schema = make_schema();
+        // Add a `slug` property to Person with an INSERT+UPDATE rewrite: lower(.name)
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.properties.push(PropertyDescriptor {
+            name: "slug".into(),
+            pg_type: "text".into(),
+            nullable: true,
+            default_sql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![
+                RewriteEntry { on: 1, handler: "str_lower(.name)".into() },  // INSERT
+                RewriteEntry { on: 2, handler: "str_lower(.name)".into() },  // UPDATE
+            ],
+        });
+        schema
+    }
+
+    #[test]
+    fn test_insert_rewrite_injected() {
+        let schema = make_schema_with_rewrite();
+        let out = compile_and_emit_with("INSERT Person { name := $name, age := 30 }", &schema);
+        // slug should appear in the INSERT column list via the rewrite
+        assert!(out.sql.contains("\"slug\""));
+        // The rewrite expression str_lower($1) should appear in VALUES
+        assert!(out.sql.contains("str_lower("));
+        // $1 (name param) should be the arg
+        assert!(out.sql.contains("$1"));
+    }
+
+    #[test]
+    fn test_insert_rewrite_overrides_explicit_assignment() {
+        let schema = make_schema_with_rewrite();
+        // User explicitly assigns slug — rewrite should win (user assignment dropped)
+        let out = compile_and_emit_with(
+            "INSERT Person { name := $name, age := 30, slug := 'manual' }",
+            &schema,
+        );
+        // The literal 'manual' must NOT appear — rewrite wins
+        assert!(!out.sql.contains("'manual'"), "rewrite must override explicit slug assignment");
+        // The rewrite expression must appear
+        assert!(out.sql.contains("str_lower("), "rewrite expression must be present");
+    }
+
+    #[test]
+    fn test_update_rewrite_in_set_clause() {
+        let schema = make_schema_with_rewrite();
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { name := $name }",
+            &schema,
+        );
+        assert!(out.sql.contains("SET"));
+        assert!(out.sql.contains("\"slug\""));
+        assert!(out.sql.contains("str_lower("));
     }
 }

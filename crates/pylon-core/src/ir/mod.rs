@@ -7,6 +7,7 @@
 mod compiler;
 
 pub use compiler::compile;
+pub use compiler::compile_expr_in_type;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 
@@ -116,6 +117,8 @@ pub struct IrInsert {
     /// Each element is (column_name, value_expr).
     pub assignments: Vec<(String, IrExpr)>,
     pub unless_conflict: Option<IrConflict>,
+    /// Schema-defined rewrites that override or augment the inserted columns.
+    pub rewrites: Vec<IrRewrite>,
     /// Shape to return after insert (for RETURNING clause).
     pub returning: Vec<IrShapeField>,
 }
@@ -133,6 +136,8 @@ pub struct IrUpdate {
     pub target: IrSource,
     pub filter: Option<IrExpr>,
     pub assignments: Vec<(String, IrExpr)>,
+    /// Schema-defined rewrites appended to the SET clause.
+    pub rewrites: Vec<IrRewrite>,
     pub returning: Vec<IrShapeField>,
 }
 
@@ -221,6 +226,19 @@ pub enum IrSortDir { Asc, Desc }
 pub enum IrNulls { First, Last }
 
 // ── Compiled output ──────────────────────────────────────────────────────────────
+
+/// A compiled mutation rewrite: a property column whose value is overridden by
+/// a schema-defined expression at INSERT/UPDATE time.
+#[derive(Debug, Clone)]
+pub struct IrRewrite {
+    /// PostgreSQL column name of the property being overridden.
+    pub column: String,
+    /// Compiled expression that produces the override value.
+    /// For INSERT: column refs are substituted with the corresponding assignment
+    /// expressions so the result is self-contained in a VALUES clause.
+    /// For UPDATE: column refs use the table alias and are valid in a SET clause.
+    pub expr: IrExpr,
+}
 
 /// The result of the IR compilation step.
 /// Carries the query plan and the ordered list of named parameters, which the
