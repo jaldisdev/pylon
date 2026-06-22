@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
@@ -20,15 +20,8 @@ from pylon.exceptions import (
     TransactionSerializationError,
 )
 
-try:
-    from pylon_core import compile_pyql  # Rust extension (maturin)
-except ImportError:  # pragma: no cover — absent until the crate is built
-
-    def compile_pyql(pyql: str) -> tuple[str, list[Any]]:  # type: ignore[misc]
-        raise InternalServerError(
-            "pylon-core Rust extension is not installed. "
-            "Run `maturin develop` inside the pylon-core directory."
-        )
+if TYPE_CHECKING:
+    from pylon._core import CompiledQuery
 
 
 # ---------------------------------------------------------------------------
@@ -103,18 +96,21 @@ class AsyncTransaction:
 
     async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
-        sql, params = _transpile(pyql, kwargs)
-        return list(await self._conn.fetch(sql, *params))
+        sql, params, compiled = _transpile(pyql, kwargs)
+        records = list(await self._conn.fetch(sql, *params))
+        return _hydrate(records, compiled)
 
     async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, compiled = _transpile(pyql, kwargs)
         rows = await self._conn.fetch(sql, *params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
             )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        return _hydrate(list(rows), compiled)[0]
 
     async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
         """Return exactly one result; raise if the set is empty or has >1 row."""
@@ -125,7 +121,7 @@ class AsyncTransaction:
 
     async def execute(self, pyql: str, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, kwargs)
         await self._conn.execute(sql, *params)
 
     async def query_json(self, pyql: str, **kwargs: Any) -> str:
@@ -133,7 +129,7 @@ class AsyncTransaction:
 
         Returns ``"[]"`` when the result set is empty.
         """
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, kwargs)
         return (
             await self._conn.fetchval(
                 f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
@@ -143,7 +139,7 @@ class AsyncTransaction:
 
     async def query_single_json(self, pyql: str, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, kwargs)
         rows = await self._conn.fetch(sql, *params)
         if len(rows) > 1:
             raise ResultCardinalityError(
@@ -303,14 +299,15 @@ class Client:
     async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, compiled = _transpile(pyql, kwargs)
         try:
             async with pool.acquire() as conn:
-                return list(await conn.fetch(sql, *params))
+                records = list(await conn.fetch(sql, *params))
         except asyncpg.SerializationFailureError as exc:
             raise TransactionSerializationError(str(exc)) from exc
         except asyncpg.DeadlockDetectedError as exc:
             raise TransactionDeadlockError(str(exc)) from exc
+        return _hydrate(records, compiled)
 
     async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
         """Execute *pyql* and return at most one result, or ``None``.
@@ -319,14 +316,16 @@ class Client:
         than one object matches.
         """
         pool = self._require_pool()
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, compiled = _transpile(pyql, kwargs)
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
             )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        return _hydrate(list(rows), compiled)[0]
 
     async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
         """Execute *pyql* and return exactly one result.
@@ -342,7 +341,7 @@ class Client:
     async def execute(self, pyql: str, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = self._require_pool()
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, kwargs)
         async with pool.acquire() as conn:
             try:
                 await conn.execute(sql, *params)
@@ -357,10 +356,13 @@ class Client:
         Returns ``"[]"`` when the result set is empty.
         """
         pool = self._require_pool()
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, kwargs)
         async with pool.acquire() as conn:
-            return await conn.fetchval(
-                f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
+            return (
+                await conn.fetchval(
+                    f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
+                )
+                or "[]"
             )
 
     async def query_single_json(self, pyql: str, **kwargs: Any) -> str | None:
@@ -370,7 +372,7 @@ class Client:
         object matches.
         """
         pool = self._require_pool()
-        sql, params = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, kwargs)
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -487,14 +489,47 @@ def create_async_client(config: Config | None = None) -> Client:
 # ---------------------------------------------------------------------------
 
 
-def _transpile(pyql: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
-    """Delegate PyQL → SQL transpilation to the pylon-core Rust extension.
+def _transpile(
+    pyql: str, kwargs: dict[str, Any]
+) -> tuple[str, list[Any], "CompiledQuery"]:
+    """Compile PyQL to SQL via the pylon-core Rust extension.
 
-    Returns a ``(sql, positional_params)`` pair ready for asyncpg.
+    Returns ``(sql, positional_params, compiled)`` ready for asyncpg.
+    kwargs values are passed positionally in insertion order; the Rust ABI
+    will expose ordered param names once the compiler is complete.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
-    return compile_pyql(pyql)  # kwargs forwarding TBD once the Rust ABI is settled
+    from pylon.query import compile as _pyql_compile
+
+    try:
+        compiled = _pyql_compile(pyql)
+    except BaseException as exc:
+        raise InternalServerError(
+            f"PyQL compiler is not yet available: {exc}"
+        ) from exc
+    return compiled.sql, list(kwargs.values()), compiled
+
+
+def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
+    """Decode asyncpg Records into Python dataclass instances.
+
+    Falls back to the raw record list when the SchemaDescriptor singleton is not
+    installed or the Rust deserializer is not yet implemented.
+    """
+    from pylon.query import _get_schema, deserialize
+    from pylon.schema import schema_snapshot
+
+    try:
+        _get_schema()
+    except RuntimeError:
+        return records
+    types, _, _ = schema_snapshot()
+    registry = {t.__name__: t for t in types}
+    try:
+        return deserialize(records, compiled, registry)
+    except Exception:
+        return records
 
 
 def _build_dsn(db: Any) -> str:

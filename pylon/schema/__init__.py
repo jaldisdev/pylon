@@ -47,6 +47,7 @@ from ._fields import (
 )
 from ._indexes import Index
 from ._lazy import lazy
+from ._registry import snapshot as schema_snapshot
 from ._triggers import On, Rewrite, Timing, Trigger
 from ._meta import FieldMeta, PylonConfig
 from ._scalars import (
@@ -149,4 +150,6 @@ __all__ = [
     "collect_module_globals",
     # Schema validation
     "SchemaError",
+    # Registry snapshot for hydration
+    "schema_snapshot",
 ]
