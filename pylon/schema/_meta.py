@@ -25,6 +25,8 @@ class FieldMeta:
     expression: str | None = None
     # mutation rewrites declared inside Property[T, Rewrite(...)]
     rewrites: list[Any] = dataclasses.field(default_factory=list)
+    # deletion policies declared inside Link[T, OnDelete(...)] or MultiLink[T, OnDelete(...)]
+    on_delete: list[Any] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass

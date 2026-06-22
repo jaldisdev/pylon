@@ -6,6 +6,59 @@ from typing import Any
 from . import _collector
 from ._constraints import Description
 
+# ── Deletion policy types ──────────────────────────────────────────────────────
+
+
+class _Side:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+class _Action:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+Target = _Side("Target")
+Source = _Side("Source")
+
+Allow = _Action("Allow")
+Restrict = _Action("Restrict")
+DeferredRestrict = _Action("DeferredRestrict")
+DeleteSource = _Action("DeleteSource")
+DeleteTarget = _Action("DeleteTarget")
+DeleteTargetIfOrphan = _Action("DeleteTargetIfOrphan")
+
+
+class OnDelete:
+    """Deletion policy for a Link or MultiLink.
+
+    Usage::
+
+        chat: Link[MessageThread, OnDelete(Target, DeleteSource)]
+        messages: MultiLink[Message, OnDelete(Source, DeleteTargetIfOrphan)]
+    """
+
+    __slots__ = ("side", "action")
+
+    def __init__(self, side: _Side, action: _Action) -> None:
+        self.side = side
+        self.action = action
+
+    def __repr__(self) -> str:
+        return f"OnDelete({self.side!r}, {self.action!r})"
+
+
 # ── Annotation result types ────────────────────────────────────────────────────
 #
 # All four annotation result classes implement __or__ so that the | None
@@ -30,11 +83,14 @@ class PropertyAnnotation:
 
 
 class LinkAnnotation:
-    __slots__ = ("target_type", "constraints")
+    __slots__ = ("target_type", "constraints", "on_delete")
 
-    def __init__(self, target_type: Any, constraints: list[Any]) -> None:
+    def __init__(
+        self, target_type: Any, constraints: list[Any], on_delete: list[OnDelete]
+    ) -> None:
         self.target_type = target_type
         self.constraints = constraints
+        self.on_delete = on_delete
 
     def __or__(self, other: Any) -> Any:
         if other is None:
@@ -46,11 +102,14 @@ class LinkAnnotation:
 
 
 class MultiLinkAnnotation:
-    __slots__ = ("target_type", "through_type")
+    __slots__ = ("target_type", "through_type", "on_delete")
 
-    def __init__(self, target_type: Any, through_type: Any = None) -> None:
+    def __init__(
+        self, target_type: Any, through_type: Any = None, on_delete: list[OnDelete] | None = None
+    ) -> None:
         self.target_type = target_type
         self.through_type = through_type
+        self.on_delete = on_delete or []
 
     def __or__(self, other: Any) -> Any:
         if other is None:
@@ -152,6 +211,7 @@ class Link:
         category: Link[Category]
         category: Link[Category] | None
         category: Link[Category, Description('The owning category')]
+        chat: Link[MessageThread, OnDelete(Target, DeleteSource)]
     """
 
     @classmethod
@@ -159,8 +219,10 @@ class Link:
         if not isinstance(params, tuple):
             params = (params,)
         target_type = params[0]
-        constraints = _consume_descriptions(list(params[1:]))
-        return LinkAnnotation(target_type=target_type, constraints=constraints)
+        rest = list(params[1:])
+        on_delete = [p for p in rest if isinstance(p, OnDelete)]
+        constraints = _consume_descriptions([p for p in rest if not isinstance(p, OnDelete)])
+        return LinkAnnotation(target_type=target_type, constraints=constraints, on_delete=on_delete)
 
 
 class MultiLink:
@@ -171,6 +233,7 @@ class MultiLink:
         tags: MultiLink[Tag]
         tags: MultiLink[Tag, through(ProductTag)]
         tags: MultiLink[Tag] | None
+        messages: MultiLink[Message, OnDelete(Source, DeleteTargetIfOrphan)]
     """
 
     @classmethod
@@ -179,10 +242,13 @@ class MultiLink:
             params = (params,)
         target_type = params[0]
         through_type = None
+        on_delete: list[OnDelete] = []
         for p in params[1:]:
             if isinstance(p, _ThroughParam):
                 through_type = p.type_
-        return MultiLinkAnnotation(target_type=target_type, through_type=through_type)
+            elif isinstance(p, OnDelete):
+                on_delete.append(p)
+        return MultiLinkAnnotation(target_type=target_type, through_type=through_type, on_delete=on_delete)
 
 
 class Computed:
