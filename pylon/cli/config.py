@@ -2,11 +2,10 @@ import functools
 
 import click
 
-from .banner import _BOLD_RED, _INFO_COLOR, _RESET, print_banner
+from .banner import _BOLD_RED, _INFO_COLOR, _RESET
 
 
 def _print_error(message: str, hint: str) -> None:
-    print_banner()
     click.echo(f"{_BOLD_RED}error:{_RESET} {message}", err=True)
     click.echo(f"{_INFO_COLOR}Hint: {hint}{_RESET}", err=True)
 

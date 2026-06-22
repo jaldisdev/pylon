@@ -36,7 +36,7 @@ def cli(ctx: click.Context) -> None:
 
     try:
         ctx.obj["config"] = load_config()
-    except FileNotFoundError:
+    except (FileNotFoundError, KeyError, ValueError):
         ctx.obj["config"] = None
 
     if ctx.invoked_subcommand is None:
@@ -61,6 +61,7 @@ cli.add_command(version)
 
 
 @cli.command("migrate", short_help="Shortcut for `pylon migration migrate`.")
+@click.argument("migration_name", required=False)
 @click.option(
     "--dry-run",
     is_flag=True,
@@ -68,6 +69,6 @@ cli.add_command(version)
     help="Preview SQL without applying.",
 )
 @click.pass_context
-def migrate_shortcut(ctx: click.Context, dry_run: bool) -> None:
+def migrate_shortcut(ctx: click.Context, migration_name: str | None, dry_run: bool) -> None:
     """Shortcut for `pylon migration migrate`."""
-    ctx.invoke(migration.commands["migrate"], dry_run=dry_run)  # type: ignore[index]
+    ctx.invoke(migration.commands["migrate"], migration_name=migration_name, dry_run=dry_run)  # type: ignore[index]
