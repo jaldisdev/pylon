@@ -605,6 +605,22 @@ impl Parser {
             return Ok(Expr::Tuple(vec![]));
         }
 
+        // Parenthesised statement: (SELECT ...), (INSERT ...), (UPDATE ...), (DELETE ...)
+        if matches!(
+            self.current(),
+            Token::Select | Token::Insert | Token::Update | Token::Delete
+        ) {
+            let stmt = match self.current() {
+                Token::Select => self.parse_select(),
+                Token::Insert => self.parse_insert(),
+                Token::Update => self.parse_update(),
+                Token::Delete => self.parse_delete(),
+                _ => unreachable!(),
+            }?;
+            self.eat(&Token::RParen)?;
+            return Ok(Expr::SubQuery(Box::new(stmt)));
+        }
+
         let first = self.parse_expr()?;
 
         // Named tuple: `(name := expr, ...)`

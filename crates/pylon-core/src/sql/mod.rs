@@ -58,13 +58,17 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     parts.extend(field_exprs);
     let tuple = parts.join(",\n    ");
 
-    let mut sql = format!(
-        "SELECT (\n    {}\n) AS result\nFROM {} AS {}",
-        tuple,
-        source_ref(&sel.source),
-        qi(alias),
-    );
+    // SELECT-over-DML: wrap inner statement in a CTE, select from it.
+    let from_clause = if let Some(dml) = &sel.dml_source {
+        let cte_sql = emit_dml_as_cte_source(dml);
+        format!("WITH \"_dml\" AS (\n{}\n)\nSELECT (\n    {}\n) AS result\nFROM \"_dml\" AS {}",
+            cte_sql, tuple, qi(alias))
+    } else {
+        format!("SELECT (\n    {}\n) AS result\nFROM {} AS {}",
+            tuple, source_ref(&sel.source), qi(alias))
+    };
 
+    let mut sql = from_clause;
     append_filter(&mut sql, &sel.filter);
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
@@ -81,6 +85,74 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
                 fields: root_fields,
             },
         },
+    }
+}
+
+/// Emit a DML statement for use as a CTE source, using `RETURNING *` to expose
+/// all columns to the outer SELECT.  The DML's own returning shape is ignored.
+fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
+    match stmt {
+        IrStmt::Insert(ins) => {
+            let rewrite_cols: std::collections::HashSet<&str> =
+                ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+            let cols: Vec<String> = ins.assignments.iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(c, _)| format!("    {}", qi(c)))
+                .chain(ins.rewrites.iter().map(|r| format!("    {}", qi(&r.column))))
+                .collect();
+            let vals: Vec<String> = ins.assignments.iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(_, e)| format!("    {}", emit_expr(e)))
+                .chain(ins.rewrites.iter().map(|r| format!("    {}", emit_expr(&r.expr))))
+                .collect();
+            let mut sql = format!(
+                "    INSERT INTO {} (\n{}\n    ) VALUES (\n{}\n    )",
+                source_ref(&ins.target),
+                cols.join(",\n"),
+                vals.join(",\n"),
+            );
+            if let Some(conflict) = &ins.unless_conflict {
+                match (&conflict.on, &conflict.else_) {
+                    (None, None) => sql.push_str(" ON CONFLICT DO NOTHING"),
+                    (Some(on_expr), None) => sql.push_str(
+                        &format!(" ON CONFLICT ({}) DO NOTHING", emit_expr(on_expr))),
+                    _ => {}
+                }
+            }
+            sql.push_str("\n    RETURNING *");
+            sql
+        }
+        IrStmt::Update(upd) => {
+            let alias = &upd.target.alias;
+            let mut sets: Vec<String> = upd.assignments.iter()
+                .map(|(col, expr)| format!("    {} = {}", qi(col), emit_expr(expr)))
+                .collect();
+            for rw in &upd.rewrites {
+                sets.push(format!("    {} = {}", qi(&rw.column), emit_expr(&rw.expr)));
+            }
+            let mut sql = format!(
+                "    UPDATE {} AS {}\n    SET\n{}",
+                source_ref(&upd.target), qi(alias), sets.join(",\n"),
+            );
+            append_filter(&mut sql, &upd.filter);
+            sql.push_str("\n    RETURNING *");
+            sql
+        }
+        IrStmt::Delete(del) => {
+            let alias = &del.target.alias;
+            let mut sql = format!(
+                "    DELETE FROM {} AS {}",
+                source_ref(&del.target), qi(alias),
+            );
+            append_filter(&mut sql, &del.filter);
+            sql.push_str("\n    RETURNING *");
+            sql
+        }
+        IrStmt::Select(inner) => {
+            // SELECT-over-SELECT: emit the inner select as a subquery
+            let out = emit_select_stmt(inner);
+            format!("    {}", out.sql.replace('\n', "\n    "))
+        }
     }
 }
 
@@ -749,10 +821,12 @@ mod tests {
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
         assert!(out.sql.contains(") AS result"));
-        // Shape root should be Required (single inserted row)
+        // Bare INSERT returns pk only (Gel behaviour)
         let ShapeNode::Object { cardinality, fields, .. } = &out.shape.root else { panic!() };
         assert_eq!(*cardinality, Cardinality::Required);
-        assert!(fields.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name")));
+        // Only __type__ and id — not name or age
+        assert!(fields.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "id")));
+        assert!(!fields.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name")));
     }
 
     #[test]
@@ -760,16 +834,56 @@ mod tests {
         let out = compile_and_emit("UPDATE Person FILTER .name = $name SET { age := 31 }");
         assert!(out.sql.contains("UPDATE \"default\".\"Person\""));
         assert!(out.sql.contains("SET"));
+        // Bare UPDATE returns pk only
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
+        assert!(!out.sql.contains("\"name\"::text"), "bare UPDATE must not return name");
     }
 
     #[test]
     fn test_delete_returning() {
         let out = compile_and_emit("DELETE Person FILTER .id = $id");
         assert!(out.sql.contains("DELETE FROM \"default\".\"Person\""));
+        // Bare DELETE returns pk only
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
+        assert!(!out.sql.contains("\"name\"::text"), "bare DELETE must not return name");
+    }
+
+    #[test]
+    fn test_select_over_insert() {
+        let out = compile_and_emit(
+            "SELECT (INSERT Person { name := $name, age := $age }) { id, name }",
+        );
+        // Must use a CTE
+        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("INSERT INTO"));
+        assert!(out.sql.contains("RETURNING *"));
+        // Outer SELECT shapes the result
+        assert!(out.sql.contains("'default::Person'::text"));
+        assert!(out.sql.contains("\"name\"::text"));
+    }
+
+    #[test]
+    fn test_select_over_update() {
+        let out = compile_and_emit(
+            "SELECT (UPDATE Person FILTER .id = $id SET { name := $name }) { id, name }",
+        );
+        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("UPDATE"));
+        assert!(out.sql.contains("RETURNING *"));
+        assert!(out.sql.contains("\"name\"::text"));
+    }
+
+    #[test]
+    fn test_select_over_delete() {
+        let out = compile_and_emit(
+            "SELECT (DELETE Person FILTER .id = $id) { id, name }",
+        );
+        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("DELETE FROM"));
+        assert!(out.sql.contains("RETURNING *"));
+        assert!(out.sql.contains("\"name\"::text"));
     }
 
     fn make_schema_with_rewrite() -> SchemaDescriptor {

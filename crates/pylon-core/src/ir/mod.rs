@@ -31,6 +31,10 @@ pub struct IrSelect {
     pub order_by: Vec<IrSort>,
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
+    /// When this SELECT wraps a DML statement (`SELECT (INSERT …) { … }`),
+    /// the inner DML is stored here and emitted as a CTE.
+    /// `None` for plain `SELECT Type { … }`.
+    pub dml_source: Option<Box<IrStmt>>,
 }
 
 /// The relation being queried: a resolved type with its PostgreSQL table name
