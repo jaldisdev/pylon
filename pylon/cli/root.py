@@ -1,12 +1,28 @@
+import sys
+
 import click
 
 from pylon.config import load_config
 
+from .banner import _BOLD_RED, _RESET
 from .commands.database import database
 from .commands.migrations import migration
 from .commands.query import repl
 from .commands.version import version
 from .config import NO_CONFIG_HINT, _print_error, requires_config
+
+
+def main() -> None:
+    try:
+        cli(standalone_mode=False)
+    except click.exceptions.Exit as e:
+        sys.exit(e.exit_code)
+    except click.ClickException as e:
+        e.show()
+        sys.exit(e.exit_code)
+    except Exception as e:
+        click.echo(f"{_BOLD_RED}error:{_RESET} {e}", err=True)
+        sys.exit(1)
 
 
 @click.group(invoke_without_command=True)

@@ -19,7 +19,7 @@ dependencies = [
 dev = ["pytest>=9.1.1"]
 
 [project.scripts]
-pylon = 'pylon.cli:cli'
+pylon = 'pylon.cli:main'
 
 [tool.maturin]
 manifest-path = "crates/pylon-py/Cargo.toml"
