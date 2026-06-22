@@ -559,13 +559,18 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             emit_expr(&ie.else_),
         ),
         IrExpr::Subquery(sel) => {
+            // Scalar subquery for link FK assignments: returns the target pk column.
+            // Emitted as `(SELECT "alias"."id" FROM … WHERE …)`.
             let alias = &sel.source.alias;
-            let (sub_exprs, _) = build_shape(&sel.shape, alias);
-            let mut parts = vec![type_disc(&sel.source.type_name)];
-            parts.extend(sub_exprs);
+            let pk_col = sel
+                .shape
+                .iter()
+                .find_map(|f| if let IrShapeField::Scalar(s) = f { Some(s.column.as_str()) } else { None })
+                .unwrap_or("id");
             let mut sql = format!(
-                "(SELECT (\n    {}\n)\nFROM {} AS {}",
-                parts.join(",\n    "),
+                "(SELECT {}.{}\nFROM {} AS {}",
+                qi(alias),
+                qi(pk_col),
                 source_ref(&sel.source),
                 qi(alias),
             );
@@ -945,5 +950,30 @@ mod tests {
         assert!(out.sql.contains("SET"));
         assert!(out.sql.contains("\"slug\""));
         assert!(out.sql.contains("str_lower("));
+    }
+
+    #[test]
+    fn test_insert_link_subquery() {
+        let out = compile_and_emit(
+            "INSERT Person { name := $name, company := (SELECT Company FILTER .name = $co) }",
+        );
+        // The company column should be assigned via a scalar subquery
+        assert!(out.sql.contains("\"company\""));
+        assert!(out.sql.contains("SELECT"));
+        // The subquery must select the pk (id) of Company
+        assert!(out.sql.contains("\"id\""));
+        assert!(out.sql.contains("FROM \"default\".\"Company\""));
+        // Filter param must appear
+        assert!(out.sql.contains("$2")); // $1 = name, $2 = co
+    }
+
+    #[test]
+    fn test_update_link_subquery() {
+        let out = compile_and_emit(
+            "UPDATE Person FILTER .id = $id SET { company := (SELECT Company FILTER .name = $co) }",
+        );
+        assert!(out.sql.contains("\"company\""));
+        assert!(out.sql.contains("SELECT"));
+        assert!(out.sql.contains("FROM \"default\".\"Company\""));
     }
 }
