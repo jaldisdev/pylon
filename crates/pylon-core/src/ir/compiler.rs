@@ -279,6 +279,12 @@ impl<'a> Compiler<'a> {
                 let column = if let Some(p) = Self::resolve_property(td, field_name) {
                     p.name.clone()
                 } else if let Some(l) = Self::resolve_link(td, field_name) {
+                    // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
+                    // Compile as a scalar subquery returning the target pk (the FK uuid).
+                    if let Expr::SubQuery(inner_stmt) = expr {
+                        let ir_expr = self.compile_link_subquery(inner_stmt)?;
+                        return Ok((l.name.clone(), ir_expr));
+                    }
                     l.name.clone()
                 } else {
                     return Err(self.field_err(field_name, &td.name));
@@ -599,6 +605,42 @@ impl<'a> Compiler<'a> {
         }
 
         Err(self.field_err(field_name, &td.name))
+    }
+
+    /// Compile `(SELECT TargetType FILTER …)` as a scalar subquery for use in a
+    /// link assignment (`company := (SELECT Company FILTER .name = $co)`).
+    /// Returns `IrExpr::Subquery` whose shape is the target pk — the SQL emitter
+    /// renders this as `(SELECT "alias"."id" FROM … WHERE …)`.
+    fn compile_link_subquery(&mut self, stmt: &Stmt) -> Result<IrExpr, PyQLError> {
+        let Stmt::Select(sel) = stmt else {
+            return Err(self.type_err(
+                "only SELECT is valid as a link assignment value; \
+                 use SELECT (INSERT …) { id } to assign from a DML result",
+            ));
+        };
+        let type_name = self.expr_as_type_name(&sel.result)?;
+        let td = self.resolve_type(&type_name)?;
+        let alias = self.fresh_alias();
+
+        let filter = sel
+            .filter
+            .as_ref()
+            .map(|f| self.compile_expr(f, td, &alias))
+            .transpose()?;
+
+        Ok(IrExpr::Subquery(Box::new(IrSelect {
+            source: IrSource {
+                type_name: format!("{}::{}", td.module, td.name),
+                table: td.table.clone(),
+                alias,
+            },
+            shape: Self::pk_returning(td),
+            filter,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            dml_source: None,
+        })))
     }
 
     fn compile_sort(
