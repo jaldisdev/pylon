@@ -465,6 +465,39 @@ mod tests {
     }
 
     #[test]
+    fn test_type_error_uuid_eq_str() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .id = 'not-a-uuid'").unwrap();
+        let err = super::compile(&ast, &schema).err().expect("expected type error");
+        let msg = err.to_string();
+        assert!(msg.contains("std::uuid") && msg.contains("std::str"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn test_type_error_str_eq_int() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .name = 42").unwrap();
+        let err = super::compile(&ast, &schema).err().expect("expected type error");
+        let msg = err.to_string();
+        assert!(msg.contains("std::str") && msg.contains("std::int64"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn test_int_literal_compatible_with_all_int_columns() {
+        // age is int8; a bare integer literal is compatible with any int column
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .age = 30").unwrap();
+        assert!(super::compile(&ast, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_cast_int16_compatible_with_int8_column() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .age = <int16>30").unwrap();
+        assert!(super::compile(&ast, &schema).is_ok());
+    }
+
+    #[test]
     fn test_unknown_type_error() {
         let schema = make_schema();
         let ast = parse::parse("SELECT Ghost { name }").unwrap();

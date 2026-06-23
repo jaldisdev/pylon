@@ -606,6 +606,20 @@ impl<'a> Compiler<'a> {
             Expr::BinOp(b) => {
                 let left = self.compile_expr(&b.left, td, alias)?;
                 let right = self.compile_expr(&b.right, td, alias)?;
+                if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
+                    if !types_compatible(lt, rt) {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "operator '{op}' cannot be applied to operands of type \
+                                 '{lq}' and '{rq}'",
+                                op = b.op,
+                                lq = pg_type_to_pyql(lt),
+                                rq = pg_type_to_pyql(rt),
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
+                }
                 Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
             }
 
@@ -908,6 +922,57 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         other => other, // pass through for user-defined types / domains
     }
     .to_string())
+}
+
+/// Return the inferred pg_type of a compiled expression, if statically known.
+/// Params and complex sub-expressions return `None` (unchecked at compile time).
+fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
+    match expr {
+        IrExpr::ColumnRef { pg_type, .. } => Some(pg_type.as_str()),
+        IrExpr::TypeCast(tc) => Some(tc.pg_type.as_str()),
+        IrExpr::Literal(lit) => Some(match lit {
+            IrLiteral::Str(_) => "text",
+            IrLiteral::Int(_) => "__int_literal",
+            IrLiteral::Float(_) => "__float_literal",
+            IrLiteral::Bool(_) => "boolean",
+        }),
+        _ => None,
+    }
+}
+
+const INT_TYPES: &[&str] = &["int2", "int4", "int8", "__int_literal"];
+const FLOAT_TYPES: &[&str] = &["float4", "float8", "__float_literal"];
+
+fn types_compatible(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_int = INT_TYPES.contains(&a);
+    let b_int = INT_TYPES.contains(&b);
+    if a_int && b_int {
+        return true;
+    }
+    let a_float = FLOAT_TYPES.contains(&a);
+    let b_float = FLOAT_TYPES.contains(&b);
+    a_float && b_float
+}
+
+fn pg_type_to_pyql(pg: &str) -> &str {
+    match pg {
+        "text" | "varchar" => "std::str",
+        "uuid"             => "std::uuid",
+        "int2"             => "std::int16",
+        "int4"             => "std::int32",
+        "int8"             => "std::int64",
+        "float4"           => "std::float32",
+        "float8"           => "std::float64",
+        "boolean"          => "std::bool",
+        "numeric"          => "std::decimal",
+        "timestamptz"      => "std::datetime",
+        "__int_literal"    => "std::int64",
+        "__float_literal"  => "std::float64",
+        other              => other,
+    }
 }
 
 /// Walk an `IrExpr` tree and replace every `ColumnRef` whose column name appears

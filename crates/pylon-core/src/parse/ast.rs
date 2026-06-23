@@ -205,6 +205,22 @@ pub enum BinOpKind {
     Concat,
 }
 
+impl std::fmt::Display for BinOpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Add => "+", Self::Sub => "-", Self::Mul => "*",
+            Self::Div => "/", Self::FloorDiv => "//", Self::Mod => "%",
+            Self::Pow => "^", Self::Eq => "=", Self::Ne => "!=",
+            Self::Lt => "<", Self::Le => "<=", Self::Gt => ">", Self::Ge => ">=",
+            Self::And => "and", Self::Or => "or",
+            Self::Like => "like", Self::Ilike => "ilike",
+            Self::NotLike => "not like", Self::NotIlike => "not ilike",
+            Self::In => "in", Self::NotIn => "not in",
+            Self::Coalesce => "??", Self::Concat => "++",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnaryOp {
     pub op: UnaryOpKind,
