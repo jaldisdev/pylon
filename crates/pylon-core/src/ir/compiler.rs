@@ -374,7 +374,63 @@ impl<'a> Compiler<'a> {
             return Ok(Self::pk_returning(td));
         }
 
-        elements.iter().map(|el| self.compile_shape_element(el, td, alias, module)).collect()
+        let mut fields = vec![];
+        for el in elements {
+            if let Some(splat) = &el.splat {
+                fields.extend(self.compile_splat(splat, td, alias, module)?);
+            } else {
+                fields.push(self.compile_shape_element(el, td, alias, module)?);
+            }
+        }
+        Ok(fields)
+    }
+
+    /// Expand `*` → all scalars; `**` → all scalars + all single links with implicit `{ id }`.
+    fn compile_splat(
+        &mut self,
+        splat: &ast::Splat,
+        td: &TypeDescriptor,
+        alias: &str,
+        module: &str,
+    ) -> Result<Vec<IrShapeField>, PyQLError> {
+        let mut fields: Vec<IrShapeField> = td
+            .properties
+            .iter()
+            .map(|p| IrShapeField::Scalar(IrScalarField {
+                alias: p.name.clone(),
+                column: p.name.clone(),
+                pg_type: p.pg_type.clone(),
+            }))
+            .collect();
+
+        if matches!(splat, ast::Splat::Deep) {
+            for l in &td.links {
+                let target_td = self.resolve_type(&l.target)?;
+                let sub_alias = self.fresh_alias();
+                let sub_shape = Self::pk_returning(target_td);
+                let subquery = IrSelect {
+                    source: IrSource {
+                        type_name: format!("{}::{}", target_td.module, target_td.name),
+                        table: target_td.table.clone(),
+                        alias: sub_alias.clone(),
+                    },
+                    shape: sub_shape,
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    dml_source: None,
+                };
+                fields.push(IrShapeField::SingleLink(IrSingleLinkField {
+                    alias: l.name.clone(),
+                    fk_column: format!("{}_id", l.name),
+                    target_pk: "id".to_string(),
+                    subquery,
+                }));
+            }
+        }
+
+        Ok(fields)
     }
 
     fn compile_shape_element(

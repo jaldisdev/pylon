@@ -67,6 +67,24 @@ mod tests {
     }
 
     #[test]
+    fn test_shape_splat_shallow() {
+        let stmt = parse("SELECT Person { * }").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Shape(sh) = &sel.result else { panic!() };
+        assert_eq!(sh.elements.len(), 1);
+        assert!(matches!(sh.elements[0].splat, Some(ast::Splat::Shallow)));
+    }
+
+    #[test]
+    fn test_shape_splat_deep() {
+        let stmt = parse("SELECT Person { ** }").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Shape(sh) = &sel.result else { panic!() };
+        assert_eq!(sh.elements.len(), 1);
+        assert!(matches!(sh.elements[0].splat, Some(ast::Splat::Deep)));
+    }
+
+    #[test]
     fn test_select_order_by_limit_offset() {
         let stmt = parse("SELECT Person { name } ORDER BY .name ASC OFFSET 10 LIMIT 5").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
