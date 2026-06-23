@@ -67,6 +67,48 @@ mod tests {
     }
 
     #[test]
+    fn test_select_set_literal() {
+        let stmt = parse("SELECT {1, 2, 3}").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Set(elems) = sel.result else { panic!("expected Set") };
+        assert_eq!(elems.len(), 3);
+        assert!(matches!(elems[0], Expr::Literal(Literal::Int(1))));
+    }
+
+    #[test]
+    fn test_select_set_literal_single() {
+        let stmt = parse("SELECT {42}").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Set(elems) = sel.result else { panic!("expected Set") };
+        assert_eq!(elems.len(), 1);
+    }
+
+    #[test]
+    fn test_select_free_object() {
+        let stmt = parse("SELECT { foo := 'bar', n := 42 }").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Shape(sh) = sel.result else { panic!("expected Shape") };
+        assert!(sh.expr.is_none());
+        assert_eq!(sh.elements.len(), 2);
+        assert_eq!(sh.elements[0].path, Path::relative("foo"));
+        assert!(sh.elements[0].compexpr.is_some());
+    }
+
+    #[test]
+    fn test_select_tuple_expr() {
+        let stmt = parse("SELECT (1, 'hello')").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert!(matches!(sel.result, Expr::Tuple(_)));
+    }
+
+    #[test]
+    fn test_select_scalar_function() {
+        let stmt = parse("SELECT str_lower('HELLO')").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert!(matches!(sel.result, Expr::FunctionCall(_)));
+    }
+
+    #[test]
     fn test_shape_splat_shallow() {
         let stmt = parse("SELECT Person { * }").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };

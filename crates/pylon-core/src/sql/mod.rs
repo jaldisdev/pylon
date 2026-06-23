@@ -1,7 +1,7 @@
 use crate::ir::{
-    IrDelete, IrExpr, IrInsert, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput,
-    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource,
-    IrStmt, IrUpdate,
+    IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral, IrMultiLinkField,
+    IrMultiLinkJoin, IrNulls, IrOutput, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField,
+    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -14,6 +14,7 @@ pub struct SqlOutput {
 pub fn emit(ir: &IrOutput) -> SqlOutput {
     match &ir.stmt {
         IrStmt::Select(sel) => emit_select_stmt(sel),
+        IrStmt::FreeSelect(sel) => emit_free_select(sel),
         IrStmt::Insert(ins) => emit_insert_stmt(ins),
         IrStmt::Update(upd) => emit_update_stmt(upd),
         IrStmt::Delete(del) => emit_delete_stmt(del),
@@ -156,6 +157,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &inner.offset, &inner.limit);
             sql
         }
+        IrStmt::FreeSelect(_) => unreachable!("FreeSelect cannot appear as a CTE source"),
     }
 }
 
@@ -187,6 +189,83 @@ fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
         .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+// ── FREE SELECT ─────────────────────────────────────────────────────────────
+
+fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
+    use crate::query::{Cardinality, ShapeNode};
+
+    if sel.items.is_empty() {
+        return SqlOutput {
+            sql: "SELECT NULL AS result WHERE FALSE".to_string(),
+            shape: ShapeDescriptor {
+                root: ShapeNode::Scalar { name: String::new(), position: 0 },
+            },
+        };
+    }
+
+    let shape_root = free_item_shape(sel.items.first().unwrap());
+
+    let branches: Vec<String> = sel.items.iter().map(|item| match item {
+        IrFreeExpr::Scalar(expr) => {
+            // Array literals can't be decoded inside anonymous ROW() composites by asyncpg
+            // (OID 1007 has no composite-element codec). Return the array as a plain column
+            // instead — asyncpg decodes top-level array columns correctly.
+            if matches!(expr, IrExpr::Array(_)) {
+                format!("SELECT {} AS result", emit_expr(expr))
+            } else {
+                format!("SELECT ROW({}) AS result", emit_expr(expr))
+            }
+        }
+        IrFreeExpr::FreeObject(fields) => {
+            if fields.len() == 1 {
+                format!("SELECT ROW({}) AS result", emit_expr(&fields[0].1))
+            } else {
+                let exprs: Vec<String> = fields.iter().map(|(_, e)| emit_expr(e)).collect();
+                format!("SELECT ({}) AS result", exprs.join(", "))
+            }
+        }
+        IrFreeExpr::Tuple(exprs) => {
+            if exprs.len() == 1 {
+                format!("SELECT ROW({}) AS result", emit_expr(&exprs[0]))
+            } else {
+                let parts: Vec<String> = exprs.iter().map(emit_expr).collect();
+                format!("SELECT ({}) AS result", parts.join(", "))
+            }
+        }
+    }).collect();
+
+    let mut sql = branches.join("\nUNION ALL\n");
+    append_order_by(&mut sql, &sel.order_by);
+    append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+
+    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root } }
+}
+
+fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
+    use crate::query::{Cardinality, ShapeNode};
+    match item {
+        IrFreeExpr::Scalar(IrExpr::Array(_)) => ShapeNode::RawScalar,
+        IrFreeExpr::Scalar(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
+        IrFreeExpr::FreeObject(fields) => ShapeNode::Object {
+            name: String::new(),
+            type_name: None,
+            position: 0,
+            cardinality: Cardinality::Many,
+            fields: fields
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| ShapeNode::Scalar { name: name.clone(), position: i })
+                .collect(),
+        },
+        IrFreeExpr::Tuple(exprs) => ShapeNode::Tuple {
+            position: 0,
+            elements: (0..exprs.len())
+                .map(|i| ShapeNode::Scalar { name: String::new(), position: i })
+                .collect(),
+        },
+    }
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
@@ -581,6 +660,14 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
         IrExpr::FunctionCall(f) => {
             let args: Vec<_> = f.args.iter().map(emit_expr).collect();
+            if let Some(tmpl) = &f.sql_template {
+                // SqlExpression impl: substitute $1, $2, … with emitted arg SQL
+                let mut sql = tmpl.to_string();
+                for (i, arg) in args.iter().enumerate() {
+                    sql = sql.replace(&format!("${}", i + 1), arg);
+                }
+                return sql;
+            }
             let name = match &f.schema {
                 Some(s) => format!("{}.{}", qi(s), qi(&f.name)),
                 None => f.name.clone(),
@@ -594,6 +681,14 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             emit_expr(&ie.if_),
             emit_expr(&ie.else_),
         ),
+        IrExpr::Array(elems) => {
+            if elems.is_empty() {
+                "ARRAY[]::text[]".to_string()
+            } else {
+                let parts: Vec<String> = elems.iter().map(emit_expr).collect();
+                format!("ARRAY[{}]", parts.join(", "))
+            }
+        }
         IrExpr::Subquery(sel) => {
             // Scalar subquery for link FK assignments: returns the target pk column.
             // Emitted as `(SELECT "alias"."id" FROM … WHERE …)`.
@@ -787,6 +882,72 @@ mod tests {
         let ast = parse::parse(query).expect("parse failed");
         let ir = ir::compile(&ast, schema).expect("IR compile failed");
         emit(&ir)
+    }
+
+    #[test]
+    fn test_free_select_set_literal() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT {1, 2, 3}").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        // Three UNION ALL branches
+        assert_eq!(out.sql.matches("UNION ALL").count(), 2);
+        assert!(out.sql.contains("ROW(1)"));
+        assert!(out.sql.contains("ROW(2)"));
+        assert!(out.sql.contains("ROW(3)"));
+        assert!(out.sql.contains("AS result"));
+        assert!(matches!(out.shape.root, crate::query::ShapeNode::Scalar { .. }));
+    }
+
+    #[test]
+    fn test_free_select_free_object() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT { foo := 'bar', n := 42 }").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(out.sql.contains("'bar'"));
+        assert!(out.sql.contains("42"));
+        assert!(out.sql.contains("AS result"));
+        // Shape should describe an object with fields foo and n
+        let crate::query::ShapeNode::Object { fields, type_name, .. } = &out.shape.root
+            else { panic!("expected Object shape") };
+        assert!(type_name.is_none());
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(&fields[0], crate::query::ShapeNode::Scalar { name, position: 0 } if name == "foo"));
+        assert!(matches!(&fields[1], crate::query::ShapeNode::Scalar { name, position: 1 } if name == "n"));
+    }
+
+    #[test]
+    fn test_free_select_tuple() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT (1, 2)").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(out.sql.contains("1"));
+        assert!(out.sql.contains("2"));
+        assert!(out.sql.contains("AS result"));
+        assert!(matches!(out.shape.root, crate::query::ShapeNode::Tuple { .. }));
+    }
+
+    #[test]
+    fn test_free_select_scalar_literal() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT 'hello'").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(out.sql.contains("ROW('hello')"));
+        assert!(out.sql.contains("AS result"));
+        assert!(matches!(out.shape.root, crate::query::ShapeNode::Scalar { .. }));
+    }
+
+    #[test]
+    fn test_free_select_array_literal() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT [1, 2, 3]").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(out.sql.contains("SELECT ARRAY[1, 2, 3] AS result"));
+        assert!(matches!(out.shape.root, crate::query::ShapeNode::RawScalar));
     }
 
     #[test]
@@ -1025,7 +1186,7 @@ mod tests {
         // slug should appear in the INSERT column list via the rewrite
         assert!(out.sql.contains("\"slug\""));
         // The rewrite expression str_lower($1) should appear in VALUES
-        assert!(out.sql.contains("str_lower("));
+        assert!(out.sql.contains("lower("));
         // $1 (name param) should be the arg
         assert!(out.sql.contains("$1"));
     }
@@ -1041,7 +1202,7 @@ mod tests {
         // The literal 'manual' must NOT appear — rewrite wins
         assert!(!out.sql.contains("'manual'"), "rewrite must override explicit slug assignment");
         // The rewrite expression must appear
-        assert!(out.sql.contains("str_lower("), "rewrite expression must be present");
+        assert!(out.sql.contains("lower("), "rewrite expression must be present");
     }
 
     #[test]
@@ -1056,9 +1217,9 @@ mod tests {
         // Rewrite references .name which is also being SET to $name ($2).
         // After substitute_col_refs, the rewrite should use $2, not the pre-update column.
         // $1 = id (filter), $2 = name (assignment)
-        assert!(out.sql.contains("str_lower($2)"),
+        assert!(out.sql.contains("lower($2)"),
             "rewrite must use new name value ($2), got:\n{}", out.sql);
-        assert!(!out.sql.contains("str_lower(\"t0\".\"name\")"),
+        assert!(!out.sql.contains("lower(\"t0\".\"name\")"),
             "rewrite must not use pre-update column ref");
     }
 
@@ -1074,7 +1235,7 @@ mod tests {
         );
         assert!(out.sql.contains("\"slug\""));
         // .name is not being SET, so rewrite sees the current row value.
-        assert!(out.sql.contains("str_lower(\"t0\".\"name\")"),
+        assert!(out.sql.contains("lower(\"t0\".\"name\")"),
             "rewrite must use current row value when name is not being SET, got:\n{}", out.sql);
     }
 

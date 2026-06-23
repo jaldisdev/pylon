@@ -12,10 +12,10 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFunctionCall, IrIfElse, IrInsert,
-    IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrRewrite, IrScalarField,
-    IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast,
-    IrUnaryOp, IrUpdate,
+    IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect,
+    IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrNulls,
+    IrOutput, IrRewrite, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort,
+    IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -112,10 +112,178 @@ impl<'a> Compiler<'a> {
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<IrStmt, PyQLError> {
         match stmt {
-            Stmt::Select(s) => self.compile_select(s).map(IrStmt::Select),
+            Stmt::Select(s) => {
+                if self.is_free_result(&s.result) {
+                    self.compile_free_select(s).map(IrStmt::FreeSelect)
+                } else {
+                    self.compile_select(s).map(IrStmt::Select)
+                }
+            }
             Stmt::Insert(s) => self.compile_insert(s).map(IrStmt::Insert),
             Stmt::Update(s) => self.compile_update(s).map(IrStmt::Update),
             Stmt::Delete(s) => self.compile_delete(s).map(IrStmt::Delete),
+        }
+    }
+
+    /// Returns true when the SELECT result expression is not a schema type reference.
+    fn is_free_result(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(p) if !p.partial => false,
+            Expr::Shape(s) if s.expr.is_some() => false,
+            Expr::SubQuery(_) => false,
+            _ => true,
+        }
+    }
+
+    // ── FREE SELECT ───────────────────────────────────────────────────────────────
+
+    fn compile_free_select(
+        &mut self,
+        sel: &ast::SelectStmt,
+    ) -> Result<IrFreeSelect, PyQLError> {
+        if sel.filter.is_some() {
+            return Err(self.type_err("FILTER is not supported on free SELECT expressions"));
+        }
+
+        let items: Vec<IrFreeExpr> = match &sel.result {
+            Expr::Set(exprs) => exprs
+                .iter()
+                .map(|e| self.compile_free_expr(e).map(IrFreeExpr::Scalar))
+                .collect::<Result<_, _>>()?,
+            Expr::Shape(s) if s.expr.is_none() => {
+                let fields = s
+                    .elements
+                    .iter()
+                    .map(|el| -> Result<(String, IrExpr), PyQLError> {
+                        let name = path_leaf(&el.path)?.to_string();
+                        let expr = el.compexpr.as_ref().ok_or_else(|| {
+                            self.type_err(
+                                "free object field must have a value expression (':= expr')",
+                            )
+                        })?;
+                        Ok((name, self.compile_free_expr(expr)?))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                vec![IrFreeExpr::FreeObject(fields)]
+            }
+            Expr::Tuple(exprs) => {
+                let ir = exprs
+                    .iter()
+                    .map(|e| self.compile_free_expr(e))
+                    .collect::<Result<_, _>>()?;
+                vec![IrFreeExpr::Tuple(ir)]
+            }
+            other => vec![IrFreeExpr::Scalar(self.compile_free_expr(other)?)],
+        };
+
+        let order_by = sel
+            .order_by
+            .iter()
+            .map(|s| -> Result<IrSort, PyQLError> {
+                Ok(IrSort {
+                    expr: self.compile_free_expr(&s.expr)?,
+                    direction: match s.direction {
+                        SortDirection::Asc => IrSortDir::Asc,
+                        SortDirection::Desc => IrSortDir::Desc,
+                    },
+                    nulls: match s.nones {
+                        NonesOrder::First => IrNulls::First,
+                        NonesOrder::Last => IrNulls::Last,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let offset = sel
+            .offset
+            .as_ref()
+            .map(|e| self.compile_free_expr(e))
+            .transpose()?;
+        let limit = sel
+            .limit
+            .as_ref()
+            .map(|e| self.compile_free_expr(e))
+            .transpose()?;
+
+        Ok(IrFreeSelect { items, order_by, offset, limit })
+    }
+
+    /// Compile an expression that has no schema type context (no .field references).
+    fn compile_free_expr(&mut self, expr: &Expr) -> Result<IrExpr, PyQLError> {
+        match expr {
+            Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
+                Literal::Str(s) => IrLiteral::Str(s.clone()),
+                Literal::Int(n) => IrLiteral::Int(*n),
+                Literal::Float(f) => IrLiteral::Float(*f),
+                Literal::Bool(b) => IrLiteral::Bool(*b),
+            })),
+
+            Expr::Parameter(name) => {
+                let index = self.param_index(name);
+                Ok(IrExpr::Param { index })
+            }
+
+            Expr::FunctionCall(f) => {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| self.compile_free_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.resolve_fn_call(f.module.as_deref(), &f.name, args)
+            }
+
+            Expr::TypeCast(tc) => {
+                let inner = self.compile_free_expr(&tc.expr)?;
+                let pg_type = type_expr_to_pg(&tc.ty)?;
+                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
+            }
+
+            Expr::BinOp(b) => {
+                let left = self.compile_free_expr(&b.left)?;
+                let right = self.compile_free_expr(&b.right)?;
+                if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
+                    if !types_compatible(lt, rt) {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "operator '{op}' cannot be applied to operands of type \
+                                 '{lq}' and '{rq}'",
+                                op = b.op,
+                                lq = pg_type_to_pyql(lt),
+                                rq = pg_type_to_pyql(rt),
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
+                }
+                Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
+            }
+
+            Expr::UnaryOp(u) => {
+                let operand = self.compile_free_expr(&u.operand)?;
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: u.op.clone(), operand })))
+            }
+
+            Expr::IfElse(ie) => {
+                let condition = self.compile_free_expr(&ie.condition)?;
+                let if_ = self.compile_free_expr(&ie.if_expr)?;
+                let else_ = self.compile_free_expr(&ie.else_expr)?;
+                Ok(IrExpr::IfElse(Box::new(IrIfElse { condition, if_, else_ })))
+            }
+
+            Expr::Array(elems) => {
+                let items = elems
+                    .iter()
+                    .map(|e| self.compile_free_expr(e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(IrExpr::Array(items))
+            }
+
+            Expr::Path(p) if p.partial => Err(self.type_err(
+                "property reference (.field) is not valid in free SELECT; \
+                 use a schema-bound SELECT instead",
+            )),
+
+            _ => Err(self.type_err("expression is not valid in free SELECT context")),
         }
     }
 
@@ -634,11 +802,7 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|a| self.compile_expr(a, td, alias))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::FunctionCall(super::IrFunctionCall {
-                    schema: f.module.clone(),
-                    name: f.name.clone(),
-                    args,
-                }))
+                self.resolve_fn_call(f.module.as_deref(), &f.name, args)
             }
 
             Expr::TypeCast(tc) => {
@@ -654,9 +818,11 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::IfElse(Box::new(IrIfElse { condition, if_, else_ })))
             }
 
-            Expr::Shape(_) | Expr::Tuple(_) | Expr::NamedTuple(_) | Expr::Array(_) => {
+            Expr::Shape(_) | Expr::Tuple(_) | Expr::NamedTuple(_)
+            | Expr::Array(_) | Expr::Set(_) => {
                 Err(PyQLError::Type(PyQLTypeError {
-                    message: "shapes, tuples, and arrays are not valid in expression context"
+                    message: "shapes, tuples, arrays, and set literals are not valid \
+                               in expression context"
                         .into(),
                     position: Position { line: 0, col: 0 },
                 }))
@@ -817,6 +983,46 @@ impl<'a> Compiler<'a> {
                 NonesOrder::Last => IrNulls::Last,
             },
         })
+    }
+
+    // ── Stdlib function resolution ────────────────────────────────────────────────
+
+    /// Look up `name` in the stdlib (namespace = `module` or `"std"`) and produce
+    /// the correct `IrExpr::FunctionCall` based on the matching `ImplStrategy`.
+    /// Falls through to a plain call if no overload is found (unknown / PG built-in).
+    fn resolve_fn_call(
+        &self,
+        module: Option<&str>,
+        name: &str,
+        args: Vec<IrExpr>,
+    ) -> Result<IrExpr, PyQLError> {
+        use crate::stdlib::{lookup, ImplStrategy};
+
+        let ns = module.unwrap_or("std");
+        let overloads = lookup(ns, name);
+
+        let (schema, resolved_name, sql_template) = if let Some(desc) = overloads.first() {
+            match &desc.impl_strategy {
+                ImplStrategy::SqlBuiltin(sql_name) =>
+                    (None, sql_name.to_string(), None),
+                ImplStrategy::SqlExpression(tmpl) =>
+                    (None, name.to_string(), Some(tmpl.to_string())),
+                ImplStrategy::PylonFunction(def) =>
+                    (Some("_pylon".to_string()), def.name.to_string(), None),
+                // SqlOperator / TranspilerIntrinsic: pass through; handled elsewhere
+                _ => (module.map(str::to_string), name.to_string(), None),
+            }
+        } else {
+            // Not in stdlib — pass through to PostgreSQL as-is
+            (module.map(str::to_string), name.to_string(), None)
+        };
+
+        Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+            schema,
+            name: resolved_name,
+            args,
+            sql_template,
+        }))
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -1007,6 +1213,7 @@ pub(super) fn substitute_col_refs(
             schema: f.schema,
             name: f.name,
             args: f.args.into_iter().map(|a| substitute_col_refs(a, bindings)).collect(),
+            sql_template: f.sql_template,
         }),
         IrExpr::TypeCast(c) => IrExpr::TypeCast(Box::new(IrTypeCast {
             expr: substitute_col_refs(c.expr, bindings),
@@ -1017,6 +1224,9 @@ pub(super) fn substitute_col_refs(
             if_: substitute_col_refs(ie.if_, bindings),
             else_: substitute_col_refs(ie.else_, bindings),
         })),
+        IrExpr::Array(elems) => {
+            IrExpr::Array(elems.into_iter().map(|e| substitute_col_refs(e, bindings)).collect())
+        }
         // Literals, Params, Subqueries — no column refs to substitute
         other => other,
     }

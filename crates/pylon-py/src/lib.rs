@@ -1019,6 +1019,9 @@ fn shape_node_to_py<'py>(
             )?;
             d.set_item("elements", py_elems)?;
         }
+        ShapeNode::RawScalar => {
+            d.set_item("kind", "raw_scalar")?;
+        }
     }
     Ok(d.into_any())
 }

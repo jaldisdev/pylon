@@ -16,9 +16,34 @@ use crate::parse::ast::{BinOpKind, UnaryOpKind};
 #[derive(Debug, Clone)]
 pub enum IrStmt {
     Select(IrSelect),
+    /// A SELECT over a free expression: set literal, tuple, free object, or scalar function.
+    FreeSelect(IrFreeSelect),
     Insert(IrInsert),
     Update(IrUpdate),
     Delete(IrDelete),
+}
+
+// ── FREE SELECT (expressions, set literals, tuples, free objects) ───────────────
+
+/// A SELECT that does not reference a schema type.
+/// Emitted as one or more UNION ALL branches with a ROW(…) wrapper.
+#[derive(Debug, Clone)]
+pub struct IrFreeSelect {
+    /// One item per UNION ALL branch (set literals expand to multiple items).
+    pub items: Vec<IrFreeExpr>,
+    pub order_by: Vec<IrSort>,
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrFreeExpr {
+    /// A single scalar value: `SELECT {1}`, `SELECT 'hello'`, `SELECT func()`.
+    Scalar(IrExpr),
+    /// A free object: `SELECT { foo := 'bar', n := 42 }`.
+    FreeObject(Vec<(String, IrExpr)>),
+    /// An anonymous tuple: `SELECT (1, 'x')`.
+    Tuple(Vec<IrExpr>),
 }
 
 // ── SELECT ──────────────────────────────────────────────────────────────────────
@@ -181,6 +206,8 @@ pub enum IrExpr {
     IfElse(Box<IrIfElse>),
     /// A scalar subquery (used for computed fields that are themselves selects).
     Subquery(Box<IrSelect>),
+    /// An array literal: `[1, 2, 3]`.
+    Array(Vec<IrExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +228,9 @@ pub struct IrFunctionCall {
     pub schema: Option<String>,
     pub name: String,
     pub args: Vec<IrExpr>,
+    /// Set for `SqlExpression` impls: raw SQL template where `$1`, `$2`, … are
+    /// replaced with the emitted arg expressions.
+    pub sql_template: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +298,8 @@ pub struct IrOutput {
 mod tests {
     use super::*;
     use crate::parse;
+    #[allow(unused_imports)]
+    use super::{IrFreeExpr, IrLiteral};
     use crate::schema::{
         LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
@@ -462,6 +494,65 @@ mod tests {
         assert_eq!(sel.shape.len(), 1);
         let IrShapeField::Scalar(f) = &sel.shape[0] else { panic!() };
         assert_eq!(f.alias, "id");
+    }
+
+    #[test]
+    fn test_free_select_set_literal() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT {1, 2, 3}").unwrap();
+        let ir = super::compile(&ast, &schema).unwrap();
+        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
+        assert_eq!(sel.items.len(), 3);
+        assert!(matches!(sel.items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(1)))));
+    }
+
+    #[test]
+    fn test_free_select_free_object() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT { foo := 'bar', n := 42 }").unwrap();
+        let ir = super::compile(&ast, &schema).unwrap();
+        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
+        assert_eq!(sel.items.len(), 1);
+        let IrFreeExpr::FreeObject(fields) = &sel.items[0] else { panic!("expected FreeObject") };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "foo");
+        assert_eq!(fields[1].0, "n");
+    }
+
+    #[test]
+    fn test_free_select_tuple() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT (1, 'hello')").unwrap();
+        let ir = super::compile(&ast, &schema).unwrap();
+        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
+        assert_eq!(sel.items.len(), 1);
+        assert!(matches!(sel.items[0], IrFreeExpr::Tuple(_)));
+    }
+
+    #[test]
+    fn test_free_select_scalar_literal() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT 42").unwrap();
+        let ir = super::compile(&ast, &schema).unwrap();
+        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
+        assert_eq!(sel.items.len(), 1);
+        assert!(matches!(sel.items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(42)))));
+    }
+
+    #[test]
+    fn test_free_select_function_call() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT str_lower('HELLO')").unwrap();
+        let ir = super::compile(&ast, &schema).unwrap();
+        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
+        assert!(matches!(sel.items[0], IrFreeExpr::Scalar(IrExpr::FunctionCall(_))));
+    }
+
+    #[test]
+    fn test_free_select_rejects_dot_path() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT {.name}").unwrap();
+        assert!(super::compile(&ast, &schema).is_err());
     }
 
     #[test]
