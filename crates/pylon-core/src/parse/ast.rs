@@ -130,9 +130,19 @@ pub struct ShapeExpr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Splat {
+    /// `*` — expand to all scalar properties.
+    Shallow,
+    /// `**` — expand to all scalar properties and all single links (with implicit `{ id }`).
+    Deep,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShapeElement {
     /// Relative path being shaped, e.g. `.name` or `.posts`.
     pub path: Path,
+    /// When set, this element is a wildcard expansion rather than a named field.
+    pub splat: Option<Splat>,
     /// Nested shape for links: `.posts { title, body }`.
     pub nested: Option<Vec<ShapeElement>>,
     /// Computed override: `.total := .price * .qty`.
@@ -142,6 +152,21 @@ pub struct ShapeElement {
     pub order_by: Vec<SortExpr>,
     pub offset: Option<Expr>,
     pub limit: Option<Expr>,
+}
+
+impl ShapeElement {
+    pub fn splat(kind: Splat) -> Self {
+        ShapeElement {
+            path: Path { steps: vec![], partial: true },
+            splat: Some(kind),
+            nested: None,
+            compexpr: None,
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+        }
+    }
 }
 
 // ── Operators ──────────────────────────────────────────────────────────────────

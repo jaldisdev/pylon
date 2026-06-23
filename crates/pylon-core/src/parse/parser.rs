@@ -723,6 +723,16 @@ impl Parser {
     }
 
     fn parse_shape_element(&mut self) -> Result<ShapeElement, PyQLSyntaxError> {
+        // Wildcard splats: `*` (shallow) and `**` (deep)
+        if matches!(self.current(), Token::StarStar) {
+            self.advance();
+            return Ok(ShapeElement::splat(Splat::Deep));
+        }
+        if matches!(self.current(), Token::Star) {
+            self.advance();
+            return Ok(ShapeElement::splat(Splat::Shallow));
+        }
+
         // Shape elements are partial paths relative to the shaped object.
         // They may start with `.name` or bare `name`.
         let path = if matches!(self.current(), Token::Dot) {
@@ -740,6 +750,7 @@ impl Parser {
             let compexpr = self.parse_expr()?;
             return Ok(ShapeElement {
                 path,
+                splat: None,
                 nested: None,
                 compexpr: Some(compexpr),
                 filter: None,
@@ -787,6 +798,7 @@ impl Parser {
 
             return Ok(ShapeElement {
                 path,
+                splat: None,
                 nested: Some(nested_elements),
                 compexpr: None,
                 filter,
@@ -799,6 +811,7 @@ impl Parser {
         // Bare inclusion: `.name`
         Ok(ShapeElement {
             path,
+            splat: None,
             nested: None,
             compexpr: None,
             filter: None,
