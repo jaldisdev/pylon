@@ -62,6 +62,8 @@ pub enum Expr {
     Tuple(Vec<Expr>),
     NamedTuple(Vec<(String, Expr)>),
     Array(Vec<Expr>),
+    /// A set literal: `{1, 2, 'hello'}`. Multiple values produce multiple rows.
+    Set(Vec<Expr>),
     /// A parenthesised statement used as an expression:
     /// `(INSERT ...)`, `(UPDATE ...)`, `(DELETE ...)`, `(SELECT ...)`.
     SubQuery(Box<Stmt>),

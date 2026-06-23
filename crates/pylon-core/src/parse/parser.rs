@@ -539,6 +539,38 @@ impl Parser {
             // Parenthesised expression, anonymous tuple, or named tuple
             Token::LParen => self.parse_paren_expr(),
 
+            // Set literal `{1, 2}` or free object `{ foo := 'bar' }`
+            Token::LBrace => {
+                self.advance(); // consume {
+                if matches!(self.current(), Token::RBrace) {
+                    self.advance();
+                    return Ok(Expr::Set(vec![]));
+                }
+                // Free object: starts with `ident :=` or `.ident :=`
+                let is_free_object = match self.current() {
+                    Token::Ident(_) => matches!(self.peek_ahead(1), Token::ColonEq),
+                    Token::Dot => {
+                        matches!(self.peek_ahead(1), Token::Ident(_))
+                            && matches!(self.peek_ahead(2), Token::ColonEq)
+                    }
+                    _ => false,
+                };
+                if is_free_object {
+                    let elements = self.parse_shape_body()?;
+                    self.eat(&Token::RBrace)?;
+                    return Ok(Expr::Shape(Box::new(ShapeExpr { expr: None, elements })));
+                }
+                // Set literal: comma-separated value expressions
+                let mut elems = vec![self.parse_expr()?];
+                while matches!(self.current(), Token::Comma) {
+                    self.advance();
+                    if matches!(self.current(), Token::RBrace) { break; }
+                    elems.push(self.parse_expr()?);
+                }
+                self.eat(&Token::RBrace)?;
+                Ok(Expr::Set(elems))
+            }
+
             // Array literal
             Token::LBracket => {
                 self.advance();

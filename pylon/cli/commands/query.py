@@ -121,8 +121,20 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
         click.echo(f"{_BOLD_RED}error:{_RESET} {e}")
         return
 
-    # Only show fields that were actually selected (exclude __type__ discriminator).
     shape = compiled.shape
+    shape_kind = shape.get("kind", "object")
+
+    # Free scalar: plain values like int, str, bool, and array literals
+    if shape_kind in ("scalar", "raw_scalar"):
+        click.echo(_format_set([_value(obj) for obj in results]))
+        return
+
+    # Anonymous tuple: (1, 'hello')
+    if shape_kind == "tuple":
+        click.echo(_format_set([_format_tuple(obj) for obj in results]))
+        return
+
+    # Schema object or free object
     selected = {f["name"] for f in shape.get("fields", []) if f["name"] != "__type__"}
     type_name = shape.get("type_name") or ""
 
@@ -136,7 +148,8 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
             }
             d["__type__"] = type_name or vars(obj).get("__pylon_type__") or type(obj).__name__
         elif isinstance(obj, dict):
-            d = {k: v for k, v in obj.items() if k == "__type__" or k in selected}
+            d = {k: v for k, v in obj.items() if k in selected}
+            d["__type__"] = type_name  # empty string for free objects
         else:
             d = {"__type__": type(obj).__name__, "value": str(obj)}
         display.append(d)
@@ -190,22 +203,32 @@ def _is_uuid(s: str) -> bool:
 
 def _format_object(type_name: str, fields: dict) -> str:
     pairs = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in fields.items())
-    return f"{_type(type_name)} {{{pairs}}}"
+    label = type_name or "Object"
+    return f"{_type(label)} {_brace('{')}{pairs}{_brace('}')}"
+
+
+def _format_tuple(t: tuple) -> str:
+    return "(" + ", ".join(_value(v) for v in t) + ")"
+
+
+def _format_set(items: list[str]) -> str:
+    """Render a set of pre-formatted value strings in Gel style."""
+    if not items:
+        return _brace("{}")
+    if len(items) == 1:
+        return f"{_brace('{')}{items[0]}{_brace('}')}"
+    inner = ",\n  ".join(items)
+    return f"{_brace('{')}\n  {inner}\n{_brace('}')}"
 
 
 def _format_results(results: list[dict]) -> str:
-    """Render a list of result objects in Gel-style coloured output.
-
-    Each dict is expected to have a ``__type__`` key with the qualified type
-    name and the remaining keys as selected fields, e.g.:
-        {'__type__': 'account::Organization', 'id': '...', 'name': '...'}
-    """
+    """Render a list of result objects in Gel-style coloured output."""
     if not results:
-        return f"{_brace('{}')}"
+        return _brace("{}")
 
     lines = [_brace("{")]
     for obj in results:
-        type_name = obj.pop("__type__", "unknown")
+        type_name = obj.pop("__type__", "")
         lines.append(f"  {_format_object(type_name, obj)},")
     lines.append(_brace("}"))
     return "\n".join(lines)
