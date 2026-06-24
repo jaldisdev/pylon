@@ -40,7 +40,7 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
     if kind == "scalar":
         return value[node["position"]]
 
-    if kind == "raw_scalar":
+    if kind in ("raw_scalar", "json_scalar"):
         return value
 
     if kind == "object":

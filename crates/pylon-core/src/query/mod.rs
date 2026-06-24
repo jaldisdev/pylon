@@ -18,6 +18,9 @@ pub enum ShapeNode {
     /// The `result` column IS the value — not wrapped in ROW(). Used for array literals
     /// where asyncpg can't decode array OIDs inside anonymous composites.
     RawScalar,
+    /// Like RawScalar but the value is a decoded JSON object (from a <json> cast).
+    /// REPL displays it as `Json("...")`.
+    JsonScalar,
     /// Object shape.
     /// `type_name = Some(s)` → named schema type decoded to a registered dataclass.
     /// `type_name = None`    → free type decoded to Pylon's generic Object dataclass.

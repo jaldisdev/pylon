@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -256,6 +257,7 @@ class Client:
                     dsn,
                     min_size=self._config.database.pool_min_size,
                     max_size=self._config.database.pool_max_size,
+                    init=_setup_codecs,
                 )
             except asyncpg.InvalidCatalogNameError as exc:
                 raise ConnectionFailedError(str(exc)) from exc
@@ -487,6 +489,16 @@ def create_async_client(config: Config | None = None) -> Client:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+async def _setup_codecs(conn: asyncpg.Connection) -> None:
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+        format="text",
+    )
 
 
 def _transpile(
