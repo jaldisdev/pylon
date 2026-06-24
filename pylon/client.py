@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
+import uuid as _uuid_mod
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -491,6 +493,75 @@ def create_async_client(config: Config | None = None) -> Client:
 # ---------------------------------------------------------------------------
 
 
+def _pg_decode_value(type_oid: int, data: bytes) -> Any:
+    match type_oid:
+        case 25 | 1043 | 1042:  # text, varchar, bpchar
+            return data.decode("utf-8")
+        case 2950:  # uuid
+            return str(_uuid_mod.UUID(bytes=data))
+        case 20:  # int8
+            return struct.unpack_from(">q", data)[0]
+        case 23:  # int4
+            return struct.unpack_from(">i", data)[0]
+        case 21:  # int2
+            return struct.unpack_from(">h", data)[0]
+        case 16:  # bool
+            return data[0] != 0
+        case 701:  # float8
+            return struct.unpack_from(">d", data)[0]
+        case 700:  # float4
+            return struct.unpack_from(">f", data)[0]
+        case 3802:  # jsonb: 1-byte version prefix + json text
+            return json.loads(data[1:].decode("utf-8"))
+        case 2249:  # record (nested composite)
+            return _pg_decode_record(data)
+        case 2287:  # _record (record[])
+            return _pg_decode_record_array(data)
+        case _:
+            return data
+
+
+def _pg_decode_record(data: bytes) -> tuple:
+    offset = 0
+    (nfields,) = struct.unpack_from(">i", data, offset)
+    offset += 4
+    fields: list[Any] = []
+    for _ in range(nfields):
+        (type_oid,) = struct.unpack_from(">I", data, offset)
+        offset += 4
+        (field_len,) = struct.unpack_from(">i", data, offset)
+        offset += 4
+        if field_len == -1:
+            fields.append(None)
+        else:
+            fields.append(_pg_decode_value(type_oid, data[offset : offset + field_len]))
+            offset += field_len
+    return tuple(fields)
+
+
+def _pg_decode_record_array(data: bytes) -> list:
+    offset = 0
+    (ndims,) = struct.unpack_from(">i", data, offset)
+    offset += 4
+    offset += 4  # flags (has-nulls)
+    offset += 4  # element OID (always 2249 for record[])
+    if ndims == 0:
+        return []
+    (dim,) = struct.unpack_from(">i", data, offset)
+    offset += 4
+    offset += 4  # lbound (usually 1)
+    result: list[Any] = []
+    for _ in range(dim):
+        (elem_len,) = struct.unpack_from(">i", data, offset)
+        offset += 4
+        if elem_len == -1:
+            result.append(None)
+        else:
+            result.append(_pg_decode_record(data[offset : offset + elem_len]))
+            offset += elem_len
+    return result
+
+
 async def _setup_codecs(conn: asyncpg.Connection) -> None:
     await conn.set_type_codec(
         "jsonb",
@@ -498,6 +569,14 @@ async def _setup_codecs(conn: asyncpg.Connection) -> None:
         decoder=json.loads,
         schema="pg_catalog",
         format="text",
+    )
+    # Monkey-patch: register a binary decoder for record[] (OID 2287) directly,
+    # bypassing asyncpg's scalar/composite validation in set_type_codec.
+    conn._protocol.get_settings().add_python_codec(
+        2287, "_record", "pg_catalog", [], "scalar",
+        lambda v: v,
+        _pg_decode_record_array,
+        "binary",
     )
 
 

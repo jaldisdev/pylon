@@ -214,6 +214,9 @@ def _value(v: object) -> str:
         return f"{_YELLOW}{str(v).lower()}{_RESET}"
     if v is None:
         return f"{_YELLOW}null{_RESET}"
+    if isinstance(v, list):
+        inner = ", ".join(_value(item) for item in v)
+        return f"{_brace('{')}{inner}{_brace('}')}"
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         qname = vars(v).get("__pylon_type__") or type(v).__name__
         pairs = ", ".join(
@@ -222,6 +225,9 @@ def _value(v: object) -> str:
             if k != "__pylon_type__"
         )
         return f"{_type(qname)} {_brace('{')}{pairs}{_brace('}')}"
+    if isinstance(v, dict):
+        pairs = ", ".join(f"{_key(k)}: {_value(val)}" for k, val in v.items())
+        return f"{_brace('{')}{pairs}{_brace('}')}"
     return str(v)
 
 
