@@ -968,6 +968,16 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_type_cast_select() {
+        let out = compile_and_emit(
+            "SELECT <default::Person><uuid>'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'",
+        );
+        assert!(out.sql.contains("FROM \"default\".\"Person\""));
+        assert!(out.sql.contains("WHERE"));
+        assert!(out.sql.contains("'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'"));
+    }
+
+    #[test]
     fn test_select_single_link() {
         let out = compile_and_emit("SELECT Person { name, company { name } }");
         assert!(out.sql.contains("'default::Company'::text"));

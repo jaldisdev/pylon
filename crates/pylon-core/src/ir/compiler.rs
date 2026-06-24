@@ -113,6 +113,12 @@ impl<'a> Compiler<'a> {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<IrStmt, PyQLError> {
         match stmt {
             Stmt::Select(s) => {
+                // <Module::Type>expr — schema object lookup by id.
+                if let Expr::TypeCast(tc) = &s.result {
+                    if tc.ty.module.as_deref().map(|m| m != "std").unwrap_or(false) {
+                        return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
+                    }
+                }
                 if self.is_free_result(&s.result) {
                     self.compile_free_select(s).map(IrStmt::FreeSelect)
                 } else {
@@ -123,6 +129,37 @@ impl<'a> Compiler<'a> {
             Stmt::Update(s) => self.compile_update(s).map(IrStmt::Update),
             Stmt::Delete(s) => self.compile_delete(s).map(IrStmt::Delete),
         }
+    }
+
+    /// `<Module::Type>expr` in SELECT position is a schema object lookup:
+    /// select the object whose `id` equals `expr`.  Semantically identical to
+    /// `SELECT Type FILTER .id = expr` plus any modifiers on the outer SELECT.
+    fn compile_schema_cast_select(
+        &mut self,
+        sel: &ast::SelectStmt,
+        tc: &ast::TypeCast,
+    ) -> Result<IrSelect, PyQLError> {
+        let id_filter = Expr::BinOp(Box::new(ast::BinOp {
+            left: Expr::Path(ast::Path::relative("id")),
+            op: ast::BinOpKind::Eq,
+            right: tc.expr.clone(),
+        }));
+        let merged_filter = match &sel.filter {
+            None => Some(id_filter),
+            Some(existing) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                left: id_filter,
+                op: ast::BinOpKind::And,
+                right: existing.clone(),
+            }))),
+        };
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(ast::Path::absolute(&tc.ty.name)),
+            filter: merged_filter,
+            order_by: sel.order_by.clone(),
+            offset: sel.offset.clone(),
+            limit: sel.limit.clone(),
+        };
+        self.compile_select(&synthetic)
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.
@@ -373,6 +410,12 @@ impl<'a> Compiler<'a> {
             Stmt::Update(upd) => self.expr_as_type_name(&upd.subject),
             Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
             Stmt::Select(sel) => {
+                // <Module::Type>expr — type name comes from the cast target
+                if let Expr::TypeCast(tc) = &sel.result {
+                    if tc.ty.module.as_deref().map(|m| m != "std").unwrap_or(false) {
+                        return Ok(tc.ty.name.clone());
+                    }
+                }
                 // SELECT-over-SELECT: get the type from the inner select's result
                 let (type_name, _, _) = self.extract_type_and_shape(&sel.result)?;
                 Ok(type_name)
