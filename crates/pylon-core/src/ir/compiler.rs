@@ -502,7 +502,7 @@ impl<'a> Compiler<'a> {
                     }
                     fk_col
                 } else {
-                    return Err(self.field_err(field_name, &td.name));
+                    return Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)));
                 };
 
                 let ir_expr = self.compile_expr(expr, td, alias)?;
@@ -788,7 +788,7 @@ impl<'a> Compiler<'a> {
             }));
         }
 
-        Err(self.field_err(field_name, &td.name))
+        Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
     }
 
     // ── Expression compilation ────────────────────────────────────────────────────
@@ -927,7 +927,7 @@ impl<'a> Compiler<'a> {
             });
         }
 
-        Err(self.field_err(field_name, &td.name))
+        Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
     }
 
     /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.
@@ -1081,7 +1081,7 @@ impl<'a> Compiler<'a> {
 
     fn field_err(&self, field: &str, type_name: &str) -> PyQLError {
         PyQLError::Resolution(PyQLResolutionError::UnknownField(PyQLUnknownFieldError {
-            message: format!("type '{type_name}' has no field '{field}'"),
+            message: format!("object type '{type_name}' has no link or property '{field}'"),
             position: Position { line: 0, col: 0 },
         }))
     }
