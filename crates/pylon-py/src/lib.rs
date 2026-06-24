@@ -1022,6 +1022,9 @@ fn shape_node_to_py<'py>(
         ShapeNode::RawScalar => {
             d.set_item("kind", "raw_scalar")?;
         }
+        ShapeNode::JsonScalar => {
+            d.set_item("kind", "json_scalar")?;
+        }
     }
     Ok(d.into_any())
 }

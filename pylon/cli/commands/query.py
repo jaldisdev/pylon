@@ -111,14 +111,14 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
         try:
             click.echo(await client.query_json(pyql))
         except Exception as e:
-            click.echo(f"{_BOLD_RED}error:{_RESET} {e}")
+            click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
         return
 
     try:
         compiled = pyql_compile(pyql)
         results = await client.query(pyql)
     except Exception as e:
-        click.echo(f"{_BOLD_RED}error:{_RESET} {e}")
+        click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
         return
 
     shape = compiled.shape
@@ -127,6 +127,15 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
     # Free scalar: plain values like int, str, bool, and array literals
     if shape_kind in ("scalar", "raw_scalar"):
         click.echo(_format_set([_value(obj) for obj in results]))
+        return
+
+    # JSON scalar: value decoded from jsonb, display as Json("...")
+    if shape_kind == "json_scalar":
+        import json as _json
+        def _json_display(v: object) -> str:
+            escaped = _json.dumps(v).replace('"', '\\"')
+            return f"Json({_brace(chr(34))}{escaped}{_brace(chr(34))})"
+        click.echo(_format_set([_json_display(obj) for obj in results]))
         return
 
     # Anonymous tuple: (1, 'hello')
@@ -157,6 +166,31 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
 
 
 # --- result formatting --------------------------------------------------------
+
+
+_PG_TO_PYQL = {
+    "timestamp with time zone": "datetime",
+    "time without time zone": "time",
+    "double precision": "float64",
+    "character varying": "str",
+    "smallint": "int16",
+    "integer": "int32",
+    "bigint": "int64",
+    "boolean": "bool",
+    "numeric": "decimal",
+    "bytea": "bytes",
+    "jsonb": "json",
+    "text": "str",
+    "real": "float32",
+}
+
+_PG_TYPE_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_PG_TO_PYQL, key=len, reverse=True)) + r")\b"
+)
+
+
+def _translate_pg_types(msg: str) -> str:
+    return _PG_TYPE_RE.sub(lambda m: _PG_TO_PYQL[m.group()], msg)
 
 
 def _type(s: str) -> str:

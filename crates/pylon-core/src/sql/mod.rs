@@ -193,6 +193,13 @@ fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
 
 // ── FREE SELECT ─────────────────────────────────────────────────────────────
 
+/// Types that asyncpg cannot decode inside anonymous ROW() composites.
+/// Return them as plain top-level columns instead.
+fn is_raw_scalar(expr: &IrExpr) -> bool {
+    matches!(expr, IrExpr::Array(_))
+        || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
+}
+
 fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
     use crate::query::{Cardinality, ShapeNode};
 
@@ -209,10 +216,9 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
 
     let branches: Vec<String> = sel.items.iter().map(|item| match item {
         IrFreeExpr::Scalar(expr) => {
-            // Array literals can't be decoded inside anonymous ROW() composites by asyncpg
-            // (OID 1007 has no composite-element codec). Return the array as a plain column
-            // instead — asyncpg decodes top-level array columns correctly.
-            if matches!(expr, IrExpr::Array(_)) {
+            // Arrays (OID 1007) and jsonb (OID 3802) can't be decoded inside anonymous
+            // ROW() composites by asyncpg. Return them as plain top-level columns instead.
+            if is_raw_scalar(expr) {
                 format!("SELECT {} AS result", emit_expr(expr))
             } else {
                 format!("SELECT ROW({}) AS result", emit_expr(expr))
@@ -246,7 +252,8 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
 fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match item {
-        IrFreeExpr::Scalar(IrExpr::Array(_)) => ShapeNode::RawScalar,
+        IrFreeExpr::Scalar(IrExpr::TypeCast(c)) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
+        IrFreeExpr::Scalar(e) if is_raw_scalar(e) => ShapeNode::RawScalar,
         IrFreeExpr::Scalar(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
         IrFreeExpr::FreeObject(fields) => ShapeNode::Object {
             name: String::new(),
@@ -674,7 +681,21 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             };
             format!("{}({})", name, args.join(", "))
         }
-        IrExpr::TypeCast(c) => format!("({})::{}", emit_expr(&c.expr), c.pg_type),
+        IrExpr::TypeCast(c) => {
+            // PostgreSQL doesn't support arbitrary_type::jsonb; to_jsonb() accepts any input.
+            // String literals have type "unknown" in PG, so cast to text first.
+            if c.pg_type == "jsonb" {
+                let inner = match &c.expr {
+                    IrExpr::Literal(IrLiteral::Str(_)) => {
+                        format!("{}::text", emit_expr(&c.expr))
+                    }
+                    _ => emit_expr(&c.expr),
+                };
+                format!("to_jsonb({})", inner)
+            } else {
+                format!("({})::{}", emit_expr(&c.expr), c.pg_type)
+            }
+        }
         IrExpr::IfElse(ie) => format!(
             "CASE WHEN {} THEN {} ELSE {} END",
             emit_expr(&ie.condition),
