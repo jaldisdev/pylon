@@ -1056,8 +1056,10 @@ impl<'a> Compiler<'a> {
                 _ => (module.map(str::to_string), name.to_string(), None),
             }
         } else {
-            // Not in stdlib — pass through to PostgreSQL as-is
-            (module.map(str::to_string), name.to_string(), None)
+            let qualified = format!("{}::{}", module.unwrap_or("default"), name);
+            return Err(self.type_err(&format!(
+                "function '{qualified}' does not exist"
+            )));
         };
 
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
