@@ -34,6 +34,7 @@ pub struct IrFreeSelect {
     pub order_by: Vec<IrSort>,
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,7 @@ pub struct IrSelect {
     pub order_by: Vec<IrSort>,
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
+    pub distinct: bool,
     /// When this SELECT wraps a DML statement (`SELECT (INSERT …) { … }`),
     /// the inner DML is stored here and emitted as a CTE.
     /// `None` for plain `SELECT Type { … }`.

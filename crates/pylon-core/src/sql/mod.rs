@@ -59,14 +59,16 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     parts.extend(field_exprs);
     let tuple = parts.join(",\n    ");
 
+    let distinct = if sel.distinct { "DISTINCT " } else { "" };
+
     // SELECT-over-DML: wrap inner statement in a CTE, select from it.
     let from_clause = if let Some(dml) = &sel.dml_source {
         let cte_sql = emit_dml_as_cte_source(dml);
-        format!("WITH \"_dml\" AS (\n{}\n)\nSELECT (\n    {}\n) AS result\nFROM \"_dml\" AS {}",
-            cte_sql, tuple, qi(alias))
+        format!("WITH \"_dml\" AS (\n{}\n)\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
+            cte_sql, distinct, tuple, qi(alias))
     } else {
-        format!("SELECT (\n    {}\n) AS result\nFROM {} AS {}",
-            tuple, source_ref(&sel.source), qi(alias))
+        format!("SELECT {}(\n    {}\n) AS result\nFROM {} AS {}",
+            distinct, tuple, source_ref(&sel.source), qi(alias))
     };
 
     let mut sql = from_clause;
@@ -242,7 +244,14 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
         }
     }).collect();
 
-    let mut sql = branches.join("\nUNION ALL\n");
+    let union_sql = branches.join("\nUNION ALL\n");
+
+    let mut sql = if sel.distinct {
+        // Wrap UNION ALL in an outer SELECT DISTINCT to deduplicate.
+        format!("SELECT DISTINCT * FROM (\n{}\n) AS \"_distinct\"", union_sql)
+    } else {
+        union_sql
+    };
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 

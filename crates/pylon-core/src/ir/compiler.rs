@@ -113,16 +113,22 @@ impl<'a> Compiler<'a> {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<IrStmt, PyQLError> {
         match stmt {
             Stmt::Select(s) => {
+                let (distinct, result) = match &s.result {
+                    Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct =>
+                        (true, &u.operand),
+                    other => (false, other),
+                };
+
                 // <Module::Type>expr — schema object lookup by id.
-                if let Expr::TypeCast(tc) = &s.result {
+                if let Expr::TypeCast(tc) = result {
                     if tc.ty.module.as_deref().map(|m| m != "std").unwrap_or(false) {
                         return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
                     }
                 }
-                if self.is_free_result(&s.result) {
-                    self.compile_free_select(s).map(IrStmt::FreeSelect)
+                if self.is_free_result(result) {
+                    self.compile_free_select(s, distinct).map(IrStmt::FreeSelect)
                 } else {
-                    self.compile_select(s).map(IrStmt::Select)
+                    self.compile_select(s, distinct).map(IrStmt::Select)
                 }
             }
             Stmt::Insert(s) => self.compile_insert(s).map(IrStmt::Insert),
@@ -159,11 +165,15 @@ impl<'a> Compiler<'a> {
             offset: sel.offset.clone(),
             limit: sel.limit.clone(),
         };
-        self.compile_select(&synthetic)
+        self.compile_select(&synthetic, false)
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.
     fn is_free_result(&self, expr: &Expr) -> bool {
+        let expr = match expr {
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
+            other => other,
+        };
         match expr {
             Expr::Path(p) if !p.partial => false,
             Expr::Shape(s) if s.expr.is_some() => false,
@@ -177,12 +187,18 @@ impl<'a> Compiler<'a> {
     fn compile_free_select(
         &mut self,
         sel: &ast::SelectStmt,
+        distinct: bool,
     ) -> Result<IrFreeSelect, PyQLError> {
         if sel.filter.is_some() {
             return Err(self.type_err("FILTER is not supported on free SELECT expressions"));
         }
 
-        let items: Vec<IrFreeExpr> = match &sel.result {
+        let result_expr = match &sel.result {
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
+            other => other,
+        };
+
+        let items: Vec<IrFreeExpr> = match result_expr {
             Expr::Set(exprs) => exprs
                 .iter()
                 .map(|e| self.compile_free_expr(e).map(IrFreeExpr::Scalar))
@@ -242,7 +258,7 @@ impl<'a> Compiler<'a> {
             .map(|e| self.compile_free_expr(e))
             .transpose()?;
 
-        Ok(IrFreeSelect { items, order_by, offset, limit })
+        Ok(IrFreeSelect { items, order_by, offset, limit, distinct })
     }
 
     /// Compile an expression that has no schema type context (no .field references).
@@ -326,9 +342,13 @@ impl<'a> Compiler<'a> {
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
 
-    fn compile_select(&mut self, sel: &ast::SelectStmt) -> Result<IrSelect, PyQLError> {
+    fn compile_select(&mut self, sel: &ast::SelectStmt, distinct: bool) -> Result<IrSelect, PyQLError> {
+        let result_expr = match &sel.result {
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
+            other => other,
+        };
         let (type_name, shape_elements, inner_stmt) =
-            self.extract_type_and_shape(&sel.result)?;
+            self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
         let source = IrSource {
@@ -368,7 +388,7 @@ impl<'a> Compiler<'a> {
             .map(|s| self.compile_stmt(s).map(Box::new))
             .transpose()?;
 
-        Ok(IrSelect { source, shape, filter, order_by, offset, limit, dml_source })
+        Ok(IrSelect { source, shape, filter, order_by, offset, limit, distinct, dml_source })
     }
 
     /// Unwrap `Shape(expr, elements)` or bare `Path` from a SELECT result.
@@ -722,6 +742,7 @@ impl<'a> Compiler<'a> {
                     order_by: vec![],
                     offset: None,
                     limit: None,
+                    distinct: false,
                     dml_source: None,
                 };
                 fields.push(IrShapeField::SingleLink(IrSingleLinkField {
@@ -790,6 +811,7 @@ impl<'a> Compiler<'a> {
                     order_by: vec![],
                     offset: None,
                     limit: None,
+                    distinct: false,
                     dml_source: None,
                 };
 
@@ -849,6 +871,7 @@ impl<'a> Compiler<'a> {
                 order_by: vec![],
                 offset: None,
                 limit: None,
+                distinct: false,
                 dml_source: None,
             };
             return Ok(IrShapeField::SingleLink(IrSingleLinkField {
@@ -938,6 +961,7 @@ impl<'a> Compiler<'a> {
                     .as_ref()
                     .map(|e| self.compile_expr(e, target_td, &sub_alias))
                     .transpose()?,
+                distinct: false,
                 dml_source: None,
             };
 
@@ -1157,6 +1181,7 @@ impl<'a> Compiler<'a> {
                     order_by: vec![],
                     offset: None,
                     limit: None,
+                    distinct: false,
                     dml_source: None,
                 })));
             }
@@ -1323,6 +1348,7 @@ impl<'a> Compiler<'a> {
                 order_by: vec![],
                 offset: None,
                 limit: None,
+                distinct: false,
                 dml_source: None,
             }));
             if flip {
@@ -1358,6 +1384,7 @@ impl<'a> Compiler<'a> {
             order_by: vec![],
             offset: None,
             limit: None,
+            distinct: false,
             dml_source: None,
         }));
 
@@ -1442,6 +1469,7 @@ impl<'a> Compiler<'a> {
             order_by: vec![],
             offset: None,
             limit: None,
+            distinct: false,
             dml_source: None,
         })))
     }
