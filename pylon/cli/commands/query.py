@@ -213,7 +213,7 @@ def _value(v: object) -> str:
     if isinstance(v, bool):
         return f"{_YELLOW}{str(v).lower()}{_RESET}"
     if v is None:
-        return f"{_YELLOW}null{_RESET}"
+        return f"{_brace('{')}{_brace('}')}"
     if isinstance(v, list):
         inner = ", ".join(_value(item) for item in v)
         return f"{_brace('{')}{inner}{_brace('}')}"
