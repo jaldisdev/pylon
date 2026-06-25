@@ -337,8 +337,8 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     let from_sql = from_parts.join("\n");
 
     let (result_expr, shape_root) = match &sel.result {
-        IrPathResult::Scalar { alias, column, .. } => {
-            let expr = format!("ROW({}.{}) AS result", qi(alias), qi(column));
+        IrPathResult::Scalar(ir_expr) => {
+            let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
             let shape = ShapeNode::Scalar { name: String::new(), position: 0 };
             (expr, shape)
         }
