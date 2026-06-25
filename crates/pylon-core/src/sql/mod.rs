@@ -317,28 +317,89 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
 
 fn emit_update_stmt(upd: &IrUpdate) -> SqlOutput {
     let alias = &upd.target.alias;
-    let mut sets: Vec<String> = upd
-        .assignments
-        .iter()
-        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-        .collect();
-    for rw in &upd.rewrites {
-        sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
-    }
-
-    let mut sql = format!(
-        "UPDATE {} AS {}\nSET {}",
-        source_ref(&upd.target),
-        qi(alias),
-        sets.join(", "),
-    );
-
-    append_filter(&mut sql, &upd.filter);
-
     let (shape, returning_sql) = emit_returning_shape(&upd.target, &upd.returning, true);
-    if let Some(r) = returning_sql {
-        sql.push_str(&r);
+
+    if upd.multi_link_clears.is_empty() {
+        // Simple UPDATE — no junction table changes.
+        let mut sets: Vec<String> = upd
+            .assignments
+            .iter()
+            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+            .collect();
+        for rw in &upd.rewrites {
+            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
+        }
+        let mut sql = format!(
+            "UPDATE {} AS {}\nSET {}",
+            source_ref(&upd.target),
+            qi(alias),
+            sets.join(", "),
+        );
+        append_filter(&mut sql, &upd.filter);
+        if let Some(r) = returning_sql {
+            sql.push_str(&r);
+        }
+        return SqlOutput { sql, shape };
     }
+
+    // UPDATE with multi-link clears — CTE so all changes are atomic.
+    // Build the result ROW expression for the final SELECT.
+    let result_expr = if !upd.returning.is_empty() {
+        let (field_exprs, _) = build_shape(&upd.returning, alias);
+        let mut parts = vec![type_disc(&upd.target.type_name)];
+        parts.extend(field_exprs);
+        parts.join(",\n    ")
+    } else {
+        format!("{}.id", qi(alias))
+    };
+
+    let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
+    let mut cte_parts: Vec<String> = vec![];
+
+    if has_scalar_changes {
+        let mut sets: Vec<String> = upd
+            .assignments
+            .iter()
+            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+            .collect();
+        for rw in &upd.rewrites {
+            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
+        }
+        let mut upd_sql = format!(
+            "UPDATE {} AS {}\nSET {}",
+            source_ref(&upd.target),
+            qi(alias),
+            sets.join(", "),
+        );
+        append_filter(&mut upd_sql, &upd.filter);
+        upd_sql.push_str("\nRETURNING *");
+        cte_parts.push(format!("_ids AS (\n{}\n)", upd_sql));
+    } else {
+        let mut sel = format!(
+            "SELECT {}.* FROM {} AS {}",
+            qi(alias),
+            source_ref(&upd.target),
+            qi(alias),
+        );
+        append_filter(&mut sel, &upd.filter);
+        cte_parts.push(format!("_ids AS (\n{}\n)", sel));
+    }
+
+    for (i, clr) in upd.multi_link_clears.iter().enumerate() {
+        let del = format!(
+            "DELETE FROM {} WHERE {} IN (SELECT id FROM _ids)",
+            qn(&clr.module, &clr.junction_table),
+            qi(&clr.source_col),
+        );
+        cte_parts.push(format!("_clr_{} AS (\n{}\n)", i, del));
+    }
+
+    let sql = format!(
+        "WITH\n{}\nSELECT (\n    {}\n) AS result\nFROM _ids AS {}",
+        cte_parts.join(",\n"),
+        result_expr,
+        qi(alias),
+    );
     SqlOutput { sql, shape }
 }
 
@@ -710,6 +771,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 format!("ARRAY[{}]", parts.join(", "))
             }
         }
+        IrExpr::Null => "NULL".to_string(),
         IrExpr::Subquery(sel) => {
             // Scalar subquery for link FK assignments: returns the target pk column.
             // Emitted as `(SELECT "alias"."id" FROM … WHERE …)`.

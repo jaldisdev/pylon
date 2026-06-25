@@ -179,6 +179,16 @@ pub struct IrUpdate {
     /// Schema-defined rewrites appended to the SET clause.
     pub rewrites: Vec<IrRewrite>,
     pub returning: Vec<IrShapeField>,
+    /// Multi-link junction tables to clear: DELETE WHERE source IN (updated ids).
+    pub multi_link_clears: Vec<IrMultiLinkClear>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrMultiLinkClear {
+    pub junction_table: String,
+    pub module: String,
+    /// Column on the junction table referencing the source object's id.
+    pub source_col: String,
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────────
@@ -208,6 +218,8 @@ pub enum IrExpr {
     Subquery(Box<IrSelect>),
     /// An array literal: `[1, 2, 3]`.
     Array(Vec<IrExpr>),
+    /// The empty set `{}` used as an assignment value — emits SQL `NULL`.
+    Null,
 }
 
 #[derive(Debug, Clone)]
