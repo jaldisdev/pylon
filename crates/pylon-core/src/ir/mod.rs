@@ -18,9 +18,43 @@ pub enum IrStmt {
     Select(IrSelect),
     /// A SELECT over a free expression: set literal, tuple, free object, or scalar function.
     FreeSelect(IrFreeSelect),
+    /// A flat SELECT produced by absolute path traversal: `select TypeName.link.prop`.
+    PathSelect(IrPathSelect),
     Insert(IrInsert),
     Update(IrUpdate),
     Delete(IrDelete),
+}
+
+// ── PATH SELECT (type-rooted path traversal) ────────────────────────────────────
+
+/// `select Person.company.name` — a flat SELECT that starts at a root type and
+/// follows links before projecting a final scalar column or object id.
+#[derive(Debug, Clone)]
+pub struct IrPathSelect {
+    pub root: IrSource,
+    pub joins: Vec<IrPathJoin>,
+    pub result: IrPathResult,
+    pub filter: Option<IrExpr>,
+    pub order_by: Vec<IrSort>,
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
+    pub distinct: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrPathJoin {
+    /// Traverse a single (FK) link.
+    Single { source_alias: String, fk_col: String, target: IrSource },
+    /// Traverse a multi-link via a junction table.
+    Multi { source_alias: String, junction_alias: String, join: IrMultiLinkJoin, target: IrSource },
+}
+
+#[derive(Debug, Clone)]
+pub enum IrPathResult {
+    /// Final step is a scalar property.
+    Scalar { alias: String, column: String, pg_type: String },
+    /// Final step is a link — return the linked objects with the given shape.
+    Object { alias: String, type_name: String, shape: Vec<IrShapeField> },
 }
 
 // ── FREE SELECT (expressions, set literals, tuples, free objects) ───────────────
