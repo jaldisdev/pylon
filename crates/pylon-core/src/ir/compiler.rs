@@ -944,6 +944,9 @@ impl<'a> Compiler<'a> {
             })),
 
             Expr::BinOp(b) => {
+                if let Some(exists) = self.try_multilink_exists(b, td, alias)? {
+                    return Ok(exists);
+                }
                 let left = self.compile_expr(&b.left, td, alias)?;
                 let right = self.compile_expr(&b.right, td, alias)?;
                 if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
@@ -1022,9 +1025,13 @@ impl<'a> Compiler<'a> {
             }));
         }
 
+        if p.steps.len() == 2 {
+            return self.compile_path_2step(p, td, alias);
+        }
+
         if p.steps.len() != 1 {
             return Err(PyQLError::Type(PyQLTypeError {
-                message: "nested path traversal in expressions is not yet supported".into(),
+                message: "path traversal deeper than 2 steps is not yet supported".into(),
                 position: Position { line: 0, col: 0 },
             }));
         }
@@ -1057,6 +1064,276 @@ impl<'a> Compiler<'a> {
         }
 
         Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
+    }
+
+    fn compile_path_2step(
+        &mut self,
+        p: &ast::Path,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let link_name = match &p.steps[0] {
+            ast::PathStep::Name(n) => n.as_str(),
+            _ => return Err(PyQLError::Type(PyQLTypeError {
+                message: "type intersections are not valid in expression context".into(),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+        let field_name = match &p.steps[1] {
+            ast::PathStep::Name(n) => n.as_str(),
+            _ => return Err(PyQLError::Type(PyQLTypeError {
+                message: "type intersections are not valid in expression context".into(),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+
+        if let Some(link) = Self::resolve_link(td, link_name) {
+            let fk_col = format!("{}_id", link_name);
+            if field_name == "id" {
+                return Ok(IrExpr::ColumnRef {
+                    alias: alias.to_string(),
+                    column: fk_col,
+                    pg_type: "uuid".to_string(),
+                });
+            }
+            let target_td = self.resolve_type(&link.target)?;
+            if let Some(prop) = Self::resolve_property(target_td, field_name) {
+                let ft_alias = self.fresh_alias();
+                return Ok(IrExpr::Subquery(Box::new(IrSelect {
+                    source: IrSource {
+                        type_name: format!("{}::{}", target_td.module, target_td.name),
+                        table: target_td.table.clone(),
+                        alias: ft_alias.clone(),
+                    },
+                    shape: vec![IrShapeField::Scalar(IrScalarField {
+                        alias: prop.name.clone(),
+                        column: prop.name.clone(),
+                        pg_type: prop.pg_type.clone(),
+                    })],
+                    filter: Some(IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::ColumnRef {
+                            alias: ft_alias.clone(),
+                            column: "id".to_string(),
+                            pg_type: "uuid".to_string(),
+                        },
+                        op: ast::BinOpKind::Eq,
+                        right: IrExpr::ColumnRef {
+                            alias: alias.to_string(),
+                            column: fk_col,
+                            pg_type: "uuid".to_string(),
+                        },
+                    }))),
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    dml_source: None,
+                })));
+            }
+            let target_name = link.target.clone();
+            return Err(self.field_err(field_name, &target_name));
+        }
+
+        if Self::resolve_multilink(td, link_name).is_some() {
+            return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "multi-link path '.{link_name}.{field_name}' must be used inside a comparison, \
+                     e.g.: filter .{link_name}.{field_name} = value"
+                ),
+                position: Position { line: 0, col: 0 },
+            }));
+        }
+
+        Err(self.field_err(link_name, &format!("{}::{}", td.module, td.name)))
+    }
+
+    /// If `b` has a 2-step multi-link path on either side, compile as EXISTS over the junction.
+    fn try_multilink_exists(
+        &mut self,
+        b: &ast::BinOp,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        fn ml_path_names(steps: &[ast::PathStep]) -> Option<(&str, &str)> {
+            if steps.len() != 2 { return None; }
+            let link = match &steps[0] { ast::PathStep::Name(n) => n.as_str(), _ => return None };
+            let field = match &steps[1] { ast::PathStep::Name(n) => n.as_str(), _ => return None };
+            Some((link, field))
+        }
+
+        let (link_name, field_name, value_ast, flip) = if let Expr::Path(p) = &b.left {
+            if p.partial {
+                if let Some((ln, fn_)) = ml_path_names(&p.steps) {
+                    if Self::resolve_multilink(td, ln).is_some() {
+                        (ln, fn_, &b.right, false)
+                    } else { return Ok(None); }
+                } else { return Ok(None); }
+            } else { return Ok(None); }
+        } else if let Expr::Path(p) = &b.right {
+            if p.partial {
+                if let Some((ln, fn_)) = ml_path_names(&p.steps) {
+                    if Self::resolve_multilink(td, ln).is_some() {
+                        (ln, fn_, &b.left, true)
+                    } else { return Ok(None); }
+                } else { return Ok(None); }
+            } else { return Ok(None); }
+        } else {
+            return Ok(None);
+        };
+
+        let value_expr = self.compile_expr(value_ast, td, alias)?;
+        let ml_name = link_name.to_string();
+        let fd_name = field_name.to_string();
+        let ml = Self::resolve_multilink(td, &ml_name).unwrap();
+        // Clone what we need to avoid borrow conflicts with self below.
+        let ml_target = ml.target.clone();
+        let ml_through = ml.through.clone();
+        let td_module = td.module.clone();
+        let td_name = td.name.clone();
+        let td_table = td.table.clone();
+
+        let jt_alias = self.fresh_alias();
+
+        // Resolve junction table columns.
+        let (jt_table, jt_module, jt_src_col, jt_tgt_col) = if let Some(through_qname) = &ml_through {
+            let through_td = self.resolve_type(through_qname)?;
+            let source_qname = format!("{}::{}", td_module, td_name);
+            let src_col = through_td
+                .links.iter()
+                .find(|l| l.target == source_qname)
+                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                    message: format!("through type {through_qname} has no link to {source_qname}"),
+                    position: Position { line: 0, col: 0 },
+                }))?
+                .name.clone();
+            let tgt_col = through_td
+                .links.iter()
+                .find(|l| l.target == ml_target && l.name != src_col)
+                .or_else(|| through_td.links.iter().find(|l| l.target == ml_target))
+                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                    message: format!("through type {through_qname} has no link to {ml_target}"),
+                    position: Position { line: 0, col: 0 },
+                }))?
+                .name.clone();
+            (
+                through_td.table.clone(),
+                through_td.module.clone(),
+                format!("{}_id", src_col),
+                format!("{}_id", tgt_col),
+            )
+        } else {
+            (
+                format!("{}.{}", td_table, ml_name),
+                td_module.clone(),
+                "source".to_string(),
+                "target".to_string(),
+            )
+        };
+
+        // source filter: jt.src_col = parent.id
+        let src_filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef {
+                alias: jt_alias.clone(),
+                column: jt_src_col,
+                pg_type: "uuid".to_string(),
+            },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef {
+                alias: alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+        }));
+
+        // field filter: compare the accessed field against the value
+        let (field_left, field_op, field_right) = if fd_name == "id" {
+            let col_ref = IrExpr::ColumnRef {
+                alias: jt_alias.clone(),
+                column: jt_tgt_col,
+                pg_type: "uuid".to_string(),
+            };
+            if flip {
+                (value_expr, b.op.clone(), col_ref)
+            } else {
+                (col_ref, b.op.clone(), value_expr)
+            }
+        } else {
+            let target_td = self.resolve_type(&ml_target)?;
+            let prop = target_td
+                .properties.iter()
+                .find(|p| p.name == fd_name)
+                .ok_or_else(|| self.field_err(&fd_name, &ml_target))?;
+            let prop_name = prop.name.clone();
+            let prop_pg = prop.pg_type.clone();
+            let ft_alias = self.fresh_alias();
+            let scalar_sub = IrExpr::Subquery(Box::new(IrSelect {
+                source: IrSource {
+                    type_name: ml_target.clone(),
+                    table: target_td.table.clone(),
+                    alias: ft_alias.clone(),
+                },
+                shape: vec![IrShapeField::Scalar(IrScalarField {
+                    alias: prop_name.clone(),
+                    column: prop_name,
+                    pg_type: prop_pg,
+                })],
+                filter: Some(IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: ft_alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: IrExpr::ColumnRef {
+                        alias: jt_alias.clone(),
+                        column: jt_tgt_col,
+                        pg_type: "uuid".to_string(),
+                    },
+                }))),
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                dml_source: None,
+            }));
+            if flip {
+                (value_expr, b.op.clone(), scalar_sub)
+            } else {
+                (scalar_sub, b.op.clone(), value_expr)
+            }
+        };
+
+        let field_filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: field_left,
+            op: field_op,
+            right: field_right,
+        }));
+
+        let full_filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: src_filter,
+            op: ast::BinOpKind::And,
+            right: field_filter,
+        }));
+
+        // EXISTS(SELECT 1 FROM junction jt WHERE ...)
+        // type_name carries the module prefix so source_ref() emits the right schema.
+        let jt_source = IrSource {
+            type_name: format!("{}::__jt__", jt_module),
+            table: jt_table,
+            alias: jt_alias,
+        };
+        let inner = IrExpr::Subquery(Box::new(IrSelect {
+            source: jt_source,
+            shape: vec![],  // empty → SELECT 1
+            filter: Some(full_filter),
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            dml_source: None,
+        }));
+
+        Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: ast::UnaryOpKind::Exists,
+            operand: inner,
+        }))))
     }
 
     /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.

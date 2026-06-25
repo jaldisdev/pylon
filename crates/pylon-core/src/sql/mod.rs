@@ -773,21 +773,22 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
         IrExpr::Null => "NULL".to_string(),
         IrExpr::Subquery(sel) => {
-            // Scalar subquery for link FK assignments: returns the target pk column.
-            // Emitted as `(SELECT "alias"."id" FROM … WHERE …)`.
             let alias = &sel.source.alias;
-            let pk_col = sel
-                .shape
-                .iter()
-                .find_map(|f| if let IrShapeField::Scalar(s) = f { Some(s.column.as_str()) } else { None })
-                .unwrap_or("id");
-            let mut sql = format!(
-                "(SELECT {}.{}\nFROM {} AS {}",
-                qi(alias),
-                qi(pk_col),
-                source_ref(&sel.source),
-                qi(alias),
-            );
+            let mut sql = if sel.shape.is_empty() {
+                // EXISTS inner: SELECT 1 FROM …
+                format!("(SELECT 1\nFROM {} AS {}", source_ref(&sel.source), qi(alias))
+            } else {
+                // Scalar subquery: SELECT alias.col FROM …
+                let pk_col = sel
+                    .shape
+                    .iter()
+                    .find_map(|f| if let IrShapeField::Scalar(s) = f { Some(s.column.as_str()) } else { None })
+                    .unwrap_or("id");
+                format!(
+                    "(SELECT {}.{}\nFROM {} AS {}",
+                    qi(alias), qi(pk_col), source_ref(&sel.source), qi(alias),
+                )
+            };
             append_filter(&mut sql, &sel.filter);
             append_order_by(&mut sql, &sel.order_by);
             append_offset_limit(&mut sql, &sel.offset, &sel.limit);
