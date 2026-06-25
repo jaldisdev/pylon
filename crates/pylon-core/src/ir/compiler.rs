@@ -1509,7 +1509,17 @@ impl<'a> Compiler<'a> {
         let ns = module.unwrap_or("std");
         let overloads = lookup(ns, name);
 
-        let (schema, resolved_name, sql_template) = if let Some(desc) = overloads.first() {
+        // Pick the overload whose parameter types best match the argument types.
+        // Fall back to the first registered overload when no type info is available.
+        let best = overloads
+            .iter()
+            .find(|d| {
+                d.params.len() == args.len()
+                    && d.params.iter().zip(&args).all(|(p, a)| pylon_type_matches(a, &p.ty))
+            })
+            .or_else(|| overloads.first());
+
+        let (schema, resolved_name, sql_template) = if let Some(desc) = best {
             match &desc.impl_strategy {
                 ImplStrategy::SqlBuiltin(sql_name) =>
                     (None, sql_name.to_string(), None),
@@ -1649,8 +1659,30 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
     .to_string())
 }
 
-/// Return the inferred pg_type of a compiled expression, if statically known.
-/// Params and complex sub-expressions return `None` (unchecked at compile time).
+/// Check whether a compiled expression is compatible with a PylonType parameter.
+/// Used for overload selection when multiple overloads share the same name.
+fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
+    use crate::stdlib::PylonType as PT;
+    match ty {
+        // Wildcard params always match.
+        PT::Any | PT::AnyOrderable | PT::AnyPoint => true,
+        PT::Array(_) => matches!(expr, IrExpr::Array(_)),
+        PT::Json => infer_ir_type(expr) == Some("jsonb"),
+        PT::Bytes => infer_ir_type(expr) == Some("bytea"),
+        PT::Str => infer_ir_type(expr) == Some("text"),
+        PT::Bool => infer_ir_type(expr) == Some("boolean"),
+        PT::Uuid => infer_ir_type(expr) == Some("uuid"),
+        PT::Int16 | PT::Int32 | PT::Int64 | PT::BigInt =>
+            matches!(infer_ir_type(expr), Some(t) if INT_TYPES.contains(&t)),
+        PT::Float32 | PT::Float64 =>
+            matches!(infer_ir_type(expr), Some(t) if FLOAT_TYPES.contains(&t)),
+        PT::Range(_) => matches!(infer_ir_type(expr), Some(t) if t.ends_with("range") && !t.starts_with('m')),
+        PT::Multirange(_) => matches!(infer_ir_type(expr), Some(t) if t.starts_with("multi")),
+        // For unrecognised / complex types, allow (don't reject).
+        _ => true,
+    }
+}
+
 fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
     match expr {
         IrExpr::ColumnRef { pg_type, .. } => Some(pg_type.as_str()),
