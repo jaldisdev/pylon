@@ -478,6 +478,25 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
     ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+        self.compile_assignments_inner(elements, td, alias, false)
+    }
+
+    fn compile_assignments_for_update(
+        &mut self,
+        elements: &[ShapeElement],
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+        self.compile_assignments_inner(elements, td, alias, true)
+    }
+
+    fn compile_assignments_inner(
+        &mut self,
+        elements: &[ShapeElement],
+        td: &TypeDescriptor,
+        alias: &str,
+        deny_readonly: bool,
+    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
         elements
             .iter()
             .map(|el| {
@@ -491,8 +510,20 @@ impl<'a> Compiler<'a> {
 
                 // Validate the field exists
                 let column = if let Some(p) = Self::resolve_property(td, field_name) {
+                    if deny_readonly && p.is_readonly {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: format!("cannot update property '{field_name}': it is declared as read-only"),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
                     p.name.clone()
                 } else if let Some(l) = Self::resolve_link(td, field_name) {
+                    if deny_readonly && l.is_readonly {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: format!("cannot update link '{field_name}': it is declared as read-only"),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
                     // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
                     // Compile as a scalar subquery returning the target pk (the FK uuid).
                     let fk_col = format!("{}_id", l.name);
@@ -590,7 +621,7 @@ impl<'a> Compiler<'a> {
             .cloned()
             .collect();
 
-        let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
+        let assignments = self.compile_assignments_for_update(&scalar_elements, td, &alias)?;
         // Substitute assignment expressions into rewrites so that when a rewrite
         // references a property that is also being SET in this UPDATE, it sees
         // the new value (e.g. $2) rather than the pre-update row value ("t0"."name").
@@ -1376,7 +1407,7 @@ impl<'a> Compiler<'a> {
         let upd_td = self.resolve_type(&type_name)?;
         // Filter on the ELSE UPDATE is ignored — PostgreSQL infers the conflicting
         // row from the ON CONFLICT target automatically.
-        self.compile_assignments(&upd.shape, upd_td, "")
+        self.compile_assignments_for_update(&upd.shape, upd_td, "")
     }
 
     /// Compile `(SELECT TargetType FILTER …)` as a scalar subquery for use in a
