@@ -700,6 +700,74 @@ impl<'a> Compiler<'a> {
                     subquery,
                 }));
             }
+
+            for ml in &td.multilinks {
+                let sub_alias = self.fresh_alias();
+                let target_td = self.resolve_type(&ml.target)?;
+                let sub_shape = Self::pk_returning(target_td);
+
+                let join = if let Some(through_qname) = &ml.through {
+                    let through_td = self.resolve_type(through_qname)?;
+                    let source_qname = format!("{}::{}", td.module, td.name);
+                    let source_col = through_td
+                        .links
+                        .iter()
+                        .find(|l| l.target == source_qname)
+                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "through type {through_qname} has no link to source type {source_qname}"
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }))?
+                        .name
+                        .clone();
+                    let target_col = through_td
+                        .links
+                        .iter()
+                        .find(|l| l.target == ml.target && l.name != source_col)
+                        .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "through type {through_qname} has no link to target type {}",
+                                ml.target
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }))?
+                        .name
+                        .clone();
+                    IrMultiLinkJoin::Through {
+                        junction_table: through_td.table.clone(),
+                        module: through_td.module.clone(),
+                        source_col,
+                        target_col,
+                    }
+                } else {
+                    IrMultiLinkJoin::Standard {
+                        junction_table: format!("{}.{}", td.table, ml.name),
+                        module: module.to_string(),
+                    }
+                };
+
+                let subquery = IrSelect {
+                    source: IrSource {
+                        type_name: format!("{}::{}", target_td.module, target_td.name),
+                        table: target_td.table.clone(),
+                        alias: sub_alias.clone(),
+                    },
+                    shape: sub_shape,
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    dml_source: None,
+                };
+
+                fields.push(IrShapeField::MultiLink(IrMultiLinkField {
+                    alias: ml.name.clone(),
+                    join,
+                    subquery,
+                }));
+            }
         }
 
         Ok(fields)
