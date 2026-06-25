@@ -51,8 +51,8 @@ pub enum IrPathJoin {
 
 #[derive(Debug, Clone)]
 pub enum IrPathResult {
-    /// Final step is a scalar property.
-    Scalar { alias: String, column: String, pg_type: String },
+    /// Final result is a scalar expression (column ref or computed expr like EXISTS).
+    Scalar(IrExpr),
     /// Final step is a link — return the linked objects with the given shape.
     Object { alias: String, type_name: String, shape: Vec<IrShapeField> },
 }

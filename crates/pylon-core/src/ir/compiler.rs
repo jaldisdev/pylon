@@ -140,6 +140,11 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
+                // Expression containing a type-rooted path: `select fn(TypeName.link.prop, ...)`.
+                if let Some(root) = self.find_path_root_in_expr(result) {
+                    return self.compile_expr_as_path_select(s, result, &root, distinct)
+                        .map(IrStmt::PathSelect);
+                }
                 if self.is_free_result(result) {
                     self.compile_free_select(s, distinct).map(IrStmt::FreeSelect)
                 } else {
@@ -227,11 +232,11 @@ impl<'a> Compiler<'a> {
                         "'{step_name}' is a scalar property, not a link — cannot traverse further"
                     )));
                 }
-                let result = IrPathResult::Scalar {
+                let result = IrPathResult::Scalar(IrExpr::ColumnRef {
                     alias: current_alias.clone(),
                     column: p.name.clone(),
                     pg_type: p.pg_type.clone(),
-                };
+                });
                 let (filter, order_by, offset, limit) =
                     self.compile_path_modifiers(sel, current_td, &current_alias)?;
                 return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
@@ -358,6 +363,96 @@ impl<'a> Compiler<'a> {
             .map(|e| self.compile_expr(e, td, alias))
             .transpose()?;
         Ok((filter, order_by, offset, limit))
+    }
+
+    // ── Expression-over-type dispatch ─────────────────────────────────────────────
+
+    /// Recursively find the first absolute path (non-partial, multi-step) in an expression
+    /// and return its root type name if it resolves to a known schema type.
+    fn find_path_root_in_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Path(p) if !p.partial && p.steps.len() > 1 => {
+                if let ast::PathStep::Name(root) = &p.steps[0] {
+                    if self.resolve_type(root).is_ok() { return Some(root.clone()); }
+                }
+                None
+            }
+            Expr::FunctionCall(f) =>
+                f.args.iter().find_map(|a| self.find_path_root_in_expr(a)),
+            Expr::BinOp(b) =>
+                self.find_path_root_in_expr(&b.left)
+                    .or_else(|| self.find_path_root_in_expr(&b.right)),
+            Expr::UnaryOp(u) => self.find_path_root_in_expr(&u.operand),
+            _ => None,
+        }
+    }
+
+    /// Rewrite absolute paths rooted at `root_name` to relative (partial) paths.
+    fn rewrite_abs_to_partial(expr: Expr, root_name: &str) -> Expr {
+        match expr {
+            Expr::Path(ref p) if !p.partial => {
+                if let ast::PathStep::Name(first) = &p.steps[0] {
+                    if first == root_name && p.steps.len() > 1 {
+                        return Expr::Path(ast::Path {
+                            steps: p.steps[1..].to_vec(),
+                            partial: true,
+                        });
+                    }
+                }
+                expr
+            }
+            Expr::FunctionCall(f) => Expr::FunctionCall(ast::FunctionCall {
+                module: f.module,
+                name: f.name,
+                args: f.args.into_iter()
+                    .map(|a| Self::rewrite_abs_to_partial(a, root_name))
+                    .collect(),
+                kwargs: f.kwargs,
+            }),
+            Expr::BinOp(b) => Expr::BinOp(Box::new(ast::BinOp {
+                left: Self::rewrite_abs_to_partial(b.left, root_name),
+                op: b.op,
+                right: Self::rewrite_abs_to_partial(b.right, root_name),
+            })),
+            Expr::UnaryOp(u) => Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: u.op,
+                operand: Self::rewrite_abs_to_partial(u.operand, root_name),
+            })),
+            other => other,
+        }
+    }
+
+    /// Compile an expression that contains a type-rooted absolute path as a flat
+    /// path select, iterating over the root type and projecting the expression as
+    /// a scalar computed field.
+    fn compile_expr_as_path_select(
+        &mut self,
+        sel: &ast::SelectStmt,
+        result: &Expr,
+        root_type_name: &str,
+        distinct: bool,
+    ) -> Result<IrPathSelect, PyQLError> {
+        let td = self.resolve_type(root_type_name)?;
+        let alias = self.fresh_alias();
+        let root = IrSource {
+            type_name: format!("{}::{}", td.module, td.name),
+            table: td.table.clone(),
+            alias: alias.clone(),
+        };
+        let rewritten = Self::rewrite_abs_to_partial(result.clone(), root_type_name);
+        let expr = self.compile_expr(&rewritten, td, &alias)?;
+        let (filter, order_by, offset, limit) =
+            self.compile_path_modifiers(sel, td, &alias)?;
+        Ok(IrPathSelect {
+            root,
+            joins: vec![],
+            result: IrPathResult::Scalar(expr),
+            filter,
+            order_by,
+            offset,
+            limit,
+            distinct,
+        })
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.
@@ -1249,6 +1344,30 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FunctionCall(f) => {
+                // contains(.multilink.scalar, value) → EXISTS (set-membership semantics)
+                if (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && f.name == "contains"
+                    && f.args.len() == 2
+                {
+                    if let Expr::Path(p) = &f.args[0] {
+                        if p.partial && p.steps.len() == 2 {
+                            if let ast::PathStep::Name(ln) = &p.steps[0] {
+                                if Self::resolve_multilink(td, ln).is_some() {
+                                    let synthetic = ast::BinOp {
+                                        left: f.args[0].clone(),
+                                        op: ast::BinOpKind::Eq,
+                                        right: f.args[1].clone(),
+                                    };
+                                    if let Some(exists) =
+                                        self.try_multilink_exists(&synthetic, td, alias)?
+                                    {
+                                        return Ok(exists);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let args = f
                     .args
                     .iter()
