@@ -567,5 +567,17 @@ END"#)),
             vec![p("d", RelativeDuration)],
             RelativeDuration,
             sql("duration_normalize_days", "SELECT justify_days(justify_hours($1))")),
+
+        // ── sys ───────────────────────────────────────────────────────────────
+
+        f("sys", "get_version_as_str",
+            vec![],
+            Str,
+            E(concat!("'", env!("CARGO_PKG_VERSION"), "'"))),
+
+        f("sys", "get_version",
+            vec![],
+            Tuple(vec![Int64, Int64, Str, Int64, Array(Box::new(Str))]),
+            E(env!("PYLON_VERSION_ROW"))),
     ]
 }
