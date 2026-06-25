@@ -222,6 +222,9 @@ pub enum IrExpr {
     Array(Vec<IrExpr>),
     /// The empty set `{}` used as an assignment value — emits SQL `NULL`.
     Null,
+    /// An aggregate function applied to an inline set literal `fn({e1, e2, ...})`.
+    /// Emits: `(SELECT fn_name(v) FROM (SELECT e1 UNION ALL ...) AS _set(v))`
+    AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
 }
 
 #[derive(Debug, Clone)]
