@@ -13,9 +13,9 @@ use std::collections::HashMap;
 
 use super::{
     IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect,
-    IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrNulls,
-    IrOutput, IrRewrite, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort,
-    IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkClear, IrMultiLinkField,
+    IrMultiLinkJoin, IrNulls, IrOutput, IrRewrite, IrScalarField, IrSelect, IrShapeField,
+    IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -505,7 +505,12 @@ impl<'a> Compiler<'a> {
                     return Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)));
                 };
 
-                let ir_expr = self.compile_expr(expr, td, alias)?;
+                // `{}` (empty set) in assignment position means NULL.
+                let ir_expr = if matches!(expr, Expr::Set(v) if v.is_empty()) {
+                    IrExpr::Null
+                } else {
+                    self.compile_expr(expr, td, alias)?
+                };
                 Ok((column, ir_expr))
             })
             .collect()
@@ -529,7 +534,63 @@ impl<'a> Compiler<'a> {
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
 
-        let assignments = self.compile_assignments(&upd.shape, td, &alias)?;
+        // Split shape elements: multi-link `{}` clears vs scalar/link assignments.
+        let mut multi_link_clears = vec![];
+        let scalar_elements: Vec<_> = upd
+            .shape
+            .iter()
+            .filter(|el| {
+                let field_name = match path_leaf(&el.path) {
+                    Ok(n) => n,
+                    Err(_) => return true,
+                };
+                if let Some(ml) = Self::resolve_multilink(td, field_name) {
+                    let is_empty_set = el
+                        .compexpr
+                        .as_ref()
+                        .map(|e| matches!(e, Expr::Set(v) if v.is_empty()))
+                        .unwrap_or(false);
+                    if is_empty_set {
+                        let (junction_table, module, source_col) = match &ml.through {
+                            None => (
+                                format!("{}.{}", td.table, ml.name),
+                                td.module.clone(),
+                                "source".to_string(),
+                            ),
+                            Some(through_qname) => {
+                                if let Ok(through_td) = self.resolve_type(through_qname) {
+                                    let source_qname =
+                                        format!("{}::{}", td.module, td.name);
+                                    let source_col = through_td
+                                        .links
+                                        .iter()
+                                        .find(|l| l.target == source_qname)
+                                        .map(|l| l.name.clone())
+                                        .unwrap_or_else(|| "source".to_string());
+                                    (
+                                        through_td.table.clone(),
+                                        through_td.module.clone(),
+                                        source_col,
+                                    )
+                                } else {
+                                    return true;
+                                }
+                            }
+                        };
+                        multi_link_clears.push(IrMultiLinkClear {
+                            junction_table,
+                            module,
+                            source_col,
+                        });
+                        return false; // exclude from scalar assignments
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
         // Substitute assignment expressions into rewrites so that when a rewrite
         // references a property that is also being SET in this UPDATE, it sees
         // the new value (e.g. $2) rather than the pre-update row value ("t0"."name").
@@ -545,7 +606,7 @@ impl<'a> Compiler<'a> {
             .collect();
         let returning = Self::pk_returning(td);
 
-        Ok(IrUpdate { target, filter, assignments, rewrites, returning })
+        Ok(IrUpdate { target, filter, assignments, rewrites, returning, multi_link_clears })
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────────────
