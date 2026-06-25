@@ -94,7 +94,9 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("std", "max",       vec![p("s", set_of(AnyOrderable))], opt(AnyOrderable), B("max")),
         f("std", "mean",      vec![p("s", set_of(Float64))],      Float64, B("avg")),
         f("std", "mean",      vec![p("s", set_of(Decimal))],      Decimal, B("avg")),
-f("std", "array_agg", vec![p("s", set_of(Any))],          arr(Any), B("array_agg")),
+        f("std", "all",       vec![p("vals", set_of(Bool))],      Bool,    B("bool_and")),
+        f("std", "any",       vec![p("vals", set_of(Bool))],      Bool,    B("bool_or")),
+        f("std", "array_agg", vec![p("s", set_of(Any))],          arr(Any), B("array_agg")),
 
         // ── std:: set ────────────────────────────────────────────────────────
         f("std", "enumerate",

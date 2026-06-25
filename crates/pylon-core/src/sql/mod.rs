@@ -781,6 +781,14 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             }
         }
         IrExpr::Null => "NULL".to_string(),
+        IrExpr::AggOverSet { fn_name, schema: _, elems } => {
+            let union_all = elems
+                .iter()
+                .map(|e| format!("SELECT {}", emit_expr(e)))
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
+            format!("(SELECT {}(v) FROM ({}) AS _set(v))", fn_name, union_all)
+        }
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;
             let mut sql = if sel.shape.is_empty() {

@@ -277,6 +277,36 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FunctionCall(f) => {
+                // If any argument is a set literal, this must be an aggregate.
+                // Compile as AggOverSet rather than a regular function call.
+                let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
+                if let Some(idx) = set_arg_idx {
+                    if let Expr::Set(set_elems) = &f.args[idx] {
+                        use crate::stdlib::{lookup, ImplStrategy};
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let overloads = lookup(ns, &f.name);
+                        let best = overloads
+                            .iter()
+                            .find(|d| d.params.len() == f.args.len())
+                            .or_else(|| overloads.first());
+                        let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
+                            Some(ImplStrategy::SqlBuiltin(sql_name)) =>
+                                (None, sql_name.to_string()),
+                            Some(_) => return Err(self.type_err(&format!(
+                                "function '{}::{}' cannot be called with a set literal in this context",
+                                ns, f.name
+                            ))),
+                            None => return Err(self.type_err(&format!(
+                                "function '{}::{}' does not exist", ns, f.name
+                            ))),
+                        };
+                        let elems = set_elems
+                            .iter()
+                            .map(|e| self.compile_free_expr(e))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
+                    }
+                }
                 let args = f
                     .args
                     .iter()
