@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use super::{
     IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect,
     IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkClear, IrMultiLinkField,
-    IrMultiLinkJoin, IrNulls, IrOutput, IrRewrite, IrScalarField, IrSelect, IrShapeField,
-    IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrRewrite,
+    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource,
+    IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -125,6 +126,20 @@ impl<'a> Compiler<'a> {
                         return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
                     }
                 }
+                // Path traversal: `select TypeName.link.prop` or `select TypeName.link { shape }`.
+                if let Expr::Path(p) = result {
+                    if !p.partial && p.steps.len() > 1 {
+                        return self.compile_path_select(s, p, &[], distinct).map(IrStmt::PathSelect);
+                    }
+                }
+                if let Expr::Shape(sh) = result {
+                    if let Some(Expr::Path(p)) = sh.expr.as_ref() {
+                        if !p.partial && p.steps.len() > 1 {
+                            return self.compile_path_select(s, p, &sh.elements, distinct)
+                                .map(IrStmt::PathSelect);
+                        }
+                    }
+                }
                 if self.is_free_result(result) {
                     self.compile_free_select(s, distinct).map(IrStmt::FreeSelect)
                 } else {
@@ -166,6 +181,183 @@ impl<'a> Compiler<'a> {
             limit: sel.limit.clone(),
         };
         self.compile_select(&synthetic, false)
+    }
+
+    // ── PATH SELECT ───────────────────────────────────────────────────────────────
+
+    /// `select TypeName.link.prop` / `select TypeName.link { shape }`.
+    /// Walks the path, building JOIN steps, then projects the final field or object.
+    fn compile_path_select(
+        &mut self,
+        sel: &ast::SelectStmt,
+        path: &ast::Path,
+        shape_elements: &[ShapeElement],
+        distinct: bool,
+    ) -> Result<IrPathSelect, PyQLError> {
+        use ast::PathStep;
+
+        let root_name = match &path.steps[0] {
+            PathStep::Name(n) => n.as_str(),
+            _ => return Err(self.type_err("path traversal must start with a type name")),
+        };
+        let root_td = self.resolve_type(root_name)?;
+        let root_alias = self.fresh_alias();
+        let root = IrSource {
+            type_name: format!("{}::{}", root_td.module, root_td.name),
+            table: root_td.table.clone(),
+            alias: root_alias.clone(),
+        };
+
+        let mut joins: Vec<IrPathJoin> = vec![];
+        let mut current_td = root_td;
+        let mut current_alias = root_alias;
+
+        let steps = &path.steps[1..];
+        for (i, step) in steps.iter().enumerate() {
+            let step_name = match step {
+                PathStep::Name(n) => n.as_str(),
+                _ => return Err(self.type_err("only name steps are supported in path traversal")),
+            };
+            let is_last = i == steps.len() - 1;
+
+            // Check scalar property first.
+            if let Some(p) = current_td.properties.iter().find(|p| p.name == step_name) {
+                if !is_last {
+                    return Err(self.type_err(&format!(
+                        "'{step_name}' is a scalar property, not a link — cannot traverse further"
+                    )));
+                }
+                let result = IrPathResult::Scalar {
+                    alias: current_alias.clone(),
+                    column: p.name.clone(),
+                    pg_type: p.pg_type.clone(),
+                };
+                let (filter, order_by, offset, limit) =
+                    self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+            }
+
+            // Single link.
+            if let Some(l) = Self::resolve_link(current_td, step_name) {
+                let target_td = self.resolve_type(&l.target)?;
+                let target_alias = self.fresh_alias();
+                let target = IrSource {
+                    type_name: format!("{}::{}", target_td.module, target_td.name),
+                    table: target_td.table.clone(),
+                    alias: target_alias.clone(),
+                };
+                joins.push(IrPathJoin::Single {
+                    source_alias: current_alias.clone(),
+                    fk_col: format!("{}_id", l.name),
+                    target: target,
+                });
+                if is_last {
+                    let shape = self.compile_shape(shape_elements, target_td, &target_alias,
+                        &target_td.module.clone())?;
+                    let result = IrPathResult::Object {
+                        alias: target_alias.clone(),
+                        type_name: format!("{}::{}", target_td.module, target_td.name),
+                        shape,
+                    };
+                    let (filter, order_by, offset, limit) =
+                        self.compile_path_modifiers(sel, target_td, &target_alias)?;
+                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                }
+                current_td = target_td;
+                current_alias = target_alias;
+                continue;
+            }
+
+            // Multi-link.
+            if let Some(ml) = Self::resolve_multilink(current_td, step_name) {
+                let target_td = self.resolve_type(&ml.target)?;
+                let target_alias = self.fresh_alias();
+                let junction_alias = self.fresh_alias();
+                let target = IrSource {
+                    type_name: format!("{}::{}", target_td.module, target_td.name),
+                    table: target_td.table.clone(),
+                    alias: target_alias.clone(),
+                };
+                let join_info = if let Some(through_qname) = &ml.through {
+                    let through_td = self.resolve_type(through_qname)?;
+                    let source_qname = format!("{}::{}", current_td.module, current_td.name);
+                    let source_col = through_td.links.iter()
+                        .find(|l| l.target == source_qname)
+                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to {source_qname}"),
+                            position: Position { line: 0, col: 0 },
+                        }))?.name.clone();
+                    let target_col = through_td.links.iter()
+                        .find(|l| l.target == ml.target && l.name != source_col)
+                        .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to target {}", ml.target),
+                            position: Position { line: 0, col: 0 },
+                        }))?.name.clone();
+                    IrMultiLinkJoin::Through {
+                        junction_table: through_td.table.clone(),
+                        module: through_td.module.clone(),
+                        source_col,
+                        target_col,
+                    }
+                } else {
+                    IrMultiLinkJoin::Standard {
+                        junction_table: format!("{}.{}", current_td.table, ml.name),
+                        module: current_td.module.clone(),
+                    }
+                };
+                joins.push(IrPathJoin::Multi {
+                    source_alias: current_alias.clone(),
+                    junction_alias,
+                    join: join_info,
+                    target,
+                });
+                if is_last {
+                    let shape = self.compile_shape(shape_elements, target_td, &target_alias,
+                        &target_td.module.clone())?;
+                    let result = IrPathResult::Object {
+                        alias: target_alias.clone(),
+                        type_name: format!("{}::{}", target_td.module, target_td.name),
+                        shape,
+                    };
+                    let (filter, order_by, offset, limit) =
+                        self.compile_path_modifiers(sel, target_td, &target_alias)?;
+                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                }
+                current_td = target_td;
+                current_alias = target_alias;
+                continue;
+            }
+
+            return Err(self.type_err(&format!(
+                "type '{}' has no property or link named '{step_name}'",
+                current_td.name
+            )));
+        }
+
+        // Should be unreachable: steps is non-empty (we checked len > 1 before dispatch).
+        Err(self.type_err("empty path traversal"))
+    }
+
+    fn compile_path_modifiers(
+        &mut self,
+        sel: &ast::SelectStmt,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<(Option<IrExpr>, Vec<IrSort>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
+        let filter = sel.filter.as_ref()
+            .map(|f| self.compile_expr(f, td, alias))
+            .transpose()?;
+        let order_by = sel.order_by.iter()
+            .map(|s| self.compile_sort(s, td, alias))
+            .collect::<Result<Vec<_>, _>>()?;
+        let offset = sel.offset.as_ref()
+            .map(|e| self.compile_expr(e, td, alias))
+            .transpose()?;
+        let limit = sel.limit.as_ref()
+            .map(|e| self.compile_expr(e, td, alias))
+            .transpose()?;
+        Ok((filter, order_by, offset, limit))
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.

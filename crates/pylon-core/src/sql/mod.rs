@@ -1,7 +1,7 @@
 use crate::ir::{
     IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral, IrMultiLinkField,
-    IrMultiLinkJoin, IrNulls, IrOutput, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField,
-    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
+    IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrScalarField,
+    IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -15,6 +15,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
     match &ir.stmt {
         IrStmt::Select(sel) => emit_select_stmt(sel),
         IrStmt::FreeSelect(sel) => emit_free_select(sel),
+        IrStmt::PathSelect(sel) => emit_path_select(sel),
         IrStmt::Insert(ins) => emit_insert_stmt(ins),
         IrStmt::Update(upd) => emit_update_stmt(upd),
         IrStmt::Delete(del) => emit_delete_stmt(del),
@@ -160,6 +161,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql
         }
         IrStmt::FreeSelect(_) => unreachable!("FreeSelect cannot appear as a CTE source"),
+        IrStmt::PathSelect(_) => unreachable!("PathSelect cannot appear as a CTE source"),
     }
 }
 
@@ -282,6 +284,86 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
                 .collect(),
         },
     }
+}
+
+// ── PATH SELECT ─────────────────────────────────────────────────────────────
+
+fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
+    let distinct = if sel.distinct { "DISTINCT " } else { "" };
+
+    // Build FROM clause: root table + JOINs.
+    let mut from_parts = vec![format!("{} AS {}", source_ref(&sel.root), qi(&sel.root.alias))];
+    for join in &sel.joins {
+        match join {
+            IrPathJoin::Single { source_alias, fk_col, target } => {
+                from_parts.push(format!(
+                    "JOIN {} AS {} ON {}.{} = {}.\"id\"",
+                    source_ref(target), qi(&target.alias),
+                    qi(source_alias), qi(fk_col),
+                    qi(&target.alias),
+                ));
+            }
+            IrPathJoin::Multi { source_alias, junction_alias, join, target } => {
+                match join {
+                    IrMultiLinkJoin::Standard { junction_table, module } => {
+                        from_parts.push(format!(
+                            "JOIN {} AS {} ON {}.\"source\" = {}.\"id\"",
+                            qn(module, junction_table), qi(junction_alias),
+                            qi(junction_alias), qi(source_alias),
+                        ));
+                        from_parts.push(format!(
+                            "JOIN {} AS {} ON {}.\"id\" = {}.\"target\"",
+                            source_ref(target), qi(&target.alias),
+                            qi(&target.alias), qi(junction_alias),
+                        ));
+                    }
+                    IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
+                        from_parts.push(format!(
+                            "JOIN {} AS {} ON {}.{} = {}.\"id\"",
+                            qn(module, junction_table), qi(junction_alias),
+                            qi(junction_alias), qi(source_col),
+                            qi(source_alias),
+                        ));
+                        from_parts.push(format!(
+                            "JOIN {} AS {} ON {}.\"id\" = {}.{}",
+                            source_ref(target), qi(&target.alias),
+                            qi(&target.alias), qi(junction_alias), qi(target_col),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let from_sql = from_parts.join("\n");
+
+    let (result_expr, shape_root) = match &sel.result {
+        IrPathResult::Scalar { alias, column, .. } => {
+            let expr = format!("ROW({}.{}) AS result", qi(alias), qi(column));
+            let shape = ShapeNode::Scalar { name: String::new(), position: 0 };
+            (expr, shape)
+        }
+        IrPathResult::Object { alias, type_name, shape } => {
+            let (field_exprs, field_nodes) = build_shape(shape, alias);
+            let mut parts = vec![type_disc(type_name)];
+            parts.extend(field_exprs);
+            let expr = format!("(\n    {}\n) AS result", parts.join(",\n    "));
+            let shape_root = ShapeNode::Object {
+                name: String::new(),
+                type_name: Some(type_name.clone()),
+                position: 0,
+                cardinality: Cardinality::Many,
+                fields: prepend_type(field_nodes),
+            };
+            (expr, shape_root)
+        }
+    };
+
+    let mut sql = format!("SELECT {}{}\nFROM {}", distinct, result_expr, from_sql);
+    append_filter(&mut sql, &sel.filter);
+    append_order_by(&mut sql, &sel.order_by);
+    append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+
+    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root } }
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
