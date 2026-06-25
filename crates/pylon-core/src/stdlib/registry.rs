@@ -570,6 +570,11 @@ END"#)),
 
         // ── sys ───────────────────────────────────────────────────────────────
 
+        f("sys", "get_current_database",
+            vec![],
+            Str,
+            B("current_database")),
+
         f("sys", "get_version_as_str",
             vec![],
             Str,
