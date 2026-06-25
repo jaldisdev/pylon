@@ -1285,21 +1285,30 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         }
     };
     Ok(match name {
-        "str" | "Str" => "text",
-        "int16" | "Int16" => "int2",
-        "int32" | "Int32" => "int4",
-        "int64" | "Int64" | "int" | "Int" => "int8",
-        "float32" | "Float32" => "float4",
-        "float64" | "Float64" | "float" | "Float" => "float8",
-        "bool" | "Bool" => "boolean",
-        "uuid" | "Uuid" => "uuid",
-        "bytes" | "Bytes" => "bytea",
-        "json" | "Json" => "jsonb",
-        "decimal" | "Decimal" => "numeric",
-        "datetime" | "Datetime" => "timestamptz",
-        "date" | "Date" => "date",
-        "time" | "Time" => "time",
-        other => other, // pass through for user-defined types / domains
+        "str" => "text",
+        "int16" => "int2",
+        "int32" => "int4",
+        "int64" => "int8",
+        "float32" => "float4",
+        "float64" => "float8",
+        "bool" => "boolean",
+        "uuid" => "uuid",
+        "bytes" => "bytea",
+        "json" => "jsonb",
+        "decimal" => "numeric",
+        "datetime" => "timestamptz",
+        "date" => "date",
+        "time" => "time",
+        "duration" => "interval",
+        other => return Err(PyQLError::Type(PyQLTypeError {
+            message: format!(
+                "unknown cast type '{other}'; \
+                 valid scalar types are: str, bool, int16, int32, int64, \
+                 float32, float64, decimal, json, uuid, bytes, \
+                 datetime, date, time, duration"
+            ),
+            position: Position { line: 0, col: 0 },
+        })),
     }
     .to_string())
 }
