@@ -79,6 +79,18 @@ pub enum IrFreeExpr {
     FreeObject(Vec<(String, IrExpr)>),
     /// An anonymous tuple: `SELECT (1, 'x')`.
     Tuple(Vec<IrExpr>),
+    /// A set-returning assert: `SELECT ROW(v) FROM unnest(_pylon.fn(ARRAY(inner))) v`.
+    /// Used for `assert_exists` and `assert_distinct` which pass through the set.
+    AssertSet { fn_name: String, inner: Box<IrArraySource> },
+}
+
+/// Source for `ARRAY(SELECT scalar FROM ...)` — used by assert functions.
+#[derive(Debug, Clone)]
+pub enum IrArraySource {
+    /// Inner is a regular schema SELECT; first scalar field is the array element.
+    Select(IrSelect),
+    /// Inner is a path traversal SELECT; scalar result is the array element.
+    PathSelect(IrPathSelect),
 }
 
 // ── SELECT ──────────────────────────────────────────────────────────────────────
@@ -259,6 +271,9 @@ pub enum IrExpr {
     /// An aggregate function applied to an inline set literal `fn({e1, e2, ...})`.
     /// Emits: `(SELECT fn_name(v) FROM (SELECT e1 UNION ALL ...) AS _set(v))`
     AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
+    /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
+    /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
+    ArrayFromSelect(Box<IrArraySource>),
 }
 
 #[derive(Debug, Clone)]

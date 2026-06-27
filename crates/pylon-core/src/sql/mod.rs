@@ -1,7 +1,8 @@
 use crate::ir::{
-    IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral, IrMultiLinkField,
-    IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrScalarField,
-    IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
+    IrArraySource, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral,
+    IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect,
+    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource,
+    IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -216,6 +217,28 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
         };
     }
 
+    // assert_exists / assert_distinct: set-returning — emit as unnest, not UNION ALL
+    if sel.items.len() == 1 {
+        if let IrFreeExpr::AssertSet { fn_name, inner } = &sel.items[0] {
+            let array_sql = emit_array_source(inner);
+            let mut sql = format!(
+                "SELECT ROW(v) AS result FROM unnest(\"_pylon\".{}({})) AS _assert(v)",
+                fn_name, array_sql,
+            );
+            if sel.distinct {
+                sql = format!("SELECT DISTINCT * FROM ({}) AS \"_distinct\"", sql);
+            }
+            append_order_by(&mut sql, &sel.order_by);
+            append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+            return SqlOutput {
+                sql,
+                shape: ShapeDescriptor {
+                    root: ShapeNode::Scalar { name: String::new(), position: 0 },
+                },
+            };
+        }
+    }
+
     let shape_root = free_item_shape(sel.items.first().unwrap());
 
     let branches: Vec<String> = sel.items.iter().map(|item| match item {
@@ -244,6 +267,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
                 format!("SELECT ({}) AS result", parts.join(", "))
             }
         }
+        IrFreeExpr::AssertSet { .. } => unreachable!("AssertSet is handled by early return above"),
     }).collect();
 
     let union_sql = branches.join("\nUNION ALL\n");
@@ -283,20 +307,18 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
                 .map(|i| ShapeNode::Scalar { name: String::new(), position: i })
                 .collect(),
         },
+        IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar { name: String::new(), position: 0 },
     }
 }
 
 // ── PATH SELECT ─────────────────────────────────────────────────────────────
 
-fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
-    let distinct = if sel.distinct { "DISTINCT " } else { "" };
-
-    // Build FROM clause: root table + JOINs.
-    let mut from_parts = vec![format!("{} AS {}", source_ref(&sel.root), qi(&sel.root.alias))];
-    for join in &sel.joins {
+fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
+    let mut parts = vec![format!("{} AS {}", source_ref(root), qi(&root.alias))];
+    for join in joins {
         match join {
             IrPathJoin::Single { source_alias, fk_col, target } => {
-                from_parts.push(format!(
+                parts.push(format!(
                     "JOIN {} AS {} ON {}.{} = {}.\"id\"",
                     source_ref(target), qi(&target.alias),
                     qi(source_alias), qi(fk_col),
@@ -306,25 +328,25 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
             IrPathJoin::Multi { source_alias, junction_alias, join, target } => {
                 match join {
                     IrMultiLinkJoin::Standard { junction_table, module } => {
-                        from_parts.push(format!(
+                        parts.push(format!(
                             "JOIN {} AS {} ON {}.\"source\" = {}.\"id\"",
                             qn(module, junction_table), qi(junction_alias),
                             qi(junction_alias), qi(source_alias),
                         ));
-                        from_parts.push(format!(
+                        parts.push(format!(
                             "JOIN {} AS {} ON {}.\"id\" = {}.\"target\"",
                             source_ref(target), qi(&target.alias),
                             qi(&target.alias), qi(junction_alias),
                         ));
                     }
                     IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
-                        from_parts.push(format!(
+                        parts.push(format!(
                             "JOIN {} AS {} ON {}.{} = {}.\"id\"",
                             qn(module, junction_table), qi(junction_alias),
                             qi(junction_alias), qi(source_col),
                             qi(source_alias),
                         ));
-                        from_parts.push(format!(
+                        parts.push(format!(
                             "JOIN {} AS {} ON {}.\"id\" = {}.{}",
                             source_ref(target), qi(&target.alias),
                             qi(&target.alias), qi(junction_alias), qi(target_col),
@@ -334,7 +356,39 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
             }
         }
     }
-    let from_sql = from_parts.join("\n");
+    parts.join("\n")
+}
+
+/// Emit `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
+fn emit_array_source(src: &IrArraySource) -> String {
+    match src {
+        IrArraySource::Select(s) => {
+            let scalar = match s.shape.first() {
+                Some(IrShapeField::Scalar(sf)) =>
+                    format!("{}.{}", qi(&s.source.alias), qi(&sf.column)),
+                _ => format!("{}.\"id\"", qi(&s.source.alias)),
+            };
+            let mut sql = format!("SELECT {} FROM {} AS {}",
+                scalar, source_ref(&s.source), qi(&s.source.alias));
+            append_filter(&mut sql, &s.filter);
+            format!("ARRAY({})", sql)
+        }
+        IrArraySource::PathSelect(ps) => {
+            let scalar = match &ps.result {
+                IrPathResult::Scalar(e) => emit_expr(e),
+                IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
+            };
+            let from_sql = emit_path_joins(&ps.root, &ps.joins);
+            let mut sql = format!("SELECT {} FROM {}", scalar, from_sql);
+            append_filter(&mut sql, &ps.filter);
+            format!("ARRAY({})", sql)
+        }
+    }
+}
+
+fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
+    let distinct = if sel.distinct { "DISTINCT " } else { "" };
+    let from_sql = emit_path_joins(&sel.root, &sel.joins);
 
     let (result_expr, shape_root) = match &sel.result {
         IrPathResult::Scalar(ir_expr) => {
@@ -871,6 +925,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 .join(" UNION ALL ");
             format!("(SELECT {}(v) FROM ({}) AS _set(v))", fn_name, union_all)
         }
+        IrExpr::ArrayFromSelect(src) => emit_array_source(src),
+
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;
             let mut sql = if sel.shape.is_empty() {

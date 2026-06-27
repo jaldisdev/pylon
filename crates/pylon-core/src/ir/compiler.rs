@@ -12,11 +12,11 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect,
-    IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkClear, IrMultiLinkField,
-    IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrRewrite,
-    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource,
-    IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrArraySource, IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFreeExpr,
+    IrFreeSelect, IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkClear,
+    IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect,
+    IrRewrite, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir,
+    IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -137,6 +137,33 @@ impl<'a> Compiler<'a> {
                         if !p.partial && p.steps.len() > 1 {
                             return self.compile_path_select(s, p, &sh.elements, distinct)
                                 .map(IrStmt::PathSelect);
+                        }
+                    }
+                }
+                // assert_exists/assert_distinct with SubQuery arg → set-returning assert
+                if let Expr::FunctionCall(f) = result {
+                    if (f.module.is_none() || f.module.as_deref() == Some("std"))
+                        && matches!(f.name.as_str(), "assert_exists" | "assert_distinct")
+                        && f.args.len() >= 1
+                    {
+                        if let Expr::SubQuery(inner_stmt) = &f.args[0] {
+                            let inner = self.compile_subquery_to_array_source(inner_stmt)?;
+                            let offset = s.offset.as_ref()
+                                .map(|e| self.compile_free_expr(e))
+                                .transpose()?;
+                            let limit = s.limit.as_ref()
+                                .map(|e| self.compile_free_expr(e))
+                                .transpose()?;
+                            return Ok(IrStmt::FreeSelect(IrFreeSelect {
+                                items: vec![IrFreeExpr::AssertSet {
+                                    fn_name: f.name.clone(),
+                                    inner: Box::new(inner),
+                                }],
+                                order_by: vec![],
+                                offset,
+                                limit,
+                                distinct,
+                            }));
                         }
                     }
                 }
@@ -504,6 +531,18 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// Compile a SubQuery stmt to an `IrArraySource` for use in assert functions.
+    /// The result is `ARRAY(SELECT scalar FROM compiled_inner)`.
+    fn compile_subquery_to_array_source(&mut self, stmt: &Stmt) -> Result<IrArraySource, PyQLError> {
+        match self.compile_stmt(stmt)? {
+            IrStmt::Select(s) => Ok(IrArraySource::Select(s)),
+            IrStmt::PathSelect(ps) => Ok(IrArraySource::PathSelect(ps)),
+            _ => Err(self.type_err(
+                "assert functions require a schema-bound SELECT as argument",
+            )),
+        }
+    }
+
     /// Returns true when the SELECT result expression is not a schema type reference.
     fn is_free_result(&self, expr: &Expr) -> bool {
         let expr = match expr {
@@ -613,6 +652,21 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FunctionCall(f) => {
+                // assert_single with SubQuery arg → _pylon.assert_single(ARRAY(subquery))
+                if (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && f.name == "assert_single"
+                    && f.args.len() >= 1
+                {
+                    if let Expr::SubQuery(inner_stmt) = &f.args[0] {
+                        let inner = self.compile_subquery_to_array_source(inner_stmt)?;
+                        return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                            schema: Some("_pylon".to_string()),
+                            name: "assert_single".to_string(),
+                            args: vec![IrExpr::ArrayFromSelect(Box::new(inner))],
+                            sql_template: None,
+                        }));
+                    }
+                }
                 // If any argument is a set literal, this must be an aggregate.
                 // Compile as AggOverSet rather than a regular function call.
                 let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
@@ -1393,6 +1447,26 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FunctionCall(f) => {
+                // assert_single/exists/distinct with SubQuery arg
+                if (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && matches!(f.name.as_str(), "assert_single" | "assert_exists" | "assert_distinct")
+                    && f.args.len() >= 1
+                {
+                    if let Expr::SubQuery(inner_stmt) = &f.args[0] {
+                        let inner = self.compile_subquery_to_array_source(inner_stmt)?;
+                        let fn_pg = match f.name.as_str() {
+                            "assert_single" => "assert_single",
+                            "assert_exists"  => "assert_exists",
+                            _               => "assert_distinct",
+                        };
+                        return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                            schema: Some("_pylon".to_string()),
+                            name: fn_pg.to_string(),
+                            args: vec![IrExpr::ArrayFromSelect(Box::new(inner))],
+                            sql_template: None,
+                        }));
+                    }
+                }
                 // contains(.multilink.scalar, value) → EXISTS (set-membership semantics)
                 if (f.module.is_none() || f.module.as_deref() == Some("std"))
                     && f.name == "contains"
