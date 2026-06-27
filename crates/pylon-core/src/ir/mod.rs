@@ -23,6 +23,23 @@ pub enum IrStmt {
     Insert(IrInsert),
     Update(IrUpdate),
     Delete(IrDelete),
+    /// `for var in iterator union body`
+    For(IrFor),
+}
+
+// ── FOR LOOP ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct IrFor {
+    pub var_name: String,
+    pub iterator: IrForIterator,
+    pub body: Box<IrStmt>,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrForIterator {
+    /// Set literal of scalar values → SQL VALUES clause.
+    Values { exprs: Vec<IrExpr>, pg_type: String },
 }
 
 // ── PATH SELECT (type-rooted path traversal) ────────────────────────────────────
@@ -303,6 +320,9 @@ pub enum IrExpr {
     AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
     /// A scalar reference to a named CTE: emits `(SELECT "id" FROM "cte_name")`.
     CteRef(String),
+    /// Reference to the current for-loop iterator variable.
+    /// Emits `"_for_{name}"."v"`.
+    ForVar { name: String },
     /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
     /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
     ArrayFromSelect(Box<IrArraySource>),

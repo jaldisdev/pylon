@@ -1,7 +1,7 @@
 use crate::ir::{
-    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral,
-    IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput,
-    IrPathJoin, IrPathResult, IrPathSelect, IrScalarField, IrSelect, IrShapeField,
+    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
+    IrInsert, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
+    IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrScalarField, IrSelect, IrShapeField,
     IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
@@ -15,6 +15,7 @@ pub struct SqlOutput {
 pub fn emit(ir: &IrOutput) -> SqlOutput {
     match &ir.stmt {
         IrStmt::Update(upd) => emit_update_stmt(upd, &ir.ctes),
+        IrStmt::For(f) => emit_for_stmt(f, &ir.ctes),
         stmt => {
             let mut out = match stmt {
                 IrStmt::Select(sel) => emit_select_stmt(sel),
@@ -22,7 +23,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
                 IrStmt::Insert(ins) => emit_insert_stmt(ins),
                 IrStmt::Delete(del) => emit_delete_stmt(del),
-                IrStmt::Update(_) => unreachable!(),
+                IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
                 let prefix = emit_cte_prefix(&ir.ctes);
@@ -171,7 +172,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &inner.offset, &inner.limit);
             sql
         }
-        IrStmt::FreeSelect(_) => unreachable!("FreeSelect cannot appear as a CTE source"),
+        IrStmt::FreeSelect(_) | IrStmt::For(_) => unreachable!("FreeSelect/For cannot appear as a CTE source"),
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
             let mut sql = emit_path_joins(&ps.root, &ps.joins);
@@ -534,6 +535,88 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
     SqlOutput { sql, shape: ShapeDescriptor { root: shape_root } }
+}
+
+// ── FOR LOOP ─────────────────────────────────────────────────────────────────
+
+fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
+    let IrForIterator::Values { exprs, pg_type } = &f.iterator;
+    let iter_alias = format!("_for_{}", f.var_name);
+
+    if exprs.is_empty() {
+        let empty = SqlOutput {
+            sql: "SELECT NULL AS result WHERE FALSE".to_string(),
+            shape: ShapeDescriptor { root: ShapeNode::Scalar { name: String::new(), position: 0 } },
+        };
+        return empty;
+    }
+
+    let rows: Vec<String> = exprs.iter()
+        .map(|e| format!("({}::{})", emit_expr(e), pg_type))
+        .collect();
+
+    match f.body.as_ref() {
+        IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &rows, user_ctes),
+        body => {
+            let body_out = match body {
+                IrStmt::Select(sel) => emit_select_stmt(sel),
+                IrStmt::FreeSelect(sel) => emit_free_select(sel),
+                IrStmt::PathSelect(sel) => emit_path_select(sel),
+                other => panic!("unsupported for-loop body: {:?}", other),
+            };
+            let values_from = format!("(VALUES {}) AS {}(\"v\")", rows.join(", "), qi(&iter_alias));
+            let indent_body = body_out.sql.replace('\n', "\n    ");
+            let cte_prefix = if !user_ctes.is_empty() { emit_cte_prefix(user_ctes) } else { String::new() };
+            let sql = format!(
+                "{}SELECT \"_body\".result\nFROM {}\nCROSS JOIN LATERAL (\n    {}\n) AS \"_body\"",
+                cte_prefix, values_from, indent_body,
+            );
+            SqlOutput { sql, shape: body_out.shape }
+        }
+    }
+}
+
+fn emit_for_insert(
+    ins: &IrInsert,
+    iter_alias: &str,
+    rows: &[String],
+    user_ctes: &[IrCteDef],
+) -> SqlOutput {
+    let rewrite_cols: std::collections::HashSet<&str> =
+        ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+
+    let cols: Vec<String> = ins.assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(c, _)| qi(c))
+        .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
+        .collect();
+    let sel_exprs: Vec<String> = ins.assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(_, e)| emit_expr(e))
+        .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
+        .collect();
+
+    let mut cte_parts: Vec<String> = user_ctes.iter().map(|cte| {
+        format!("{} AS (\n{}\n)", qi(&cte.name), emit_dml_as_cte_source(&cte.stmt))
+    }).collect();
+    cte_parts.push(format!("{}(\"v\") AS (VALUES {})", qi(iter_alias), rows.join(", ")));
+
+    let mut sql = format!(
+        "WITH {}\nINSERT INTO {} ({})\nSELECT {} FROM {}",
+        cte_parts.join(",\n"),
+        source_ref(&ins.target),
+        cols.join(", "),
+        sel_exprs.join(", "),
+        qi(iter_alias),
+    );
+    if let Some(conflict) = &ins.unless_conflict {
+        emit_conflict(&mut sql, conflict);
+    }
+    let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
+    if let Some(r) = returning_sql {
+        sql.push_str(&r);
+    }
+    SqlOutput { sql, shape }
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
@@ -1060,6 +1143,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
 
         IrExpr::CteRef(name) => format!("(SELECT \"id\" FROM \"{}\")", name),
+
+        IrExpr::ForVar { name } => format!("\"_for_{}\".\"v\"", name),
 
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;
