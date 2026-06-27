@@ -9,6 +9,21 @@ pub enum Stmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    /// `with alias := (stmt), ... main_stmt`
+    With(WithStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithStmt {
+    pub aliases: Vec<CteDef>,
+    pub stmt: Box<Stmt>,
+}
+
+/// One `name := (inner_stmt)` binding in a WITH block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CteDef {
+    pub name: String,
+    pub expr: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +136,20 @@ impl ObjectRef {
     }
 }
 
+// ── Shape operators ────────────────────────────────────────────────────────────
+
+/// The assignment operator used on a shape element in UPDATE SET { ... }.
+/// Only relevant for multi-link fields; scalar/single-link fields always use Assign.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShapeOp {
+    /// `:=` — replace the entire value (clear + insert for multi-links).
+    Assign,
+    /// `+=` — append to a multi-link set.
+    Append,
+    /// `-=` — remove from a multi-link set.
+    Remove,
+}
+
 // ── Shapes ─────────────────────────────────────────────────────────────────────
 
 /// A shape expression: `Expr { element, element, ... }`.
@@ -147,8 +176,10 @@ pub struct ShapeElement {
     pub splat: Option<Splat>,
     /// Nested shape for links: `.posts { title, body }`.
     pub nested: Option<Vec<ShapeElement>>,
-    /// Computed override: `.total := .price * .qty`.
+    /// Computed override or assignment: `.total := .price * .qty` or `friends += expr`.
     pub compexpr: Option<Expr>,
+    /// Assignment operator (only meaningful for UPDATE SET elements on multi-links).
+    pub op: ShapeOp,
     /// Per-element link modifiers.
     pub filter: Option<Expr>,
     pub order_by: Vec<SortExpr>,
@@ -163,6 +194,7 @@ impl ShapeElement {
             splat: Some(kind),
             nested: None,
             compexpr: None,
+            op: ShapeOp::Assign,
             filter: None,
             order_by: vec![],
             offset: None,

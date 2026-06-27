@@ -71,12 +71,13 @@ impl Parser {
 
     pub fn parse_stmt(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         let stmt = match self.current() {
+            Token::With => self.parse_with(),
             Token::Select => self.parse_select(),
             Token::Insert => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
             _ => Err(self.err(&format!(
-                "expected SELECT, INSERT, UPDATE, or DELETE, got {:?}",
+                "expected WITH, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
                 self.current()
             ))),
         }?;
@@ -230,6 +231,41 @@ impl Parser {
         };
 
         Ok(Stmt::Delete(DeleteStmt { subject, filter }))
+    }
+
+    // ── WITH ────────────────────────────────────────────────────────────────────
+
+    fn parse_with(&mut self) -> Result<Stmt, PyQLSyntaxError> {
+        self.eat(&Token::With)?;
+        let mut aliases = vec![];
+        loop {
+            let name = self.eat_ident()?;
+            self.eat(&Token::ColonEq)?;
+            // The binding value is any expression: a parenthesised stmt, a type cast, etc.
+            let expr = self.parse_expr()?;
+            aliases.push(CteDef { name, expr });
+            if !matches!(self.current(), Token::Comma) {
+                break;
+            }
+            self.advance();
+        }
+        let stmt = self.parse_inner_stmt()?;
+        Ok(Stmt::With(WithStmt { aliases, stmt: Box::new(stmt) }))
+    }
+
+    /// Parse a statement in positions where WITH is also allowed (CTE bindings and subqueries).
+    fn parse_inner_stmt(&mut self) -> Result<Stmt, PyQLSyntaxError> {
+        match self.current() {
+            Token::With => self.parse_with(),
+            Token::Select => self.parse_select(),
+            Token::Insert => self.parse_insert(),
+            Token::Update => self.parse_update(),
+            Token::Delete => self.parse_delete(),
+            _ => Err(self.err(&format!(
+                "expected WITH, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
+                self.current()
+            ))),
+        }
     }
 
     // ── Expressions ─────────────────────────────────────────────────────────────
@@ -637,18 +673,12 @@ impl Parser {
             return Ok(Expr::Tuple(vec![]));
         }
 
-        // Parenthesised statement: (SELECT ...), (INSERT ...), (UPDATE ...), (DELETE ...)
+        // Parenthesised statement: (SELECT ...), (INSERT ...), (UPDATE ...), (DELETE ...), (WITH ...)
         if matches!(
             self.current(),
-            Token::Select | Token::Insert | Token::Update | Token::Delete
+            Token::With | Token::Select | Token::Insert | Token::Update | Token::Delete
         ) {
-            let stmt = match self.current() {
-                Token::Select => self.parse_select(),
-                Token::Insert => self.parse_insert(),
-                Token::Update => self.parse_update(),
-                Token::Delete => self.parse_delete(),
-                _ => unreachable!(),
-            }?;
+            let stmt = self.parse_inner_stmt()?;
             self.eat(&Token::RParen)?;
             return Ok(Expr::SubQuery(Box::new(stmt)));
         }
@@ -776,8 +806,14 @@ impl Parser {
             Path::relative(name)
         };
 
-        // Computed expression: `.field := expr`
-        if matches!(self.current(), Token::ColonEq) {
+        // Assignment operators: `:=` (assign), `+=` (append), `-=` (remove)
+        if matches!(self.current(), Token::ColonEq | Token::PlusEq | Token::MinusEq) {
+            let op = match self.current() {
+                Token::ColonEq => ShapeOp::Assign,
+                Token::PlusEq => ShapeOp::Append,
+                Token::MinusEq => ShapeOp::Remove,
+                _ => unreachable!(),
+            };
             self.advance();
             let compexpr = self.parse_expr()?;
             return Ok(ShapeElement {
@@ -785,6 +821,7 @@ impl Parser {
                 splat: None,
                 nested: None,
                 compexpr: Some(compexpr),
+                op,
                 filter: None,
                 order_by: vec![],
                 offset: None,
@@ -833,6 +870,7 @@ impl Parser {
                 splat: None,
                 nested: Some(nested_elements),
                 compexpr: None,
+                op: ShapeOp::Assign,
                 filter,
                 order_by,
                 offset,
@@ -846,6 +884,7 @@ impl Parser {
             splat: None,
             nested: None,
             compexpr: None,
+            op: ShapeOp::Assign,
             filter: None,
             order_by: vec![],
             offset: None,
