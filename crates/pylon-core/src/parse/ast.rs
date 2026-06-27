@@ -11,6 +11,8 @@ pub enum Stmt {
     Delete(DeleteStmt),
     /// `with alias := (stmt), ... main_stmt`
     With(WithStmt),
+    /// `for var in iterator union body`
+    For(ForStmt),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +26,15 @@ pub struct WithStmt {
 pub struct CteDef {
     pub name: String,
     pub expr: Expr,
+}
+
+/// `for [optional] var in iterator union body`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForStmt {
+    pub var: String,
+    pub optional: bool,
+    pub iterator: Expr,
+    pub body: Box<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

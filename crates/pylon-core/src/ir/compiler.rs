@@ -12,11 +12,12 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFreeExpr,
-    IrFreeSelect, IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkClear,
-    IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput,
-    IrPathJoin, IrPathResult, IrPathSelect, IrRewrite, IrScalarField, IrSelect, IrShapeField,
-    IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
+    IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrIfElse, IrInsert, IrLiteral,
+    IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
+    IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrRewrite, IrScalarField, IrSelect,
+    IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp,
+    IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         IrStmt::Select(sel) => sel.source.type_name.clone(),
         IrStmt::PathSelect(ps) => ps.root.type_name.clone(),
         IrStmt::FreeSelect(_) => String::new(),
+        IrStmt::For(f) => cte_stmt_type(&f.body),
     }
 }
 
@@ -96,11 +98,19 @@ struct Compiler<'a> {
     alias_counter: usize,
     /// CTE names registered in the enclosing WITH block → qualified type name.
     cte_types: HashMap<String, String>,
+    /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
+    for_vars: HashMap<String, String>,
 }
 
 impl<'a> Compiler<'a> {
     fn new(schema: &'a SchemaDescriptor) -> Self {
-        Compiler { schema, params: vec![], alias_counter: 0, cte_types: HashMap::new() }
+        Compiler {
+            schema,
+            params: vec![],
+            alias_counter: 0,
+            cte_types: HashMap::new(),
+            for_vars: HashMap::new(),
+        }
     }
 
     /// Return the CTE name if `expr` is a bare identifier that matches a registered CTE.
@@ -252,6 +262,7 @@ impl<'a> Compiler<'a> {
                 }
                 self.compile_stmt(&w.stmt)
             }
+            Stmt::For(f) => self.compile_for(f).map(IrStmt::For),
         }
     }
 
@@ -792,7 +803,17 @@ impl<'a> Compiler<'a> {
             other => other,
         };
         match expr {
-            Expr::Path(p) if !p.partial => false,
+            Expr::Path(p) if !p.partial => {
+                // A for-loop variable is a scalar, not a schema type reference.
+                if p.steps.len() == 1 {
+                    if let ast::PathStep::Name(n) = &p.steps[0] {
+                        if self.for_vars.contains_key(n.as_str()) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             Expr::Shape(s) if s.expr.is_some() => false,
             Expr::SubQuery(_) => false,
             _ => true,
@@ -1002,9 +1023,12 @@ impl<'a> Compiler<'a> {
                  use a schema-bound SELECT instead",
             )),
 
-            // CTE name used as a value in free context
+            // CTE name or for-loop variable used as a value in free context
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if self.for_vars.contains_key(n.as_str()) {
+                        return Ok(IrExpr::ForVar { name: n.clone() });
+                    }
                     if self.cte_types.contains_key(n.as_str()) {
                         return Ok(IrExpr::CteRef(n.clone()));
                     }
@@ -1099,6 +1123,43 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    fn compile_for(&mut self, f: &ast::ForStmt) -> Result<IrFor, PyQLError> {
+        // Compile the iterator expression to determine scalar type and VALUES list.
+        let (exprs, pg_type) = match &f.iterator {
+            Expr::Set(elems) => {
+                let compiled: Result<Vec<_>, _> =
+                    elems.iter().map(|e| self.compile_free_expr(e)).collect();
+                let compiled = compiled?;
+                let raw = compiled.first()
+                    .and_then(|e| infer_ir_type(e))
+                    .unwrap_or("text");
+                let pg_type = literal_sentinel_to_pg(raw).to_string();
+                (compiled, pg_type)
+            }
+            other => {
+                let e = self.compile_free_expr(other)?;
+                let raw = infer_ir_type(&e).unwrap_or("text");
+                let pg_type = literal_sentinel_to_pg(raw).to_string();
+                (vec![e], pg_type)
+            }
+        };
+
+        // Register the for variable so the body can reference it.
+        let prev = self.for_vars.insert(f.var.clone(), pg_type.clone());
+        let body = self.compile_stmt(&f.body)?;
+        // Restore previous for-var (or remove if none existed).
+        match prev {
+            Some(old) => { self.for_vars.insert(f.var.clone(), old); }
+            None => { self.for_vars.remove(&f.var); }
+        }
+
+        Ok(IrFor {
+            var_name: f.var.clone(),
+            iterator: IrForIterator::Values { exprs, pg_type },
+            body: Box::new(body),
+        })
+    }
+
     /// Extract the target type name from a DML or inner SELECT statement.
     fn dml_subject_type(&self, stmt: &Stmt) -> Result<String, PyQLError> {
         match stmt {
@@ -1106,6 +1167,7 @@ impl<'a> Compiler<'a> {
             Stmt::Update(upd) => self.expr_as_type_name(&upd.subject),
             Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
             Stmt::With(w) => self.dml_subject_type(&w.stmt),
+            Stmt::For(f) => self.dml_subject_type(&f.body),
             Stmt::Select(sel) => {
                 // <Module::Type>expr — type name comes from the cast target
                 if let Expr::TypeCast(tc) = &sel.result {
@@ -1907,9 +1969,13 @@ impl<'a> Compiler<'a> {
         alias: &str,
     ) -> Result<IrExpr, PyQLError> {
         if !p.partial {
-            // Allow CTE names as scalar references: emit (SELECT "id" FROM "cte_name").
             if p.steps.len() == 1 {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
+                    // For-loop variable used in schema-bound context.
+                    if self.for_vars.contains_key(n.as_str()) {
+                        return Ok(IrExpr::ForVar { name: n.clone() });
+                    }
+                    // Allow CTE names as scalar references.
                     if self.cte_types.contains_key(n.as_str()) {
                         return Ok(IrExpr::CteRef(n.clone()));
                     }
@@ -2655,6 +2721,14 @@ fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
         PT::Multirange(_) => matches!(infer_ir_type(expr), Some(t) if t.starts_with("multi")),
         // For unrecognised / complex types, allow (don't reject).
         _ => true,
+    }
+}
+
+fn literal_sentinel_to_pg(t: &str) -> &str {
+    match t {
+        "__int_literal" => "int8",
+        "__float_literal" => "float8",
+        other => other,
     }
 }
 

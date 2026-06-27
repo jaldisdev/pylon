@@ -72,12 +72,13 @@ impl Parser {
     pub fn parse_stmt(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         let stmt = match self.current() {
             Token::With => self.parse_with(),
+            Token::For => self.parse_for(),
             Token::Select => self.parse_select(),
             Token::Insert => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
             _ => Err(self.err(&format!(
-                "expected WITH, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
+                "expected WITH, FOR, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
                 self.current()
             ))),
         }?;
@@ -253,19 +254,48 @@ impl Parser {
         Ok(Stmt::With(WithStmt { aliases, stmt: Box::new(stmt) }))
     }
 
-    /// Parse a statement in positions where WITH is also allowed (CTE bindings and subqueries).
+    /// Parse a statement in positions where WITH/FOR are also allowed.
     fn parse_inner_stmt(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         match self.current() {
             Token::With => self.parse_with(),
+            Token::For => self.parse_for(),
             Token::Select => self.parse_select(),
             Token::Insert => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
             _ => Err(self.err(&format!(
-                "expected WITH, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
+                "expected WITH, FOR, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
                 self.current()
             ))),
         }
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, PyQLSyntaxError> {
+        self.eat(&Token::For)?;
+        let optional = if matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("OPTIONAL")) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let var = self.eat_ident()?;
+        self.eat(&Token::In)?;
+        let iterator = self.parse_expr()?;
+        // Body: `union (stmt)` or `union stmt` or bare `stmt`.
+        if matches!(self.current(), Token::Union) {
+            self.advance();
+        }
+        let body = if matches!(self.current(), Token::LParen) {
+            // Parenthesised body: `(select ...)`, `(insert ...)`, etc.
+            let expr = self.parse_paren_expr()?;
+            match expr {
+                Expr::SubQuery(stmt) => *stmt,
+                _ => return Err(self.err("for loop body must be a statement")),
+            }
+        } else {
+            self.parse_inner_stmt()?
+        };
+        Ok(Stmt::For(ForStmt { var, optional, iterator, body: Box::new(body) }))
     }
 
     // ── Expressions ─────────────────────────────────────────────────────────────
@@ -674,10 +704,10 @@ impl Parser {
             return Ok(Expr::Tuple(vec![]));
         }
 
-        // Parenthesised statement: (SELECT ...), (INSERT ...), (UPDATE ...), (DELETE ...), (WITH ...)
+        // Parenthesised statement: (SELECT ...), (INSERT ...), (UPDATE ...), (DELETE ...), (WITH ...), (FOR ...)
         if matches!(
             self.current(),
-            Token::With | Token::Select | Token::Insert | Token::Update | Token::Delete
+            Token::With | Token::For | Token::Select | Token::Insert | Token::Update | Token::Delete
         ) {
             let stmt = self.parse_inner_stmt()?;
             self.eat(&Token::RParen)?;
