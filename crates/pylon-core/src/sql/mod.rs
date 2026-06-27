@@ -1,8 +1,8 @@
 use crate::ir::{
-    IrArraySource, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral,
-    IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect,
-    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource,
-    IrStmt, IrUpdate,
+    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFreeExpr, IrFreeSelect, IrInsert, IrLiteral,
+    IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput,
+    IrPathJoin, IrPathResult, IrPathSelect, IrScalarField, IrSelect, IrShapeField,
+    IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -14,12 +14,22 @@ pub struct SqlOutput {
 
 pub fn emit(ir: &IrOutput) -> SqlOutput {
     match &ir.stmt {
-        IrStmt::Select(sel) => emit_select_stmt(sel),
-        IrStmt::FreeSelect(sel) => emit_free_select(sel),
-        IrStmt::PathSelect(sel) => emit_path_select(sel),
-        IrStmt::Insert(ins) => emit_insert_stmt(ins),
-        IrStmt::Update(upd) => emit_update_stmt(upd),
-        IrStmt::Delete(del) => emit_delete_stmt(del),
+        IrStmt::Update(upd) => emit_update_stmt(upd, &ir.ctes),
+        stmt => {
+            let mut out = match stmt {
+                IrStmt::Select(sel) => emit_select_stmt(sel),
+                IrStmt::FreeSelect(sel) => emit_free_select(sel),
+                IrStmt::PathSelect(sel) => emit_path_select(sel),
+                IrStmt::Insert(ins) => emit_insert_stmt(ins),
+                IrStmt::Delete(del) => emit_delete_stmt(del),
+                IrStmt::Update(_) => unreachable!(),
+            };
+            if !ir.ctes.is_empty() {
+                let prefix = emit_cte_prefix(&ir.ctes);
+                out.sql = format!("{}{}", prefix, out.sql);
+            }
+            out
+        }
     }
 }
 
@@ -162,8 +172,114 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql
         }
         IrStmt::FreeSelect(_) => unreachable!("FreeSelect cannot appear as a CTE source"),
-        IrStmt::PathSelect(_) => unreachable!("PathSelect cannot appear as a CTE source"),
+        IrStmt::PathSelect(ps) => {
+            // Path select as CTE: emit a flat SELECT that exposes an `id` column.
+            let mut sql = emit_path_joins(&ps.root, &ps.joins);
+            append_filter(&mut sql, &ps.filter);
+            sql
+        }
     }
+}
+
+// ── User CTE helpers ────────────────────────────────────────────────────────
+
+/// Emit `WITH "name" AS (...), ...` prefix (WITH keyword + trailing newline included).
+fn emit_cte_prefix(ctes: &[IrCteDef]) -> String {
+    let parts: Vec<String> = ctes.iter()
+        .map(|c| format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)))
+        .collect();
+    format!("WITH\n{}\n", parts.join(",\n"))
+}
+
+/// Emit `(SELECT id FROM ...)` sub-expression for a multi-link values source.
+fn emit_multilink_values_subquery(vals: &IrMultiLinkValues) -> String {
+    match vals {
+        IrMultiLinkValues::CteRef(name) => {
+            // Just the CTE name; will be aliased at the call site.
+            format!("\"{}\"", name)
+        }
+        IrMultiLinkValues::Select(s) => {
+            let alias = &s.source.alias;
+            let mut sql = format!(
+                "(SELECT {}.\"id\" FROM {} AS {}",
+                qi(alias), source_ref(&s.source), qi(alias)
+            );
+            append_filter(&mut sql, &s.filter);
+            sql.push(')');
+            sql
+        }
+        IrMultiLinkValues::PathSelect(ps) => {
+            let root_alias = &ps.root.alias;
+            let mut sql = format!(
+                "(SELECT {}.\"id\" FROM {} AS {}",
+                qi(root_alias), source_ref(&ps.root), qi(root_alias)
+            );
+            for join in &ps.joins {
+                sql.push_str(&emit_path_join_sql(join));
+            }
+            append_filter(&mut sql, &ps.filter);
+            sql.push(')');
+            sql
+        }
+    }
+}
+
+/// SQL fragment for a single path join (used in multilink values emission).
+fn emit_path_join_sql(join: &IrPathJoin) -> String {
+    match join {
+        IrPathJoin::Single { source_alias, fk_col, target } => {
+            format!(
+                " JOIN {} AS {} ON {}.\"id\" = {}.{}",
+                source_ref(target), qi(&target.alias),
+                qi(&target.alias), qi(source_alias), qi(fk_col)
+            )
+        }
+        IrPathJoin::Multi { source_alias, junction_alias, join: ml_join, target } => {
+            let (jt_ref, src_col, tgt_col) = match ml_join {
+                IrMultiLinkJoin::Standard { junction_table, module } =>
+                    (qn(module, junction_table), "source".to_string(), "target".to_string()),
+                IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } =>
+                    (qn(module, junction_table), source_col.clone(), target_col.clone()),
+            };
+            format!(
+                " JOIN {} AS {} ON {}.{} = {}.\"id\" JOIN {} AS {} ON {}.{} = {}.\"id\"",
+                jt_ref, qi(junction_alias),
+                qi(junction_alias), qi(&src_col), qi(source_alias),
+                source_ref(target), qi(&target.alias),
+                qi(junction_alias), qi(&tgt_col), qi(&target.alias),
+            )
+        }
+    }
+}
+
+/// Emit the CTE clause for a junction table INSERT (append / replace-insert).
+fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, idx: usize, cte_name: &str) -> String {
+    let vals_ref = emit_multilink_values_subquery(&mutation.values);
+    let ins = format!(
+        "INSERT INTO {} ({}, {})\nSELECT \"_ids\".\"id\", \"_v\".\"id\" FROM \"_ids\" CROSS JOIN {} AS \"_v\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}",
+        qn(&mutation.module, &mutation.junction_table),
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+        vals_ref,
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+    );
+    format!("\"{}\" AS (\n{}\n)", cte_name, ins)
+}
+
+/// Emit the CTE clause for a junction table DELETE (remove).
+fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, idx: usize, cte_name: &str) -> String {
+    let vals_ref = emit_multilink_values_subquery(&mutation.values);
+    let del = format!(
+        "DELETE FROM {}\nWHERE {} IN (SELECT \"id\" FROM \"_ids\")\n  AND {} IN (SELECT \"id\" FROM {})\nRETURNING {}, {}",
+        qn(&mutation.module, &mutation.junction_table),
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+        vals_ref,
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+    );
+    format!("\"{}\" AS (\n{}\n)", cte_name, del)
 }
 
 // ── Conflict helper ─────────────────────────────────────────────────────────
@@ -460,15 +576,18 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────
 
-fn emit_update_stmt(upd: &IrUpdate) -> SqlOutput {
+fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     let alias = &upd.target.alias;
     let (shape, returning_sql) = emit_returning_shape(&upd.target, &upd.returning, true);
 
-    if upd.multi_link_clears.is_empty() {
-        // Simple UPDATE — no junction table changes.
-        let mut sets: Vec<String> = upd
-            .assignments
-            .iter()
+    let has_any_multilink = !upd.multi_link_clears.is_empty()
+        || !upd.multi_link_replaces.is_empty()
+        || !upd.multi_link_appends.is_empty()
+        || !upd.multi_link_removals.is_empty();
+
+    if !has_any_multilink {
+        // No junction changes — emit a plain UPDATE (possibly with user CTE prefix).
+        let mut sets: Vec<String> = upd.assignments.iter()
             .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
             .collect();
         for rw in &upd.rewrites {
@@ -476,19 +595,17 @@ fn emit_update_stmt(upd: &IrUpdate) -> SqlOutput {
         }
         let mut sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target),
-            qi(alias),
-            sets.join(", "),
+            source_ref(&upd.target), qi(alias), sets.join(", "),
         );
         append_filter(&mut sql, &upd.filter);
-        if let Some(r) = returning_sql {
-            sql.push_str(&r);
+        if let Some(r) = returning_sql { sql.push_str(&r); }
+        if !user_ctes.is_empty() {
+            sql = format!("{}{}", emit_cte_prefix(user_ctes), sql);
         }
         return SqlOutput { sql, shape };
     }
 
-    // UPDATE with multi-link clears — CTE so all changes are atomic.
-    // Build the result ROW expression for the final SELECT.
+    // CTE-based UPDATE for junction table mutations.
     let result_expr = if !upd.returning.is_empty() {
         let (field_exprs, _) = build_shape(&upd.returning, alias);
         let mut parts = vec![type_disc(&upd.target.type_name)];
@@ -501,10 +618,14 @@ fn emit_update_stmt(upd: &IrUpdate) -> SqlOutput {
     let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
     let mut cte_parts: Vec<String> = vec![];
 
+    // User CTEs first.
+    for cte in user_ctes {
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte.name, emit_dml_as_cte_source(&cte.stmt)));
+    }
+
+    // _ids: the target rows (updated or selected).
     if has_scalar_changes {
-        let mut sets: Vec<String> = upd
-            .assignments
-            .iter()
+        let mut sets: Vec<String> = upd.assignments.iter()
             .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
             .collect();
         for rw in &upd.rewrites {
@@ -512,35 +633,46 @@ fn emit_update_stmt(upd: &IrUpdate) -> SqlOutput {
         }
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target),
-            qi(alias),
-            sets.join(", "),
+            source_ref(&upd.target), qi(alias), sets.join(", "),
         );
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\nRETURNING *");
-        cte_parts.push(format!("_ids AS (\n{}\n)", upd_sql));
+        cte_parts.push(format!("\"_ids\" AS (\n{}\n)", upd_sql));
     } else {
         let mut sel = format!(
             "SELECT {}.* FROM {} AS {}",
-            qi(alias),
-            source_ref(&upd.target),
-            qi(alias),
+            qi(alias), source_ref(&upd.target), qi(alias),
         );
         append_filter(&mut sel, &upd.filter);
-        cte_parts.push(format!("_ids AS (\n{}\n)", sel));
+        cte_parts.push(format!("\"_ids\" AS (\n{}\n)", sel));
     }
 
+    // Junction clears (`:= {}` and `:= expr` — the clear part of replace).
     for (i, clr) in upd.multi_link_clears.iter().enumerate() {
         let del = format!(
-            "DELETE FROM {} WHERE {} IN (SELECT id FROM _ids)",
-            qn(&clr.module, &clr.junction_table),
-            qi(&clr.source_col),
+            "DELETE FROM {} WHERE {} IN (SELECT id FROM \"_ids\")",
+            qn(&clr.module, &clr.junction_table), qi(&clr.source_col),
         );
-        cte_parts.push(format!("_clr_{} AS (\n{}\n)", i, del));
+        cte_parts.push(format!("\"_clr_{}\" AS (\n{}\n)", i, del));
+    }
+
+    // Junction appends (`+=`).
+    for (i, app) in upd.multi_link_appends.iter().enumerate() {
+        cte_parts.push(emit_ml_append_cte(app, i, &format!("_ml_add_{}", i)));
+    }
+
+    // Junction removals (`-=`).
+    for (i, rem) in upd.multi_link_removals.iter().enumerate() {
+        cte_parts.push(emit_ml_remove_cte(rem, i, &format!("_ml_rm_{}", i)));
+    }
+
+    // Junction inserts for replace (`:= expr` — insert after the clear).
+    for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
+        cte_parts.push(emit_ml_append_cte(rep, i, &format!("_ml_rep_{}", i)));
     }
 
     let sql = format!(
-        "WITH\n{}\nSELECT (\n    {}\n) AS result\nFROM _ids AS {}",
+        "WITH\n{}\nSELECT (\n    {}\n) AS result\nFROM \"_ids\" AS {}",
         cte_parts.join(",\n"),
         result_expr,
         qi(alias),
@@ -926,6 +1058,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("(SELECT {}(v) FROM ({}) AS _set(v))", fn_name, union_all)
         }
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
+
+        IrExpr::CteRef(name) => format!("(SELECT \"id\" FROM \"{}\")", name),
 
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;

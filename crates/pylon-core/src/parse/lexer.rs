@@ -80,6 +80,8 @@ pub enum Token {
     StarStar,  // **
     QQ,        // ??
     PlusPlus,  // ++
+    PlusEq,    // +=
+    MinusEq,   // -=
     Dollar,    // $
 
     Eof,
@@ -186,14 +188,25 @@ impl<'a> Lexer<'a> {
             b'$' => Ok(Token::Dollar),
             b'.' => Ok(Token::Dot),
             b'+' => {
-                if self.pos < self.input.len() && self.current() == b'+' {
+                if self.pos < self.input.len() {
+                    if self.current() == b'+' {
+                        self.advance();
+                        return Ok(Token::PlusPlus);
+                    } else if self.current() == b'=' {
+                        self.advance();
+                        return Ok(Token::PlusEq);
+                    }
+                }
+                Ok(Token::Plus)
+            }
+            b'-' => {
+                if self.pos < self.input.len() && self.current() == b'=' {
                     self.advance();
-                    Ok(Token::PlusPlus)
+                    Ok(Token::MinusEq)
                 } else {
-                    Ok(Token::Plus)
+                    Ok(Token::Minus)
                 }
             }
-            b'-' => Ok(Token::Minus),
             b'*' => {
                 if self.pos < self.input.len() && self.current() == b'*' {
                     self.advance();

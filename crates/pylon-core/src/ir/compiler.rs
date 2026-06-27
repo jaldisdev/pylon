@@ -3,7 +3,7 @@ use crate::error::{
     PyQLUnknownFieldError, PyQLUnknownTypeError,
 };
 use crate::parse::ast::{
-    self, Expr, Literal, NonesOrder, ShapeElement, SortDirection, Stmt,
+    self, Expr, Literal, NonesOrder, ShapeElement, ShapeOp, SortDirection, Stmt,
 };
 use crate::schema::{
     LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
@@ -12,11 +12,11 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrArraySource, IrBinOp, IrComputedField, IrConflict, IrDelete, IrExpr, IrFreeExpr,
+    IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFreeExpr,
     IrFreeSelect, IrFunctionCall, IrIfElse, IrInsert, IrLiteral, IrMultiLinkClear,
-    IrMultiLinkField, IrMultiLinkJoin, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect,
-    IrRewrite, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir,
-    IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput,
+    IrPathJoin, IrPathResult, IrPathSelect, IrRewrite, IrScalarField, IrSelect, IrShapeField,
+    IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -25,8 +25,52 @@ use super::{
 /// Returns the IR plan and the ordered list of parameter names (matching $1, $2, …).
 pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLError> {
     let mut c = Compiler::new(schema);
-    let ir = c.compile_stmt(stmt)?;
-    Ok(IrOutput { stmt: ir, params: c.params })
+
+    // Unwrap top-level WITH block: compile each CTE binding, then the main statement.
+    let (ctes, ir) = if let Stmt::With(w) = stmt {
+        let mut cte_defs = vec![];
+        for alias in &w.aliases {
+            let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
+            let type_name = cte_stmt_type(&ir_stmt);
+            c.cte_types.insert(alias.name.clone(), type_name.clone());
+            cte_defs.push(IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name });
+        }
+        let main = c.compile_stmt(&w.stmt)?;
+        (cte_defs, main)
+    } else {
+        (vec![], c.compile_stmt(stmt)?)
+    };
+
+    Ok(IrOutput { stmt: ir, params: c.params, ctes })
+}
+
+fn cte_stmt_type(stmt: &IrStmt) -> String {
+    match stmt {
+        IrStmt::Insert(ins) => ins.target.type_name.clone(),
+        IrStmt::Update(upd) => upd.target.type_name.clone(),
+        IrStmt::Delete(del) => del.target.type_name.clone(),
+        IrStmt::Select(sel) => sel.source.type_name.clone(),
+        IrStmt::PathSelect(ps) => ps.root.type_name.clone(),
+        IrStmt::FreeSelect(_) => String::new(),
+    }
+}
+
+/// Compile a WITH binding value: a subquery becomes its statement; any other
+/// expression is wrapped in a synthetic `select expr` so it can be used as a CTE.
+fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQLError> {
+    if let Expr::SubQuery(s) = expr {
+        return c.compile_stmt(s);
+    }
+    // Non-statement expression (e.g. `<default::Company><uuid>'...'`):
+    // treat as `select expr`.
+    let fake_sel = ast::SelectStmt {
+        result: expr.clone(),
+        filter: None,
+        order_by: vec![],
+        offset: None,
+        limit: None,
+    };
+    c.compile_stmt(&Stmt::Select(fake_sel))
 }
 
 /// Compile a single PyQL expression in the context of a named type.
@@ -50,11 +94,27 @@ struct Compiler<'a> {
     /// Ordered parameter names — index + 1 is the $N position in SQL.
     params: Vec<String>,
     alias_counter: usize,
+    /// CTE names registered in the enclosing WITH block → qualified type name.
+    cte_types: HashMap<String, String>,
 }
 
 impl<'a> Compiler<'a> {
     fn new(schema: &'a SchemaDescriptor) -> Self {
-        Compiler { schema, params: vec![], alias_counter: 0 }
+        Compiler { schema, params: vec![], alias_counter: 0, cte_types: HashMap::new() }
+    }
+
+    /// Return the CTE name if `expr` is a bare identifier that matches a registered CTE.
+    fn resolve_cte_name<'e>(&self, expr: &'e Expr) -> Option<&'e str> {
+        if let Expr::Path(p) = expr {
+            if !p.partial && p.steps.len() == 1 {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if self.cte_types.contains_key(n.as_str()) {
+                        return Some(n.as_str());
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn fresh_alias(&mut self) -> String {
@@ -181,6 +241,17 @@ impl<'a> Compiler<'a> {
             Stmt::Insert(s) => self.compile_insert(s).map(IrStmt::Insert),
             Stmt::Update(s) => self.compile_update(s).map(IrStmt::Update),
             Stmt::Delete(s) => self.compile_delete(s).map(IrStmt::Delete),
+            // Nested WITH blocks (e.g. inside a subquery): inline the CTE types
+            // into the current compiler scope so references resolve correctly.
+            // The actual CTE SQL is handled at the top-level compile() boundary.
+            Stmt::With(w) => {
+                for alias in &w.aliases {
+                    let ir_inner = compile_cte_binding(self, &alias.expr)?;
+                    let type_name = cte_stmt_type(&ir_inner);
+                    self.cte_types.insert(alias.name.clone(), type_name);
+                }
+                self.compile_stmt(&w.stmt)
+            }
         }
     }
 
@@ -931,6 +1002,16 @@ impl<'a> Compiler<'a> {
                  use a schema-bound SELECT instead",
             )),
 
+            // CTE name used as a value in free context
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if self.cte_types.contains_key(n.as_str()) {
+                        return Ok(IrExpr::CteRef(n.clone()));
+                    }
+                }
+                Err(self.type_err("expression is not valid in free SELECT context"))
+            }
+
             _ => Err(self.type_err("expression is not valid in free SELECT context")),
         }
     }
@@ -1024,6 +1105,7 @@ impl<'a> Compiler<'a> {
             Stmt::Insert(ins) => Ok(ins.subject.name.clone()),
             Stmt::Update(upd) => self.expr_as_type_name(&upd.subject),
             Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
+            Stmt::With(w) => self.dml_subject_type(&w.stmt),
             Stmt::Select(sel) => {
                 // <Module::Type>expr — type name comes from the cast target
                 if let Expr::TypeCast(tc) = &sel.result {
@@ -1180,67 +1262,74 @@ impl<'a> Compiler<'a> {
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
 
-        // Split shape elements: multi-link `{}` clears vs scalar/link assignments.
+        // Classify shape elements by kind.
         let mut multi_link_clears = vec![];
-        let scalar_elements: Vec<_> = upd
-            .shape
-            .iter()
-            .filter(|el| {
-                let field_name = match path_leaf(&el.path) {
-                    Ok(n) => n,
-                    Err(_) => return true,
-                };
-                if let Some(ml) = Self::resolve_multilink(td, field_name) {
-                    let is_empty_set = el
-                        .compexpr
-                        .as_ref()
-                        .map(|e| matches!(e, Expr::Set(v) if v.is_empty()))
-                        .unwrap_or(false);
-                    if is_empty_set {
-                        let (junction_table, module, source_col) = match &ml.through {
-                            None => (
-                                format!("{}.{}", td.table, ml.name),
-                                td.module.clone(),
-                                "source".to_string(),
-                            ),
-                            Some(through_qname) => {
-                                if let Ok(through_td) = self.resolve_type(through_qname) {
-                                    let source_qname =
-                                        format!("{}::{}", td.module, td.name);
-                                    let source_col = through_td
-                                        .links
-                                        .iter()
-                                        .find(|l| l.target == source_qname)
-                                        .map(|l| l.name.clone())
-                                        .unwrap_or_else(|| "source".to_string());
-                                    (
-                                        through_td.table.clone(),
-                                        through_td.module.clone(),
-                                        source_col,
-                                    )
-                                } else {
-                                    return true;
-                                }
-                            }
-                        };
-                        multi_link_clears.push(IrMultiLinkClear {
-                            junction_table,
-                            module,
-                            source_col,
-                        });
-                        return false; // exclude from scalar assignments
+        let mut multi_link_replaces = vec![];
+        let mut multi_link_appends = vec![];
+        let mut multi_link_removals = vec![];
+        let mut scalar_elements: Vec<ShapeElement> = vec![];
+
+        for el in &upd.shape {
+            let field_name = match path_leaf(&el.path) {
+                Ok(n) => n,
+                Err(_) => { scalar_elements.push(el.clone()); continue; }
+            };
+
+            if let Some(ml) = Self::resolve_multilink(td, field_name) {
+                let (jt, module, src_col, tgt_col) =
+                    self.multilink_junction_info(td, ml)?;
+
+                match el.op {
+                    ShapeOp::Assign => {
+                        let is_empty = el.compexpr.as_ref()
+                            .map(|e| matches!(e, Expr::Set(v) if v.is_empty()))
+                            .unwrap_or(false);
+                        if is_empty {
+                            // := {} — clear all junction rows
+                            multi_link_clears.push(IrMultiLinkClear {
+                                junction_table: jt,
+                                module,
+                                source_col: src_col,
+                            });
+                        } else if let Some(expr) = &el.compexpr {
+                            // := expr — replace (clear + insert)
+                            multi_link_clears.push(IrMultiLinkClear {
+                                junction_table: jt.clone(),
+                                module: module.clone(),
+                                source_col: src_col.clone(),
+                            });
+                            let values = self.compile_multilink_values(expr)?;
+                            multi_link_replaces.push(IrMultiLinkMutation {
+                                junction_table: jt, module, source_col: src_col,
+                                target_col: tgt_col, values,
+                            });
+                        }
+                    }
+                    ShapeOp::Append => {
+                        if let Some(expr) = &el.compexpr {
+                            let values = self.compile_multilink_values(expr)?;
+                            multi_link_appends.push(IrMultiLinkMutation {
+                                junction_table: jt, module, source_col: src_col,
+                                target_col: tgt_col, values,
+                            });
+                        }
+                    }
+                    ShapeOp::Remove => {
+                        if let Some(expr) = &el.compexpr {
+                            let values = self.compile_multilink_values(expr)?;
+                            multi_link_removals.push(IrMultiLinkMutation {
+                                junction_table: jt, module, source_col: src_col,
+                                target_col: tgt_col, values,
+                            });
+                        }
                     }
                 }
-                true
-            })
-            .cloned()
-            .collect();
+            } else {
+                scalar_elements.push(el.clone());
+            }
+        }
 
         let assignments = self.compile_assignments_for_update(&scalar_elements, td, &alias)?;
-        // Substitute assignment expressions into rewrites so that when a rewrite
-        // references a property that is also being SET in this UPDATE, it sees
-        // the new value (e.g. $2) rather than the pre-update row value ("t0"."name").
-        // Properties not being SET keep their ColumnRef and read the current row value.
         let assignment_map: HashMap<String, IrExpr> =
             assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
         let rewrites = self.compile_rewrites(td, &alias, 2)?
@@ -1252,7 +1341,82 @@ impl<'a> Compiler<'a> {
             .collect();
         let returning = Self::pk_returning(td);
 
-        Ok(IrUpdate { target, filter, assignments, rewrites, returning, multi_link_clears })
+        Ok(IrUpdate {
+            target, filter, assignments, rewrites, returning,
+            multi_link_clears, multi_link_replaces,
+            multi_link_appends, multi_link_removals,
+        })
+    }
+
+    /// Extract junction table info for a multi-link: (junction_table, module, source_col, target_col).
+    fn multilink_junction_info(
+        &mut self,
+        td: &TypeDescriptor,
+        ml: &MultiLinkDescriptor,
+    ) -> Result<(String, String, String, String), PyQLError> {
+        match &ml.through {
+            None => Ok((
+                format!("{}.{}", td.table, ml.name),
+                td.module.clone(),
+                "source".to_string(),
+                "target".to_string(),
+            )),
+            Some(through_qname) => {
+                let through_td = self.resolve_type(through_qname)?;
+                let src_type = format!("{}::{}", td.module, td.name);
+                let source_col = through_td.links.iter()
+                    .find(|l| l.target == src_type)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_else(|| "source".to_string());
+                let tgt_type = &ml.target;
+                let target_col = through_td.links.iter()
+                    .find(|l| &l.target == tgt_type)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_else(|| "target".to_string());
+                Ok((through_td.table.clone(), through_td.module.clone(), source_col, target_col))
+            }
+        }
+    }
+
+    /// Compile the RHS of a multilink `+=`, `-=`, or `:= expr` into an `IrMultiLinkValues`.
+    fn compile_multilink_values(&mut self, expr: &Expr) -> Result<IrMultiLinkValues, PyQLError> {
+        // CTE reference: bare name matching a registered CTE
+        if let Some(name) = self.resolve_cte_name(expr) {
+            return Ok(IrMultiLinkValues::CteRef(name.to_string()));
+        }
+
+        // Parenthesised subquery
+        if let Expr::SubQuery(inner) = expr {
+            return match self.compile_stmt(inner)? {
+                IrStmt::Select(s) => Ok(IrMultiLinkValues::Select(Box::new(s))),
+                IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues::PathSelect(Box::new(ps))),
+                _ => Err(self.type_err(
+                    "multilink value must resolve to a SELECT or path query"
+                )),
+            };
+        }
+
+        // Absolute path expression (type reference or path traversal)
+        if let Expr::Path(p) = expr {
+            if !p.partial {
+                let fake_sel = ast::SelectStmt {
+                    result: expr.clone(),
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                };
+                return match self.compile_stmt(&Stmt::Select(fake_sel))? {
+                    IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues::PathSelect(Box::new(ps))),
+                    IrStmt::Select(s) => Ok(IrMultiLinkValues::Select(Box::new(s))),
+                    _ => Err(self.type_err("expected a path expression for multilink value")),
+                };
+            }
+        }
+
+        Err(self.type_err(
+            "multilink value must be a CTE reference, parenthesised subquery, or type path"
+        ))
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────────────
@@ -1717,6 +1881,14 @@ impl<'a> Compiler<'a> {
         alias: &str,
     ) -> Result<IrExpr, PyQLError> {
         if !p.partial {
+            // Allow CTE names as scalar references: emit (SELECT "id" FROM "cte_name").
+            if p.steps.len() == 1 {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if self.cte_types.contains_key(n.as_str()) {
+                        return Ok(IrExpr::CteRef(n.clone()));
+                    }
+                }
+            }
             return Err(PyQLError::Type(PyQLTypeError {
                 message: "absolute paths are not valid in expression context; use .field".into(),
                 position: Position { line: 0, col: 0 },
@@ -1753,10 +1925,10 @@ impl<'a> Compiler<'a> {
         }
 
         if let Some(link) = Self::resolve_link(td, field_name) {
-            // FK column reference (uuid)
+            // FK column reference (uuid) — e.g. `.company` → `t0."company_id"`
             return Ok(IrExpr::ColumnRef {
                 alias: alias.to_string(),
-                column: link.name.clone(),
+                column: format!("{}_id", link.name),
                 pg_type: "uuid".to_string(),
             });
         }

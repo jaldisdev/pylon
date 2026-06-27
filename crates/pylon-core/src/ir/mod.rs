@@ -227,8 +227,14 @@ pub struct IrUpdate {
     /// Schema-defined rewrites appended to the SET clause.
     pub rewrites: Vec<IrRewrite>,
     pub returning: Vec<IrShapeField>,
-    /// Multi-link junction tables to clear: DELETE WHERE source IN (updated ids).
+    /// `friends := {}` — DELETE all junction rows for this object.
     pub multi_link_clears: Vec<IrMultiLinkClear>,
+    /// `friends := expr` — clear + insert (both lists share the same index).
+    pub multi_link_replaces: Vec<IrMultiLinkMutation>,
+    /// `friends += expr` — INSERT junction rows.
+    pub multi_link_appends: Vec<IrMultiLinkMutation>,
+    /// `friends -= expr` — DELETE specific junction rows.
+    pub multi_link_removals: Vec<IrMultiLinkMutation>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +243,30 @@ pub struct IrMultiLinkClear {
     pub module: String,
     /// Column on the junction table referencing the source object's id.
     pub source_col: String,
+}
+
+/// A multi-link mutation: insert or delete specific rows in a junction table.
+#[derive(Debug, Clone)]
+pub struct IrMultiLinkMutation {
+    pub junction_table: String,
+    pub module: String,
+    /// Column on the junction table referencing the source (updated) object's id.
+    pub source_col: String,
+    /// Column on the junction table referencing the target object's id.
+    pub target_col: String,
+    /// The set of target objects.
+    pub values: IrMultiLinkValues,
+}
+
+/// How to obtain the target object IDs for a multi-link mutation.
+#[derive(Debug, Clone)]
+pub enum IrMultiLinkValues {
+    /// Reference to a named CTE: `FROM "cte_name"`.
+    CteRef(String),
+    /// A regular schema SELECT (use source table + filter to get ids).
+    Select(Box<IrSelect>),
+    /// A path-traversal SELECT (root + joins, final result is the id).
+    PathSelect(Box<IrPathSelect>),
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────────
@@ -271,6 +301,8 @@ pub enum IrExpr {
     /// An aggregate function applied to an inline set literal `fn({e1, e2, ...})`.
     /// Emits: `(SELECT fn_name(v) FROM (SELECT e1 UNION ALL ...) AS _set(v))`
     AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
+    /// A scalar reference to a named CTE: emits `(SELECT "id" FROM "cte_name")`.
+    CteRef(String),
     /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
     /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
     ArrayFromSelect(Box<IrArraySource>),
@@ -351,6 +383,16 @@ pub struct IrRewrite {
     pub expr: IrExpr,
 }
 
+/// One `name := (stmt)` binding from a WITH block.
+#[derive(Debug, Clone)]
+pub struct IrCteDef {
+    pub name: String,
+    pub stmt: IrStmt,
+    /// Qualified type name of the result set (e.g. `"default::Person"`).
+    /// Empty for free expressions.
+    pub type_name: String,
+}
+
 /// The result of the IR compilation step.
 /// Carries the query plan and the ordered list of named parameters, which the
 /// SQL emitter uses to emit `$1 … $N` and the client uses to bind values.
@@ -358,6 +400,8 @@ pub struct IrOutput {
     pub stmt: IrStmt,
     /// Ordered parameter names, positionally matching `$1`, `$2`, … in the SQL.
     pub params: Vec<String>,
+    /// User-defined CTE bindings from a WITH block, in declaration order.
+    pub ctes: Vec<IrCteDef>,
 }
 
 #[cfg(test)]
