@@ -1596,6 +1596,19 @@ impl<'a> Compiler<'a> {
 
         // Computed override: `field := expr`
         if let Some(compexpr) = &el.compexpr {
+            // `alias := .multilink` → rename a multilink, same semantics as a regular field
+            if let Expr::Path(p) = compexpr {
+                if p.partial && p.steps.len() == 1 {
+                    if let ast::PathStep::Name(ml_name) = &p.steps[0] {
+                        if Self::resolve_multilink(td, ml_name).is_some() {
+                            let ml_name = ml_name.clone();
+                            return self.compile_multilink_field(
+                                field_name, &ml_name, td, alias, module, el,
+                            );
+                        }
+                    }
+                }
+            }
             let ir = self.compile_expr(compexpr, td, alias)?;
             return Ok(IrShapeField::Computed(IrComputedField {
                 alias: field_name.to_string(),
@@ -1642,96 +1655,109 @@ impl<'a> Compiler<'a> {
         }
 
         // Multi-link
-        if let Some(ml) = Self::resolve_multilink(td, field_name) {
-            let target_td = self.resolve_type(&ml.target)?;
-            let sub_alias = self.fresh_alias();
-            let nested_elements = el.nested.as_deref().unwrap_or(&[]);
-            let sub_shape =
-                self.compile_shape(nested_elements, target_td, &sub_alias, &target_td.module.clone())?;
-
-            let join = if let Some(through_qname) = &ml.through {
-                let through_td = self.resolve_type(through_qname)?;
-                let source_qname = format!("{}::{}", td.module, td.name);
-                let source_col = through_td
-                    .links
-                    .iter()
-                    .find(|l| l.target == source_qname)
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!(
-                            "through type {through_qname} has no link to source type {source_qname}"
-                        ),
-                        position: Position { line: 0, col: 0 },
-                    }))?
-                    .name
-                    .clone();
-                // Skip source_col when searching for target_col to handle self-referential
-                // through types where both links point to the same type.
-                let target_col = through_td
-                    .links
-                    .iter()
-                    .find(|l| l.target == ml.target && l.name != source_col)
-                    .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!(
-                            "through type {through_qname} has no link to target type {}",
-                            ml.target
-                        ),
-                        position: Position { line: 0, col: 0 },
-                    }))?
-                    .name
-                    .clone();
-                IrMultiLinkJoin::Through {
-                    junction_table: through_td.table.clone(),
-                    module: through_td.module.clone(),
-                    source_col,
-                    target_col,
-                }
-            } else {
-                IrMultiLinkJoin::Standard {
-                    junction_table: format!("{}.{}", td.table, ml.name),
-                    module: module.to_string(),
-                }
-            };
-
-            let subquery = IrSelect {
-                source: IrSource {
-                    type_name: format!("{}::{}", target_td.module, target_td.name),
-                    table: target_td.table.clone(),
-                    alias: sub_alias.clone(),
-                },
-                shape: sub_shape,
-                filter: el
-                    .filter
-                    .as_ref()
-                    .map(|f| self.compile_expr(f, target_td, &sub_alias))
-                    .transpose()?,
-                order_by: el
-                    .order_by
-                    .iter()
-                    .map(|s| self.compile_sort(s, target_td, &sub_alias))
-                    .collect::<Result<_, _>>()?,
-                offset: el
-                    .offset
-                    .as_ref()
-                    .map(|e| self.compile_expr(e, target_td, &sub_alias))
-                    .transpose()?,
-                limit: el
-                    .limit
-                    .as_ref()
-                    .map(|e| self.compile_expr(e, target_td, &sub_alias))
-                    .transpose()?,
-                distinct: false,
-                dml_source: None,
-            };
-
-            return Ok(IrShapeField::MultiLink(IrMultiLinkField {
-                alias: field_name.to_string(),
-                join,
-                subquery,
-            }));
+        if Self::resolve_multilink(td, field_name).is_some() {
+            return self.compile_multilink_field(field_name, field_name, td, alias, module, el);
         }
 
         Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
+    }
+
+    fn compile_multilink_field(
+        &mut self,
+        output_alias: &str,
+        ml_name: &str,
+        td: &TypeDescriptor,
+        parent_alias: &str,
+        module: &str,
+        el: &ShapeElement,
+    ) -> Result<IrShapeField, PyQLError> {
+        let ml = Self::resolve_multilink(td, ml_name)
+            .expect("caller verified multilink exists")
+            .clone();
+        let target_td = self.resolve_type(&ml.target)?;
+        let sub_alias = self.fresh_alias();
+        let nested_elements = el.nested.as_deref().unwrap_or(&[]);
+        let sub_shape =
+            self.compile_shape(nested_elements, target_td, &sub_alias, &target_td.module.clone())?;
+
+        let join = if let Some(through_qname) = &ml.through {
+            let through_td = self.resolve_type(through_qname)?;
+            let source_qname = format!("{}::{}", td.module, td.name);
+            let source_col = through_td
+                .links
+                .iter()
+                .find(|l| l.target == source_qname)
+                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                    message: format!(
+                        "through type {through_qname} has no link to source type {source_qname}"
+                    ),
+                    position: Position { line: 0, col: 0 },
+                }))?
+                .name
+                .clone();
+            let target_col = through_td
+                .links
+                .iter()
+                .find(|l| l.target == ml.target && l.name != source_col)
+                .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                    message: format!(
+                        "through type {through_qname} has no link to target type {}",
+                        ml.target
+                    ),
+                    position: Position { line: 0, col: 0 },
+                }))?
+                .name
+                .clone();
+            IrMultiLinkJoin::Through {
+                junction_table: through_td.table.clone(),
+                module: through_td.module.clone(),
+                source_col,
+                target_col,
+            }
+        } else {
+            IrMultiLinkJoin::Standard {
+                junction_table: format!("{}.{}", td.table, ml_name),
+                module: module.to_string(),
+            }
+        };
+
+        let subquery = IrSelect {
+            source: IrSource {
+                type_name: format!("{}::{}", target_td.module, target_td.name),
+                table: target_td.table.clone(),
+                alias: sub_alias.clone(),
+            },
+            shape: sub_shape,
+            filter: el
+                .filter
+                .as_ref()
+                .map(|f| self.compile_expr(f, target_td, &sub_alias))
+                .transpose()?,
+            order_by: el
+                .order_by
+                .iter()
+                .map(|s| self.compile_sort(s, target_td, &sub_alias))
+                .collect::<Result<_, _>>()?,
+            offset: el
+                .offset
+                .as_ref()
+                .map(|e| self.compile_expr(e, target_td, &sub_alias))
+                .transpose()?,
+            limit: el
+                .limit
+                .as_ref()
+                .map(|e| self.compile_expr(e, target_td, &sub_alias))
+                .transpose()?,
+            distinct: false,
+            dml_source: None,
+        };
+
+        Ok(IrShapeField::MultiLink(IrMultiLinkField {
+            alias: output_alias.to_string(),
+            join,
+            subquery,
+        }))
     }
 
     // ── Expression compilation ────────────────────────────────────────────────────

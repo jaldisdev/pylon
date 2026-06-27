@@ -151,9 +151,9 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
     for obj in results:
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             d = {
-                f.name: getattr(obj, f.name)
-                for f in dataclasses.fields(obj)
-                if f.name in selected
+                k: v
+                for k, v in vars(obj).items()
+                if k in selected
             }
             d["__type__"] = type_name or vars(obj).get("__pylon_type__") or type(obj).__name__
         elif isinstance(obj, dict):

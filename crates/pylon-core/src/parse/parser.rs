@@ -283,7 +283,8 @@ impl Parser {
             self.advance();
             let condition = self.parse_or()?;
             self.eat(&Token::Else)?;
-            let else_expr = self.parse_or()?;
+            // Recurse so that `a if x else b if y else c` chains correctly.
+            let else_expr = self.parse_if_else()?;
             return Ok(Expr::IfElse(Box::new(IfElse {
                 if_expr: expr,
                 condition,
