@@ -432,6 +432,55 @@ impl<'a> Compiler<'a> {
         root_type_name: &str,
         distinct: bool,
     ) -> Result<IrPathSelect, PyQLError> {
+        // BinOp where one side is the absolute type-rooted path:
+        // Build the join chain for the path side, then apply the comparison
+        // element-wise so we get one boolean per traversal element (not one EXISTS per root).
+        if let Expr::BinOp(b) = result {
+            let (path_expr, value_expr, flip) = match (&b.left, &b.right) {
+                (Expr::Path(p), v) if !p.partial => (p, v, false),
+                (v, Expr::Path(p)) if !p.partial => (p, v, true),
+                _ => return self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct),
+            };
+            // Compile value side first so we can report its type in errors
+            let root_td = self.resolve_type(root_type_name)?;
+            // Build PathSelect for the path (builds root + joins + scalar/object result)
+            let ast_path = ast::Path { partial: false, steps: path_expr.steps.clone() };
+            let mut ps = self.compile_path_select(sel, &ast_path, &[], distinct)?;
+            let val_ir = self.compile_expr(value_expr, root_td, &ps.root.alias)?;
+            // Extract the scalar result from the path
+            let scalar_col = match ps.result {
+                IrPathResult::Scalar(e) => e,
+                IrPathResult::Object { type_name, .. } => {
+                    let val_type = infer_ir_type(&val_ir)
+                        .map(pg_type_to_pyql)
+                        .unwrap_or("unknown");
+                    return Err(PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "operator '{}' cannot be applied to operands of type '{}' and '{}'",
+                            b.op,
+                            type_name,
+                            val_type,
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }));
+                }
+            };
+            let (l, r) = if flip { (val_ir, scalar_col) } else { (scalar_col, val_ir) };
+            ps.result = IrPathResult::Scalar(IrExpr::BinOp(Box::new(IrBinOp {
+                left: l, op: b.op.clone(), right: r,
+            })));
+            return Ok(ps);
+        }
+        self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct)
+    }
+
+    fn compile_expr_as_path_select_fallback(
+        &mut self,
+        sel: &ast::SelectStmt,
+        result: &Expr,
+        root_type_name: &str,
+        distinct: bool,
+    ) -> Result<IrPathSelect, PyQLError> {
         let td = self.resolve_type(root_type_name)?;
         let alias = self.fresh_alias();
         let root = IrSource {
@@ -1350,7 +1399,7 @@ impl<'a> Compiler<'a> {
                     && f.args.len() == 2
                 {
                     if let Expr::Path(p) = &f.args[0] {
-                        if p.partial && p.steps.len() == 2 {
+                        if p.partial && p.steps.len() >= 2 {
                             if let ast::PathStep::Name(ln) = &p.steps[0] {
                                 if Self::resolve_multilink(td, ln).is_some() {
                                     let synthetic = ast::BinOp {
@@ -1543,33 +1592,31 @@ impl<'a> Compiler<'a> {
         Err(self.field_err(link_name, &format!("{}::{}", td.module, td.name)))
     }
 
-    /// If `b` has a 2-step multi-link path on either side, compile as EXISTS over the junction.
+    /// If `b` has a multi-link path (any depth) on either side, compile as EXISTS over the junction.
     fn try_multilink_exists(
         &mut self,
         b: &ast::BinOp,
         td: &TypeDescriptor,
         alias: &str,
     ) -> Result<Option<IrExpr>, PyQLError> {
-        fn ml_path_names(steps: &[ast::PathStep]) -> Option<(&str, &str)> {
-            if steps.len() != 2 { return None; }
-            let link = match &steps[0] { ast::PathStep::Name(n) => n.as_str(), _ => return None };
-            let field = match &steps[1] { ast::PathStep::Name(n) => n.as_str(), _ => return None };
-            Some((link, field))
+        fn ml_first_name(steps: &[ast::PathStep]) -> Option<&str> {
+            if steps.len() < 2 { return None; }
+            match &steps[0] { ast::PathStep::Name(n) => Some(n.as_str()), _ => None }
         }
 
-        let (link_name, field_name, value_ast, flip) = if let Expr::Path(p) = &b.left {
+        let (path_steps, value_ast, flip) = if let Expr::Path(p) = &b.left {
             if p.partial {
-                if let Some((ln, fn_)) = ml_path_names(&p.steps) {
+                if let Some(ln) = ml_first_name(&p.steps) {
                     if Self::resolve_multilink(td, ln).is_some() {
-                        (ln, fn_, &b.right, false)
+                        (p.steps.as_slice(), &b.right, false)
                     } else { return Ok(None); }
                 } else { return Ok(None); }
             } else { return Ok(None); }
         } else if let Expr::Path(p) = &b.right {
             if p.partial {
-                if let Some((ln, fn_)) = ml_path_names(&p.steps) {
+                if let Some(ln) = ml_first_name(&p.steps) {
                     if Self::resolve_multilink(td, ln).is_some() {
-                        (ln, fn_, &b.left, true)
+                        (p.steps.as_slice(), &b.left, true)
                     } else { return Ok(None); }
                 } else { return Ok(None); }
             } else { return Ok(None); }
@@ -1578,8 +1625,7 @@ impl<'a> Compiler<'a> {
         };
 
         let value_expr = self.compile_expr(value_ast, td, alias)?;
-        let ml_name = link_name.to_string();
-        let fd_name = field_name.to_string();
+        let ml_name = match &path_steps[0] { ast::PathStep::Name(n) => n.clone(), _ => return Ok(None) };
         let ml = Self::resolve_multilink(td, &ml_name).unwrap();
         // Clone what we need to avoid borrow conflicts with self below.
         let ml_target = ml.target.clone();
@@ -1587,6 +1633,9 @@ impl<'a> Compiler<'a> {
         let td_module = td.module.clone();
         let td_name = td.name.clone();
         let td_table = td.table.clone();
+
+        // tail steps are everything after the multi-link name (path_steps[1..])
+        let tail_steps: Vec<ast::PathStep> = path_steps[1..].to_vec();
 
         let jt_alias = self.fresh_alias();
 
@@ -1641,78 +1690,24 @@ impl<'a> Compiler<'a> {
             },
         }));
 
-        // field filter: compare the accessed field against the value
-        let (field_left, field_op, field_right) = if fd_name == "id" {
-            let col_ref = IrExpr::ColumnRef {
-                alias: jt_alias.clone(),
-                column: jt_tgt_col,
-                pg_type: "uuid".to_string(),
-            };
-            if flip {
-                (value_expr, b.op.clone(), col_ref)
-            } else {
-                (col_ref, b.op.clone(), value_expr)
-            }
-        } else {
-            let target_td = self.resolve_type(&ml_target)?;
-            let prop = target_td
-                .properties.iter()
-                .find(|p| p.name == fd_name)
-                .ok_or_else(|| self.field_err(&fd_name, &ml_target))?;
-            let prop_name = prop.name.clone();
-            let prop_pg = prop.pg_type.clone();
-            let ft_alias = self.fresh_alias();
-            let scalar_sub = IrExpr::Subquery(Box::new(IrSelect {
-                source: IrSource {
-                    type_name: ml_target.clone(),
-                    table: target_td.table.clone(),
-                    alias: ft_alias.clone(),
-                },
-                shape: vec![IrShapeField::Scalar(IrScalarField {
-                    alias: prop_name.clone(),
-                    column: prop_name,
-                    pg_type: prop_pg,
-                })],
-                filter: Some(IrExpr::BinOp(Box::new(IrBinOp {
-                    left: IrExpr::ColumnRef {
-                        alias: ft_alias.clone(),
-                        column: "id".to_string(),
-                        pg_type: "uuid".to_string(),
-                    },
-                    op: ast::BinOpKind::Eq,
-                    right: IrExpr::ColumnRef {
-                        alias: jt_alias.clone(),
-                        column: jt_tgt_col,
-                        pg_type: "uuid".to_string(),
-                    },
-                }))),
-                order_by: vec![],
-                offset: None,
-                limit: None,
-                distinct: false,
-                dml_source: None,
-            }));
-            if flip {
-                (value_expr, b.op.clone(), scalar_sub)
-            } else {
-                (scalar_sub, b.op.clone(), value_expr)
-            }
-        };
-
-        let field_filter = IrExpr::BinOp(Box::new(IrBinOp {
-            left: field_left,
-            op: field_op,
-            right: field_right,
-        }));
+        // Build tail filter: what to compare inside the junction/target EXISTS
+        let tail_filter = self.compile_path_tail_filter(
+            &tail_steps,
+            b.op.clone(),
+            value_expr,
+            flip,
+            &ml_target,
+            &jt_alias,
+            &jt_tgt_col,
+        )?;
 
         let full_filter = IrExpr::BinOp(Box::new(IrBinOp {
             left: src_filter,
             op: ast::BinOpKind::And,
-            right: field_filter,
+            right: tail_filter,
         }));
 
         // EXISTS(SELECT 1 FROM junction jt WHERE ...)
-        // type_name carries the module prefix so source_ref() emits the right schema.
         let jt_source = IrSource {
             type_name: format!("{}::__jt__", jt_module),
             table: jt_table,
@@ -1720,7 +1715,7 @@ impl<'a> Compiler<'a> {
         };
         let inner = IrExpr::Subquery(Box::new(IrSelect {
             source: jt_source,
-            shape: vec![],  // empty → SELECT 1
+            shape: vec![],
             filter: Some(full_filter),
             order_by: vec![],
             offset: None,
@@ -1733,6 +1728,184 @@ impl<'a> Compiler<'a> {
             op: ast::UnaryOpKind::Exists,
             operand: inner,
         }))))
+    }
+
+    /// Build a filter expression for the tail steps after the multi-link in an EXISTS context.
+    ///
+    /// `steps` = path steps after the multi-link name (e.g. ["company", "id"] for .friends.company.id)
+    /// `jt_alias` = alias of the junction table row
+    /// `jt_tgt_col` = column in the junction table holding the target id (e.g. "target" or "friend_id")
+    /// `target_type` = qualified name of the multi-link's target type (e.g. "default::Person")
+    #[allow(clippy::too_many_arguments)]
+    fn compile_path_tail_filter(
+        &mut self,
+        steps: &[ast::PathStep],
+        op: ast::BinOpKind,
+        value_expr: IrExpr,
+        flip: bool,
+        target_type: &str,
+        jt_alias: &str,
+        jt_tgt_col: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        // steps should have at least 1 element
+        let first_name = match steps.first() {
+            Some(ast::PathStep::Name(n)) => n.clone(),
+            _ => return Err(self.type_err("expected field or link name in path")),
+        };
+
+        let target_td = self.resolve_type(target_type)?;
+        let target_table = target_td.table.clone();
+
+        if steps.len() == 1 {
+            // Terminal step: must be a scalar property or "id"
+            if first_name == "id" {
+                // FK optimisation: compare jt.target directly
+                let col_ref = IrExpr::ColumnRef {
+                    alias: jt_alias.to_string(),
+                    column: jt_tgt_col.to_string(),
+                    pg_type: "uuid".to_string(),
+                };
+                let (l, r) = if flip { (value_expr, col_ref) } else { (col_ref, value_expr) };
+                return Ok(IrExpr::BinOp(Box::new(IrBinOp { left: l, op, right: r })));
+            }
+            // Check if it's a link (object) rather than a scalar
+            let is_link = target_td.links.iter().any(|l| l.name == first_name)
+                || target_td.multilinks.iter().any(|l| l.name == first_name);
+            if is_link {
+                let target_display = target_type.replace("::", ".");
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: format!(
+                        "operator '{op}' cannot be applied to operands of type '{target_display}' and the value type",
+                        op = &op,
+                    ),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
+            let prop = target_td.properties.iter()
+                .find(|p| p.name == first_name)
+                .ok_or_else(|| self.field_err(&first_name, target_type))?;
+            let prop_name = prop.name.clone();
+            let prop_pg = prop.pg_type.clone();
+            let tgt_alias = self.fresh_alias();
+            // Build EXISTS(SELECT 1 FROM target WHERE target.id = jt.target AND target.prop op value)
+            let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef { alias: tgt_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef { alias: jt_alias.to_string(), column: jt_tgt_col.to_string(), pg_type: "uuid".to_string() },
+            }));
+            let prop_col = IrExpr::ColumnRef { alias: tgt_alias.clone(), column: prop_name, pg_type: prop_pg };
+            let (pl, pr) = if flip { (value_expr, prop_col) } else { (prop_col, value_expr) };
+            let prop_filter = IrExpr::BinOp(Box::new(IrBinOp { left: pl, op, right: pr }));
+            let full = IrExpr::BinOp(Box::new(IrBinOp {
+                left: id_filter,
+                op: ast::BinOpKind::And,
+                right: prop_filter,
+            }));
+            let inner = IrExpr::Subquery(Box::new(IrSelect {
+                source: IrSource {
+                    type_name: target_type.to_string(),
+                    table: target_table,
+                    alias: tgt_alias,
+                },
+                shape: vec![],
+                filter: Some(full),
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                distinct: false,
+                dml_source: None,
+            }));
+            return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
+        }
+
+        // steps.len() >= 2: first_name must be a single link (not multi)
+        if target_td.multilinks.iter().any(|l| l.name == first_name) {
+            return Err(self.type_err(
+                "nested multi-link traversal in comparison is not yet supported",
+            ));
+        }
+        let link = target_td.links.iter()
+            .find(|l| l.name == first_name)
+            .ok_or_else(|| self.field_err(&first_name, target_type))?;
+        let next_target = link.target.clone();
+        let fk_col = format!("{}_id", first_name);
+        let tgt_alias = self.fresh_alias();
+
+        // FK optimisation for [single_link, "id"]:
+        if steps.len() == 2 {
+            if let Some(ast::PathStep::Name(n)) = steps.get(1) {
+                if n == "id" {
+                    // Compare tgt.{fk_col} (the FK in current target) directly
+                    // We need an EXISTS over the target to access fk_col
+                    // Actually: EXISTS(target WHERE target.id = jt.target AND target.{fk_col} op value)
+                    let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::ColumnRef { alias: tgt_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                        op: ast::BinOpKind::Eq,
+                        right: IrExpr::ColumnRef { alias: jt_alias.to_string(), column: jt_tgt_col.to_string(), pg_type: "uuid".to_string() },
+                    }));
+                    let fk_ref = IrExpr::ColumnRef { alias: tgt_alias.clone(), column: fk_col, pg_type: "uuid".to_string() };
+                    let (fl, fr) = if flip { (value_expr, fk_ref) } else { (fk_ref, value_expr) };
+                    let fk_filter = IrExpr::BinOp(Box::new(IrBinOp { left: fl, op, right: fr }));
+                    let full = IrExpr::BinOp(Box::new(IrBinOp {
+                        left: id_filter,
+                        op: ast::BinOpKind::And,
+                        right: fk_filter,
+                    }));
+                    let inner = IrExpr::Subquery(Box::new(IrSelect {
+                        source: IrSource {
+                            type_name: target_type.to_string(),
+                            table: target_table,
+                            alias: tgt_alias,
+                        },
+                        shape: vec![],
+                        filter: Some(full),
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        distinct: false,
+                        dml_source: None,
+                    }));
+                    return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
+                }
+            }
+        }
+
+        // General case: EXISTS(target WHERE target.id = jt.jt_tgt_col AND <tail_filter for steps[1..]>)
+        // Recursive call uses tgt_alias.fk_col as the "pointer to the next type's id"
+        let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef { alias: tgt_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef { alias: jt_alias.to_string(), column: jt_tgt_col.to_string(), pg_type: "uuid".to_string() },
+        }));
+        let nested_filter = self.compile_path_tail_filter(
+            &steps[1..],
+            op,
+            value_expr,
+            flip,
+            &next_target,
+            &tgt_alias,
+            &fk_col,
+        )?;
+        let full = IrExpr::BinOp(Box::new(IrBinOp {
+            left: id_filter,
+            op: ast::BinOpKind::And,
+            right: nested_filter,
+        }));
+        let inner = IrExpr::Subquery(Box::new(IrSelect {
+            source: IrSource {
+                type_name: target_type.to_string(),
+                table: target_table,
+                alias: tgt_alias,
+            },
+            shape: vec![],
+            filter: Some(full),
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct: false,
+            dml_source: None,
+        }));
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
     }
 
     /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.
