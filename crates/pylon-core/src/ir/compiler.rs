@@ -543,6 +543,177 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// `exists` in schema-bound expression context (FILTER, computed field, etc.).
+    fn compile_exists_operand(
+        &mut self,
+        operand: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        match operand {
+            // exists $param  /  exists <type>$param → $N IS NOT NULL
+            Expr::Parameter(name) => {
+                let idx = self.param_index(name);
+                Ok(ir_is_not_null(IrExpr::Param { index: idx }))
+            }
+            // exists <type>expr → expr IS NOT NULL (cast result is always a scalar)
+            Expr::TypeCast(_) => {
+                let inner = self.compile_expr(operand, td, alias)?;
+                Ok(ir_is_not_null(inner))
+            }
+
+            // exists .prop → alias.col IS NOT NULL
+            // exists .link → alias.link_id IS NOT NULL
+            // exists .multilink → EXISTS(SELECT 1 FROM junction WHERE src = alias.id)
+            Expr::Path(p) if p.partial && p.steps.len() == 1 => {
+                let field_name = match &p.steps[0] {
+                    ast::PathStep::Name(n) => n.as_str(),
+                    _ => return Err(self.type_err("exists: invalid path step")),
+                };
+                if let Some(prop) = Self::resolve_property(td, field_name) {
+                    return Ok(ir_is_not_null(IrExpr::ColumnRef {
+                        alias: alias.to_string(),
+                        column: prop.name.clone(),
+                        pg_type: prop.pg_type.clone(),
+                    }));
+                }
+                if let Some(link) = Self::resolve_link(td, field_name) {
+                    return Ok(ir_is_not_null(IrExpr::ColumnRef {
+                        alias: alias.to_string(),
+                        column: format!("{}_id", link.name),
+                        pg_type: "uuid".to_string(),
+                    }));
+                }
+                if Self::resolve_multilink(td, field_name).is_some() {
+                    return self.compile_multilink_exists_check(field_name, td, alias);
+                }
+                Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
+            }
+
+            // exists (select ...) → EXISTS(SELECT 1 FROM ...)
+            Expr::SubQuery(stmt) => {
+                self.compile_subquery_exists(stmt)
+            }
+
+            // Fallback: any scalar expression → expr IS NOT NULL
+            other => {
+                let inner = self.compile_expr(other, td, alias)?;
+                Ok(ir_is_not_null(inner))
+            }
+        }
+    }
+
+    /// `exists` in free (no schema context) expressions — params and subqueries only.
+    fn compile_exists_free(&mut self, operand: &Expr) -> Result<IrExpr, PyQLError> {
+        match operand {
+            Expr::Parameter(name) => {
+                let idx = self.param_index(name);
+                Ok(ir_is_not_null(IrExpr::Param { index: idx }))
+            }
+            // exists <type>expr → expr IS NOT NULL (cast result is always scalar)
+            Expr::TypeCast(_) => {
+                let inner = self.compile_free_expr(operand)?;
+                Ok(ir_is_not_null(inner))
+            }
+            Expr::SubQuery(stmt) => {
+                self.compile_subquery_exists(stmt)
+            }
+            // Fallback: any scalar literal or expression → expr IS NOT NULL
+            other => {
+                let inner = self.compile_free_expr(other)?;
+                Ok(ir_is_not_null(inner))
+            }
+        }
+    }
+
+    /// Compile `exists (select ...)` → `EXISTS(SELECT 1 FROM ... WHERE ...)`.
+    fn compile_subquery_exists(&mut self, stmt: &Stmt) -> Result<IrExpr, PyQLError> {
+        match self.compile_stmt(stmt)? {
+            IrStmt::Select(s) => {
+                let inner = IrExpr::Subquery(Box::new(IrSelect {
+                    source: s.source,
+                    shape: vec![],
+                    filter: s.filter,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    distinct: false,
+                    dml_source: None,
+                }));
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
+            }
+            IrStmt::PathSelect(ps) => {
+                // EXISTS(SELECT 1 FROM root [JOINs] WHERE filter)
+                // Reuse the path select but signal "exists" via a dedicated IR node
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: IrExpr::Subquery(Box::new(IrSelect {
+                        source: ps.root,
+                        shape: vec![],
+                        filter: ps.filter,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        distinct: false,
+                        dml_source: None,
+                    })),
+                })))
+            }
+            _ => Err(self.type_err("exists requires a SELECT expression")),
+        }
+    }
+
+    /// `EXISTS(SELECT 1 FROM junction WHERE junction.source = alias.id)` for a multi-link.
+    fn compile_multilink_exists_check(
+        &mut self,
+        ml_name: &str,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let ml = Self::resolve_multilink(td, ml_name).unwrap();
+        let ml_target = ml.target.clone();
+        let ml_through = ml.through.clone();
+        let td_module = td.module.clone();
+        let td_name = td.name.clone();
+        let td_table = td.table.clone();
+        let jt_alias = self.fresh_alias();
+
+        let (jt_table, jt_module, jt_src_col) = if let Some(through_qname) = &ml_through {
+            let through_td = self.resolve_type(through_qname)?;
+            let source_qname = format!("{}::{}", td_module, td_name);
+            let src_col = through_td.links.iter()
+                .find(|l| l.target == source_qname)
+                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                    message: format!("through type {through_qname} has no link to {source_qname}"),
+                    position: Position { line: 0, col: 0 },
+                }))?.name.clone();
+            (through_td.table.clone(), through_td.module.clone(), format!("{}_id", src_col))
+        } else {
+            (format!("{}.{}", td_table, ml_name), td_module.clone(), "source".to_string())
+        };
+
+        let filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+        }));
+        let inner = IrExpr::Subquery(Box::new(IrSelect {
+            source: IrSource {
+                type_name: format!("{}::__jt__", jt_module),
+                table: jt_table,
+                alias: jt_alias,
+            },
+            shape: vec![],
+            filter: Some(filter),
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct: false,
+            dml_source: None,
+        }));
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
+    }
+
     /// Returns true when the SELECT result expression is not a schema type reference.
     fn is_free_result(&self, expr: &Expr) -> bool {
         let expr = match expr {
@@ -729,6 +900,10 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
+            }
+
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => {
+                self.compile_exists_free(&u.operand)
             }
 
             Expr::UnaryOp(u) => {
@@ -1439,6 +1614,10 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
+            }
+
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => {
+                self.compile_exists_operand(&u.operand, td, alias)
             }
 
             Expr::UnaryOp(u) => {
@@ -2249,6 +2428,16 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
 
 /// Check whether a compiled expression is compatible with a PylonType parameter.
 /// Used for overload selection when multiple overloads share the same name.
+/// Emit `($1 IS NOT NULL)` for a given IR expression.
+fn ir_is_not_null(expr: IrExpr) -> IrExpr {
+    IrExpr::FunctionCall(IrFunctionCall {
+        schema: None,
+        name: String::new(),
+        args: vec![expr],
+        sql_template: Some("($1 IS NOT NULL)".to_string()),
+    })
+}
+
 fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
     use crate::stdlib::PylonType as PT;
     match ty {
