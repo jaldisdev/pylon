@@ -165,6 +165,35 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
     click.echo(_format_results(display))
 
 
+# --- one-shot query command ---------------------------------------------------
+
+
+@click.command("query")
+@click.argument("pyql_query")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Return results as JSON.")
+def query_cmd(pyql_query: str, as_json: bool) -> None:
+    """Execute a single PyQL query and print the result.
+
+    Example:
+
+        pylon query "select Person { name, age };"
+    """
+    try:
+        pylon.finalize()
+    except Exception as e:
+        click.echo(f"{_BOLD_RED}error:{_RESET} could not load schema: {e}", err=True)
+        raise SystemExit(1)
+
+    pyql = pyql_query.rstrip(";").strip()
+
+    async def run() -> None:
+        async with create_async_client() as client:
+            await _execute(client, pyql, as_json=as_json)
+
+    asyncio.run(run())
+
+
 # --- result formatting --------------------------------------------------------
 
 

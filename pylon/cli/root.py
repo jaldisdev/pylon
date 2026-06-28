@@ -6,8 +6,9 @@ from pylon.config import load_config
 
 from .banner import _BOLD_RED, _RESET
 from .commands.database import database
+from .commands.info import info_cmd
 from .commands.migrations import migration
-from .commands.query import repl
+from .commands.query import query_cmd, repl
 from .commands.version import version
 from .config import NO_CONFIG_HINT, _print_error, requires_config
 
@@ -55,6 +56,8 @@ cli.add_command(migration)
 # --- top-level commands -------------------------------------------------------
 
 cli.add_command(version)
+cli.add_command(query_cmd)
+cli.add_command(info_cmd)
 
 
 # --- shortcuts ----------------------------------------------------------------
