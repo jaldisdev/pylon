@@ -132,6 +132,8 @@ pub enum PathStep {
     TypeIntersection(ObjectRef),
     /// Link property access: `@source` in a link context
     LinkProp(String),
+    /// Backlink traversal: `.<link_name` — objects whose `link_name` points to the current object
+    Backlink(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

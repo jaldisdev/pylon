@@ -651,6 +651,13 @@ impl<'a> Compiler<'a> {
                 Ok(ir_is_not_null(inner))
             }
 
+            // exists .<link[is Type] → EXISTS(SELECT 1 FROM type WHERE type.link_id = alias.id)
+            Expr::Path(p) if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) => {
+                let current_qname = format!("{}::{}", td.module, td.name);
+                let exists = self.compile_backlink_as_exists(&p.steps, None, &current_qname, alias)?;
+                return Ok(exists);
+            }
+
             // exists .prop → alias.col IS NOT NULL
             // exists .link → alias.link_id IS NOT NULL
             // exists .multilink → EXISTS(SELECT 1 FROM junction WHERE src = alias.id)
@@ -1980,6 +1987,9 @@ impl<'a> Compiler<'a> {
             })),
 
             Expr::BinOp(b) => {
+                if let Some(exists) = self.try_backlink_exists(b, td, alias)? {
+                    return Ok(exists);
+                }
                 if let Some(exists) = self.try_multilink_exists(b, td, alias)? {
                     return Ok(exists);
                 }
@@ -2247,6 +2257,241 @@ impl<'a> Compiler<'a> {
         }
 
         Err(self.field_err(link_name, &format!("{}::{}", td.module, td.name)))
+    }
+
+    // ── Backlink compilation ─────────────────────────────────────────────────────
+
+    /// Detect a backlink path on either side of a BinOp and compile as EXISTS.
+    fn try_backlink_exists(
+        &mut self,
+        b: &ast::BinOp,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        use ast::PathStep;
+        fn is_backlink(p: &ast::Path) -> bool {
+            p.partial && matches!(p.steps.first(), Some(PathStep::Backlink(_)))
+        }
+        let (path_steps, value_ast, flip) = if let Expr::Path(p) = &b.left {
+            if is_backlink(p) { (p.steps.as_slice(), &b.right, false) }
+            else { return Ok(None); }
+        } else if let Expr::Path(p) = &b.right {
+            if is_backlink(p) { (p.steps.as_slice(), &b.left, true) }
+            else { return Ok(None); }
+        } else {
+            return Ok(None);
+        };
+        let value_expr = self.compile_expr(value_ast, td, alias)?;
+        let current_qname = format!("{}::{}", td.module, td.name);
+        let exists = self.compile_backlink_as_exists(
+            path_steps, Some((b.op.clone(), value_expr, flip)), &current_qname, alias,
+        )?;
+        Ok(Some(exists))
+    }
+
+    /// Compile a path `[Backlink(name), TypeIntersect(type), ...rest]` into EXISTS.
+    /// `comparison` is `Some((op, value_expr, flip))` when used in a comparison filter.
+    /// `current_qname` is the fully-qualified name of the object type being filtered.
+    fn compile_backlink_as_exists(
+        &mut self,
+        steps: &[ast::PathStep],
+        comparison: Option<(ast::BinOpKind, IrExpr, bool)>,
+        current_qname: &str,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        use ast::PathStep;
+
+        let backlink_name = match steps.first() {
+            Some(PathStep::Backlink(n)) => n.clone(),
+            _ => return Err(self.type_err("internal: expected backlink step")),
+        };
+        let type_ref = match steps.get(1) {
+            Some(PathStep::TypeIntersection(tr)) => tr,
+            _ => return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "backlink '.< {backlink_name}' requires a type intersection, \
+                     e.g.: .< {backlink_name}[is SomeType]"
+                ),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+
+        let type_name = match &type_ref.module {
+            Some(m) => format!("{}::{}", m, type_ref.name),
+            None => type_ref.name.clone(),
+        };
+        let target_td = self.resolve_type(&type_name)?;
+        let target_qname = format!("{}::{}", target_td.module, target_td.name);
+        let target_table = target_td.table.clone();
+
+        // Verify target has a link named `backlink_name` pointing to the current type.
+        if !target_td.links.iter().any(|l| l.name == backlink_name && l.target == current_qname) {
+            return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "type {} has no link '{}' pointing to {}",
+                    target_qname, backlink_name, current_qname,
+                ),
+                position: Position { line: 0, col: 0 },
+            }));
+        }
+        let fk_col = format!("{}_id", backlink_name);
+        let t_alias = self.fresh_alias();
+
+        // Join condition: target.fk_col = current.id
+        let join_cond = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef {
+                alias: t_alias.clone(),
+                column: fk_col,
+                pg_type: "uuid".to_string(),
+            },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef {
+                alias: alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+        }));
+
+        let rest = &steps[2..];
+        let tail_cond = self.compile_backlink_tail(rest, comparison, &target_qname, &t_alias)?;
+
+        let filter = match tail_cond {
+            Some(tc) => IrExpr::BinOp(Box::new(IrBinOp {
+                left: join_cond,
+                op: ast::BinOpKind::And,
+                right: tc,
+            })),
+            None => join_cond,
+        };
+
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: ast::UnaryOpKind::Exists,
+            operand: IrExpr::Subquery(Box::new(IrSelect {
+                source: IrSource { type_name: target_qname, table: target_table, alias: t_alias },
+                shape: vec![],
+                filter: Some(filter),
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                distinct: false,
+                dml_source: None,
+            })),
+        })))
+    }
+
+    /// Compile the tail steps after `[Backlink, TypeIntersect]`.
+    fn compile_backlink_tail(
+        &mut self,
+        steps: &[ast::PathStep],
+        comparison: Option<(ast::BinOpKind, IrExpr, bool)>,
+        target_qname: &str,
+        t_alias: &str,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        use ast::PathStep;
+
+        if steps.is_empty() {
+            return Ok(None);
+        }
+
+        // Chained backlink: recurse (current_qname is now target_qname of the outer backlink)
+        if matches!(steps.first(), Some(PathStep::Backlink(_))) {
+            let inner = self.compile_backlink_as_exists(steps, comparison, target_qname, t_alias)?;
+            return Ok(Some(inner));
+        }
+
+        let target_td = self.resolve_type(target_qname)?;
+
+        // Single property or link FK
+        if let [PathStep::Name(field_name)] = steps {
+            if let Some(prop) = Self::resolve_property(target_td, field_name) {
+                let col = IrExpr::ColumnRef {
+                    alias: t_alias.to_string(),
+                    column: prop.name.clone(),
+                    pg_type: prop.pg_type.clone(),
+                };
+                return Ok(Some(Self::apply_comparison(col, comparison)));
+            }
+            if let Some(link) = Self::resolve_link(target_td, field_name) {
+                let col = IrExpr::ColumnRef {
+                    alias: t_alias.to_string(),
+                    column: format!("{}_id", link.name),
+                    pg_type: "uuid".to_string(),
+                };
+                return Ok(Some(Self::apply_comparison(col, comparison)));
+            }
+            return Err(self.field_err(field_name, target_qname));
+        }
+
+        // Two forward steps: link then property (single FK join)
+        if let [PathStep::Name(link_name), PathStep::Name(prop_name)] = steps {
+            if let Some(link) = Self::resolve_link(target_td, link_name) {
+                let link_target = link.target.clone();
+                let fk_col = format!("{}_id", link_name);
+                let link_target_td = self.resolve_type(&link_target)?;
+                let link_target_qname = format!("{}::{}", link_target_td.module, link_target_td.name);
+                let link_target_table = link_target_td.table.clone();
+                if let Some(prop) = Self::resolve_property(link_target_td, prop_name) {
+                    let l_alias = self.fresh_alias();
+                    let id_cond = IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::ColumnRef {
+                            alias: l_alias.clone(),
+                            column: "id".to_string(),
+                            pg_type: "uuid".to_string(),
+                        },
+                        op: ast::BinOpKind::Eq,
+                        right: IrExpr::ColumnRef {
+                            alias: t_alias.to_string(),
+                            column: fk_col,
+                            pg_type: "uuid".to_string(),
+                        },
+                    }));
+                    let col = IrExpr::ColumnRef {
+                        alias: l_alias.clone(),
+                        column: prop.name.clone(),
+                        pg_type: prop.pg_type.clone(),
+                    };
+                    let prop_cond = Self::apply_comparison(col, comparison);
+                    let full = IrExpr::BinOp(Box::new(IrBinOp {
+                        left: id_cond,
+                        op: ast::BinOpKind::And,
+                        right: prop_cond,
+                    }));
+                    return Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                        op: ast::UnaryOpKind::Exists,
+                        operand: IrExpr::Subquery(Box::new(IrSelect {
+                            source: IrSource {
+                                type_name: link_target_qname,
+                                table: link_target_table,
+                                alias: l_alias,
+                            },
+                            shape: vec![],
+                            filter: Some(full),
+                            order_by: vec![],
+                            offset: None,
+                            limit: None,
+                            distinct: false,
+                            dml_source: None,
+                        })),
+                    }))));
+                }
+            }
+        }
+
+        Err(PyQLError::Type(PyQLTypeError {
+            message: "backlink path tail is unsupported (expected a property name)".to_string(),
+            position: Position { line: 0, col: 0 },
+        }))
+    }
+
+    /// Apply an optional comparison to a column ref, defaulting to IS NOT NULL.
+    fn apply_comparison(col: IrExpr, comparison: Option<(ast::BinOpKind, IrExpr, bool)>) -> IrExpr {
+        match comparison {
+            Some((op, val, flip)) => {
+                let (l, r) = if flip { (val, col) } else { (col, val) };
+                IrExpr::BinOp(Box::new(IrBinOp { left: l, op, right: r }))
+            }
+            None => ir_is_not_null(col),
+        }
     }
 
     /// If `b` has a multi-link path (any depth) on either side, compile as EXISTS over the junction.

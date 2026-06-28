@@ -543,8 +543,15 @@ impl Parser {
                 }
                 Token::Dot => {
                     self.advance();
-                    let name = self.eat_ident()?;
-                    expr = self.extend_path(expr, PathStep::Name(name))?;
+                    if matches!(self.current(), Token::Lt) {
+                        // Backlink: .<link_name
+                        self.advance();
+                        let name = self.eat_ident()?;
+                        expr = self.extend_path(expr, PathStep::Backlink(name))?;
+                    } else {
+                        let name = self.eat_ident()?;
+                        expr = self.extend_path(expr, PathStep::Name(name))?;
+                    }
                 }
                 Token::LBracket => {
                     // `[is TypeName]` type intersection
@@ -592,11 +599,20 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, PyQLSyntaxError> {
         match self.current().clone() {
-            // Relative path starting with `.`
+            // Relative path starting with `.name` or `.<name` (backlink)
             Token::Dot => {
                 self.advance();
-                let name = self.eat_ident()?;
-                Ok(Expr::Path(Path::relative(name)))
+                if matches!(self.current(), Token::Lt) {
+                    self.advance(); // consume <
+                    let name = self.eat_ident()?;
+                    Ok(Expr::Path(Path {
+                        steps: vec![PathStep::Backlink(name)],
+                        partial: true,
+                    }))
+                } else {
+                    let name = self.eat_ident()?;
+                    Ok(Expr::Path(Path::relative(name)))
+                }
             }
 
             // Parameter `$name`
