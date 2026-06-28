@@ -93,6 +93,8 @@ pub enum Expr {
     /// A parenthesised statement used as an expression:
     /// `(INSERT ...)`, `(UPDATE ...)`, `(DELETE ...)`, `(SELECT ...)`.
     SubQuery(Box<Stmt>),
+    /// Binary set union: `expr union expr` — compiles to UNION ALL.
+    Union(Box<Expr>, Box<Expr>),
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────

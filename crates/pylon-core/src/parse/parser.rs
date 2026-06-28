@@ -280,7 +280,7 @@ impl Parser {
         };
         let var = self.eat_ident()?;
         self.eat(&Token::In)?;
-        let iterator = self.parse_expr()?;
+        let iterator = self.parse_if_else()?;
         // Body: `union (stmt)` or `union stmt` or bare `stmt`.
         if matches!(self.current(), Token::Union) {
             self.advance();
@@ -301,10 +301,20 @@ impl Parser {
     // ── Expressions ─────────────────────────────────────────────────────────────
 
     // Precedence (lowest → highest):
-    //   if/else → or → and → not → comparison → coalesce → add/concat → mul → pow → unary → postfix
+    //   union → if/else → or → and → not → comparison → coalesce → add/concat → mul → pow → unary → postfix
 
     pub fn parse_expr(&mut self) -> Result<Expr, PyQLSyntaxError> {
-        self.parse_if_else()
+        self.parse_union()
+    }
+
+    fn parse_union(&mut self) -> Result<Expr, PyQLSyntaxError> {
+        let mut left = self.parse_if_else()?;
+        while matches!(self.current(), Token::Union) {
+            self.advance();
+            let right = self.parse_if_else()?;
+            left = Expr::Union(Box::new(left), Box::new(right));
+        }
+        Ok(left)
     }
 
     fn parse_if_else(&mut self) -> Result<Expr, PyQLSyntaxError> {

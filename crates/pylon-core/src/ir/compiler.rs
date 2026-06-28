@@ -816,11 +816,34 @@ impl<'a> Compiler<'a> {
             }
             Expr::Shape(s) if s.expr.is_some() => false,
             Expr::SubQuery(_) => false,
+            Expr::Union(a, b) => self.is_free_result(a) && self.is_free_result(b),
             _ => true,
         }
     }
 
     // ── FREE SELECT ───────────────────────────────────────────────────────────────
+
+    fn collect_union_items(
+        &mut self,
+        expr: &Expr,
+        items: &mut Vec<IrFreeExpr>,
+    ) -> Result<(), PyQLError> {
+        match expr {
+            Expr::Union(a, b) => {
+                self.collect_union_items(a, items)?;
+                self.collect_union_items(b, items)?;
+            }
+            Expr::Set(exprs) => {
+                for e in exprs {
+                    self.collect_union_items(e, items)?;
+                }
+            }
+            other => {
+                items.push(IrFreeExpr::Scalar(self.compile_free_expr(other)?));
+            }
+        }
+        Ok(())
+    }
 
     fn compile_free_select(
         &mut self,
@@ -837,10 +860,11 @@ impl<'a> Compiler<'a> {
         };
 
         let items: Vec<IrFreeExpr> = match result_expr {
-            Expr::Set(exprs) => exprs
-                .iter()
-                .map(|e| self.compile_free_expr(e).map(IrFreeExpr::Scalar))
-                .collect::<Result<_, _>>()?,
+            Expr::Union(_, _) | Expr::Set(_) => {
+                let mut union_items = vec![];
+                self.collect_union_items(result_expr, &mut union_items)?;
+                union_items
+            }
             Expr::Shape(s) if s.expr.is_none() => {
                 let fields = s
                     .elements
@@ -1957,6 +1981,11 @@ impl<'a> Compiler<'a> {
                 message: "sub-statement (SELECT/INSERT/UPDATE/DELETE) used as expression is \
                            only valid as the subject of a SELECT result"
                     .into(),
+                position: Position { line: 0, col: 0 },
+            })),
+
+            Expr::Union(_, _) => Err(PyQLError::Type(PyQLTypeError {
+                message: "union is not valid in expression context".into(),
                 position: Position { line: 0, col: 0 },
             })),
         }
