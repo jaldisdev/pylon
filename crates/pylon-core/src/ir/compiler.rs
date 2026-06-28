@@ -878,6 +878,29 @@ impl<'a> Compiler<'a> {
             Expr::Union(_, _) | Expr::Set(_) => {
                 let mut union_items = vec![];
                 self.collect_union_items(result_expr, &mut union_items)?;
+                // Type-check UNION operands: all scalar branches must be in the same type family.
+                let mut first: Option<(String, String)> = None; // (pg_type, pyql_name)
+                for item in &union_items {
+                    if let IrFreeExpr::Scalar(expr) = item {
+                        if let Some(t) = infer_ir_type(expr) {
+                            let t = t.to_string();
+                            if let Some((ft, fq)) = &first {
+                                if !types_compatible(ft, &t) {
+                                    return Err(PyQLError::Type(PyQLTypeError {
+                                        message: format!(
+                                            "operator 'UNION' cannot be applied to operands of type '{}' and '{}'",
+                                            fq,
+                                            pg_type_to_pyql(&t),
+                                        ),
+                                        position: Position { line: 0, col: 0 },
+                                    }));
+                                }
+                            } else {
+                                first = Some((t.clone(), pg_type_to_pyql(&t).to_string()));
+                            }
+                        }
+                    }
+                }
                 union_items
             }
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
