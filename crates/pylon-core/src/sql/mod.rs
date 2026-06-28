@@ -371,7 +371,10 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
             if is_raw_scalar(expr) {
                 format!("SELECT {} AS result", emit_expr(expr))
             } else {
-                format!("SELECT ROW({}) AS result", emit_expr(expr))
+                // `result` is a ROW() composite for top-level asyncpg decoding.
+                // `v` is the unwrapped scalar for use in CteRef expression context.
+                let e = emit_expr(expr);
+                format!("SELECT ROW({e}) AS result, {e} AS v")
             }
         }
         IrFreeExpr::FreeObject(fields) => {
@@ -1162,7 +1165,12 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
 
-        IrExpr::CteRef(name) => format!("(SELECT \"id\" FROM \"{}\")", name),
+        IrExpr::CteRef { name, scalar } => {
+            // scalar CTEs emit `ROW(expr) AS result, expr AS v`; use `v` for
+            // expression context so we get the plain scalar type, not record.
+            let col = if *scalar { "v" } else { "id" };
+            format!("(SELECT \"{}\" FROM \"{}\")", col, name)
+        }
 
         IrExpr::ForVar { name } => format!("\"_for_{}\".\"v\"", name),
 

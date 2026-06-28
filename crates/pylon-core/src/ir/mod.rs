@@ -329,8 +329,10 @@ pub enum IrExpr {
     /// An aggregate function applied to an inline set literal `fn({e1, e2, ...})`.
     /// Emits: `(SELECT fn_name(v) FROM (SELECT e1 UNION ALL ...) AS _set(v))`
     AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
-    /// A scalar reference to a named CTE: emits `(SELECT "id" FROM "cte_name")`.
-    CteRef(String),
+    /// A reference to a named CTE used in expression context.
+    /// `scalar = true`  → emits `(SELECT "result" FROM "cte_name")`
+    /// `scalar = false` → emits `(SELECT "id"     FROM "cte_name")`
+    CteRef { name: String, scalar: bool },
     /// Reference to the current for-loop iterator variable.
     /// Emits `"_for_{name}"."v"`.
     ForVar { name: String },

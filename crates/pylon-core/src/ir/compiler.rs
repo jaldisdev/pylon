@@ -1079,8 +1079,9 @@ impl<'a> Compiler<'a> {
                     if self.for_vars.contains_key(n.as_str()) {
                         return Ok(IrExpr::ForVar { name: n.clone() });
                     }
-                    if self.cte_types.contains_key(n.as_str()) {
-                        return Ok(IrExpr::CteRef(n.clone()));
+                    if let Some(t) = self.cte_types.get(n.as_str()) {
+                        let scalar = t.is_empty();
+                        return Ok(IrExpr::CteRef { name: n.clone(), scalar });
                     }
                 }
                 Err(self.type_err("expression is not valid in free SELECT context"))
@@ -2090,9 +2091,10 @@ impl<'a> Compiler<'a> {
                     if self.for_vars.contains_key(n.as_str()) {
                         return Ok(IrExpr::ForVar { name: n.clone() });
                     }
-                    // Allow CTE names as scalar references.
-                    if self.cte_types.contains_key(n.as_str()) {
-                        return Ok(IrExpr::CteRef(n.clone()));
+                    // Allow CTE names as references in expression context.
+                    if let Some(t) = self.cte_types.get(n.as_str()) {
+                        let scalar = t.is_empty();
+                        return Ok(IrExpr::CteRef { name: n.clone(), scalar });
                     }
                 }
             }
