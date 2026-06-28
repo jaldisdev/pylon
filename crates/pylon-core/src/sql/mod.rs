@@ -280,6 +280,23 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
                 qi(junction_alias), qi(&tgt_col), qi(&target.alias),
             )
         }
+        IrPathJoin::BacklinkSingle { source_alias, fk_col, target } => {
+            format!(
+                " JOIN {} AS {} ON {}.{} = {}.\"id\"",
+                source_ref(target), qi(&target.alias),
+                qi(&target.alias), qi(fk_col), qi(source_alias),
+            )
+        }
+        IrPathJoin::BacklinkMulti { source_alias, junction_alias, junction_table, module,
+                                    owner_col, current_col, target } => {
+            format!(
+                " JOIN {} AS {} ON {}.{} = {}.\"id\" JOIN {} AS {} ON {}.\"id\" = {}.{}",
+                qn(module, junction_table), qi(junction_alias),
+                qi(junction_alias), qi(current_col), qi(source_alias),
+                source_ref(target), qi(&target.alias),
+                qi(&target.alias), qi(junction_alias), qi(owner_col),
+            )
+        }
     }
 }
 
@@ -505,6 +522,26 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
                         ));
                     }
                 }
+            }
+            IrPathJoin::BacklinkSingle { source_alias, fk_col, target } => {
+                parts.push(format!(
+                    "JOIN {} AS {} ON {}.{} = {}.\"id\"",
+                    source_ref(target), qi(&target.alias),
+                    qi(&target.alias), qi(fk_col), qi(source_alias),
+                ));
+            }
+            IrPathJoin::BacklinkMulti { source_alias, junction_alias, junction_table, module,
+                                        owner_col, current_col, target } => {
+                parts.push(format!(
+                    "JOIN {} AS {} ON {}.{} = {}.\"id\"",
+                    qn(module, junction_table), qi(junction_alias),
+                    qi(junction_alias), qi(current_col), qi(source_alias),
+                ));
+                parts.push(format!(
+                    "JOIN {} AS {} ON {}.\"id\" = {}.{}",
+                    source_ref(target), qi(&target.alias),
+                    qi(&target.alias), qi(junction_alias), qi(owner_col),
+                ));
             }
         }
     }

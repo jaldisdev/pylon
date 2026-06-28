@@ -351,16 +351,124 @@ impl<'a> Compiler<'a> {
         let mut current_alias = root_alias;
 
         let steps = &path.steps[1..];
-        for (i, step) in steps.iter().enumerate() {
+        let mut idx = 0;
+        while idx < steps.len() {
+            let step = &steps[idx];
+            let is_last = |extra: usize| idx + extra == steps.len() - 1;
+
+            // Type intersection standalone (not after backlink): narrows current_td.
+            if let PathStep::TypeIntersection(type_ref) = step {
+                let type_name = match &type_ref.module {
+                    Some(m) => format!("{}::{}", m, type_ref.name),
+                    None => type_ref.name.clone(),
+                };
+                current_td = self.resolve_type(&type_name)?;
+                idx += 1;
+                continue;
+            }
+
+            // Backlink: .<link_name — optionally followed by [is OwnerType].
+            if let PathStep::Backlink(link_name) = step {
+                // Peek ahead: if the next step is [is Type], use it to identify the owner.
+                let owner_hint = steps.get(idx + 1).and_then(|s| {
+                    if let PathStep::TypeIntersection(tr) = s { Some(tr.clone()) } else { None }
+                });
+                let consumed_extra = if owner_hint.is_some() { 1 } else { 0 };
+
+                let owner_td: &TypeDescriptor = if let Some(ref tr) = owner_hint {
+                    let type_name = match &tr.module {
+                        Some(m) => format!("{}::{}", m, tr.name),
+                        None => tr.name.clone(),
+                    };
+                    let td = self.resolve_type(&type_name)?;
+                    let current_qname = format!("{}::{}", current_td.module, current_td.name);
+                    let link_targets_current = td.links.iter().any(|l| l.name == *link_name && l.target == current_qname)
+                        || td.multilinks.iter().any(|ml| ml.name == *link_name && ml.target == current_qname);
+                    if !link_targets_current {
+                        return Err(self.type_err(&format!(
+                            "link '{}::{}' does not target '{}'; backlink is not valid here",
+                            type_name, link_name, current_qname,
+                        )));
+                    }
+                    td
+                } else {
+                    // No hint — search for any type whose link/multilink targets current_td.
+                    let current_qname = format!("{}::{}", current_td.module, current_td.name);
+                    self.schema.types.iter()
+                        .find(|t| {
+                            t.links.iter().any(|l| l.name == *link_name && l.target == current_qname)
+                            || t.multilinks.iter().any(|ml| ml.name == *link_name && ml.target == current_qname)
+                        })
+                        .ok_or_else(|| self.type_err(&format!(
+                            "no type has a link '{}' targeting '{}'",
+                            link_name, current_qname,
+                        )))?
+                };
+
+                let target_alias = self.fresh_alias();
+                let target = IrSource {
+                    type_name: format!("{}::{}", owner_td.module, owner_td.name),
+                    table: owner_td.table.clone(),
+                    alias: target_alias.clone(),
+                };
+
+                // Determine if the link is single (FK) or multi (junction).
+                if owner_td.links.iter().any(|l| l.name == *link_name) {
+                    joins.push(IrPathJoin::BacklinkSingle {
+                        source_alias: current_alias.clone(),
+                        fk_col: format!("{}_id", link_name),
+                        target,
+                    });
+                } else {
+                    let ml = owner_td.multilinks.iter().find(|ml| ml.name == *link_name).unwrap();
+                    let junction_alias = self.fresh_alias();
+                    let (junction_table, module) = match &ml.through {
+                        Some(through_qname) => {
+                            let through_td = self.resolve_type(through_qname)?;
+                            (through_td.table.clone(), through_td.module.clone())
+                        }
+                        None => (
+                            format!("{}.{}", owner_td.table, ml.name),
+                            owner_td.module.clone(),
+                        ),
+                    };
+                    joins.push(IrPathJoin::BacklinkMulti {
+                        source_alias: current_alias.clone(),
+                        junction_alias,
+                        junction_table,
+                        module,
+                        owner_col: "source".to_string(),
+                        current_col: "target".to_string(),
+                        target,
+                    });
+                }
+
+                if is_last(consumed_extra) {
+                    let shape = self.compile_shape(shape_elements, owner_td, &target_alias,
+                        &owner_td.module.clone())?;
+                    let result = IrPathResult::Object {
+                        alias: target_alias.clone(),
+                        type_name: format!("{}::{}", owner_td.module, owner_td.name),
+                        shape,
+                    };
+                    let (filter, order_by, offset, limit) =
+                        self.compile_path_modifiers(sel, owner_td, &target_alias)?;
+                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                }
+                current_td = owner_td;
+                current_alias = target_alias;
+                idx += 1 + consumed_extra;
+                continue;
+            }
+
             let step_name = match step {
                 PathStep::Name(n) => n.as_str(),
                 _ => return Err(self.type_err("only name steps are supported in path traversal")),
             };
-            let is_last = i == steps.len() - 1;
 
             // Check scalar property first.
             if let Some(p) = current_td.properties.iter().find(|p| p.name == step_name) {
-                if !is_last {
+                if !is_last(0) {
                     return Err(self.type_err(&format!(
                         "'{step_name}' is a scalar property, not a link — cannot traverse further"
                     )));
@@ -387,9 +495,9 @@ impl<'a> Compiler<'a> {
                 joins.push(IrPathJoin::Single {
                     source_alias: current_alias.clone(),
                     fk_col: format!("{}_id", l.name),
-                    target: target,
+                    target,
                 });
-                if is_last {
+                if is_last(0) {
                     let shape = self.compile_shape(shape_elements, target_td, &target_alias,
                         &target_td.module.clone())?;
                     let result = IrPathResult::Object {
@@ -403,6 +511,7 @@ impl<'a> Compiler<'a> {
                 }
                 current_td = target_td;
                 current_alias = target_alias;
+                idx += 1;
                 continue;
             }
 
@@ -457,7 +566,7 @@ impl<'a> Compiler<'a> {
                     join: join_info,
                     target,
                 });
-                if is_last {
+                if is_last(0) {
                     let shape = self.compile_shape(shape_elements, target_td, &target_alias,
                         &target_td.module.clone())?;
                     let result = IrPathResult::Object {
@@ -471,6 +580,7 @@ impl<'a> Compiler<'a> {
                 }
                 current_td = target_td;
                 current_alias = target_alias;
+                idx += 1;
                 continue;
             }
 

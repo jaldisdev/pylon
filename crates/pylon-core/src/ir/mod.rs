@@ -64,6 +64,20 @@ pub enum IrPathJoin {
     Single { source_alias: String, fk_col: String, target: IrSource },
     /// Traverse a multi-link via a junction table.
     Multi { source_alias: String, junction_alias: String, join: IrMultiLinkJoin, target: IrSource },
+    /// Reverse of a single FK link: find owner rows whose FK column points to the current row.
+    BacklinkSingle { source_alias: String, fk_col: String, target: IrSource },
+    /// Reverse of a multi-link: traverse the junction table in reverse.
+    BacklinkMulti {
+        source_alias: String,
+        junction_alias: String,
+        junction_table: String,
+        module: String,
+        /// Junction column that points to the owner (forward source).
+        owner_col: String,
+        /// Junction column that points to the current row (forward target).
+        current_col: String,
+        target: IrSource,
+    },
 }
 
 #[derive(Debug, Clone)]
