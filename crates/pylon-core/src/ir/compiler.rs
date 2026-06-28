@@ -2426,12 +2426,16 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::IfElse(Box::new(IrIfElse { condition, if_, else_ })))
             }
 
-            Expr::Shape(_) | Expr::Tuple(_) | Expr::NamedTuple(_)
-            | Expr::Array(_) | Expr::Set(_) => {
+            Expr::Array(elems) => {
+                let items = elems.iter()
+                    .map(|e| self.compile_expr(e, td, alias))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(IrExpr::Array(items))
+            }
+
+            Expr::Shape(_) | Expr::Tuple(_) | Expr::NamedTuple(_) | Expr::Set(_) => {
                 Err(PyQLError::Type(PyQLTypeError {
-                    message: "shapes, tuples, arrays, and set literals are not valid \
-                               in expression context"
-                        .into(),
+                    message: "shapes and set literals are not valid in expression context".into(),
                     position: Position { line: 0, col: 0 },
                 }))
             }
