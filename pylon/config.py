@@ -22,6 +22,7 @@ class ProjectConfig:
     """
 
     schema_dir: Path
+    name: str | None = None
     pyql: str | None = None
 
 
@@ -340,9 +341,11 @@ def load_config(path: str | Path | None = None) -> Config:
         raise KeyError("pylon.toml: [project] requires 'schema-dir'.")
 
     schema_dir = (toml_path.parent / str(schema_dir_raw)).resolve()
+    name_raw = raw_project.get("name")
     pyql_raw = raw_project.get("pyql")
     project = ProjectConfig(
         schema_dir=schema_dir,
+        name=str(name_raw) if name_raw is not None else None,
         pyql=str(pyql_raw) if pyql_raw is not None else None,
     )
 
