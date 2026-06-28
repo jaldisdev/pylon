@@ -44,7 +44,9 @@ def cli(ctx: click.Context) -> None:
         if ctx.obj["config"] is None:
             _print_error("no pylon.toml found", NO_CONFIG_HINT)
             ctx.exit(1)
-        repl()
+        cfg = ctx.obj["config"]
+        project_name = cfg.project.name if cfg and cfg.project else None
+        repl(project_name=project_name)
 
 
 # --- groups -------------------------------------------------------------------

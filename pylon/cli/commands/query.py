@@ -1,9 +1,11 @@
 import asyncio
 import dataclasses
 import re
+from pathlib import Path
 
 import click
 from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
@@ -56,7 +58,14 @@ def _make_bindings() -> KeyBindings:
 # --- repl ---------------------------------------------------------------------
 
 
-def repl(*, as_json: bool = False) -> None:
+def _history_path(project_name: str | None) -> Path:
+    history_dir = Path.home() / ".pylon" / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    name = project_name or "default"
+    return history_dir / name
+
+
+def repl(*, as_json: bool = False, project_name: str | None = None) -> None:
     """Start an interactive PyQL session.
 
     Statements are terminated by a semicolon. Type \\help for help,
@@ -70,14 +79,15 @@ def repl(*, as_json: bool = False) -> None:
 
     print_banner(info_line="Type \\help for help, \\quit to quit.")
 
-    asyncio.run(_async_repl(as_json=as_json))
+    asyncio.run(_async_repl(as_json=as_json, project_name=project_name))
 
 
-async def _async_repl(*, as_json: bool) -> None:
+async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
     session: PromptSession[str] = PromptSession(
         multiline=True,
         key_bindings=_make_bindings(),
         prompt_continuation="",
+        history=FileHistory(str(_history_path(project_name))),
     )
 
     async with create_async_client() as client:
