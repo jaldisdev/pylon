@@ -57,7 +57,11 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
             for f in fields
             if not (f["name"] == "__type__" and f["position"] == 0)
         }
-        type_name = node.get("type_name")
+        # Use the actual per-row __type__ value (obj_tuple[0]) for class lookup.
+        # For concrete types it equals the static type_name; for polymorphic (interface)
+        # queries it gives the real concrete type.
+        actual_type = obj_tuple[0] if obj_tuple else None
+        type_name = actual_type or node.get("type_name")
         if type_name:
             short = type_name.split("::")[-1]
             cls = registry.get(short)

@@ -163,7 +163,7 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
             }
             # __display_type__ is the internal sentinel used as the type label in _format_results.
             # Keeping it separate from __type__ lets an explicit `__type__` field show in the output.
-            d["__display_type__"] = type_name or vars(obj).get("__pylon_type__") or type(obj).__name__
+            d["__display_type__"] = vars(obj).get("__pylon_type__") or type_name or type(obj).__name__
         elif isinstance(obj, dict):
             d = {k: v for k, v in obj.items() if k in selected}
             d["__display_type__"] = type_name
