@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import re
+import shutil
 from pathlib import Path
 
 import click
@@ -115,7 +116,7 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
                 await _execute(client, pyql, as_json=as_json)
 
 
-async def _execute(client, pyql: str, *, as_json: bool) -> None:
+async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True) -> None:
     """Transpile and execute a single PyQL statement, printing the result."""
     from pylon.query import compile as pyql_compile
 
@@ -138,7 +139,8 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
 
     # Free scalar: plain values like int, str, bool, and array literals
     if shape_kind in ("scalar", "raw_scalar"):
-        click.echo(_format_set([_value(obj) for obj in results]))
+        items = [_value(obj) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
     # JSON scalar: value decoded from jsonb, display as Json("...")
@@ -147,12 +149,14 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
         def _json_display(v: object) -> str:
             escaped = _json.dumps(v).replace('"', '\\"')
             return f"Json({_brace(chr(34))}{escaped}{_brace(chr(34))})"
-        click.echo(_format_set([_json_display(obj) for obj in results]))
+        items = [_json_display(obj) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
     # Anonymous tuple: (1, 'hello')
     if shape_kind == "tuple":
-        click.echo(_format_set([_format_tuple(obj) for obj in results]))
+        items = [_format_tuple(obj) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
     # Schema object or free object
@@ -180,7 +184,7 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
         else:
             d = {"__display_type__": type(obj).__name__, "value": str(obj)}
         display.append(d)
-    click.echo(_format_results(display))
+    click.echo(_format_results(display, wrap=repl))
 
 
 # --- one-shot query command ---------------------------------------------------
@@ -207,7 +211,7 @@ def query_cmd(pyql_query: str, as_json: bool) -> None:
 
     async def run() -> None:
         async with create_async_client() as client:
-            await _execute(client, pyql, as_json=as_json)
+            await _execute(client, pyql, as_json=as_json, repl=False)
 
     asyncio.run(run())
 
@@ -263,7 +267,7 @@ def _value(v: object) -> str:
         return f"{_brace('{')}{_brace('}')}"
     if isinstance(v, list):
         inner = ", ".join(_value(item) for item in v)
-        return f"{_brace('{')}{inner}{_brace('}')}"
+        return f"{_brace('[')}{inner}{_brace(']')}"
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         qname = vars(v).get("__pylon_type__") or type(v).__name__
         pairs = ", ".join(
@@ -288,10 +292,36 @@ def _is_uuid(s: str) -> bool:
     )
 
 
-def _format_object(type_name: str, fields: dict) -> str:
-    pairs = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in fields.items())
-    label = type_name or "Object"
-    return f"{_type(label)} {_brace('{')}{pairs}{_brace('}')}"
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _visual_len(s: str) -> int:
+    return len(_ANSI_RE.sub('', s))
+
+
+def _pformat_value(v: object, depth: int, max_width: int) -> str:
+    """Pretty-print a value, recursively expanding objects that are too wide."""
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        qname = vars(v).get("__pylon_type__") or type(v).__name__
+        fields = {k: val for k, val in vars(v).items() if k != "__pylon_type__"}
+        return _pformat_object(qname, fields, depth, max_width)
+    if isinstance(v, dict):
+        return _pformat_object("", v, depth, max_width)
+    return _value(v)
+
+
+def _pformat_object(type_name: str, fields: dict, depth: int, max_width: int) -> str:
+    """Format an object as single-line if it fits, otherwise expand to multi-line."""
+    prefix = f"{_type(type_name)} " if type_name else ""
+    pairs_compact = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in fields.items())
+    compact = f"{prefix}{_brace('{')}{pairs_compact}{_brace('}')}"
+    if _visual_len(compact) <= max_width - depth * 2:
+        return compact
+    indent = "  " * (depth + 1)
+    closing = "  " * depth
+    field_strs = [f"{_key(k)}: {_pformat_value(v, depth + 1, max_width)}" for k, v in fields.items()]
+    inner = f",\n{indent}".join(field_strs)
+    return f"{prefix}{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
 
 
 def _format_tuple(t: tuple) -> str:
@@ -308,15 +338,24 @@ def _format_set(items: list[str]) -> str:
     return f"{_brace('{')}\n  {inner}\n{_brace('}')}"
 
 
-def _format_results(results: list[dict]) -> str:
+def _format_results(results: list[dict], *, wrap: bool = True) -> str:
     """Render a list of result objects in conventional coloured output."""
+    max_width = shutil.get_terminal_size((100, 24)).columns
     if not results:
-        return _brace("{}")
+        return _brace("{}") if wrap else ""
+
+    depth = 1 if wrap else 0
+    formatted = [
+        _pformat_object(obj.pop("__display_type__", ""), obj, depth, max_width)
+        for obj in results
+    ]
+
+    if not wrap:
+        return "\n".join(formatted)
 
     lines = [_brace("{")]
-    for obj in results:
-        type_name = obj.pop("__display_type__", "")
-        lines.append(f"  {_format_object(type_name, obj)},")
+    for item in formatted:
+        lines.append(f"  {item},")
     lines.append(_brace("}"))
     return "\n".join(lines)
 
