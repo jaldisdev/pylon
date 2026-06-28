@@ -52,7 +52,16 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         IrStmt::Delete(del) => del.target.type_name.clone(),
         IrStmt::Select(sel) => sel.source.type_name.clone(),
         IrStmt::PathSelect(ps) => ps.root.type_name.clone(),
-        IrStmt::FreeSelect(_) => String::new(),
+        IrStmt::FreeSelect(fs) => {
+            // Infer the scalar pg_type from the first item so the type is available
+            // for UNION mismatch error messages. Returns empty string if unknown.
+            if let Some(IrFreeExpr::Scalar(expr)) = fs.items.first() {
+                if let Some(t) = infer_ir_type(expr) {
+                    return t.to_string();
+                }
+            }
+            String::new()
+        }
         IrStmt::For(f) => cte_stmt_type(&f.body),
     }
 }
@@ -252,6 +261,10 @@ impl<'a> Compiler<'a> {
                 if let Some(root) = self.find_path_root_in_expr(result) {
                     return self.compile_expr_as_path_select(s, result, &root, distinct)
                         .map(IrStmt::PathSelect);
+                }
+                // Catch mixed object/scalar UNION before dispatching further.
+                if let Err(e) = self.check_union_type_compat(result) {
+                    return Err(e);
                 }
                 if self.is_free_result(result) {
                     self.compile_free_select(s, distinct).map(IrStmt::FreeSelect)
@@ -829,6 +842,55 @@ impl<'a> Compiler<'a> {
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.
+    /// Check that a UNION expression doesn't mix object types with scalars.
+    /// Called before dispatch so we can give a clear error instead of "expected a type name".
+    fn check_union_type_compat(&self, expr: &Expr) -> Result<(), PyQLError> {
+        let Expr::Union(a, b) = expr else { return Ok(()) };
+        let a_free = self.is_free_result(a);
+        let b_free = self.is_free_result(b);
+        if a_free != b_free {
+            let left = self.union_operand_type_display(a);
+            let right = self.union_operand_type_display(b);
+            return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "operator 'UNION' cannot be applied to operands of type '{}' and '{}'",
+                    left, right,
+                ),
+                position: Position { line: 0, col: 0 },
+            }));
+        }
+        Ok(())
+    }
+
+    fn union_operand_type_display(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if let Some(t) = self.cte_types.get(n.as_str()) {
+                        if t.contains("::") {
+                            return t.clone(); // object CTE: "default::Person"
+                        }
+                        if !t.is_empty() {
+                            return pg_type_to_pyql(t).to_string(); // scalar CTE: "std::int64"
+                        }
+                    }
+                }
+                // Bare type name reference
+                if let Ok(td) = self.resolve_type(
+                    p.steps.first().and_then(|s| if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None }).unwrap_or("")
+                ) {
+                    return format!("{}::{}", td.module, td.name);
+                }
+            }
+            Expr::Literal(Literal::Int(_)) => return "std::int64".to_string(),
+            Expr::Literal(Literal::Str(_)) => return "std::str".to_string(),
+            Expr::Literal(Literal::Float(_)) => return "std::float64".to_string(),
+            Expr::Literal(Literal::Bool(_)) => return "std::bool".to_string(),
+            _ => {}
+        }
+        "unknown".to_string()
+    }
+
     fn is_free_result(&self, expr: &Expr) -> bool {
         let expr = match expr {
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
@@ -842,8 +904,8 @@ impl<'a> Compiler<'a> {
                         if self.for_vars.contains_key(n.as_str()) {
                             return true;
                         }
-                        // Scalar CTE (FreeSelect produces an empty type_name string).
-                        if self.cte_types.get(n.as_str()).map(|t| t.is_empty()).unwrap_or(false) {
+                        // Scalar CTE: type string has no "::" (object types always do).
+                        if self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false) {
                             return true;
                         }
                     }
@@ -926,7 +988,7 @@ impl<'a> Compiler<'a> {
             }
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if self.cte_types.get(n.as_str()).map(|t| t.is_empty()).unwrap_or(false) {
+                    if self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false) {
                         vec![IrFreeExpr::CtePassthrough(n.clone())]
                     } else {
                         vec![IrFreeExpr::Scalar(self.compile_free_expr(result_expr)?)]
@@ -1124,7 +1186,7 @@ impl<'a> Compiler<'a> {
                         return Ok(IrExpr::ForVar { name: n.clone() });
                     }
                     if let Some(t) = self.cte_types.get(n.as_str()) {
-                        let scalar = t.is_empty();
+                        let scalar = !t.contains("::");
                         return Ok(IrExpr::CteRef { name: n.clone(), scalar });
                     }
                 }
@@ -1220,7 +1282,7 @@ impl<'a> Compiler<'a> {
                     Some(Expr::Path(p)) if !p.partial && p.steps.len() == 1 => {
                         if let ast::PathStep::Name(n) = &p.steps[0] {
                             if let Some(t) = self.cte_types.get(n.as_str()) {
-                                if !t.is_empty() {
+                                if t.contains("::") {
                                     (t.clone(), Some(n.clone()), None)
                                 } else {
                                     (self.expr_as_type_name(s.expr.as_ref().unwrap())?, None, None)
@@ -1250,7 +1312,7 @@ impl<'a> Compiler<'a> {
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
                     if let Some(t) = self.cte_types.get(n.as_str()) {
-                        if !t.is_empty() {
+                        if t.contains("::") {
                             return Ok((t.clone(), &[], None, Some(n.clone())));
                         }
                     }
@@ -2403,7 +2465,7 @@ impl<'a> Compiler<'a> {
                     }
                     // Allow CTE names as references in expression context.
                     if let Some(t) = self.cte_types.get(n.as_str()) {
-                        let scalar = t.is_empty();
+                        let scalar = !t.contains("::");
                         return Ok(IrExpr::CteRef { name: n.clone(), scalar });
                     }
                     // __type__ without a leading dot still means the current object's type.
