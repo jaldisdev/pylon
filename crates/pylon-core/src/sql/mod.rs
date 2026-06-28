@@ -1,8 +1,9 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
     IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation,
-    IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrScalarField,
-    IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
+    IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor,
+    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
+    IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -67,13 +68,32 @@ fn source_ref(src: &IrSource) -> String {
     }
 }
 
+// ── Polymorphic UNION ALL ───────────────────────────────────────────────────
+
+fn emit_poly_union(implementors: &[IrPolyImplementor], columns: &[String]) -> String {
+    let col_list = columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+    implementors.iter().map(|imp| {
+        format!(
+            "    SELECT {}::text AS \"__type__\", {} FROM {}",
+            sql_str(&imp.type_name),
+            col_list,
+            qn(&imp.module, &imp.table),
+        )
+    }).collect::<Vec<_>>().join("\n    UNION ALL\n")
+}
+
 // ── SELECT statement ────────────────────────────────────────────────────────
 
 fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     let alias = &sel.source.alias;
     let (field_exprs, shape_fields) = build_shape(&sel.shape, alias);
 
-    let mut parts = vec![type_disc(&sel.source.type_name)];
+    let type_expr = if sel.polymorphic {
+        format!("{}.\"__type__\"", qi(alias))
+    } else {
+        type_disc(&sel.source.type_name)
+    };
+    let mut parts = vec![type_expr];
     parts.extend(field_exprs);
     let tuple = parts.join(",\n    ");
 
@@ -84,6 +104,10 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         let cte_sql = emit_dml_as_cte_source(dml);
         format!("WITH \"_dml\" AS (\n{}\n)\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
             cte_sql, distinct, tuple, qi(alias))
+    } else if sel.polymorphic {
+        let union_sql = emit_poly_union(&sel.poly_implementors, &sel.poly_columns);
+        format!("SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
+            distinct, tuple, union_sql, qi(alias))
     } else {
         format!("SELECT {}(\n    {}\n) AS result\nFROM {} AS {}",
             distinct, tuple, source_ref(&sel.source), qi(alias))

@@ -664,6 +664,18 @@ impl Parser {
                 Ok(Expr::Set(elems))
             }
 
+            // `[is Type]` in expression context — type intersection starting expression
+            Token::LBracket if matches!(self.peek_ahead(1), Token::Is) => {
+                self.advance(); // [
+                self.advance(); // is
+                let type_ref = self.parse_object_ref()?;
+                self.eat(&Token::RBracket)?;
+                Ok(Expr::Path(Path {
+                    steps: vec![PathStep::TypeIntersection(type_ref)],
+                    partial: true,
+                }))
+            }
+
             // Array literal
             Token::LBracket => {
                 self.advance();
@@ -842,6 +854,73 @@ impl Parser {
     }
 
     fn parse_shape_element(&mut self) -> Result<ShapeElement, PyQLSyntaxError> {
+        // Type intersection shape element: `[is Type].*`, `[is Type].**`, or `[is Type].field`
+        if matches!(self.current(), Token::LBracket) && matches!(self.peek_ahead(1), Token::Is) {
+            self.advance(); // [
+            self.advance(); // is
+            let type_ref = self.parse_object_ref()?;
+            self.eat(&Token::RBracket)?;
+
+            // Must be followed by .
+            self.eat(&Token::Dot)?;
+
+            // .* or .** — type intersection splat
+            if matches!(self.current(), Token::Star | Token::StarStar) {
+                let splat = if matches!(self.current(), Token::StarStar) {
+                    self.advance();
+                    Splat::Deep
+                } else {
+                    self.advance();
+                    Splat::Shallow
+                };
+                return Ok(ShapeElement {
+                    path: Path { steps: vec![PathStep::TypeIntersection(type_ref)], partial: true },
+                    splat: Some(splat),
+                    nested: None,
+                    compexpr: None,
+                    op: ShapeOp::Assign,
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                });
+            }
+
+            // .field_name — type intersection field access
+            let field_name = self.eat_ident()?;
+            let path = Path {
+                steps: vec![PathStep::TypeIntersection(type_ref), PathStep::Name(field_name)],
+                partial: true,
+            };
+            // Could be followed by := for computed alias
+            if matches!(self.current(), Token::ColonEq) {
+                self.advance();
+                let compexpr = self.parse_expr()?;
+                return Ok(ShapeElement {
+                    path,
+                    splat: None,
+                    nested: None,
+                    compexpr: Some(compexpr),
+                    op: ShapeOp::Assign,
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                });
+            }
+            return Ok(ShapeElement {
+                path,
+                splat: None,
+                nested: None,
+                compexpr: None,
+                op: ShapeOp::Assign,
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+            });
+        }
+
         // Wildcard splats: `*` (shallow) and `**` (deep)
         if matches!(self.current(), Token::StarStar) {
             self.advance();

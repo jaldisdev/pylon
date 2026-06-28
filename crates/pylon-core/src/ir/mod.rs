@@ -127,6 +127,24 @@ pub struct IrSelect {
     /// the inner DML is stored here and emitted as a CTE.
     /// `None` for plain `SELECT Type { … }`.
     pub dml_source: Option<Box<IrStmt>>,
+    /// True when this SELECT targets an interface type.
+    /// The SQL emitter builds a UNION ALL inline instead of hitting the view.
+    pub polymorphic: bool,
+    /// Concrete implementors of the interface (populated when `polymorphic = true`).
+    pub poly_implementors: Vec<IrPolyImplementor>,
+    /// Interface column names used in the UNION ALL branches (e.g. `["id", "email"]`).
+    pub poly_columns: Vec<String>,
+}
+
+/// One concrete type that implements a polymorphic interface.
+#[derive(Debug, Clone)]
+pub struct IrPolyImplementor {
+    /// Qualified type name, e.g. `default::Individual`.
+    pub type_name: String,
+    /// PostgreSQL table name.
+    pub table: String,
+    /// Schema / module name.
+    pub module: String,
 }
 
 /// The relation being queried: a resolved type with its PostgreSQL table name

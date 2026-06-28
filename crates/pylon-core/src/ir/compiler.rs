@@ -15,9 +15,9 @@ use super::{
     IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
     IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrIfElse, IrInsert, IrLiteral,
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
-    IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrRewrite, IrScalarField, IrSelect,
-    IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp,
-    IrUpdate, IrLinkProp,
+    IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
+    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
+    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -159,6 +159,17 @@ impl<'a> Compiler<'a> {
                     position: Position { line: 0, col: 0 },
                 }))
             })
+    }
+
+    fn find_poly_implementors(&self, iface_qname: &str) -> Vec<IrPolyImplementor> {
+        self.schema.types.iter()
+            .filter(|t| !t.abstract_ && t.interfaces.iter().any(|i| i == iface_qname))
+            .map(|t| IrPolyImplementor {
+                type_name: format!("{}::{}", t.module, t.name),
+                table: t.table.clone(),
+                module: t.module.clone(),
+            })
+            .collect()
     }
 
     fn resolve_property<'t>(
@@ -735,6 +746,7 @@ impl<'a> Compiler<'a> {
                     limit: None,
                     distinct: false,
                     dml_source: None,
+                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                 }));
                 Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
             }
@@ -752,6 +764,7 @@ impl<'a> Compiler<'a> {
                         limit: None,
                         distinct: false,
                         dml_source: None,
+                        polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                     })),
                 })))
             }
@@ -810,6 +823,7 @@ impl<'a> Compiler<'a> {
             limit: None,
             distinct: false,
             dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
         }));
         Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
     }
@@ -1173,7 +1187,19 @@ impl<'a> Compiler<'a> {
             .map(|s| self.compile_stmt(s).map(Box::new))
             .transpose()?;
 
-        Ok(IrSelect { source, shape, filter, order_by, offset, limit, distinct, dml_source })
+        let polymorphic = td.abstract_ && td.materialized;
+        let (poly_implementors, poly_columns) = if polymorphic {
+            let iface_qname = format!("{}::{}", td.module, td.name);
+            let implementors = self.find_poly_implementors(&iface_qname);
+            let columns: Vec<String> = td.properties.iter().map(|p| p.name.clone())
+                .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
+                .collect();
+            (implementors, columns)
+        } else {
+            (vec![], vec![])
+        };
+
+        Ok(IrSelect { source, shape, filter, order_by, offset, limit, distinct, dml_source, polymorphic, poly_implementors, poly_columns })
     }
 
     /// Unwrap `Shape(expr, elements)` or bare `Path` from a SELECT result.
@@ -1633,7 +1659,13 @@ impl<'a> Compiler<'a> {
         let mut fields = vec![];
         for el in elements {
             if let Some(splat) = &el.splat {
-                fields.extend(self.compile_splat(splat, td, alias, module)?);
+                // Check if this is a type-intersection splat: [is Type].*
+                if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first() {
+                    let type_ref = type_ref.clone();
+                    fields.extend(self.compile_type_intersection_splat(&type_ref, splat, td, alias)?);
+                } else {
+                    fields.extend(self.compile_splat(splat, td, alias, module)?);
+                }
             } else {
                 fields.push(self.compile_shape_element(el, td, alias, module)?);
             }
@@ -1677,6 +1709,7 @@ impl<'a> Compiler<'a> {
                     limit: None,
                     distinct: false,
                     dml_source: None,
+                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                 };
                 fields.push(IrShapeField::SingleLink(IrSingleLinkField {
                     alias: l.name.clone(),
@@ -1753,6 +1786,7 @@ impl<'a> Compiler<'a> {
                     limit: None,
                     distinct: false,
                     dml_source: None,
+                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                 };
 
                 fields.push(IrShapeField::MultiLink(IrMultiLinkField {
@@ -1767,6 +1801,220 @@ impl<'a> Compiler<'a> {
         Ok(fields)
     }
 
+    // ── Type-intersection helpers ─────────────────────────────────────────────────
+
+    /// Expand `[is ConcreteType].*` → scalar subqueries for each non-inherited property.
+    fn compile_type_intersection_splat(
+        &mut self,
+        type_ref: &ast::ObjectRef,
+        splat: &ast::Splat,
+        parent_td: &TypeDescriptor,
+        parent_alias: &str,
+    ) -> Result<Vec<IrShapeField>, PyQLError> {
+        let type_name = match &type_ref.module {
+            Some(m) => format!("{}::{}", m, type_ref.name),
+            None => type_ref.name.clone(),
+        };
+        let concrete_td = self.resolve_type(&type_name)?;
+        let concrete_qname = format!("{}::{}", concrete_td.module, concrete_td.name);
+        let concrete_table = concrete_td.table.clone();
+
+        // Interface properties: those in the parent (interface) td
+        let interface_props: std::collections::HashSet<String> = parent_td.properties.iter()
+            .map(|p| p.name.clone())
+            .collect();
+
+        // Emit scalar subquery for each property not already in the interface
+        let props: Vec<_> = concrete_td.properties.iter()
+            .filter(|p| !interface_props.contains(&p.name))
+            .cloned()
+            .collect();
+
+        // For deep splat, also include links
+        let links: Vec<_> = if matches!(splat, ast::Splat::Deep) {
+            concrete_td.links.iter().cloned().collect()
+        } else {
+            vec![]
+        };
+
+        let mut fields = vec![];
+        for prop in props {
+            let sub_alias = self.fresh_alias();
+            let filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: sub_alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef {
+                    alias: parent_alias.to_string(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+            }));
+            let subquery = IrSelect {
+                source: IrSource {
+                    type_name: concrete_qname.clone(),
+                    table: concrete_table.clone(),
+                    alias: sub_alias,
+                },
+                shape: vec![IrShapeField::Scalar(IrScalarField {
+                    alias: prop.name.clone(),
+                    column: prop.name.clone(),
+                    pg_type: prop.pg_type.clone(),
+                })],
+                filter: Some(filter),
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                distinct: false,
+                dml_source: None,
+                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+            };
+            fields.push(IrShapeField::Computed(IrComputedField {
+                alias: prop.name.clone(),
+                expr: IrExpr::Subquery(Box::new(subquery)),
+            }));
+        }
+
+        // For deep splat, include single-link fields as subqueries
+        for link in links {
+            let target_td = self.resolve_type(&link.target)?;
+            let sub_alias = self.fresh_alias();
+            let filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: sub_alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef {
+                    alias: parent_alias.to_string(),
+                    column: format!("{}_id", link.name),
+                    pg_type: "uuid".to_string(),
+                },
+            }));
+            let sub_shape = Self::pk_returning(target_td);
+            let subquery = IrSelect {
+                source: IrSource {
+                    type_name: format!("{}::{}", target_td.module, target_td.name),
+                    table: target_td.table.clone(),
+                    alias: sub_alias,
+                },
+                shape: sub_shape,
+                filter: Some(filter),
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                distinct: false,
+                dml_source: None,
+                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+            };
+            fields.push(IrShapeField::Computed(IrComputedField {
+                alias: link.name.clone(),
+                expr: IrExpr::Subquery(Box::new(subquery)),
+            }));
+        }
+
+        Ok(fields)
+    }
+
+    /// Compile `[is ConcreteType].field_name` → `IrShapeField`.
+    fn compile_type_intersection_field(
+        &mut self,
+        type_ref: &ast::ObjectRef,
+        tail_steps: &[ast::PathStep],
+        parent_alias: &str,
+    ) -> Result<IrShapeField, PyQLError> {
+        let expr = self.compile_type_intersection_expr_steps(type_ref, tail_steps, parent_alias)?;
+        // Alias is the last Name step
+        let alias = match tail_steps.last() {
+            Some(ast::PathStep::Name(n)) => n.clone(),
+            _ => return Err(self.type_err("type intersection field must end with a field name")),
+        };
+        Ok(IrShapeField::Computed(IrComputedField { alias, expr }))
+    }
+
+    /// Compile `[is Type].field` as an `IrExpr` (for computed field / expression context).
+    fn compile_type_intersection_expr(
+        &mut self,
+        steps: &[ast::PathStep],
+        _td: &TypeDescriptor,
+        parent_alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        use ast::PathStep;
+        let type_ref = match steps.first() {
+            Some(PathStep::TypeIntersection(tr)) => tr.clone(),
+            _ => return Err(self.type_err("expected type intersection")),
+        };
+        self.compile_type_intersection_expr_steps(&type_ref, &steps[1..], parent_alias)
+    }
+
+    /// Shared: build scalar subquery for `[is ConcreteType]` + tail field steps.
+    fn compile_type_intersection_expr_steps(
+        &mut self,
+        type_ref: &ast::ObjectRef,
+        tail_steps: &[ast::PathStep],
+        parent_alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        use ast::PathStep;
+        let type_name = match &type_ref.module {
+            Some(m) => format!("{}::{}", m, type_ref.name),
+            None => type_ref.name.clone(),
+        };
+        let concrete_td = self.resolve_type(&type_name)?;
+        let concrete_qname = format!("{}::{}", concrete_td.module, concrete_td.name);
+        let concrete_table = concrete_td.table.clone();
+
+        let field_name = match tail_steps.first() {
+            Some(PathStep::Name(n)) => n.as_str(),
+            _ => return Err(self.type_err(
+                "type intersection must be followed by a field name, e.g. [is Type].field"
+            )),
+        };
+
+        let prop = concrete_td.properties.iter().find(|p| p.name == field_name)
+            .ok_or_else(|| self.field_err(field_name, &concrete_qname))?;
+        let prop_name = prop.name.clone();
+        let prop_type = prop.pg_type.clone();
+
+        let sub_alias = self.fresh_alias();
+        let filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef {
+                alias: sub_alias.clone(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef {
+                alias: parent_alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+        }));
+
+        Ok(IrExpr::Subquery(Box::new(IrSelect {
+            source: IrSource {
+                type_name: concrete_qname,
+                table: concrete_table,
+                alias: sub_alias,
+            },
+            shape: vec![IrShapeField::Scalar(IrScalarField {
+                alias: prop_name.clone(),
+                column: prop_name,
+                pg_type: prop_type,
+            })],
+            filter: Some(filter),
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct: false,
+            dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+        })))
+    }
+
     fn compile_shape_element(
         &mut self,
         el: &ShapeElement,
@@ -1774,16 +2022,32 @@ impl<'a> Compiler<'a> {
         alias: &str,
         module: &str,
     ) -> Result<IrShapeField, PyQLError> {
+        // Type intersection field: [is Type].field_name (without compexpr)
+        if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first() {
+            if el.compexpr.is_none() && el.path.steps.len() >= 2 {
+                let type_ref = type_ref.clone();
+                return self.compile_type_intersection_field(&type_ref, &el.path.steps[1..], alias);
+            }
+        }
+
         let field_name = path_leaf(&el.path)?;
 
         // __type__ is a virtual property: the fully-qualified type name as a string.
         // It's always injected at position 0 for internal use; explicit inclusion adds
         // it as a regular computed field at a later position so Python can read it.
         if field_name == "__type__" && el.compexpr.is_none() {
-            let type_qname = format!("{}::{}", td.module, td.name);
+            let expr = if td.abstract_ && td.materialized {
+                IrExpr::ColumnRef {
+                    alias: alias.to_string(),
+                    column: "__type__".to_string(),
+                    pg_type: "text".to_string(),
+                }
+            } else {
+                IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
+            };
             return Ok(IrShapeField::Computed(IrComputedField {
                 alias: "__type__".to_string(),
-                expr: IrExpr::Literal(IrLiteral::Str(type_qname)),
+                expr,
             }));
         }
 
@@ -1838,6 +2102,7 @@ impl<'a> Compiler<'a> {
                 limit: None,
                 distinct: false,
                 dml_source: None,
+                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
             };
             return Ok(IrShapeField::SingleLink(IrSingleLinkField {
                 alias: field_name.to_string(),
@@ -1964,6 +2229,7 @@ impl<'a> Compiler<'a> {
                 .transpose()?,
             distinct: false,
             dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
         };
 
         Ok(IrShapeField::MultiLink(IrMultiLinkField {
@@ -2142,9 +2408,15 @@ impl<'a> Compiler<'a> {
                     }
                     // __type__ without a leading dot still means the current object's type.
                     if n == "__type__" {
-                        return Ok(IrExpr::Literal(IrLiteral::Str(
-                            format!("{}::{}", td.module, td.name)
-                        )));
+                        return Ok(if td.abstract_ && td.materialized {
+                            IrExpr::ColumnRef {
+                                alias: alias.to_string(),
+                                column: "__type__".to_string(),
+                                pg_type: "text".to_string(),
+                            }
+                        } else {
+                            IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
+                        });
                     }
                 }
             }
@@ -2152,6 +2424,11 @@ impl<'a> Compiler<'a> {
                 message: "absolute paths are not valid in expression context; use .field".into(),
                 position: Position { line: 0, col: 0 },
             }));
+        }
+
+        // Type intersection in expression: [is Type].field — scalar subquery
+        if p.partial && matches!(p.steps.first(), Some(ast::PathStep::TypeIntersection(_))) {
+            return self.compile_type_intersection_expr(&p.steps, td, alias);
         }
 
         if p.steps.len() == 2 {
@@ -2175,9 +2452,18 @@ impl<'a> Compiler<'a> {
             }
         };
 
-        // __type__ as an expression: returns the fully-qualified type name as text.
+        // __type__ as an expression: for polymorphic (interface) types, read from the
+        // inline union column; for concrete types, emit the static qualified name.
         if field_name == "__type__" {
-            return Ok(IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name))));
+            return Ok(if td.abstract_ && td.materialized {
+                IrExpr::ColumnRef {
+                    alias: alias.to_string(),
+                    column: "__type__".to_string(),
+                    pg_type: "text".to_string(),
+                }
+            } else {
+                IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
+            });
         }
 
         if let Some(prop) = Self::resolve_property(td, field_name) {
@@ -2262,6 +2548,7 @@ impl<'a> Compiler<'a> {
                     limit: None,
                     distinct: false,
                     dml_source: None,
+                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                 })));
             }
             let target_name = link.target.clone();
@@ -2397,6 +2684,7 @@ impl<'a> Compiler<'a> {
                 limit: None,
                 distinct: false,
                 dml_source: None,
+                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
             })),
         })))
     }
@@ -2493,6 +2781,7 @@ impl<'a> Compiler<'a> {
                             limit: None,
                             distinct: false,
                             dml_source: None,
+                            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                         })),
                     }))));
                 }
@@ -2655,6 +2944,7 @@ impl<'a> Compiler<'a> {
             limit: None,
             distinct: false,
             dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
         }));
 
         Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
@@ -2747,6 +3037,7 @@ impl<'a> Compiler<'a> {
                 limit: None,
                 distinct: false,
                 dml_source: None,
+                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
             }));
             return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
         }
@@ -2797,6 +3088,7 @@ impl<'a> Compiler<'a> {
                         limit: None,
                         distinct: false,
                         dml_source: None,
+                        polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                     }));
                     return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
                 }
@@ -2837,6 +3129,7 @@ impl<'a> Compiler<'a> {
             limit: None,
             distinct: false,
             dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
         }));
         Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
     }
@@ -2918,6 +3211,7 @@ impl<'a> Compiler<'a> {
             limit: None,
             distinct: false,
             dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
         })))
     }
 
