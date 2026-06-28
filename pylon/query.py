@@ -50,11 +50,12 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         if obj_tuple is None:
             return None
         fields = node["fields"]
-        # fields[0] is always __type__ (the discriminator string); skip it.
+        # fields[0] is always the auto-injected __type__ discriminator (position 0); skip it.
+        # Explicit __type__ requested by the user appears at position > 0 and is included.
         kwargs = {
             f["name"]: _decode(obj_tuple, f, registry)
             for f in fields
-            if f["name"] != "__type__"
+            if not (f["name"] == "__type__" and f["position"] == 0)
         }
         type_name = node.get("type_name")
         if type_name:

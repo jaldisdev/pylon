@@ -146,7 +146,11 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
         return
 
     # Schema object or free object
-    selected = {f["name"] for f in shape.get("fields", []) if f["name"] != "__type__"}
+    # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
+    selected = {
+        f["name"] for f in shape.get("fields", [])
+        if not (f["name"] == "__type__" and f["position"] == 0)
+    }
     type_name = shape.get("type_name") or ""
 
     display = []
@@ -157,12 +161,14 @@ async def _execute(client, pyql: str, *, as_json: bool) -> None:
                 for k, v in vars(obj).items()
                 if k in selected
             }
-            d["__type__"] = type_name or vars(obj).get("__pylon_type__") or type(obj).__name__
+            # __display_type__ is the internal sentinel used as the type label in _format_results.
+            # Keeping it separate from __type__ lets an explicit `__type__` field show in the output.
+            d["__display_type__"] = type_name or vars(obj).get("__pylon_type__") or type(obj).__name__
         elif isinstance(obj, dict):
             d = {k: v for k, v in obj.items() if k in selected}
-            d["__type__"] = type_name  # empty string for free objects
+            d["__display_type__"] = type_name
         else:
-            d = {"__type__": type(obj).__name__, "value": str(obj)}
+            d = {"__display_type__": type(obj).__name__, "value": str(obj)}
         display.append(d)
     click.echo(_format_results(display))
 
@@ -299,7 +305,7 @@ def _format_results(results: list[dict]) -> str:
 
     lines = [_brace("{")]
     for obj in results:
-        type_name = obj.pop("__type__", "")
+        type_name = obj.pop("__display_type__", "")
         lines.append(f"  {_format_object(type_name, obj)},")
     lines.append(_brace("}"))
     return "\n".join(lines)
