@@ -1776,6 +1776,17 @@ impl<'a> Compiler<'a> {
     ) -> Result<IrShapeField, PyQLError> {
         let field_name = path_leaf(&el.path)?;
 
+        // __type__ is a virtual property: the fully-qualified type name as a string.
+        // It's always injected at position 0 for internal use; explicit inclusion adds
+        // it as a regular computed field at a later position so Python can read it.
+        if field_name == "__type__" && el.compexpr.is_none() {
+            let type_qname = format!("{}::{}", td.module, td.name);
+            return Ok(IrShapeField::Computed(IrComputedField {
+                alias: "__type__".to_string(),
+                expr: IrExpr::Literal(IrLiteral::Str(type_qname)),
+            }));
+        }
+
         // Computed override: `field := expr`
         if let Some(compexpr) = &el.compexpr {
             // `alias := .multilink` → rename a multilink, same semantics as a regular field
@@ -2129,6 +2140,12 @@ impl<'a> Compiler<'a> {
                         let scalar = t.is_empty();
                         return Ok(IrExpr::CteRef { name: n.clone(), scalar });
                     }
+                    // __type__ without a leading dot still means the current object's type.
+                    if n == "__type__" {
+                        return Ok(IrExpr::Literal(IrLiteral::Str(
+                            format!("{}::{}", td.module, td.name)
+                        )));
+                    }
                 }
             }
             return Err(PyQLError::Type(PyQLTypeError {
@@ -2157,6 +2174,11 @@ impl<'a> Compiler<'a> {
                 }))
             }
         };
+
+        // __type__ as an expression: returns the fully-qualified type name as text.
+        if field_name == "__type__" {
+            return Ok(IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name))));
+        }
 
         if let Some(prop) = Self::resolve_property(td, field_name) {
             return Ok(IrExpr::ColumnRef {
