@@ -341,6 +341,7 @@ def _build_type(
     module: str | None = None,
     name: str | None = None,
     table: str | None = None,
+    junction: bool = False,
 ) -> type:
     # Drain class-body expressions that were registered during the class body.
     exprs = _collector.drain()
@@ -366,11 +367,20 @@ def _build_type(
     for field_name, annotation in annotations.items():
         if field_name.startswith("_"):
             continue
+        if junction and field_name in ("source", "target"):
+            raise ValueError(
+                f"Junction type {cls.__name__!r}: 'source' and 'target' are reserved "
+                f"names — they are injected automatically by Pylon."
+            )
         nullable, inner = _unwrap_optional(annotation)
         cls_default = cls.__dict__.get(field_name, MISSING)
-        field_metas[field_name] = _annotation_to_meta(
-            field_name, inner, nullable, cls_default
-        )
+        meta = _annotation_to_meta(field_name, inner, nullable, cls_default)
+        if junction and meta.kind != "property":
+            raise ValueError(
+                f"Junction type {cls.__name__!r}: field {field_name!r} is a "
+                f"{meta.kind!r}; junction types only support scalar properties."
+            )
+        field_metas[field_name] = meta
 
     _prepare_dataclass(cls, field_metas)
     dataclasses.dataclass(cls, kw_only=True)
@@ -391,6 +401,7 @@ def _build_type(
         indexes=class_indexes,
         triggers=class_triggers,
         description=description,
+        junction=junction,
     )
 
     from . import _registry
@@ -482,6 +493,39 @@ def interface_decorator(
     def _wrap(c: type) -> type:
         return _build_type(
             c, abstract=True, materialized=True, module=module, name=name
+        )
+
+    return _wrap(cls) if cls is not None else _wrap
+
+
+def junction_decorator(
+    cls: type | None = None,
+    *,
+    module: str | None = None,
+    name: str | None = None,
+) -> Any:
+    """@pylon.junction — mark a type as a junction table for MultiLink.
+
+    Junction types hold extra link properties for many-to-many relationships.
+    They may only declare scalar properties; 'source' and 'target' are reserved.
+    The actual junction table name is derived from the MultiLink that references
+    this junction type — the class name is not used as the table name.
+
+    Usage::
+
+        @pylon.junction
+        class ProductTag:
+            weight: Property[pylon.Float64, MinValue(0)]
+            created_at: Property[pylon.DateTime, Default(Now)]
+
+        @pylon.type
+        class Product:
+            tags: MultiLink[Tag, through(ProductTag)]
+    """
+
+    def _wrap(c: type) -> type:
+        return _build_type(
+            c, abstract=False, materialized=True, junction=True, module=module, name=name
         )
 
     return _wrap(cls) if cls is not None else _wrap

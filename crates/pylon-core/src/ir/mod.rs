@@ -182,6 +182,15 @@ pub struct IrMultiLinkField {
     pub join: IrMultiLinkJoin,
     /// Nested SELECT producing the linked objects.
     pub subquery: IrSelect,
+    /// Extra scalar columns from a junction table (`@prop` syntax).
+    pub link_properties: Vec<IrLinkProp>,
+}
+
+/// A single link property pulled from a junction table.
+#[derive(Debug, Clone)]
+pub struct IrLinkProp {
+    /// The column name in the junction table and alias in the output.
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]

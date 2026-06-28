@@ -152,7 +152,7 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
 
 fn emit_tables(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         emit_one_table(t, out);
     }
 }
@@ -237,7 +237,7 @@ fn emit_fk_constraints(
 ) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         for l in &t.links {
             let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
             let cname = qi(&format!("{}_{}_fkey", t.table, l.name));
@@ -289,7 +289,7 @@ fn emit_link_source_triggers(
     out: &mut String,
 ) {
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         for l in &t.links {
             let src_action = policy_for(&l.on_delete, &DeleteSide::Source)
                 .unwrap_or(&DeleteAction::Allow);
@@ -330,7 +330,7 @@ fn emit_junction_tables(
     out: &mut String,
 ) {
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         for ml in &t.multilinks {
             let jt_name = format!("{}.{}", t.table, ml.name);
             let src_suffix = source_jt_fk_suffix(&ml.on_delete);
@@ -350,6 +350,23 @@ fn emit_junction_tables(
             } else {
                 out.push_str("    target uuid NOT NULL,\n");
             }
+
+            // Extra property columns from a junction through type.
+            if let Some(through_qname) = &ml.through {
+                let through_td = schema.types.iter().find(|td| {
+                    format!("{}::{}", td.module, td.name) == *through_qname
+                });
+                if let Some(td) = through_td {
+                    if td.junction {
+                        for p in &td.properties {
+                            if p.name == "id" { continue; }
+                            let not_null = if p.nullable { "" } else { " NOT NULL" };
+                            out.push_str(&format!("    {} {}{},\n", qi(&p.name), p.pg_type, not_null));
+                        }
+                    }
+                }
+            }
+
             out.push_str("    PRIMARY KEY (source, target)\n);\n\n");
         }
     }
@@ -363,7 +380,7 @@ fn emit_multilink_deletion_triggers(
     out: &mut String,
 ) {
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         for ml in &t.multilinks {
             let jt_name = format!("{}.{}", t.table, ml.name);
             let jt_qname = qn(&t.module, &jt_name);
@@ -415,7 +432,7 @@ fn emit_multilink_deletion_triggers(
 fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         let qname = qn(&t.module, &t.table);
 
         for p in &t.properties {
@@ -460,7 +477,7 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
 fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         let qname = qn(&t.module, &t.table);
 
         for p in &t.properties {
@@ -496,7 +513,7 @@ fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) {
 fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         let qname = qn(&t.module, &t.table);
 
         for idx in &t.indexes {
@@ -526,7 +543,7 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
 
 fn emit_triggers(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types {
-        if t.abstract_ { continue; }
+        if t.abstract_ || t.junction { continue; }
         let table_qname = qn(&t.module, &t.table);
 
         for trig in &t.triggers {

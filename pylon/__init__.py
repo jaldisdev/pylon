@@ -66,6 +66,7 @@ from .schema import (
     collect_module_globals,
     enum,
     interface,
+    junction,
     lazy,
     scalar,
     through,
@@ -88,6 +89,7 @@ __all__ = [
     "abstract",
     "enum",
     "interface",
+    "junction",
     "scalar",
     "type",
     # Schema — base types & introspection

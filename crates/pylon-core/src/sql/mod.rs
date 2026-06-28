@@ -1,8 +1,8 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrInsert, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
-    IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrScalarField, IrSelect, IrShapeField,
-    IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
+    IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation,
+    IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrScalarField,
+    IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -933,9 +933,21 @@ fn emit_multi_link(
     let sub = &f.subquery;
     let sub_alias = &sub.source.alias;
 
-    let (sub_exprs, sub_nodes) = build_shape(&sub.shape, sub_alias);
+    let (sub_exprs, mut sub_nodes) = build_shape(&sub.shape, sub_alias);
     let mut row_parts = vec![type_disc(&sub.source.type_name)];
     row_parts.extend(sub_exprs);
+
+    // Link properties: read from the junction table alias "jt".
+    // The ShapeNode name carries the `@` prefix so hydration stores it as
+    // `@prop` in the object's __dict__ and the REPL displays it with `@`.
+    for lp in &f.link_properties {
+        row_parts.push(format!("\"jt\".{}", qi(&lp.name)));
+        // Positions are 1-based (0 = type discriminator). sub_nodes.len() gives
+        // the count of already-assigned positions, so the next position is len+1.
+        let pos = sub_nodes.len() + 1;
+        sub_nodes.push(ShapeNode::Scalar { name: format!("@{}", lp.name), position: pos });
+    }
+
     let row = row_parts.join(",\n            ");
 
     // ORDER BY inside array_agg

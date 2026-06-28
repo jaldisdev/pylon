@@ -230,6 +230,66 @@ def _detect_required_link_cycles(
             dfs(node)
 
 
+# ── Junction validation ────────────────────────────────────────────────────────
+
+
+def _validate_junctions(
+    types: list[type],
+    class_to_qname: dict[int, str],
+) -> dict[str, tuple[str, str]]:
+    """Validate junction type usage and return junction_qname → (source_table, ml_name) map.
+
+    Enforces:
+    - Each junction type is referenced by exactly one MultiLink.
+    - Junction types have no link or multilink fields (already enforced at decoration time,
+      but re-checked here for types that arrive from non-decorator paths).
+    """
+    # Build reverse map: junction_qname → (source_type_cfg, ml_name)
+    junction_to_ml: dict[str, tuple[str, str]] = {}  # qname → (source_table, ml_name)
+
+    for cls in types:
+        cfg = cls.__pylon_config__
+        for fn, meta in cfg.fields.items():
+            if meta.kind != "multilink" or meta.through is None:
+                continue
+            through_qname = meta.through  # already resolved to a qname string
+            through_cls = next(
+                (t for t in types if class_to_qname.get(id(t)) == through_qname),
+                None,
+            )
+            if through_cls is None:
+                continue  # unresolved — caught elsewhere
+            through_cfg = through_cls.__pylon_config__
+            if not through_cfg.junction:
+                continue  # old-style through type — not a junction, no restriction
+
+            src_qname = class_to_qname[id(cls)]
+            if through_qname in junction_to_ml:
+                other_src_table, other_ml = junction_to_ml[through_qname]
+                raise SchemaError(
+                    f"Junction type {through_qname!r} is referenced by more than one "
+                    f"MultiLink: {other_src_table!r}.{other_ml!r} and "
+                    f"{src_qname!r}.{fn!r}. Each junction type may only be used by "
+                    f"a single MultiLink."
+                )
+            junction_to_ml[through_qname] = (cfg.table, fn)
+
+    # Every junction type must be referenced by exactly one MultiLink.
+    for cls in types:
+        cfg = cls.__pylon_config__
+        if not cfg.junction:
+            continue
+        qname = class_to_qname[id(cls)]
+        if qname not in junction_to_ml:
+            raise SchemaError(
+                f"Junction type {qname!r} is not referenced by any MultiLink. "
+                f"Junction types must be used as the 'through' parameter of exactly "
+                f"one MultiLink field."
+            )
+
+    return junction_to_ml
+
+
 # ── Interface conformance ──────────────────────────────────────────────────────
 
 
@@ -593,6 +653,7 @@ def _build_type_descriptor(
     cls: type,
     class_to_qname: dict[int, str],
     _core: Any,
+    junction_to_ml: dict[str, tuple[str, str]] | None = None,
 ) -> Any:
     from ._constraints import Exclusive, Expression
 
@@ -636,10 +697,18 @@ def _build_type_descriptor(
     index_descs = [_make_index_desc(idx, _core) for idx in all_indexes]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
 
+    # Junction types: derive the actual table name from the MultiLink that references them.
+    if cfg.junction and junction_to_ml is not None:
+        qname = _qualified(cfg.module, cfg.name)
+        source_table, ml_name = junction_to_ml.get(qname, (cfg.table, cfg.name))
+        actual_table = f"{source_table}.{ml_name}"
+    else:
+        actual_table = cfg.table
+
     return _core.TypeDescriptor(
         name=cfg.name,
         module=cfg.module,
-        table=cfg.table,
+        table=actual_table,
         properties=properties,
         links=links,
         multilinks=multilinks,
@@ -653,6 +722,7 @@ def _build_type_descriptor(
         expression_constraints=expression_constraints,
         indexes=index_descs,
         triggers=trigger_descs,
+        junction=cfg.junction,
     )
 
 
@@ -749,9 +819,12 @@ def walk(
     # Phase 4 — interface conformance
     _validate_interfaces(types, class_to_qname)
 
+    # Phase 4.5 — junction type validation
+    junction_to_ml = _validate_junctions(types, class_to_qname)
+
     # Phase 5+6 — build PyO3 descriptors
     type_descs = [
-        _build_type_descriptor(cls, class_to_qname, _core) for cls in types
+        _build_type_descriptor(cls, class_to_qname, _core, junction_to_ml) for cls in types
     ]
     scalar_descs = [_build_scalar_descriptor(cls, _core) for cls in custom_scalars]
     enum_descs = [_build_enum_descriptor(cls, _core) for cls in enums]

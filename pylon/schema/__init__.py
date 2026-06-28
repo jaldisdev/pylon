@@ -25,6 +25,9 @@ from ._decorators import (
     interface_decorator as interface,
 )
 from ._decorators import (
+    junction_decorator as junction,
+)
+from ._decorators import (
     type_decorator as type,
 )
 from ._enums import Enum
