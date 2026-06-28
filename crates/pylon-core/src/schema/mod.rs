@@ -156,6 +156,8 @@ pub struct TypeDescriptor {
     pub indexes: Vec<IndexDescriptor>,
     /// Triggers (own + inherited from abstract parents).
     pub triggers: Vec<TriggerDescriptor>,
+    /// True for `@pylon.junction` — type is a junction table for a MultiLink.
+    pub junction: bool,
 }
 
 // ── Scalar / enum / global descriptors ────────────────────────────────────────

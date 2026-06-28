@@ -45,3 +45,4 @@ class PylonConfig:
     indexes: list[Any] = dataclasses.field(default_factory=list)
     triggers: list[Any] = dataclasses.field(default_factory=list)
     description: str | None = None
+    junction: bool = False

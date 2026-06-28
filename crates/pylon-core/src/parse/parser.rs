@@ -836,6 +836,27 @@ impl Parser {
             return Ok(ShapeElement::splat(Splat::Shallow));
         }
 
+        // Link property in a nested shape: `@name`
+        if matches!(self.current(), Token::At) {
+            self.advance();
+            let name = self.eat_ident()?;
+            let path = Path {
+                steps: vec![PathStep::LinkProp(name)],
+                partial: true,
+            };
+            return Ok(ShapeElement {
+                path,
+                splat: None,
+                nested: None,
+                compexpr: None,
+                op: ShapeOp::Assign,
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+            });
+        }
+
         // Shape elements are partial paths relative to the shaped object.
         // They may start with `.name` or bare `name`.
         let path = if matches!(self.current(), Token::Dot) {

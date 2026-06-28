@@ -17,7 +17,7 @@ use super::{
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrRewrite, IrScalarField, IrSelect,
     IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp,
-    IrUpdate,
+    IrUpdate, IrLinkProp,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -394,25 +394,32 @@ impl<'a> Compiler<'a> {
                 };
                 let join_info = if let Some(through_qname) = &ml.through {
                     let through_td = self.resolve_type(through_qname)?;
-                    let source_qname = format!("{}::{}", current_td.module, current_td.name);
-                    let source_col = through_td.links.iter()
-                        .find(|l| l.target == source_qname)
-                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!("through type {through_qname} has no link to {source_qname}"),
-                            position: Position { line: 0, col: 0 },
-                        }))?.name.clone();
-                    let target_col = through_td.links.iter()
-                        .find(|l| l.target == ml.target && l.name != source_col)
-                        .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!("through type {through_qname} has no link to target {}", ml.target),
-                            position: Position { line: 0, col: 0 },
-                        }))?.name.clone();
-                    IrMultiLinkJoin::Through {
-                        junction_table: through_td.table.clone(),
-                        module: through_td.module.clone(),
-                        source_col,
-                        target_col,
+                    if through_td.junction {
+                        IrMultiLinkJoin::Standard {
+                            junction_table: through_td.table.clone(),
+                            module: through_td.module.clone(),
+                        }
+                    } else {
+                        let source_qname = format!("{}::{}", current_td.module, current_td.name);
+                        let source_col = through_td.links.iter()
+                            .find(|l| l.target == source_qname)
+                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                                message: format!("through type {through_qname} has no link to {source_qname}"),
+                                position: Position { line: 0, col: 0 },
+                            }))?.name.clone();
+                        let target_col = through_td.links.iter()
+                            .find(|l| l.target == ml.target && l.name != source_col)
+                            .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                                message: format!("through type {through_qname} has no link to target {}", ml.target),
+                                position: Position { line: 0, col: 0 },
+                            }))?.name.clone();
+                        IrMultiLinkJoin::Through {
+                            junction_table: through_td.table.clone(),
+                            module: through_td.module.clone(),
+                            source_col,
+                            target_col,
+                        }
                     }
                 } else {
                     IrMultiLinkJoin::Standard {
@@ -762,14 +769,18 @@ impl<'a> Compiler<'a> {
 
         let (jt_table, jt_module, jt_src_col) = if let Some(through_qname) = &ml_through {
             let through_td = self.resolve_type(through_qname)?;
-            let source_qname = format!("{}::{}", td_module, td_name);
-            let src_col = through_td.links.iter()
-                .find(|l| l.target == source_qname)
-                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                    message: format!("through type {through_qname} has no link to {source_qname}"),
-                    position: Position { line: 0, col: 0 },
-                }))?.name.clone();
-            (through_td.table.clone(), through_td.module.clone(), format!("{}_id", src_col))
+            if through_td.junction {
+                (through_td.table.clone(), through_td.module.clone(), "source".to_string())
+            } else {
+                let source_qname = format!("{}::{}", td_module, td_name);
+                let src_col = through_td.links.iter()
+                    .find(|l| l.target == source_qname)
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!("through type {through_qname} has no link to {source_qname}"),
+                        position: Position { line: 0, col: 0 },
+                    }))?.name.clone();
+                (through_td.table.clone(), through_td.module.clone(), format!("{}_id", src_col))
+            }
         } else {
             (format!("{}.{}", td_table, ml_name), td_module.clone(), "source".to_string())
         };
@@ -1651,38 +1662,45 @@ impl<'a> Compiler<'a> {
 
                 let join = if let Some(through_qname) = &ml.through {
                     let through_td = self.resolve_type(through_qname)?;
-                    let source_qname = format!("{}::{}", td.module, td.name);
-                    let source_col = through_td
-                        .links
-                        .iter()
-                        .find(|l| l.target == source_qname)
-                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!(
-                                "through type {through_qname} has no link to source type {source_qname}"
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        }))?
-                        .name
-                        .clone();
-                    let target_col = through_td
-                        .links
-                        .iter()
-                        .find(|l| l.target == ml.target && l.name != source_col)
-                        .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                        .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!(
-                                "through type {through_qname} has no link to target type {}",
-                                ml.target
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        }))?
-                        .name
-                        .clone();
-                    IrMultiLinkJoin::Through {
-                        junction_table: through_td.table.clone(),
-                        module: through_td.module.clone(),
-                        source_col,
-                        target_col,
+                    if through_td.junction {
+                        IrMultiLinkJoin::Standard {
+                            junction_table: through_td.table.clone(),
+                            module: through_td.module.clone(),
+                        }
+                    } else {
+                        let source_qname = format!("{}::{}", td.module, td.name);
+                        let source_col = through_td
+                            .links
+                            .iter()
+                            .find(|l| l.target == source_qname)
+                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                                message: format!(
+                                    "through type {through_qname} has no link to source type {source_qname}"
+                                ),
+                                position: Position { line: 0, col: 0 },
+                            }))?
+                            .name
+                            .clone();
+                        let target_col = through_td
+                            .links
+                            .iter()
+                            .find(|l| l.target == ml.target && l.name != source_col)
+                            .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                                message: format!(
+                                    "through type {through_qname} has no link to target type {}",
+                                    ml.target
+                                ),
+                                position: Position { line: 0, col: 0 },
+                            }))?
+                            .name
+                            .clone();
+                        IrMultiLinkJoin::Through {
+                            junction_table: through_td.table.clone(),
+                            module: through_td.module.clone(),
+                            source_col,
+                            target_col,
+                        }
                     }
                 } else {
                     IrMultiLinkJoin::Standard {
@@ -1710,6 +1728,7 @@ impl<'a> Compiler<'a> {
                     alias: ml.name.clone(),
                     join,
                     subquery,
+                    link_properties: vec![],
                 }));
             }
         }
@@ -1809,43 +1828,63 @@ impl<'a> Compiler<'a> {
         let target_td = self.resolve_type(&ml.target)?;
         let sub_alias = self.fresh_alias();
         let nested_elements = el.nested.as_deref().unwrap_or(&[]);
+
+        // Partition @prop link-property elements from regular shape elements.
+        let mut link_properties: Vec<IrLinkProp> = Vec::new();
+        let mut regular_els: Vec<ShapeElement> = Vec::new();
+        for nel in nested_elements {
+            if let [ast::PathStep::LinkProp(name)] = nel.path.steps.as_slice() {
+                link_properties.push(IrLinkProp { name: name.clone() });
+            } else {
+                regular_els.push(nel.clone());
+            }
+        }
+
         let sub_shape =
-            self.compile_shape(nested_elements, target_td, &sub_alias, &target_td.module.clone())?;
+            self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
 
         let join = if let Some(through_qname) = &ml.through {
             let through_td = self.resolve_type(through_qname)?;
-            let source_qname = format!("{}::{}", td.module, td.name);
-            let source_col = through_td
-                .links
-                .iter()
-                .find(|l| l.target == source_qname)
-                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                    message: format!(
-                        "through type {through_qname} has no link to source type {source_qname}"
-                    ),
-                    position: Position { line: 0, col: 0 },
-                }))?
-                .name
-                .clone();
-            let target_col = through_td
-                .links
-                .iter()
-                .find(|l| l.target == ml.target && l.name != source_col)
-                .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                    message: format!(
-                        "through type {through_qname} has no link to target type {}",
-                        ml.target
-                    ),
-                    position: Position { line: 0, col: 0 },
-                }))?
-                .name
-                .clone();
-            IrMultiLinkJoin::Through {
-                junction_table: through_td.table.clone(),
-                module: through_td.module.clone(),
-                source_col,
-                target_col,
+            if through_td.junction {
+                // Junction type: columns are always named `source` and `target`.
+                IrMultiLinkJoin::Standard {
+                    junction_table: through_td.table.clone(),
+                    module: through_td.module.clone(),
+                }
+            } else {
+                let source_qname = format!("{}::{}", td.module, td.name);
+                let source_col = through_td
+                    .links
+                    .iter()
+                    .find(|l| l.target == source_qname)
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "through type {through_qname} has no link to source type {source_qname}"
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }))?
+                    .name
+                    .clone();
+                let target_col = through_td
+                    .links
+                    .iter()
+                    .find(|l| l.target == ml.target && l.name != source_col)
+                    .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "through type {through_qname} has no link to target type {}",
+                            ml.target
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }))?
+                    .name
+                    .clone();
+                IrMultiLinkJoin::Through {
+                    junction_table: through_td.table.clone(),
+                    module: through_td.module.clone(),
+                    source_col,
+                    target_col,
+                }
             }
         } else {
             IrMultiLinkJoin::Standard {
@@ -1889,6 +1928,7 @@ impl<'a> Compiler<'a> {
             alias: output_alias.to_string(),
             join,
             subquery,
+            link_properties,
         }))
     }
 
@@ -2234,30 +2274,39 @@ impl<'a> Compiler<'a> {
         // Resolve junction table columns.
         let (jt_table, jt_module, jt_src_col, jt_tgt_col) = if let Some(through_qname) = &ml_through {
             let through_td = self.resolve_type(through_qname)?;
-            let source_qname = format!("{}::{}", td_module, td_name);
-            let src_col = through_td
-                .links.iter()
-                .find(|l| l.target == source_qname)
-                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                    message: format!("through type {through_qname} has no link to {source_qname}"),
-                    position: Position { line: 0, col: 0 },
-                }))?
-                .name.clone();
-            let tgt_col = through_td
-                .links.iter()
-                .find(|l| l.target == ml_target && l.name != src_col)
-                .or_else(|| through_td.links.iter().find(|l| l.target == ml_target))
-                .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                    message: format!("through type {through_qname} has no link to {ml_target}"),
-                    position: Position { line: 0, col: 0 },
-                }))?
-                .name.clone();
-            (
-                through_td.table.clone(),
-                through_td.module.clone(),
-                format!("{}_id", src_col),
-                format!("{}_id", tgt_col),
-            )
+            if through_td.junction {
+                (
+                    through_td.table.clone(),
+                    through_td.module.clone(),
+                    "source".to_string(),
+                    "target".to_string(),
+                )
+            } else {
+                let source_qname = format!("{}::{}", td_module, td_name);
+                let src_col = through_td
+                    .links.iter()
+                    .find(|l| l.target == source_qname)
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!("through type {through_qname} has no link to {source_qname}"),
+                        position: Position { line: 0, col: 0 },
+                    }))?
+                    .name.clone();
+                let tgt_col = through_td
+                    .links.iter()
+                    .find(|l| l.target == ml_target && l.name != src_col)
+                    .or_else(|| through_td.links.iter().find(|l| l.target == ml_target))
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!("through type {through_qname} has no link to {ml_target}"),
+                        position: Position { line: 0, col: 0 },
+                    }))?
+                    .name.clone();
+                (
+                    through_td.table.clone(),
+                    through_td.module.clone(),
+                    format!("{}_id", src_col),
+                    format!("{}_id", tgt_col),
+                )
+            }
         } else {
             (
                 format!("{}.{}", td_table, ml_name),
