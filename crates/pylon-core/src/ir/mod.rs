@@ -99,6 +99,8 @@ pub enum IrFreeExpr {
     /// A set-returning assert: `SELECT ROW(v) FROM unnest(_pylon.fn(ARRAY(inner))) v`.
     /// Used for `assert_exists` and `assert_distinct` which pass through the set.
     AssertSet { fn_name: String, inner: Box<IrArraySource> },
+    /// Pass all rows from a scalar CTE through: `SELECT "result" FROM "cte_name"`.
+    CtePassthrough(String),
 }
 
 /// Source for `ARRAY(SELECT scalar FROM ...)` — used by assert functions.
