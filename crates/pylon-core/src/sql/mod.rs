@@ -694,7 +694,54 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────
 
+fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
+    let alias = &upd.target.alias;
+    let sets: Vec<String> = upd.assignments.iter()
+        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+        .chain(upd.rewrites.iter().map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
+        .collect();
+
+    let mut cte_parts: Vec<String> = user_ctes.iter()
+        .map(|c| format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)))
+        .collect();
+    let mut union_parts = vec![];
+
+    for (i, imp) in upd.poly_implementors.iter().enumerate() {
+        let cte_name = format!("_u{}", i);
+        let mut upd_sql = format!(
+            "UPDATE {} AS {}\nSET {}",
+            qn(&imp.module, &imp.table),
+            qi(alias),
+            sets.join(", "),
+        );
+        append_filter(&mut upd_sql, &upd.filter);
+        upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+
+        let r_alias = format!("_r{}", i);
+        union_parts.push(format!(
+            "SELECT ROW({}::text, {}.\"id\") AS result FROM \"{}\" AS {}",
+            sql_str(&imp.type_name),
+            qi(&r_alias),
+            cte_name,
+            qi(&r_alias),
+        ));
+    }
+
+    let sql = format!(
+        "WITH\n{}\n{}",
+        cte_parts.join(",\n"),
+        union_parts.join("\nUNION ALL\n"),
+    );
+
+    let (shape, _) = emit_returning_shape(&upd.target, &upd.returning, true);
+    SqlOutput { sql, shape }
+}
+
 fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
+    if !upd.poly_implementors.is_empty() {
+        return emit_poly_update_stmt(upd, user_ctes);
+    }
     let alias = &upd.target.alias;
     let (shape, returning_sql) = emit_returning_shape(&upd.target, &upd.returning, true);
 
@@ -801,6 +848,9 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 // ── DELETE ──────────────────────────────────────────────────────────────────
 
 fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
+    if !del.poly_implementors.is_empty() {
+        return emit_poly_delete_stmt(del);
+    }
     let alias = &del.target.alias;
     let mut sql = format!(
         "DELETE FROM {} AS {}",
@@ -814,6 +864,42 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
     if let Some(r) = returning_sql {
         sql.push_str(&r);
     }
+    SqlOutput { sql, shape }
+}
+
+fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
+    let alias = &del.target.alias;
+    let mut cte_parts = vec![];
+    let mut union_parts = vec![];
+
+    for (i, imp) in del.poly_implementors.iter().enumerate() {
+        let cte_name = format!("_d{}", i);
+        let mut del_sql = format!(
+            "DELETE FROM {} AS {}",
+            qn(&imp.module, &imp.table),
+            qi(alias),
+        );
+        append_filter(&mut del_sql, &del.filter);
+        del_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, del_sql));
+
+        let r_alias = format!("_r{}", i);
+        union_parts.push(format!(
+            "SELECT ROW({}::text, {}.\"id\") AS result FROM \"{}\" AS {}",
+            sql_str(&imp.type_name),
+            qi(&r_alias),
+            cte_name,
+            qi(&r_alias),
+        ));
+    }
+
+    let sql = format!(
+        "WITH\n{}\n{}",
+        cte_parts.join(",\n"),
+        union_parts.join("\nUNION ALL\n"),
+    );
+
+    let (shape, _) = emit_returning_shape(&del.target, &del.returning, true);
     SqlOutput { sql, shape }
 }
 

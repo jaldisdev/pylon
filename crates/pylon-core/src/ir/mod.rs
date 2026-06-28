@@ -273,6 +273,8 @@ pub struct IrUpdate {
     /// Schema-defined rewrites appended to the SET clause.
     pub rewrites: Vec<IrRewrite>,
     pub returning: Vec<IrShapeField>,
+    /// Populated when updating an interface type; one entry per concrete implementor.
+    pub poly_implementors: Vec<IrPolyImplementor>,
     /// `friends := {}` — DELETE all junction rows for this object.
     pub multi_link_clears: Vec<IrMultiLinkClear>,
     /// `friends := expr` — clear + insert (both lists share the same index).
@@ -322,6 +324,8 @@ pub struct IrDelete {
     pub target: IrSource,
     pub filter: Option<IrExpr>,
     pub returning: Vec<IrShapeField>,
+    /// Populated when deleting from an interface type; one entry per concrete implementor.
+    pub poly_implementors: Vec<IrPolyImplementor>,
 }
 
 // ── Expressions ─────────────────────────────────────────────────────────────────
