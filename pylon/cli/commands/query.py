@@ -42,11 +42,13 @@ def _make_bindings() -> KeyBindings:
 
     @kb.add(Keys.Enter)
     def _(event) -> None:
-        text = event.current_buffer.text.strip()
-        if text.endswith(";") or text.startswith("\\"):
-            event.current_buffer.validate_and_handle()
+        buf = event.current_buffer
+        text = buf.text.strip()
+        at_end = buf.cursor_position == len(buf.text)
+        if at_end and (text.endswith(";") or text.startswith("\\")):
+            buf.validate_and_handle()
         else:
-            event.current_buffer.insert_text("\n")
+            buf.insert_text("\n")
 
     return kb
 
