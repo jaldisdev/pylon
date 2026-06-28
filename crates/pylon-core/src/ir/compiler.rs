@@ -1399,6 +1399,12 @@ impl<'a> Compiler<'a> {
     fn compile_insert(&mut self, ins: &ast::InsertStmt) -> Result<IrInsert, PyQLError> {
         let type_name = format!("{}", ins.subject.name);
         let td = self.resolve_type(&type_name)?;
+        if td.abstract_ && td.materialized {
+            return Err(self.type_err(&format!(
+                "cannot insert into interface type '{}::{}'; insert into a concrete type instead",
+                td.module, td.name
+            )));
+        }
         let alias = self.fresh_alias();
         let target = IrSource {
             type_name: format!("{}::{}", td.module, td.name),
@@ -1603,10 +1609,17 @@ impl<'a> Compiler<'a> {
             .collect();
         let returning = Self::pk_returning(td);
 
+        let poly_implementors = if td.abstract_ && td.materialized {
+            self.find_poly_implementors(&format!("{}::{}", td.module, td.name))
+        } else {
+            vec![]
+        };
+
         Ok(IrUpdate {
             target, filter, assignments, rewrites, returning,
             multi_link_clears, multi_link_replaces,
             multi_link_appends, multi_link_removals,
+            poly_implementors,
         })
     }
 
@@ -1701,7 +1714,13 @@ impl<'a> Compiler<'a> {
 
         let returning = Self::pk_returning(td);
 
-        Ok(IrDelete { target, filter, returning })
+        let poly_implementors = if td.abstract_ && td.materialized {
+            self.find_poly_implementors(&format!("{}::{}", td.module, td.name))
+        } else {
+            vec![]
+        };
+
+        Ok(IrDelete { target, filter, returning, poly_implementors })
     }
 
     // ── Shape compilation ─────────────────────────────────────────────────────────
