@@ -97,24 +97,19 @@ def initialize(ctx: click.Context, dry_run: bool) -> None:
 
 
 @database.command()
-@click.argument("file", required=False)
+@click.argument("file")
 @click.option("--format", "fmt", default="custom",
               type=click.Choice(["custom", "plain"], case_sensitive=False),
               help="Dump format: 'custom' (pg_restore) or 'plain' (SQL). Default: custom.")
 @requires_config
 @click.pass_context
-def dump(ctx: click.Context, file: str | None, fmt: str) -> None:
+def dump(ctx: click.Context, file: str, fmt: str) -> None:
     """Create a database backup using pg_dump.
 
-    FILE defaults to <dbname>.dump (custom format) or <dbname>.sql (plain).
+    FILE is the destination path for the backup, e.g. backup.dump or backup.sql.
     The backup includes all schemas, functions, and data.
     """
     db = ctx.obj["config"].database
-    dbname = db.name or "pylon"
-
-    if file is None:
-        ext = "sql" if fmt == "plain" else "dump"
-        file = f"{dbname}.{ext}"
 
     pg_fmt = "--format=plain" if fmt == "plain" else "--format=custom"
     cmd = ["pg_dump", pg_fmt, f"--file={file}", _pg_dsn(db)]
