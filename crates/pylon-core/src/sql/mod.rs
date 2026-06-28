@@ -59,7 +59,12 @@ fn module_of(type_name: &str) -> &str {
 }
 
 fn source_ref(src: &IrSource) -> String {
-    qn(module_of(&src.type_name), &src.table)
+    // "@cte:name" sentinel: the source is a WITH-clause CTE, not a real table.
+    if let Some(cte_name) = src.table.strip_prefix("@cte:") {
+        qi(cte_name)
+    } else {
+        qn(module_of(&src.type_name), &src.table)
+    }
 }
 
 // ── SELECT statement ────────────────────────────────────────────────────────
@@ -172,7 +177,8 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &inner.offset, &inner.limit);
             sql
         }
-        IrStmt::FreeSelect(_) | IrStmt::For(_) => unreachable!("FreeSelect/For cannot appear as a CTE source"),
+        IrStmt::FreeSelect(sel) => emit_free_select(sel).sql,
+        IrStmt::For(_) => unreachable!("For cannot appear as a CTE source"),
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
             let mut sql = emit_path_joins(&ps.root, &ps.joins);
@@ -385,6 +391,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
             }
         }
         IrFreeExpr::AssertSet { .. } => unreachable!("AssertSet is handled by early return above"),
+        IrFreeExpr::CtePassthrough(name) => format!("SELECT \"result\" FROM {}", qi(name)),
     }).collect();
 
     let union_sql = branches.join("\nUNION ALL\n");
@@ -425,6 +432,7 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
                 .collect(),
         },
         IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar { name: String::new(), position: 0 },
+        IrFreeExpr::CtePassthrough(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
     }
 }
 

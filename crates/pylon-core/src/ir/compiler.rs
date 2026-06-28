@@ -804,10 +804,14 @@ impl<'a> Compiler<'a> {
         };
         match expr {
             Expr::Path(p) if !p.partial => {
-                // A for-loop variable is a scalar, not a schema type reference.
                 if p.steps.len() == 1 {
                     if let ast::PathStep::Name(n) = &p.steps[0] {
+                        // For-loop variable is a scalar, not a schema type reference.
                         if self.for_vars.contains_key(n.as_str()) {
+                            return true;
+                        }
+                        // Scalar CTE (FreeSelect produces an empty type_name string).
+                        if self.cte_types.get(n.as_str()).map(|t| t.is_empty()).unwrap_or(false) {
                             return true;
                         }
                     }
@@ -864,6 +868,17 @@ impl<'a> Compiler<'a> {
                 let mut union_items = vec![];
                 self.collect_union_items(result_expr, &mut union_items)?;
                 union_items
+            }
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if self.cte_types.get(n.as_str()).map(|t| t.is_empty()).unwrap_or(false) {
+                        vec![IrFreeExpr::CtePassthrough(n.clone())]
+                    } else {
+                        vec![IrFreeExpr::Scalar(self.compile_free_expr(result_expr)?)]
+                    }
+                } else {
+                    vec![IrFreeExpr::Scalar(self.compile_free_expr(result_expr)?)]
+                }
             }
             Expr::Shape(s) if s.expr.is_none() => {
                 let fields = s
@@ -1071,13 +1086,17 @@ impl<'a> Compiler<'a> {
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
             other => other,
         };
-        let (type_name, shape_elements, inner_stmt) =
+        let (type_name, shape_elements, inner_stmt, cte_name) =
             self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
+        let table = match cte_name {
+            Some(ref cte) => format!("@cte:{}", cte),
+            None => td.table.clone(),
+        };
         let source = IrSource {
             type_name: format!("{}::{}", td.module, td.name),
-            table: td.table.clone(),
+            table,
             alias: alias.clone(),
         };
 
@@ -1116,20 +1135,36 @@ impl<'a> Compiler<'a> {
     }
 
     /// Unwrap `Shape(expr, elements)` or bare `Path` from a SELECT result.
-    /// Returns (type_name, shape_elements, optional_inner_stmt).
+    /// Returns (type_name, shape_elements, optional_inner_stmt, optional_cte_name).
     /// The inner stmt is Some when the subject is `(INSERT …)` / `(SELECT …)` etc.
+    /// The cte_name is Some when the subject is a WITH-block CTE reference.
     fn extract_type_and_shape<'e>(
         &self,
         expr: &'e Expr,
-    ) -> Result<(String, &'e [ShapeElement], Option<&'e Stmt>), PyQLError> {
+    ) -> Result<(String, &'e [ShapeElement], Option<&'e Stmt>, Option<String>), PyQLError> {
         match expr {
             Expr::Shape(s) => {
                 // s.expr is Option<Expr> (not Box), so use as_ref() not as_deref()
-                let (type_name, inner) = match s.expr.as_ref() {
+                let (type_name, cte_name, inner) = match s.expr.as_ref() {
                     Some(Expr::SubQuery(stmt)) => {
-                        (self.dml_subject_type(stmt)?, Some(stmt.as_ref()))
+                        (self.dml_subject_type(stmt)?, None, Some(stmt.as_ref()))
                     }
-                    Some(inner) => (self.expr_as_type_name(inner)?, None),
+                    Some(Expr::Path(p)) if !p.partial && p.steps.len() == 1 => {
+                        if let ast::PathStep::Name(n) = &p.steps[0] {
+                            if let Some(t) = self.cte_types.get(n.as_str()) {
+                                if !t.is_empty() {
+                                    (t.clone(), Some(n.clone()), None)
+                                } else {
+                                    (self.expr_as_type_name(s.expr.as_ref().unwrap())?, None, None)
+                                }
+                            } else {
+                                (self.expr_as_type_name(s.expr.as_ref().unwrap())?, None, None)
+                            }
+                        } else {
+                            (self.expr_as_type_name(s.expr.as_ref().unwrap())?, None, None)
+                        }
+                    }
+                    Some(inner) => (self.expr_as_type_name(inner)?, None, None),
                     None => {
                         return Err(PyQLError::Type(PyQLTypeError {
                             message: "shape without subject expression".into(),
@@ -1137,13 +1172,24 @@ impl<'a> Compiler<'a> {
                         }))
                     }
                 };
-                Ok((type_name, &s.elements, inner))
+                Ok((type_name, &s.elements, inner, cte_name))
             }
             // Bare `SELECT (DML)` without an outer shape
             Expr::SubQuery(stmt) => {
-                Ok((self.dml_subject_type(stmt)?, &[], Some(stmt.as_ref())))
+                Ok((self.dml_subject_type(stmt)?, &[], Some(stmt.as_ref()), None))
             }
-            _ => Ok((self.expr_as_type_name(expr)?, &[], None)),
+            // Bare CTE object reference: `select cte_name`
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if let Some(t) = self.cte_types.get(n.as_str()) {
+                        if !t.is_empty() {
+                            return Ok((t.clone(), &[], None, Some(n.clone())));
+                        }
+                    }
+                }
+                Ok((self.expr_as_type_name(expr)?, &[], None, None))
+            }
+            _ => Ok((self.expr_as_type_name(expr)?, &[], None, None)),
         }
     }
 
@@ -1200,7 +1246,7 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 // SELECT-over-SELECT: get the type from the inner select's result
-                let (type_name, _, _) = self.extract_type_and_shape(&sel.result)?;
+                let (type_name, _, _, _) = self.extract_type_and_shape(&sel.result)?;
                 Ok(type_name)
             }
         }
