@@ -2103,6 +2103,16 @@ impl<'a> Compiler<'a> {
             }))
             .collect();
 
+        for cd in &td.computed.clone() {
+            let expr_ast = crate::parse::parse_expr(&cd.expression)
+                .map_err(|e| PyQLError::Syntax(e))?;
+            let ir = self.compile_expr(&expr_ast, td, alias)?;
+            fields.push(IrShapeField::Computed(IrComputedField {
+                alias: cd.name.clone(),
+                expr: ir,
+            }));
+        }
+
         if matches!(splat, ast::Splat::Deep) {
             for l in &td.links {
                 let target_td = self.resolve_type(&l.target)?;
@@ -2527,6 +2537,17 @@ impl<'a> Compiler<'a> {
         // Multi-link
         if Self::resolve_multilink(td, field_name).is_some() {
             return self.compile_multilink_field(field_name, field_name, td, alias, module, el);
+        }
+
+        // Schema-defined computed field
+        if let Some(cd) = td.computed.iter().find(|c| c.name == field_name) {
+            let expr_ast = crate::parse::parse_expr(&cd.expression)
+                .map_err(|e| PyQLError::Syntax(e))?;
+            let ir = self.compile_expr(&expr_ast, td, alias)?;
+            return Ok(IrShapeField::Computed(IrComputedField {
+                alias: field_name.to_string(),
+                expr: ir,
+            }));
         }
 
         Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
