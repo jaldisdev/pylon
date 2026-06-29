@@ -1058,6 +1058,12 @@ fn shape_node_to_py<'py>(
             d.set_item("position", position)?;
             d.set_item("type_name", type_name.as_deref())?;
         }
+        ShapeNode::Enum { name, position, enum_type } => {
+            d.set_item("kind", "enum")?;
+            d.set_item("name", name.as_str())?;
+            d.set_item("position", position)?;
+            d.set_item("enum_type", enum_type.as_str())?;
+        }
     }
     Ok(d.into_any())
 }

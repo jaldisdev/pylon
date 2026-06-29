@@ -49,6 +49,13 @@ pub enum ShapeNode {
         position: usize,
         type_name: Option<String>,
     },
+    /// Enum value arrived as text; hydrated to the Python enum class keyed by `enum_type`.
+    Enum {
+        name: String,
+        position: usize,
+        /// Pylon-qualified name, e.g. `default::Gender`.
+        enum_type: String,
+    },
 }
 
 /// Opaque handle to the output shape of a compiled query.
