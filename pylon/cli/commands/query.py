@@ -159,6 +159,12 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True) -> No
         click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
+    # Named tuple: (x := val, y := val)
+    if shape_kind == "named_tuple":
+        items = [_format_named_tuple(obj) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
+        return
+
     # Schema object or free object
     # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
     selected = {
@@ -269,6 +275,9 @@ def _value(v: object) -> str:
         inner = ", ".join(_value(item) for item in v)
         return f"{_brace('[')}{inner}{_brace(']')}"
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        from pylon.schema._named_tuples import NamedTuple as PylonNamedTuple
+        if isinstance(v, PylonNamedTuple):
+            return _format_named_tuple(v)
         qname = vars(v).get("__pylon_type__") or type(v).__name__
         pairs = ", ".join(
             f"{_key(k)}: {_value(val)}"
@@ -280,6 +289,24 @@ def _value(v: object) -> str:
         pairs = ", ".join(f"{_key(k)}: {_value(val)}" for k, val in v.items())
         return f"{_brace('{')}{pairs}{_brace('}')}"
     return str(v)
+
+
+def _format_named_tuple(v: object) -> str:
+    """Display a named tuple as default::Point (x := val, y := val)."""
+    if v is None:
+        return f"{_brace('{')}{_brace('}')}"
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        mod = getattr(type(v), "__pylon_module__", None)
+        qname = f"{mod}::{type(v).__name__}" if mod else type(v).__name__
+        fields = {k: val for k, val in vars(v).items() if not k.startswith("__pylon_")}
+    elif isinstance(v, dict):
+        qname = ""
+        fields = v
+    else:
+        return str(v)
+    prefix = f"{_type(qname)} " if qname else ""
+    pairs = ", ".join(f"{_key(k)} := {_value(val)}" for k, val in fields.items())
+    return f"{prefix}({pairs})"
 
 
 def _is_uuid(s: str) -> bool:

@@ -168,7 +168,8 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
         let default = p.default_sql.as_deref()
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        lines.push(format!("    {} {}{}{}", qi(&p.name), p.pg_type, not_null, default));
+        let col_type = p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type);
+        lines.push(format!("    {} {}{}{}", qi(&p.name), col_type, not_null, default));
     }
 
     // Link columns — uuid stubs; FK constraints added in phase 5

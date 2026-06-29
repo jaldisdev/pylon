@@ -407,6 +407,13 @@ def _to_pg_type(scalar_type: Any) -> str:
             return PG_TYPE_MAP.get(base, "text")
         return "text"
 
+    # Named tuple type → jsonb with type marker
+    from ._named_tuples import NamedTuple as PylonNamedTuple
+    if isinstance(scalar_type, type) and issubclass(scalar_type, PylonNamedTuple):
+        mod = getattr(scalar_type, "__pylon_module__", None) or \
+            (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+        return f"__nt__:{mod}::{scalar_type.__name__}"
+
     # Enum type → schema-qualified PostgreSQL ENUM type reference
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonEnum):
         mod = getattr(scalar_type, "__pylon_module__", None) or \

@@ -43,6 +43,12 @@ pub enum ShapeNode {
         position: usize,
         elements: Vec<ShapeNode>,
     },
+    /// Named tuple decoded from jsonb. When `type_name` is Some, hydrated to the registered class.
+    NamedTuple {
+        name: String,
+        position: usize,
+        type_name: Option<String>,
+    },
 }
 
 /// Opaque handle to the output shape of a compiled query.
