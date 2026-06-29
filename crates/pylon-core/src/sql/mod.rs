@@ -1321,6 +1321,10 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::ForVar { name } => format!("\"_for_{}\".\"v\"", name),
 
+        IrExpr::EnumLiteral { pg_type, variant } => {
+            format!("'{}'::{}", variant.replace('\'', "''"), pg_type)
+        }
+
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;
             let mut sql = if sel.shape.is_empty() {
