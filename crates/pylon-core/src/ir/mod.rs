@@ -375,6 +375,8 @@ pub enum IrExpr {
     /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
     /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
     ArrayFromSelect(Box<IrArraySource>),
+    /// An enum member access: `default::Gender.Female` → `'Female'::"default"."Gender"`.
+    EnumLiteral { pg_type: String, variant: String },
 }
 
 #[derive(Debug, Clone)]

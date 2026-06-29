@@ -170,6 +170,28 @@ impl<'a> Compiler<'a> {
             })
     }
 
+    fn resolve_enum(&self, name: &str) -> Option<&'a crate::schema::EnumDescriptor> {
+        self.schema.enums.iter().find(|e| {
+            e.name == name || format!("{}::{}", e.module, e.name) == name
+        })
+    }
+
+    fn compile_enum_access(&self, type_ref: &str, variant: &str) -> Result<IrExpr, PyQLError> {
+        let ed = self.resolve_enum(type_ref).ok_or_else(|| {
+            self.type_err(&format!("unknown type '{}'", type_ref))
+        })?;
+        if !ed.members.iter().any(|m| m == variant) {
+            return Err(self.type_err(&format!(
+                "enum '{}::{}' has no member '{}'",
+                ed.module, ed.name, variant
+            )));
+        }
+        Ok(IrExpr::EnumLiteral {
+            pg_type: format!("\"{}\".\"{}\"", ed.module, ed.name),
+            variant: variant.to_string(),
+        })
+    }
+
     fn find_poly_implementors(&self, iface_qname: &str) -> Vec<IrPolyImplementor> {
         self.schema.types.iter()
             .filter(|t| !t.abstract_ && t.interfaces.iter().any(|i| i == iface_qname))
@@ -218,6 +240,20 @@ impl<'a> Compiler<'a> {
                 }
                 // Path traversal: `select TypeName.link.prop` or `select TypeName.link { shape }`.
                 if let Expr::Path(p) = result {
+                    if !p.partial && p.steps.len() == 2 {
+                        if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
+                            if self.resolve_enum(type_ref).is_some() {
+                                let expr = self.compile_enum_access(type_ref, variant)?;
+                                return Ok(IrStmt::FreeSelect(IrFreeSelect {
+                                    items: vec![IrFreeExpr::Scalar(expr)],
+                                    order_by: vec![],
+                                    offset: None,
+                                    limit: None,
+                                    distinct,
+                                }));
+                            }
+                        }
+                    }
                     if !p.partial && p.steps.len() > 1 {
                         return self.compile_path_select(s, p, &[], distinct).map(IrStmt::PathSelect);
                     }
@@ -1288,6 +1324,16 @@ impl<'a> Compiler<'a> {
                 "property reference (.field) is not valid in free SELECT; \
                  use a schema-bound SELECT instead",
             )),
+
+            // Enum member access in free context: `default::Gender.Female`
+            Expr::Path(p) if !p.partial && p.steps.len() == 2 => {
+                if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
+                    if self.resolve_enum(type_ref).is_some() {
+                        return self.compile_enum_access(type_ref, variant);
+                    }
+                }
+                Err(self.type_err("expression is not valid in free SELECT context"))
+            }
 
             // CTE name or for-loop variable used as a value in free context
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
@@ -2615,6 +2661,14 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
+            // Enum member access: `default::Gender.Female`
+            if p.steps.len() == 2 {
+                if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
+                    if self.resolve_enum(type_ref).is_some() {
+                        return self.compile_enum_access(type_ref, variant);
+                    }
+                }
+            }
             return Err(PyQLError::Type(PyQLTypeError {
                 message: "absolute paths are not valid in expression context; use .field".into(),
                 position: Position { line: 0, col: 0 },
@@ -3647,6 +3701,7 @@ fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             IrLiteral::Float(_) => "__float_literal",
             IrLiteral::Bool(_) => "boolean",
         }),
+        IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
         _ => None,
     }
 }
