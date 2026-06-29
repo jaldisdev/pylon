@@ -2938,6 +2938,13 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        // Schema-defined computed field: inline the expression in place.
+        if let Some(cd) = td.computed.iter().find(|c| c.name == field_name) {
+            let expr_ast = crate::parse::parse_expr(&cd.expression)
+                .map_err(|e| PyQLError::Syntax(e))?;
+            return self.compile_expr(&expr_ast, td, alias);
+        }
+
         Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
     }
 
