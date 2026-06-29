@@ -660,7 +660,15 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 let shape = ShapeNode::NamedTuple { name: String::new(), position: 0, type_name };
                 (expr, shape)
             } else {
-                let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
+                // Schema-qualified types (enums, domains) have unknown OIDs inside ROW() —
+                // cast to text so asyncpg's anonymous_record_decode can handle them.
+                let is_custom = matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with('"'));
+                let inner = if is_custom {
+                    format!("{}::text", emit_expr(ir_expr))
+                } else {
+                    emit_expr(ir_expr)
+                };
+                let expr = format!("ROW({}) AS result", inner);
                 let shape = ShapeNode::Scalar { name: String::new(), position: 0 };
                 (expr, shape)
             }
