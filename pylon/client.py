@@ -300,6 +300,16 @@ class Client:
     # Query interface
     # ------------------------------------------------------------------
 
+    def with_globals(self, globals_: dict[str, Any]) -> "ClientWithGlobals":
+        """Return a thin wrapper that injects *globals_* into every query.
+
+        Usage::
+
+            authed = client.with_globals({"default::current_user_id": user_id})
+            posts = await authed.query("select Post { title }")
+        """
+        return ClientWithGlobals(self, globals_)
+
     async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
@@ -489,6 +499,73 @@ def create_async_client(config: Config | None = None) -> Client:
 
 
 # ---------------------------------------------------------------------------
+# ClientWithGlobals — thin globals-injecting wrapper
+# ---------------------------------------------------------------------------
+
+
+class ClientWithGlobals:
+    """Wraps a :class:`Client` and injects a fixed globals dict into every query.
+
+    Obtain via :meth:`Client.with_globals`.  Globals are keyed by their
+    qualified name (``"module::name"``).
+    """
+
+    def __init__(self, client: Client, globals_: dict[str, Any]) -> None:
+        self._client = client
+        self._globals = globals_
+
+    def with_globals(self, globals_: dict[str, Any]) -> "ClientWithGlobals":
+        """Return a new wrapper with the given globals merged on top."""
+        return ClientWithGlobals(self._client, {**self._globals, **globals_})
+
+    def _require_pool(self) -> Any:
+        return self._client._require_pool()
+
+    async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
+        pool = self._require_pool()
+        sql, params, compiled = _transpile(pyql, kwargs, self._globals)
+        async with pool.acquire() as conn:
+            records = list(await conn.fetch(sql, *params))
+        return _hydrate(records, compiled)
+
+    async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
+        pool = self._require_pool()
+        sql, params, compiled = _transpile(pyql, kwargs, self._globals)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        if len(rows) > 1:
+            raise ResultCardinalityError(
+                f"query_single expected at most one result, got {len(rows)}."
+            )
+        if not rows:
+            return None
+        return _hydrate(list(rows), compiled)[0]
+
+    async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
+        result = await self.query_single(pyql, **kwargs)
+        if result is None:
+            raise NoDataError("query_required_single returned an empty result set.")
+        return result
+
+    async def execute(self, pyql: str, **kwargs: Any) -> None:
+        pool = self._require_pool()
+        sql, params, _ = _transpile(pyql, kwargs, self._globals)
+        async with pool.acquire() as conn:
+            await conn.execute(sql, *params)
+
+    async def query_json(self, pyql: str, **kwargs: Any) -> str:
+        pool = self._require_pool()
+        sql, params, _ = _transpile(pyql, kwargs, self._globals)
+        async with pool.acquire() as conn:
+            return (
+                await conn.fetchval(
+                    f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
+                )
+                or "[]"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -589,12 +666,15 @@ async def _setup_codecs(conn: asyncpg.Connection) -> None:
 
 
 def _transpile(
-    pyql: str, kwargs: dict[str, Any]
+    pyql: str,
+    kwargs: dict[str, Any],
+    globals_: dict[str, Any] | None = None,
 ) -> tuple[str, list[Any], "CompiledQuery"]:
     """Compile PyQL to SQL via the pylon-core Rust extension.
 
     Returns ``(sql, positional_params, compiled)`` ready for asyncpg.
-    The Rust compiler's ``param_names`` determines the $1/$2/… binding order.
+    ``param_names`` entries prefixed with ``__global__`` are filled from
+    ``globals_``; all others from ``kwargs``.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
@@ -607,7 +687,13 @@ def _transpile(
             f"PyQL compiler is not yet available: {exc}"
         ) from exc
     try:
-        params = [kwargs[n] for n in compiled.param_names]
+        params: list[Any] = []
+        for name in compiled.param_names:
+            if name.startswith("__global__"):
+                qname = name[len("__global__"):]
+                params.append((globals_ or {}).get(qname))
+            else:
+                params.append(kwargs[name])
     except KeyError as exc:
         raise InterfaceError(f"Missing query parameter: {exc}") from exc
     return compiled.sql, params, compiled

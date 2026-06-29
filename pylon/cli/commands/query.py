@@ -3,6 +3,7 @@ import dataclasses
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 import click
 from prompt_toolkit import PromptSession
@@ -14,6 +15,12 @@ import pylon
 from pylon.client import create_async_client
 
 from ..banner import print_banner
+
+# Regex that matches `set global name := expression` (case-insensitive SET/GLOBAL)
+_SET_GLOBAL_RE = re.compile(
+    r"^set\s+global\s+([\w:]+)\s*:=\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # --- colours ------------------------------------------------------------------
 
@@ -91,6 +98,9 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
         history=FileHistory(str(_history_path(project_name))),
     )
 
+    # Session globals: qualified_name → value (e.g. "default::current_user_id" → uuid)
+    _session_globals: dict[str, Any] = {}
+
     async with create_async_client() as client:
         while True:
             try:
@@ -112,13 +122,52 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
                 continue
 
             pyql = stripped.rstrip(";").strip()
-            if pyql:
-                await _execute(client, pyql, as_json=as_json)
+            if not pyql:
+                continue
+
+            # Intercept `set global name := expression`
+            m = _SET_GLOBAL_RE.match(pyql)
+            if m:
+                await _handle_set_global(client, m.group(1), m.group(2).strip(), _session_globals)
+                continue
+
+            await _execute(client, pyql, as_json=as_json, globals_=_session_globals)
 
 
-async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True) -> None:
+async def _handle_set_global(
+    client: Any,
+    name: str,
+    expression: str,
+    session_globals: dict[str, Any],
+) -> None:
+    """Evaluate `expression` via `select <expr>` and store in session_globals."""
+    from pylon.query import _get_schema
+
+    # Resolve unqualified name to module::name using schema globals
+    try:
+        schema = _get_schema()
+        gs = {g["name"]: g["qualified_name"] for g in schema.globals()}
+        qualified = gs.get(name) or (name if "::" in name else None)
+        if qualified is None:
+            click.echo(f"{_BOLD_RED}error:{_RESET} unknown global {name!r}")
+            return
+    except Exception:
+        qualified = name if "::" in name else f"default::{name}"
+
+    try:
+        results = await client.query(f"select {expression}")
+    except Exception as e:
+        click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
+        return
+
+    value = results[0] if results else None
+    session_globals[qualified] = value
+    click.echo(f"{_INFO_COLOR}OK — {qualified} = {_value(value)}{_RESET}")
+
+
+async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globals_: dict[str, Any] | None = None) -> None:
     """Transpile and execute a single PyQL statement, printing the result."""
-    from pylon.query import compile as pyql_compile
+    from pylon.client import _transpile, _hydrate
 
     if as_json:
         try:
@@ -128,8 +177,10 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True) -> No
         return
 
     try:
-        compiled = pyql_compile(pyql)
-        results = await client.query(pyql)
+        sql, params, compiled = _transpile(pyql, {}, globals_)
+        async with client._require_pool().acquire() as conn:
+            records = list(await conn.fetch(sql, *params))
+        results = _hydrate(records, compiled)
     except Exception as e:
         click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
         return

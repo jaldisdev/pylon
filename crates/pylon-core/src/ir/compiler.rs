@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use super::{
     IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrIfElse, IrInsert, IrLiteral,
+    IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrGlobalCte, IrComputedGlobalCte,
+    IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
@@ -42,7 +43,7 @@ pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLE
         (vec![], c.compile_stmt(stmt)?)
     };
 
-    Ok(IrOutput { stmt: ir, params: c.params, ctes })
+    Ok(IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes })
 }
 
 fn cte_stmt_type(stmt: &IrStmt) -> String {
@@ -109,6 +110,8 @@ struct Compiler<'a> {
     cte_types: HashMap<String, String>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
+    /// Global CTEs collected during compilation (session and computed), in dependency order.
+    global_ctes: Vec<IrGlobalCte>,
 }
 
 impl<'a> Compiler<'a> {
@@ -119,6 +122,7 @@ impl<'a> Compiler<'a> {
             alias_counter: 0,
             cte_types: HashMap::new(),
             for_vars: HashMap::new(),
+            global_ctes: vec![],
         }
     }
 
@@ -150,6 +154,155 @@ impl<'a> Compiler<'a> {
         let i = self.params.len();
         self.params.push(name.to_string());
         i
+    }
+
+    // ── Global variable resolution ────────────────────────────────────────────────
+
+    fn resolve_global_pg_type(&self, scalar_type: &str) -> String {
+        let builtin = match scalar_type {
+            "Str"           => Some("text"),
+            "Int16"         => Some("int2"),
+            "Int32"         => Some("int4"),
+            "Int64"         => Some("int8"),
+            "Float32"       => Some("float4"),
+            "Float64"       => Some("float8"),
+            "Decimal"       => Some("numeric"),
+            "Bool"          => Some("boolean"),
+            "DateTime"      => Some("timestamptz"),
+            "LocalDateTime" => Some("timestamp"),
+            "LocalDate"     => Some("date"),
+            "LocalTime"     => Some("time"),
+            "UUID"          => Some("uuid"),
+            "Bytes"         => Some("bytea"),
+            "Json"          => Some("jsonb"),
+            "Duration"      => Some("interval"),
+            _               => None,
+        };
+        if let Some(t) = builtin {
+            return t.to_string();
+        }
+        // Fall back to custom scalar lookup
+        self.schema.scalars.iter()
+            .find(|s| s.name.split("::").last() == Some(scalar_type) || s.name == scalar_type)
+            .map(|s| s.pg_type.clone())
+            .unwrap_or_else(|| "text".to_string())
+    }
+
+    /// When `global name` (or `global name { shape }`) appears as the top-level
+    /// SELECT subject, inline the computed expression rather than going through a
+    /// CTE — this returns a full object, not just its id.
+    fn try_compile_global_select(
+        &mut self,
+        outer: &ast::SelectStmt,
+        result: &Expr,
+        distinct: bool,
+    ) -> Result<Option<IrStmt>, PyQLError> {
+        let (global_name, shape_elements): (&str, &[ast::ShapeElement]) = match result {
+            Expr::Global(name) => (name.as_str(), &[]),
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::Global(name)) => (name.as_str(), sh.elements.as_slice()),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let global = self.schema.globals.iter().find(|g| {
+            g.name == global_name || format!("{}::{}", g.module, g.name) == global_name
+        });
+        let global = match global {
+            Some(g) => g.clone(),
+            None => return Ok(None),
+        };
+        let computed_expr = match global.computed_expr {
+            Some(e) => e,
+            None => return Ok(None), // scalar session global — fall through
+        };
+
+        let inner_ast = crate::parse::parse(&computed_expr)?;
+        let inner_sel = match inner_ast {
+            Stmt::Select(sel) => sel,
+            _ => return Ok(None),
+        };
+
+        let merged_result = if shape_elements.is_empty() {
+            inner_sel.result.clone()
+        } else {
+            Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: Some(inner_sel.result.clone()),
+                elements: shape_elements.to_vec(),
+            }))
+        };
+
+        let merged_filter = match (&inner_sel.filter, &outer.filter) {
+            (Some(a), Some(b)) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                left: a.clone(),
+                op: ast::BinOpKind::And,
+                right: b.clone(),
+            }))),
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b.clone(),
+        };
+
+        let merged = ast::SelectStmt {
+            result: merged_result,
+            filter: merged_filter,
+            order_by: if outer.order_by.is_empty() {
+                inner_sel.order_by.clone()
+            } else {
+                outer.order_by.clone()
+            },
+            offset: outer.offset.clone().or(inner_sel.offset.clone()),
+            limit: outer.limit.clone().or(inner_sel.limit.clone()),
+        };
+
+        let ir = self.compile_stmt(&Stmt::Select(merged))?;
+        Ok(Some(ir))
+    }
+
+    fn compile_global(&mut self, raw_name: &str) -> Result<IrExpr, PyQLError> {
+        let global = self.schema.globals.iter().find(|g| {
+            g.name == raw_name || format!("{}::{}", g.module, g.name) == raw_name
+        });
+        let global = global.ok_or_else(|| {
+            PyQLError::Resolution(PyQLResolutionError::UnknownField(PyQLUnknownFieldError {
+                message: format!("unknown global: {:?}", raw_name),
+                position: Position { line: 0, col: 0 },
+            }))
+        })?.clone();
+
+        let qualified = format!("{}::{}", global.module, global.name);
+        let cte_name = format!("__global__{}", qualified);
+
+        if let Some(computed_expr) = global.computed_expr {
+            // Computed global — check for duplicate before compiling
+            if self.global_ctes.iter().any(|g| g.cte_name() == cte_name) {
+                return Ok(IrExpr::GlobalRef { cte_name });
+            }
+            // Recursively compile the PyQL expression (shares params and global_ctes)
+            let inner_ast = crate::parse::parse(&computed_expr)?;
+            let inner_stmt = self.compile_stmt(&inner_ast)?;
+            self.global_ctes.push(IrGlobalCte::Computed(IrComputedGlobalCte {
+                cte_name: cte_name.clone(),
+                qualified_name: qualified,
+                stmt: inner_stmt,
+            }));
+            Ok(IrExpr::GlobalRef { cte_name })
+        } else {
+            // Session global — allocate parameter slot
+            let pg_type = self.resolve_global_pg_type(&global.scalar_type);
+            let param_name = format!("__global__{}", qualified);
+            let index = self.param_index(&param_name);
+            // Register CTE only once
+            if !self.global_ctes.iter().any(|g| g.cte_name() == cte_name) {
+                self.global_ctes.push(IrGlobalCte::Session(IrSessionGlobalCte {
+                    cte_name: cte_name,
+                    qualified_name: qualified,
+                    param_index: index,
+                    pg_type: pg_type.clone(),
+                }));
+            }
+            Ok(IrExpr::GlobalParam { index, pg_type })
+        }
     }
 
     // ── Schema lookups ────────────────────────────────────────────────────────────
@@ -231,6 +384,11 @@ impl<'a> Compiler<'a> {
                         (true, &u.operand),
                     other => (false, other),
                 };
+
+                // `select global name [{ shape }]` — inline the computed expression.
+                if let Some(ir) = self.try_compile_global_select(s, result, distinct)? {
+                    return Ok(ir);
+                }
 
                 // <Module::Type>expr — schema object lookup by id.
                 if let Expr::TypeCast(tc) = result {
@@ -1222,6 +1380,8 @@ impl<'a> Compiler<'a> {
                 let index = self.param_index(name);
                 Ok(IrExpr::Param { index })
             }
+
+            Expr::Global(name) => self.compile_global(name),
 
             Expr::FunctionCall(f) => {
                 // assert_single with SubQuery arg → _pylon.assert_single(ARRAY(subquery))
@@ -2508,6 +2668,8 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::Param { index })
             }
 
+            Expr::Global(name) => self.compile_global(name),
+
             Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
                 Literal::Str(s) => IrLiteral::Str(s.clone()),
                 Literal::Int(n) => IrLiteral::Int(*n),
@@ -3726,6 +3888,7 @@ fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         }),
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::NamedTuple(_) => Some("jsonb"),
+        IrExpr::GlobalParam { pg_type, .. } => Some(pg_type.as_str()),
         _ => None,
     }
 }

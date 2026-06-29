@@ -379,6 +379,10 @@ pub enum IrExpr {
     EnumLiteral { pg_type: String, variant: String },
     /// Named tuple construction: `(x := 1.0, y := 2.0)` → `jsonb_build_object('x', 1.0, 'y', 2.0)`.
     NamedTuple(Vec<(String, IrExpr)>),
+    /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.
+    GlobalParam { index: usize, pg_type: String },
+    /// Computed global reference: emits `(SELECT "value" FROM "cte_name")`.
+    GlobalRef { cte_name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -466,15 +470,50 @@ pub struct IrCteDef {
     pub type_name: String,
 }
 
+/// A session global CTE: `WITH "cte_name" AS (SELECT $N::pg_type AS "value")`.
+#[derive(Debug, Clone)]
+pub struct IrSessionGlobalCte {
+    pub cte_name: String,
+    pub qualified_name: String,
+    pub param_index: usize,
+    pub pg_type: String,
+}
+
+/// A computed global CTE: `WITH "cte_name" AS (<compiled stmt returning "value" column>)`.
+#[derive(Debug, Clone)]
+pub struct IrComputedGlobalCte {
+    pub cte_name: String,
+    pub qualified_name: String,
+    pub stmt: IrStmt,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrGlobalCte {
+    Session(IrSessionGlobalCte),
+    Computed(IrComputedGlobalCte),
+}
+
+impl IrGlobalCte {
+    pub fn cte_name(&self) -> &str {
+        match self {
+            Self::Session(s) => &s.cte_name,
+            Self::Computed(c) => &c.cte_name,
+        }
+    }
+}
+
 /// The result of the IR compilation step.
 /// Carries the query plan and the ordered list of named parameters, which the
 /// SQL emitter uses to emit `$1 … $N` and the client uses to bind values.
 pub struct IrOutput {
     pub stmt: IrStmt,
     /// Ordered parameter names, positionally matching `$1`, `$2`, … in the SQL.
+    /// Global params use the `__global__module::name` prefix; user params use bare names.
     pub params: Vec<String>,
     /// User-defined CTE bindings from a WITH block, in declaration order.
     pub ctes: Vec<IrCteDef>,
+    /// Global variable CTEs (session-injected or computed), in dependency order.
+    pub global_ctes: Vec<IrGlobalCte>,
 }
 
 #[cfg(test)]

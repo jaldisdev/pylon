@@ -24,33 +24,41 @@ def _unwrap_optional(annotation: Any) -> tuple[bool, Any]:
 
 
 class GlobalAnnotation:
-    __slots__ = ("scalar_type", "required")
+    __slots__ = ("scalar_type", "required", "computed_expr")
 
-    def __init__(self, scalar_type: Any, required: bool) -> None:
+    def __init__(self, scalar_type: Any, required: bool, computed_expr: str | None = None) -> None:
         self.scalar_type = scalar_type
         self.required = required
+        self.computed_expr = computed_expr
 
     def __repr__(self) -> str:
         return f"GlobalAnnotation({self.scalar_type!r}, required={self.required})"
 
 
 class Global:
-    """Session-scoped global variable annotation.
+    """Global variable annotation for schema modules.
 
-    Declared at module level in schema files. The module it lives in determines
-    the PyQL namespace prefix — a global in ``schema/user.py`` is referenced as
-    ``user::current_user_id`` in queries; globals in the ``default`` module need
-    no prefix.
+    Session globals are injected per-request via ``client.with_globals({})``.
+    Computed globals are defined with a PyQL expression and evaluated at query time.
 
     Usage::
 
-        current_user_id: Global[pylon.UUID]               # required
-        current_user_id: Global[pylon.UUID | None]         # optional
-        current_tenant_id: Global[pylon.UUID | None] = some_uuid  # with default
+        current_user_id: Global[pylon.UUID]               # required session global
+        current_user_id: Global[pylon.UUID | None]         # optional session global
+        current_user: Global[pylon.UUID | None, 'select User.id filter User.email = global current_user_email']
     """
 
     @classmethod
     def __class_getitem__(cls, params: Any) -> GlobalAnnotation:
+        if isinstance(params, tuple) and len(params) == 2:
+            type_param, expr = params
+            if not isinstance(expr, str):
+                raise TypeError(
+                    f"Global computed expression must be a string literal, "
+                    f"got {type(expr).__name__!r}"
+                )
+            nullable, scalar_type = _unwrap_optional(type_param)
+            return GlobalAnnotation(scalar_type=scalar_type, required=not nullable, computed_expr=expr)
         nullable, scalar_type = _unwrap_optional(params)
         return GlobalAnnotation(scalar_type=scalar_type, required=not nullable)
 
@@ -64,6 +72,7 @@ class GlobalDescriptor:
     scalar_type: Any  # pylon scalar class, e.g. pylon.UUID, or raw Python type
     required: bool
     default: Any = dataclasses.field(default_factory=lambda: dataclasses.MISSING)
+    computed_expr: str | None = None
 
     def __repr__(self) -> str:
         default_part = "" if self.default is MISSING else f", default={self.default!r}"
@@ -108,6 +117,7 @@ def collect_module_globals(module: Any) -> list[GlobalDescriptor]:
                 scalar_type=annotation.scalar_type,
                 required=annotation.required,
                 default=default,
+                computed_expr=annotation.computed_expr,
             )
         )
     return result

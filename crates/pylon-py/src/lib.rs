@@ -817,13 +817,14 @@ pub struct GlobalDescriptor {
 #[pymethods]
 impl GlobalDescriptor {
     #[new]
-    #[pyo3(signature = (name, module, scalar_type, required, *, default_expr = None))]
+    #[pyo3(signature = (name, module, scalar_type, required, *, default_expr = None, computed_expr = None))]
     fn new(
         name: String,
         module: String,
         scalar_type: String,
         required: bool,
         default_expr: Option<String>,
+        computed_expr: Option<String>,
     ) -> Self {
         Self {
             inner: core::schema::GlobalDescriptor {
@@ -832,6 +833,7 @@ impl GlobalDescriptor {
                 scalar_type,
                 required,
                 default_expr,
+                computed_expr,
             },
         }
     }
@@ -859,6 +861,11 @@ impl GlobalDescriptor {
     #[getter]
     fn default_expr(&self) -> Option<&str> {
         self.inner.default_expr.as_deref()
+    }
+
+    #[getter]
+    fn computed_expr(&self) -> Option<&str> {
+        self.inner.computed_expr.as_deref()
     }
 }
 
@@ -923,6 +930,23 @@ impl SchemaDescriptor {
     #[getter]
     fn global_count(&self) -> usize {
         self.inner.globals.len()
+    }
+
+    /// Return global descriptors as a list of dicts for the REPL and client.
+    /// Each dict has keys: name, module, qualified_name, scalar_type, required, computed.
+    fn globals<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::{PyDict, PyList};
+        let items: Vec<_> = self.inner.globals.iter().map(|g| -> PyResult<_> {
+            let d = PyDict::new(py);
+            d.set_item("name", &g.name)?;
+            d.set_item("module", &g.module)?;
+            d.set_item("qualified_name", format!("{}::{}", g.module, g.name))?;
+            d.set_item("scalar_type", &g.scalar_type)?;
+            d.set_item("required", g.required)?;
+            d.set_item("computed", g.computed_expr.is_some())?;
+            Ok(d)
+        }).collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, items)?)
     }
 }
 

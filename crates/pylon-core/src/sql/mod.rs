@@ -1,9 +1,9 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation,
-    IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor,
-    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
-    IrUpdate,
+    IrGlobalCte, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
+    IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
+    IrPathSelect, IrPolyImplementor, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField,
+    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -13,12 +13,59 @@ pub struct SqlOutput {
     pub shape: ShapeDescriptor,
 }
 
+/// Emit the SQL body for a computed global CTE — a plain scalar query with a `value` column.
+fn emit_for_global_cte(stmt: &IrStmt) -> String {
+    match stmt {
+        IrStmt::FreeSelect(sel) => match sel.items.first() {
+            Some(IrFreeExpr::Scalar(e)) => format!("SELECT {} AS \"value\"", emit_expr(e)),
+            _ => "SELECT NULL AS \"value\"".to_string(),
+        },
+        IrStmt::PathSelect(sel) => {
+            let from_sql = emit_path_joins(&sel.root, &sel.joins);
+            let scalar_expr = match &sel.result {
+                IrPathResult::Scalar(e) => emit_expr(e),
+                IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
+            };
+            let mut sql = format!("SELECT {} AS \"value\"\nFROM {}", scalar_expr, from_sql);
+            append_filter(&mut sql, &sel.filter);
+            append_order_by(&mut sql, &sel.order_by);
+            append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+            sql
+        }
+        IrStmt::Select(sel) => {
+            let alias = &sel.source.alias;
+            let mut sql = format!(
+                "SELECT {}.\"id\" AS \"value\"\nFROM {} AS {}",
+                qi(alias),
+                source_ref(&sel.source),
+                qi(alias)
+            );
+            append_filter(&mut sql, &sel.filter);
+            sql
+        }
+        _ => "SELECT NULL AS \"value\"".to_string(),
+    }
+}
+
+fn emit_global_cte_parts(global_ctes: &[IrGlobalCte]) -> Vec<String> {
+    global_ctes.iter().map(|g| match g {
+        IrGlobalCte::Session(s) => format!(
+            "\"{}\" AS (SELECT ${}::{} AS \"value\")",
+            s.cte_name, s.param_index + 1, s.pg_type
+        ),
+        IrGlobalCte::Computed(c) => {
+            let body = emit_for_global_cte(&c.stmt);
+            format!("\"{}\" AS (\n{}\n)", c.cte_name, body)
+        }
+    }).collect()
+}
+
 pub fn emit(ir: &IrOutput) -> SqlOutput {
-    match &ir.stmt {
+    let mut out = match &ir.stmt {
         IrStmt::Update(upd) => emit_update_stmt(upd, &ir.ctes),
         IrStmt::For(f) => emit_for_stmt(f, &ir.ctes),
         stmt => {
-            let mut out = match stmt {
+            let mut o = match stmt {
                 IrStmt::Select(sel) => emit_select_stmt(sel),
                 IrStmt::FreeSelect(sel) => emit_free_select(sel),
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
@@ -28,11 +75,24 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
             };
             if !ir.ctes.is_empty() {
                 let prefix = emit_cte_prefix(&ir.ctes);
-                out.sql = format!("{}{}", prefix, out.sql);
+                o.sql = format!("{}{}", prefix, o.sql);
             }
-            out
+            o
+        }
+    };
+
+    // Prepend global CTEs — merged into the existing WITH clause if present.
+    if !ir.global_ctes.is_empty() {
+        let global_parts = emit_global_cte_parts(&ir.global_ctes);
+        let global_str = global_parts.join(",\n     ");
+        if out.sql.starts_with("WITH ") {
+            out.sql = format!("WITH {},\n     {}", global_str, &out.sql[5..]);
+        } else {
+            out.sql = format!("WITH {}\n{}", global_str, out.sql);
         }
     }
+
+    out
 }
 
 // ── Identifier / literal helpers ────────────────────────────────────────────
@@ -1358,6 +1418,14 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::EnumLiteral { pg_type, variant } => {
             format!("'{}'::{}", variant.replace('\'', "''"), pg_type)
+        }
+
+        IrExpr::GlobalParam { index, pg_type } => {
+            format!("(${}::{})", index + 1, pg_type)
+        }
+
+        IrExpr::GlobalRef { cte_name } => {
+            format!("(SELECT \"value\" FROM \"{}\")", cte_name)
         }
 
         IrExpr::NamedTuple(fields) => {
