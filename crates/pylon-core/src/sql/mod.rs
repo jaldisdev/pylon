@@ -662,15 +662,20 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
             } else {
                 // Schema-qualified types (enums, domains) have unknown OIDs inside ROW() —
                 // cast to text so asyncpg's anonymous_record_decode can handle them.
-                let is_custom = matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with('"'));
-                let inner = if is_custom {
-                    format!("{}::text", emit_expr(ir_expr))
+                if let IrExpr::ColumnRef { pg_type, .. } = ir_expr {
+                    if pg_type.starts_with('"') {
+                        let enum_type = pg_quoted_to_pylon(pg_type);
+                        let expr = format!("ROW({}::text) AS result", emit_expr(ir_expr));
+                        let shape = ShapeNode::Enum { name: String::new(), position: 0, enum_type };
+                        (expr, shape)
+                    } else {
+                        let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
+                        (expr, ShapeNode::Scalar { name: String::new(), position: 0 })
+                    }
                 } else {
-                    emit_expr(ir_expr)
-                };
-                let expr = format!("ROW({}) AS result", inner);
-                let shape = ShapeNode::Scalar { name: String::new(), position: 0 };
-                (expr, shape)
+                    let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
+                    (expr, ShapeNode::Scalar { name: String::new(), position: 0 })
+                }
             }
         }
         IrPathResult::Object { alias, type_name, shape } => {
@@ -1106,6 +1111,19 @@ fn build_shape(
     (exprs, nodes)
 }
 
+/// Convert a PostgreSQL schema-qualified type name (`"module"."TypeName"`) to
+/// a Pylon-qualified name (`module::TypeName`).
+fn pg_quoted_to_pylon(pg_type: &str) -> String {
+    let inner = pg_type.trim_start_matches('"');
+    if let Some(idx) = inner.find(r#""."#) {
+        let module = &inner[..idx];
+        let type_name = inner[idx + 3..].trim_end_matches('"');
+        format!("{}::{}", module, type_name)
+    } else {
+        pg_type.to_string()
+    }
+}
+
 fn emit_scalar(f: &IrScalarField, table_alias: &str, pos: usize) -> (String, ShapeNode) {
     if let Some(nt_name) = f.pg_type.strip_prefix("__nt__:") {
         let sql = if table_alias.is_empty() {
@@ -1121,11 +1139,19 @@ fn emit_scalar(f: &IrScalarField, table_alias: &str, pos: usize) -> (String, Sha
     }
     // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to asyncpg's
     // anonymous_record_decode. Cast to text — the string label is all the decoder needs.
-    let cast_type = if f.pg_type.starts_with('"') { "text" } else { f.pg_type.as_str() };
+    if f.pg_type.starts_with('"') {
+        let enum_type = pg_quoted_to_pylon(&f.pg_type);
+        let sql = if table_alias.is_empty() {
+            format!("{}::text", qi(&f.column))
+        } else {
+            format!("{}.{}::text", qi(table_alias), qi(&f.column))
+        };
+        return (sql, ShapeNode::Enum { name: f.alias.clone(), position: pos, enum_type });
+    }
     let sql = if table_alias.is_empty() {
-        format!("{}::{}", qi(&f.column), cast_type)
+        format!("{}::{}", qi(&f.column), f.pg_type)
     } else {
-        format!("{}.{}::{}", qi(table_alias), qi(&f.column), cast_type)
+        format!("{}.{}::{}", qi(table_alias), qi(&f.column), f.pg_type)
     };
     (sql, ShapeNode::Scalar { name: f.alias.clone(), position: pos })
 }

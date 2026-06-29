@@ -314,6 +314,9 @@ def _brace(s: str) -> str:
 
 
 def _value(v: object) -> str:
+    import enum as _enum_mod
+    if isinstance(v, _enum_mod.Enum):
+        return f"{_YELLOW}{v.name}{_RESET}"
     if isinstance(v, str):
         if _is_uuid(v):
             return f"{_YELLOW}{v}{_RESET}"

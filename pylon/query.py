@@ -86,6 +86,17 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
                 return cls(**raw)
         return raw
 
+    if kind == "enum":
+        raw = value[node["position"]]
+        if raw is None:
+            return None
+        enum_type = node["enum_type"]
+        short = enum_type.split("::")[-1]
+        cls = registry.get(enum_type) or registry.get(short)
+        if cls is not None:
+            return cls(raw)
+        return raw
+
     if kind == "array":
         arr = value[node["position"]] or []
         element = node["element"]
