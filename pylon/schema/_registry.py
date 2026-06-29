@@ -13,6 +13,7 @@ _lock = threading.Lock()
 _types: list[type] = []
 _enums: list[type] = []
 _custom_scalars: list[type] = []
+_named_tuples: list[type] = []
 
 
 def register_type(cls: type) -> None:
@@ -30,10 +31,21 @@ def register_scalar(cls: type) -> None:
         _custom_scalars.append(cls)
 
 
+def register_named_tuple(cls: type) -> None:
+    with _lock:
+        _named_tuples.append(cls)
+
+
 def snapshot() -> tuple[list[type], list[type], list[type]]:
     """Return (types, enums, custom_scalars) without clearing the registry."""
     with _lock:
         return list(_types), list(_enums), list(_custom_scalars)
+
+
+def named_tuples_snapshot() -> list[type]:
+    """Return registered named tuple classes."""
+    with _lock:
+        return list(_named_tuples)
 
 
 def clear() -> None:
@@ -42,3 +54,4 @@ def clear() -> None:
         _types.clear()
         _enums.clear()
         _custom_scalars.clear()
+        _named_tuples.clear()

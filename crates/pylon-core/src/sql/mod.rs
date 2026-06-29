@@ -367,6 +367,7 @@ fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
 fn is_raw_scalar(expr: &IrExpr) -> bool {
     matches!(expr, IrExpr::Array(_))
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
+        || matches!(expr, IrExpr::NamedTuple(_))
 }
 
 fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
@@ -456,6 +457,11 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match item {
         IrFreeExpr::Scalar(IrExpr::TypeCast(c)) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
+        IrFreeExpr::Scalar(IrExpr::NamedTuple(_)) => ShapeNode::NamedTuple {
+            name: String::new(),
+            position: 0,
+            type_name: None,
+        },
         IrFreeExpr::Scalar(e) if is_raw_scalar(e) => ShapeNode::RawScalar,
         IrFreeExpr::Scalar(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
         IrFreeExpr::FreeObject(fields) => ShapeNode::Object {
@@ -581,9 +587,23 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
 
     let (result_expr, shape_root) = match &sel.result {
         IrPathResult::Scalar(ir_expr) => {
-            let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
-            let shape = ShapeNode::Scalar { name: String::new(), position: 0 };
-            (expr, shape)
+            // Named tuples (jsonb) can't be decoded inside ROW() by asyncpg — emit raw.
+            let is_nt = matches!(ir_expr, IrExpr::NamedTuple(_))
+                || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"));
+            if is_nt {
+                let type_name = match ir_expr {
+                    IrExpr::ColumnRef { pg_type, .. } =>
+                        pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
+                    _ => None,
+                };
+                let expr = format!("{} AS result", emit_expr(ir_expr));
+                let shape = ShapeNode::NamedTuple { name: String::new(), position: 0, type_name };
+                (expr, shape)
+            } else {
+                let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
+                let shape = ShapeNode::Scalar { name: String::new(), position: 0 };
+                (expr, shape)
+            }
         }
         IrPathResult::Object { alias, type_name, shape } => {
             let (field_exprs, field_nodes) = build_shape(shape, alias);
@@ -1019,10 +1039,25 @@ fn build_shape(
 }
 
 fn emit_scalar(f: &IrScalarField, table_alias: &str, pos: usize) -> (String, ShapeNode) {
+    if let Some(nt_name) = f.pg_type.strip_prefix("__nt__:") {
+        let sql = if table_alias.is_empty() {
+            format!("{}::jsonb", qi(&f.column))
+        } else {
+            format!("{}.{}::jsonb", qi(table_alias), qi(&f.column))
+        };
+        return (sql, ShapeNode::NamedTuple {
+            name: f.alias.clone(),
+            position: pos,
+            type_name: Some(nt_name.to_string()),
+        });
+    }
+    // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to asyncpg's
+    // anonymous_record_decode. Cast to text — the string label is all the decoder needs.
+    let cast_type = if f.pg_type.starts_with('"') { "text" } else { f.pg_type.as_str() };
     let sql = if table_alias.is_empty() {
-        format!("{}::{}", qi(&f.column), f.pg_type)
+        format!("{}::{}", qi(&f.column), cast_type)
     } else {
-        format!("{}.{}::{}", qi(table_alias), qi(&f.column), f.pg_type)
+        format!("{}.{}::{}", qi(table_alias), qi(&f.column), cast_type)
     };
     (sql, ShapeNode::Scalar { name: f.alias.clone(), position: pos })
 }
@@ -1323,6 +1358,13 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::EnumLiteral { pg_type, variant } => {
             format!("'{}'::{}", variant.replace('\'', "''"), pg_type)
+        }
+
+        IrExpr::NamedTuple(fields) => {
+            let pairs: Vec<String> = fields.iter()
+                .flat_map(|(k, v)| [format!("'{}'", k.replace('\'', "''")), emit_expr(v)])
+                .collect();
+            format!("jsonb_build_object({})", pairs.join(", "))
         }
 
         IrExpr::Subquery(sel) => {

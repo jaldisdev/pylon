@@ -72,6 +72,20 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
                 return obj
         return kwargs
 
+    if kind == "named_tuple":
+        pos = node.get("position", 0)
+        # Root-level named tuples arrive as the raw decoded jsonb dict; nested ones
+        # sit at a positional index inside the parent composite row.
+        raw = value if (value is None or isinstance(value, dict)) else value[pos]
+        if raw is None:
+            return None
+        type_name = node.get("type_name")
+        if type_name and isinstance(raw, dict):
+            cls = registry.get(type_name)
+            if cls is not None:
+                return cls(**raw)
+        return raw
+
     if kind == "array":
         arr = value[node["position"]] or []
         element = node["element"]

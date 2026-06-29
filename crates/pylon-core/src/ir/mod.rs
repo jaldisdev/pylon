@@ -377,6 +377,8 @@ pub enum IrExpr {
     ArrayFromSelect(Box<IrArraySource>),
     /// An enum member access: `default::Gender.Female` → `'Female'::"default"."Gender"`.
     EnumLiteral { pg_type: String, variant: String },
+    /// Named tuple construction: `(x := 1.0, y := 2.0)` → `jsonb_build_object('x', 1.0, 'y', 2.0)`.
+    NamedTuple(Vec<(String, IrExpr)>),
 }
 
 #[derive(Debug, Clone)]

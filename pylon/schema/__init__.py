@@ -32,6 +32,9 @@ from ._decorators import (
 )
 from ._enums import Enum
 from ._enums import enum_decorator as enum
+from ._named_tuples import NamedTuple
+from ._named_tuples import named_tuple_decorator as named_tuple
+from ._registry import named_tuples_snapshot
 from ._fields import (
     Allow,
     Computed,
@@ -140,6 +143,10 @@ __all__ = [
     "LocalTime",
     "Str",
     "UUID",
+    # Named tuples
+    "NamedTuple",
+    "named_tuple",
+    "named_tuples_snapshot",
     # Introspection
     "FieldMeta",
     "PylonConfig",

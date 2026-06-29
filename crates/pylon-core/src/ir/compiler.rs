@@ -1166,6 +1166,13 @@ impl<'a> Compiler<'a> {
                     .collect::<Result<_, _>>()?;
                 vec![IrFreeExpr::Tuple(ir)]
             }
+            Expr::NamedTuple(fields) => {
+                let ir = fields
+                    .iter()
+                    .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
+                    .collect::<Result<Vec<_>, PyQLError>>()?;
+                vec![IrFreeExpr::Scalar(IrExpr::NamedTuple(ir))]
+            }
             other => vec![IrFreeExpr::Scalar(self.compile_free_expr(other)?)],
         };
 
@@ -1318,6 +1325,14 @@ impl<'a> Compiler<'a> {
                     .map(|e| self.compile_free_expr(e))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(IrExpr::Array(items))
+            }
+
+            Expr::NamedTuple(fields) => {
+                let ir = fields
+                    .iter()
+                    .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
+                    .collect::<Result<Vec<_>, PyQLError>>()?;
+                Ok(IrExpr::NamedTuple(ir))
             }
 
             Expr::Path(p) if p.partial => Err(self.type_err(
@@ -2608,7 +2623,15 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::Array(items))
             }
 
-            Expr::Shape(_) | Expr::Tuple(_) | Expr::NamedTuple(_) | Expr::Set(_) => {
+            Expr::NamedTuple(fields) => {
+                let ir = fields
+                    .iter()
+                    .map(|(name, e)| Ok((name.clone(), self.compile_expr(e, td, alias)?)))
+                    .collect::<Result<Vec<_>, PyQLError>>()?;
+                Ok(IrExpr::NamedTuple(ir))
+            }
+
+            Expr::Shape(_) | Expr::Tuple(_) | Expr::Set(_) => {
                 Err(PyQLError::Type(PyQLTypeError {
                     message: "shapes and set literals are not valid in expression context".into(),
                     position: Position { line: 0, col: 0 },
@@ -3702,6 +3725,7 @@ fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             IrLiteral::Bool(_) => "boolean",
         }),
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
+        IrExpr::NamedTuple(_) => Some("jsonb"),
         _ => None,
     }
 }
@@ -3786,6 +3810,9 @@ pub(super) fn substitute_col_refs(
         })),
         IrExpr::Array(elems) => {
             IrExpr::Array(elems.into_iter().map(|e| substitute_col_refs(e, bindings)).collect())
+        }
+        IrExpr::NamedTuple(fields) => {
+            IrExpr::NamedTuple(fields.into_iter().map(|(k, v)| (k, substitute_col_refs(v, bindings))).collect())
         }
         // Literals, Params, Subqueries — no column refs to substitute
         other => other,

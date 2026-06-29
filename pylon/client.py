@@ -517,8 +517,8 @@ def _pg_decode_value(type_oid: int, data: bytes) -> Any:
             return _pg_decode_record(data)
         case 2287:  # _record (record[])
             return _pg_decode_record_array(data)
-        case _:
-            return data
+        case _:  # enums, domains, and other text-compatible custom types
+            return data.decode("utf-8")
 
 
 def _pg_decode_record(data: bytes) -> tuple:
@@ -570,6 +570,14 @@ async def _setup_codecs(conn: asyncpg.Connection) -> None:
         schema="pg_catalog",
         format="text",
     )
+    # Override jsonb with a binary-format codec so it decodes correctly inside
+    # anonymous record composites (asyncpg passes binary data there, not text).
+    conn._protocol.get_settings().add_python_codec(
+        3802, "jsonb", "pg_catalog", [], "scalar",
+        lambda v: b"\x01" + json.dumps(v).encode(),
+        lambda data: json.loads(data[1:].decode("utf-8")),
+        "binary",
+    )
     # Monkey-patch: register a binary decoder for record[] (OID 2287) directly,
     # bypassing asyncpg's scalar/composite validation in set_type_codec.
     conn._protocol.get_settings().add_python_codec(
@@ -609,13 +617,17 @@ def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
     """Decode asyncpg Records into Python dataclass instances."""
     from pylon.query import _get_schema, deserialize
     from pylon.schema import schema_snapshot
+    from pylon.schema._registry import named_tuples_snapshot
 
     try:
         _get_schema()
     except RuntimeError:
         return records
     types, _, _ = schema_snapshot()
-    registry = {t.__name__: t for t in types}
+    registry: dict[str, type] = {t.__name__: t for t in types}
+    for nt in named_tuples_snapshot():
+        mod = getattr(nt, "__pylon_module__", "default")
+        registry[f"{mod}::{nt.__name__}"] = nt
     return deserialize(records, compiled, registry)
 
 

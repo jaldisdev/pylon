@@ -1028,6 +1028,12 @@ fn shape_node_to_py<'py>(
         ShapeNode::JsonScalar => {
             d.set_item("kind", "json_scalar")?;
         }
+        ShapeNode::NamedTuple { name, position, type_name } => {
+            d.set_item("kind", "named_tuple")?;
+            d.set_item("name", name.as_str())?;
+            d.set_item("position", position)?;
+            d.set_item("type_name", type_name.as_deref())?;
+        }
     }
     Ok(d.into_any())
 }
