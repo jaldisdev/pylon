@@ -95,6 +95,8 @@ pub enum Expr {
     SubQuery(Box<Stmt>),
     /// Binary set union: `expr union expr` — compiles to UNION ALL.
     Union(Box<Expr>, Box<Expr>),
+    /// A global variable reference: `global name` or `global module::name`.
+    Global(String),
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────

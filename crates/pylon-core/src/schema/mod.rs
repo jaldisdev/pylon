@@ -189,6 +189,9 @@ pub struct GlobalDescriptor {
     pub scalar_type: String,
     pub required: bool,
     pub default_expr: Option<String>,
+    /// PyQL expression string for computed globals (e.g. `select User filter .id = global current_user_id`).
+    /// When set, the global is computed from this expression at query time rather than injected as a parameter.
+    pub computed_expr: Option<String>,
 }
 
 // ── Top-level schema ───────────────────────────────────────────────────────────

@@ -698,6 +698,22 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
 
+                // `global name` or `global module::name` → Expr::Global
+                if name == "global" {
+                    if let Token::Ident(gname) = self.current().clone() {
+                        let gname = gname.clone();
+                        self.advance();
+                        if matches!(self.current(), Token::ColonColon) {
+                            self.advance();
+                            let member = self.eat_ident()?;
+                            return Ok(Expr::Global(format!("{}::{}", gname, member)));
+                        }
+                        return Ok(Expr::Global(gname));
+                    }
+                    // `global` not followed by ident → fall through as bare path
+                    return Ok(Expr::Path(Path::absolute(name)));
+                }
+
                 // `Module::Name` qualified reference or function call
                 if matches!(self.current(), Token::ColonColon) {
                     self.advance();

@@ -85,11 +85,17 @@ def finalize(
     from pylon.query import _set_schema
 
     cfg = load_config(config)
-    _import_schema_dir(cfg.project.schema_dir)  # type: ignore[union-attr]
+    schema_dir = cfg.project.schema_dir  # type: ignore[union-attr]
+    _import_schema_dir(schema_dir)
 
     types, enums, custom_scalars = snapshot()
 
+    # Collect globals from every non-private schema file that was imported.
     globals_: list[Any] = []
+    for py_file in sorted(schema_dir.glob("*.py")):
+        stem = py_file.stem
+        if not stem.startswith("_") and stem in sys.modules:
+            globals_.extend(collect_module_globals(sys.modules[stem]))
     if modules:
         for mod in modules:
             globals_.extend(collect_module_globals(mod))

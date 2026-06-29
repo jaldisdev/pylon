@@ -790,6 +790,7 @@ def _build_global_descriptor(g: Any, _core: Any) -> Any:
         scalar_type=scalar_type_name,
         required=g.required,
         default_expr=default_expr,
+        computed_expr=g.computed_expr,
     )
 
 
