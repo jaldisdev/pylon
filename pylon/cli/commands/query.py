@@ -218,6 +218,14 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
         click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
+    # Group result: free objects with key / grouping / elements
+    if shape_kind == "group":
+        max_width = shutil.get_terminal_size((100, 24)).columns
+        depth = 1 if repl else 0
+        items = [_format_group_row(obj, depth, max_width) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
+        return
+
     # Schema object or free object
     # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
     selected = {
@@ -405,6 +413,40 @@ def _pformat_object(type_name: str, fields: dict, depth: int, max_width: int) ->
     field_strs = [f"{_key(k)}: {_pformat_value(v, depth + 1, max_width)}" for k, v in fields.items()]
     inner = f",\n{indent}".join(field_strs)
     return f"{prefix}{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
+
+
+def _format_group_row(obj: dict, depth: int, max_width: int) -> str:
+    """Format a GROUP result row: key as free object, grouping as set, elements as set."""
+    key_pairs = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in obj.get("key", {}).items())
+    key_str = f"{_brace('{')}{key_pairs}{_brace('}')}"
+
+    grouping_items = [f"{_GREEN}'{name}'{_RESET}" for name in sorted(obj.get("grouping", []))]
+    grouping_str = _format_set(grouping_items)
+
+    elements = obj.get("elements", [])
+    if dataclasses and elements and dataclasses.is_dataclass(elements[0]):
+        elem_strs = [
+            _pformat_object(
+                vars(e).get("__pylon_type__") or type(e).__name__,
+                {k: v for k, v in vars(e).items() if k != "__pylon_type__"},
+                depth + 2,
+                max_width,
+            )
+            for e in elements
+        ]
+    else:
+        elem_strs = [_pformat_value(e, depth + 2, max_width) for e in elements]
+    elements_str = _format_set(elem_strs)
+
+    fields = {
+        "key": key_str,
+        "grouping": grouping_str,
+        "elements": elements_str,
+    }
+    indent = "  " * (depth + 1)
+    closing = "  " * depth
+    inner = f",\n{indent}".join(f"{_key(k)}: {v}" for k, v in fields.items())
+    return f"{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
 
 
 def _format_tuple(t: tuple) -> str:

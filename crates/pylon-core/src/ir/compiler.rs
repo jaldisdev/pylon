@@ -18,7 +18,7 @@ use super::{
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
-    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp,
+    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -64,6 +64,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
             String::new()
         }
         IrStmt::For(f) => cte_stmt_type(&f.body),
+        IrStmt::Group(g) => g.source.type_name.clone(),
     }
 }
 
@@ -472,6 +473,7 @@ impl<'a> Compiler<'a> {
             Stmt::Insert(s) => self.compile_insert(s).map(IrStmt::Insert),
             Stmt::Update(s) => self.compile_update(s).map(IrStmt::Update),
             Stmt::Delete(s) => self.compile_delete(s).map(IrStmt::Delete),
+            Stmt::Group(s) => self.compile_group(s).map(IrStmt::Group),
             // Nested WITH blocks (e.g. inside a subquery): inline the CTE types
             // into the current compiler scope so references resolve correctly.
             // The actual CTE SQL is handled at the top-level compile() boundary.
@@ -1714,6 +1716,104 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    fn compile_group(&mut self, g: &ast::GroupStmt) -> Result<IrGroup, PyQLError> {
+        // Resolve the subject type — may be a schema type or a CTE alias.
+        let (type_name, cte_name) = match &g.subject {
+            Expr::Path(p) if !p.partial => {
+                match p.steps.as_slice() {
+                    [ast::PathStep::Name(n)] => {
+                        if let Some(t) = self.cte_types.get(n.as_str()) {
+                            (t.clone(), Some(n.clone()))
+                        } else {
+                            (n.clone(), None)
+                        }
+                    }
+                    [ast::PathStep::Name(m), ast::PathStep::Name(n)] =>
+                        (format!("{}::{}", m, n), None),
+                    _ => return Err(PyQLError::Type(PyQLTypeError {
+                        message: format!("unsupported group subject: {:?}", g.subject),
+                        position: Position { line: 0, col: 0 },
+                    })),
+                }
+            }
+            _ => return Err(PyQLError::Type(PyQLTypeError {
+                message: "group subject must be a type name".to_string(),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+
+        let td = self.resolve_type(&type_name)?;
+        let alias = self.fresh_alias();
+        let fq_type_name = format!("{}::{}", td.module, td.name);
+        let table = match cte_name {
+            Some(ref cte) => format!("@cte:{}", cte),
+            None => td.table.clone(),
+        };
+        let source = IrSource {
+            type_name: fq_type_name.clone(),
+            table,
+            alias: alias.clone(),
+        };
+        let module = td.module.clone();
+
+        // Compile the element shape. No explicit shape → implicit { id }, matching the upstream engine semantics.
+        let shape = self.compile_shape(
+            g.shape.as_deref().unwrap_or(&[]),
+            td,
+            &alias,
+            &module,
+        )?;
+
+        // Build a map from using-alias → compiled expression.
+        let td = self.resolve_type(&type_name)?;
+        let mut using_map: HashMap<String, IrExpr> = HashMap::new();
+        for (alias_name, expr) in &g.using {
+            let ir = self.compile_expr(expr, td, &alias)?;
+            using_map.insert(alias_name.clone(), ir);
+        }
+
+        // Compile BY keys: each is either an Ident (using-alias ref) or a partial Path (.prop).
+        let mut keys: Vec<(String, IrExpr)> = vec![];
+        let td = self.resolve_type(&type_name)?;
+        for by_expr in &g.by {
+            match by_expr {
+                Expr::Path(p) if p.partial && p.steps.len() == 1 => {
+                    if let ast::PathStep::Name(prop) = &p.steps[0] {
+                        // `.prop` shorthand: infer alias = prop name, expr = column ref.
+                        let ir = self.compile_expr(by_expr, td, &alias)?;
+                        keys.push((prop.clone(), ir));
+                    } else {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: "group by path must be a simple property".to_string(),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
+                }
+                Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                    if let ast::PathStep::Name(name) = &p.steps[0] {
+                        // Bare ident: must be a using alias.
+                        let ir = using_map.get(name).ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!("group by references unknown alias '{}'", name),
+                            position: Position { line: 0, col: 0 },
+                        }))?;
+                        keys.push((name.clone(), ir.clone()));
+                    } else {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: "group by identifier must be a simple name".to_string(),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
+                }
+                _ => return Err(PyQLError::Type(PyQLTypeError {
+                    message: format!("unsupported group by expression: {:?}", by_expr),
+                    position: Position { line: 0, col: 0 },
+                })),
+            }
+        }
+
+        Ok(IrGroup { source, shape, keys })
+    }
+
     /// Extract the target type name from a DML or inner SELECT statement.
     fn dml_subject_type(&self, stmt: &Stmt) -> Result<String, PyQLError> {
         match stmt {
@@ -1722,6 +1822,7 @@ impl<'a> Compiler<'a> {
             Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
             Stmt::With(w) => self.dml_subject_type(&w.stmt),
             Stmt::For(f) => self.dml_subject_type(&f.body),
+            Stmt::Group(g) => self.expr_as_type_name(&g.subject),
             Stmt::Select(sel) => {
                 // <Module::Type>expr — type name comes from the cast target
                 if let Expr::TypeCast(tc) = &sel.result {

@@ -106,6 +106,16 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
     if kind == "tuple":
         return tuple(_decode(value, e, registry) for e in node["elements"])
 
+    if kind == "group":
+        key_nodes = node["key_nodes"]
+        key_obj = {kn["name"]: _decode(value, kn, registry) for kn in key_nodes}
+        grouping = list(value[node["grouping_position"]] or [])
+        elements = [
+            _decode(item, {**node["element"], "position": 0}, registry)
+            for item in (value[node["elements_position"]] or [])
+        ]
+        return {"key": key_obj, "grouping": grouping, "elements": elements}
+
     raise ValueError(f"unknown shape node kind: {kind!r}")
 
 

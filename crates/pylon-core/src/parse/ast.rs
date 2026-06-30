@@ -9,10 +9,23 @@ pub enum Stmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    Group(GroupStmt),
     /// `with alias := (stmt), ... main_stmt`
     With(WithStmt),
     /// `for var in iterator union body`
     For(ForStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupStmt {
+    /// The type or expression being grouped.
+    pub subject: Expr,
+    /// Optional shape restricting which fields appear in `elements`.
+    pub shape: Option<Vec<ShapeElement>>,
+    /// `USING alias := expr, ...` bindings.
+    pub using: Vec<(String, Expr)>,
+    /// `BY expr, ...` — each item is an Ident (using-alias ref) or a partial Path (.prop).
+    pub by: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

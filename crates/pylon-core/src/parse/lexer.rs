@@ -40,6 +40,8 @@ pub enum Token {
     Unless,
     Conflict,
     Detached,
+    Group,
+    Using,
 
     // Identifiers
     Ident(String),
@@ -425,6 +427,8 @@ fn keyword_or_ident(s: &str) -> Token {
         "UNLESS" => Token::Unless,
         "CONFLICT" => Token::Conflict,
         "DETACHED" => Token::Detached,
+        "GROUP" => Token::Group,
+        "USING" => Token::Using,
         _ => Token::Ident(s.to_string()),
     }
 }
