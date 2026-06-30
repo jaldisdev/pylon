@@ -514,6 +514,8 @@ pub struct IrOutput {
     pub ctes: Vec<IrCteDef>,
     /// Global variable CTEs (session-injected or computed), in dependency order.
     pub global_ctes: Vec<IrGlobalCte>,
+    /// Non-fatal warnings produced during compilation.
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]

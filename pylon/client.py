@@ -230,7 +230,7 @@ class Client:
                 client attempts to load ``pylon.toml`` from the working tree.
     """
 
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(self, config: Config | None = None, *, warnings: bool = True) -> None:
         if config is None:
             from pylon.config import load_config
 
@@ -238,6 +238,7 @@ class Client:
         self._config = config
         self._pool: asyncpg.Pool | None = None
         self._lock = asyncio.Lock()
+        self._warnings = warnings
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -308,12 +309,14 @@ class Client:
             authed = client.with_globals({"default::current_user_id": user_id})
             posts = await authed.query("select Post { title }")
         """
-        return ClientWithGlobals(self, globals_)
+        return ClientWithGlobals(self, globals_, warnings=self._warnings)
 
     async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
         sql, params, compiled = _transpile(pyql, kwargs)
+        if self._warnings:
+            _emit_warnings(compiled)
         try:
             async with pool.acquire() as conn:
                 records = list(await conn.fetch(sql, *params))
@@ -331,6 +334,8 @@ class Client:
         """
         pool = self._require_pool()
         sql, params, compiled = _transpile(pyql, kwargs)
+        if self._warnings:
+            _emit_warnings(compiled)
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -510,13 +515,14 @@ class ClientWithGlobals:
     qualified name (``"module::name"``).
     """
 
-    def __init__(self, client: Client, globals_: dict[str, Any]) -> None:
+    def __init__(self, client: Client, globals_: dict[str, Any], *, warnings: bool = True) -> None:
         self._client = client
         self._globals = globals_
+        self._warnings = warnings
 
     def with_globals(self, globals_: dict[str, Any]) -> "ClientWithGlobals":
         """Return a new wrapper with the given globals merged on top."""
-        return ClientWithGlobals(self._client, {**self._globals, **globals_})
+        return ClientWithGlobals(self._client, {**self._globals, **globals_}, warnings=self._warnings)
 
     def _require_pool(self) -> Any:
         return self._client._require_pool()
@@ -524,6 +530,8 @@ class ClientWithGlobals:
     async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
         pool = self._require_pool()
         sql, params, compiled = _transpile(pyql, kwargs, self._globals)
+        if self._warnings:
+            _emit_warnings(compiled)
         async with pool.acquire() as conn:
             records = list(await conn.fetch(sql, *params))
         return _hydrate(records, compiled)
@@ -531,6 +539,8 @@ class ClientWithGlobals:
     async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
         pool = self._require_pool()
         sql, params, compiled = _transpile(pyql, kwargs, self._globals)
+        if self._warnings:
+            _emit_warnings(compiled)
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -663,6 +673,12 @@ async def _setup_codecs(conn: asyncpg.Connection) -> None:
         _pg_decode_record_array,
         "binary",
     )
+
+
+def _emit_warnings(compiled: "CompiledQuery") -> None:
+    import warnings as _warnings
+    for msg in compiled.warnings():
+        _warnings.warn(msg, stacklevel=4)
 
 
 def _transpile(

@@ -178,6 +178,8 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
 
     try:
         sql, params, compiled = _transpile(pyql, {}, globals_)
+        for w in compiled.warnings():
+            click.echo(f"{_YELLOW}warning:{_RESET} {w}", err=True)
         async with client._require_pool().acquire() as conn:
             records = list(await conn.fetch(sql, *params))
         results = _hydrate(records, compiled)
