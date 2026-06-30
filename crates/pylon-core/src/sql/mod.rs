@@ -1469,6 +1469,44 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("jsonb_build_object({})", pairs.join(", "))
         }
 
+        IrExpr::Subscript { expr, index, is_array } => {
+            let e = emit_expr(expr);
+            let i = emit_expr(index);
+            if *is_array {
+                // PG arrays are 1-indexed; PyQL uses 0-based.
+                format!("({})[({}) + 1]", e, i)
+            } else {
+                // Works for text and bytea.
+                format!("substr({}, ({}) + 1, 1)", e, i)
+            }
+        }
+
+        IrExpr::Slice { expr, lower, upper, is_array } => {
+            let e = emit_expr(expr);
+            if *is_array {
+                let lo = lower.as_deref().map(|x| format!("({}) + 1", emit_expr(x)))
+                    .unwrap_or_else(|| "1".to_string());
+                let hi = upper.as_deref().map(|x| emit_expr(x))
+                    .unwrap_or_default();
+                if hi.is_empty() {
+                    format!("({})[{}:]", e, lo)
+                } else {
+                    format!("({})[{}:{}]", e, lo, hi)
+                }
+            } else {
+                // substr(expr, start, length) for text/bytea.
+                let start = lower.as_deref().map(|x| format!("({}) + 1", emit_expr(x)))
+                    .unwrap_or_else(|| "1".to_string());
+                match upper.as_deref() {
+                    Some(hi_expr) => {
+                        let lo_val = lower.as_deref().map(emit_expr).unwrap_or_else(|| "0".to_string());
+                        format!("substr({}, {}, ({}) - ({}))", e, start, emit_expr(hi_expr), lo_val)
+                    }
+                    None => format!("substr({}, {})", e, start),
+                }
+            }
+        }
+
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;
             let mut sql = if sel.shape.is_empty() {

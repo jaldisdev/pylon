@@ -562,7 +562,27 @@ impl Parser {
                         self.eat(&Token::RBracket)?;
                         expr = self.extend_path(expr, PathStep::TypeIntersection(type_ref))?;
                     } else {
-                        break;
+                        // Index `[i]` or slice `[lower:upper]`
+                        self.advance(); // consume [
+                        let lower = if matches!(self.current(), Token::Colon) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        if matches!(self.current(), Token::Colon) {
+                            self.advance(); // consume :
+                            let upper = if matches!(self.current(), Token::RBracket) {
+                                None
+                            } else {
+                                Some(Box::new(self.parse_expr()?))
+                            };
+                            self.eat(&Token::RBracket)?;
+                            expr = Expr::Slice { expr: Box::new(expr), lower, upper };
+                        } else {
+                            let index = lower.ok_or_else(|| self.err("expected index expression"))?;
+                            self.eat(&Token::RBracket)?;
+                            expr = Expr::Index { expr: Box::new(expr), index };
+                        }
                     }
                 }
                 Token::At => {

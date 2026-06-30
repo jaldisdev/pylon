@@ -383,6 +383,15 @@ pub enum IrExpr {
     GlobalParam { index: usize, pg_type: String },
     /// Computed global reference: emits `(SELECT "value" FROM "cte_name")`.
     GlobalRef { cte_name: String },
+    /// Index access `expr[i]`: `substr(expr, i+1, 1)` for strings/bytes, `(expr)[i+1]` for arrays.
+    Subscript { expr: Box<IrExpr>, index: Box<IrExpr>, is_array: bool },
+    /// Slice access `expr[lower:upper]`: `substr` for strings/bytes, PG subscript for arrays.
+    Slice {
+        expr: Box<IrExpr>,
+        lower: Option<Box<IrExpr>>,
+        upper: Option<Box<IrExpr>>,
+        is_array: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
