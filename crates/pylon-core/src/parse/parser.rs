@@ -599,9 +599,17 @@ impl Parser {
                         self.advance();
                         let name = self.eat_ident()?;
                         expr = self.extend_path(expr, PathStep::Backlink(name))?;
+                    } else if let Token::IntLit(n) = self.current().clone() {
+                        // Positional tuple access: expr.0, expr.1, ...
+                        self.advance();
+                        expr = Expr::TupleIndex { expr: Box::new(expr), index: n as usize };
                     } else {
                         let name = self.eat_ident()?;
-                        expr = self.extend_path(expr, PathStep::Name(name))?;
+                        // Path expressions extend the path; everything else uses FieldAccess.
+                        expr = match expr {
+                            Expr::Path(_) => self.extend_path(expr, PathStep::Name(name))?,
+                            other => Expr::FieldAccess { expr: Box::new(other), field: name },
+                        };
                     }
                 }
                 Token::LBracket => {

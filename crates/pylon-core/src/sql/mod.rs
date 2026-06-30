@@ -756,18 +756,23 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
 
     let (result_expr, shape_root) = match &sel.result {
         IrPathResult::Scalar(ir_expr) => {
-            // Named tuples (jsonb) can't be decoded inside ROW() by asyncpg — emit raw.
+            // Named tuples / jsonb field accesses can't be decoded inside ROW() — emit raw.
             let is_nt = matches!(ir_expr, IrExpr::NamedTuple(_))
+                || matches!(ir_expr, IrExpr::JsonbField { .. })
                 || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"));
             if is_nt {
-                let type_name = match ir_expr {
-                    IrExpr::ColumnRef { pg_type, .. } =>
-                        pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
-                    _ => None,
+                let expr_sql = format!("{} AS result", emit_expr(ir_expr));
+                let shape = if matches!(ir_expr, IrExpr::JsonbField { .. }) {
+                    ShapeNode::RawScalar
+                } else {
+                    let type_name = match ir_expr {
+                        IrExpr::ColumnRef { pg_type, .. } =>
+                            pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
+                        _ => None,
+                    };
+                    ShapeNode::NamedTuple { name: String::new(), position: 0, type_name }
                 };
-                let expr = format!("{} AS result", emit_expr(ir_expr));
-                let shape = ShapeNode::NamedTuple { name: String::new(), position: 0, type_name };
-                (expr, shape)
+                (expr_sql, shape)
             } else {
                 // Schema-qualified types (enums, domains) have unknown OIDs inside ROW() —
                 // cast to text so asyncpg's anonymous_record_decode can handle them.
@@ -1588,11 +1593,9 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             let e = emit_expr(expr);
             let i = emit_expr(index);
             if *is_array {
-                // PG arrays are 1-indexed; PyQL uses 0-based.
-                format!("({})[({}) + 1]", e, i)
+                format!("_pylon.array_subscript({}, ({})::bigint)", e, i)
             } else {
-                // Works for text and bytea.
-                format!("substr({}, ({}) + 1, 1)", e, i)
+                format!("_pylon.str_subscript({}, ({})::bigint)", e, i)
             }
         }
 
@@ -1615,11 +1618,16 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 match upper.as_deref() {
                     Some(hi_expr) => {
                         let lo_val = lower.as_deref().map(emit_expr).unwrap_or_else(|| "0".to_string());
-                        format!("substr({}, {}, ({}) - ({}))", e, start, emit_expr(hi_expr), lo_val)
+                        // GREATEST(0, ...) so reversed bounds yield '' instead of a PG error.
+                        format!("substr({}, {}, GREATEST(0, ({}) - ({})))", e, start, emit_expr(hi_expr), lo_val)
                     }
                     None => format!("substr({}, {})", e, start),
                 }
             }
+        }
+
+        IrExpr::JsonbField { expr, field } => {
+            format!("({}->{})", emit_expr(expr), sql_str(field))
         }
 
         IrExpr::Subquery(sel) => {
@@ -2299,10 +2307,9 @@ mod tests {
     }
 
     #[test]
-    fn test_string_index_emits_substr() {
+    fn test_string_index_emits_str_subscript() {
         let out = compile_and_emit("SELECT 'hello'[1]");
-        assert!(out.sql.contains("substr"), "expected substr() for string index, got:\n{}", out.sql);
-        assert!(out.sql.contains("+ 1"), "expected 0-to-1 index offset");
+        assert!(out.sql.contains("_pylon.str_subscript"), "expected _pylon.str_subscript() for string index, got:\n{}", out.sql);
     }
 
     #[test]
@@ -2314,17 +2321,14 @@ mod tests {
     #[test]
     fn test_array_index_emits_subscript() {
         let out = compile_and_emit("SELECT [1, 2, 3][1]");
-        // Should use array subscript syntax, not substr
-        assert!(!out.sql.contains("substr"), "should not use substr for array, got:\n{}", out.sql);
-        assert!(out.sql.contains(")["), "expected array subscript syntax, got:\n{}", out.sql);
+        assert!(out.sql.contains("_pylon.array_subscript"), "expected _pylon.array_subscript() for array index, got:\n{}", out.sql);
     }
 
     #[test]
     fn test_array_slice_emits_subscript() {
         let out = compile_and_emit("SELECT [1, 2, 3][0:2]");
         assert!(!out.sql.contains("substr"), "should not use substr for array, got:\n{}", out.sql);
-        // Should have lower:upper array slice syntax
-        assert!(out.sql.contains(")["), "expected array subscript syntax, got:\n{}", out.sql);
+        assert!(out.sql.contains(")["), "expected array slice syntax, got:\n{}", out.sql);
     }
 
     #[test]

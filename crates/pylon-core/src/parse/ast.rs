@@ -114,6 +114,10 @@ pub enum Expr {
     Index { expr: Box<Expr>, index: Box<Expr> },
     /// Slice access: `expr[lower:upper]` (0-based, either bound may be absent).
     Slice { expr: Box<Expr>, lower: Option<Box<Expr>>, upper: Option<Box<Expr>> },
+    /// Named tuple field access on a non-path expression: `(name := 'a', age := 1).name`.
+    FieldAccess { expr: Box<Expr>, field: String },
+    /// Positional tuple element on a non-path expression: `(1, 3.14, 'red').2`.
+    TupleIndex { expr: Box<Expr>, index: usize },
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────
