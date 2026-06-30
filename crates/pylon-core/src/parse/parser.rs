@@ -132,7 +132,7 @@ impl Parser {
 
     fn parse_sort_list(&mut self) -> Result<Vec<SortExpr>, PyQLSyntaxError> {
         let mut list = vec![self.parse_sort_expr()?];
-        while matches!(self.current(), Token::Comma) {
+        while matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("then")) {
             self.advance();
             list.push(self.parse_sort_expr()?);
         }
