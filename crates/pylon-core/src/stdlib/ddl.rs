@@ -130,6 +130,47 @@ fn render_function(desc: &FnDescriptor, def: &PylonFnDef) -> String {
 /// `TranspilerIntrinsic` entries (range, multirange) are skipped.
 pub fn export_stdlib() -> String {
     let mut out = String::from("CREATE SCHEMA IF NOT EXISTS _pylon;\n\n");
+
+    // Internal runtime helpers (not user-callable from PyQL).
+    out.push_str(concat!(
+        "CREATE OR REPLACE FUNCTION _pylon.array_subscript(arr anyarray, idx bigint)\n",
+        "\tRETURNS anyelement\n",
+        "\tLANGUAGE plpgsql STABLE PARALLEL SAFE\n",
+        "AS $$\n",
+        "BEGIN\n",
+        "    IF idx < 0 OR idx >= cardinality(arr) THEN\n",
+        "        RAISE EXCEPTION 'array index % is out of bounds', idx\n",
+        "            USING ERRCODE = 'array_subscript_error';\n",
+        "    END IF;\n",
+        "    RETURN arr[idx + 1];\n",
+        "END\n",
+        "$$;\n\n",
+        "CREATE OR REPLACE FUNCTION _pylon.str_subscript(s text, idx bigint)\n",
+        "\tRETURNS text\n",
+        "\tLANGUAGE plpgsql STABLE PARALLEL SAFE\n",
+        "AS $$\n",
+        "BEGIN\n",
+        "    IF idx < 0 OR idx >= char_length(s) THEN\n",
+        "        RAISE EXCEPTION 'string index % is out of bounds', idx\n",
+        "            USING ERRCODE = 'array_subscript_error';\n",
+        "    END IF;\n",
+        "    RETURN substr(s, (idx + 1)::int, 1);\n",
+        "END\n",
+        "$$;\n\n",
+        "CREATE OR REPLACE FUNCTION _pylon.str_subscript(s bytea, idx bigint)\n",
+        "\tRETURNS bytea\n",
+        "\tLANGUAGE plpgsql STABLE PARALLEL SAFE\n",
+        "AS $$\n",
+        "BEGIN\n",
+        "    IF idx < 0 OR idx >= length(s) THEN\n",
+        "        RAISE EXCEPTION 'bytes index % is out of bounds', idx\n",
+        "            USING ERRCODE = 'array_subscript_error';\n",
+        "    END IF;\n",
+        "    RETURN substr(s, (idx + 1)::int, 1);\n",
+        "END\n",
+        "$$;\n\n",
+    ));
+
     for desc in super::registry() {
         if let ImplStrategy::PylonFunction(def) = &desc.impl_strategy {
             out.push_str(&render_function(desc, def));

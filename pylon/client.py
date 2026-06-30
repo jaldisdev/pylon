@@ -699,9 +699,7 @@ def _transpile(
     try:
         compiled = _pyql_compile(pyql)
     except BaseException as exc:
-        raise InternalServerError(
-            f"PyQL compiler is not yet available: {exc}"
-        ) from exc
+        raise InternalServerError(str(exc)) from exc
     try:
         params: list[Any] = []
         for name in compiled.param_names:

@@ -398,6 +398,8 @@ pub enum IrExpr {
     GlobalRef { cte_name: String },
     /// Index access `expr[i]`: `substr(expr, i+1, 1)` for strings/bytes, `(expr)[i+1]` for arrays.
     Subscript { expr: Box<IrExpr>, index: Box<IrExpr>, is_array: bool },
+    /// Named tuple / jsonb field access: `(expr)->'field'` (returns jsonb).
+    JsonbField { expr: Box<IrExpr>, field: String },
     /// Slice access `expr[lower:upper]`: `substr` for strings/bytes, PG subscript for arrays.
     Slice {
         expr: Box<IrExpr>,

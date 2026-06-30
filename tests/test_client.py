@@ -127,7 +127,7 @@ class TestTranspile:
         from pylon.client import _transpile
 
         with patch("pylon.query.compile", side_effect=RuntimeError("todo")):
-            with pytest.raises(InternalServerError, match="compiler"):
+            with pytest.raises(InternalServerError, match="todo"):
                 _transpile("select 1", {})
 
 

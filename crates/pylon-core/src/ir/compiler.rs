@@ -668,6 +668,37 @@ impl<'a> Compiler<'a> {
             // Check scalar property first.
             if let Some(p) = current_td.properties.iter().find(|p| p.name == step_name) {
                 if !is_last(0) {
+                    // Named tuple properties allow further field access via jsonb operators.
+                    if p.pg_type.starts_with("__nt__:") {
+                        let base = IrExpr::ColumnRef {
+                            alias: current_alias.clone(),
+                            column: p.name.clone(),
+                            pg_type: p.pg_type.clone(),
+                        };
+                        let remaining = &steps[idx + 1..];
+                        let mut ir: IrExpr = base;
+                        for step in remaining {
+                            let field = match step {
+                                ast::PathStep::Name(n) => n.clone(),
+                                _ => return Err(self.type_err(
+                                    "only field name steps are valid inside a named tuple",
+                                )),
+                            };
+                            ir = IrExpr::JsonbField { expr: Box::new(ir), field };
+                        }
+                        let (filter, order_by, offset, limit) =
+                            self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                        return Ok(IrPathSelect {
+                            root,
+                            joins,
+                            result: IrPathResult::Scalar(ir),
+                            filter,
+                            order_by,
+                            offset,
+                            limit,
+                            distinct,
+                        });
+                    }
                     return Err(self.type_err(&format!(
                         "'{step_name}' is a scalar property, not a link — cannot traverse further"
                     )));
@@ -1518,6 +1549,46 @@ impl<'a> Compiler<'a> {
                     .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
                 Ok(IrExpr::NamedTuple(ir))
+            }
+
+            Expr::FieldAccess { expr: inner, field } => {
+                if let Expr::NamedTuple(fields) = inner.as_ref() {
+                    let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
+                        self.type_err(&format!(
+                            "{field} is not a member of {}",
+                            named_tuple_type_str(fields)
+                        ))
+                    })?;
+                    return self.compile_free_expr(val);
+                }
+                let ir = self.compile_free_expr(inner)?;
+                Ok(IrExpr::JsonbField { expr: Box::new(ir), field: field.clone() })
+            }
+
+            Expr::TupleIndex { expr: inner, index } => {
+                match inner.as_ref() {
+                    Expr::Tuple(elems) => {
+                        let elem = elems.get(*index).ok_or_else(|| {
+                            self.type_err(&format!(
+                                "{index} is not a member of {}",
+                                positional_tuple_type_str(elems)
+                            ))
+                        })?;
+                        self.compile_free_expr(elem)
+                    }
+                    Expr::NamedTuple(fields) => {
+                        let (_, val) = fields.get(*index).ok_or_else(|| {
+                            self.type_err(&format!(
+                                "{index} is not a member of {}",
+                                named_tuple_type_str(fields)
+                            ))
+                        })?;
+                        self.compile_free_expr(val)
+                    }
+                    _ => Err(self.type_err(
+                        "positional tuple index is only supported on tuple literals",
+                    )),
+                }
             }
 
             Expr::Path(p) if p.partial => Err(self.type_err(
@@ -2958,6 +3029,53 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::NamedTuple(ir))
             }
 
+            Expr::FieldAccess { expr: inner, field } => {
+                // Constant-fold on named tuple literals; otherwise emit jsonb field access.
+                if let Expr::NamedTuple(fields) = inner.as_ref() {
+                    let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "{field} is not a member of {}",
+                                named_tuple_type_str(fields)
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?;
+                    return self.compile_expr(val, td, alias);
+                }
+                let ir = self.compile_expr(inner, td, alias)?;
+                Ok(IrExpr::JsonbField { expr: Box::new(ir), field: field.clone() })
+            }
+
+            Expr::TupleIndex { expr: inner, index } => {
+                match inner.as_ref() {
+                    Expr::Tuple(elems) => {
+                        let elem = elems.get(*index).ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "{index} is not a member of {}",
+                                positional_tuple_type_str(elems)
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }))?;
+                        self.compile_expr(elem, td, alias)
+                    }
+                    Expr::NamedTuple(fields) => {
+                        let (_, val) = fields.get(*index).ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "{index} is not a member of {}",
+                                named_tuple_type_str(fields)
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }))?;
+                        self.compile_expr(val, td, alias)
+                    }
+                    _ => Err(PyQLError::Type(PyQLTypeError {
+                        message: "positional tuple index is only supported on tuple literals".into(),
+                        position: Position { line: 0, col: 0 },
+                    })),
+                }
+            }
+
             Expr::Shape(_) | Expr::Tuple(_) | Expr::Set(_) => {
                 Err(PyQLError::Type(PyQLTypeError {
                     message: "shapes and set literals are not valid in expression context".into(),
@@ -4070,6 +4188,30 @@ fn is_array_expr(expr: &IrExpr) -> bool {
         IrExpr::TypeCast(tc) => tc.pg_type.ends_with("[]"),
         _ => false,
     }
+}
+
+fn expr_to_std_type(expr: &ast::Expr) -> &'static str {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Str(_)) => "std::str",
+        ast::Expr::Literal(ast::Literal::Int(_)) => "std::int64",
+        ast::Expr::Literal(ast::Literal::Float(_)) => "std::float64",
+        ast::Expr::Literal(ast::Literal::Bool(_)) => "std::bool",
+        _ => "anytype",
+    }
+}
+
+fn named_tuple_type_str(fields: &[(String, ast::Expr)]) -> String {
+    let inner = fields
+        .iter()
+        .map(|(k, v)| format!("{}: {}", k, expr_to_std_type(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("tuple<{}>", inner)
+}
+
+fn positional_tuple_type_str(elems: &[ast::Expr]) -> String {
+    let inner = elems.iter().map(expr_to_std_type).collect::<Vec<_>>().join(", ");
+    format!("tuple<{}>", inner)
 }
 
 fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
