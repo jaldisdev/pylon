@@ -978,6 +978,10 @@ impl CompiledQuery {
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
         shape_node_to_py(py, &self.inner.shape.root)
     }
+
+    fn warnings<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
+        pyo3::types::PyList::new(py, &self.inner.warnings).unwrap()
+    }
 }
 
 // ── Public functions ───────────────────────────────────────────────────────────

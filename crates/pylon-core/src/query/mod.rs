@@ -89,6 +89,8 @@ pub struct CompiledQuery {
     pub params: Vec<QueryParam>,
     /// Opaque shape handle — consumed by the Rust deserializer.
     pub shape: ShapeDescriptor,
+    /// Non-fatal warnings produced during compilation.
+    pub warnings: Vec<String>,
 }
 
 /// Compile a PyQL query string to SQL against `schema`.
@@ -104,5 +106,6 @@ pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, 
         param_names: ir_out.params,
         params: Vec::new(),
         shape: sql_out.shape,
+        warnings: ir_out.warnings,
     })
 }

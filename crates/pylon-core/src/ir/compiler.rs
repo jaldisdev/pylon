@@ -43,7 +43,7 @@ pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLE
         (vec![], c.compile_stmt(stmt)?)
     };
 
-    Ok(IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes })
+    Ok(IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
 }
 
 fn cte_stmt_type(stmt: &IrStmt) -> String {
@@ -112,6 +112,8 @@ struct Compiler<'a> {
     for_vars: HashMap<String, String>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
+    /// Non-fatal warnings collected during compilation.
+    warnings: Vec<String>,
 }
 
 impl<'a> Compiler<'a> {
@@ -123,6 +125,7 @@ impl<'a> Compiler<'a> {
             cte_types: HashMap::new(),
             for_vars: HashMap::new(),
             global_ctes: vec![],
+            warnings: vec![],
         }
     }
 
@@ -3302,6 +3305,21 @@ impl<'a> Compiler<'a> {
         let value_expr = self.compile_expr(value_ast, td, alias)?;
         let ml_name = match &path_steps[0] { ast::PathStep::Name(n) => n.clone(), _ => return Ok(None) };
         let ml = Self::resolve_multilink(td, &ml_name).unwrap();
+
+        // Warn: multi-link traversal in a comparison returns a set, not a single boolean.
+        // The query works (compiled as EXISTS), but `any()` makes the intent explicit.
+        {
+            let field_path: Vec<_> = path_steps.iter().map(|s| match s {
+                ast::PathStep::Name(n) => n.as_str(),
+                _ => "?",
+            }).collect();
+            self.warnings.push(format!(
+                "possibly more than one element returned by an expression in a FILTER clause \
+                 (multi-link '.{}'); wrap with any() to make intent explicit",
+                field_path.join("."),
+            ));
+        }
+
         // Clone what we need to avoid borrow conflicts with self below.
         let ml_target = ml.target.clone();
         let ml_through = ml.through.clone();
