@@ -1,6 +1,6 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrGlobalCte, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
+    IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
     IrPathSelect, IrPolyImplementor, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField,
     IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
@@ -71,6 +71,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
                 IrStmt::Insert(ins) => emit_insert_stmt(ins),
                 IrStmt::Delete(del) => emit_delete_stmt(del),
+                IrStmt::Group(grp) => emit_group(grp),
                 IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
@@ -262,7 +263,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql
         }
         IrStmt::FreeSelect(sel) => emit_free_select(sel).sql,
-        IrStmt::For(_) => unreachable!("For cannot appear as a CTE source"),
+        IrStmt::For(_) | IrStmt::Group(_) => unreachable!("cannot appear as a CTE source"),
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
             let mut sql = emit_path_joins(&ps.root, &ps.joins);
@@ -424,6 +425,16 @@ fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
 
 /// Types that asyncpg cannot decode inside anonymous ROW() composites.
 /// Return them as plain top-level columns instead.
+fn is_integer_expr(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::ColumnRef { pg_type, .. } =>
+            matches!(pg_type.as_str(), "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"),
+        IrExpr::Literal(crate::ir::IrLiteral::Int(_)) => true,
+        IrExpr::BinOp(op) => is_integer_expr(&op.left) && is_integer_expr(&op.right),
+        _ => false,
+    }
+}
+
 fn is_raw_scalar(expr: &IrExpr) -> bool {
     matches!(expr, IrExpr::Array(_))
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
@@ -639,6 +650,104 @@ fn emit_array_source(src: &IrArraySource) -> String {
             format!("ARRAY({})", sql)
         }
     }
+}
+
+/// Emit a group-key expression, casting schema-qualified enum ColumnRefs to `::text`
+/// so asyncpg can decode them outside of a typed composite.
+fn emit_key_expr(expr: &IrExpr) -> String {
+    if let IrExpr::ColumnRef { alias, column, pg_type } = expr {
+        if pg_type.starts_with('"') {
+            let col_ref = if alias.is_empty() {
+                qi(column)
+            } else {
+                format!("{}.{}", qi(alias), qi(column))
+            };
+            return format!("{}::text", col_ref);
+        }
+    }
+    emit_expr(expr)
+}
+
+fn emit_group(grp: &IrGroup) -> SqlOutput {
+    let alias = &grp.source.alias;
+    let (shape_exprs, shape_nodes) = build_shape(&grp.shape, alias);
+
+    // Build the elements ROW: type discriminator at pos 0, then shape fields.
+    let mut elem_row_parts = vec![type_disc(&grp.source.type_name)];
+    elem_row_parts.extend(shape_exprs);
+    let elem_row = elem_row_parts.join(",\n            ");
+
+    // Key positions: NULL at pos 0 (type slot), keys at 1..=N, grouping at N+1, elements at N+2.
+    let n_keys = grp.keys.len();
+    let grouping_pos = n_keys + 1;
+    let elements_pos = n_keys + 2;
+
+    // Build key SQL expressions and ShapeNodes.
+    let mut key_exprs_sql: Vec<String> = vec![];
+    let mut key_nodes: Vec<ShapeNode> = vec![];
+    for (i, (key_name, key_expr)) in grp.keys.iter().enumerate() {
+        let pos = i + 1;
+        if let IrExpr::ColumnRef { pg_type, .. } = key_expr {
+            if pg_type.starts_with('"') {
+                key_exprs_sql.push(emit_key_expr(key_expr));
+                let enum_type = pg_quoted_to_pylon(pg_type);
+                key_nodes.push(ShapeNode::Enum {
+                    name: key_name.clone(),
+                    position: pos,
+                    enum_type,
+                });
+                continue;
+            }
+        }
+        key_exprs_sql.push(emit_expr(key_expr));
+        key_nodes.push(ShapeNode::Scalar { name: key_name.clone(), position: pos });
+    }
+
+    // Build the outer SELECT tuple.
+    let mut outer_parts = vec!["NULL::text".to_string()];
+    outer_parts.extend(key_exprs_sql.clone());
+    let key_names_sql = grp.keys.iter()
+        .map(|(name, _)| format!("'{}'", name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    outer_parts.push(format!("ARRAY[{}]::text[]", key_names_sql));
+    outer_parts.push(format!(
+        "array_agg(ROW(\n            {}\n        )::record)",
+        elem_row
+    ));
+
+    let outer_tuple = outer_parts.join(",\n    ");
+
+    let group_by_sql = grp.keys.iter()
+        .map(|(_, key_expr)| emit_expr(key_expr))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT (\n    {}\n) AS \"result\"\nFROM {} AS {}\nGROUP BY {}",
+        outer_tuple,
+        source_ref(&grp.source),
+        qi(alias),
+        group_by_sql,
+    );
+
+    // ShapeNode for each element (Object with the selected fields).
+    let element_node = ShapeNode::Object {
+        name: String::new(),
+        type_name: Some(grp.source.type_name.clone()),
+        position: 0,
+        cardinality: Cardinality::Many,
+        fields: prepend_type(shape_nodes),
+    };
+
+    let root = ShapeNode::Group {
+        key_nodes,
+        grouping_position: grouping_pos,
+        elements_position: elements_pos,
+        element: Box::new(element_node),
+    };
+
+    SqlOutput { sql, shape: ShapeDescriptor { root } }
 }
 
 fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
@@ -1355,7 +1464,13 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 BinOpKind::Sub => format!("({} - {})", l, r),
                 BinOpKind::Mul => format!("({} * {})", l, r),
                 BinOpKind::Div => format!("({} / {})", l, r),
-                BinOpKind::FloorDiv => format!("floor(({}) / ({}))", l, r),
+                BinOpKind::FloorDiv => {
+                    if is_integer_expr(&op.left) && is_integer_expr(&op.right) {
+                        format!("({} / {})", l, r)
+                    } else {
+                        format!("floor(({}) / ({}))", l, r)
+                    }
+                }
                 BinOpKind::Mod => format!("({} % {})", l, r),
                 BinOpKind::Pow => format!("power({}, {})", l, r),
                 BinOpKind::Eq => format!("({} = {})", l, r),
@@ -2222,5 +2337,37 @@ mod tests {
         let after = &out.sql[substr_idx..];
         let commas = after.chars().take_while(|&c| c != ')').filter(|&c| c == ',').count();
         assert_eq!(commas, 1, "open-ended slice should use 2-arg substr, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_group_by_single_key() {
+        let out = compile_and_emit("group Person { name } by .age");
+        // GROUP BY clause present
+        assert!(out.sql.contains("GROUP BY"), "expected GROUP BY, got:\n{}", out.sql);
+        // Key column referenced
+        assert!(out.sql.contains("\"age\""), "expected age column, got:\n{}", out.sql);
+        // array_agg for elements
+        assert!(out.sql.contains("array_agg(ROW("), "expected array_agg, got:\n{}", out.sql);
+        // grouping names array
+        assert!(out.sql.contains("ARRAY['age']"), "expected grouping array, got:\n{}", out.sql);
+        // shape node is Group
+        assert!(matches!(out.shape.root, crate::query::ShapeNode::Group { .. }));
+        if let crate::query::ShapeNode::Group { key_nodes, grouping_position, elements_position, .. } = &out.shape.root {
+            assert_eq!(key_nodes.len(), 1);
+            assert!(matches!(&key_nodes[0], crate::query::ShapeNode::Scalar { name, position: 1 } if name == "age"));
+            assert_eq!(*grouping_position, 2);
+            assert_eq!(*elements_position, 3);
+        }
+    }
+
+    #[test]
+    fn test_group_using_alias() {
+        let out = compile_and_emit("group Person using decade := .age // 10 by decade");
+        assert!(out.sql.contains("GROUP BY"), "expected GROUP BY, got:\n{}", out.sql);
+        assert!(out.sql.contains("ARRAY['decade']"), "expected grouping array, got:\n{}", out.sql);
+        if let crate::query::ShapeNode::Group { key_nodes, .. } = &out.shape.root {
+            assert_eq!(key_nodes.len(), 1);
+            assert!(matches!(&key_nodes[0], crate::query::ShapeNode::Scalar { name, .. } if name == "decade"));
+        }
     }
 }

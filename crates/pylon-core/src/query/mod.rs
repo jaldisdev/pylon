@@ -56,6 +56,18 @@ pub enum ShapeNode {
         /// Pylon-qualified name, e.g. `default::Gender`.
         enum_type: String,
     },
+    /// Result of a `group` statement: each row is a free object with key/grouping/elements.
+    Group {
+        /// One ShapeNode per grouping key (carries name, position, and type).
+        /// Positions are 1-based in the outer tuple (pos 0 is the NULL type slot).
+        key_nodes: Vec<ShapeNode>,
+        /// Position of the `ARRAY[key_names...]::text[]` in the outer tuple.
+        grouping_position: usize,
+        /// Position of the `array_agg(elements)` in the outer tuple.
+        elements_position: usize,
+        /// Shape node for each element in the elements array.
+        element: Box<ShapeNode>,
+    },
 }
 
 /// Opaque handle to the output shape of a compiled query.

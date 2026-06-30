@@ -1068,6 +1068,17 @@ fn shape_node_to_py<'py>(
             d.set_item("position", position)?;
             d.set_item("enum_type", enum_type.as_str())?;
         }
+        ShapeNode::Group { key_nodes, grouping_position, elements_position, element } => {
+            d.set_item("kind", "group")?;
+            let py_key_nodes = PyList::new(
+                py,
+                key_nodes.iter().map(|n| shape_node_to_py(py, n)).collect::<PyResult<Vec<_>>>()?,
+            )?;
+            d.set_item("key_nodes", py_key_nodes)?;
+            d.set_item("grouping_position", grouping_position)?;
+            d.set_item("elements_position", elements_position)?;
+            d.set_item("element", shape_node_to_py(py, element)?)?;
+        }
     }
     Ok(d.into_any())
 }

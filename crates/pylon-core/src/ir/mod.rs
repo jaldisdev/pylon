@@ -25,6 +25,8 @@ pub enum IrStmt {
     Delete(IrDelete),
     /// `for var in iterator union body`
     For(IrFor),
+    /// `group Type [shape] [using alias := expr, ...] by key, ...`
+    Group(IrGroup),
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────────
@@ -40,6 +42,17 @@ pub struct IrFor {
 pub enum IrForIterator {
     /// Set literal of scalar values → SQL VALUES clause.
     Values { exprs: Vec<IrExpr>, pg_type: String },
+}
+
+// ── GROUP ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct IrGroup {
+    pub source: IrSource,
+    /// Fields projected into each element of the `elements` array.
+    pub shape: Vec<IrShapeField>,
+    /// Ordered list of (key_name, key_expr) — what we GROUP BY.
+    pub keys: Vec<(String, IrExpr)>,
 }
 
 // ── PATH SELECT (type-rooted path traversal) ────────────────────────────────────

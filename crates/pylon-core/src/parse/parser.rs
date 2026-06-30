@@ -77,8 +77,9 @@ impl Parser {
             Token::Insert => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
+            Token::Group => self.parse_group(),
             _ => Err(self.err(&format!(
-                "expected WITH, FOR, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
+                "expected WITH, FOR, SELECT, INSERT, UPDATE, DELETE, or GROUP, got {:?}",
                 self.current()
             ))),
         }?;
@@ -263,8 +264,9 @@ impl Parser {
             Token::Insert => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
+            Token::Group => self.parse_group(),
             _ => Err(self.err(&format!(
-                "expected WITH, FOR, SELECT, INSERT, UPDATE, or DELETE, got {:?}",
+                "expected WITH, FOR, SELECT, INSERT, UPDATE, DELETE, or GROUP, got {:?}",
                 self.current()
             ))),
         }
@@ -296,6 +298,55 @@ impl Parser {
             self.parse_inner_stmt()?
         };
         Ok(Stmt::For(ForStmt { var, optional, iterator, body: Box::new(body) }))
+    }
+
+    fn parse_group(&mut self) -> Result<Stmt, PyQLSyntaxError> {
+        self.eat(&Token::Group)?;
+        // Subject: a type name (path) optionally followed by a shape.
+        let subject_expr = self.parse_postfix()?;
+        let (subject, shape) = if let Expr::Shape(sh) = subject_expr {
+            let inner = sh.expr.map(|e| e).unwrap_or(Expr::Path(crate::parse::ast::Path {
+                steps: vec![],
+                partial: false,
+            }));
+            (inner, Some(sh.elements))
+        } else if matches!(self.current(), Token::LBrace) {
+            let elements = self.parse_shape_body()?;
+            (subject_expr, Some(elements))
+        } else {
+            (subject_expr, None)
+        };
+
+        // Optional USING clause.
+        let mut using = vec![];
+        if matches!(self.current(), Token::Using) {
+            self.advance();
+            loop {
+                let alias = self.eat_ident()?;
+                self.eat(&Token::ColonEq)?;
+                let expr = self.parse_if_else()?;
+                using.push((alias, expr));
+                if matches!(self.current(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // BY clause (required).
+        self.eat(&Token::By)?;
+        let mut by = vec![];
+        loop {
+            by.push(self.parse_postfix()?);
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(Stmt::Group(crate::parse::ast::GroupStmt { subject, shape, using, by }))
     }
 
     // ── Expressions ─────────────────────────────────────────────────────────────
