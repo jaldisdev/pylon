@@ -183,6 +183,7 @@ def _client_with_pool(pool: MagicMock):
     client._config = cfg
     client._pool = pool
     client._lock = asyncio.Lock()
+    client._warnings = True
     return client
 
 

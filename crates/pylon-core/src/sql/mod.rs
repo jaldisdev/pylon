@@ -1628,6 +1628,7 @@ mod tests {
                     constraints: vec![],
                     indexes: vec![],
                     triggers: vec![],
+                    junction: false,
                 },
                 TypeDescriptor {
                     name: "Company".into(),
@@ -1656,6 +1657,7 @@ mod tests {
                     constraints: vec![],
                     indexes: vec![],
                     triggers: vec![],
+                    junction: false,
                 },
                 TypeDescriptor {
                     name: "Post".into(),
@@ -1684,6 +1686,7 @@ mod tests {
                     constraints: vec![],
                     indexes: vec![],
                     triggers: vec![],
+                    junction: false,
                 },
             ],
             scalars: vec![],
@@ -1840,7 +1843,7 @@ mod tests {
                         through: Some("default::PersonFriend".into()),
                         nullable: false, description: None, on_delete: vec![],
                     }],
-                    computed: vec![], constraints: vec![], indexes: vec![], triggers: vec![],
+                    computed: vec![], constraints: vec![], indexes: vec![], triggers: vec![], junction: false,
                 },
                 TypeDescriptor {
                     name: "PersonFriend".into(), module: "default".into(), table: "PersonFriend".into(),
@@ -1860,7 +1863,7 @@ mod tests {
                         },
                     ],
                     multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], triggers: vec![],
+                    indexes: vec![], triggers: vec![], junction: false,
                 },
             ],
             scalars: vec![], enums: vec![], globals: vec![],
@@ -2156,5 +2159,68 @@ mod tests {
         assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
         assert!(out.sql.contains("FROM \"default\".\"Company\""));
+    }
+
+    #[test]
+    fn test_computed_field_in_shape_emits_expression() {
+        let mut schema = make_schema();
+        schema.types[0].computed.push(crate::schema::ComputedDescriptor {
+            name: "upper_name".into(),
+            expression: "str_upper(.name)".into(),
+            return_type: Some("text".into()),
+        });
+        let out = compile_and_emit_with("SELECT Person { upper_name }", &schema);
+        assert!(out.sql.to_lowercase().contains("upper"), "expected upper() in SQL, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_multi_sort_with_then_emits_two_order_keys() {
+        let out = compile_and_emit("SELECT Person { name } ORDER BY .name THEN .age DESC");
+        assert!(out.sql.contains("ORDER BY"), "expected ORDER BY");
+        // Both columns should appear in the ORDER BY clause
+        assert!(out.sql.contains("\"name\""));
+        assert!(out.sql.contains("\"age\""));
+        assert!(out.sql.contains("DESC"));
+    }
+
+    #[test]
+    fn test_string_index_emits_substr() {
+        let out = compile_and_emit("SELECT 'hello'[1]");
+        assert!(out.sql.contains("substr"), "expected substr() for string index, got:\n{}", out.sql);
+        assert!(out.sql.contains("+ 1"), "expected 0-to-1 index offset");
+    }
+
+    #[test]
+    fn test_string_slice_emits_substr() {
+        let out = compile_and_emit("SELECT 'hello'[1:3]");
+        assert!(out.sql.contains("substr"), "expected substr() for string slice, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_array_index_emits_subscript() {
+        let out = compile_and_emit("SELECT [1, 2, 3][1]");
+        // Should use array subscript syntax, not substr
+        assert!(!out.sql.contains("substr"), "should not use substr for array, got:\n{}", out.sql);
+        assert!(out.sql.contains(")["), "expected array subscript syntax, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_array_slice_emits_subscript() {
+        let out = compile_and_emit("SELECT [1, 2, 3][0:2]");
+        assert!(!out.sql.contains("substr"), "should not use substr for array, got:\n{}", out.sql);
+        // Should have lower:upper array slice syntax
+        assert!(out.sql.contains(")["), "expected array subscript syntax, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_open_ended_string_slice_emits_substr_no_length() {
+        let out = compile_and_emit("SELECT 'hello'[2:]");
+        // substr(expr, start) without length argument
+        assert!(out.sql.contains("substr"), "expected substr(), got:\n{}", out.sql);
+        // Should NOT have a third argument (length)
+        let substr_idx = out.sql.find("substr").unwrap();
+        let after = &out.sql[substr_idx..];
+        let commas = after.chars().take_while(|&c| c != ')').filter(|&c| c == ',').count();
+        assert_eq!(commas, 1, "open-ended slice should use 2-arg substr, got:\n{}", out.sql);
     }
 }

@@ -91,6 +91,7 @@ fn main() {
                 constraints: vec![],
                 indexes: vec![],
                 triggers: vec![],
+                junction: false,
             },
             TypeDescriptor {
                 name: "Company".into(),
@@ -119,6 +120,7 @@ fn main() {
                 constraints: vec![],
                 indexes: vec![],
                 triggers: vec![],
+                junction: false,
             },
             TypeDescriptor {
                 name: "Post".into(),
@@ -161,6 +163,7 @@ fn main() {
                 constraints: vec![],
                 indexes: vec![],
                 triggers: vec![],
+                junction: false,
             },
         ],
         scalars: vec![],

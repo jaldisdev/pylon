@@ -534,7 +534,8 @@ mod tests {
     #[allow(unused_imports)]
     use super::{IrFreeExpr, IrLiteral};
     use crate::schema::{
-        LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        ComputedDescriptor, GlobalDescriptor, LinkDescriptor, MultiLinkDescriptor,
+        PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -609,6 +610,7 @@ mod tests {
                     constraints: vec![],
                     indexes: vec![],
                     triggers: vec![],
+                    junction: false,
                 },
                 TypeDescriptor {
                     name: "Company".into(),
@@ -637,6 +639,7 @@ mod tests {
                     constraints: vec![],
                     indexes: vec![],
                     triggers: vec![],
+                    junction: false,
                 },
                 TypeDescriptor {
                     name: "Post".into(),
@@ -665,6 +668,7 @@ mod tests {
                     constraints: vec![],
                     indexes: vec![],
                     triggers: vec![],
+                    junction: false,
                 },
             ],
             scalars: vec![],
@@ -851,5 +855,115 @@ mod tests {
         let IrStmt::Delete(del) = ir.stmt else { panic!() };
         assert!(del.filter.is_some());
         assert_eq!(ir.params, vec!["name"]);
+    }
+
+    fn make_schema_with_computed() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        // Add a computed field to Person
+        schema.types[0].computed.push(ComputedDescriptor {
+            name: "upper_name".into(),
+            expression: "str_upper(.name)".into(),
+            return_type: Some("text".into()),
+        });
+        schema
+    }
+
+    #[test]
+    fn test_computed_field_in_shape() {
+        let schema = make_schema_with_computed();
+        let ast = parse::parse("SELECT Person { upper_name }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        // upper_name should compile to a Computed shape field
+        assert!(sel.shape.iter().any(|f| matches!(f, IrShapeField::Computed(c) if c.alias == "upper_name")));
+    }
+
+    #[test]
+    fn test_computed_field_in_expression_context() {
+        let schema = make_schema_with_computed();
+        let ast = parse::parse("SELECT Person { x := str_lower(.upper_name) }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        assert!(sel.shape.iter().any(|f| matches!(f, IrShapeField::Computed(c) if c.alias == "x")));
+    }
+
+    #[test]
+    fn test_multi_sort_with_then() {
+        let ir = compile("SELECT Person { name } ORDER BY .name THEN .age");
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        assert_eq!(sel.order_by.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_link_filter_emits_warning() {
+        let ir = compile("SELECT Person { name } FILTER .posts.title = 'hello'");
+        assert!(!ir.warnings.is_empty(), "expected a warning for multi-link in filter");
+        assert!(ir.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn test_session_global_produces_cte() {
+        let mut schema = make_schema();
+        schema.globals.push(GlobalDescriptor {
+            name: "viewer_id".into(),
+            module: "default".into(),
+            scalar_type: "UUID".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        });
+        let ast = parse::parse("SELECT Person FILTER .id = global viewer_id").unwrap();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        assert_eq!(ir.global_ctes.len(), 1);
+        assert_eq!(ir.global_ctes[0].cte_name(), "__global__default::viewer_id");
+        assert_eq!(ir.params, vec!["__global__default::viewer_id"]);
+    }
+
+    #[test]
+    fn test_string_index_compiles() {
+        let ast = parse::parse("SELECT 'hello'[1]").unwrap();
+        let schema = make_schema();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        assert!(matches!(
+            &fs.items[0],
+            IrFreeExpr::Scalar(IrExpr::Subscript { is_array: false, .. })
+        ));
+    }
+
+    #[test]
+    fn test_array_index_compiles() {
+        let ast = parse::parse("SELECT [1, 2, 3][0]").unwrap();
+        let schema = make_schema();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        assert!(matches!(
+            &fs.items[0],
+            IrFreeExpr::Scalar(IrExpr::Subscript { is_array: true, .. })
+        ));
+    }
+
+    #[test]
+    fn test_string_slice_compiles() {
+        let ast = parse::parse("SELECT 'hello'[1:3]").unwrap();
+        let schema = make_schema();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        assert!(matches!(
+            &fs.items[0],
+            IrFreeExpr::Scalar(IrExpr::Slice { is_array: false, .. })
+        ));
+    }
+
+    #[test]
+    fn test_array_slice_compiles() {
+        let ast = parse::parse("SELECT [1, 2, 3][0:2]").unwrap();
+        let schema = make_schema();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        assert!(matches!(
+            &fs.items[0],
+            IrFreeExpr::Scalar(IrExpr::Slice { is_array: true, .. })
+        ));
     }
 }
