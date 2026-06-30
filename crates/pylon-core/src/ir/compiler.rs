@@ -1386,6 +1386,26 @@ impl<'a> Compiler<'a> {
 
             Expr::Global(name) => self.compile_global(name),
 
+            Expr::Index { expr: e, index: i } => {
+                let ir_expr = self.compile_free_expr(e)?;
+                let ir_index = self.compile_free_expr(i)?;
+                let is_array = is_array_expr(&ir_expr);
+                Ok(IrExpr::Subscript { expr: Box::new(ir_expr), index: Box::new(ir_index), is_array })
+            }
+
+            Expr::Slice { expr: e, lower: lo, upper: hi } => {
+                let ir_expr = self.compile_free_expr(e)?;
+                let is_array = is_array_expr(&ir_expr);
+                let ir_lower = lo.as_ref().map(|x| self.compile_free_expr(x)).transpose()?;
+                let ir_upper = hi.as_ref().map(|x| self.compile_free_expr(x)).transpose()?;
+                Ok(IrExpr::Slice {
+                    expr: Box::new(ir_expr),
+                    lower: ir_lower.map(Box::new),
+                    upper: ir_upper.map(Box::new),
+                    is_array,
+                })
+            }
+
             Expr::FunctionCall(f) => {
                 // assert_single with SubQuery arg → _pylon.assert_single(ARRAY(subquery))
                 if (f.module.is_none() || f.module.as_deref() == Some("std"))
@@ -2694,6 +2714,26 @@ impl<'a> Compiler<'a> {
 
             Expr::Global(name) => self.compile_global(name),
 
+            Expr::Index { expr: e, index: i } => {
+                let ir_expr = self.compile_expr(e, td, alias)?;
+                let ir_index = self.compile_expr(i, td, alias)?;
+                let is_array = is_array_expr(&ir_expr);
+                Ok(IrExpr::Subscript { expr: Box::new(ir_expr), index: Box::new(ir_index), is_array })
+            }
+
+            Expr::Slice { expr: e, lower: lo, upper: hi } => {
+                let ir_expr = self.compile_expr(e, td, alias)?;
+                let is_array = is_array_expr(&ir_expr);
+                let ir_lower = lo.as_ref().map(|x| self.compile_expr(x, td, alias)).transpose()?;
+                let ir_upper = hi.as_ref().map(|x| self.compile_expr(x, td, alias)).transpose()?;
+                Ok(IrExpr::Slice {
+                    expr: Box::new(ir_expr),
+                    lower: ir_lower.map(Box::new),
+                    upper: ir_upper.map(Box::new),
+                    is_array,
+                })
+            }
+
             Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
                 Literal::Str(s) => IrLiteral::Str(s.clone()),
                 Literal::Int(n) => IrLiteral::Int(*n),
@@ -3919,6 +3959,15 @@ fn literal_sentinel_to_pg(t: &str) -> &str {
         "__int_literal" => "int8",
         "__float_literal" => "float8",
         other => other,
+    }
+}
+
+fn is_array_expr(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::Array(_) | IrExpr::ArrayFromSelect(_) => true,
+        IrExpr::ColumnRef { pg_type, .. } => pg_type.ends_with("[]"),
+        IrExpr::TypeCast(tc) => tc.pg_type.ends_with("[]"),
+        _ => false,
     }
 }
 

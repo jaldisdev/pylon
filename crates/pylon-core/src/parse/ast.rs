@@ -97,6 +97,10 @@ pub enum Expr {
     Union(Box<Expr>, Box<Expr>),
     /// A global variable reference: `global name` or `global module::name`.
     Global(String),
+    /// Index access: `expr[i]` (0-based).
+    Index { expr: Box<Expr>, index: Box<Expr> },
+    /// Slice access: `expr[lower:upper]` (0-based, either bound may be absent).
+    Slice { expr: Box<Expr>, lower: Option<Box<Expr>>, upper: Option<Box<Expr>> },
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────
