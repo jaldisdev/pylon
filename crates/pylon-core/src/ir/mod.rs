@@ -407,6 +407,9 @@ pub enum IrExpr {
         upper: Option<Box<IrExpr>>,
         is_array: bool,
     },
+    /// Detached path as a scalar subquery: `(SELECT scalar FROM root [JOINs])`.
+    /// Used when `detached TypeName.prop` appears in a schema-bound expression context.
+    PathSubquery(Box<IrPathSelect>),
 }
 
 #[derive(Debug, Clone)]

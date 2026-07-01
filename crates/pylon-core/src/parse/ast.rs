@@ -118,6 +118,8 @@ pub enum Expr {
     FieldAccess { expr: Box<Expr>, field: String },
     /// Positional tuple element on a non-path expression: `(1, 3.14, 'red').2`.
     TupleIndex { expr: Box<Expr>, index: usize },
+    /// `detached expr` — evaluate `expr` independently of the current implicit scope.
+    Detached(Box<Expr>),
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────
