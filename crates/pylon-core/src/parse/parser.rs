@@ -828,9 +828,8 @@ impl Parser {
 
             Token::Detached => {
                 self.advance();
-                // DETACHED is a modifier; for Phase 1 we parse the inner expr and
-                // represent it as a plain path (detached semantics applied in IR phase).
-                self.parse_expr()
+                let inner = self.parse_expr()?;
+                Ok(Expr::Detached(Box::new(inner)))
             }
 
             other => Err(self.err(&format!("unexpected token {other:?}"))),

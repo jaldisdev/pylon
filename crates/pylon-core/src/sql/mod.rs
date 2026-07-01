@@ -1630,6 +1630,18 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("({}->{})", emit_expr(expr), sql_str(field))
         }
 
+        IrExpr::PathSubquery(ps) => {
+            let scalar = match &ps.result {
+                IrPathResult::Scalar(e) => emit_expr(e),
+                IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
+            };
+            let from_sql = emit_path_joins(&ps.root, &ps.joins);
+            let mut sql = format!("(SELECT {}\nFROM {}", scalar, from_sql);
+            append_filter(&mut sql, &ps.filter);
+            sql.push(')');
+            sql
+        }
+
         IrExpr::Subquery(sel) => {
             let alias = &sel.source.alias;
             let mut sql = if sel.shape.is_empty() {

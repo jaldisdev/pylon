@@ -386,6 +386,9 @@ impl<'a> Compiler<'a> {
                 let (distinct, result) = match &s.result {
                     Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct =>
                         (true, &u.operand),
+                    // detached at select level is a no-op: CTEs and top-level selects
+                    // are already independent — strip the wrapper and compile normally.
+                    Expr::Detached(inner) => (false, inner.as_ref()),
                     other => (false, other),
                 };
 
@@ -1236,6 +1239,7 @@ impl<'a> Compiler<'a> {
     fn is_free_result(&self, expr: &Expr) -> bool {
         let expr = match expr {
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
+            Expr::Detached(inner) => inner.as_ref(),
             other => other,
         };
         match expr {
@@ -1622,6 +1626,9 @@ impl<'a> Compiler<'a> {
                 Err(self.type_err("expression is not valid in free SELECT context"))
             }
 
+            // detached has no effect in already-free context
+            Expr::Detached(inner) => self.compile_free_expr(inner),
+
             _ => Err(self.type_err("expression is not valid in free SELECT context")),
         }
     }
@@ -1631,6 +1638,7 @@ impl<'a> Compiler<'a> {
     fn compile_select(&mut self, sel: &ast::SelectStmt, distinct: bool) -> Result<IrSelect, PyQLError> {
         let result_expr = match &sel.result {
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
+            Expr::Detached(inner) => inner.as_ref(),
             other => other,
         };
         let (type_name, shape_elements, inner_stmt, cte_name) =
@@ -3096,6 +3104,21 @@ impl<'a> Compiler<'a> {
                 message: "union is not valid in expression context".into(),
                 position: Position { line: 0, col: 0 },
             })),
+
+            // detached in schema-bound context: compile inner as an independent subquery,
+            // bypassing the implicit root-matches-td correlation rewrite.
+            Expr::Detached(inner) => {
+                if let Some(root) = self.find_path_root_in_expr(inner) {
+                    let synthetic = ast::SelectStmt {
+                        result: *inner.clone(),
+                        filter: None, order_by: vec![], offset: None, limit: None,
+                    };
+                    let ps = self.compile_expr_as_path_select(&synthetic, inner, &root, false)?;
+                    return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                }
+                // No type-rooted path — compile inner without schema binding
+                self.compile_free_expr(inner)
+            }
         }
     }
 
