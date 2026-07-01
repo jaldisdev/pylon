@@ -3139,6 +3139,18 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
+            // Absolute path rooted at the current td: `TypeName.prop` inside a schema-bound
+            // expression (e.g. the value side of a BinOp in compile_expr_as_path_select).
+            // Rewrite to a relative path and compile normally.
+            if p.steps.len() > 1 {
+                if let ast::PathStep::Name(root) = &p.steps[0] {
+                    let qualified = format!("{}::{}", td.module, td.name);
+                    if *root == td.name || *root == qualified {
+                        let relative = ast::Path { steps: p.steps[1..].to_vec(), partial: true };
+                        return self.compile_path(&relative, td, alias);
+                    }
+                }
+            }
             return Err(PyQLError::Type(PyQLTypeError {
                 message: "absolute paths are not valid in expression context; use .field".into(),
                 position: Position { line: 0, col: 0 },

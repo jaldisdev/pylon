@@ -2376,6 +2376,21 @@ mod tests {
     }
 
     #[test]
+    fn test_abs_path_concat_same_type() {
+        let out = compile_and_emit("SELECT Person.name ++ ' ' ++ Person.name");
+        assert!(out.sql.contains("\"name\""), "expected name column, got:\n{}", out.sql);
+        assert!(out.sql.contains("||"), "expected concat operator, got:\n{}", out.sql);
+        assert!(out.sql.contains("FROM"), "expected FROM clause, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_abs_path_single_property() {
+        let out = compile_and_emit("SELECT Person.name");
+        assert!(out.sql.contains("\"name\""), "expected name column, got:\n{}", out.sql);
+        assert!(out.sql.contains("FROM"), "expected FROM clause, got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_pgvector_cast_emits_vector_type() {
         let out = compile_and_emit("SELECT <pgvector::vector>[1.0, 2.0, 3.0]");
         assert!(out.sql.contains("::vector"), "expected ::vector cast, got:\n{}", out.sql);
