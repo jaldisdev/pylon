@@ -649,7 +649,30 @@ def _pg_decode_record_array(data: bytes) -> list:
     return result
 
 
+def _decode_vector_binary(data: bytes) -> list:
+    ndim = struct.unpack_from(">H", data, 0)[0]
+    return list(struct.unpack_from(f">{ndim}f", data, 4))
+
+
+def _encode_vector_binary(v: list) -> bytes:
+    floats = [float(x) for x in v]
+    return struct.pack(f">HH{len(floats)}f", len(floats), 0, *floats)
+
+
 async def _setup_codecs(conn: asyncpg.Connection) -> None:
+    row = await conn.fetchrow(
+        "SELECT t.oid, n.nspname "
+        "FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
+        "WHERE t.typname = 'vector'"
+    )
+    if row is not None:
+        conn._protocol.get_settings().add_python_codec(
+            row["oid"], "vector", row["nspname"], [], "scalar",
+            _encode_vector_binary,
+            _decode_vector_binary,
+            "binary",
+        )
+
     await conn.set_type_codec(
         "jsonb",
         encoder=json.dumps,

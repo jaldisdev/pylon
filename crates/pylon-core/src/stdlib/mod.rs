@@ -29,6 +29,8 @@ pub enum PylonType {
     LocalDate,
     LocalTime,
     RelativeDuration,
+    // pgvector:: types
+    Vector,
     // Polymorphic
     Any,
     AnyOrderable,

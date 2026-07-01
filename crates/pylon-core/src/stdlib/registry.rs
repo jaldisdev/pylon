@@ -4,7 +4,7 @@ use ImplStrategy::{SqlBuiltin as B, SqlExpression as E, SqlOperator as O, Transp
 use PylonType::{
     Any, AnyOrderable, AnyPoint, Array, BigInt, Bool, Bytes, Datetime, Decimal, Duration, Float32,
     Float64, Int16, Int32, Int64, Json, LocalDate, LocalDatetime, LocalTime, Multirange, Optional,
-    Range, RelativeDuration, Set, Str, Tuple, Uuid,
+    Range, RelativeDuration, Set, Str, Tuple, Uuid, Vector,
 };
 
 // ── Type helpers ─────────────────────────────────────────────────────────────
@@ -625,5 +625,11 @@ END"#)),
             vec![],
             Tuple(vec![Int64, Int64, Str, Int64, Array(Box::new(Str))]),
             E(env!("PYLON_VERSION_ROW"))),
+
+        // ── pgvector:: ────────────────────────────────────────────────────────
+        f("pgvector", "euclidean_distance",  vec![p("a", Vector), p("b", Vector)], Float64, E("($1 <-> $2)")),
+        f("pgvector", "cosine_distance",     vec![p("a", Vector), p("b", Vector)], Float64, E("($1 <=> $2)")),
+        f("pgvector", "neg_inner_product",   vec![p("a", Vector), p("b", Vector)], Float64, E("($1 <#> $2)")),
+        f("pgvector", "inner_product",       vec![p("a", Vector), p("b", Vector)], Float64, E("(0.0 - ($1 <#> $2))")),
     ]
 }
