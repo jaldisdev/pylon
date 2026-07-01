@@ -18,6 +18,7 @@ from pylon.exceptions import (
     InterfaceError,
     InternalServerError,
     NoDataError,
+    QueryError,
     ResultCardinalityError,
     TransactionDeadlockError,
     TransactionSerializationError,
@@ -324,6 +325,8 @@ class Client:
             raise TransactionSerializationError(str(exc)) from exc
         except asyncpg.DeadlockDetectedError as exc:
             raise TransactionDeadlockError(str(exc)) from exc
+        except asyncpg.PostgresError as exc:
+            raise _fmt_pg_error(exc) from exc
         return _hydrate(records, compiled)
 
     async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
@@ -336,8 +339,15 @@ class Client:
         sql, params, compiled = _transpile(pyql, kwargs)
         if self._warnings:
             _emit_warnings(compiled)
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(sql, *params)
+        except asyncpg.SerializationError as exc:
+            raise TransactionSerializationError(str(exc)) from exc
+        except asyncpg.DeadlockDetectedError as exc:
+            raise TransactionDeadlockError(str(exc)) from exc
+        except asyncpg.PostgresError as exc:
+            raise _fmt_pg_error(exc) from exc
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
@@ -368,6 +378,8 @@ class Client:
                 raise TransactionSerializationError(str(exc)) from exc
             except asyncpg.DeadlockDetectedError as exc:
                 raise TransactionDeadlockError(str(exc)) from exc
+            except asyncpg.PostgresError as exc:
+                raise _fmt_pg_error(exc) from exc
 
     async def query_json(self, pyql: str, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -532,8 +544,11 @@ class ClientWithGlobals:
         sql, params, compiled = _transpile(pyql, kwargs, self._globals)
         if self._warnings:
             _emit_warnings(compiled)
-        async with pool.acquire() as conn:
-            records = list(await conn.fetch(sql, *params))
+        try:
+            async with pool.acquire() as conn:
+                records = list(await conn.fetch(sql, *params))
+        except asyncpg.PostgresError as exc:
+            raise _fmt_pg_error(exc) from exc
         return _hydrate(records, compiled)
 
     async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
@@ -541,8 +556,11 @@ class ClientWithGlobals:
         sql, params, compiled = _transpile(pyql, kwargs, self._globals)
         if self._warnings:
             _emit_warnings(compiled)
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(sql, *params)
+        except asyncpg.PostgresError as exc:
+            raise _fmt_pg_error(exc) from exc
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
@@ -696,6 +714,17 @@ async def _setup_codecs(conn: asyncpg.Connection) -> None:
         _pg_decode_record_array,
         "binary",
     )
+
+
+import re as _re
+
+_PG_QUOTED_IDENT_RE = _re.compile(r'"([^"]+)"\."([^"]+)"')
+
+
+def _fmt_pg_error(exc: asyncpg.PostgresError) -> QueryError:
+    """Re-raise a PostgresError with Pylon-style type names in the message."""
+    msg = _PG_QUOTED_IDENT_RE.sub(lambda m: f"'{m.group(1)}::{m.group(2)}'", exc.args[0])
+    return QueryError(msg)
 
 
 def _emit_warnings(compiled: "CompiledQuery") -> None:

@@ -397,10 +397,26 @@ impl<'a> Compiler<'a> {
                     return Ok(ir);
                 }
 
-                // <Module::Type>expr — schema object lookup by id.
+                // <Module::Type>expr — schema object lookup by id, or enum cast.
                 // Stdlib modules are handled by compile_free_expr; only user schema modules route here.
                 const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector"];
                 if let Expr::TypeCast(tc) = result {
+                    let qname = match tc.ty.module.as_deref() {
+                        Some(m) => format!("{}::{}", m, tc.ty.name),
+                        None => tc.ty.name.clone(),
+                    };
+                    if let Some(ed) = self.resolve_enum(&qname) {
+                        let pg_type = format!("\"{}\".\"{}\"", ed.module, ed.name);
+                        let inner = self.compile_free_expr(&tc.expr)?;
+                        let cast_expr = IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type }));
+                        return Ok(IrStmt::FreeSelect(IrFreeSelect {
+                            items: vec![IrFreeExpr::Scalar(cast_expr)],
+                            order_by: vec![],
+                            offset: None,
+                            limit: None,
+                            distinct,
+                        }));
+                    }
                     if tc.ty.module.as_deref().map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false) {
                         return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
                     }
@@ -1564,7 +1580,15 @@ impl<'a> Compiler<'a> {
 
             Expr::TypeCast(tc) => {
                 let inner = self.compile_free_expr(&tc.expr)?;
-                let pg_type = type_expr_to_pg(&tc.ty)?;
+                let qname = match tc.ty.module.as_deref() {
+                    Some(m) => format!("{}::{}", m, tc.ty.name),
+                    None => tc.ty.name.clone(),
+                };
+                let pg_type = if let Some(ed) = self.resolve_enum(&qname) {
+                    format!("\"{}\".\"{}\"", ed.module, ed.name)
+                } else {
+                    type_expr_to_pg(&tc.ty)?
+                };
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
             }
 
@@ -3092,7 +3116,15 @@ impl<'a> Compiler<'a> {
 
             Expr::TypeCast(tc) => {
                 let inner = self.compile_expr(&tc.expr, td, alias)?;
-                let pg_type = type_expr_to_pg(&tc.ty)?;
+                let qname = match tc.ty.module.as_deref() {
+                    Some(m) => format!("{}::{}", m, tc.ty.name),
+                    None => tc.ty.name.clone(),
+                };
+                let pg_type = if let Some(ed) = self.resolve_enum(&qname) {
+                    format!("\"{}\".\"{}\"", ed.module, ed.name)
+                } else {
+                    type_expr_to_pg(&tc.ty)?
+                };
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
             }
 
