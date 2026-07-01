@@ -49,6 +49,7 @@ pub enum Token {
     // Literals
     IntLit(i64),
     FloatLit(f64),
+    DecimalLit(String),
     StrLit(String),
 
     // Punctuation
@@ -160,9 +161,13 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self, pos: Position) -> Result<Token, PyQLSyntaxError> {
         let ch = self.current();
 
-        // String literals
+        // String literals (including raw: r'...' / r"...")
         if ch == b'\'' || ch == b'"' {
             return self.lex_string(pos);
+        }
+        if ch == b'r' && self.peek().map_or(false, |c| c == b'\'' || c == b'"') {
+            self.advance(); // consume 'r'
+            return self.lex_raw_string(pos);
         }
 
         // Numeric literals
@@ -320,15 +325,41 @@ impl<'a> Lexer<'a> {
                 }
             }
             let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
+            // `n` suffix → decimal literal (e.g. 123.45n)
+            if self.pos < self.input.len() && self.input[self.pos] == b'n' {
+                self.advance();
+                return Ok(Token::DecimalLit(s.to_string()));
+            }
             s.parse::<f64>()
                 .map(Token::FloatLit)
                 .map_err(|_| self.err(pos, &format!("invalid float '{s}'")))
         } else {
             let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
+            // `n` suffix → decimal literal (e.g. 42n)
+            if self.pos < self.input.len() && self.input[self.pos] == b'n' {
+                self.advance();
+                return Ok(Token::DecimalLit(s.to_string()));
+            }
             s.parse::<i64>()
                 .map(Token::IntLit)
                 .map_err(|_| self.err(pos, &format!("integer overflow '{s}'")))
         }
+    }
+
+    fn lex_raw_string(&mut self, pos: Position) -> Result<Token, PyQLSyntaxError> {
+        let quote = self.advance(); // consume the opening quote
+        let mut buf = String::new();
+        loop {
+            if self.pos >= self.input.len() {
+                return Err(self.err(pos, "unterminated raw string literal"));
+            }
+            let ch = self.advance();
+            if ch == quote {
+                break;
+            }
+            buf.push(ch as char);
+        }
+        Ok(Token::StrLit(buf))
     }
 
     fn lex_string(&mut self, pos: Position) -> Result<Token, PyQLSyntaxError> {
