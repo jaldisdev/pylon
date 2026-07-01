@@ -120,6 +120,8 @@ pub enum Expr {
     TupleIndex { expr: Box<Expr>, index: usize },
     /// `detached expr` — evaluate `expr` independently of the current implicit scope.
     Detached(Box<Expr>),
+    /// `expr is TypeName` — runtime type check; returns bool.
+    TypeIs { expr: Box<Expr>, ty: TypeExpr },
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────

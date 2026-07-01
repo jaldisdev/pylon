@@ -2,7 +2,7 @@ use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
     IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
-    IrPathSelect, IrPolyImplementor, IrScalarField, IrSelect, IrShapeField, IrSingleLinkField,
+    IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField,
     IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
@@ -649,6 +649,16 @@ fn emit_array_source(src: &IrArraySource) -> String {
             append_filter(&mut sql, &ps.filter);
             format!("ARRAY({})", sql)
         }
+        IrArraySource::RawExpr { source, poly_implementors, poly_columns, expr } => {
+            let from_sql = if !poly_implementors.is_empty() {
+                format!("(\n{}\n) AS {}",
+                    emit_poly_union(poly_implementors, poly_columns),
+                    qi(&source.alias))
+            } else {
+                format!("{} AS {}", source_ref(source), qi(&source.alias))
+            };
+            format!("ARRAY(SELECT {} FROM {})", emit_expr(expr), from_sql)
+        }
     }
 }
 
@@ -750,9 +760,27 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
     SqlOutput { sql, shape: ShapeDescriptor { root } }
 }
 
+fn emit_poly_union_type_only(implementors: &[IrPolyImplementor]) -> String {
+    implementors.iter().map(|imp| {
+        format!(
+            "    SELECT {}::text AS \"__type__\" FROM {}",
+            sql_str(&imp.type_name),
+            qn(&imp.module, &imp.table),
+        )
+    }).collect::<Vec<_>>().join("\n    UNION ALL\n")
+}
+
 fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     let distinct = if sel.distinct { "DISTINCT " } else { "" };
-    let from_sql = emit_path_joins(&sel.root, &sel.joins);
+    let from_sql = if !sel.poly_implementors.is_empty() {
+        format!(
+            "(\n{}\n) AS {}",
+            emit_poly_union_type_only(&sel.poly_implementors),
+            qi(&sel.root.alias),
+        )
+    } else {
+        emit_path_joins(&sel.root, &sel.joins)
+    };
 
     let (result_expr, shape_root) = match &sel.result {
         IrPathResult::Scalar(ir_expr) => {
@@ -1188,6 +1216,27 @@ fn emit_returning_shape(
 
 // ── Shape emission ───────────────────────────────────────────────────────────
 
+fn emit_scalar_set(f: &IrScalarSetField, pos: usize) -> (String, ShapeNode) {
+    let from_sql = if !f.poly_implementors.is_empty() {
+        format!("(\n{}\n) AS {}",
+            emit_poly_union(&f.poly_implementors, &f.poly_columns),
+            qi(&f.source.alias))
+    } else {
+        format!("{} AS {}", source_ref(&f.source), qi(&f.source.alias))
+    };
+    let sql = format!(
+        "(SELECT COALESCE(array_agg(ROW({})::record), ARRAY[]::record[]) FROM {})",
+        emit_expr(&f.bool_expr),
+        from_sql,
+    );
+    let node = ShapeNode::Array {
+        name: f.alias.clone(),
+        position: pos,
+        element: Box::new(ShapeNode::Scalar { name: String::new(), position: 0 }),
+    };
+    (sql, node)
+}
+
 /// Build SQL expressions and ShapeNodes for `fields`, starting at position 1
 /// (position 0 is always the type discriminator, added by the caller).
 fn build_shape(
@@ -1218,6 +1267,11 @@ fn build_shape(
             IrShapeField::Computed(f) => {
                 exprs.push(emit_expr(&f.expr));
                 nodes.push(ShapeNode::Scalar { name: f.alias.clone(), position: pos });
+            }
+            IrShapeField::ScalarSet(f) => {
+                let (sql, node) = emit_scalar_set(f, pos);
+                exprs.push(sql);
+                nodes.push(node);
             }
         }
     }

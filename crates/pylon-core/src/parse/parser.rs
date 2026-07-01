@@ -430,6 +430,11 @@ impl Parser {
             Token::Like => BinOpKind::Like,
             Token::Ilike => BinOpKind::Ilike,
             Token::In => BinOpKind::In,
+            Token::Is => {
+                self.advance();
+                let ty = self.parse_type_expr()?;
+                return Ok(Expr::TypeIs { expr: Box::new(left), ty });
+            }
             Token::Not => {
                 // NOT LIKE / NOT ILIKE / NOT IN
                 match self.peek_ahead(1) {

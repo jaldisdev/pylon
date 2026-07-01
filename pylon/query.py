@@ -98,10 +98,11 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         return raw
 
     if kind == "array":
+        from pylon.datatypes import PylonSet
         arr = value[node["position"]] or []
         element = node["element"]
         # Array elements are anonymous records; decode each one as a root object.
-        return [_decode(item, {**element, "position": 0}, registry) for item in arr]
+        return PylonSet(_decode(item, {**element, "position": 0}, registry) for item in arr)
 
     if kind == "tuple":
         return tuple(_decode(value, e, registry) for e in node["elements"])

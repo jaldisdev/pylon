@@ -336,7 +336,10 @@ def _value(v: object) -> str:
     if v is None:
         return f"{_brace('{')}{_brace('}')}"
     if isinstance(v, list):
+        from pylon.datatypes import PylonSet
         inner = ", ".join(_value(item) for item in v)
+        if isinstance(v, PylonSet):
+            return f"{_brace('{')}{inner}{_brace('}')}"
         return f"{_brace('[')}{inner}{_brace(']')}"
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         from pylon.schema._named_tuples import NamedTuple as PylonNamedTuple
@@ -398,6 +401,10 @@ def _pformat_value(v: object, depth: int, max_width: int) -> str:
         return _pformat_object(qname, fields, depth, max_width)
     if isinstance(v, dict):
         return _pformat_object("", v, depth, max_width)
+    from pylon.datatypes import PylonSet
+    if isinstance(v, PylonSet):
+        elem_strs = [_pformat_value(e, depth + 1, max_width) for e in v]
+        return _format_set(elem_strs)
     return _value(v)
 
 
