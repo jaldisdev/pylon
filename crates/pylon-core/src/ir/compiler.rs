@@ -17,7 +17,7 @@ use super::{
     IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
-    IrScalarField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
+    IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
     IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup,
 };
 
@@ -465,6 +465,67 @@ impl<'a> Compiler<'a> {
                     return self.compile_expr_as_path_select(s, result, &root, distinct)
                         .map(IrStmt::PathSelect);
                 }
+                // `select TypeName is CheckType` — iterate source type, return bool per row.
+                if let Expr::TypeIs { expr, ty } = result {
+                    if let Expr::Path(p) = expr.as_ref() {
+                        if !p.partial && p.steps.len() == 1 {
+                            if let ast::PathStep::Name(src_name) = &p.steps[0] {
+                                let src_td = self.resolve_type(src_name)?;
+                                {
+                                    let src_qname = format!("{}::{}", src_td.module, src_td.name);
+                                    let check_module = ty.module.as_deref().unwrap_or(&src_td.module);
+                                    let check_name = format!("{}::{}", check_module, ty.name);
+                                    self.resolve_type(&check_name)?;
+                                    let check_qname = check_name;
+                                    let src_table = src_td.table.clone();
+                                    let src_abstract = src_td.abstract_;
+                                    let src_materialized = src_td.materialized;
+                                    let src_interfaces = src_td.interfaces.clone();
+                                    let src_alias = self.fresh_alias();
+                                    let poly_implementors = if src_abstract && src_materialized {
+                                        self.find_poly_implementors(&src_qname)
+                                    } else {
+                                        vec![]
+                                    };
+                                    let bool_expr = if check_qname == src_qname
+                                        || src_interfaces.iter().any(|i| i == &check_qname) {
+                                        IrExpr::Literal(IrLiteral::Bool(true))
+                                    } else if src_abstract && src_materialized {
+                                        IrExpr::BinOp(Box::new(IrBinOp {
+                                            left: IrExpr::ColumnRef {
+                                                alias: src_alias.clone(),
+                                                column: "__type__".into(),
+                                                pg_type: "text".into(),
+                                            },
+                                            op: crate::parse::ast::BinOpKind::Eq,
+                                            right: IrExpr::Literal(IrLiteral::Str(check_qname)),
+                                        }))
+                                    } else {
+                                        IrExpr::Literal(IrLiteral::Bool(false))
+                                    };
+                                    let ps = IrPathSelect {
+                                        root: IrSource {
+                                            type_name: src_qname,
+                                            table: src_table,
+                                            alias: src_alias,
+                                        },
+                                        joins: vec![],
+                                        result: IrPathResult::Scalar(bool_expr),
+                                        filter: s.filter.as_ref()
+                                            .map(|_| Err(self.type_err("FILTER is not supported on type-is SELECT")))
+                                            .transpose()?,
+                                        order_by: vec![],
+                                        offset: None,
+                                        limit: None,
+                                        distinct,
+                                        poly_implementors,
+                                    };
+                                    return Ok(IrStmt::PathSelect(ps));
+                                }
+                            }
+                        }
+                    }
+                }
                 // Catch mixed object/scalar UNION before dispatching further.
                 if let Err(e) = self.check_union_type_compat(result) {
                     return Err(e);
@@ -657,7 +718,7 @@ impl<'a> Compiler<'a> {
                     };
                     let (filter, order_by, offset, limit) =
                         self.compile_path_modifiers(sel, owner_td, &target_alias)?;
-                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
                 }
                 current_td = owner_td;
                 current_alias = target_alias;
@@ -702,6 +763,7 @@ impl<'a> Compiler<'a> {
                             offset,
                             limit,
                             distinct,
+                            poly_implementors: vec![],
                         });
                     }
                     return Err(self.type_err(&format!(
@@ -715,7 +777,7 @@ impl<'a> Compiler<'a> {
                 });
                 let (filter, order_by, offset, limit) =
                     self.compile_path_modifiers(sel, current_td, &current_alias)?;
-                return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
             }
 
             // Single link.
@@ -742,7 +804,7 @@ impl<'a> Compiler<'a> {
                     };
                     let (filter, order_by, offset, limit) =
                         self.compile_path_modifiers(sel, target_td, &target_alias)?;
-                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
                 }
                 current_td = target_td;
                 current_alias = target_alias;
@@ -811,7 +873,7 @@ impl<'a> Compiler<'a> {
                     };
                     let (filter, order_by, offset, limit) =
                         self.compile_path_modifiers(sel, target_td, &target_alias)?;
-                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct });
+                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
                 }
                 current_td = target_td;
                 current_alias = target_alias;
@@ -986,6 +1048,7 @@ impl<'a> Compiler<'a> {
             offset,
             limit,
             distinct,
+            poly_implementors: vec![],
         })
     }
 
@@ -2694,6 +2757,22 @@ impl<'a> Compiler<'a> {
                 }
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
+            // Cross-scope TypeIs: promote to set-valued shape field.
+            if let IrExpr::ArrayFromSelect(src) = ir {
+                if let IrArraySource::RawExpr { source, poly_implementors, poly_columns, expr } = *src {
+                    return Ok(IrShapeField::ScalarSet(IrScalarSetField {
+                        alias: field_name.to_string(),
+                        source,
+                        poly_implementors,
+                        poly_columns,
+                        bool_expr: expr,
+                    }));
+                }
+                return Ok(IrShapeField::Computed(IrComputedField {
+                    alias: field_name.to_string(),
+                    expr: IrExpr::ArrayFromSelect(src),
+                }));
+            }
             return Ok(IrShapeField::Computed(IrComputedField {
                 alias: field_name.to_string(),
                 expr: ir,
@@ -3119,6 +3198,127 @@ impl<'a> Compiler<'a> {
                 // No type-rooted path — compile inner without schema binding
                 self.compile_free_expr(inner)
             }
+
+            Expr::TypeIs { expr, ty } => self.compile_type_is(expr, ty, td, alias),
+        }
+    }
+
+    fn compile_type_is(
+        &mut self,
+        expr: &Expr,
+        ty: &ast::TypeExpr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let self_qname = format!("{}::{}", td.module, td.name);
+
+        // Determine whether `expr` refers to the current scope or a different type.
+        // A 1-step absolute path matching the current td → same scope.
+        let (source_qname, cross_scope) = match expr {
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if n == &td.name || n == &self_qname {
+                        (self_qname.clone(), false)
+                    } else {
+                        // Attempt to resolve as another type.
+                        match self.resolve_type(n) {
+                            Ok(other) => (format!("{}::{}", other.module, other.name), true),
+                            Err(_) => (self_qname.clone(), false),
+                        }
+                    }
+                } else {
+                    (self_qname.clone(), false)
+                }
+            }
+            _ => (self_qname.clone(), false),
+        };
+
+        let check_module = ty.module.as_deref().unwrap_or(td.module.as_str());
+        let check_qname = format!("{}::{}", check_module, ty.name);
+        self.resolve_type(&check_qname)?;
+
+        if !cross_scope {
+            // Scalar bool using the current alias.
+            return Ok(self.type_check_bool_expr(&source_qname, &check_qname, td, alias));
+        }
+
+        // Cross-scope: ARRAY(SELECT bool_expr FROM source_table).
+        // Collect everything needed before calling fresh_alias (which needs &mut self).
+        let (source_table, source_abstract, source_materialized,
+             poly_implementors, poly_columns) = {
+            let src_td = self.resolve_type(&source_qname)?;
+            let table = src_td.table.clone();
+            let abstract_ = src_td.abstract_;
+            let materialized = src_td.materialized;
+            let imps = if abstract_ && materialized {
+                self.find_poly_implementors(&source_qname)
+            } else {
+                vec![]
+            };
+            let cols = if abstract_ && materialized {
+                src_td.properties.iter().map(|p| p.name.clone())
+                    .chain(src_td.links.iter().map(|l| format!("{}_id", l.name)))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
+            (table, abstract_, materialized, imps, cols)
+        };
+
+        let src_alias = self.fresh_alias();
+
+        let bool_expr = if check_qname == source_qname {
+            IrExpr::Literal(IrLiteral::Bool(true))
+        } else if source_abstract && source_materialized {
+            IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: src_alias.clone(),
+                    column: "__type__".into(),
+                    pg_type: "text".into(),
+                },
+                op: crate::parse::ast::BinOpKind::Eq,
+                right: IrExpr::Literal(IrLiteral::Str(check_qname)),
+            }))
+        } else {
+            IrExpr::Literal(IrLiteral::Bool(false))
+        };
+
+        let source = IrSource {
+            type_name: source_qname,
+            table: source_table,
+            alias: src_alias,
+        };
+
+        Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::RawExpr {
+            source,
+            poly_implementors,
+            poly_columns,
+            expr: bool_expr,
+        })))
+    }
+
+    /// Build the boolean `IrExpr` for `source_qname is check_qname` in the current row's scope.
+    fn type_check_bool_expr(
+        &self,
+        source_qname: &str,
+        check_qname: &str,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> IrExpr {
+        if check_qname == source_qname || td.interfaces.iter().any(|i| i == check_qname) {
+            IrExpr::Literal(IrLiteral::Bool(true))
+        } else if td.abstract_ && td.materialized {
+            IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: alias.to_string(),
+                    column: "__type__".into(),
+                    pg_type: "text".into(),
+                },
+                op: crate::parse::ast::BinOpKind::Eq,
+                right: IrExpr::Literal(IrLiteral::Str(check_qname.to_string())),
+            }))
+        } else {
+            IrExpr::Literal(IrLiteral::Bool(false))
         }
     }
 

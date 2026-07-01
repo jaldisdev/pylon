@@ -69,6 +69,9 @@ pub struct IrPathSelect {
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
     pub distinct: bool,
+    /// Non-empty when the root is a polymorphic (abstract+materialized) type.
+    /// The FROM clause uses a UNION ALL of these instead of the root table directly.
+    pub poly_implementors: Vec<IrPolyImplementor>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +140,14 @@ pub enum IrArraySource {
     Select(IrSelect),
     /// Inner is a path traversal SELECT; scalar result is the array element.
     PathSelect(IrPathSelect),
+    /// `ARRAY(SELECT expr FROM source)` — cross-scope type-is iteration.
+    RawExpr {
+        source: IrSource,
+        /// Non-empty when source is polymorphic; replaces `source` with a UNION ALL.
+        poly_implementors: Vec<IrPolyImplementor>,
+        poly_columns: Vec<String>,
+        expr: IrExpr,
+    },
 }
 
 // ── SELECT ──────────────────────────────────────────────────────────────────────
@@ -186,12 +197,24 @@ pub struct IrSource {
     pub alias: String,
 }
 
+/// A set-valued scalar computed field from cross-scope `TypeIs`.
+/// Emits `COALESCE(array_agg(ROW(bool_expr)::record), ARRAY[]::record[]) FROM source`.
+#[derive(Debug, Clone)]
+pub struct IrScalarSetField {
+    pub alias: String,
+    pub source: IrSource,
+    pub poly_implementors: Vec<IrPolyImplementor>,
+    pub poly_columns: Vec<String>,
+    pub bool_expr: IrExpr,
+}
+
 #[derive(Debug, Clone)]
 pub enum IrShapeField {
     Scalar(IrScalarField),
     SingleLink(IrSingleLinkField),
     MultiLink(IrMultiLinkField),
     Computed(IrComputedField),
+    ScalarSet(IrScalarSetField),
 }
 
 /// A property column included in the output shape.

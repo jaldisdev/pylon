@@ -4,6 +4,13 @@ from typing import Any
 _object_class_cache: dict[tuple[str, ...], type] = {}
 
 
+class PylonSet(list):
+    """A Pylon set value — displayed as {a, b, c} instead of [a, b, c].
+
+    Used for multi-link fields and any other set-valued computed results.
+    """
+
+
 class Object:
     """Result container for free-form PyQL queries.
 
