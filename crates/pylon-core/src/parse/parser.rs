@@ -704,6 +704,14 @@ impl Parser {
             // Literals
             Token::IntLit(n) => { self.advance(); Ok(Expr::Literal(Literal::Int(n))) }
             Token::FloatLit(f) => { self.advance(); Ok(Expr::Literal(Literal::Float(f))) }
+            Token::DecimalLit(s) => {
+                self.advance();
+                // Emit as <decimal>str — compiles to 'value'::numeric
+                Ok(Expr::TypeCast(Box::new(TypeCast {
+                    ty: TypeExpr { module: Some("std".to_string()), name: "decimal".to_string() },
+                    expr: Expr::Literal(Literal::Str(s)),
+                })))
+            }
             Token::StrLit(s) => { self.advance(); Ok(Expr::Literal(Literal::Str(s))) }
             Token::True => { self.advance(); Ok(Expr::Literal(Literal::Bool(true))) }
             Token::False => { self.advance(); Ok(Expr::Literal(Literal::Bool(false))) }

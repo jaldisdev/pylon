@@ -63,6 +63,14 @@ fn plpgsql_stable_nullable(name: &'static str, body: &'static str) -> ImplStrate
     })
 }
 
+/// PL/pgSQL STABLE, NOT STRICT, returning `boolean` (for assert 2-arg).
+fn plpgsql_stable_nullable_bool(name: &'static str, body: &'static str) -> ImplStrategy {
+    ImplStrategy::PylonFunction(PylonFnDef {
+        name, language: SqlLanguage::PlPgSql, volatility: FnVolatility::Stable,
+        strict: false, returns_override: Some("boolean"), body,
+    })
+}
+
 /// PL/pgSQL STABLE, NOT STRICT, returning `anyelement` (for assert_single 2-arg).
 fn plpgsql_stable_nullable_elem(name: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
@@ -182,6 +190,29 @@ BEGIN
         RAISE EXCEPTION USING
             MESSAGE = coalesce($2, 'assert_distinct: duplicate elements in set'),
             ERRCODE = 'P0002';
+    END IF;
+    RETURN $1;
+END"#)),
+
+        f("std", "assert",
+            vec![p("condition", Bool)],
+            Bool,
+            plpgsql_stable_returns("assert", "boolean", r#"BEGIN
+    IF NOT $1 THEN
+        RAISE EXCEPTION 'assert: assertion failed'
+            USING ERRCODE = 'P0001';
+    END IF;
+    RETURN $1;
+END"#)),
+
+        f("std", "assert",
+            vec![p("condition", Bool), p("msg", Str)],
+            Bool,
+            plpgsql_stable_nullable_bool("assert", r#"BEGIN
+    IF $1 IS NULL OR NOT $1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = coalesce($2, 'assert: assertion failed'),
+            ERRCODE = 'P0001';
     END IF;
     RETURN $1;
 END"#)),
