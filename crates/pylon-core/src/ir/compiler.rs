@@ -395,8 +395,10 @@ impl<'a> Compiler<'a> {
                 }
 
                 // <Module::Type>expr — schema object lookup by id.
+                // Stdlib modules are handled by compile_free_expr; only user schema modules route here.
+                const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector"];
                 if let Expr::TypeCast(tc) = result {
-                    if tc.ty.module.as_deref().map(|m| m != "std").unwrap_or(false) {
+                    if tc.ty.module.as_deref().map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false) {
                         return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
                     }
                 }
@@ -4101,6 +4103,17 @@ fn path_leaf(p: &ast::Path) -> Result<&str, PyQLError> {
 
 /// Map a PyQL type expression to a PostgreSQL type string.
 fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
+    // pgvector:: types map directly to PostgreSQL types.
+    if ty.module.as_deref() == Some("pgvector") {
+        return match ty.name.as_str() {
+            "vector" => Ok("vector".to_string()),
+            other => Err(PyQLError::Type(PyQLTypeError {
+                message: format!("unknown pgvector type '{other}'; valid types are: vector"),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+    }
+
     // cal:: types map directly to PostgreSQL types.
     if ty.module.as_deref() == Some("cal") {
         let pg = match ty.name.as_str() {

@@ -2374,4 +2374,44 @@ mod tests {
             assert!(matches!(&key_nodes[0], crate::query::ShapeNode::Scalar { name, .. } if name == "decade"));
         }
     }
+
+    #[test]
+    fn test_pgvector_cast_emits_vector_type() {
+        let out = compile_and_emit("SELECT <pgvector::vector>[1.0, 2.0, 3.0]");
+        assert!(out.sql.contains("::vector"), "expected ::vector cast, got:\n{}", out.sql);
+        assert!(out.sql.contains("ARRAY["), "expected ARRAY literal, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_pgvector_euclidean_distance_emits_l2_operator() {
+        let out = compile_and_emit(
+            "SELECT pgvector::euclidean_distance(<pgvector::vector>[1.0, 2.0], <pgvector::vector>[3.0, 4.0])",
+        );
+        assert!(out.sql.contains("<->"), "expected <-> operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_pgvector_cosine_distance_emits_cosine_operator() {
+        let out = compile_and_emit(
+            "SELECT pgvector::cosine_distance(<pgvector::vector>[1.0, 2.0], <pgvector::vector>[3.0, 4.0])",
+        );
+        assert!(out.sql.contains("<=>"), "expected <=> operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_pgvector_neg_inner_product_emits_ip_operator() {
+        let out = compile_and_emit(
+            "SELECT pgvector::neg_inner_product(<pgvector::vector>[1.0, 2.0], <pgvector::vector>[3.0, 4.0])",
+        );
+        assert!(out.sql.contains("<#>"), "expected <#> operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_pgvector_inner_product_negates_ip_operator() {
+        let out = compile_and_emit(
+            "SELECT pgvector::inner_product(<pgvector::vector>[1.0, 2.0], <pgvector::vector>[3.0, 4.0])",
+        );
+        assert!(out.sql.contains("<#>"), "expected <#> operator, got:\n{}", out.sql);
+        assert!(out.sql.contains("0.0"), "expected negation of <#>, got:\n{}", out.sql);
+    }
 }
