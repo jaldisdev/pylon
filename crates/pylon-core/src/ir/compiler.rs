@@ -4101,6 +4101,25 @@ fn path_leaf(p: &ast::Path) -> Result<&str, PyQLError> {
 
 /// Map a PyQL type expression to a PostgreSQL type string.
 fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
+    // cal:: types map directly to PostgreSQL types.
+    if ty.module.as_deref() == Some("cal") {
+        let pg = match ty.name.as_str() {
+            "local_datetime" => "timestamp",
+            "local_date"     => "date",
+            "local_time"     => "time",
+            "relative_duration" | "date_duration" => "interval",
+            other => return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "unknown cal type '{other}'; \
+                     valid types are: local_datetime, local_date, local_time, \
+                     relative_duration, date_duration"
+                ),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+        return Ok(pg.to_string());
+    }
+
     let name = match ty.module.as_deref() {
         Some("std") | None => ty.name.as_str(),
         Some(m) => {
