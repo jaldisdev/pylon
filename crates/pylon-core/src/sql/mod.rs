@@ -165,11 +165,14 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         let cte_sql = emit_dml_as_cte_source(dml);
         format!("WITH \"_dml\" AS (\n{}\n)\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
             cte_sql, distinct, tuple, qi(alias))
-    } else if sel.polymorphic {
+    } else if sel.polymorphic && !sel.source.table.starts_with("@cte:") {
+        // Polymorphic interface with no CTE indirection: fan out to implementor tables.
         let union_sql = emit_poly_union(&sel.poly_implementors, &sel.poly_columns);
         format!("SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
             distinct, tuple, union_sql, qi(alias))
     } else {
+        // Concrete table or CTE (pre-filtered): query directly.
+        // For CTE-backed polymorphic sources, __type__ is already present in the CTE result.
         format!("SELECT {}(\n    {}\n) AS result\nFROM {} AS {}",
             distinct, tuple, source_ref(&sel.source), qi(alias))
     };
@@ -252,11 +255,16 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
         IrStmt::Select(inner) => {
             // SELECT-over-SELECT: expose raw columns so the outer SELECT can
             // project its own shape from them, mirroring DML's RETURNING *.
-            let mut sql = format!(
-                "    SELECT * FROM {} AS {}",
-                source_ref(&inner.source),
-                qi(&inner.source.alias),
-            );
+            let from = if inner.polymorphic && !inner.source.table.starts_with("@cte:") {
+                format!(
+                    "(\n{}\n    ) AS {}",
+                    emit_poly_union(&inner.poly_implementors, &inner.poly_columns),
+                    qi(&inner.source.alias),
+                )
+            } else {
+                format!("{} AS {}", source_ref(&inner.source), qi(&inner.source.alias))
+            };
+            let mut sql = format!("    SELECT * FROM {}", from);
             append_filter(&mut sql, &inner.filter);
             append_order_by(&mut sql, &inner.order_by);
             append_offset_limit(&mut sql, &inner.offset, &inner.limit);
