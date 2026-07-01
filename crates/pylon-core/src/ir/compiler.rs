@@ -397,6 +397,38 @@ impl<'a> Compiler<'a> {
                     return Ok(ir);
                 }
 
+                // (<Module::Type>expr) { shape } — parenthesised id-lookup with shape.
+                // The parens are stripped by the parser, leaving Shape { expr: TypeCast }.
+                if let Expr::Shape(sh) = result {
+                    if let Some(Expr::TypeCast(tc)) = sh.expr.as_ref() {
+                        if tc.ty.module.as_deref().map(|m| !["std","cal","math","sys","pgvector"].contains(&m)).unwrap_or(false) {
+                            let id_filter = Expr::BinOp(Box::new(ast::BinOp {
+                                left: Expr::Path(ast::Path::relative("id")),
+                                op: ast::BinOpKind::Eq,
+                                right: tc.expr.clone(),
+                            }));
+                            let merged_filter = match &s.filter {
+                                None => Some(id_filter),
+                                Some(existing) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                                    left: id_filter,
+                                    op: ast::BinOpKind::And,
+                                    right: existing.clone(),
+                                }))),
+                            };
+                            let synthetic = ast::SelectStmt {
+                                result: Expr::Shape(Box::new(ast::ShapeExpr {
+                                    expr: Some(Expr::Path(ast::Path::absolute(&tc.ty.name))),
+                                    elements: sh.elements.clone(),
+                                })),
+                                filter: merged_filter,
+                                order_by: s.order_by.clone(),
+                                offset: s.offset.clone(),
+                                limit: s.limit.clone(),
+                            };
+                            return self.compile_select(&synthetic, distinct).map(IrStmt::Select);
+                        }
+                    }
+                }
                 // <Module::Type>expr — schema object lookup by id, or enum cast.
                 // Stdlib modules are handled by compile_free_expr; only user schema modules route here.
                 const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector"];
