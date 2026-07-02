@@ -1,5 +1,5 @@
-use crate::error::PyQLError;
-use crate::schema::{DeleteAction, DeleteSide, OnDeletePolicy, SchemaDescriptor, TypeDescriptor, TypeConstraint};
+use crate::error::{PyQLError, PyQLFragmentError};
+use crate::schema::{DeleteAction, DeleteSide, FunctionDescriptor, OnDeletePolicy, SchemaDescriptor, TypeDescriptor, TypeConstraint};
 use std::collections::{BTreeSet, HashMap};
 
 /// Export the full schema as a PostgreSQL DDL string.
@@ -39,6 +39,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_plain_indexes(schema, &mut out);
     emit_triggers(schema, &mut out);
     emit_interface_views(schema, &mut out);
+    emit_functions(schema, &mut out)?;
 
     Ok(out)
 }
@@ -619,6 +620,92 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
+// ── Phase 12: user-defined functions ─────────────────────────────────────────
+
+fn emit_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
+    for fd in &schema.functions {
+        let ddl = emit_one_function(fd, schema)?;
+        out.push_str(&ddl);
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Result<String, PyQLError> {
+    use crate::ir::compile_fn_body;
+    use crate::sql::emit_fn_body;
+
+    // Compile the body PyQL to an IR statement.
+    let ir_stmt = compile_fn_body(fd, schema).map_err(|e| {
+        let msg = format!("error in function '{}::{}' body: {}", fd.module, fd.name, e);
+        PyQLError::Fragment(PyQLFragmentError {
+            message: msg,
+            context: format!("{}::{}", fd.module, fd.name),
+            position: crate::error::Position { line: 0, col: 0 },
+        })
+    })?;
+
+    // Emit the raw SQL body.
+    let body_sql = emit_fn_body(&ir_stmt);
+
+    // Parameter list: "name" pg_type, ...
+    let params_sql = fd.params.iter()
+        .map(|p| format!("{} {}", qi(&p.name), p.pg_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // RETURNS clause.
+    let returns_sql = if fd.return_is_object {
+        // Object-returning: look up the return type to build RETURNS TABLE columns.
+        let type_columns = emit_fn_return_table(fd, schema);
+        if fd.return_is_set {
+            format!("TABLE({})", type_columns)
+        } else {
+            // Single-object return: PostgreSQL doesn't have a good way to express
+            // "optional single row" in SQL functions, so use TABLE (LIMIT 1 in body).
+            format!("TABLE({})", type_columns)
+        }
+    } else if fd.return_is_set {
+        format!("SETOF {}", fd.return_pg_type)
+    } else {
+        fd.return_pg_type.clone()
+    };
+
+    let volatility_kw = match fd.volatility.as_str() {
+        "immutable" => "IMMUTABLE",
+        "stable" => "STABLE",
+        _ => "VOLATILE",
+    };
+
+    Ok(format!(
+        "CREATE OR REPLACE FUNCTION {fn_name}({params})\nRETURNS {returns}\nLANGUAGE SQL {vol}\nAS $$\n    {body}\n$$;\n",
+        fn_name = qn(&fd.module, &fd.name),
+        params = params_sql,
+        returns = returns_sql,
+        vol = volatility_kw,
+        body = body_sql,
+    ))
+}
+
+fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> String {
+    let type_name = &fd.return_pg_type; // qualified type name for object returns
+    let td = schema.types.iter().find(|t| {
+        format!("{}::{}", t.module, t.name) == *type_name
+    });
+    let Some(td) = td else {
+        return "__type__ text, id uuid".to_string();
+    };
+
+    let mut cols: Vec<String> = Vec::new();
+    if fd.return_is_polymorphic {
+        cols.push("__type__ text".to_string());
+    }
+    for p in &td.properties {
+        cols.push(format!("{} {}", qi(&p.name), p.pg_type));
+    }
+    cols.join(", ")
+}
+
 /// Compile a schema-level PyQL expression fragment to a raw SQL expression string.
 ///
 /// Separate entry point from `compile()` — called only by the schema exporter,
@@ -629,6 +716,138 @@ pub(crate) fn compile_fragment(
     _schema: &SchemaDescriptor,
 ) -> Result<String, PyQLError> {
     todo!("Fragment compilation not yet implemented")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{
+        FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, SchemaDescriptor,
+        TypeDescriptor,
+    };
+
+    fn person_type() -> TypeDescriptor {
+        TypeDescriptor {
+            name: "Person".into(),
+            module: "default".into(),
+            table: "Person".into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: vec![
+                PropertyDescriptor {
+                    name: "id".into(),
+                    pg_type: "uuid".into(),
+                    nullable: false,
+                    default_sql: Some("uuidv7()".into()),
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: true,
+                    is_pk: true,
+                    is_readonly: true,
+                    rewrites: vec![],
+                },
+                PropertyDescriptor {
+                    name: "age".into(),
+                    pg_type: "int8".into(),
+                    nullable: true,
+                    default_sql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: false,
+                    is_pk: false,
+                    is_readonly: false,
+                    rewrites: vec![],
+                },
+            ],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            triggers: vec![],
+            junction: false,
+        }
+    }
+
+    fn minimal_schema(fns: Vec<FunctionDescriptor>) -> SchemaDescriptor {
+        SchemaDescriptor {
+            types: vec![person_type()],
+            scalars: vec![],
+            enums: vec![],
+            globals: vec![],
+            functions: fns,
+        }
+    }
+
+    #[test]
+    fn test_emit_scalar_function_ddl() {
+        let fd = FunctionDescriptor {
+            name: "mysum".into(),
+            module: "math".into(),
+            params: vec![
+                FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() },
+                FunctionParamDescriptor { name: "b".into(), pg_type: "int8".into() },
+            ],
+            return_pg_type: "int8".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+            body: "a + b".into(),
+        };
+        let schema = minimal_schema(vec![fd.clone()]);
+        let ddl = emit_one_function(&fd, &schema).unwrap();
+        assert!(ddl.contains("CREATE OR REPLACE FUNCTION \"math\".\"mysum\""), "got:\n{}", ddl);
+        assert!(ddl.contains("\"a\" int8, \"b\" int8"), "got:\n{}", ddl);
+        assert!(ddl.contains("RETURNS int8"), "got:\n{}", ddl);
+        assert!(ddl.contains("IMMUTABLE"), "got:\n{}", ddl);
+        assert!(ddl.contains("SELECT"), "got:\n{}", ddl);
+    }
+
+    #[test]
+    fn test_emit_setof_function_ddl() {
+        let fd = FunctionDescriptor {
+            name: "counters".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "int8".into(),
+            return_is_object: false,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "1".into(),
+        };
+        let schema = minimal_schema(vec![fd.clone()]);
+        let ddl = emit_one_function(&fd, &schema).unwrap();
+        assert!(ddl.contains("RETURNS SETOF int8"), "got:\n{}", ddl);
+        assert!(ddl.contains("STABLE"), "got:\n{}", ddl);
+    }
+
+    #[test]
+    fn test_emit_object_function_ddl() {
+        let fd = FunctionDescriptor {
+            name: "adults".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Person".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Person filter .age > 18".into(),
+        };
+        let schema = minimal_schema(vec![fd.clone()]);
+        let ddl = emit_one_function(&fd, &schema).unwrap();
+        assert!(ddl.contains("CREATE OR REPLACE FUNCTION \"default\".\"adults\"()"), "got:\n{}", ddl);
+        assert!(ddl.contains("RETURNS TABLE("), "got:\n{}", ddl);
+        assert!(ddl.contains("\"id\" uuid"), "got:\n{}", ddl);
+        assert!(ddl.contains("\"age\" int8"), "got:\n{}", ddl);
+        assert!(ddl.contains("STABLE"), "got:\n{}", ddl);
+        assert!(ddl.contains("SELECT * FROM"), "got:\n{}", ddl);
+    }
 }
 
 /// Enclosing context for compiling a schema-level PyQL fragment.

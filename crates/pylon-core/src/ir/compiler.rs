@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use super::{
     IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrGlobalCte, IrComputedGlobalCte,
+    IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrComputedGlobalCte,
     IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
@@ -65,6 +65,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         }
         IrStmt::For(f) => cte_stmt_type(&f.body),
         IrStmt::Group(g) => g.source.type_name.clone(),
+        IrStmt::FunctionSelect(fs) => fs.type_name.clone(),
     }
 }
 
@@ -84,6 +85,31 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
         limit: None,
     };
     c.compile_stmt(&Stmt::Select(fake_sel))
+}
+
+/// Compile the PyQL body of a user-defined function for DDL emission.
+///
+/// Sets `fn_params` on the compiler so that parameter names resolve as `FnParam`
+/// nodes rather than raising "expression is not valid in free SELECT context".
+pub fn compile_fn_body(
+    fn_desc: &crate::schema::FunctionDescriptor,
+    schema: &SchemaDescriptor,
+) -> Result<IrStmt, crate::error::PyQLError> {
+    use crate::parse;
+
+    let body = fn_desc.body.trim().to_string();
+    let body = if body.starts_with("select") || body.starts_with("SELECT") {
+        body
+    } else {
+        format!("select {}", body)
+    };
+
+    let ast = parse::parse(&body).map_err(|e| e)?;
+    let mut c = Compiler::new(schema);
+    for p in &fn_desc.params {
+        c.fn_params.insert(p.name.clone(), p.pg_type.clone());
+    }
+    c.compile_stmt(&ast)
 }
 
 /// Compile a single PyQL expression in the context of a named type.
@@ -111,6 +137,8 @@ struct Compiler<'a> {
     cte_types: HashMap<String, String>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
+    /// User-defined function parameters in scope (only set during body compilation).
+    fn_params: HashMap<String, String>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
     /// Non-fatal warnings collected during compilation.
@@ -125,6 +153,7 @@ impl<'a> Compiler<'a> {
             alias_counter: 0,
             cte_types: HashMap::new(),
             for_vars: HashMap::new(),
+            fn_params: HashMap::new(),
             global_ctes: vec![],
             warnings: vec![],
         }
@@ -395,6 +424,22 @@ impl<'a> Compiler<'a> {
                 // `select global name [{ shape }]` — inline the computed expression.
                 if let Some(ir) = self.try_compile_global_select(s, result, distinct)? {
                     return Ok(ir);
+                }
+
+                // select fn() { shape } — user-defined object-returning function with shape.
+                if let Expr::Shape(sh) = result {
+                    if let Some(Expr::FunctionCall(fc)) = sh.expr.as_ref() {
+                        if let Some(ir) = self.try_compile_fn_object_select(fc, &sh.elements, s, distinct)? {
+                            return Ok(IrStmt::FunctionSelect(ir));
+                        }
+                    }
+                }
+
+                // select fn() — bare user-defined object-returning function (no shape).
+                if let Expr::FunctionCall(fc) = result {
+                    if let Some(ir) = self.try_compile_fn_object_select(fc, &[], s, distinct)? {
+                        return Ok(IrStmt::FunctionSelect(ir));
+                    }
                 }
 
                 // (<Module::Type>expr) { shape } — parenthesised id-lookup with shape.
@@ -1731,7 +1776,7 @@ impl<'a> Compiler<'a> {
                 Err(self.type_err("expression is not valid in free SELECT context"))
             }
 
-            // CTE name or for-loop variable used as a value in free context
+            // CTE name, for-loop variable, or function parameter used as a value in free context
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
                     if self.for_vars.contains_key(n.as_str()) {
@@ -1740,6 +1785,9 @@ impl<'a> Compiler<'a> {
                     if let Some(t) = self.cte_types.get(n.as_str()) {
                         let scalar = !t.contains("::");
                         return Ok(IrExpr::CteRef { name: n.clone(), scalar });
+                    }
+                    if let Some(pg_type) = self.fn_params.get(n.as_str()) {
+                        return Ok(IrExpr::FnParam { name: n.clone(), pg_type: pg_type.clone() });
                     }
                 }
                 Err(self.type_err("expression is not valid in free SELECT context"))
@@ -4312,7 +4360,27 @@ impl<'a> Compiler<'a> {
                 _ => (module.map(str::to_string), name.to_string(), None),
             }
         } else {
-            let qualified = format!("{}::{}", module.unwrap_or("default"), name);
+            // Fall back to user-defined scalar functions.
+            let effective_module = module.unwrap_or("default");
+            let user_fn = self.schema.functions.iter().find(|f| {
+                let module_matches = module.map(|m| m == f.module.as_str()).unwrap_or(true);
+                module_matches && f.name == name && !f.return_is_object
+            });
+            if let Some(fd) = user_fn {
+                if fd.params.len() != args.len() {
+                    return Err(self.type_err(&format!(
+                        "function '{}::{}' expects {} argument(s), got {}",
+                        fd.module, fd.name, fd.params.len(), args.len()
+                    )));
+                }
+                return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    schema: Some(fd.module.clone()),
+                    name: fd.name.clone(),
+                    args,
+                    sql_template: None,
+                }));
+            }
+            let qualified = format!("{}::{}", effective_module, name);
             return Err(self.type_err(&format!(
                 "function '{qualified}' does not exist"
             )));
@@ -4324,6 +4392,93 @@ impl<'a> Compiler<'a> {
             args,
             sql_template,
         }))
+    }
+
+    // ── User-defined function helpers ─────────────────────────────────────────────
+
+    /// Try to compile `fn(args) { shape }` as a `FunctionSelect` for an object-returning
+    /// user function.  Returns `None` if no matching user function exists (so the caller
+    /// can fall through to other dispatch paths).
+    fn try_compile_fn_object_select(
+        &mut self,
+        fc: &ast::FunctionCall,
+        elements: &[ast::ShapeElement],
+        s: &ast::SelectStmt,
+        distinct: bool,
+    ) -> Result<Option<IrFunctionSelect>, PyQLError> {
+        use crate::schema::FunctionDescriptor;
+
+        let effective_module = fc.module.as_deref().unwrap_or("default");
+        let fd: Option<&FunctionDescriptor> = self.schema.functions.iter().find(|f| {
+            let module_matches = fc.module.as_deref().map(|m| m == f.module.as_str()).unwrap_or(true);
+            module_matches && f.name == fc.name && f.return_is_object
+        });
+        let fd = match fd {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if fd.params.len() != fc.args.len() {
+            return Err(self.type_err(&format!(
+                "function '{}::{}' expects {} argument(s), got {}",
+                fd.module, fd.name, fd.params.len(), fc.args.len()
+            )));
+        }
+
+        let fn_module = fd.module.clone();
+        let fn_name = fd.name.clone();
+        let return_type_name = fd.return_pg_type.clone(); // qualified type name for object returns
+        let polymorphic = fd.return_is_polymorphic;
+
+        let fn_args = fc.args.iter()
+            .map(|a| self.compile_free_expr(a))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let alias = self.fresh_alias();
+
+        // Resolve the return type to build the shape.
+        let td = self.resolve_type(&return_type_name)?;
+        let td = td.clone();
+
+        let (poly_implementors, poly_columns) = if polymorphic {
+            self.collect_poly_info(&return_type_name)
+        } else {
+            (vec![], vec![])
+        };
+
+        let td_module = td.module.clone();
+        // Build shape against the return type (treat alias as the source alias).
+        let shape = self.compile_shape(elements, &td, &alias, &td_module)?;
+        let (filter, order_by, offset, limit) = self.compile_path_modifiers(s, &td, &alias)?;
+
+        Ok(Some(IrFunctionSelect {
+            fn_module,
+            fn_name,
+            fn_args,
+            alias,
+            type_name: return_type_name,
+            polymorphic,
+            poly_implementors,
+            poly_columns,
+            shape,
+            filter,
+            order_by,
+            offset,
+            limit,
+            distinct,
+        }))
+    }
+
+    /// Collect poly_implementors and poly_columns for a polymorphic return type.
+    fn collect_poly_info(&self, type_name: &str) -> (Vec<IrPolyImplementor>, Vec<String>) {
+        let implementors = self.find_poly_implementors(type_name);
+        let columns = if let Some(td) = self.schema.types.iter().find(|t| {
+            format!("{}::{}", t.module, t.name) == type_name
+        }) {
+            td.properties.iter().map(|p| p.name.clone()).collect()
+        } else {
+            vec![]
+        };
+        (implementors, columns)
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────────────

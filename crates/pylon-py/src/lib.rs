@@ -869,6 +869,95 @@ impl GlobalDescriptor {
     }
 }
 
+// ── Function descriptors ────────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct FunctionParamDescriptor {
+    inner: core::schema::FunctionParamDescriptor,
+}
+
+#[pymethods]
+impl FunctionParamDescriptor {
+    #[new]
+    fn new(name: String, pg_type: String) -> Self {
+        Self { inner: core::schema::FunctionParamDescriptor { name, pg_type } }
+    }
+
+    #[getter]
+    fn name(&self) -> &str { &self.inner.name }
+
+    #[getter]
+    fn pg_type(&self) -> &str { &self.inner.pg_type }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct FunctionDescriptor {
+    inner: core::schema::FunctionDescriptor,
+}
+
+#[pymethods]
+impl FunctionDescriptor {
+    #[new]
+    #[pyo3(signature = (
+        name,
+        module,
+        params,
+        return_pg_type,
+        body,
+        *,
+        return_is_object = false,
+        return_is_set = false,
+        return_is_polymorphic = false,
+        volatility = "volatile"
+    ))]
+    fn new(
+        name: String,
+        module: String,
+        params: Vec<PyRef<FunctionParamDescriptor>>,
+        return_pg_type: String,
+        body: String,
+        return_is_object: bool,
+        return_is_set: bool,
+        return_is_polymorphic: bool,
+        volatility: &str,
+    ) -> Self {
+        Self {
+            inner: core::schema::FunctionDescriptor {
+                name,
+                module,
+                params: params.iter().map(|p| p.inner.clone()).collect(),
+                return_pg_type,
+                return_is_object,
+                return_is_set,
+                return_is_polymorphic,
+                volatility: volatility.to_string(),
+                body,
+            },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str { &self.inner.name }
+
+    #[getter]
+    fn module(&self) -> &str { &self.inner.module }
+
+    #[getter]
+    fn return_pg_type(&self) -> &str { &self.inner.return_pg_type }
+
+    #[getter]
+    fn return_is_object(&self) -> bool { self.inner.return_is_object }
+
+    #[getter]
+    fn return_is_set(&self) -> bool { self.inner.return_is_set }
+
+    #[getter]
+    fn volatility(&self) -> &str { &self.inner.volatility }
+
+    #[getter]
+    fn body(&self) -> &str { &self.inner.body }
+}
+
 /// Opaque Rust value built by the Python schema registry. Treat as immutable;
 /// recreate after schema changes.
 #[pyclass(module = "pylon._core", frozen)]
@@ -879,12 +968,13 @@ pub struct SchemaDescriptor {
 #[pymethods]
 impl SchemaDescriptor {
     #[new]
-    #[pyo3(signature = (*, types = None, scalars = None, enums = None, globals = None))]
+    #[pyo3(signature = (*, types = None, scalars = None, enums = None, globals = None, functions = None))]
     fn new(
         types: Option<Vec<PyRef<TypeDescriptor>>>,
         scalars: Option<Vec<PyRef<ScalarDescriptor>>>,
         enums: Option<Vec<PyRef<EnumDescriptor>>>,
         globals: Option<Vec<PyRef<GlobalDescriptor>>>,
+        functions: Option<Vec<PyRef<FunctionDescriptor>>>,
     ) -> Self {
         Self {
             inner: core::schema::SchemaDescriptor {
@@ -907,6 +997,11 @@ impl SchemaDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|g| g.inner.clone())
+                    .collect(),
+                functions: functions
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|f| f.inner.clone())
                     .collect(),
             },
         }
@@ -1150,6 +1245,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScalarDescriptor>()?;
     m.add_class::<EnumDescriptor>()?;
     m.add_class::<GlobalDescriptor>()?;
+    m.add_class::<FunctionParamDescriptor>()?;
+    m.add_class::<FunctionDescriptor>()?;
     m.add_class::<SchemaDescriptor>()?;
 
     // Query types

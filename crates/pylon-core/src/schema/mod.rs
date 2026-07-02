@@ -194,6 +194,34 @@ pub struct GlobalDescriptor {
     pub computed_expr: Option<String>,
 }
 
+// ── Function descriptors ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FunctionParamDescriptor {
+    pub name: String,
+    /// PostgreSQL type string, e.g. `int8`, `text`, `uuid`.
+    pub pg_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionDescriptor {
+    pub name: String,
+    pub module: String,
+    pub params: Vec<FunctionParamDescriptor>,
+    /// For scalar returns: the PG type (e.g. `int8`).
+    /// For object returns: the qualified type name (e.g. `default::Account`).
+    pub return_pg_type: String,
+    pub return_is_object: bool,
+    /// True when the return is `set[T]`.
+    pub return_is_set: bool,
+    /// True when the return type is a polymorphic interface (abstract + materialized).
+    pub return_is_polymorphic: bool,
+    /// "immutable" | "stable" | "volatile"
+    pub volatility: String,
+    /// PyQL expression string (the function body from the docstring).
+    pub body: String,
+}
+
 // ── Top-level schema ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -202,4 +230,5 @@ pub struct SchemaDescriptor {
     pub scalars: Vec<ScalarDescriptor>,
     pub enums: Vec<EnumDescriptor>,
     pub globals: Vec<GlobalDescriptor>,
+    pub functions: Vec<FunctionDescriptor>,
 }

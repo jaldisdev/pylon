@@ -1,6 +1,6 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
+    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
     IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField,
     IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
@@ -72,6 +72,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::Insert(ins) => emit_insert_stmt(ins),
                 IrStmt::Delete(del) => emit_delete_stmt(del),
                 IrStmt::Group(grp) => emit_group(grp),
+                IrStmt::FunctionSelect(sel) => emit_function_select(sel),
                 IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
@@ -271,6 +272,17 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql
         }
         IrStmt::FreeSelect(sel) => emit_free_select(sel).sql,
+        IrStmt::FunctionSelect(sel) => {
+            // Expose raw columns so the outer SELECT can project its own shape,
+            // mirroring how IrStmt::Select works as a CTE source.
+            let args_sql = sel.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+            let fn_call = format!("{}.{}({})", qi(&sel.fn_module), qi(&sel.fn_name), args_sql);
+            let mut sql = format!("    SELECT * FROM {} AS {}", fn_call, qi(&sel.alias));
+            append_filter(&mut sql, &sel.filter);
+            append_order_by(&mut sql, &sel.order_by);
+            append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+            sql
+        }
         IrStmt::For(_) | IrStmt::Group(_) => unreachable!("cannot appear as a CTE source"),
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
@@ -1692,6 +1704,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("({}->{})", emit_expr(expr), sql_str(field))
         }
 
+        IrExpr::FnParam { name, .. } => qi(name),
+
         IrExpr::PathSubquery(ps) => {
             let scalar = match &ps.result {
                 IrPathResult::Scalar(e) => emit_expr(e),
@@ -1730,6 +1744,74 @@ pub fn emit_expr(expr: &IrExpr) -> String {
     }
 }
 
+// ── Function select ──────────────────────────────────────────────────────────
+
+fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
+    let alias = &sel.alias;
+    let (field_exprs, shape_fields) = build_shape(&sel.shape, alias);
+
+    let type_expr = if sel.polymorphic {
+        format!("{}.\"__type__\"", qi(alias))
+    } else {
+        type_disc(&sel.type_name)
+    };
+    let mut parts = vec![type_expr];
+    parts.extend(field_exprs);
+    let tuple = parts.join(",\n    ");
+    let distinct = if sel.distinct { "DISTINCT " } else { "" };
+
+    let args_sql = sel.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+    let fn_call = format!("{}.{}({})", qi(&sel.fn_module), qi(&sel.fn_name), args_sql);
+
+    let from_clause = if sel.polymorphic {
+        // Polymorphic: we can't peek inside the function — assume it returns
+        // a __type__ column since we control the DDL.  Use the fn call directly.
+        format!("{} AS {}", fn_call, qi(alias))
+    } else {
+        format!("{} AS {}", fn_call, qi(alias))
+    };
+
+    let mut sql = format!(
+        "SELECT {}(\n    {}\n) AS result\nFROM {}",
+        distinct, tuple, from_clause,
+    );
+    append_filter(&mut sql, &sel.filter);
+    append_order_by(&mut sql, &sel.order_by);
+    append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+
+    let root_fields = prepend_type(shape_fields);
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor {
+            root: ShapeNode::Object {
+                name: String::new(),
+                type_name: Some(sel.type_name.clone()),
+                position: 0,
+                cardinality: Cardinality::Many,
+                fields: root_fields,
+            },
+        },
+    }
+}
+
+/// Emit the SQL body expression for a user-defined function DDL.
+///
+/// For scalar functions (`FreeSelect`) emits just the expression — e.g. `"a" + "b"`.
+/// For object functions (`Select`, `FunctionSelect`) emits a full `SELECT … FROM …`.
+pub fn emit_fn_body(stmt: &IrStmt) -> String {
+    match stmt {
+        IrStmt::FreeSelect(sel) => {
+            if let Some(IrFreeExpr::Scalar(e)) = sel.items.first() {
+                // Wrap in a complete SELECT statement for PostgreSQL LANGUAGE SQL body.
+                format!("SELECT {}", emit_expr(e))
+            } else {
+                emit_free_select(sel).sql
+            }
+        }
+        other => emit_dml_as_cte_source(other),
+    }
+}
+
 fn emit_literal(lit: &IrLiteral) -> String {
     match lit {
         IrLiteral::Str(s) => sql_str(s),
@@ -1750,7 +1832,8 @@ mod tests {
     use crate::ir;
     use crate::parse;
     use crate::schema::{
-        LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        FunctionDescriptor, FunctionParamDescriptor, LinkDescriptor, MultiLinkDescriptor,
+        PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -1889,6 +1972,7 @@ mod tests {
             scalars: vec![],
             enums: vec![],
             globals: vec![],
+            functions: vec![],
         }
     }
 
@@ -2063,7 +2147,7 @@ mod tests {
                     indexes: vec![], triggers: vec![], junction: false,
                 },
             ],
-            scalars: vec![], enums: vec![], globals: vec![],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         }
     }
 
@@ -2502,5 +2586,79 @@ mod tests {
         );
         assert!(out.sql.contains("<#>"), "expected <#> operator, got:\n{}", out.sql);
         assert!(out.sql.contains("0.0"), "expected negation of <#>, got:\n{}", out.sql);
+    }
+
+    // ── User-defined function tests ───────────────────────────────────────────
+
+    fn make_schema_with_fns() -> SchemaDescriptor {
+        let mut s = make_schema();
+        s.functions = vec![
+            FunctionDescriptor {
+                name: "mysum".into(),
+                module: "default".into(),
+                params: vec![
+                    FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() },
+                    FunctionParamDescriptor { name: "b".into(), pg_type: "int8".into() },
+                ],
+                return_pg_type: "int8".into(),
+                return_is_object: false,
+                return_is_set: false,
+                return_is_polymorphic: false,
+                volatility: "immutable".into(),
+                body: "a + b".into(),
+            },
+            FunctionDescriptor {
+                name: "adults".into(),
+                module: "default".into(),
+                params: vec![],
+                return_pg_type: "default::Person".into(),
+                return_is_object: true,
+                return_is_set: true,
+                return_is_polymorphic: false,
+                volatility: "stable".into(),
+                body: "select Person filter .age > 18".into(),
+            },
+        ];
+        s
+    }
+
+    #[test]
+    fn test_user_fn_scalar_call() {
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with("SELECT mysum(1, 2)", &schema);
+        assert!(out.sql.contains("\"default\".\"mysum\"(1, 2)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_user_fn_object_select_no_shape() {
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with("SELECT adults()", &schema);
+        assert!(out.sql.contains("\"default\".\"adults\"()"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("FROM"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_user_fn_object_select_with_shape() {
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with("SELECT adults() { name }", &schema);
+        assert!(out.sql.contains("\"default\".\"adults\"()"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"name\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_user_fn_in_cte_exposes_raw_columns() {
+        // Regression: FunctionSelect as a CTE source must emit SELECT * FROM fn()
+        // so the outer query can reference raw columns like t1.age.
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with(
+            "WITH persons := adults() SELECT persons FILTER .age > 25",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("SELECT * FROM \"default\".\"adults\"()"),
+            "CTE source must be SELECT * FROM fn(), got:\n{}",
+            out.sql,
+        );
+        assert!(out.sql.contains("\"age\""), "outer filter must reference raw column, got:\n{}", out.sql);
     }
 }

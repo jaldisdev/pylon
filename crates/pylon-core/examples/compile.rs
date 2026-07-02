@@ -169,6 +169,7 @@ fn main() {
         scalars: vec![],
         enums: vec![],
         globals: vec![],
+        functions: vec![],
     };
 
     let queries = [

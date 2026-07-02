@@ -794,6 +794,156 @@ def _build_global_descriptor(g: Any, _core: Any) -> Any:
     )
 
 
+# ── Function descriptor builder ───────────────────────────────────────────────
+
+
+def _parse_return_annotation(
+    annotation: Any,
+    type_map: dict[str, Any],
+    class_to_qname: dict[int, str],
+) -> tuple[str, bool, bool, bool]:
+    """Parse a return type annotation into (return_pg_type, is_object, is_set, is_polymorphic).
+
+    return_pg_type is either a PostgreSQL type string (for scalars) or a
+    qualified type name like 'default::Account' (for object returns).
+    """
+    import typing as _typing
+    from ._lazy import _Lazy
+
+    is_set = False
+    is_object = False
+    is_polymorphic = False
+
+    # Unwrap Optional (T | None): strip None from union
+    origin = _typing.get_origin(annotation)
+    if origin is _typing.Union:
+        args = [a for a in _typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            annotation = args[0]
+            origin = _typing.get_origin(annotation)
+
+    # Unwrap set[T]
+    if origin is set:
+        is_set = True
+        args = _typing.get_args(annotation)
+        annotation = args[0] if args else annotation
+        # Re-check for Optional inside set[T | None]
+        inner_origin = _typing.get_origin(annotation)
+        if inner_origin is _typing.Union:
+            inner_args = [a for a in _typing.get_args(annotation) if a is not type(None)]
+            if len(inner_args) == 1:
+                annotation = inner_args[0]
+
+    # Unwrap Annotated[T, lazy(...)]
+    if _typing.get_origin(annotation) is _typing.Annotated:
+        a_args = _typing.get_args(annotation)
+        annotation = a_args[0]
+
+    # Check if this is a Pylon object type
+    if isinstance(annotation, type) and hasattr(annotation, "__pylon_config__"):
+        cfg = annotation.__pylon_config__
+        qname = f"{cfg.module}::{cfg.name}"
+        is_object = True
+        is_polymorphic = cfg.abstract and cfg.materialized
+        return qname, is_object, is_set, is_polymorphic
+
+    # Check by id in class_to_qname
+    if isinstance(annotation, type) and id(annotation) in class_to_qname:
+        qname = class_to_qname[id(annotation)]
+        td_cls = type_map.get(qname)
+        if td_cls is not None:
+            cfg = td_cls.__pylon_config__
+            is_object = True
+            is_polymorphic = cfg.abstract and cfg.materialized
+            return qname, is_object, is_set, is_polymorphic
+
+    # Must be a scalar type
+    pg_type = _to_pg_type(annotation)
+    return pg_type, False, is_set, False
+
+
+def _param_pg_type(annotation: Any) -> str:
+    """Resolve a parameter type annotation to a PostgreSQL type string."""
+    import typing as _typing
+    # Unwrap Optional
+    origin = _typing.get_origin(annotation)
+    if origin is _typing.Union:
+        args = [a for a in _typing.get_args(annotation) if a is not type(None)]
+        if args:
+            annotation = args[0]
+    # Unwrap Annotated
+    if _typing.get_origin(annotation) is _typing.Annotated:
+        annotation = _typing.get_args(annotation)[0]
+    # Object types: use uuid (FK-like param)
+    if isinstance(annotation, type) and hasattr(annotation, "__pylon_config__"):
+        return "uuid"
+    return _to_pg_type(annotation)
+
+
+def _build_function_descriptor(
+    func: Any,
+    type_map: dict[str, Any],
+    class_to_qname: dict[int, str],
+    _core: Any,
+) -> Any:
+    import typing as _typing
+
+    config = func.__pylon_function__
+    hints = {}
+    try:
+        hints = _typing.get_type_hints(func, include_extras=True)
+    except Exception:
+        hints = getattr(func, "__annotations__", {})
+
+    # Build parameter descriptors
+    sig = __import__("inspect").signature(func)
+    params = []
+    for param_name, param in sig.parameters.items():
+        annotation = hints.get(param_name, param.annotation)
+        if annotation is __import__("inspect").Parameter.empty:
+            raise SchemaError(
+                f"function '{config.module}::{config.name}' parameter '{param_name}' "
+                f"has no type annotation"
+            )
+        pg_type = _param_pg_type(annotation)
+        params.append(_core.FunctionParamDescriptor(name=param_name, pg_type=pg_type))
+
+    # Parse return type
+    return_annotation = hints.get("return", __import__("inspect").Parameter.empty)
+    if return_annotation is __import__("inspect").Parameter.empty:
+        raise SchemaError(
+            f"function '{config.module}::{config.name}' has no return type annotation"
+        )
+    return_pg_type, return_is_object, return_is_set, return_is_polymorphic = (
+        _parse_return_annotation(return_annotation, type_map, class_to_qname)
+    )
+
+    if return_is_object and not return_is_set:
+        raise SchemaError(
+            f"function '{config.module}::{config.name}': object-returning functions must "
+            f"annotate the return type as set[T], not a bare T — single-object returns "
+            f"are not supported"
+        )
+
+    volatility = config.volatility or Volatility.Volatile
+
+    return _core.FunctionDescriptor(
+        name=config.name,
+        module=config.module,
+        params=params,
+        return_pg_type=return_pg_type,
+        body=config.body,
+        return_is_object=return_is_object,
+        return_is_set=return_is_set,
+        return_is_polymorphic=return_is_polymorphic,
+        volatility=volatility,
+    )
+
+
+# Import Volatility for use in walker
+from ._functions import Volatility
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 
@@ -802,6 +952,7 @@ def walk(
     enums: list[type],
     custom_scalars: list[type],
     globals_: list[Any],
+    functions: list[Any] | None = None,
 ) -> Any:
     """Walk the collected schema and return a pylon._core.SchemaDescriptor.
 
@@ -837,10 +988,15 @@ def walk(
     scalar_descs = [_build_scalar_descriptor(cls, _core) for cls in custom_scalars]
     enum_descs = [_build_enum_descriptor(cls, _core) for cls in enums]
     global_descs = [_build_global_descriptor(g, _core) for g in globals_]
+    fn_descs = [
+        _build_function_descriptor(f, type_map, class_to_qname, _core)
+        for f in (functions or [])
+    ]
 
     return _core.SchemaDescriptor(
         types=type_descs,
         scalars=scalar_descs,
         enums=enum_descs,
         globals=global_descs,
+        functions=fn_descs,
     )

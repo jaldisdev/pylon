@@ -14,6 +14,7 @@ _types: list[type] = []
 _enums: list[type] = []
 _custom_scalars: list[type] = []
 _named_tuples: list[type] = []
+_functions: list = []
 
 
 def register_type(cls: type) -> None:
@@ -36,6 +37,16 @@ def register_named_tuple(cls: type) -> None:
         _named_tuples.append(cls)
 
 
+def register_function(func: object) -> None:
+    with _lock:
+        _functions.append(func)
+
+
+def functions_snapshot() -> list:
+    with _lock:
+        return list(_functions)
+
+
 def snapshot() -> tuple[list[type], list[type], list[type]]:
     """Return (types, enums, custom_scalars) without clearing the registry."""
     with _lock:
@@ -55,3 +66,4 @@ def clear() -> None:
         _enums.clear()
         _custom_scalars.clear()
         _named_tuples.clear()
+        _functions.clear()
