@@ -54,6 +54,7 @@ from ._fields import (
 from ._indexes import Index
 from ._lazy import lazy
 from ._registry import snapshot as schema_snapshot
+from ._functions import Volatility, Language, function as function_decorator
 from ._triggers import On, Rewrite, Timing, Trigger
 from ._meta import FieldMeta, PylonConfig
 from ._scalars import (
@@ -84,6 +85,10 @@ __all__ = [
     "interface",
     "enum",
     "scalar",
+    "function_decorator",
+    # Functions
+    "Volatility",
+    "Language",
     # Base types
     "BaseObject",
     "Scalar",

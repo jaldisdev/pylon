@@ -8,6 +8,7 @@ mod compiler;
 
 pub use compiler::compile;
 pub use compiler::compile_expr_in_type;
+pub use compiler::compile_fn_body;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 
@@ -27,6 +28,8 @@ pub enum IrStmt {
     For(IrFor),
     /// `group Type [shape] [using alias := expr, ...] by key, ...`
     Group(IrGroup),
+    /// `select fn(args) { shape }` — a SELECT driven by a user-defined object-returning function.
+    FunctionSelect(IrFunctionSelect),
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────────
@@ -433,6 +436,36 @@ pub enum IrExpr {
     /// Detached path as a scalar subquery: `(SELECT scalar FROM root [JOINs])`.
     /// Used when `detached TypeName.prop` appears in a schema-bound expression context.
     PathSubquery(Box<IrPathSelect>),
+    /// A named parameter reference inside a user-defined function body.
+    /// Emitted as a double-quoted SQL identifier: `"param_name"`.
+    FnParam { name: String, pg_type: String },
+}
+
+// ── User-defined function SELECT ─────────────────────────────────────────────
+
+/// `select fn(args) { shape }` — a SELECT over the result set of a user-defined
+/// object-returning function.  Emits `FROM "module"."fn"(args) AS alias`.
+#[derive(Debug, Clone)]
+pub struct IrFunctionSelect {
+    pub fn_module: String,
+    pub fn_name: String,
+    pub fn_args: Vec<IrExpr>,
+    /// Alias for the function result row source.
+    pub alias: String,
+    /// Qualified return type name (e.g. `account::Account`).
+    pub type_name: String,
+    /// True when the return type is a polymorphic interface.
+    pub polymorphic: bool,
+    /// Concrete implementors when polymorphic = true.
+    pub poly_implementors: Vec<IrPolyImplementor>,
+    /// Interface column names for the UNION ALL branches.
+    pub poly_columns: Vec<String>,
+    pub shape: Vec<IrShapeField>,
+    pub filter: Option<IrExpr>,
+    pub order_by: Vec<IrSort>,
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -715,6 +748,7 @@ mod tests {
             scalars: vec![],
             enums: vec![],
             globals: vec![],
+            functions: vec![],
         }
     }
 

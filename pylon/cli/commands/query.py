@@ -329,9 +329,12 @@ def _brace(s: str) -> str:
 
 
 def _value(v: object) -> str:
+    import decimal as _decimal_mod
     import enum as _enum_mod
     if isinstance(v, _enum_mod.Enum):
         return f"{_RED}{v.name}{_RESET}"
+    if isinstance(v, _decimal_mod.Decimal):
+        return format(v.normalize(), 'f')
     if isinstance(v, str):
         if _is_uuid(v):
             return f"{_YELLOW}{v}{_RESET}"
