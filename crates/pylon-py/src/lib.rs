@@ -546,6 +546,8 @@ impl VectorIndexDescriptor {
     fn metric(&self) -> &str { &self.inner.metric }
     #[getter]
     fn dimensions(&self) -> u32 { self.inner.dimensions }
+    #[getter]
+    fn column_name(&self) -> String { self.inner.column_name() }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -767,6 +769,11 @@ impl TypeDescriptor {
     #[getter]
     fn interfaces(&self) -> Vec<String> {
         self.inner.interfaces.clone()
+    }
+
+    #[getter]
+    fn vector_indexes(&self) -> Vec<VectorIndexDescriptor> {
+        self.inner.vector_indexes.iter().map(|v| VectorIndexDescriptor { inner: v.clone() }).collect()
     }
 }
 
@@ -1056,6 +1063,11 @@ impl SchemaDescriptor {
     #[getter]
     fn type_count(&self) -> usize {
         self.inner.types.len()
+    }
+
+    #[getter]
+    fn types(&self) -> Vec<TypeDescriptor> {
+        self.inner.types.iter().map(|t| TypeDescriptor { inner: t.clone() }).collect()
     }
 
     #[getter]

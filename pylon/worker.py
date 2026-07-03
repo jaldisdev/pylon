@@ -28,7 +28,10 @@ DELETE FROM _pylon."IndexOutbox" WHERE id = ANY($1::uuid[])
 
 MARK_FAILED_SQL = """
 UPDATE _pylon."IndexOutbox"
-SET status = CASE WHEN attempts >= 5 THEN 'Failed' ELSE 'Pending' END,
+SET status = CASE WHEN attempts >= 5
+                  THEN 'Failed'::_pylon."IndexOutboxStatus"
+                  ELSE 'Pending'::_pylon."IndexOutboxStatus"
+             END,
     attempts = attempts + 1,
     next_attempt = now() + (30 * 2^LEAST(attempts, 4) || ' seconds')::interval
 WHERE id = ANY($1::uuid[])
@@ -54,6 +57,7 @@ class IndexWorker:
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
+        self._drain_lock = asyncio.Lock()
 
     async def run(self) -> None:
         await self._conn.add_listener("pylon_index_queue", self._on_notify)
@@ -69,13 +73,16 @@ class IndexWorker:
         asyncio.ensure_future(self._drain())
 
     async def _drain(self) -> None:
-        while True:
-            rows = await self.claim_batch(self.batch_size)
-            if not rows:
-                break
-            await self._process_safe(rows)
-            if len(rows) < self.batch_size:
-                break
+        if self._drain_lock.locked():
+            return
+        async with self._drain_lock:
+            while True:
+                rows = await self.claim_batch(self.batch_size)
+                if not rows:
+                    break
+                await self._process_safe(rows)
+                if len(rows) < self.batch_size:
+                    break
 
     async def _process_safe(self, rows: list[Any]) -> None:
         try:

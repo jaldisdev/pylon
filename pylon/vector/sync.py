@@ -53,7 +53,7 @@ class VectorIndexWorker(IndexWorker):
 
     def _table_and_col(self, type_name: str, index_name: str | None) -> tuple[str, str]:
         td = next(
-            (t for t in self._schema.inner.types
+            (t for t in self._schema.types
              if f"{t.module}::{t.name}" == type_name),
             None,
         )
@@ -69,7 +69,7 @@ class VectorIndexWorker(IndexWorker):
                 f"VectorIndexWorker: no VectorIndex '{key}' on type '{type_name}'"
             )
         table = f'"{td.module}"."{td.table}"'
-        col = f'"{vi.column_name()}"'
+        col = f'"{vi.column_name}"'
         return table, col
 
     async def process_batch(self, rows: list[Any]) -> None:
