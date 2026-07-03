@@ -124,6 +124,13 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         obj = _decode(obj_tuple, {**node["object_node"], "position": 0}, registry)
         return {"object": obj, "distance": distance}
 
+    if kind == "fts_search":
+        # Outer tuple: (NULL, object_record, rank_float)
+        obj_tuple = value[node["object_position"]]
+        rank = value[node["rank_position"]]
+        obj = _decode(obj_tuple, {**node["object_node"], "position": 0}, registry)
+        return {"object": obj, "rank": rank}
+
     raise ValueError(f"unknown shape node kind: {kind!r}")
 
 

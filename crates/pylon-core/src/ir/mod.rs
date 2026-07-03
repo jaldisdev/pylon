@@ -32,6 +32,8 @@ pub enum IrStmt {
     FunctionSelect(IrFunctionSelect),
     /// `select vector::search(Type, $vec) { object { … }, distance }` — pgvector similarity search.
     VectorSearch(IrVectorSearch),
+    /// `select fts::search(Type, $query) { object { … }, rank }` — full-text search.
+    FtsSearch(IrFtsSearch),
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────────
@@ -482,6 +484,30 @@ pub struct IrVectorSearch {
     /// `None` = no ORDER BY; `Some(dir)` = ORDER BY distance in that direction.
     /// Only distance ordering is supported for v1.
     pub order_by_distance: Option<IrSortDir>,
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
+}
+
+// ── Full-text search ──────────────────────────────────────────────────────────
+
+/// `select fts::search(Type, $query) { object { … }, rank }`
+///
+/// Emits a SELECT with a `WHERE tsvector @@ tsquery` filter and a `ts_rank`
+/// score returned alongside the matched object.
+#[derive(Debug, Clone)]
+pub struct IrFtsSearch {
+    /// The searched type as an `IrSource` (table + alias).
+    pub source: IrSource,
+    /// tsvector column name, e.g. `__search__`.
+    pub search_col: String,
+    /// PostgreSQL tsquery constructor: `websearch_to_tsquery` | `phraseto_tsquery`.
+    pub tsquery_fn: &'static str,
+    /// The query text expression (e.g. `$1`).
+    pub query_expr: IrExpr,
+    /// Fields to include in the `object` sub-tuple.
+    pub object_shape: Vec<IrShapeField>,
+    pub filter: Option<IrExpr>,
+    pub order_by_rank: Option<IrSortDir>,
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
 }

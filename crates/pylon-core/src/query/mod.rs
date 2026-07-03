@@ -66,6 +66,13 @@ pub enum ShapeNode {
         distance_position: usize,
         object_node: Box<ShapeNode>,
     },
+    /// Result of a `fts::search` statement.
+    /// Outer tuple layout mirrors `VectorSearch`: pos 0 = NULL, pos 1 = object, pos 2 = rank.
+    FtsSearch {
+        object_position: usize,
+        rank_position: usize,
+        object_node: Box<ShapeNode>,
+    },
     /// Result of a `group` statement: each row is a free object with key/grouping/elements.
     Group {
         /// One ShapeNode per grouping key (carries name, position, and type).

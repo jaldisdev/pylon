@@ -18,7 +18,7 @@ use super::{
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
-    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch, VectorEnqueueInfo,
+    IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch, VectorEnqueueInfo,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -33,6 +33,10 @@ pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLE
         // Special case: `with search := vector::search(…); select search { … } …`
         // Merge into a single IrVectorSearch rather than going through the CTE machinery.
         if let Some(ir) = try_compile_vs_with_pattern(&mut c, w)? {
+            return Ok(IrOutput { stmt: ir, params: c.params, ctes: vec![], global_ctes: c.global_ctes, warnings: c.warnings });
+        }
+        // Special case: `with search := fts::search(…); select search { … } …`
+        if let Some(ir) = try_compile_fts_with_pattern(&mut c, w)? {
             return Ok(IrOutput { stmt: ir, params: c.params, ctes: vec![], global_ctes: c.global_ctes, warnings: c.warnings });
         }
 
@@ -97,6 +101,45 @@ fn try_compile_vs_with_pattern(
     }
 }
 
+fn try_compile_fts_with_pattern(
+    c: &mut Compiler<'_>,
+    w: &ast::WithStmt,
+) -> Result<Option<IrStmt>, PyQLError> {
+    if w.aliases.len() != 1 { return Ok(None); }
+    let alias_def = &w.aliases[0];
+    let fc = match &alias_def.expr {
+        Expr::FunctionCall(fc) => fc,
+        _ => return Ok(None),
+    };
+    if fc.module.as_deref() != Some("fts") || fc.name != "search" { return Ok(None); }
+
+    let select_stmt = match w.stmt.as_ref() {
+        Stmt::Select(s) => s,
+        _ => return Ok(None),
+    };
+    let (elements, result_inner): (&[ast::ShapeElement], &Expr) = match &select_stmt.result {
+        Expr::Shape(sh) => {
+            let inner = sh.expr.as_ref().unwrap_or(&select_stmt.result);
+            (sh.elements.as_slice(), inner)
+        }
+        other => (&[], other),
+    };
+    match result_inner {
+        Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+            if let ast::PathStep::Name(n) = &p.steps[0] {
+                if n != &alias_def.name { return Ok(None); }
+            } else { return Ok(None); }
+        }
+        _ => return Ok(None),
+    }
+
+    if let Some(ir) = c.try_compile_fts_search(fc, elements, select_stmt)? {
+        Ok(Some(IrStmt::FtsSearch(ir)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn cte_stmt_type(stmt: &IrStmt) -> String {
     match stmt {
         IrStmt::Insert(ins) => ins.target.type_name.clone(),
@@ -118,6 +161,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         IrStmt::Group(g) => g.source.type_name.clone(),
         IrStmt::FunctionSelect(fs) => fs.type_name.clone(),
         IrStmt::VectorSearch(vs) => format!("__vs__{}", vs.source.type_name),
+        IrStmt::FtsSearch(fs) => format!("__fts__{}", fs.source.type_name),
     }
 }
 
@@ -500,12 +544,18 @@ impl<'a> Compiler<'a> {
                         if let Some(ir) = self.try_compile_vector_search(fc, &sh.elements, s)? {
                             return Ok(IrStmt::VectorSearch(ir));
                         }
+                        if let Some(ir) = self.try_compile_fts_search(fc, &sh.elements, s)? {
+                            return Ok(IrStmt::FtsSearch(ir));
+                        }
                     }
                 }
-                // bare vector::search without shape
+                // bare vector::search / fts::search without shape
                 if let Expr::FunctionCall(fc) = result {
                     if let Some(ir) = self.try_compile_vector_search(fc, &[], s)? {
                         return Ok(IrStmt::VectorSearch(ir));
+                    }
+                    if let Some(ir) = self.try_compile_fts_search(fc, &[], s)? {
+                        return Ok(IrStmt::FtsSearch(ir));
                     }
                 }
 
@@ -4711,6 +4761,150 @@ impl<'a> Compiler<'a> {
         };
 
         Ok((filter, order_by_distance, offset, limit))
+    }
+
+    // ── fts::search ──────────────────────────────────────────────────────────────
+
+    /// Try to compile `fts::search(TypeName, $query [, index_name := '…'] [, mode := '…'])`.
+    /// Returns `None` if the call is not `fts::search`.
+    fn try_compile_fts_search(
+        &mut self,
+        fc: &ast::FunctionCall,
+        elements: &[ast::ShapeElement],
+        s: &ast::SelectStmt,
+    ) -> Result<Option<IrFtsSearch>, PyQLError> {
+        if fc.module.as_deref() != Some("fts") || fc.name != "search" {
+            return Ok(None);
+        }
+        if fc.args.len() < 2 {
+            return Err(self.type_err("fts::search requires at least 2 arguments: (TypeName, $query)"));
+        }
+
+        // First argument: a bare type name reference.
+        let type_qname = match &fc.args[0] {
+            ast::Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    let td = self.resolve_type(n)
+                        .map_err(|_| self.type_err(&format!("fts::search: '{}' is not a known type", n)))?;
+                    format!("{}::{}", td.module, td.name)
+                } else {
+                    return Err(self.type_err("fts::search: first argument must be a type name"));
+                }
+            }
+            _ => return Err(self.type_err("fts::search: first argument must be a bare type name")),
+        };
+
+        // Optional named arguments.
+        let index_name: Option<String> = fc.kwargs.iter()
+            .find(|(k, _)| k == "index_name")
+            .and_then(|(_, v)| if let ast::Expr::Literal(ast::Literal::Str(s)) = v { Some(s.clone()) } else { None });
+
+        let mode_str = fc.kwargs.iter()
+            .find(|(k, _)| k == "mode")
+            .and_then(|(_, v)| if let ast::Expr::Literal(ast::Literal::Str(s)) = v { Some(s.as_str()) } else { None })
+            .unwrap_or("BestFields");
+
+        let tsquery_fn: &'static str = match mode_str {
+            "Phrase" => "phraseto_tsquery",
+            _ => "websearch_to_tsquery",   // BestFields and PhrasePrefix both use websearch
+        };
+
+        // Resolve the type and find the SearchIndex.
+        let td = self.resolve_type(&type_qname)?.clone();
+        let si = td.search_indexes.iter()
+            .find(|si| si.index_name.as_deref() == index_name.as_deref())
+            .ok_or_else(|| {
+                let key = index_name.as_deref().unwrap_or("<default>");
+                self.type_err(&format!("type '{}' has no search index '{}'", type_qname, key))
+            })?;
+
+        let search_col = si.column_name();
+
+        // Second argument: the query text expression.
+        let query_expr = self.compile_free_expr(&fc.args[1])?;
+
+        let alias = self.fresh_alias();
+        let source = IrSource {
+            type_name: type_qname.clone(),
+            table: td.table.clone(),
+            alias: alias.clone(),
+        };
+
+        // Compile the object shape from `object { … }` in the outer shape.
+        let mut object_shape: Vec<IrShapeField> = vec![];
+        for el in elements {
+            if el.splat.is_some() { continue; }
+            let field_name = match el.path.steps.first() {
+                Some(ast::PathStep::Name(n)) => n.as_str(),
+                _ => continue,
+            };
+            match field_name {
+                "rank" => { /* always emitted */ }
+                "object" => {
+                    let sub_els = el.nested.as_deref().unwrap_or(&[]);
+                    object_shape = self.compile_shape(sub_els, &td, &alias, &td.module)?;
+                }
+                other => {
+                    return Err(self.type_err(&format!(
+                        "fts::search result has no field '{}'; valid fields are 'object' and 'rank'",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let (filter, order_by_rank, offset, limit) = self.compile_fts_modifiers(s)?;
+
+        Ok(Some(IrFtsSearch {
+            source,
+            search_col,
+            tsquery_fn,
+            query_expr,
+            object_shape,
+            filter,
+            order_by_rank,
+            offset,
+            limit,
+        }))
+    }
+
+    /// Compile `order by`, `filter`, `offset`, `limit` for a FtsSearch source.
+    /// Recognises `.rank` (relative path) as the rank expression.
+    fn compile_fts_modifiers(
+        &mut self,
+        s: &ast::SelectStmt,
+    ) -> Result<(Option<IrExpr>, Option<IrSortDir>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
+        let mut order_by_rank: Option<IrSortDir> = None;
+        for sort in &s.order_by {
+            let is_rank = matches!(&sort.expr,
+                ast::Expr::Path(p) if p.partial && p.steps.len() == 1
+                    && matches!(&p.steps[0], ast::PathStep::Name(n) if n == "rank")
+            );
+            if is_rank {
+                let dir = match sort.direction {
+                    ast::SortDirection::Desc => IrSortDir::Desc,
+                    ast::SortDirection::Asc  => IrSortDir::Asc,
+                };
+                order_by_rank = Some(dir);
+            } else {
+                return Err(self.type_err("fts::search: only 'order by .rank' is supported as a sort key"));
+            }
+        }
+
+        let filter = match &s.filter {
+            Some(f) => Some(self.compile_free_expr(f)?),
+            None => None,
+        };
+        let offset = match &s.offset {
+            Some(o) => Some(self.compile_free_expr(o)?),
+            None => None,
+        };
+        let limit = match &s.limit {
+            Some(l) => Some(self.compile_free_expr(l)?),
+            None => None,
+        };
+
+        Ok((filter, order_by_rank, offset, limit))
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ use crate::ir::{
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
     IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField,
-    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo,
+    IrFtsSearch, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -74,6 +74,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::Group(grp) => emit_group(grp),
                 IrStmt::FunctionSelect(sel) => emit_function_select(sel),
                 IrStmt::VectorSearch(vs) => emit_vector_search(vs),
+                IrStmt::FtsSearch(fs) => emit_fts_search(fs),
                 IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
@@ -291,7 +292,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &sel.offset, &sel.limit);
             sql
         }
-        IrStmt::For(_) | IrStmt::Group(_) | IrStmt::VectorSearch(_) => unreachable!("cannot appear as a CTE source"),
+        IrStmt::For(_) | IrStmt::Group(_) | IrStmt::VectorSearch(_) | IrStmt::FtsSearch(_) => unreachable!("cannot appear as a CTE source"),
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
             let mut sql = emit_path_joins(&ps.root, &ps.joins);
@@ -1922,6 +1923,66 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
         root: ShapeNode::VectorSearch {
             object_position: 1,
             distance_position: 2,
+            object_node: Box::new(object_node),
+        },
+    };
+    SqlOutput { sql, shape }
+}
+
+// ── FTS search ───────────────────────────────────────────────────────────────
+
+fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
+    let alias = &fs.source.alias;
+    let search_col = format!("{}.{}", qi(alias), qi(&fs.search_col));
+    let query_sql = emit_expr(&fs.query_expr);
+    let tsquery = format!("{}('english', {})", fs.tsquery_fn, query_sql);
+    let rank_sql = format!("ts_rank({}, {})", search_col, tsquery);
+
+    let (obj_tuple, object_shape_nodes) = if fs.object_shape.is_empty() {
+        let type_expr = type_disc(&fs.source.type_name);
+        let id_expr = format!("{}.\"id\"", qi(alias));
+        let tuple = format!("{},\n    {}", type_expr, id_expr);
+        let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
+        (tuple, vec![id_node])
+    } else {
+        let (field_exprs, shape_fields) = build_shape(&fs.object_shape, alias);
+        let mut parts = vec![type_disc(&fs.source.type_name)];
+        parts.extend(field_exprs);
+        (parts.join(",\n    "), prepend_type(shape_fields))
+    };
+
+    let outer = format!(
+        "NULL::text,\n    ROW(\n    {}\n    )::record,\n    {}",
+        obj_tuple, rank_sql,
+    );
+    let mut sql = format!(
+        "SELECT (\n    {}\n) AS result\nFROM {} AS {}\nWHERE {} @@ {}",
+        outer,
+        source_ref(&fs.source),
+        qi(alias),
+        search_col,
+        tsquery,
+    );
+    if let Some(f) = &fs.filter {
+        sql.push_str(&format!(" AND ({})", emit_expr(f)));
+    }
+    if let Some(dir) = &fs.order_by_rank {
+        let dir_sql = match dir { IrSortDir::Asc => "ASC", IrSortDir::Desc => "DESC" };
+        sql.push_str(&format!("\nORDER BY {} {}", rank_sql, dir_sql));
+    }
+    append_offset_limit(&mut sql, &fs.offset, &fs.limit);
+
+    let object_node = ShapeNode::Object {
+        name: "object".to_string(),
+        type_name: Some(fs.source.type_name.clone()),
+        position: 1,
+        cardinality: Cardinality::Many,
+        fields: object_shape_nodes,
+    };
+    let shape = ShapeDescriptor {
+        root: ShapeNode::FtsSearch {
+            object_position: 1,
+            rank_position: 2,
             object_node: Box::new(object_node),
         },
     };
