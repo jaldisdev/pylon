@@ -45,6 +45,8 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_functions(schema, &mut out)?;
     emit_vector_columns(schema, &mut out);
     emit_vector_indexes(schema, &mut out);
+    emit_search_columns(schema, &mut out);
+    emit_search_indexes(schema, &mut out);
 
     Ok(out)
 }
@@ -751,6 +753,69 @@ fn emit_vector_indexes(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
+// ── Phase 15: search tsvector generated columns (Postgres backend) ─────────────
+
+fn emit_search_columns(schema: &SchemaDescriptor, out: &mut String) {
+    use crate::schema::SearchBackend;
+
+    let mut emitted = false;
+    for td in &schema.types {
+        if td.abstract_ { continue; }
+        for si in &td.search_indexes {
+            if si.backend != SearchBackend::Postgres { continue; }
+
+            // Build: setweight(to_tsvector('english', coalesce(col, '')), 'W') || ...
+            let parts: Vec<String> = si.fields.iter().map(|sf| {
+                let col = qi(&sf.name);
+                let w = sf.weight.as_str();
+                format!("setweight(to_tsvector('english', coalesce({col}, '')), '{w}')")
+            }).collect();
+
+            let expr = if parts.len() == 1 {
+                parts.into_iter().next().unwrap()
+            } else {
+                parts.join(" || ")
+            };
+
+            out.push_str(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} tsvector GENERATED ALWAYS AS ({}) STORED;\n",
+                qn(&td.module, &td.table),
+                qi(&si.column_name()),
+                expr,
+            ));
+            emitted = true;
+        }
+    }
+    if emitted {
+        out.push('\n');
+    }
+}
+
+// ── Phase 16: search GIN indexes (Postgres backend) ───────────────────────────
+
+fn emit_search_indexes(schema: &SchemaDescriptor, out: &mut String) {
+    use crate::schema::SearchBackend;
+
+    for td in &schema.types {
+        if td.abstract_ { continue; }
+        for si in &td.search_indexes {
+            if si.backend != SearchBackend::Postgres { continue; }
+
+            let col = si.column_name();
+            let index_name = match &si.index_name {
+                None => format!("{}__search__", td.table),
+                Some(name) => format!("{}__search_{}__", td.table, name),
+            };
+            out.push_str(&format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});\n",
+                qi(&index_name),
+                qn(&td.module, &td.table),
+                qi(&col),
+            ));
+        }
+    }
+}
+
 // ── compile_index_fetch ────────────────────────────────────────────────────────
 
 /// Build the SQL that fetches source text for a batch of objects to embed.
@@ -872,6 +937,7 @@ mod tests {
             constraints: vec![],
             indexes: vec![],
             vector_indexes: vec![],
+            search_indexes: vec![],
             triggers: vec![],
             junction: false,
         }

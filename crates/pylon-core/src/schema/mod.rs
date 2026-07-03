@@ -92,6 +92,55 @@ pub struct ComputedDescriptor {
 
 // ── Type-level constructs ──────────────────────────────────────────────────────
 
+// ── Search index ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchBackend {
+    Postgres,
+    OpenSearch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchWeight {
+    A,
+    B,
+    C,
+    D,
+}
+
+impl SearchWeight {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchWeight::A => "A",
+            SearchWeight::B => "B",
+            SearchWeight::C => "C",
+            SearchWeight::D => "D",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchFieldDescriptor {
+    pub name: String,
+    pub weight: SearchWeight,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchIndexDescriptor {
+    pub index_name: Option<String>,
+    pub backend: SearchBackend,
+    pub fields: Vec<SearchFieldDescriptor>,
+}
+
+impl SearchIndexDescriptor {
+    pub fn column_name(&self) -> String {
+        match &self.index_name {
+            None => "__search__".to_string(),
+            Some(name) => format!("__search_{}__", name),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorIndexDescriptor {
     /// `None` = default (bare) index; `Some(name)` = named index.
@@ -189,6 +238,8 @@ pub struct TypeDescriptor {
     pub indexes: Vec<IndexDescriptor>,
     /// Vector (embedding) indexes.
     pub vector_indexes: Vec<VectorIndexDescriptor>,
+    /// Full-text search indexes.
+    pub search_indexes: Vec<SearchIndexDescriptor>,
     /// Triggers (own + inherited from abstract parents).
     pub triggers: Vec<TriggerDescriptor>,
     /// True for `@pylon.junction` — type is a junction table for a MultiLink.
