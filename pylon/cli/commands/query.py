@@ -167,7 +167,7 @@ async def _handle_set_global(
 
 async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globals_: dict[str, Any] | None = None) -> None:
     """Transpile and execute a single PyQL statement, printing the result."""
-    from pylon.client import _transpile, _hydrate
+    from pylon.client import _compile_and_resolve, _hydrate
 
     if as_json:
         try:
@@ -179,7 +179,7 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
     try:
         import asyncpg as _asyncpg
         from pylon.client import _fmt_pg_error
-        sql, params, compiled = _transpile(pyql, {}, globals_)
+        compiled, sql, params = await _compile_and_resolve(pyql, {}, client._config, globals_)
         for w in compiled.warnings():
             click.echo(f"{_YELLOW}warning:{_RESET} {w}", err=True)
         try:
@@ -230,7 +230,7 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
         click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
-    # Full-text search result: { object, rank }
+    # Full-text search result: { object, score }
     if shape_kind == "fts_search":
         depth = 1 if repl else 0
         items = [_format_fts_search_row(obj, depth) for obj in results]
@@ -504,10 +504,10 @@ def _format_vector_search_row(obj: dict, depth: int) -> str:
 
 
 def _format_fts_search_row(obj: dict, depth: int) -> str:
-    """Format a fts::search result row: { object: …, rank: … }."""
+    """Format a fts::search result row: { object: …, score: … }."""
     import dataclasses as _dc
     obj_val = obj.get("object")
-    rank_val = obj.get("rank")
+    score_val = obj.get("score")
     if obj_val is not None and _dc.is_dataclass(obj_val) and not isinstance(obj_val, type):
         type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
         obj_str = _pformat_object(
@@ -523,7 +523,7 @@ def _format_fts_search_row(obj: dict, depth: int) -> str:
     return (
         f"{_brace('{')}\n"
         f"{indent}{_key('object')}: {obj_str},\n"
-        f"{indent}{_key('rank')}: {_value(rank_val)}\n"
+        f"{indent}{_key('score')}: {_value(score_val)}\n"
         f"{closing}{_brace('}')}"
     )
 

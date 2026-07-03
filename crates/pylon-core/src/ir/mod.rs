@@ -32,7 +32,7 @@ pub enum IrStmt {
     FunctionSelect(IrFunctionSelect),
     /// `select vector::search(Type, $vec) { object { … }, distance }` — pgvector similarity search.
     VectorSearch(IrVectorSearch),
-    /// `select fts::search(Type, $query) { object { … }, rank }` — full-text search.
+    /// `select fts::search(Type, $query) { object { … }, score }` — full-text search.
     FtsSearch(IrFtsSearch),
 }
 
@@ -310,6 +310,15 @@ pub struct VectorEnqueueInfo {
     pub index_name: Option<String>,
 }
 
+/// Identifies one OpenSearch-backed SearchIndex that needs an outbox row written.
+#[derive(Debug, Clone)]
+pub struct SearchEnqueueInfo {
+    pub type_name: String,
+    pub index_name: Option<String>,
+    /// `"index"` for insert/update, `"delete"` for delete.
+    pub operation: &'static str,
+}
+
 // ── INSERT ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -324,6 +333,8 @@ pub struct IrInsert {
     pub returning: Vec<IrShapeField>,
     /// Vector indexes on this type that need outbox rows written.
     pub enqueue_vector: Vec<VectorEnqueueInfo>,
+    /// OpenSearch-backed SearchIndexes that need outbox rows written.
+    pub enqueue_search: Vec<SearchEnqueueInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +357,8 @@ pub struct IrUpdate {
     pub returning: Vec<IrShapeField>,
     /// Vector indexes whose source fields are touched by this update.
     pub enqueue_vector: Vec<VectorEnqueueInfo>,
+    /// OpenSearch-backed SearchIndexes that need outbox rows written.
+    pub enqueue_search: Vec<SearchEnqueueInfo>,
     /// Populated when updating an interface type; one entry per concrete implementor.
     pub poly_implementors: Vec<IrPolyImplementor>,
     /// `friends := {}` — DELETE all junction rows for this object.
@@ -399,6 +412,8 @@ pub struct IrDelete {
     pub returning: Vec<IrShapeField>,
     /// Populated when deleting from an interface type; one entry per concrete implementor.
     pub poly_implementors: Vec<IrPolyImplementor>,
+    /// OpenSearch-backed SearchIndexes that need delete outbox rows written.
+    pub enqueue_search: Vec<SearchEnqueueInfo>,
 }
 
 // ── Expressions ─────────────────────────────────────────────────────────────────
@@ -490,7 +505,7 @@ pub struct IrVectorSearch {
 
 // ── Full-text search ──────────────────────────────────────────────────────────
 
-/// `select fts::search(Type, $query) { object { … }, rank }`
+/// `select fts::search(Type, $query) { object { … }, score }`
 ///
 /// Emits a SELECT with a `WHERE tsvector @@ tsquery` filter and a `ts_rank`
 /// score returned alongside the matched object.
@@ -498,9 +513,11 @@ pub struct IrVectorSearch {
 pub struct IrFtsSearch {
     /// The searched type as an `IrSource` (table + alias).
     pub source: IrSource,
-    /// tsvector column name, e.g. `__search__`.
+    /// Backend that owns this search index.
+    pub backend: crate::schema::SearchBackend,
+    /// tsvector column name, e.g. `__search__` (Postgres backend only).
     pub search_col: String,
-    /// PostgreSQL tsquery constructor: `websearch_to_tsquery` | `phraseto_tsquery`.
+    /// PostgreSQL tsquery constructor (Postgres backend only).
     pub tsquery_fn: &'static str,
     /// The query text expression (e.g. `$1`).
     pub query_expr: IrExpr,
@@ -510,6 +527,16 @@ pub struct IrFtsSearch {
     pub order_by_rank: Option<IrSortDir>,
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
+    /// Remote index name (derived from type + index_name, set for deferred backends).
+    pub deferred_index_name: Option<String>,
+    /// Name of the user's query-text param (e.g. "query"), for the deferred search plan.
+    pub deferred_query_param_name: Option<String>,
+    /// Inline literal query text (when not a param), for the deferred search plan.
+    pub deferred_query_literal: Option<String>,
+    /// Param index for the uuid[] IDs injected by the Python layer (deferred backend).
+    pub deferred_ids_param: Option<usize>,
+    /// Param index for the float8[] scores injected by the Python layer (deferred backend).
+    pub deferred_scores_param: Option<usize>,
 }
 
 // ── User-defined function SELECT ─────────────────────────────────────────────

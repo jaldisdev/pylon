@@ -6,7 +6,8 @@ use crate::parse::ast::{
     self, Expr, Literal, NonesOrder, ShapeElement, ShapeOp, SortDirection, Stmt,
 };
 use crate::schema::{
-    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, SearchBackend,
+    TypeDescriptor,
 };
 
 use std::collections::HashMap;
@@ -18,7 +19,8 @@ use super::{
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
-    IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch, VectorEnqueueInfo,
+    IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
+    VectorEnqueueInfo, SearchEnqueueInfo,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -2247,12 +2249,14 @@ impl<'a> Compiler<'a> {
             .map(|uc| self.compile_conflict(uc, td))
             .transpose()?;
         let returning = Self::pk_returning(td);
+        let type_name = format!("{}::{}", td.module, td.name);
         let enqueue_vector = td.vector_indexes.iter()
             .map(|vi| VectorEnqueueInfo {
-                type_name: format!("{}::{}", td.module, td.name),
+                type_name: type_name.clone(),
                 index_name: vi.index_name.clone(),
             })
             .collect();
+        let enqueue_search = collect_search_enqueue(td, &type_name, "index");
 
         Ok(IrInsert {
             target,
@@ -2261,6 +2265,7 @@ impl<'a> Compiler<'a> {
             rewrites,
             returning,
             enqueue_vector,
+            enqueue_search,
         })
     }
 
@@ -2445,13 +2450,15 @@ impl<'a> Compiler<'a> {
         // Only enqueue indexes whose source fields are touched by this update.
         let written_cols: std::collections::HashSet<&str> =
             assignments.iter().map(|(c, _)| c.as_str()).collect();
+        let type_name = format!("{}::{}", td.module, td.name);
         let enqueue_vector = td.vector_indexes.iter()
             .filter(|vi| vi.fields.iter().any(|f| written_cols.contains(f.as_str())))
             .map(|vi| VectorEnqueueInfo {
-                type_name: format!("{}::{}", td.module, td.name),
+                type_name: type_name.clone(),
                 index_name: vi.index_name.clone(),
             })
             .collect();
+        let enqueue_search = collect_search_enqueue(td, &type_name, "index");
 
         Ok(IrUpdate {
             target, filter, assignments, rewrites, returning,
@@ -2459,6 +2466,7 @@ impl<'a> Compiler<'a> {
             multi_link_appends, multi_link_removals,
             poly_implementors,
             enqueue_vector,
+            enqueue_search,
         })
     }
 
@@ -2558,8 +2566,10 @@ impl<'a> Compiler<'a> {
         } else {
             vec![]
         };
+        let qname = format!("{}::{}", td.module, td.name);
+        let enqueue_search = collect_search_enqueue(td, &qname, "delete");
 
-        Ok(IrDelete { target, filter, returning, poly_implementors })
+        Ok(IrDelete { target, filter, returning, poly_implementors, enqueue_search })
     }
 
     // ── Shape compilation ─────────────────────────────────────────────────────────
@@ -4818,10 +4828,46 @@ impl<'a> Compiler<'a> {
                 self.type_err(&format!("type '{}' has no search index '{}'", type_qname, key))
             })?;
 
+        let backend = si.backend.clone();
         let search_col = si.column_name();
+        let deferred_index_name = if backend == SearchBackend::OpenSearch {
+            Some(si.deferred_index_name(&td.module, &td.name))
+        } else {
+            None
+        };
 
         // Second argument: the query text expression.
-        let query_expr = self.compile_free_expr(&fc.args[1])?;
+        // For deferred backends, IDs/scores are the only SQL params ($1/$2). The query
+        // text is consumed by the Python layer before SQL execution, so we extract its
+        // name/literal directly from the AST without registering a SQL param for it.
+        let query_expr;
+        let deferred_query_param_name;
+        let deferred_query_literal;
+        let deferred_ids_param;
+        let deferred_scores_param;
+
+        if backend == SearchBackend::OpenSearch {
+            let ids_idx = self.param_index("__deferred_ids__");
+            let scores_idx = self.param_index("__deferred_scores__");
+            deferred_ids_param = Some(ids_idx);
+            deferred_scores_param = Some(scores_idx);
+            deferred_query_param_name = match &fc.args[1] {
+                ast::Expr::Parameter(name) => Some(name.clone()),
+                _ => None,
+            };
+            deferred_query_literal = match &fc.args[1] {
+                ast::Expr::Literal(ast::Literal::Str(s)) => Some(s.clone()),
+                _ => None,
+            };
+            // Placeholder — not used in SQL for the deferred backend.
+            query_expr = IrExpr::Literal(crate::ir::IrLiteral::Str(String::new()));
+        } else {
+            query_expr = self.compile_free_expr(&fc.args[1])?;
+            deferred_query_param_name = None;
+            deferred_query_literal = None;
+            deferred_ids_param = None;
+            deferred_scores_param = None;
+        }
 
         let alias = self.fresh_alias();
         let source = IrSource {
@@ -4839,14 +4885,14 @@ impl<'a> Compiler<'a> {
                 _ => continue,
             };
             match field_name {
-                "rank" => { /* always emitted */ }
+                "score" => { /* always emitted */ }
                 "object" => {
                     let sub_els = el.nested.as_deref().unwrap_or(&[]);
                     object_shape = self.compile_shape(sub_els, &td, &alias, &td.module)?;
                 }
                 other => {
                     return Err(self.type_err(&format!(
-                        "fts::search result has no field '{}'; valid fields are 'object' and 'rank'",
+                        "fts::search result has no field '{}'; valid fields are 'object' and 'score'",
                         other
                     )));
                 }
@@ -4857,6 +4903,7 @@ impl<'a> Compiler<'a> {
 
         Ok(Some(IrFtsSearch {
             source,
+            backend,
             search_col,
             tsquery_fn,
             query_expr,
@@ -4865,11 +4912,16 @@ impl<'a> Compiler<'a> {
             order_by_rank,
             offset,
             limit,
+            deferred_index_name,
+            deferred_query_param_name,
+            deferred_query_literal,
+            deferred_ids_param,
+            deferred_scores_param,
         }))
     }
 
     /// Compile `order by`, `filter`, `offset`, `limit` for a FtsSearch source.
-    /// Recognises `.rank` (relative path) as the rank expression.
+    /// Recognises `.score` (relative path) as the score expression.
     fn compile_fts_modifiers(
         &mut self,
         s: &ast::SelectStmt,
@@ -4878,7 +4930,7 @@ impl<'a> Compiler<'a> {
         for sort in &s.order_by {
             let is_rank = matches!(&sort.expr,
                 ast::Expr::Path(p) if p.partial && p.steps.len() == 1
-                    && matches!(&p.steps[0], ast::PathStep::Name(n) if n == "rank")
+                    && matches!(&p.steps[0], ast::PathStep::Name(n) if n == "score")
             );
             if is_rank {
                 let dir = match sort.direction {
@@ -4887,7 +4939,7 @@ impl<'a> Compiler<'a> {
                 };
                 order_by_rank = Some(dir);
             } else {
-                return Err(self.type_err("fts::search: only 'order by .rank' is supported as a sort key"));
+                return Err(self.type_err("fts::search: only 'order by .score' is supported as a sort key"));
             }
         }
 
@@ -5158,6 +5210,22 @@ fn types_compatible(a: &str, b: &str) -> bool {
     let a_float = FLOAT_TYPES.contains(&a);
     let b_float = FLOAT_TYPES.contains(&b);
     a_float && b_float
+}
+
+/// Collect `SearchEnqueueInfo` for all OpenSearch-backed search indexes on a type.
+fn collect_search_enqueue(
+    td: &TypeDescriptor,
+    type_name: &str,
+    operation: &'static str,
+) -> Vec<SearchEnqueueInfo> {
+    td.search_indexes.iter()
+        .filter(|si| si.backend == SearchBackend::OpenSearch)
+        .map(|si| SearchEnqueueInfo {
+            type_name: type_name.to_string(),
+            index_name: si.index_name.clone(),
+            operation,
+        })
+        .collect()
 }
 
 fn pg_type_to_pyql(pg: &str) -> &str {

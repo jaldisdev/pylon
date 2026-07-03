@@ -1213,6 +1213,24 @@ impl CompiledQuery {
     fn warnings<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
         pyo3::types::PyList::new(py, &self.inner.warnings).unwrap()
     }
+
+    /// Returns a `DeferredSearchPlan` dict if this query requires two-phase remote execution,
+    /// or `None` for pure-SQL queries.
+    #[getter]
+    fn deferred_search_plan<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
+        use pyo3::types::PyDict;
+        match &self.inner.deferred_search_plan {
+            None => Ok(py.None().into_bound(py)),
+            Some(plan) => {
+                let d = PyDict::new(py);
+                d.set_item("index_name", &plan.index_name)?;
+                d.set_item("query_param_name", &plan.query_param_name)?;
+                d.set_item("query_literal", plan.query_literal.as_deref())?;
+                d.set_item("size", plan.size)?;
+                Ok(d.into_any())
+            }
+        }
+    }
 }
 
 // ── Public functions ───────────────────────────────────────────────────────────
@@ -1242,6 +1260,16 @@ fn compile_index_fetch(
     index_name: Option<&str>,
 ) -> PyResult<String> {
     core::export::compile_index_fetch(type_name, index_name, &schema.inner).map_err(pyql_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (type_name, schema, *, index_name = None))]
+fn compile_search_index_fetch(
+    type_name: &str,
+    schema: &SchemaDescriptor,
+    index_name: Option<&str>,
+) -> PyResult<String> {
+    core::export::compile_search_index_fetch(type_name, index_name, &schema.inner).map_err(pyql_err)
 }
 
 // ── Shape conversion ───────────────────────────────────────────────────────────
@@ -1418,5 +1446,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
     m.add_function(wrap_pyfunction!(compile_index_fetch, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_search_index_fetch, m)?)?;
     Ok(())
 }

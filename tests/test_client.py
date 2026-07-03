@@ -169,6 +169,7 @@ class TestHydrate:
 def _fake_compiled(sql: str = "SELECT 1"):
     c = MagicMock()
     c.sql = sql
+    c.deferred_search_plan = None
     return c
 
 
@@ -218,10 +219,25 @@ class TestClientQuery:
     def _patch_transpile(self, sql="SELECT 1"):
         compiled = _fake_compiled(sql)
 
-        def fake_transpile(pyql, kwargs):
+        async def fake_resolve(pyql, kwargs, config, globals_=None):
+            return compiled, sql, list(kwargs.values())
+
+        def fake_transpile(pyql, kwargs, globals_=None):
             return sql, list(kwargs.values()), compiled
 
-        return patch("pylon.client._transpile", side_effect=fake_transpile), compiled
+        p1 = patch("pylon.client._compile_and_resolve", side_effect=fake_resolve)
+        p2 = patch("pylon.client._transpile", side_effect=fake_transpile)
+
+        class _Both:
+            def __enter__(self):
+                p1.__enter__()
+                p2.__enter__()
+                return self
+            def __exit__(self, *a):
+                p2.__exit__(*a)
+                p1.__exit__(*a)
+
+        return _Both(), compiled
 
     def _patch_hydrate(self, result=None):
         out = result if result is not None else []

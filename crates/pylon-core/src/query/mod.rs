@@ -67,7 +67,7 @@ pub enum ShapeNode {
         object_node: Box<ShapeNode>,
     },
     /// Result of a `fts::search` statement.
-    /// Outer tuple layout mirrors `VectorSearch`: pos 0 = NULL, pos 1 = object, pos 2 = rank.
+    /// Outer tuple layout mirrors `VectorSearch`: pos 0 = NULL, pos 1 = object, pos 2 = score.
     FtsSearch {
         object_position: usize,
         rank_position: usize,
@@ -107,6 +107,23 @@ pub enum QueryParam {
 
 /// The output of a successful PyQL compilation.
 /// Immutable and safe to cache and reuse across requests.
+/// Execution plan for a deferred (remote) `fts::search` query.
+/// The Python client uses this to drive the two-phase execution:
+/// 1. Call the remote search backend with `query_param_name`'s value → get (id, score) pairs
+/// 2. Inject them as `__deferred_ids__` / `__deferred_scores__` params and run `sql` against Postgres
+#[derive(Debug, Clone)]
+pub struct DeferredSearchPlan {
+    /// OpenSearch index to query.
+    pub index_name: String,
+    /// The user's query-text kwarg name (e.g. `"query"` for `fts::search(T, $query)`).
+    /// Empty string when the query text is an inline literal.
+    pub query_param_name: String,
+    /// Inline literal query text — set when the query is `fts::search(T, 'literal text')`.
+    pub query_literal: Option<String>,
+    /// Requested result size (limit), if known at compile time.
+    pub size: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
     /// PostgreSQL SQL string ready for execution.
@@ -120,6 +137,8 @@ pub struct CompiledQuery {
     pub shape: ShapeDescriptor,
     /// Non-fatal warnings produced during compilation.
     pub warnings: Vec<String>,
+    /// Set when the query uses a deferred (remote) backend; drives two-phase execution.
+    pub deferred_search_plan: Option<DeferredSearchPlan>,
 }
 
 /// Compile a PyQL query string to SQL against `schema`.
@@ -136,5 +155,6 @@ pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, 
         params: Vec::new(),
         shape: sql_out.shape,
         warnings: ir_out.warnings,
+        deferred_search_plan: sql_out.deferred_search_plan,
     })
 }

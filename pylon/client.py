@@ -315,7 +315,7 @@ class Client:
     async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, kwargs)
+        compiled, sql, params = await _compile_and_resolve(pyql, kwargs, self._config)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -336,7 +336,7 @@ class Client:
         than one object matches.
         """
         pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, kwargs)
+        compiled, sql, params = await _compile_and_resolve(pyql, kwargs, self._config)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -731,6 +731,73 @@ def _emit_warnings(compiled: "CompiledQuery") -> None:
     import warnings as _warnings
     for msg in compiled.warnings():
         _warnings.warn(msg, stacklevel=4)
+
+
+async def _compile_and_resolve(
+    pyql: str,
+    kwargs: dict[str, Any],
+    config: "Config",
+    globals_: dict[str, Any] | None = None,
+) -> tuple["CompiledQuery", str, list[Any]]:
+    """Compile PyQL and, for OpenSearch-backed queries, perform the HTTP phase first.
+
+    Returns ``(compiled, sql, params)`` ready for asyncpg.
+    """
+    if not isinstance(pyql, str):
+        raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
+    from pylon.query import compile as _pyql_compile
+    try:
+        compiled = _pyql_compile(pyql)
+    except BaseException as exc:
+        raise InternalServerError(str(exc)) from exc
+
+    plan = compiled.deferred_search_plan
+    if plan is None:
+        # Normal path — bind params from kwargs/globals the standard way.
+        try:
+            params: list[Any] = []
+            for name in compiled.param_names:
+                if name.startswith("__global__"):
+                    qname = name[len("__global__"):]
+                    params.append((globals_ or {}).get(qname))
+                else:
+                    params.append(kwargs[name])
+        except KeyError as exc:
+            raise InterfaceError(f"Missing query parameter: {exc}") from exc
+        return compiled, compiled.sql, params
+
+    # Deferred two-phase path — the SQL uses __deferred_ids__ / __deferred_scores__, not the
+    # user's query text param, so we must NOT try to bind it from kwargs.
+    from pylon.search.http import OpenSearchClient
+
+    search_cfg = config.search_registry.get("default")
+    if search_cfg is None:
+        raise InterfaceError(
+            "fts::search with OpenSearch backend requires [search] config in pylon.toml"
+        )
+    base_url = f"http://{search_cfg.host}:{search_cfg.port}"
+    auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
+
+    # The query text is either an inline literal (captured at compile time)
+    # or a runtime kwarg (whose name was captured dynamically from the AST).
+    query_text: str | None = plan["query_literal"]
+    if query_text is None:
+        param_name = plan["query_param_name"]
+        query_text = kwargs.get(param_name) if param_name else None
+        if query_text is None and param_name:
+            raise InterfaceError(
+                f"Missing query parameter '{param_name}' for fts::search"
+            )
+
+    size = plan["size"] or 100
+    async with OpenSearchClient(base_url, auth=auth) as os_client:
+        hits = await os_client.search(plan["index_name"], query_text or "", size=size)
+
+    ids = [h[0] for h in hits]
+    scores = [h[1] for h in hits]
+    deferred_kwargs = {"__deferred_ids__": ids, "__deferred_scores__": scores}
+    params = [deferred_kwargs[name] for name in compiled.param_names]
+    return compiled, compiled.sql, params
 
 
 def _transpile(
