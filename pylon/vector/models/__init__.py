@@ -1,5 +1,5 @@
-from .anthropic import AnthropicEmbeddingProvider
-from .base import EmbeddingProvider
-from .openai import OpenAIEmbeddingProvider
+from .anthropic import AnthropicProvider
+from .base import ModelProvider
+from .openai import OpenAIProvider
 
-__all__ = ["EmbeddingProvider", "OpenAIEmbeddingProvider", "AnthropicEmbeddingProvider"]
+__all__ = ["ModelProvider", "OpenAIProvider", "AnthropicProvider"]

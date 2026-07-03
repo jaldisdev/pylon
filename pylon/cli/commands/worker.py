@@ -12,11 +12,11 @@ from ..config import _print_error, requires_config
 
 def _build_provider(api_style: str, api_url: str, model: str, secret: str | None):
     if api_style == "openai":
-        from pylon.vector.models.openai import OpenAIEmbeddingProvider
-        return OpenAIEmbeddingProvider(api_url=api_url, model=model, api_key=secret)
+        from pylon.vector.models.openai import OpenAIProvider
+        return OpenAIProvider(api_url=api_url, model=model, api_key=secret)
     if api_style == "anthropic":
-        from pylon.vector.models.anthropic import AnthropicEmbeddingProvider
-        return AnthropicEmbeddingProvider(api_url=api_url, model=model, api_key=secret)
+        from pylon.vector.models.anthropic import AnthropicProvider
+        return AnthropicProvider(api_url=api_url, model=model, api_key=secret)
     raise click.ClickException(
         f"Unknown api_style {api_style!r} in [models] — expected 'openai' or 'anthropic'."
     )

@@ -3,7 +3,7 @@
 Covers:
   - VectorField / VectorIndex construction
   - Walker field resolution (_resolve_vector_field, _make_vector_index_desc)
-  - OpenAIEmbeddingProvider and AnthropicEmbeddingProvider (mocked httpx)
+  - OpenAIProvider and AnthropicProvider (mocked httpx)
   - IndexWorker drain lock
   - VectorIndexWorker.process_batch (mocked asyncpg + compile_index_fetch)
 """
@@ -155,13 +155,13 @@ class TestMakeVectorIndexDesc:
         assert core.VectorIndexDescriptor.call_args.kwargs["index_name"] == "my_index"
 
 
-# ── OpenAIEmbeddingProvider ───────────────────────────────────────────────────
+# ── OpenAIProvider ───────────────────────────────────────────────────
 
 
-class TestOpenAIEmbeddingProvider:
+class TestOpenAIProvider:
     def _make_provider(self, json_responses: list):
-        from pylon.vector.models.openai import OpenAIEmbeddingProvider
-        provider = OpenAIEmbeddingProvider(
+        from pylon.vector.models.openai import OpenAIProvider
+        provider = OpenAIProvider(
             api_url="https://api.example.com/v1",
             model="test-model",
             api_key="test-key",
@@ -201,16 +201,16 @@ class TestOpenAIEmbeddingProvider:
         assert mock_client.post.await_count == 2
 
     def test_uses_bearer_auth(self):
-        from pylon.vector.models.openai import OpenAIEmbeddingProvider
+        from pylon.vector.models.openai import OpenAIProvider
         with patch("httpx.AsyncClient") as mock_cls:
-            OpenAIEmbeddingProvider(api_url="https://api.example.com/v1", model="m", api_key="sk-123")
+            OpenAIProvider(api_url="https://api.example.com/v1", model="m", api_key="sk-123")
             headers = mock_cls.call_args.kwargs["headers"]
             assert headers["Authorization"] == "Bearer sk-123"
 
     def test_http_error_propagates(self):
         import httpx
-        from pylon.vector.models.openai import OpenAIEmbeddingProvider
-        provider = OpenAIEmbeddingProvider(
+        from pylon.vector.models.openai import OpenAIProvider
+        provider = OpenAIProvider(
             api_url="https://api.example.com/v1", model="m", api_key="k"
         )
         mock_resp = MagicMock()
@@ -224,28 +224,28 @@ class TestOpenAIEmbeddingProvider:
             run(provider.embed_batch(["text"]))
 
 
-# ── AnthropicEmbeddingProvider ────────────────────────────────────────────────
+# ── AnthropicProvider ────────────────────────────────────────────────
 
 
-class TestAnthropicEmbeddingProvider:
+class TestAnthropicProvider:
     def test_sets_x_api_key_header(self):
-        from pylon.vector.models.anthropic import AnthropicEmbeddingProvider
+        from pylon.vector.models.anthropic import AnthropicProvider
         with patch("httpx.AsyncClient") as mock_cls:
-            AnthropicEmbeddingProvider(api_url="https://api.example.com", model="m", api_key="sk-ant")
+            AnthropicProvider(api_url="https://api.example.com", model="m", api_key="sk-ant")
             headers = mock_cls.call_args.kwargs["headers"]
             assert headers["x-api-key"] == "sk-ant"
 
     def test_sets_anthropic_version_header(self):
-        from pylon.vector.models.anthropic import AnthropicEmbeddingProvider
+        from pylon.vector.models.anthropic import AnthropicProvider
         with patch("httpx.AsyncClient") as mock_cls:
-            AnthropicEmbeddingProvider(api_url="https://api.example.com", model="m", api_key="k")
+            AnthropicProvider(api_url="https://api.example.com", model="m", api_key="k")
             headers = mock_cls.call_args.kwargs["headers"]
             assert "anthropic-version" in headers
 
     def test_no_bearer_auth(self):
-        from pylon.vector.models.anthropic import AnthropicEmbeddingProvider
+        from pylon.vector.models.anthropic import AnthropicProvider
         with patch("httpx.AsyncClient") as mock_cls:
-            AnthropicEmbeddingProvider(api_url="https://api.example.com", model="m", api_key="k")
+            AnthropicProvider(api_url="https://api.example.com", model="m", api_key="k")
             headers = mock_cls.call_args.kwargs["headers"]
             assert "Authorization" not in headers
 
