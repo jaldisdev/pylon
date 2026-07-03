@@ -230,6 +230,13 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
         click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
+    # Full-text search result: { object, rank }
+    if shape_kind == "fts_search":
+        depth = 1 if repl else 0
+        items = [_format_fts_search_row(obj, depth) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
+        return
+
     # Group result: free objects with key / grouping / elements
     if shape_kind == "group":
         max_width = shutil.get_terminal_size((100, 24)).columns
@@ -496,6 +503,31 @@ def _format_vector_search_row(obj: dict, depth: int) -> str:
     )
 
 
+def _format_fts_search_row(obj: dict, depth: int) -> str:
+    """Format a fts::search result row: { object: …, rank: … }."""
+    import dataclasses as _dc
+    obj_val = obj.get("object")
+    rank_val = obj.get("rank")
+    if obj_val is not None and _dc.is_dataclass(obj_val) and not isinstance(obj_val, type):
+        type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
+        obj_str = _pformat_object(
+            type_label,
+            {k: v for k, v in vars(obj_val).items() if k != "__pylon_type__"},
+            depth + 1,
+            shutil.get_terminal_size((100, 24)).columns,
+        )
+    else:
+        obj_str = _value(obj_val)
+    indent = "  " * (depth + 1)
+    closing = "  " * depth
+    return (
+        f"{_brace('{')}\n"
+        f"{indent}{_key('object')}: {obj_str},\n"
+        f"{indent}{_key('rank')}: {_value(rank_val)}\n"
+        f"{closing}{_brace('}')}"
+    )
+
+
 def _format_tuple(t: tuple) -> str:
     return "(" + ", ".join(_value(v) for v in t) + ")"
 
@@ -505,7 +537,10 @@ def _format_set(items: list[str]) -> str:
     if not items:
         return _brace("{}")
     if len(items) == 1:
-        return f"{_brace('{')}{items[0]}{_brace('}')}"
+        item = items[0]
+        if '\n' in item:
+            return f"{_brace('{')}\n  {item}\n{_brace('}')}"
+        return f"{_brace('{')}{item}{_brace('}')}"
     inner = ",\n  ".join(items)
     return f"{_brace('{')}\n  {inner}\n{_brace('}')}"
 

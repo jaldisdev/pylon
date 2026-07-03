@@ -1326,6 +1326,12 @@ fn shape_node_to_py<'py>(
             d.set_item("distance_position", distance_position)?;
             d.set_item("object_node", shape_node_to_py(py, object_node)?)?;
         }
+        ShapeNode::FtsSearch { object_position, rank_position, object_node } => {
+            d.set_item("kind", "fts_search")?;
+            d.set_item("object_position", object_position)?;
+            d.set_item("rank_position", rank_position)?;
+            d.set_item("object_node", shape_node_to_py(py, object_node)?)?;
+        }
     }
     Ok(d.into_any())
 }
