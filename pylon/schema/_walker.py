@@ -636,9 +636,26 @@ def _make_index_desc(idx: Any, _core: Any) -> Any:
     )
 
 
-def _make_vector_index_desc(vi: Any, _core: Any) -> Any:
+def _resolve_vector_field(ref: str, type_name: str, valid_fields: set[str]) -> str:
+    if "." in ref:
+        prefix, field = ref.rsplit(".", 1)
+        if prefix != type_name:
+            raise SchemaError(
+                f"VectorField {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
+            )
+    else:
+        field = ref
+    if field not in valid_fields:
+        raise SchemaError(
+            f"VectorField {ref!r}: field {field!r} not found on type {type_name!r}"
+        )
+    return field
+
+
+def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_fields: set[str]) -> Any:
+    fields = [_resolve_vector_field(vf.ref, type_name, valid_fields) for vf in vi._vector_fields]
     return _core.VectorIndexDescriptor(
-        fields=vi.fields,
+        fields=fields,
         model=vi.model,
         metric=vi.metric,
         dimensions=vi.dimensions,
@@ -712,7 +729,10 @@ def _build_type_descriptor(
         if isinstance(c, Expression)
     ]
     index_descs = [_make_index_desc(idx, _core) for idx in all_indexes]
-    vector_index_descs = [_make_vector_index_desc(vi, _core) for vi in cfg.vector_indexes]
+    vector_index_descs = [
+        _make_vector_index_desc(vi, _core, cfg.name, set(effective.keys()))
+        for vi in cfg.vector_indexes
+    ]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
 
     # Junction types: derive the actual table name from the MultiLink that references them.

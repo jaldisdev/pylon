@@ -37,6 +37,7 @@ from .schema import (
     Global,
     GlobalDescriptor,
     Index,
+    VectorField,
     VectorIndex,
     Int16,
     Int32,
@@ -145,6 +146,7 @@ __all__ = [
     "Regexp",
     # Schema — indexes
     "Index",
+    "VectorField",
     "VectorIndex",
     # Schema — globals
     "Global",
