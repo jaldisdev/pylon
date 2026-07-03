@@ -663,6 +663,34 @@ def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_fields: s
     )
 
 
+def _resolve_search_field(ref: str, type_name: str, valid_fields: set[str]) -> str:
+    if "." in ref:
+        prefix, field = ref.rsplit(".", 1)
+        if prefix != type_name:
+            raise SchemaError(
+                f"SearchField {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
+            )
+    else:
+        field = ref
+    if field not in valid_fields:
+        raise SchemaError(
+            f"SearchField {ref!r}: field {field!r} not found on type {type_name!r}"
+        )
+    return field
+
+
+def _make_search_index_desc(si: Any, _core: Any, type_name: str, valid_fields: set[str]) -> Any:
+    fields = []
+    for sf in si._search_fields:
+        field_name = _resolve_search_field(sf.ref, type_name, valid_fields)
+        fields.append(_core.SearchFieldDescriptor(name=field_name, weight=sf.weight_category.value))
+    return _core.SearchIndexDescriptor(
+        backend=si.backend.value,
+        fields=fields,
+        index_name=si.index_name,
+    )
+
+
 def _make_trigger_desc(trig: Any, _core: Any) -> Any:
     return _core.TriggerDescriptor(
         on=int(trig.on),
@@ -733,6 +761,10 @@ def _build_type_descriptor(
         _make_vector_index_desc(vi, _core, cfg.name, set(effective.keys()))
         for vi in cfg.vector_indexes
     ]
+    search_index_descs = [
+        _make_search_index_desc(si, _core, cfg.name, set(effective.keys()))
+        for si in cfg.search_indexes
+    ]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
 
     # Junction types: derive the actual table name from the MultiLink that references them.
@@ -760,6 +792,7 @@ def _build_type_descriptor(
         expression_constraints=expression_constraints,
         indexes=index_descs,
         vector_indexes=vector_index_descs,
+        search_indexes=search_index_descs,
         triggers=trigger_descs,
         junction=cfg.junction,
     )

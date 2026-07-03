@@ -44,6 +44,7 @@ class PylonConfig:
     constraints: list[Any] = dataclasses.field(default_factory=list)
     indexes: list[Any] = dataclasses.field(default_factory=list)
     vector_indexes: list[Any] = dataclasses.field(default_factory=list)
+    search_indexes: list[Any] = dataclasses.field(default_factory=list)
     triggers: list[Any] = dataclasses.field(default_factory=list)
     description: str | None = None
     junction: bool = False

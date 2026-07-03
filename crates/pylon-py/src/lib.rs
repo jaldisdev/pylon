@@ -551,6 +551,72 @@ impl VectorIndexDescriptor {
 }
 
 #[pyclass(module = "pylon._core", frozen)]
+pub struct SearchFieldDescriptor {
+    inner: core::schema::SearchFieldDescriptor,
+}
+
+#[pymethods]
+impl SearchFieldDescriptor {
+    #[new]
+    fn new(name: String, weight: String) -> Self {
+        let w = match weight.as_str() {
+            "B" => core::schema::SearchWeight::B,
+            "C" => core::schema::SearchWeight::C,
+            "D" => core::schema::SearchWeight::D,
+            _ => core::schema::SearchWeight::A,
+        };
+        Self { inner: core::schema::SearchFieldDescriptor { name, weight: w } }
+    }
+    #[getter]
+    fn name(&self) -> &str { &self.inner.name }
+    #[getter]
+    fn weight(&self) -> &str { self.inner.weight.as_str() }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct SearchIndexDescriptor {
+    pub(crate) inner: core::schema::SearchIndexDescriptor,
+}
+
+#[pymethods]
+impl SearchIndexDescriptor {
+    #[new]
+    #[pyo3(signature = (backend, fields, *, index_name = None))]
+    fn new(
+        backend: String,
+        fields: Vec<PyRef<SearchFieldDescriptor>>,
+        index_name: Option<String>,
+    ) -> Self {
+        let b = match backend.as_str() {
+            "OpenSearch" => core::schema::SearchBackend::OpenSearch,
+            _ => core::schema::SearchBackend::Postgres,
+        };
+        Self {
+            inner: core::schema::SearchIndexDescriptor {
+                index_name,
+                backend: b,
+                fields: fields.iter().map(|f| f.inner.clone()).collect(),
+            },
+        }
+    }
+    #[getter]
+    fn backend(&self) -> &str {
+        match &self.inner.backend {
+            core::schema::SearchBackend::Postgres => "Postgres",
+            core::schema::SearchBackend::OpenSearch => "OpenSearch",
+        }
+    }
+    #[getter]
+    fn fields(&self) -> Vec<SearchFieldDescriptor> {
+        self.inner.fields.iter().map(|f| SearchFieldDescriptor { inner: f.clone() }).collect()
+    }
+    #[getter]
+    fn index_name(&self) -> Option<&str> { self.inner.index_name.as_deref() }
+    #[getter]
+    fn column_name(&self) -> String { self.inner.column_name() }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
 pub struct TriggerDescriptor {
     inner: core::schema::TriggerDescriptor,
 }
@@ -666,6 +732,7 @@ impl TypeDescriptor {
         expression_constraints = None,
         indexes = None,
         vector_indexes = None,
+        search_indexes = None,
         triggers = None
     ))]
     fn new(
@@ -686,6 +753,7 @@ impl TypeDescriptor {
         expression_constraints: Option<Vec<PyRef<ExpressionConstraint>>>,
         indexes: Option<Vec<PyRef<IndexDescriptor>>>,
         vector_indexes: Option<Vec<PyRef<VectorIndexDescriptor>>>,
+        search_indexes: Option<Vec<PyRef<SearchIndexDescriptor>>>,
         triggers: Option<Vec<PyRef<TriggerDescriptor>>>,
     ) -> Self {
         let mut constraints: Vec<core::schema::TypeConstraint> = Vec::new();
@@ -721,6 +789,11 @@ impl TypeDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|v| v.inner.clone())
+                    .collect(),
+                search_indexes: search_indexes
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.inner.clone())
                     .collect(),
                 triggers: triggers
                     .unwrap_or_default()
@@ -774,6 +847,11 @@ impl TypeDescriptor {
     #[getter]
     fn vector_indexes(&self) -> Vec<VectorIndexDescriptor> {
         self.inner.vector_indexes.iter().map(|v| VectorIndexDescriptor { inner: v.clone() }).collect()
+    }
+
+    #[getter]
+    fn search_indexes(&self) -> Vec<SearchIndexDescriptor> {
+        self.inner.search_indexes.iter().map(|s| SearchIndexDescriptor { inner: s.clone() }).collect()
     }
 }
 
@@ -1311,6 +1389,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Type-level constructs
     m.add_class::<IndexDescriptor>()?;
     m.add_class::<VectorIndexDescriptor>()?;
+    m.add_class::<SearchFieldDescriptor>()?;
+    m.add_class::<SearchIndexDescriptor>()?;
     m.add_class::<TriggerDescriptor>()?;
     m.add_class::<ExclusiveConstraint>()?;
     m.add_class::<ExpressionConstraint>()?;
