@@ -10,6 +10,7 @@ from .commands.info import info_cmd
 from .commands.migrations import migration
 from .commands.query import query_cmd, repl
 from .commands.version import version
+from .commands.worker import worker
 from .config import NO_CONFIG_HINT, _print_error, requires_config
 
 
@@ -53,6 +54,7 @@ def cli(ctx: click.Context) -> None:
 
 cli.add_command(database)
 cli.add_command(migration)
+cli.add_command(worker)
 
 
 # --- top-level commands -------------------------------------------------------
