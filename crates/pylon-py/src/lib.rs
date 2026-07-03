@@ -1230,6 +1230,12 @@ fn shape_node_to_py<'py>(
             d.set_item("elements_position", elements_position)?;
             d.set_item("element", shape_node_to_py(py, element)?)?;
         }
+        ShapeNode::VectorSearch { object_position, distance_position, object_node } => {
+            d.set_item("kind", "vector_search")?;
+            d.set_item("object_position", object_position)?;
+            d.set_item("distance_position", distance_position)?;
+            d.set_item("object_node", shape_node_to_py(py, object_node)?)?;
+        }
     }
     Ok(d.into_any())
 }

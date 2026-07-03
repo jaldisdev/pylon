@@ -18,7 +18,7 @@ use super::{
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
-    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, VectorEnqueueInfo,
+    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch, VectorEnqueueInfo,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -30,6 +30,12 @@ pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLE
 
     // Unwrap top-level WITH block: compile each CTE binding, then the main statement.
     let (ctes, ir) = if let Stmt::With(w) = stmt {
+        // Special case: `with search := vector::search(…); select search { … } …`
+        // Merge into a single IrVectorSearch rather than going through the CTE machinery.
+        if let Some(ir) = try_compile_vs_with_pattern(&mut c, w)? {
+            return Ok(IrOutput { stmt: ir, params: c.params, ctes: vec![], global_ctes: c.global_ctes, warnings: c.warnings });
+        }
+
         let mut cte_defs = vec![];
         for alias in &w.aliases {
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
@@ -44,6 +50,51 @@ pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLE
     };
 
     Ok(IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
+}
+
+/// Detect `with <var> := vector::search(Type, $vec); select <var> { object { … }, distance }`.
+/// When matched, compile the whole thing to a single `IrVectorSearch`.
+fn try_compile_vs_with_pattern(
+    c: &mut Compiler<'_>,
+    w: &ast::WithStmt,
+) -> Result<Option<IrStmt>, PyQLError> {
+    // Only handle exactly one alias that is a bare function call (not a subquery).
+    if w.aliases.len() != 1 { return Ok(None); }
+    let alias_def = &w.aliases[0];
+    let fc = match &alias_def.expr {
+        Expr::FunctionCall(fc) => fc,
+        _ => return Ok(None),
+    };
+    if fc.module.as_deref() != Some("vector") || fc.name != "search" { return Ok(None); }
+
+    // Main statement must be `select <alias_name> { … }`.
+    let select_stmt = match w.stmt.as_ref() {
+        Stmt::Select(s) => s,
+        _ => return Ok(None),
+    };
+    // Unwrap optional Shape wrapper around the result expression.
+    let (elements, result_inner): (&[ast::ShapeElement], &Expr) = match &select_stmt.result {
+        Expr::Shape(sh) => {
+            let inner = sh.expr.as_ref().unwrap_or(&select_stmt.result);
+            (sh.elements.as_slice(), inner)
+        }
+        other => (&[], other),
+    };
+    // The inner expression should be a path referencing the WITH alias.
+    match result_inner {
+        Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+            if let ast::PathStep::Name(n) = &p.steps[0] {
+                if n != &alias_def.name { return Ok(None); }
+            } else { return Ok(None); }
+        }
+        _ => return Ok(None),
+    }
+
+    if let Some(ir) = c.try_compile_vector_search(fc, elements, select_stmt)? {
+        Ok(Some(IrStmt::VectorSearch(ir)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn cte_stmt_type(stmt: &IrStmt) -> String {
@@ -66,6 +117,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         IrStmt::For(f) => cte_stmt_type(&f.body),
         IrStmt::Group(g) => g.source.type_name.clone(),
         IrStmt::FunctionSelect(fs) => fs.type_name.clone(),
+        IrStmt::VectorSearch(vs) => format!("__vs__{}", vs.source.type_name),
     }
 }
 
@@ -439,6 +491,21 @@ impl<'a> Compiler<'a> {
                 if let Expr::FunctionCall(fc) = result {
                     if let Some(ir) = self.try_compile_fn_object_select(fc, &[], s, distinct)? {
                         return Ok(IrStmt::FunctionSelect(ir));
+                    }
+                }
+
+                // select vector::search(Type, $vec) { object { … }, distance }
+                if let Expr::Shape(sh) = result {
+                    if let Some(Expr::FunctionCall(fc)) = sh.expr.as_ref() {
+                        if let Some(ir) = self.try_compile_vector_search(fc, &sh.elements, s)? {
+                            return Ok(IrStmt::VectorSearch(ir));
+                        }
+                    }
+                }
+                // bare vector::search without shape
+                if let Expr::FunctionCall(fc) = result {
+                    if let Some(ir) = self.try_compile_vector_search(fc, &[], s)? {
+                        return Ok(IrStmt::VectorSearch(ir));
                     }
                 }
 
@@ -4498,6 +4565,152 @@ impl<'a> Compiler<'a> {
             vec![]
         };
         (implementors, columns)
+    }
+
+    // ── vector::search ────────────────────────────────────────────────────────────
+
+    /// Try to compile `vector::search(TypeName, $vec [, index_name := '…'])` from a
+    /// function-call AST node.  Returns `None` if the call is not `vector::search`.
+    fn try_compile_vector_search(
+        &mut self,
+        fc: &ast::FunctionCall,
+        elements: &[ast::ShapeElement],
+        s: &ast::SelectStmt,
+    ) -> Result<Option<IrVectorSearch>, PyQLError> {
+        if fc.module.as_deref() != Some("vector") || fc.name != "search" {
+            return Ok(None);
+        }
+        if fc.args.len() < 2 {
+            return Err(self.type_err("vector::search requires at least 2 arguments: (TypeName, $query_vector)"));
+        }
+
+        // First argument: a bare type name reference (e.g. `Product` or `default::Product`).
+        let type_qname = match &fc.args[0] {
+            ast::Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    let td = self.resolve_type(n)
+                        .map_err(|_| self.type_err(&format!("vector::search: '{}' is not a known type", n)))?;
+                    format!("{}::{}", td.module, td.name)
+                } else {
+                    return Err(self.type_err("vector::search: first argument must be a type name"));
+                }
+            }
+            _ => return Err(self.type_err("vector::search: first argument must be a bare type name")),
+        };
+
+        // Optional named argument: index_name := '…'
+        let index_name: Option<String> = fc.kwargs.iter()
+            .find(|(k, _)| k == "index_name")
+            .and_then(|(_, v)| if let ast::Expr::Literal(ast::Literal::Str(s)) = v { Some(s.clone()) } else { None });
+
+        // Resolve the type and find the VectorIndex.
+        let td = self.resolve_type(&type_qname)?.clone();
+        let vi = td.vector_indexes.iter().find(|vi| vi.index_name.as_deref() == index_name.as_deref())
+            .ok_or_else(|| {
+                let key = index_name.as_deref().unwrap_or("<default>");
+                self.type_err(&format!("type '{}' has no vector index '{}'", type_qname, key))
+            })?;
+
+        let vector_col = vi.column_name();
+        let distance_op = match vi.metric.as_str() {
+            "euclidean"     => "<->",
+            "inner_product" => "<#>",
+            _               => "<=>",  // cosine (default)
+        };
+
+        // Second argument: the query vector expression.
+        let raw_query_expr = self.compile_free_expr(&fc.args[1])?;
+        // Cast to vector so pgvector can pick up the correct operator.
+        let query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
+            expr: raw_query_expr,
+            pg_type: "vector".to_string(),
+        }));
+
+        let alias = self.fresh_alias();
+        let source = IrSource {
+            type_name: type_qname.clone(),
+            table: td.table.clone(),
+            alias: alias.clone(),
+        };
+
+        // Compile the object shape from `object { … }` inside the shape elements.
+        // `elements` is the outer shape (`{ object { … }, distance }`).
+        // We find the `object` element and take its sub-shape; everything else is ignored
+        // at compile time (distance is always emitted; unknown fields are an error).
+        let mut object_shape: Vec<IrShapeField> = vec![];
+        for el in elements {
+            if el.splat.is_some() { continue; } // ignore splat in outer shape
+            let field_name = match el.path.steps.first() {
+                Some(ast::PathStep::Name(n)) => n.as_str(),
+                _ => continue,
+            };
+            match field_name {
+                "distance" => { /* always emitted; no sub-shape */ }
+                "object" => {
+                    let sub_els = el.nested.as_deref().unwrap_or(&[]);
+                    object_shape = self.compile_shape(sub_els, &td, &alias, &td.module)?;
+                }
+                other => {
+                    return Err(self.type_err(&format!(
+                        "vector::search result has no field '{}'; valid fields are 'object' and 'distance'",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let (filter, order_by_distance, offset, limit) = self.compile_vs_modifiers(s)?;
+
+        Ok(Some(IrVectorSearch {
+            source,
+            vector_col,
+            distance_op,
+            query_expr,
+            object_shape,
+            filter,
+            order_by_distance,
+            offset,
+            limit,
+        }))
+    }
+
+    /// Compile `order by`, `filter`, `offset`, `limit` for a VectorSearch source.
+    /// Recognises `.distance` (relative path) as the distance expression.
+    fn compile_vs_modifiers(
+        &mut self,
+        s: &ast::SelectStmt,
+    ) -> Result<(Option<IrExpr>, Option<IrSortDir>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
+        let mut order_by_distance: Option<IrSortDir> = None;
+        for sort in &s.order_by {
+            let is_distance = matches!(&sort.expr,
+                ast::Expr::Path(p) if p.partial && p.steps.len() == 1
+                    && matches!(&p.steps[0], ast::PathStep::Name(n) if n == "distance")
+            );
+            if is_distance {
+                let dir = match sort.direction {
+                    ast::SortDirection::Desc => IrSortDir::Desc,
+                    ast::SortDirection::Asc  => IrSortDir::Asc,
+                };
+                order_by_distance = Some(dir);
+            } else {
+                return Err(self.type_err("vector::search: only 'order by .distance' is supported as a sort key"));
+            }
+        }
+
+        let filter = match &s.filter {
+            Some(f) => Some(self.compile_free_expr(f)?),
+            None => None,
+        };
+        let offset = match &s.offset {
+            Some(o) => Some(self.compile_free_expr(o)?),
+            None => None,
+        };
+        let limit = match &s.limit {
+            Some(l) => Some(self.compile_free_expr(l)?),
+            None => None,
+        };
+
+        Ok((filter, order_by_distance, offset, limit))
     }
 
     // ── Error helpers ─────────────────────────────────────────────────────────────
