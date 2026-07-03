@@ -16,6 +16,9 @@ use std::collections::{BTreeSet, HashMap};
 ///   9. CREATE INDEX for non-unique indexes
 ///  10. CREATE FUNCTION + CREATE TRIGGER for trigger descriptors
 ///  11. CREATE VIEW for interface types (abstract + materialized)
+///  12. User-defined functions
+///  13. ALTER TABLE ADD COLUMN for vector embedding columns
+///  14. CREATE INDEX USING hnsw for vector indexes
 pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     let mut out = String::new();
 
@@ -40,6 +43,8 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_triggers(schema, &mut out);
     emit_interface_views(schema, &mut out);
     emit_functions(schema, &mut out)?;
+    emit_vector_columns(schema, &mut out);
+    emit_vector_indexes(schema, &mut out);
 
     Ok(out)
 }
@@ -706,6 +711,105 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
     cols.join(", ")
 }
 
+// ── Phase 13: vector embedding columns ────────────────────────────────────────
+
+fn emit_vector_columns(schema: &SchemaDescriptor, out: &mut String) {
+    for td in &schema.types {
+        if td.abstract_ || td.vector_indexes.is_empty() { continue; }
+        for vi in &td.vector_indexes {
+            out.push_str(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} vector({});\n",
+                qn(&td.module, &td.table),
+                qi(&vi.column_name()),
+                vi.dimensions,
+            ));
+        }
+    }
+    if schema.types.iter().any(|t| !t.abstract_ && !t.vector_indexes.is_empty()) {
+        out.push('\n');
+    }
+}
+
+// ── Phase 14: vector HNSW indexes ─────────────────────────────────────────────
+
+fn emit_vector_indexes(schema: &SchemaDescriptor, out: &mut String) {
+    for td in &schema.types {
+        if td.abstract_ || td.vector_indexes.is_empty() { continue; }
+        for vi in &td.vector_indexes {
+            let index_name = match &vi.index_name {
+                None => format!("{}__vector__", td.table),
+                Some(name) => format!("{}__vector_{}__", td.table, name),
+            };
+            out.push_str(&format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});\n",
+                qi(&index_name),
+                qn(&td.module, &td.table),
+                qi(&vi.column_name()),
+                vi.ops_class(),
+            ));
+        }
+    }
+}
+
+// ── compile_index_fetch ────────────────────────────────────────────────────────
+
+/// Build the SQL that fetches source text for a batch of objects to embed.
+///
+/// Returns a query of the form:
+/// ```sql
+/// SELECT id, concat_ws(E'\n', field1, field2::text) AS source_text
+/// FROM "module"."table"
+/// WHERE id = ANY($1::uuid[])
+/// ```
+///
+/// Non-text source fields are cast to `::text`. The query is compiled once at
+/// startup and cached; the worker runs it with `asyncpg.fetch(sql, [ids])`.
+pub fn compile_index_fetch(
+    type_name: &str,
+    index_name: Option<&str>,
+    schema: &SchemaDescriptor,
+) -> Result<String, PyQLError> {
+    let td = schema.types.iter().find(|t| {
+        format!("{}::{}", t.module, t.name) == type_name
+    }).ok_or_else(|| PyQLError::Fragment(PyQLFragmentError {
+        message: format!("compile_index_fetch: unknown type '{}'", type_name),
+        context: type_name.to_string(),
+        position: crate::error::Position { line: 0, col: 0 },
+    }))?;
+
+    let vi = td.vector_indexes.iter().find(|vi| vi.index_name.as_deref() == index_name)
+        .ok_or_else(|| {
+            let key = index_name.unwrap_or("<default>");
+            PyQLError::Fragment(PyQLFragmentError {
+                message: format!("compile_index_fetch: no vector index '{}' on type '{}'", key, type_name),
+                context: type_name.to_string(),
+                position: crate::error::Position { line: 0, col: 0 },
+            })
+        })?;
+
+    let field_exprs = vi.fields.iter().map(|f| {
+        // Resolve the field's pg_type to decide whether an explicit cast is needed.
+        let pg_type = td.properties.iter()
+            .find(|p| p.name == *f)
+            .map(|p| p.pg_type.as_str())
+            .unwrap_or("text");
+        let col = qi(f);
+        if pg_type == "text" { col } else { format!("{}::text", col) }
+    }).collect::<Vec<_>>();
+
+    let concat = if field_exprs.len() == 1 {
+        field_exprs.into_iter().next().unwrap()
+    } else {
+        format!("concat_ws(E'\\n', {})", field_exprs.join(", "))
+    };
+
+    Ok(format!(
+        "SELECT \"id\", {} AS source_text\nFROM {}\nWHERE \"id\" = ANY($1::uuid[])",
+        concat,
+        qn(&td.module, &td.table),
+    ))
+}
+
 /// Compile a schema-level PyQL expression fragment to a raw SQL expression string.
 ///
 /// Separate entry point from `compile()` — called only by the schema exporter,
@@ -767,6 +871,7 @@ mod tests {
             computed: vec![],
             constraints: vec![],
             indexes: vec![],
+            vector_indexes: vec![],
             triggers: vec![],
             junction: false,
         }

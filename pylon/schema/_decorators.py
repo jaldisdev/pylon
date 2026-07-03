@@ -17,7 +17,7 @@ from ._fields import (
     MultiLinkAnnotation,
     PropertyAnnotation,
 )
-from ._indexes import Index
+from ._indexes import Index, VectorIndex
 from ._triggers import Rewrite, Trigger
 from ._meta import MISSING, FieldMeta, PylonConfig
 from ._scalars import SHORTHAND_MAP
@@ -347,8 +347,16 @@ def _build_type(
     exprs = _collector.drain()
 
     class_indexes = [e for e in exprs if isinstance(e, Index)]
+    class_vector_indexes = [e for e in exprs if isinstance(e, VectorIndex)]
     class_constraints = [e for e in exprs if isinstance(e, (Exclusive, Expression))]
     class_triggers = [e for e in exprs if isinstance(e, Trigger)]
+
+    default_vi = [vi for vi in class_vector_indexes if vi.index_name is None]
+    if len(default_vi) > 1:
+        raise ValueError(
+            f"Type {cls.__name__!r}: at most one bare (default) VectorIndex is allowed; "
+            f"assign additional indexes to named attributes."
+        )
     class_desc_exprs = [e for e in exprs if isinstance(e, Description)]
 
     description = (
@@ -399,6 +407,7 @@ def _build_type(
         fields=field_metas,
         constraints=class_constraints,
         indexes=class_indexes,
+        vector_indexes=class_vector_indexes,
         triggers=class_triggers,
         description=description,
         junction=junction,

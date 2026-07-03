@@ -93,6 +93,39 @@ pub struct ComputedDescriptor {
 // ── Type-level constructs ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+pub struct VectorIndexDescriptor {
+    /// `None` = default (bare) index; `Some(name)` = named index.
+    pub index_name: Option<String>,
+    /// Source fields whose text is concatenated to form the embedding input.
+    pub fields: Vec<String>,
+    /// Embedding model identifier, e.g. `"mistral-embed"`.
+    pub model: String,
+    /// Distance metric: `"cosine"` | `"euclidean"` | `"inner_product"`.
+    pub metric: String,
+    /// Embedding dimension, e.g. `1024`.
+    pub dimensions: u32,
+}
+
+impl VectorIndexDescriptor {
+    /// PostgreSQL column name for this index's vector column.
+    pub fn column_name(&self) -> String {
+        match &self.index_name {
+            None => "__vector__".to_string(),
+            Some(name) => format!("__vector_{}__", name),
+        }
+    }
+
+    /// pgvector operator class for the configured metric.
+    pub fn ops_class(&self) -> &'static str {
+        match self.metric.as_str() {
+            "euclidean" => "vector_l2_ops",
+            "inner_product" => "vector_ip_ops",
+            _ => "vector_cosine_ops",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct IndexDescriptor {
     /// Column names for a simple or composite index; empty when is_expression=true.
     pub fields: Vec<String>,
@@ -154,6 +187,8 @@ pub struct TypeDescriptor {
     pub constraints: Vec<TypeConstraint>,
     /// Non-unique indexes (own + inherited from abstract parents).
     pub indexes: Vec<IndexDescriptor>,
+    /// Vector (embedding) indexes.
+    pub vector_indexes: Vec<VectorIndexDescriptor>,
     /// Triggers (own + inherited from abstract parents).
     pub triggers: Vec<TriggerDescriptor>,
     /// True for `@pylon.junction` — type is a junction table for a MultiLink.

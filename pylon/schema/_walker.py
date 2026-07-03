@@ -636,6 +636,16 @@ def _make_index_desc(idx: Any, _core: Any) -> Any:
     )
 
 
+def _make_vector_index_desc(vi: Any, _core: Any) -> Any:
+    return _core.VectorIndexDescriptor(
+        fields=vi.fields,
+        model=vi.model,
+        metric=vi.metric,
+        dimensions=vi.dimensions,
+        index_name=vi.index_name,
+    )
+
+
 def _make_trigger_desc(trig: Any, _core: Any) -> Any:
     return _core.TriggerDescriptor(
         on=int(trig.on),
@@ -702,6 +712,7 @@ def _build_type_descriptor(
         if isinstance(c, Expression)
     ]
     index_descs = [_make_index_desc(idx, _core) for idx in all_indexes]
+    vector_index_descs = [_make_vector_index_desc(vi, _core) for vi in cfg.vector_indexes]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
 
     # Junction types: derive the actual table name from the MultiLink that references them.
@@ -728,6 +739,7 @@ def _build_type_descriptor(
         exclusive_constraints=exclusive_constraints,
         expression_constraints=expression_constraints,
         indexes=index_descs,
+        vector_indexes=vector_index_descs,
         triggers=trigger_descs,
         junction=cfg.junction,
     )

@@ -294,6 +294,18 @@ pub struct IrComputedField {
     pub expr: IrExpr,
 }
 
+// ── Vector index enqueue ────────────────────────────────────────────────────────
+
+/// Identifies one vector index that needs an outbox row written when a
+/// mutation touches its source fields.
+#[derive(Debug, Clone)]
+pub struct VectorEnqueueInfo {
+    /// Schema-qualified type name, e.g. `"default::Product"`.
+    pub type_name: String,
+    /// `None` = default index, `Some(name)` = named index.
+    pub index_name: Option<String>,
+}
+
 // ── INSERT ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -306,6 +318,8 @@ pub struct IrInsert {
     pub rewrites: Vec<IrRewrite>,
     /// Shape to return after insert (for RETURNING clause).
     pub returning: Vec<IrShapeField>,
+    /// Vector indexes on this type that need outbox rows written.
+    pub enqueue_vector: Vec<VectorEnqueueInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +340,8 @@ pub struct IrUpdate {
     /// Schema-defined rewrites appended to the SET clause.
     pub rewrites: Vec<IrRewrite>,
     pub returning: Vec<IrShapeField>,
+    /// Vector indexes whose source fields are touched by this update.
+    pub enqueue_vector: Vec<VectorEnqueueInfo>,
     /// Populated when updating an interface type; one entry per concrete implementor.
     pub poly_implementors: Vec<IrPolyImplementor>,
     /// `friends := {}` — DELETE all junction rows for this object.
@@ -683,6 +699,7 @@ mod tests {
                     computed: vec![],
                     constraints: vec![],
                     indexes: vec![],
+                    vector_indexes: vec![],
                     triggers: vec![],
                     junction: false,
                 },
@@ -712,6 +729,7 @@ mod tests {
                     computed: vec![],
                     constraints: vec![],
                     indexes: vec![],
+                    vector_indexes: vec![],
                     triggers: vec![],
                     junction: false,
                 },
@@ -741,6 +759,7 @@ mod tests {
                     computed: vec![],
                     constraints: vec![],
                     indexes: vec![],
+                    vector_indexes: vec![],
                     triggers: vec![],
                     junction: false,
                 },

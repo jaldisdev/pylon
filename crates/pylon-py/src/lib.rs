@@ -510,6 +510,45 @@ impl IndexDescriptor {
 }
 
 #[pyclass(module = "pylon._core", frozen)]
+pub struct VectorIndexDescriptor {
+    inner: core::schema::VectorIndexDescriptor,
+}
+
+#[pymethods]
+impl VectorIndexDescriptor {
+    #[new]
+    #[pyo3(signature = (fields, model, metric, dimensions, *, index_name = None))]
+    fn new(
+        fields: Vec<String>,
+        model: String,
+        metric: String,
+        dimensions: u32,
+        index_name: Option<String>,
+    ) -> Self {
+        Self {
+            inner: core::schema::VectorIndexDescriptor {
+                index_name,
+                fields,
+                model,
+                metric,
+                dimensions,
+            },
+        }
+    }
+
+    #[getter]
+    fn index_name(&self) -> Option<&str> { self.inner.index_name.as_deref() }
+    #[getter]
+    fn fields(&self) -> Vec<String> { self.inner.fields.clone() }
+    #[getter]
+    fn model(&self) -> &str { &self.inner.model }
+    #[getter]
+    fn metric(&self) -> &str { &self.inner.metric }
+    #[getter]
+    fn dimensions(&self) -> u32 { self.inner.dimensions }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
 pub struct TriggerDescriptor {
     inner: core::schema::TriggerDescriptor,
 }
@@ -624,6 +663,7 @@ impl TypeDescriptor {
         exclusive_constraints = None,
         expression_constraints = None,
         indexes = None,
+        vector_indexes = None,
         triggers = None
     ))]
     fn new(
@@ -643,6 +683,7 @@ impl TypeDescriptor {
         exclusive_constraints: Option<Vec<PyRef<ExclusiveConstraint>>>,
         expression_constraints: Option<Vec<PyRef<ExpressionConstraint>>>,
         indexes: Option<Vec<PyRef<IndexDescriptor>>>,
+        vector_indexes: Option<Vec<PyRef<VectorIndexDescriptor>>>,
         triggers: Option<Vec<PyRef<TriggerDescriptor>>>,
     ) -> Self {
         let mut constraints: Vec<core::schema::TypeConstraint> = Vec::new();
@@ -673,6 +714,11 @@ impl TypeDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|i| i.inner.clone())
+                    .collect(),
+                vector_indexes: vector_indexes
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| v.inner.clone())
                     .collect(),
                 triggers: triggers
                     .unwrap_or_default()
@@ -1098,6 +1144,16 @@ fn export_stdlib() -> String {
     core::stdlib::export_stdlib()
 }
 
+#[pyfunction]
+#[pyo3(signature = (type_name, schema, *, index_name = None))]
+fn compile_index_fetch(
+    type_name: &str,
+    schema: &SchemaDescriptor,
+    index_name: Option<&str>,
+) -> PyResult<String> {
+    core::export::compile_index_fetch(type_name, index_name, &schema.inner).map_err(pyql_err)
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1236,6 +1292,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Type-level constructs
     m.add_class::<IndexDescriptor>()?;
+    m.add_class::<VectorIndexDescriptor>()?;
     m.add_class::<TriggerDescriptor>()?;
     m.add_class::<ExclusiveConstraint>()?;
     m.add_class::<ExpressionConstraint>()?;
@@ -1256,5 +1313,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_index_fetch, m)?)?;
     Ok(())
 }
