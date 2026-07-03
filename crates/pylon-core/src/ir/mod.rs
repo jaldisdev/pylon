@@ -30,6 +30,8 @@ pub enum IrStmt {
     Group(IrGroup),
     /// `select fn(args) { shape }` — a SELECT driven by a user-defined object-returning function.
     FunctionSelect(IrFunctionSelect),
+    /// `select vector::search(Type, $vec) { object { … }, distance }` — pgvector similarity search.
+    VectorSearch(IrVectorSearch),
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────────
@@ -455,6 +457,33 @@ pub enum IrExpr {
     /// A named parameter reference inside a user-defined function body.
     /// Emitted as a double-quoted SQL identifier: `"param_name"`.
     FnParam { name: String, pg_type: String },
+}
+
+// ── Vector search ─────────────────────────────────────────────────────────────
+
+/// `select vector::search(Type, $vec) { object { … }, distance }`
+///
+/// Emits a single SELECT from the type's table that computes the distance
+/// inline and returns a virtual `{ object, distance }` shape.
+#[derive(Debug, Clone)]
+pub struct IrVectorSearch {
+    /// The searched type as an `IrSource` (table + alias).
+    pub source: IrSource,
+    /// pgvector column name, e.g. `__vector__`.
+    pub vector_col: String,
+    /// pgvector distance operator: `<=>`, `<->`, or `<#>`.
+    pub distance_op: &'static str,
+    /// The query vector expression (e.g. `$1::vector`).
+    pub query_expr: IrExpr,
+    /// Fields to include in the `object` sub-tuple (from the `object { … }` shape).
+    /// Empty means no explicit shape was given; the SQL emitter uses all properties.
+    pub object_shape: Vec<IrShapeField>,
+    pub filter: Option<IrExpr>,
+    /// `None` = no ORDER BY; `Some(dir)` = ORDER BY distance in that direction.
+    /// Only distance ordering is supported for v1.
+    pub order_by_distance: Option<IrSortDir>,
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
 }
 
 // ── User-defined function SELECT ─────────────────────────────────────────────

@@ -117,6 +117,13 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         ]
         return {"key": key_obj, "grouping": grouping, "elements": elements}
 
+    if kind == "vector_search":
+        # Outer tuple: (NULL, object_record, distance_float)
+        obj_tuple = value[node["object_position"]]
+        distance = value[node["distance_position"]]
+        obj = _decode(obj_tuple, {**node["object_node"], "position": 0}, registry)
+        return {"object": obj, "distance": distance}
+
     raise ValueError(f"unknown shape node kind: {kind!r}")
 
 

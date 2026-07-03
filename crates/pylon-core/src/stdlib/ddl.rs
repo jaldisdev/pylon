@@ -145,7 +145,7 @@ pub const INDEX_OUTBOX_DDL: &str = concat!(
     "    PRIMARY KEY (id),\n",
     "    UNIQUE NULLS NOT DISTINCT (object_id, index_kind, index_name)\n",
     ");\n\n",
-    "CREATE INDEX IF NOT EXISTS ON _pylon.\"IndexOutbox\" (status, next_attempt)\n",
+    "CREATE INDEX IF NOT EXISTS \"IndexOutbox_status_next_attempt\" ON _pylon.\"IndexOutbox\" (status, next_attempt)\n",
     "    WHERE status IN ('Pending', 'Failed');\n\n",
     "CREATE OR REPLACE FUNCTION _pylon.notify_index_queue()\n",
     "    RETURNS trigger LANGUAGE plpgsql AS $$\n",

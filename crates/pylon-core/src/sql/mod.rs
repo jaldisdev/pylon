@@ -3,7 +3,7 @@ use crate::ir::{
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
     IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField,
-    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, VectorEnqueueInfo,
+    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -73,6 +73,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::Delete(del) => emit_delete_stmt(del),
                 IrStmt::Group(grp) => emit_group(grp),
                 IrStmt::FunctionSelect(sel) => emit_function_select(sel),
+                IrStmt::VectorSearch(vs) => emit_vector_search(vs),
                 IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
@@ -290,7 +291,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &sel.offset, &sel.limit);
             sql
         }
-        IrStmt::For(_) | IrStmt::Group(_) => unreachable!("cannot appear as a CTE source"),
+        IrStmt::For(_) | IrStmt::Group(_) | IrStmt::VectorSearch(_) => unreachable!("cannot appear as a CTE source"),
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
             let mut sql = emit_path_joins(&ps.root, &ps.joins);
@@ -1858,6 +1859,73 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             sql
         }
     }
+}
+
+// ── Vector search ────────────────────────────────────────────────────────────
+
+fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
+    let alias = &vs.source.alias;
+    let dist_sql = format!(
+        "{}.{} {} {}",
+        qi(alias),
+        qi(&vs.vector_col),
+        vs.distance_op,
+        emit_expr(&vs.query_expr),
+    );
+
+    // Build the object sub-tuple.  If object_shape is empty, include all properties
+    // (type disc + id implicitly come from build_shape when no elements provided;
+    //  with no shape elements the shape is empty, so we fall back to "just id").
+    // Use build_shape when there are explicit shape fields; otherwise emit a minimal tuple.
+    let (obj_tuple, object_shape_nodes) = if vs.object_shape.is_empty() {
+        // No explicit shape: produce (type_disc, id) as minimum.
+        let type_expr = type_disc(&vs.source.type_name);
+        let id_expr = format!("{}.\"id\"", qi(alias));
+        let tuple = format!("{},\n    {}", type_expr, id_expr);
+        let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
+        (tuple, vec![id_node])
+    } else {
+        let (field_exprs, shape_fields) = build_shape(&vs.object_shape, alias);
+        let mut parts = vec![type_disc(&vs.source.type_name)];
+        parts.extend(field_exprs);
+        (parts.join(",\n    "), prepend_type(shape_fields))
+    };
+
+    // Outer tuple: NULL (type slot), object sub-tuple at pos 1, distance at pos 2.
+    let outer = format!(
+        "NULL::text,\n    ROW(\n    {}\n    )::record,\n    {}",
+        obj_tuple, dist_sql,
+    );
+    let mut sql = format!(
+        "SELECT (\n    {}\n) AS result\nFROM {} AS {}",
+        outer,
+        source_ref(&vs.source),
+        qi(alias),
+    );
+    append_filter(&mut sql, &vs.filter);
+
+    // ORDER BY distance if requested.
+    if let Some(dir) = &vs.order_by_distance {
+        let dir_sql = match dir { IrSortDir::Asc => "ASC", IrSortDir::Desc => "DESC" };
+        sql.push_str(&format!("\nORDER BY {} {}", dist_sql, dir_sql));
+    }
+    append_offset_limit(&mut sql, &vs.offset, &vs.limit);
+
+    let object_node = ShapeNode::Object {
+        name: "object".to_string(),
+        type_name: Some(vs.source.type_name.clone()),
+        position: 1,
+        cardinality: Cardinality::Many,
+        fields: object_shape_nodes,
+    };
+    let shape = ShapeDescriptor {
+        root: ShapeNode::VectorSearch {
+            object_position: 1,
+            distance_position: 2,
+            object_node: Box::new(object_node),
+        },
+    };
+    SqlOutput { sql, shape }
 }
 
 // ── Function select ──────────────────────────────────────────────────────────

@@ -56,6 +56,16 @@ pub enum ShapeNode {
         /// Pylon-qualified name, e.g. `default::Gender`.
         enum_type: String,
     },
+    /// Result of a `vector::search` statement.
+    /// The outer `result` tuple has three slots:
+    ///   0 → NULL (virtual type, no registry lookup)
+    ///   `object_position` → the object sub-tuple (decoded as a Pylon object)
+    ///   `distance_position` → the distance scalar (float64)
+    VectorSearch {
+        object_position: usize,
+        distance_position: usize,
+        object_node: Box<ShapeNode>,
+    },
     /// Result of a `group` statement: each row is a free object with key/grouping/elements.
     Group {
         /// One ShapeNode per grouping key (carries name, position, and type).

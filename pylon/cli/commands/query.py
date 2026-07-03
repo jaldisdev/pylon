@@ -223,6 +223,13 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
         click.echo(_format_set(items) if repl else "\n".join(items))
         return
 
+    # Vector search result: { object, distance }
+    if shape_kind == "vector_search":
+        depth = 1 if repl else 0
+        items = [_format_vector_search_row(obj, depth) for obj in results]
+        click.echo(_format_set(items) if repl else "\n".join(items))
+        return
+
     # Group result: free objects with key / grouping / elements
     if shape_kind == "group":
         max_width = shutil.get_terminal_size((100, 24)).columns
@@ -462,6 +469,31 @@ def _format_group_row(obj: dict, depth: int, max_width: int) -> str:
     closing = "  " * depth
     inner = f",\n{indent}".join(f"{_key(k)}: {v}" for k, v in fields.items())
     return f"{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
+
+
+def _format_vector_search_row(obj: dict, depth: int) -> str:
+    """Format a vector::search result row: { object: …, distance: … }."""
+    import dataclasses as _dc
+    obj_val = obj.get("object")
+    dist_val = obj.get("distance")
+    if obj_val is not None and _dc.is_dataclass(obj_val) and not isinstance(obj_val, type):
+        type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
+        obj_str = _pformat_object(
+            type_label,
+            {k: v for k, v in vars(obj_val).items() if k != "__pylon_type__"},
+            depth + 1,
+            shutil.get_terminal_size((100, 24)).columns,
+        )
+    else:
+        obj_str = _value(obj_val)
+    indent = "  " * (depth + 1)
+    closing = "  " * depth
+    return (
+        f"{_brace('{')}\n"
+        f"{indent}{_key('object')}: {obj_str},\n"
+        f"{indent}{_key('distance')}: {_value(dist_val)}\n"
+        f"{closing}{_brace('}')}"
+    )
 
 
 def _format_tuple(t: tuple) -> str:
