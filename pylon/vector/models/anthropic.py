@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from .base import EmbeddingProvider
+from .base import ModelProvider
 
 MAX_BATCH = 2048
 
 
-class AnthropicEmbeddingProvider(EmbeddingProvider):
+class AnthropicProvider(ModelProvider):
     """Generic Anthropic-style embedding provider.
 
     For endpoints that use Anthropic's authentication conventions
@@ -20,7 +20,7 @@ class AnthropicEmbeddingProvider(EmbeddingProvider):
             import httpx  # type: ignore[import-untyped]
         except ImportError as e:
             raise ImportError(
-                "Install the 'httpx' package to use AnthropicEmbeddingProvider: "
+                "Install the 'httpx' package to use AnthropicProvider: "
                 "pip install httpx"
             ) from e
         headers: dict[str, str] = {

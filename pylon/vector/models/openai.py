@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from .base import EmbeddingProvider
+from .base import ModelProvider
 
 MAX_BATCH = 2048
 
 
-class OpenAIEmbeddingProvider(EmbeddingProvider):
+class OpenAIProvider(ModelProvider):
     """Generic OpenAI-compatible embedding provider.
 
     Works with any endpoint that follows the OpenAI embeddings API:
@@ -21,8 +21,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             import httpx  # type: ignore[import-untyped]
         except ImportError as e:
             raise ImportError(
-                "Install the 'httpx' package to use OpenAIEmbeddingProvider: "
-                "pip install httpx"
+                "Install the 'httpx' package to use OpenAIProvider: pip install httpx"
             ) from e
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:

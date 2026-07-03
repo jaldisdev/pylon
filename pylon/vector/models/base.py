@@ -3,8 +3,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 
-class EmbeddingProvider(ABC):
-    """Abstract embedding provider.  Each concrete subclass targets one API."""
+class ModelProvider(ABC):
+    """Abstract model provider.  Each concrete subclass targets one API."""
 
     @abstractmethod
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
