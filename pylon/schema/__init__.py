@@ -51,7 +51,7 @@ from ._fields import (
     Target,
     through,
 )
-from ._indexes import Index
+from ._indexes import Index, VectorIndex
 from ._lazy import lazy
 from ._registry import snapshot as schema_snapshot
 from ._functions import Volatility, Language, function as function_decorator
@@ -126,6 +126,7 @@ __all__ = [
     "Regexp",
     # Indexes
     "Index",
+    "VectorIndex",
     # Triggers & rewrites
     "On",
     "Timing",

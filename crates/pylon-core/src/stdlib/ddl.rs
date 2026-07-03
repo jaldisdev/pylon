@@ -123,6 +123,42 @@ fn render_function(desc: &FnDescriptor, def: &PylonFnDef) -> String {
     )
 }
 
+/// DDL for the `_pylon."IndexOutbox"` table and its supporting types.
+///
+/// Emitted once, at schema-bootstrap time, before any user-schema DDL.
+/// `index_name IS NULL` represents the default (unnamed) index on a type;
+/// `NULLS NOT DISTINCT` on the unique constraint collapses multiple writes
+/// to the same object/index into a single outstanding job.
+pub const INDEX_OUTBOX_DDL: &str = concat!(
+    "CREATE TYPE _pylon.\"IndexKind\" AS ENUM ('Vector', 'OpenSearch');\n",
+    "CREATE TYPE _pylon.\"IndexOutboxStatus\" AS ENUM ('Pending', 'Processing', 'Failed');\n\n",
+    "CREATE TABLE IF NOT EXISTS _pylon.\"IndexOutbox\" (\n",
+    "    id            uuid        NOT NULL DEFAULT uuidv7(),\n",
+    "    object_id     uuid        NOT NULL,\n",
+    "    type_name     text        NOT NULL,\n",
+    "    index_kind    _pylon.\"IndexKind\"         NOT NULL,\n",
+    "    index_name    text,\n",
+    "    status        _pylon.\"IndexOutboxStatus\" NOT NULL DEFAULT 'Pending',\n",
+    "    attempts      int         NOT NULL DEFAULT 0,\n",
+    "    enqueued_at   timestamptz NOT NULL DEFAULT now(),\n",
+    "    next_attempt  timestamptz,\n",
+    "    PRIMARY KEY (id),\n",
+    "    UNIQUE NULLS NOT DISTINCT (object_id, index_kind, index_name)\n",
+    ");\n\n",
+    "CREATE INDEX IF NOT EXISTS ON _pylon.\"IndexOutbox\" (status, next_attempt)\n",
+    "    WHERE status IN ('Pending', 'Failed');\n\n",
+    "CREATE OR REPLACE FUNCTION _pylon.notify_index_queue()\n",
+    "    RETURNS trigger LANGUAGE plpgsql AS $$\n",
+    "BEGIN\n",
+    "    PERFORM pg_notify('pylon_index_queue', NEW.object_id::text);\n",
+    "    RETURN NEW;\n",
+    "END\n",
+    "$$;\n\n",
+    "CREATE OR REPLACE TRIGGER notify_index_queue\n",
+    "    AFTER INSERT OR UPDATE ON _pylon.\"IndexOutbox\"\n",
+    "    FOR EACH ROW EXECUTE FUNCTION _pylon.notify_index_queue();\n",
+);
+
 /// Generate the complete `_pylon` schema DDL from the stdlib registry.
 ///
 /// Every `ImplStrategy::PylonFunction` entry contributes one
@@ -131,6 +167,9 @@ fn render_function(desc: &FnDescriptor, def: &PylonFnDef) -> String {
 /// `TranspilerIntrinsic` entries (range, multirange) are skipped.
 pub fn export_stdlib() -> String {
     let mut out = String::from("CREATE SCHEMA IF NOT EXISTS _pylon;\n\n");
+
+    out.push_str(INDEX_OUTBOX_DDL);
+    out.push('\n');
 
     // Internal runtime helpers (not user-callable from PyQL).
     out.push_str(concat!(

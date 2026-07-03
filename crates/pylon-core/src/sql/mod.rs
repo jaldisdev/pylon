@@ -3,7 +3,7 @@ use crate::ir::{
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
     IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField,
-    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
+    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, VectorEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
@@ -164,8 +164,15 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     // SELECT-over-DML: wrap inner statement in a CTE, select from it.
     let from_clause = if let Some(dml) = &sel.dml_source {
         let cte_sql = emit_dml_as_cte_source(dml);
-        format!("WITH \"_dml\" AS (\n{}\n)\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
-            cte_sql, distinct, tuple, qi(alias))
+        let enqueue = match dml.as_ref() {
+            IrStmt::Insert(ins) => ins.enqueue_vector.as_slice(),
+            IrStmt::Update(upd) => upd.enqueue_vector.as_slice(),
+            _ => &[],
+        };
+        let mut cte_parts = vec![format!("\"_dml\" AS (\n{}\n)", cte_sql)];
+        cte_parts.extend(enqueue_ctes(enqueue, "_dml"));
+        format!("WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
+            cte_parts.join(",\n"), distinct, tuple, qi(alias))
     } else if sel.polymorphic && !sel.source.table.starts_with("@cte:") {
         // Polymorphic interface with no CTE indirection: fan out to implementor tables.
         let union_sql = emit_poly_union(&sel.poly_implementors, &sel.poly_columns);
@@ -948,11 +955,73 @@ fn emit_for_insert(
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
 
+// ── Vector index enqueue helpers ─────────────────────────────────────────────
+
+/// Build one `"_eqN" AS (INSERT INTO _pylon."IndexOutbox" ...)` CTE string.
+fn enqueue_cte_sql(eq: &VectorEnqueueInfo, source_cte: &str, cte_name: &str) -> String {
+    let index_name_sql = match &eq.index_name {
+        None => "NULL".to_string(),
+        Some(name) => sql_str(name),
+    };
+    format!(
+        concat!(
+            "\"{}\" AS (\n",
+            "    INSERT INTO _pylon.\"IndexOutbox\"\n",
+            "        (object_id, type_name, index_kind, index_name)\n",
+            "    SELECT \"id\", {}, 'Vector'::_pylon.\"IndexKind\", {}\n",
+            "    FROM \"{}\"\n",
+            "    ON CONFLICT (object_id, index_kind, index_name)\n",
+            "    DO UPDATE SET status = 'Pending', enqueued_at = now()\n",
+            ")",
+        ),
+        cte_name,
+        sql_str(&eq.type_name),
+        index_name_sql,
+        source_cte,
+    )
+}
+
+/// Build the full list of enqueue CTE strings for a set of vector indexes.
+fn enqueue_ctes(enqueue: &[VectorEnqueueInfo], source_cte: &str) -> Vec<String> {
+    enqueue.iter().enumerate()
+        .map(|(i, eq)| enqueue_cte_sql(eq, source_cte, &format!("_eq{}", i)))
+        .collect()
+}
+
+/// Build `SELECT (...) AS result FROM "cte_name"` plus its ShapeDescriptor,
+/// mirroring `emit_returning_shape` but for the CTE-wrapper SELECT path.
+fn shape_select_from_cte(
+    target: &IrSource,
+    returning: &[IrShapeField],
+    cte_name: &str,
+) -> (ShapeDescriptor, Option<String>) {
+    if returning.is_empty() {
+        return (
+            ShapeDescriptor { root: ShapeNode::Scalar { name: String::new(), position: 0 } },
+            None,
+        );
+    }
+    let (field_exprs, shape_fields) = build_shape(returning, "");
+    let mut parts = vec![type_disc(&target.type_name)];
+    parts.extend(field_exprs);
+    let tuple = parts.join(",\n    ");
+    let sql = format!("SELECT (\n    {}\n) AS result\nFROM {}", tuple, qi(cte_name));
+    let root_fields = prepend_type(shape_fields);
+    let shape = ShapeDescriptor {
+        root: ShapeNode::Object {
+            name: String::new(),
+            type_name: Some(target.type_name.clone()),
+            position: 0,
+            cardinality: Cardinality::Required,
+            fields: root_fields,
+        },
+    };
+    (shape, Some(sql))
+}
+
 fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
-    // Rewrites override explicit assignments for the same column.
     let rewrite_cols: std::collections::HashSet<&str> =
         ins.rewrites.iter().map(|r| r.column.as_str()).collect();
-
     let mut cols: Vec<String> = ins.assignments.iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(c, _)| qi(c))
@@ -966,21 +1035,34 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         vals.push(emit_expr(&rw.expr));
     }
 
-    let mut sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        source_ref(&ins.target),
-        cols.join(", "),
-        vals.join(", "),
+    if ins.enqueue_vector.is_empty() {
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            source_ref(&ins.target), cols.join(", "), vals.join(", "),
+        );
+        if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut sql, conflict); }
+        let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
+        if let Some(r) = returning_sql { sql.push_str(&r); }
+        return SqlOutput { sql, shape };
+    }
+
+    // Enqueue path: wrap INSERT in a CTE so we can append the outbox inserts.
+    let mut insert_sql = format!(
+        "    INSERT INTO {} ({}) VALUES ({})",
+        source_ref(&ins.target), cols.join(", "), vals.join(", "),
     );
+    if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
+    insert_sql.push_str("\n    RETURNING \"id\"");
 
-    if let Some(conflict) = &ins.unless_conflict {
-        emit_conflict(&mut sql, conflict);
-    }
+    let mut cte_parts = vec![format!("\"_w\" AS (\n{}\n)", insert_sql)];
+    cte_parts.extend(enqueue_ctes(&ins.enqueue_vector, "_w"));
 
-    let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
-    if let Some(r) = returning_sql {
-        sql.push_str(&r);
-    }
+    let (shape, select_sql) = shape_select_from_cte(&ins.target, &ins.returning, "_w");
+    let sql = format!(
+        "WITH\n{}\n{}",
+        cte_parts.join(",\n"),
+        select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
+    );
     SqlOutput { sql, shape }
 }
 
@@ -1042,8 +1124,8 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         || !upd.multi_link_appends.is_empty()
         || !upd.multi_link_removals.is_empty();
 
-    if !has_any_multilink {
-        // No junction changes — emit a plain UPDATE (possibly with user CTE prefix).
+    if !has_any_multilink && upd.enqueue_vector.is_empty() {
+        // No junction changes, no enqueue — plain UPDATE (possibly with user CTE prefix).
         let mut sets: Vec<String> = upd.assignments.iter()
             .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
             .collect();
@@ -1060,6 +1142,37 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             sql = format!("{}{}", emit_cte_prefix(user_ctes), sql);
         }
         return SqlOutput { sql, shape };
+    }
+
+    if !has_any_multilink && !upd.enqueue_vector.is_empty() {
+        // No junction changes but need to enqueue — wrap UPDATE in a CTE.
+        let mut sets: Vec<String> = upd.assignments.iter()
+            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+            .collect();
+        for rw in &upd.rewrites {
+            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
+        }
+        let mut upd_sql = format!(
+            "    UPDATE {} AS {}\n    SET {}",
+            source_ref(&upd.target), qi(alias), sets.join(", "),
+        );
+        append_filter(&mut upd_sql, &upd.filter);
+        upd_sql.push_str("\n    RETURNING \"id\"");
+
+        let mut cte_parts: Vec<String> = vec![];
+        for cte in user_ctes {
+            cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte.name, emit_dml_as_cte_source(&cte.stmt)));
+        }
+        cte_parts.push(format!("\"_w\" AS (\n{}\n)", upd_sql));
+        cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_w"));
+
+        let (shape2, select_sql) = shape_select_from_cte(&upd.target, &upd.returning, "_w");
+        let sql = format!(
+            "WITH\n{}\n{}",
+            cte_parts.join(",\n"),
+            select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
+        );
+        return SqlOutput { sql, shape: shape2 };
     }
 
     // CTE-based UPDATE for junction table mutations.
@@ -1127,6 +1240,9 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
         cte_parts.push(emit_ml_append_cte(rep, i, &format!("_ml_rep_{}", i)));
     }
+
+    // Enqueue CTEs (source is _ids which has all columns including id).
+    cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_ids"));
 
     let sql = format!(
         "WITH\n{}\nSELECT (\n    {}\n) AS result\nFROM \"_ids\" AS {}",
@@ -1907,6 +2023,7 @@ mod tests {
                     computed: vec![],
                     constraints: vec![],
                     indexes: vec![],
+                    vector_indexes: vec![],
                     triggers: vec![],
                     junction: false,
                 },
@@ -1936,6 +2053,7 @@ mod tests {
                     computed: vec![],
                     constraints: vec![],
                     indexes: vec![],
+                    vector_indexes: vec![],
                     triggers: vec![],
                     junction: false,
                 },
@@ -1965,6 +2083,7 @@ mod tests {
                     computed: vec![],
                     constraints: vec![],
                     indexes: vec![],
+                    vector_indexes: vec![],
                     triggers: vec![],
                     junction: false,
                 },
@@ -2124,7 +2243,7 @@ mod tests {
                         through: Some("default::PersonFriend".into()),
                         nullable: false, description: None, on_delete: vec![],
                     }],
-                    computed: vec![], constraints: vec![], indexes: vec![], triggers: vec![], junction: false,
+                    computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![], triggers: vec![], junction: false,
                 },
                 TypeDescriptor {
                     name: "PersonFriend".into(), module: "default".into(), table: "PersonFriend".into(),
@@ -2144,7 +2263,7 @@ mod tests {
                         },
                     ],
                     multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], triggers: vec![], junction: false,
+                    indexes: vec![], vector_indexes: vec![], triggers: vec![], junction: false,
                 },
             ],
             scalars: vec![], enums: vec![], globals: vec![], functions: vec![],

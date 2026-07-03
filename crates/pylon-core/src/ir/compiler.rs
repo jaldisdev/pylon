@@ -18,7 +18,7 @@ use super::{
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
-    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup,
+    IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, VectorEnqueueInfo,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -2130,6 +2130,12 @@ impl<'a> Compiler<'a> {
             .map(|uc| self.compile_conflict(uc, td))
             .transpose()?;
         let returning = Self::pk_returning(td);
+        let enqueue_vector = td.vector_indexes.iter()
+            .map(|vi| VectorEnqueueInfo {
+                type_name: format!("{}::{}", td.module, td.name),
+                index_name: vi.index_name.clone(),
+            })
+            .collect();
 
         Ok(IrInsert {
             target,
@@ -2137,6 +2143,7 @@ impl<'a> Compiler<'a> {
             unless_conflict,
             rewrites,
             returning,
+            enqueue_vector,
         })
     }
 
@@ -2318,11 +2325,23 @@ impl<'a> Compiler<'a> {
             vec![]
         };
 
+        // Only enqueue indexes whose source fields are touched by this update.
+        let written_cols: std::collections::HashSet<&str> =
+            assignments.iter().map(|(c, _)| c.as_str()).collect();
+        let enqueue_vector = td.vector_indexes.iter()
+            .filter(|vi| vi.fields.iter().any(|f| written_cols.contains(f.as_str())))
+            .map(|vi| VectorEnqueueInfo {
+                type_name: format!("{}::{}", td.module, td.name),
+                index_name: vi.index_name.clone(),
+            })
+            .collect();
+
         Ok(IrUpdate {
             target, filter, assignments, rewrites, returning,
             multi_link_clears, multi_link_replaces,
             multi_link_appends, multi_link_removals,
             poly_implementors,
+            enqueue_vector,
         })
     }
 
