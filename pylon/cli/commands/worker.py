@@ -63,10 +63,10 @@ def worker() -> None:
 @requires_config
 @click.pass_context
 def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: str) -> None:
-    """Start the vector index worker.
+    """Start index workers (vector and/or OpenSearch).
 
-    Reads [models.*] from pylon.toml, auto-discovers all types that declare a
-    VectorIndex, and processes IndexOutbox rows until interrupted.
+    Auto-discovers all VectorIndex and OpenSearch-backed SearchIndex declarations
+    from the schema and processes IndexOutbox rows until interrupted.
     """
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
@@ -76,6 +76,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
 
     import pylon
     from pylon.vector.sync import VectorIndexWorker
+    from pylon.search import OpenSearchClient, OpenSearchWorker
     import pylon.query as _q
 
     pylon.finalize()
@@ -83,11 +84,25 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     schema = _q._singleton
 
     providers = _build_providers(schema, config)
-    if not providers:
+    want_opensearch = any(
+        si.backend == "OpenSearch"
+        for td in schema.types
+        for si in td.search_indexes
+    )
+
+    if not providers and not want_opensearch:
         _print_error(
-            "no vector index providers configured",
-            "Add [models.<model-name>] entries to pylon.toml matching the "
-            "model= declared on each VectorIndex in your schema.",
+            "no index workers to start",
+            "Add VectorIndex or SearchIndex(backend=OpenSearch) to your schema, "
+            "and configure [models.*] / [search] in pylon.toml.",
+        )
+        ctx.exit(1)
+        return
+
+    if want_opensearch and not config.search_registry:
+        _print_error(
+            "OpenSearch indexes defined but no [search] config found",
+            "Add [search] host/port to pylon.toml.",
         )
         ctx.exit(1)
         return
@@ -96,18 +111,46 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     dsn = db.dsn or f"postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}"
 
     async def run() -> None:
-        conn = await asyncpg.connect(dsn)
-        try:
-            worker_instance = VectorIndexWorker(conn, schema=schema, providers=providers)
-            worker_instance.batch_size = batch_size
-            worker_instance.poll_interval = poll_interval
+        tasks = []
+        conns = []
+
+        if providers:
+            conn = await asyncpg.connect(dsn)
+            conns.append(conn)
+            w = VectorIndexWorker(conn, schema=schema, providers=providers)
+            w.batch_size = batch_size
+            w.poll_interval = poll_interval
             log.info(
                 "VectorIndexWorker started  batch_size=%d  poll_interval=%.0fs",
                 batch_size, poll_interval,
             )
-            await worker_instance.run()
+            tasks.append(w.run())
+
+        os_client = None
+        if want_opensearch:
+            search_cfg = config.search_registry["default"]
+            base_url = f"http://{search_cfg.host}:{search_cfg.port}"
+            auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
+            os_client = OpenSearchClient(base_url, auth=auth)
+            await os_client.__aenter__()
+            conn = await asyncpg.connect(dsn)
+            conns.append(conn)
+            w = OpenSearchWorker(conn, schema=schema, client=os_client)
+            w.batch_size = batch_size
+            w.poll_interval = poll_interval
+            log.info(
+                "OpenSearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs",
+                base_url, batch_size, poll_interval,
+            )
+            tasks.append(w.run())
+
+        try:
+            await asyncio.gather(*tasks)
         finally:
-            await conn.close()
+            for conn in conns:
+                await conn.close()
+            if os_client is not None:
+                await os_client.__aexit__(None, None, None)
 
     try:
         asyncio.run(run())

@@ -139,6 +139,15 @@ impl SearchIndexDescriptor {
             Some(name) => format!("__search_{}__", name),
         }
     }
+
+    /// Deferred search index name: `"module__table[__name]"` in lowercase.
+    pub fn deferred_index_name(&self, module: &str, type_name: &str) -> String {
+        let base = format!("{}__{}", module, type_name).to_lowercase();
+        match &self.index_name {
+            None => base,
+            Some(n) => format!("{}__{}", base, n.to_lowercase()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

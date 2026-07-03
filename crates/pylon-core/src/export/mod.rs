@@ -120,7 +120,7 @@ fn emit_enums(schema: &SchemaDescriptor, out: &mut String) {
             .map(|m| format!("'{}'", m.replace('\'', "''")))
             .collect();
         out.push_str(&format!(
-            "CREATE TYPE {}.{} AS ENUM ({});\n",
+            "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n",
             qi(&e.module),
             qi(&e.name),
             members.join(", "),
@@ -859,6 +859,55 @@ pub fn compile_index_fetch(
             .map(|p| p.pg_type.as_str())
             .unwrap_or("text");
         let col = qi(f);
+        if pg_type == "text" { col } else { format!("{}::text", col) }
+    }).collect::<Vec<_>>();
+
+    let concat = if field_exprs.len() == 1 {
+        field_exprs.into_iter().next().unwrap()
+    } else {
+        format!("concat_ws(E'\\n', {})", field_exprs.join(", "))
+    };
+
+    Ok(format!(
+        "SELECT \"id\", {} AS source_text\nFROM {}\nWHERE \"id\" = ANY($1::uuid[])",
+        concat,
+        qn(&td.module, &td.table),
+    ))
+}
+
+/// Like `compile_index_fetch` but for OpenSearch-backed SearchIndexes.
+/// Returns SQL that fetches source-text fields for a batch of object IDs.
+pub fn compile_search_index_fetch(
+    type_name: &str,
+    index_name: Option<&str>,
+    schema: &SchemaDescriptor,
+) -> Result<String, PyQLError> {
+    let td = schema.types.iter().find(|t| {
+        format!("{}::{}", t.module, t.name) == type_name
+    }).ok_or_else(|| PyQLError::Fragment(PyQLFragmentError {
+        message: format!("compile_search_index_fetch: unknown type '{}'", type_name),
+        context: type_name.to_string(),
+        position: crate::error::Position { line: 0, col: 0 },
+    }))?;
+
+    use crate::schema::SearchBackend;
+    let si = td.search_indexes.iter()
+        .find(|si| si.index_name.as_deref() == index_name && si.backend == SearchBackend::OpenSearch)
+        .ok_or_else(|| {
+            let key = index_name.unwrap_or("<default>");
+            PyQLError::Fragment(PyQLFragmentError {
+                message: format!("compile_search_index_fetch: no OpenSearch SearchIndex '{}' on type '{}'", key, type_name),
+                context: type_name.to_string(),
+                position: crate::error::Position { line: 0, col: 0 },
+            })
+        })?;
+
+    let field_exprs = si.fields.iter().map(|sf| {
+        let pg_type = td.properties.iter()
+            .find(|p| p.name == sf.name)
+            .map(|p| p.pg_type.as_str())
+            .unwrap_or("text");
+        let col = qi(&sf.name);
         if pg_type == "text" { col } else { format!("{}::text", col) }
     }).collect::<Vec<_>>();
 

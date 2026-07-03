@@ -1,16 +1,18 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField, IrMultiLinkJoin,
-    IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult,
-    IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField,
-    IrFtsSearch, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo,
+    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField,
+    IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
+    IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect,
+    IrShapeField, IrSingleLinkField, IrFtsSearch, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
+    IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
-use crate::query::{Cardinality, ShapeDescriptor, ShapeNode};
+use crate::query::{Cardinality, DeferredSearchPlan, ShapeDescriptor, ShapeNode};
 
 pub struct SqlOutput {
     pub sql: String,
     pub shape: ShapeDescriptor,
+    pub deferred_search_plan: Option<DeferredSearchPlan>,
 }
 
 /// Emit the SQL body for a computed global CTE — a plain scalar query with a `value` column.
@@ -166,13 +168,14 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     // SELECT-over-DML: wrap inner statement in a CTE, select from it.
     let from_clause = if let Some(dml) = &sel.dml_source {
         let cte_sql = emit_dml_as_cte_source(dml);
-        let enqueue = match dml.as_ref() {
-            IrStmt::Insert(ins) => ins.enqueue_vector.as_slice(),
-            IrStmt::Update(upd) => upd.enqueue_vector.as_slice(),
-            _ => &[],
+        let (enqueue_v, enqueue_s) = match dml.as_ref() {
+            IrStmt::Insert(ins) => (ins.enqueue_vector.as_slice(), ins.enqueue_search.as_slice()),
+            IrStmt::Update(upd) => (upd.enqueue_vector.as_slice(), upd.enqueue_search.as_slice()),
+            _ => (&[][..], &[][..]),
         };
         let mut cte_parts = vec![format!("\"_dml\" AS (\n{}\n)", cte_sql)];
-        cte_parts.extend(enqueue_ctes(enqueue, "_dml"));
+        cte_parts.extend(enqueue_ctes(enqueue_v, "_dml"));
+        cte_parts.extend(enqueue_search_ctes(enqueue_s, "_dml", enqueue_v.len()));
         format!("WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
             cte_parts.join(",\n"), distinct, tuple, qi(alias))
     } else if sel.polymorphic && !sel.source.table.starts_with("@cte:") {
@@ -204,6 +207,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
                 fields: root_fields,
             },
         },
+        deferred_search_plan: None,
     }
 }
 
@@ -479,6 +483,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
             shape: ShapeDescriptor {
                 root: ShapeNode::Scalar { name: String::new(), position: 0 },
             },
+            deferred_search_plan: None,
         };
     }
 
@@ -500,6 +505,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
                 shape: ShapeDescriptor {
                     root: ShapeNode::Scalar { name: String::new(), position: 0 },
                 },
+                deferred_search_plan: None,
             };
         }
     }
@@ -550,7 +556,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root } }
+    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, deferred_search_plan: None }
 }
 
 fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
@@ -786,7 +792,7 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         element: Box::new(element_node),
     };
 
-    SqlOutput { sql, shape: ShapeDescriptor { root } }
+    SqlOutput { sql, shape: ShapeDescriptor { root }, deferred_search_plan: None }
 }
 
 fn emit_poly_union_type_only(implementors: &[IrPolyImplementor]) -> String {
@@ -870,7 +876,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root } }
+    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, deferred_search_plan: None }
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────
@@ -883,6 +889,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
         let empty = SqlOutput {
             sql: "SELECT NULL AS result WHERE FALSE".to_string(),
             shape: ShapeDescriptor { root: ShapeNode::Scalar { name: String::new(), position: 0 } },
+            deferred_search_plan: None,
         };
         return empty;
     }
@@ -907,7 +914,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
                 "{}SELECT \"_body\".result\nFROM {}\nCROSS JOIN LATERAL (\n    {}\n) AS \"_body\"",
                 cte_prefix, values_from, indent_body,
             );
-            SqlOutput { sql, shape: body_out.shape }
+            SqlOutput { sql, shape: body_out.shape, deferred_search_plan: None }
         }
     }
 }
@@ -952,7 +959,7 @@ fn emit_for_insert(
     if let Some(r) = returning_sql {
         sql.push_str(&r);
     }
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
@@ -987,6 +994,38 @@ fn enqueue_cte_sql(eq: &VectorEnqueueInfo, source_cte: &str, cte_name: &str) -> 
 fn enqueue_ctes(enqueue: &[VectorEnqueueInfo], source_cte: &str) -> Vec<String> {
     enqueue.iter().enumerate()
         .map(|(i, eq)| enqueue_cte_sql(eq, source_cte, &format!("_eq{}", i)))
+        .collect()
+}
+
+/// Build one OpenSearch outbox CTE string.
+fn enqueue_search_cte_sql(eq: &SearchEnqueueInfo, source_cte: &str, cte_name: &str) -> String {
+    let index_name_sql = match &eq.index_name {
+        None => "NULL".to_string(),
+        Some(name) => sql_str(name),
+    };
+    format!(
+        concat!(
+            "\"{}\" AS (\n",
+            "    INSERT INTO _pylon.\"IndexOutbox\"\n",
+            "        (object_id, type_name, index_kind, index_name, operation)\n",
+            "    SELECT \"id\", {}, 'OpenSearch'::_pylon.\"IndexKind\", {}, {}\n",
+            "    FROM \"{}\"\n",
+            "    ON CONFLICT (object_id, index_kind, index_name)\n",
+            "    DO UPDATE SET status = 'Pending', operation = EXCLUDED.operation, enqueued_at = now()\n",
+            ")",
+        ),
+        cte_name,
+        sql_str(&eq.type_name),
+        index_name_sql,
+        sql_str(eq.operation),
+        source_cte,
+    )
+}
+
+/// Build the full list of OpenSearch enqueue CTE strings.
+fn enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], source_cte: &str, offset: usize) -> Vec<String> {
+    enqueue.iter().enumerate()
+        .map(|(i, eq)| enqueue_search_cte_sql(eq, source_cte, &format!("_es{}", offset + i)))
         .collect()
 }
 
@@ -1037,7 +1076,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         vals.push(emit_expr(&rw.expr));
     }
 
-    if ins.enqueue_vector.is_empty() {
+    if ins.enqueue_vector.is_empty() && ins.enqueue_search.is_empty() {
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
             source_ref(&ins.target), cols.join(", "), vals.join(", "),
@@ -1045,7 +1084,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut sql, conflict); }
         let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
         if let Some(r) = returning_sql { sql.push_str(&r); }
-        return SqlOutput { sql, shape };
+        return SqlOutput { sql, shape, deferred_search_plan: None };
     }
 
     // Enqueue path: wrap INSERT in a CTE so we can append the outbox inserts.
@@ -1058,6 +1097,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
 
     let mut cte_parts = vec![format!("\"_w\" AS (\n{}\n)", insert_sql)];
     cte_parts.extend(enqueue_ctes(&ins.enqueue_vector, "_w"));
+    cte_parts.extend(enqueue_search_ctes(&ins.enqueue_search, "_w", ins.enqueue_vector.len()));
 
     let (shape, select_sql) = shape_select_from_cte(&ins.target, &ins.returning, "_w");
     let sql = format!(
@@ -1065,7 +1105,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         cte_parts.join(",\n"),
         select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
     );
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────
@@ -1111,7 +1151,7 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     );
 
     let (shape, _) = emit_returning_shape(&upd.target, &upd.returning, true);
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
@@ -1126,7 +1166,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         || !upd.multi_link_appends.is_empty()
         || !upd.multi_link_removals.is_empty();
 
-    if !has_any_multilink && upd.enqueue_vector.is_empty() {
+    if !has_any_multilink && upd.enqueue_vector.is_empty() && upd.enqueue_search.is_empty() {
         // No junction changes, no enqueue — plain UPDATE (possibly with user CTE prefix).
         let mut sets: Vec<String> = upd.assignments.iter()
             .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
@@ -1143,10 +1183,10 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         if !user_ctes.is_empty() {
             sql = format!("{}{}", emit_cte_prefix(user_ctes), sql);
         }
-        return SqlOutput { sql, shape };
+        return SqlOutput { sql, shape, deferred_search_plan: None };
     }
 
-    if !has_any_multilink && !upd.enqueue_vector.is_empty() {
+    if !has_any_multilink && (!upd.enqueue_vector.is_empty() || !upd.enqueue_search.is_empty()) {
         // No junction changes but need to enqueue — wrap UPDATE in a CTE.
         let mut sets: Vec<String> = upd.assignments.iter()
             .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
@@ -1167,6 +1207,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         }
         cte_parts.push(format!("\"_w\" AS (\n{}\n)", upd_sql));
         cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_w"));
+        cte_parts.extend(enqueue_search_ctes(&upd.enqueue_search, "_w", upd.enqueue_vector.len()));
 
         let (shape2, select_sql) = shape_select_from_cte(&upd.target, &upd.returning, "_w");
         let sql = format!(
@@ -1174,7 +1215,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             cte_parts.join(",\n"),
             select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
         );
-        return SqlOutput { sql, shape: shape2 };
+        return SqlOutput { sql, shape: shape2, deferred_search_plan: None };
     }
 
     // CTE-based UPDATE for junction table mutations.
@@ -1245,6 +1286,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Enqueue CTEs (source is _ids which has all columns including id).
     cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_ids"));
+    cte_parts.extend(enqueue_search_ctes(&upd.enqueue_search, "_ids", upd.enqueue_vector.len()));
 
     let sql = format!(
         "WITH\n{}\nSELECT (\n    {}\n) AS result\nFROM \"_ids\" AS {}",
@@ -1252,7 +1294,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         result_expr,
         qi(alias),
     );
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
@@ -1262,19 +1304,38 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
         return emit_poly_delete_stmt(del);
     }
     let alias = &del.target.alias;
-    let mut sql = format!(
-        "DELETE FROM {} AS {}",
+
+    if del.enqueue_search.is_empty() {
+        let mut sql = format!(
+            "DELETE FROM {} AS {}",
+            source_ref(&del.target),
+            qi(alias),
+        );
+        append_filter(&mut sql, &del.filter);
+        let (shape, returning_sql) = emit_returning_shape(&del.target, &del.returning, true);
+        if let Some(r) = returning_sql { sql.push_str(&r); }
+        return SqlOutput { sql, shape, deferred_search_plan: None };
+    }
+
+    // Wrap DELETE in a CTE to enqueue OpenSearch delete jobs.
+    let mut del_sql = format!(
+        "    DELETE FROM {} AS {}",
         source_ref(&del.target),
         qi(alias),
     );
+    append_filter(&mut del_sql, &del.filter);
+    del_sql.push_str("\n    RETURNING \"id\"");
 
-    append_filter(&mut sql, &del.filter);
+    let mut cte_parts = vec![format!("\"_del\" AS (\n{}\n)", del_sql)];
+    cte_parts.extend(enqueue_search_ctes(&del.enqueue_search, "_del", 0));
 
-    let (shape, returning_sql) = emit_returning_shape(&del.target, &del.returning, true);
-    if let Some(r) = returning_sql {
-        sql.push_str(&r);
-    }
-    SqlOutput { sql, shape }
+    let (shape, select_sql) = shape_select_from_cte(&del.target, &del.returning, "_del");
+    let sql = format!(
+        "WITH\n{}\n{}",
+        cte_parts.join(",\n"),
+        select_sql.unwrap_or_else(|| "SELECT * FROM \"_del\"".to_string()),
+    );
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
@@ -1310,7 +1371,7 @@ fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
     );
 
     let (shape, _) = emit_returning_shape(&del.target, &del.returning, true);
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 // ── RETURNING helper ─────────────────────────────────────────────────────────
@@ -1926,12 +1987,17 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
 }
 
 // ── FTS search ───────────────────────────────────────────────────────────────
 
 fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
+    use crate::schema::SearchBackend;
+    if fs.backend == SearchBackend::OpenSearch {
+        return emit_fts_search_deferred(fs);
+    }
+
     let alias = &fs.source.alias;
     let search_col = format!("{}.{}", qi(alias), qi(&fs.search_col));
     let query_sql = emit_expr(&fs.query_expr);
@@ -1986,7 +2052,80 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    SqlOutput { sql, shape }
+    SqlOutput { sql, shape, deferred_search_plan: None }
+}
+
+fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
+    let alias = &fs.source.alias;
+    let ids_idx = fs.deferred_ids_param.expect("deferred_ids_param must be set for deferred backend");
+    let scores_idx = fs.deferred_scores_param.expect("deferred_scores_param must be set for deferred backend");
+    let ids_param = format!("${}", ids_idx + 1);
+    let scores_param = format!("${}", scores_idx + 1);
+
+    let (obj_tuple, object_shape_nodes) = if fs.object_shape.is_empty() {
+        let type_expr = type_disc(&fs.source.type_name);
+        let id_expr = format!("{}.\"id\"", qi(alias));
+        let tuple = format!("{},\n    {}", type_expr, id_expr);
+        let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
+        (tuple, vec![id_node])
+    } else {
+        let (field_exprs, shape_fields) = build_shape(&fs.object_shape, alias);
+        let mut parts = vec![type_disc(&fs.source.type_name)];
+        parts.extend(field_exprs);
+        (parts.join(",\n    "), prepend_type(shape_fields))
+    };
+
+    let outer = format!(
+        "NULL::text,\n    ROW(\n    {}\n    )::record,\n    \"_os\".\"score\"",
+        obj_tuple,
+    );
+    let mut sql = format!(
+        concat!(
+            "SELECT (\n    {}\n) AS result\n",
+            "FROM {} AS {}\n",
+            "JOIN UNNEST({}::uuid[], {}::float8[]) AS \"_os\"(\"id\", \"score\")\n",
+            "    ON \"_os\".\"id\" = {}.\"id\"",
+        ),
+        outer,
+        source_ref(&fs.source),
+        qi(alias),
+        ids_param,
+        scores_param,
+        qi(alias),
+    );
+    if let Some(f) = &fs.filter {
+        sql.push_str(&format!("\nWHERE ({})", emit_expr(f)));
+    }
+    if let Some(dir) = &fs.order_by_rank {
+        let dir_sql = match dir { IrSortDir::Asc => "ASC", IrSortDir::Desc => "DESC" };
+        sql.push_str(&format!("\nORDER BY \"_os\".\"score\" {}", dir_sql));
+    }
+    // limit/offset are passed to OpenSearch as size/from, not emitted in Postgres SQL.
+    let size = fs.limit.as_ref().and_then(|lim| {
+        if let IrExpr::Literal(IrLiteral::Int(n)) = lim { Some(*n as usize) } else { None }
+    });
+
+    let object_node = ShapeNode::Object {
+        name: "object".to_string(),
+        type_name: Some(fs.source.type_name.clone()),
+        position: 1,
+        cardinality: Cardinality::Many,
+        fields: object_shape_nodes,
+    };
+    let shape = ShapeDescriptor {
+        root: ShapeNode::FtsSearch {
+            object_position: 1,
+            rank_position: 2,
+            object_node: Box::new(object_node),
+        },
+    };
+    let deferred_search_plan = Some(DeferredSearchPlan {
+        index_name: fs.deferred_index_name.clone().unwrap_or_default(),
+        query_param_name: fs.deferred_query_param_name.clone().unwrap_or_default(),
+        query_literal: fs.deferred_query_literal.clone(),
+        size,
+    });
+    SqlOutput { sql, shape, deferred_search_plan }
 }
 
 // ── Function select ──────────────────────────────────────────────────────────
@@ -2036,6 +2175,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
                 fields: root_fields,
             },
         },
+        deferred_search_plan: None,
     }
 }
 
@@ -2490,7 +2630,7 @@ mod tests {
             "SELECT (INSERT Person { name := $name, age := $age }) { id, name }",
         );
         // Must use a CTE
-        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("INSERT INTO"));
         assert!(out.sql.contains("RETURNING *"));
         // Outer SELECT shapes the result
@@ -2503,7 +2643,7 @@ mod tests {
         let out = compile_and_emit(
             "SELECT (UPDATE Person FILTER .id = $id SET { name := $name }) { id, name }",
         );
-        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("UPDATE"));
         assert!(out.sql.contains("RETURNING *"));
         assert!(out.sql.contains("\"name\"::text"));
@@ -2514,7 +2654,7 @@ mod tests {
         let out = compile_and_emit(
             "SELECT (DELETE Person FILTER .id = $id) { id, name }",
         );
-        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("DELETE FROM"));
         assert!(out.sql.contains("RETURNING *"));
         assert!(out.sql.contains("\"name\"::text"));
@@ -2645,7 +2785,7 @@ mod tests {
             "SELECT (SELECT Person FILTER .age > 18) { name }",
         );
         // Must use a CTE
-        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         // CTE exposes raw columns via SELECT *
         assert!(out.sql.contains("SELECT *"));
         assert!(out.sql.contains("FROM \"default\".\"Person\""));
@@ -2661,7 +2801,7 @@ mod tests {
         let out = compile_and_emit(
             "SELECT (SELECT Person FILTER .age > 18) { name } FILTER .name = $name",
         );
-        assert!(out.sql.contains("WITH \"_dml\" AS ("));
+        assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("SELECT *"));
         // Both filters present: one inside CTE, one in outer SELECT
         assert_eq!(out.sql.matches("WHERE").count(), 2);
