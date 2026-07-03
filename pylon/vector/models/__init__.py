@@ -1,4 +1,5 @@
+from .anthropic import AnthropicEmbeddingProvider
 from .base import EmbeddingProvider
-from .mistral import MistralProvider
+from .openai import OpenAIEmbeddingProvider
 
-__all__ = ["EmbeddingProvider", "MistralProvider"]
+__all__ = ["EmbeddingProvider", "OpenAIEmbeddingProvider", "AnthropicEmbeddingProvider"]
