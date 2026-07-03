@@ -50,6 +50,23 @@ class Index:
 Metric = Literal["cosine", "euclidean", "inner_product"]
 
 
+class VectorField:
+    """A field included in a VectorIndex, referenced as a lazy annotation string.
+
+    Use the ``'TypeName.field_name'`` form — the type prefix is validated
+    during ``pylon.finalize()`` against the enclosing type::
+
+        pylon.VectorField('Product.name')
+        pylon.VectorField('Product.description')
+    """
+
+    def __init__(self, ref: str) -> None:
+        self.ref = ref
+
+    def __repr__(self) -> str:
+        return f"VectorField({self.ref!r})"
+
+
 class VectorIndex:
     """Deferred embedding index.  Writes enqueue jobs; a background worker
     generates embeddings and writes them back into the vector column.
@@ -60,33 +77,38 @@ class VectorIndex:
         class Product(pylon.BaseObject):
             name: Property[str]
             description: Property[str]
-            pylon.VectorIndex(fields=['name', 'description'], model='mistral-embed')
+            pylon.VectorIndex(
+                fields=[pylon.VectorField('Product.name'), pylon.VectorField('Product.description')],
+                model='mistral-embed',
+            )
 
     Named index (assigned to a class attribute; picks up its name via ``__set_name__``)::
 
         @pylon.type
         class Product(pylon.BaseObject):
             name: Property[str]
-            summary: Property[str]
-            summary_index = pylon.VectorIndex(fields=['summary'], model='mistral-embed')
+            summary_index = pylon.VectorIndex(
+                fields=[pylon.VectorField('Product.name')],
+                model='mistral-embed',
+            )
     """
 
     index_name: str | None
-    fields: list[str]
+    _vector_fields: list[VectorField]
     model: str
     metric: Metric
     dimensions: int
 
     def __init__(
         self,
-        fields: list[str],
+        fields: list[VectorField],
         model: str,
         *,
         metric: Metric = "cosine",
         dimensions: int = 1024,
     ) -> None:
         self.index_name = None
-        self.fields = list(fields)
+        self._vector_fields = list(fields)
         self.model = model
         self.metric = metric
         self.dimensions = dimensions
