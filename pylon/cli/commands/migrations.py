@@ -625,7 +625,7 @@ async def _create_from_diff(
     import sys
     import asyncpg
     from pylon._core import (
-        diff_schema as _core_diff_schema,
+        diff_schema_ops as _core_diff_schema_ops,
         render_migration_file,
         compute_migration_short_id,
         verify_migration,
@@ -676,17 +676,21 @@ async def _create_from_diff(
     finally:
         await conn.close()
 
-    # Compute the diff.
-    ops = _core_diff_schema(schema, db_state)
+    # Compute the diff — returns [(sql, non_transactional), ...].
+    ops = _core_diff_schema_ops(schema, db_state)
 
     if not ops:
         click.echo("No schema changes detected.")
         return
 
     # Show proposed changes.
+    has_concurrent = any(nt for _, nt in ops)
     click.echo(f"\n{len(ops)} proposed change(s):")
-    for sql in ops:
-        click.echo(f"  {sql.splitlines()[0]}")
+    for sql, non_tx in ops:
+        marker = " [CONCURRENTLY]" if non_tx else ""
+        click.echo(f"  {sql.splitlines()[0]}{marker}")
+    if has_concurrent:
+        click.echo("\n  Note: CONCURRENTLY statements run outside a transaction wrapper.")
 
     # Confirm unless --non-interactive or not a TTY.
     if not non_interactive and sys.stdout.isatty():
@@ -694,9 +698,9 @@ async def _create_from_diff(
         if not click.confirm("Write migration?"):
             raise click.ClickException("Aborted.")
 
-    # Assemble the migration body.
-    # Each op is a complete SQL statement; join with blank lines for readability.
-    body = "\n" + "\n".join(ops) + "\n"
+    # Assemble migration body with -- pylon:step markers between transactional
+    # and non-transactional groups.
+    body = _assemble_migration_body(ops)
 
     # Write the file.
     onto = chain_tip
@@ -716,6 +720,37 @@ async def _create_from_diff(
 
     (d / filename).write_text(content)
     click.echo(f"\nCreated {filename}")
+
+
+def _assemble_migration_body(ops: list[tuple[str, bool]]) -> str:
+    """Build a migration body string from (sql, non_transactional) pairs.
+
+    Consecutive ops with the same transactional status are grouped. Between
+    groups a -- pylon:step or -- pylon:step non-transactional marker is emitted
+    so the apply command knows where transaction boundaries fall.
+    """
+    if not ops:
+        return ""
+
+    # Group consecutive ops by their non_transactional flag.
+    groups: list[tuple[bool, list[str]]] = []  # [(non_transactional, [sql, ...]), ...]
+    for sql, non_tx in ops:
+        if groups and groups[-1][0] == non_tx:
+            groups[-1][1].append(sql)
+        else:
+            groups.append((non_tx, [sql]))
+
+    parts: list[str] = []
+    for i, (non_tx, sqls) in enumerate(groups):
+        if i > 0:
+            # Insert the step marker that signals the start of this group.
+            if non_tx:
+                parts.append("-- pylon:step non-transactional")
+            else:
+                parts.append("-- pylon:step")
+        parts.append("\n".join(sqls))
+
+    return "\n" + "\n\n".join(parts) + "\n"
 
 
 # ── rehash ────────────────────────────────────────────────────────────────────
