@@ -224,6 +224,20 @@ pub fn compile_expr_in_type(
     Ok((ir, c.params))
 }
 
+/// Like `compile_expr_in_type` but uses an empty table alias, so that column
+/// references emit as bare column names (`"col"` rather than `"a1"."col"`).
+/// Used for fill expressions in migration UPDATE SET clauses.
+pub fn compile_expr_unaliased(
+    expr: &Expr,
+    type_name: &str,
+    schema: &SchemaDescriptor,
+) -> Result<(IrExpr, Vec<String>), PyQLError> {
+    let mut c = Compiler::new(schema);
+    let td = c.resolve_type(type_name)?;
+    let ir = c.compile_expr(expr, td, "")?;
+    Ok((ir, c.params))
+}
+
 // ── Compiler context ────────────────────────────────────────────────────────────
 
 struct Compiler<'a> {

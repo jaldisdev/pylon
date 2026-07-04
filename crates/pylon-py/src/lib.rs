@@ -1507,6 +1507,54 @@ fn diff_schema_ops_with_renames(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
+/// Compile a PyQL fill expression to a bare SQL expression for use in an UPDATE SET clause.
+/// `type_name` is the qualified type name (e.g. `"blog::Post"`).
+/// `expr_str`  is the PyQL expression (e.g. `"'No content'"`, `".title"`, `"0"`).
+/// Raises `PyQLError` on syntax, type, or resolution failures.
+/// Raises `PyQLSyntaxError` if the expression contains query parameters ($name).
+#[pyfunction]
+fn compile_fill_expr(
+    type_name: &str,
+    expr_str: &str,
+    schema: &SchemaDescriptor,
+) -> PyResult<String> {
+    core::query::compile_fill_expr(type_name, expr_str, &schema.inner).map_err(pyql_err)
+}
+
+/// Detect columns that are being made NOT NULL and will need a fill expression.
+/// Returns list of (module, table, column, pg_type, type_name, is_new_column, default_sql).
+/// `default_sql` is `None` when no schema-level default is declared.
+#[pyfunction]
+fn detect_fill_required(
+    target: &SchemaDescriptor,
+    current: &DbState,
+) -> Vec<(String, String, String, String, String, bool, Option<String>)> {
+    core::diff::detect_fill_required(&target.inner, &current.inner)
+        .into_iter()
+        .map(|f| (f.module, f.table, f.column, f.pg_type, f.type_name, f.is_new_column, f.default_sql))
+        .collect()
+}
+
+/// Diff with confirmed renames and fill expressions applied.
+/// `type_renames`: list of (old_module, old_table, new_module, new_table).
+/// `col_renames`:  list of (module, table, old_col, new_col).
+/// `fills`:        list of (module, table, column, sql_expr).
+/// Returns list of (sql, non_transactional).
+#[pyfunction]
+fn diff_schema_ops_with_renames_and_fills(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    type_renames: Vec<(String, String, String, String)>,
+    col_renames: Vec<(String, String, String, String)>,
+    fills: Vec<(String, String, String, String)>,
+) -> PyResult<Vec<(String, bool)>> {
+    core::diff::diff_schema_ops_with_renames_and_fills(
+        &target.inner, &current.inner, &type_renames, &col_renames, &fills,
+    )
+    .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1701,6 +1749,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
     m.add_function(wrap_pyfunction!(detect_col_renames, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_fill_required, m)?)?;
+    m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
 
     Ok(())
 }

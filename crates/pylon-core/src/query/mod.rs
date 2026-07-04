@@ -141,6 +141,28 @@ pub struct CompiledQuery {
     pub deferred_search_plan: Option<DeferredSearchPlan>,
 }
 
+/// Compile a PyQL expression string in the context of a named type to a bare SQL
+/// expression suitable for use in an UPDATE SET clause.
+///
+/// Column references (`.field`) are emitted without a table alias because UPDATE
+/// SET expressions reference the current row directly.  Query parameters (`$name`)
+/// are rejected — fill expressions must be literal values or field references.
+pub fn compile_fill_expr(
+    type_name: &str,
+    expr_str: &str,
+    schema: &SchemaDescriptor,
+) -> Result<String, crate::error::PyQLError> {
+    let expr_ast = parse::parse_expr(expr_str)?;
+    let (ir_expr, params) = ir::compile_expr_unaliased(&expr_ast, type_name, schema)?;
+    if !params.is_empty() {
+        return Err(crate::error::PyQLError::Syntax(crate::error::PyQLSyntaxError {
+            message: "fill expressions may not contain query parameters".into(),
+            position: crate::error::Position { line: 0, col: 0 },
+        }));
+    }
+    Ok(sql::emit_expr(&ir_expr))
+}
+
 /// Compile a PyQL query string to SQL against `schema`.
 ///
 /// Synchronous — compilation is CPU-bound; async lives at the DB execution layer.
