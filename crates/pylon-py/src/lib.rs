@@ -1555,6 +1555,24 @@ fn diff_schema_ops_with_renames_and_fills(
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
+/// Serialize a compiled `SchemaDescriptor` to the `DbState` JSON snapshot format.
+/// The result is suitable for storage in `_pylon."Migrations".db_state` and can be
+/// read back as a diff baseline via `db_state_from_json`.
+#[pyfunction]
+fn schema_to_db_state_json(schema: &SchemaDescriptor) -> String {
+    let state = core::diff::schema_to_db_state(&schema.inner);
+    core::diff::db_state_to_json(&state)
+}
+
+/// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
+/// Returns a `DbState` object usable as a diff baseline for `diff_schema_ops` etc.
+#[pyfunction]
+fn db_state_from_json(json: &str) -> PyResult<DbState> {
+    core::diff::db_state_from_json(json)
+        .map(|inner| DbState { inner })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1752,6 +1770,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;
     m.add_function(wrap_pyfunction!(detect_fill_required, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
+    m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
+    m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
 
     Ok(())
 }

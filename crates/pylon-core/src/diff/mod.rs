@@ -7,12 +7,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
 
 // ── Live database state ────────────────────────────────────────────────────────
 
 /// Snapshot of the live PostgreSQL database, built by Python from pg_catalog queries.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DbState {
     /// User-managed schema names (excludes _pylon, public, pg_* etc.).
     pub schemas: Vec<String>,
@@ -21,7 +23,7 @@ pub struct DbState {
     pub domains: Vec<DbDomain>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbTable {
     pub schema: String,
     pub name: String,
@@ -31,7 +33,7 @@ pub struct DbTable {
     pub checks: Vec<DbCheck>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbColumn {
     pub name: String,
     pub pg_type: String,
@@ -39,7 +41,7 @@ pub struct DbColumn {
     pub is_generated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbForeignKey {
     pub constraint_name: String,
     pub local_column: String,
@@ -47,29 +49,273 @@ pub struct DbForeignKey {
     pub ref_table: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbIndex {
     pub name: String,
     pub is_unique: bool,
     pub method: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCheck {
     pub constraint_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbEnum {
     pub schema: String,
     pub name: String,
     pub members: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbDomain {
     pub schema: String,
     pub name: String,
+}
+
+// ── Schema → DbState projection ────────────────────────────────────────────────
+
+/// Convert a compiled `SchemaDescriptor` into the equivalent `DbState` snapshot.
+///
+/// This produces exactly what `introspect_db_state` would return after the schema
+/// is fully applied — used to persist a baseline alongside each migration record
+/// so that subsequent `pylon migration create` calls can diff without introspecting
+/// the live database.
+pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
+    use std::collections::BTreeSet;
+
+    let type_map: HashMap<String, (&str, &str)> = schema
+        .types
+        .iter()
+        .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
+        .collect();
+
+    // Collect all module names that contribute a Postgres schema.
+    let mut schema_set: BTreeSet<String> = BTreeSet::new();
+    for t in &schema.types  { schema_set.insert(t.module.clone()); }
+    for e in &schema.enums  { schema_set.insert(e.module.clone()); }
+    for s in &schema.scalars { schema_set.insert(s.module.clone()); }
+
+    let schemas: Vec<String> = schema_set.into_iter().collect();
+
+    // Enums
+    let enums: Vec<DbEnum> = schema.enums.iter()
+        .map(|e| DbEnum { schema: e.module.clone(), name: e.name.clone(), members: e.members.clone() })
+        .collect();
+
+    // Domains (custom scalars)
+    let domains: Vec<DbDomain> = schema.scalars.iter()
+        .map(|s| DbDomain { schema: s.module.clone(), name: s.name.clone() })
+        .collect();
+
+    let mut tables: Vec<DbTable> = Vec::new();
+
+    for td in &schema.types {
+        if td.abstract_ || td.junction { continue; }
+
+        // Columns: properties + link FK stubs + vector/search generated columns
+        let mut columns: Vec<DbColumn> = Vec::new();
+        for p in &td.properties {
+            columns.push(DbColumn {
+                name: p.name.clone(),
+                pg_type: col_type_str(&p.pg_type).to_string(),
+                nullable: p.nullable,
+                is_generated: false,
+            });
+        }
+        for l in &td.links {
+            columns.push(DbColumn {
+                name: format!("{}_id", l.name),
+                pg_type: "uuid".to_string(),
+                nullable: l.nullable,
+                is_generated: false,
+            });
+        }
+        // Generated columns for vector indexes
+        for vi in &td.vector_indexes {
+            let col = vi.column_name();
+            if !columns.iter().any(|c| c.name == col) {
+                columns.push(DbColumn {
+                    name: col,
+                    pg_type: format!("vector({})", vi.dimensions),
+                    nullable: true,
+                    is_generated: false,
+                });
+            }
+        }
+        // Generated columns for search indexes (tsvector)
+        for si in &td.search_indexes {
+            if si.backend != SearchBackend::Postgres { continue; }
+            let col = si.column_name();
+            if !columns.iter().any(|c| c.name == col) {
+                columns.push(DbColumn {
+                    name: col,
+                    pg_type: "tsvector".to_string(),
+                    nullable: true,
+                    is_generated: true,
+                });
+            }
+        }
+
+        // FK constraints: one per single link
+        let mut foreign_keys: Vec<DbForeignKey> = Vec::new();
+        for l in &td.links {
+            let cname = format!("{}_{}_fkey", td.table, l.name);
+            if let Some((tgt_schema, tgt_table)) = type_map.get(&l.target) {
+                foreign_keys.push(DbForeignKey {
+                    constraint_name: cname,
+                    local_column: format!("{}_id", l.name),
+                    ref_schema: tgt_schema.to_string(),
+                    ref_table: tgt_table.to_string(),
+                });
+            }
+        }
+
+        // Unique indexes from exclusive properties and links (Postgres auto-names them).
+        let mut indexes: Vec<DbIndex> = Vec::new();
+        for p in &td.properties {
+            if p.is_exclusive && !p.is_pk {
+                indexes.push(DbIndex {
+                    name: format!("{}_{}_key", td.table, p.name),
+                    is_unique: true,
+                    method: "btree".to_string(),
+                });
+            }
+        }
+        for l in &td.links {
+            if l.is_exclusive {
+                indexes.push(DbIndex {
+                    name: format!("{}_{}_id_key", td.table, l.name),
+                    is_unique: true,
+                    method: "btree".to_string(),
+                });
+            }
+        }
+        for (i, constraint) in td.constraints.iter().enumerate() {
+            use crate::schema::TypeConstraint;
+            if let TypeConstraint::Exclusive { fields, .. } = constraint {
+                // Postgres auto-names these; mirror the convention.
+                let idx_name = format!("{}_{}_{}_key", td.table, fields.join("_"), i);
+                indexes.push(DbIndex { name: idx_name, is_unique: true, method: "btree".to_string() });
+            }
+        }
+        // Plain indexes (Postgres auto-names these too).
+        for (i, idx) in td.indexes.iter().enumerate() {
+            let name = if idx.expression.is_some() {
+                format!("{}__expr{}_idx", td.table, i)
+            } else {
+                format!("{}__{}_idx", td.table, idx.fields.join("_"))
+            };
+            indexes.push(DbIndex { name, is_unique: idx.unique, method: "btree".to_string() });
+        }
+        // Vector HNSW indexes
+        for vi in &td.vector_indexes {
+            let idx_name = match &vi.index_name {
+                None => format!("{}__vector__", td.table),
+                Some(n) => format!("{}__vector_{}__", td.table, n),
+            };
+            indexes.push(DbIndex { name: idx_name, is_unique: false, method: "hnsw".to_string() });
+        }
+        // Search GIN indexes
+        for si in &td.search_indexes {
+            if si.backend != SearchBackend::Postgres { continue; }
+            let idx_name = match &si.index_name {
+                None => format!("{}__search__", td.table),
+                Some(n) => format!("{}__search_{}__", td.table, n),
+            };
+            indexes.push(DbIndex { name: idx_name, is_unique: false, method: "gin".to_string() });
+        }
+
+        // CHECK constraints — names are hash-based in the real schema; approximate here.
+        let mut checks: Vec<DbCheck> = Vec::new();
+        for p in &td.properties {
+            for (i, _) in p.check_constraints.iter().enumerate() {
+                checks.push(DbCheck { constraint_name: format!("{}_{}_check_{}", td.table, p.name, i) });
+            }
+        }
+        for (i, constraint) in td.constraints.iter().enumerate() {
+            use crate::schema::TypeConstraint;
+            if let TypeConstraint::Expression { .. } = constraint {
+                checks.push(DbCheck { constraint_name: format!("{}_expr_check_{}", td.table, i) });
+            }
+        }
+
+        tables.push(DbTable {
+            schema: td.module.clone(),
+            name: td.table.clone(),
+            columns,
+            foreign_keys,
+            indexes,
+            checks,
+        });
+
+        // Junction tables for multi-links
+        for ml in &td.multilinks {
+            let jt_name = format!("{}.{}", td.table, ml.name);
+            let mut jt_columns = vec![
+                DbColumn { name: "source".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false },
+                DbColumn { name: "target".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false },
+            ];
+
+            // Extra columns from the through junction type
+            if let Some(through_qname) = &ml.through {
+                if let Some(through_td) = schema.types.iter().find(|t| {
+                    format!("{}::{}", t.module, t.name) == *through_qname && t.junction
+                }) {
+                    for p in &through_td.properties {
+                        if p.name == "id" { continue; }
+                        let pg_type = col_type_str(&p.pg_type).to_string();
+                        jt_columns.push(DbColumn {
+                            name: p.name.clone(),
+                            pg_type,
+                            nullable: p.nullable,
+                            is_generated: false,
+                        });
+                    }
+                }
+            }
+
+            let mut jt_fks = Vec::new();
+            let src_fk_name = format!("{}_{}_source_fkey", td.table, ml.name);
+            jt_fks.push(DbForeignKey {
+                constraint_name: src_fk_name,
+                local_column: "source".to_string(),
+                ref_schema: td.module.clone(),
+                ref_table: td.table.clone(),
+            });
+            if let Some((tgt_schema, tgt_table)) = type_map.get(&ml.target) {
+                let tgt_fk_name = format!("{}_{}_target_fkey", td.table, ml.name);
+                jt_fks.push(DbForeignKey {
+                    constraint_name: tgt_fk_name,
+                    local_column: "target".to_string(),
+                    ref_schema: tgt_schema.to_string(),
+                    ref_table: tgt_table.to_string(),
+                });
+            }
+
+            tables.push(DbTable {
+                schema: td.module.clone(),
+                name: jt_name,
+                columns: jt_columns,
+                foreign_keys: jt_fks,
+                indexes: vec![],
+                checks: vec![],
+            });
+        }
+    }
+
+    DbState { schemas, tables, enums, domains }
+}
+
+/// Serialize a `DbState` to a JSON string for storage in `_pylon."Migrations".db_state`.
+pub fn db_state_to_json(state: &DbState) -> String {
+    serde_json::to_string(state).expect("DbState serialization is infallible")
+}
+
+/// Deserialize a `DbState` from the JSON stored in `_pylon."Migrations".db_state`.
+pub fn db_state_from_json(json: &str) -> Result<DbState, String> {
+    serde_json::from_str(json).map_err(|e| e.to_string())
 }
 
 // ── Rename candidates ─────────────────────────────────────────────────────────
