@@ -307,14 +307,16 @@ async def _drop_invalid_concurrent_index(conn, sql: str) -> None:
 # ── status ────────────────────────────────────────────────────────────────────
 
 @migration.command()
+@click.option("--dev-mode", is_flag=True, default=False,
+              help="Also report whether the live DB has drifted ahead of the recorded tip (watch drift).")
 @requires_config
 @click.pass_context
-def status(ctx: click.Context) -> None:
+def status(ctx: click.Context, dev_mode: bool) -> None:
     """Show applied tip, pending migrations, and chain validity."""
-    asyncio.run(_status(ctx))
+    asyncio.run(_status(ctx, dev_mode))
 
 
-async def _status(ctx: click.Context) -> None:
+async def _status(ctx: click.Context, dev_mode: bool) -> None:
     import asyncpg
 
     config = ctx.obj["config"]
@@ -328,6 +330,11 @@ async def _status(ctx: click.Context) -> None:
     try:
         await _ensure_tracking_tables(conn)
         tracking = await _read_tracking(conn)
+        if dev_mode:
+            from pylon.schema._introspect import introspect_db_state
+            db_state = await introspect_db_state(conn)
+        else:
+            db_state = None
     finally:
         await conn.close()
 
@@ -359,6 +366,19 @@ async def _status(ctx: click.Context) -> None:
             click.echo(f"  {m.filename}")
     else:
         click.echo("\nDatabase is up to date.")
+
+    # dev-mode: report whether watch has applied changes beyond the recorded tip.
+    if dev_mode and db_state is not None and not pending:
+        from pylon._core import diff_schema as _core_diff_schema
+        schema = _reload_schema(config)
+        ops = _core_diff_schema(schema, db_state)
+        if ops:
+            click.echo(f"\n⚠  Live database has {len(ops)} change(s) not yet in a migration (watch drift):")
+            for sql in ops:
+                click.echo(f"  {sql.splitlines()[0]}")
+            click.echo("\nRun 'pylon migration create' to record them, then 'pylon migration apply --dev-mode'.")
+        else:
+            click.echo("\nLive database matches compiled schema — no watch drift.")
 
 
 # ── log ───────────────────────────────────────────────────────────────────────
@@ -543,20 +563,27 @@ def _reload_schema(config):
               help="Optional label appended to the filename.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Print the file content without writing it.")
+@click.option("--non-interactive", "non_interactive", is_flag=True, default=False,
+              help="Skip the confirmation prompt (also the default when stdout is not a TTY).")
 @requires_config
 @click.pass_context
-def create(ctx: click.Context, blank: bool, name: str | None, dry_run: bool) -> None:
+def create(
+    ctx: click.Context,
+    blank: bool,
+    name: str | None,
+    dry_run: bool,
+    non_interactive: bool,
+) -> None:
     """Generate a new migration file.
 
-    Use --blank to write a hand-editable stub (no database diffing required).
-    Schema-diffing 'create' is not yet implemented.
+    Diffs the compiled schema against the live database and writes a migration
+    file for any pending changes. Use --blank to skip diffing and write a
+    hand-editable stub instead.
     """
-    if not blank:
-        raise click.ClickException(
-            "Schema-diffing 'create' is not yet implemented. "
-            "Use --blank to write a hand-editable migration stub."
-        )
-    _create_blank(ctx, name, dry_run)
+    if blank:
+        _create_blank(ctx, name, dry_run)
+    else:
+        asyncio.run(_create_from_diff(ctx, name, dry_run, non_interactive))
 
 
 def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
@@ -587,6 +614,108 @@ def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
     (d / filename).write_text(content)
     click.echo(f"Created {filename}")
     click.echo("Edit the file, then run 'pylon migration rehash' to recompute its ID.")
+
+
+async def _create_from_diff(
+    ctx: click.Context,
+    name: str | None,
+    dry_run: bool,
+    non_interactive: bool,
+) -> None:
+    import sys
+    import asyncpg
+    from pylon._core import (
+        diff_schema as _core_diff_schema,
+        render_migration_file,
+        compute_migration_short_id,
+        verify_migration,
+    )
+    from pylon.schema._introspect import introspect_db_state
+
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+    _require_migrations_dir(ctx, d)
+
+    # Compile the target schema from Python source files.
+    schema = _reload_schema(config)
+
+    # Load and validate the on-disk migration chain.
+    migrations = _load_migrations(d)
+    chain = _ordered_chain(migrations)
+    chain_tip = chain[-1].id if chain else "initial"
+
+    conn = await asyncpg.connect(_pg_dsn(config))
+    try:
+        await _ensure_tracking_tables(conn)
+        tracking = await _read_tracking(conn)
+        applied_tip = _applied_tip(tracking)
+        chain_ids = [m.id for m in chain]
+
+        # Diverged history → abort.
+        if applied_tip is not None and applied_tip not in chain_ids:
+            raise click.ClickException(
+                f"Database tip {applied_tip!r} not found in on-disk chain — "
+                "history has diverged. Resolve manually."
+            )
+
+        # Behind → apply pending migrations first so the diff baseline is current.
+        if applied_tip != chain_tip:
+            pending_start = 0 if applied_tip is None else (chain_ids.index(applied_tip) + 1)
+            pending = chain[pending_start:]
+            if pending:
+                click.echo(f"Applying {len(pending)} pending migration(s) before diffing…")
+                await conn.execute("SELECT pg_advisory_lock($1)", _ADVISORY_LOCK_KEY)
+                try:
+                    for m in pending:
+                        await _apply_one(conn, m, False, verify_migration)
+                finally:
+                    await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
+
+        # Introspect the live database (now at the chain tip).
+        db_state = await introspect_db_state(conn)
+    finally:
+        await conn.close()
+
+    # Compute the diff.
+    ops = _core_diff_schema(schema, db_state)
+
+    if not ops:
+        click.echo("No schema changes detected.")
+        return
+
+    # Show proposed changes.
+    click.echo(f"\n{len(ops)} proposed change(s):")
+    for sql in ops:
+        click.echo(f"  {sql.splitlines()[0]}")
+
+    # Confirm unless --non-interactive or not a TTY.
+    if not non_interactive and sys.stdout.isatty():
+        click.echo()
+        if not click.confirm("Write migration?"):
+            raise click.ClickException("Aborted.")
+
+    # Assemble the migration body.
+    # Each op is a complete SQL statement; join with blank lines for readability.
+    body = "\n" + "\n".join(ops) + "\n"
+
+    # Write the file.
+    onto = chain_tip
+    content = render_migration_file(onto, body)
+    short_id = compute_migration_short_id(body)
+
+    seq = _next_seq(d)
+    stem = f"{seq:05d}_{short_id}"
+    if name:
+        stem = f"{stem}_{name}"
+    filename = f"{stem}.sql"
+
+    if dry_run:
+        click.echo(f"\n-- would write: {d / filename}")
+        click.echo(content)
+        return
+
+    (d / filename).write_text(content)
+    click.echo(f"\nCreated {filename}")
 
 
 # ── rehash ────────────────────────────────────────────────────────────────────
