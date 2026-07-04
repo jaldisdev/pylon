@@ -588,6 +588,24 @@ fn emit_triggers(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
+/// Return `CREATE OR REPLACE VIEW` DDL for every interface type in `schema`.
+pub fn interface_view_ddl(schema: &SchemaDescriptor) -> Vec<String> {
+    let mut out = String::new();
+    emit_interface_views(schema, &mut out);
+    // Split on the double-newline separator between statements.
+    out.split("\n\n")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Return `CREATE OR REPLACE FUNCTION` DDL for every user-defined function in `schema`.
+pub fn function_ddl(schema: &SchemaDescriptor) -> Result<Vec<String>, crate::error::PyQLError> {
+    schema.functions.iter()
+        .map(|fd| emit_one_function(fd, schema))
+        .collect()
+}
+
 // ── Phase 11: interface views ──────────────────────────────────────────────────
 
 fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
@@ -708,7 +726,11 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
         cols.push("__type__ text".to_string());
     }
     for p in &td.properties {
-        cols.push(format!("{} {}", qi(&p.name), p.pg_type));
+        let pg_type = p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type);
+        cols.push(format!("{} {}", qi(&p.name), pg_type));
+    }
+    for l in &td.links {
+        cols.push(format!("{} uuid", qi(&format!("{}_id", l.name))));
     }
     cols.join(", ")
 }

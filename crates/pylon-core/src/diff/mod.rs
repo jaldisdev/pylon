@@ -613,58 +613,49 @@ fn diff_inner(
     for e in &target.enums  { target_schemas.insert(e.module.clone()); }
     for s in &target.scalars { target_schemas.insert(s.module.clone()); }
 
-    // ── Phase 1: new schemas ──────────────────────────────────────────────────
+    // ── Phase 1: schemas (IF NOT EXISTS — idempotent) ────────────────────────
     for schema in &target_schemas {
-        if !cur_schemas.contains(schema.as_str()) {
-            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
-        }
+        push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
     }
 
-    // ── Phase 2: new / altered enums ──────────────────────────────────────────
+    // ── Phase 2: enums (idempotent create + add-only member changes) ─────────
     for e in &target.enums {
-        match cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
-            None => {
-                let members: Vec<String> = e.members.iter()
-                    .map(|m| format!("'{}'", m.replace('\'', "''")))
-                    .collect();
-                push_tx(&mut ops, format!(
-                    "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
-                     EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                    qi(&e.module), qi(&e.name), members.join(", ")
-                ));
-            }
-            Some(existing) => {
-                let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
-                for member in &e.members {
-                    if !existing_set.contains(member.as_str()) {
-                        push_tx(&mut ops, format!(
-                            "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                            qi(&e.module), qi(&e.name), member.replace('\'', "''")
-                        ));
-                    }
+        let members: Vec<String> = e.members.iter()
+            .map(|m| format!("'{}'", m.replace('\'', "''")))
+            .collect();
+        push_tx(&mut ops, format!(
+            "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+            qi(&e.module), qi(&e.name), members.join(", ")
+        ));
+        // Also emit any members that exist in the target but not in the live DB.
+        if let Some(existing) = cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
+            let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
+            for member in &e.members {
+                if !existing_set.contains(member.as_str()) {
+                    push_tx(&mut ops, format!(
+                        "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                        qi(&e.module), qi(&e.name), member.replace('\'', "''")
+                    ));
                 }
             }
         }
     }
 
-    // ── Phase 3: new custom scalar domains ────────────────────────────────────
+    // ── Phase 3: custom scalar domains (idempotent) ───────────────────────────
     for s in &target.scalars {
-        if !cur_domains.contains(&(s.module.as_str(), s.name.as_str())) {
-            let checks: Vec<String> = s.check_constraints.iter()
-                .map(|c| format!("    CHECK ({})", c))
-                .collect();
-            let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
-            // Postgres has no CREATE DOMAIN IF NOT EXISTS, so use the same
-            // exception-swallowing pattern we use for enums.
-            push_tx(&mut ops, format!(
-                "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
-                 EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
-                qi(&s.module), qi(&s.name), s.pg_type, check_clause
-            ));
-        }
+        let checks: Vec<String> = s.check_constraints.iter()
+            .map(|c| format!("    CHECK ({})", c))
+            .collect();
+        let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
+        push_tx(&mut ops, format!(
+            "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
+            qi(&s.module), qi(&s.name), s.pg_type, check_clause
+        ));
     }
 
-    // ── Phase 4 & 5: tables (create new or alter existing) ────────────────────
+    // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
     let sort_order = topo_sort_types(&target.types)?;
 
     // Track which tables are created in this diff (needed for CONCURRENTLY decision).
@@ -705,7 +696,7 @@ fn diff_inner(
         for ml in &td.multilinks {
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
-                emit_junction_table(td, &ml.name, &ml.target, &ml.on_delete, &type_map, &mut ops);
+                emit_junction_table(td, &ml.name, &ml.target, ml.through.as_deref(), &ml.on_delete, &type_map, target, &mut ops);
                 new_tables.insert((td.module.clone(), jt));
             }
         }
@@ -785,7 +776,19 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 10: drop removed tables ─────────────────────────────────────────
+    // ── Phase 10: interface views (after all tables exist) ───────────────────
+    for ddl in crate::export::interface_view_ddl(target) {
+        push_tx(&mut ops, ddl);
+    }
+
+    // ── Phase 11: user-defined functions ─────────────────────────────────────
+    let fn_ddls = crate::export::function_ddl(target)
+        .map_err(|e| e.to_string())?;
+    for ddl in fn_ddls {
+        push_tx(&mut ops, ddl);
+    }
+
+    // ── Phase 12: drop removed tables ────────────────────────────────────────
     let mut target_tables: HashSet<(String, String)> = HashSet::new();
     for td in &target.types {
         if !td.abstract_ {
@@ -807,7 +810,7 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 11: drop removed enums ──────────────────────────────────────────
+    // ── Phase 13: drop removed enums ─────────────────────────────────────────
     let target_enum_set: HashSet<(String, String)> = target.enums.iter()
         .map(|e| (e.module.clone(), e.name.clone()))
         .collect();
@@ -820,7 +823,7 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 12: drop removed domains ────────────────────────────────────────
+    // ── Phase 14: drop removed domains ───────────────────────────────────────
     let target_domain_set: HashSet<(String, String)> = target.scalars.iter()
         .map(|s| (s.module.clone(), s.name.clone()))
         .collect();
@@ -833,7 +836,7 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 13: drop removed schemas ────────────────────────────────────────
+    // ── Phase 15: drop removed schemas ───────────────────────────────────────
     for schema in &current.schemas {
         if !target_schemas.contains(schema) {
             push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", qi(schema)));
@@ -1011,8 +1014,10 @@ fn emit_junction_table(
     td: &TypeDescriptor,
     ml_name: &str,
     ml_target: &str,
+    through: Option<&str>,
     on_delete: &[crate::schema::OnDeletePolicy],
     type_map: &HashMap<String, (&str, &str)>,
+    schema: &SchemaDescriptor,
     ops: &mut Vec<DiffOp>,
 ) {
     use crate::schema::{DeleteAction, DeleteSide};
@@ -1033,13 +1038,30 @@ fn emit_junction_table(
     let tgt_ref = type_map.get(ml_target).map(|(m, t)| qn(m, t))
         .unwrap_or_else(|| qi(ml_target));
 
+    let mut col_lines = format!(
+        "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){}",
+        qn(&td.module, &td.table), src_on_delete,
+        tgt_ref, tgt_on_delete,
+    );
+
+    // Extra columns from the through junction type.
+    if let Some(through_qname) = through {
+        if let Some(through_td) = schema.types.iter().find(|t| {
+            format!("{}::{}", t.module, t.name) == through_qname && t.junction
+        }) {
+            for p in &through_td.properties {
+                if p.name == "id" { continue; }
+                let not_null = if p.nullable { "" } else { " NOT NULL" };
+                let pg_type = p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type);
+                col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), pg_type, not_null));
+            }
+        }
+    }
+
     push_tx(ops, format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){},\n    PRIMARY KEY (source, target)\n);",
+        "CREATE TABLE IF NOT EXISTS {} (\n{},\n    PRIMARY KEY (source, target)\n);",
         qn(&td.module, &jt_name),
-        qn(&td.module, &td.table),
-        src_on_delete,
-        tgt_ref,
-        tgt_on_delete
+        col_lines,
     ));
 }
 
