@@ -1,3 +1,4 @@
+import dataclasses
 import sys
 
 import click
@@ -28,8 +29,13 @@ def main() -> None:
 
 
 @click.group(invoke_without_command=True)
+@click.option(
+    "-d", "--database", "db_name",
+    default=None, metavar="NAME",
+    help="Named database connection from pylon.toml (e.g. -d staging).",
+)
 @click.pass_context
-def cli(ctx: click.Context) -> None:
+def cli(ctx: click.Context, db_name: str | None) -> None:
     """Pylon — async PostgreSQL mapper and PyQL query engine.
 
     Run without a subcommand to start an interactive PyQL session.
@@ -37,9 +43,24 @@ def cli(ctx: click.Context) -> None:
     ctx.ensure_object(dict)
 
     try:
-        ctx.obj["config"] = load_config()
+        config = load_config()
     except (FileNotFoundError, KeyError, ValueError):
-        ctx.obj["config"] = None
+        config = None
+
+    if config is not None and db_name is not None:
+        db = config.connections.get(db_name)
+        if db is None:
+            available = ", ".join(k for k in config.connections if k != "default")
+            _print_error(
+                f"connection {db_name!r} not found in pylon.toml",
+                f"Available: {available}" if available else "No named connections defined.",
+            )
+            ctx.obj["config"] = None
+            ctx.exit(1)
+            return
+        config = dataclasses.replace(config, database=db)
+
+    ctx.obj["config"] = config
 
     if ctx.invoked_subcommand is None:
         if ctx.obj["config"] is None:

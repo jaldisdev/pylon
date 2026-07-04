@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -116,12 +116,17 @@ class Config:
     *search* and *models* each accept either a single instance (implicitly
     bound as ``'default'``) or a named registry dict.  When a dict is
     supplied the key ``'default'`` is reserved for the primary connection.
+
+    *connections* maps every named ``[database.<name>]`` sub-table (plus
+    ``'default'`` for the base ``[database]`` block) to its resolved
+    :class:`DatabaseConfig`.  Pass ``-d <name>`` on the CLI to select one.
     """
 
     database: DatabaseConfig
     project: ProjectConfig | None = None
     search: SearchConfig | SearchRegistry | None = None
     models: ModelConfig | ModelRegistry | None = None
+    connections: dict[str, DatabaseConfig] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Normalised accessors
@@ -180,6 +185,10 @@ def _resolve_secret(
 
 
 def _build_database(raw: dict[str, object]) -> DatabaseConfig:
+    pool_min = int(raw.get("pool_min_size", 2))  # type: ignore[arg-type]
+    pool_max = int(raw.get("pool_max_size", 10))  # type: ignore[arg-type]
+    if dsn := raw.get("dsn"):
+        return DatabaseConfig(dsn=str(dsn), pool_min_size=pool_min, pool_max_size=pool_max)
     password = _resolve_secret(raw, "password", "password_env")
     return DatabaseConfig(
         host=str(raw["host"]),
@@ -187,8 +196,8 @@ def _build_database(raw: dict[str, object]) -> DatabaseConfig:
         name=str(raw["name"]),
         user=str(raw["user"]),
         password=password,
-        pool_min_size=int(raw.get("pool_min_size", 2)),  # type: ignore[arg-type]
-        pool_max_size=int(raw.get("pool_max_size", 10)),  # type: ignore[arg-type]
+        pool_min_size=pool_min,
+        pool_max_size=pool_max,
     )
 
 
@@ -227,7 +236,7 @@ _RESERVED_TOP_LEVEL = frozenset({"project", "database", "search", "models"})
 # Known scalar keys in each section — sub-tables within a section are named
 # connections/branches.
 _DATABASE_SCALAR_KEYS = frozenset(
-    {"host", "port", "name", "user", "password", "password_env", "pool_min_size", "pool_max_size"}
+    {"dsn", "host", "port", "name", "user", "password", "password_env", "pool_min_size", "pool_max_size"}
 )
 _SEARCH_SCALAR_KEYS = frozenset({"host", "port", "user", "password", "password_env"})
 _MODELS_SCALAR_KEYS = frozenset(
@@ -276,9 +285,18 @@ def load_config(path: str | Path | None = None) -> Config:
     if not isinstance(raw_db, dict):
         raise KeyError("pylon.toml: required section [database] is missing or invalid.")
 
-    # Extract only scalar keys for the base config; sub-tables are branches.
+    # Extract only scalar keys for the base config; sub-tables are named connections.
     base_db_raw = {k: v for k, v in raw_db.items() if k in _DATABASE_SCALAR_KEYS}
     database = _build_database(base_db_raw)
+
+    # Build the named-connections registry.  "default" is always the base block;
+    # each sub-table is a sparse override (inherits unset keys from the base).
+    connections: dict[str, DatabaseConfig] = {"default": database}
+    for key, value in raw_db.items():
+        if key in _DATABASE_SCALAR_KEYS or not isinstance(value, dict):
+            continue
+        merged = {**base_db_raw, **value}
+        connections[key] = _build_database(merged)
 
     # ------------------------------------------------------------------
     # [search]
@@ -349,7 +367,7 @@ def load_config(path: str | Path | None = None) -> Config:
         pyql=str(pyql_raw) if pyql_raw is not None else None,
     )
 
-    return Config(database=database, project=project, search=search, models=models)
+    return Config(database=database, project=project, search=search, models=models, connections=connections)
 
 
 __all__ = [
