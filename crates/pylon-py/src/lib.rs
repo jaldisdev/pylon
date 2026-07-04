@@ -1438,19 +1438,19 @@ impl DbState {
 /// Returns a list of SQL strings; empty when nothing needs to change.
 /// All index creation uses plain (non-CONCURRENTLY) form — suitable for watch mode.
 #[pyfunction]
-fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
+fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<String>> {
     core::diff::diff_schema(&target.inner, &current.inner)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 /// Compute ordered DDL ops with non-transactional markers for migration file creation.
 /// Returns a list of `(sql, non_transactional)` tuples. Indexes on pre-existing tables
 /// use `CREATE INDEX CONCURRENTLY` and are marked `non_transactional=True`.
 #[pyfunction]
-fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Vec<(String, bool)> {
+fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<(String, bool)>> {
     core::diff::diff_schema_ops(&target.inner, &current.inner)
-        .into_iter()
-        .map(|op| (op.sql, op.non_transactional))
-        .collect()
+        .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 /// Compute the net DDL to go from `before` to `after` (two live-DB snapshots).
@@ -1501,11 +1501,10 @@ fn diff_schema_ops_with_renames(
     current: &DbState,
     type_renames: Vec<(String, String, String, String)>,
     col_renames: Vec<(String, String, String, String)>,
-) -> Vec<(String, bool)> {
+) -> PyResult<Vec<(String, bool)>> {
     core::diff::diff_schema_ops_with_renames(&target.inner, &current.inner, &type_renames, &col_renames)
-        .into_iter()
-        .map(|op| (op.sql, op.non_transactional))
-        .collect()
+        .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 // ── Shape conversion ───────────────────────────────────────────────────────────
