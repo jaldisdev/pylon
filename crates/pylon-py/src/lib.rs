@@ -1465,6 +1465,49 @@ fn diff_states(before: &DbState, after: &DbState) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// Detect potential type (table) renames.
+/// Returns list of (old_module, old_table, new_module, new_table, new_type_name, confidence).
+#[pyfunction]
+fn detect_type_renames(
+    target: &SchemaDescriptor,
+    current: &DbState,
+) -> Vec<(String, String, String, String, String, f64)> {
+    core::diff::detect_type_renames(&target.inner, &current.inner)
+        .into_iter()
+        .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table, c.new_type_name, c.confidence))
+        .collect()
+}
+
+/// Detect potential column renames within existing tables.
+/// Returns list of (module, table, old_col, new_col, pg_type).
+#[pyfunction]
+fn detect_col_renames(
+    target: &SchemaDescriptor,
+    current: &DbState,
+) -> Vec<(String, String, String, String, String)> {
+    core::diff::detect_col_renames(&target.inner, &current.inner)
+        .into_iter()
+        .map(|c| (c.module, c.table, c.old_col, c.new_col, c.pg_type))
+        .collect()
+}
+
+/// Diff with confirmed renames applied.
+/// `type_renames`: list of (old_module, old_table, new_module, new_table).
+/// `col_renames`:  list of (module, table, old_col, new_col).
+/// Returns list of (sql, non_transactional).
+#[pyfunction]
+fn diff_schema_ops_with_renames(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    type_renames: Vec<(String, String, String, String)>,
+    col_renames: Vec<(String, String, String, String)>,
+) -> Vec<(String, bool)> {
+    core::diff::diff_schema_ops_with_renames(&target.inner, &current.inner, &type_renames, &col_renames)
+        .into_iter()
+        .map(|op| (op.sql, op.non_transactional))
+        .collect()
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1656,6 +1699,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_schema, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops, m)?)?;
     m.add_function(wrap_pyfunction!(diff_states, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_col_renames, m)?)?;
+    m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames, m)?)?;
 
     Ok(())
 }
