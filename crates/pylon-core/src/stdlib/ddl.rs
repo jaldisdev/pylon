@@ -166,6 +166,23 @@ pub const INDEX_OUTBOX_DDL: &str = concat!(
     "    FOR EACH ROW EXECUTE FUNCTION _pylon.notify_index_queue();\n",
 );
 
+/// DDL for the `_pylon."Migrations"` and `_pylon."Progress"` tracking tables (§7).
+///
+/// Emitted alongside `INDEX_OUTBOX_DDL` at schema-bootstrap time.
+pub const MIGRATION_TRACKING_DDL: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS _pylon.\"Migrations\" (\n",
+    "    id          text        PRIMARY KEY,\n",
+    "    onto        text        NOT NULL,\n",
+    "    filename    text        NOT NULL,\n",
+    "    applied_at  timestamptz NOT NULL DEFAULT now()\n",
+    ");\n\n",
+    "CREATE TABLE IF NOT EXISTS _pylon.\"Progress\" (\n",
+    "    id          text        PRIMARY KEY,\n",
+    "    step_index  integer     NOT NULL,\n",
+    "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
+    ");\n",
+);
+
 /// Generate the complete `_pylon` schema DDL from the stdlib registry.
 ///
 /// Every `ImplStrategy::PylonFunction` entry contributes one
@@ -176,6 +193,8 @@ pub fn export_stdlib() -> String {
     let mut out = String::from("CREATE SCHEMA IF NOT EXISTS _pylon;\n\n");
 
     out.push_str(INDEX_OUTBOX_DDL);
+    out.push('\n');
+    out.push_str(MIGRATION_TRACKING_DDL);
     out.push('\n');
 
     // Internal runtime helpers (not user-callable from PyQL).
