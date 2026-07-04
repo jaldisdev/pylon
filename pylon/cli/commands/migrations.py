@@ -426,6 +426,114 @@ async def _log(
         click.echo(f"{e['id']}  onto={e['onto']}  {e['ref']}")
 
 
+# ── watch ────────────────────────────────────────────────────────────────────
+
+
+@migration.command()
+@requires_config
+@click.pass_context
+def watch(ctx: click.Context) -> None:
+    """Live-sync a dev database on schema file changes (no migration files written).
+
+    Watches Python schema source files for changes, recompiles the schema,
+    diffs it against the live database, and applies DDL immediately.
+    Run 'pylon migration create' afterward to record the changes as a migration.
+    """
+    asyncio.run(_watch(ctx))
+
+
+async def _watch(ctx: click.Context) -> None:
+    import asyncpg
+    from watchfiles import awatch
+
+    config = ctx.obj["config"]
+    schema_dir = config.project.schema_dir
+
+    click.echo(f"Watching {schema_dir} for changes… (Ctrl+C to stop)")
+
+    # Initial sync
+    await _sync_once(config)
+
+    async for changes in awatch(str(schema_dir)):
+        py_changes = [p for _, p in changes if p.endswith(".py")]
+        if py_changes:
+            click.echo(f"\nDetected change: {', '.join(py_changes)}")
+            await _sync_once(config)
+
+
+async def _sync_once(config) -> None:
+    """Recompile schema, introspect DB, diff, apply."""
+    import asyncpg
+    from pylon._core import diff_schema as _diff_schema
+    from pylon.schema._introspect import introspect_db_state
+
+    schema = _reload_schema(config)
+
+    conn = await asyncpg.connect(_pg_dsn(config))
+    try:
+        db_state = await introspect_db_state(conn)
+        ops = _diff_schema(schema, db_state)
+
+        if not ops:
+            click.echo("Schema up to date.")
+            return
+
+        async with conn.transaction():
+            for sql in ops:
+                await conn.execute(sql)
+
+        click.echo(f"Applied {len(ops)} DDL statement(s):")
+        for sql in ops:
+            # Print first line of each statement as a brief summary
+            first_line = sql.splitlines()[0]
+            click.echo(f"  {first_line}")
+    finally:
+        await conn.close()
+
+
+def _reload_schema(config):
+    """Clear the registry, re-import schema modules, return a fresh SchemaDescriptor."""
+    import sys
+    import importlib
+    from pylon.schema._registry import clear as _clear_registry
+    from pylon.schema._walker import walk
+    from pylon.schema._globals import collect_module_globals
+
+    schema_dir = config.project.schema_dir
+
+    # Remove previously loaded schema modules from sys.modules so they re-run.
+    schema_dir_str = str(schema_dir)
+    to_remove = [
+        name for name, mod in sys.modules.items()
+        if hasattr(mod, "__file__") and mod.__file__ and
+        mod.__file__.startswith(schema_dir_str) and not name.startswith("_")
+    ]
+    for name in to_remove:
+        del sys.modules[name]
+
+    _clear_registry()
+
+    # Ensure schema_dir is on sys.path
+    if schema_dir_str not in sys.path:
+        sys.path.insert(0, schema_dir_str)
+
+    for py_file in sorted(schema_dir.glob("*.py")):
+        stem = py_file.stem
+        if not stem.startswith("_"):
+            importlib.import_module(stem)
+
+    from pylon.schema._registry import snapshot, functions_snapshot
+    types, enums, custom_scalars = snapshot()
+    globals_: list = []
+    for py_file in sorted(schema_dir.glob("*.py")):
+        stem = py_file.stem
+        if not stem.startswith("_") and stem in sys.modules:
+            globals_.extend(collect_module_globals(sys.modules[stem]))
+
+    schema = walk(types, enums, custom_scalars, globals_, functions=functions_snapshot())
+    return schema
+
+
 # ── create ────────────────────────────────────────────────────────────────────
 
 @migration.command()

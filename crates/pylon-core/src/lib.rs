@@ -1,4 +1,5 @@
 pub mod cast;
+pub mod diff;
 pub mod error;
 pub mod export;
 pub mod ir;

@@ -1341,6 +1341,106 @@ fn blank_migration_body() -> &'static str {
     core::migration::blank_body()
 }
 
+// ── Diff / DbState ────────────────────────────────────────────────────────────
+
+/// Mutable snapshot of live PostgreSQL structure, built from pg_catalog queries.
+/// Pass to `diff_schema()` to compute the DDL needed to reach the target schema.
+#[pyclass(module = "pylon._core")]
+pub struct DbState {
+    inner: core::diff::DbState,
+}
+
+#[pymethods]
+impl DbState {
+    #[new]
+    fn new() -> Self {
+        Self { inner: core::diff::DbState::default() }
+    }
+
+    fn add_schema(&mut self, name: String) {
+        self.inner.schemas.push(name);
+    }
+
+    fn add_enum(&mut self, schema: String, name: String, members: Vec<String>) {
+        self.inner.enums.push(core::diff::DbEnum { schema, name, members });
+    }
+
+    fn add_domain(&mut self, schema: String, name: String) {
+        self.inner.domains.push(core::diff::DbDomain { schema, name });
+    }
+
+    /// Add a table. Columns, FKs, indexes, and checks are set via add_column etc.
+    fn add_table(&mut self, schema: String, name: String) {
+        self.inner.tables.push(core::diff::DbTable {
+            schema,
+            name,
+            columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+            checks: vec![],
+        });
+    }
+
+    fn add_column(
+        &mut self,
+        schema: &str,
+        table: &str,
+        name: String,
+        pg_type: String,
+        nullable: bool,
+        is_generated: bool,
+    ) {
+        if let Some(t) = self.inner.tables.iter_mut()
+            .find(|t| t.schema == schema && t.name == table)
+        {
+            t.columns.push(core::diff::DbColumn { name, pg_type, nullable, is_generated });
+        }
+    }
+
+    fn add_foreign_key(
+        &mut self,
+        schema: &str,
+        table: &str,
+        constraint_name: String,
+        local_column: String,
+        ref_schema: String,
+        ref_table: String,
+    ) {
+        if let Some(t) = self.inner.tables.iter_mut()
+            .find(|t| t.schema == schema && t.name == table)
+        {
+            t.foreign_keys.push(core::diff::DbForeignKey {
+                constraint_name,
+                local_column,
+                ref_schema,
+                ref_table,
+            });
+        }
+    }
+
+    fn add_index(
+        &mut self,
+        schema: &str,
+        table: &str,
+        name: String,
+        is_unique: bool,
+        method: String,
+    ) {
+        if let Some(t) = self.inner.tables.iter_mut()
+            .find(|t| t.schema == schema && t.name == table)
+        {
+            t.indexes.push(core::diff::DbIndex { name, is_unique, method });
+        }
+    }
+}
+
+/// Compute ordered DDL SQL statements to bring `current` in sync with `target`.
+/// Returns a list of SQL strings; empty when nothing needs to change.
+#[pyfunction]
+fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
+    core::diff::diff_schema(&target.inner, &current.inner)
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1526,5 +1626,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_migration_short_id, m)?)?;
     m.add_function(wrap_pyfunction!(render_migration_file, m)?)?;
     m.add_function(wrap_pyfunction!(blank_migration_body, m)?)?;
+
+    // Diff / watch
+    m.add_class::<DbState>()?;
+    m.add_function(wrap_pyfunction!(diff_schema, m)?)?;
+
     Ok(())
 }
