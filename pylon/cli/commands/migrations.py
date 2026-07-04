@@ -62,11 +62,12 @@ def _ordered_chain(migrations: list) -> list:
 
 
 def _applied_tip(tracking: list[dict]) -> str | None:
-    """Compute the tip ID from _pylon."Migrations" rows (the one with no descendant)."""
-    if not tracking:
+    """Compute the tip ID from applied _pylon."Migrations" rows (the one with no descendant)."""
+    applied = [r for r in tracking if r.get("applied_at") is not None]
+    if not applied:
         return None
-    applied_ids = {r["id"] for r in tracking}
-    onto_targets = {r["onto"] for r in tracking}
+    applied_ids = {r["id"] for r in applied}
+    onto_targets = {r["onto"] for r in applied}
     tips = applied_ids - onto_targets
     return next(iter(tips)) if tips else None
 
@@ -105,7 +106,8 @@ async def _ensure_tracking_tables(conn) -> None:
         "    id          text        PRIMARY KEY,"
         "    onto        text        NOT NULL,"
         "    filename    text        NOT NULL,"
-        "    applied_at  timestamptz NOT NULL DEFAULT now()"
+        "    db_state    jsonb       NULL,"
+        "    applied_at  timestamptz NULL"
         ");"
     )
     await conn.execute(
@@ -118,7 +120,7 @@ async def _ensure_tracking_tables(conn) -> None:
 
 
 async def _read_tracking(conn) -> list[dict]:
-    rows = await conn.fetch('SELECT id, onto, filename FROM _pylon."Migrations"')
+    rows = await conn.fetch('SELECT id, onto, filename, db_state, applied_at FROM _pylon."Migrations"')
     return [dict(r) for r in rows]
 
 
@@ -152,7 +154,7 @@ async def _apply(
     no_wait: bool,
 ) -> None:
     import asyncpg
-    from pylon._core import verify_migration
+    from pylon._core import verify_migration, schema_to_db_state_json
 
     config = ctx.obj["config"]
     d = _migrations_dir(config)
@@ -222,6 +224,16 @@ async def _apply(
                     continue
                 await _apply_one(conn, m, dev_mode, verify_migration)
                 applied_ids.add(m.id)
+
+            # Store a db_state snapshot on the tip row so the next `migration create`
+            # has a correct baseline without needing to apply pending migrations first.
+            tip = pending[-1]
+            schema = _reload_schema(config)
+            db_state_snapshot = schema_to_db_state_json(schema)
+            await conn.execute(
+                'UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2',
+                db_state_snapshot, tip.id,
+            )
 
         finally:
             await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
@@ -307,7 +319,11 @@ async def _apply_one(conn, m, dev_mode: bool, verify_migration) -> None:
 
 async def _record_applied(conn, m) -> None:
     await conn.execute(
-        'INSERT INTO _pylon."Migrations" (id, onto, filename) VALUES ($1, $2, $3)',
+        """
+        INSERT INTO _pylon."Migrations" (id, onto, filename, applied_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (id) DO UPDATE SET applied_at = now()
+        """,
         m.id, m.onto, m.filename,
     )
 
@@ -838,6 +854,7 @@ async def _create_from_diff(
         render_migration_file,
         compute_migration_short_id,
         verify_migration,  # noqa: F401 — used by _apply_one
+        db_state_from_json,
     )
     from pylon.schema._introspect import introspect_db_state
 
@@ -867,27 +884,32 @@ async def _create_from_diff(
                 "history has diverged. Resolve manually."
             )
 
-        # Behind → apply pending migrations first so the diff baseline is current.
+        # Pending migrations → abort. All migrations must be applied before
+        # creating a new one so the live database is the correct diff baseline.
         if applied_tip != chain_tip:
             pending_start = 0 if applied_tip is None else (chain_ids.index(applied_tip) + 1)
             pending = chain[pending_start:]
             if pending:
-                click.echo(f"Applying {len(pending)} pending migration(s) before diffing…")
-                await conn.execute("SELECT pg_advisory_lock($1)", _ADVISORY_LOCK_KEY)
-                try:
-                    for m in pending:
-                        await _apply_one(conn, m, False, verify_migration)
-                finally:
-                    await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
+                names = ", ".join(m.filename for m in pending)
+                raise click.ClickException(
+                    f"{len(pending)} unapplied migration(s): {names}\n"
+                    "Run 'pylon migration apply' first."
+                )
 
-        # Introspect the live database (now at the chain tip).
-        db_state = await introspect_db_state(conn)
+        # Use the db_state snapshot from the tip row as the baseline — this is
+        # what the schema looked like after the last migration was applied, which
+        # is the correct baseline even when watch has run since then.
+        # Fall back to live DB introspection only when no snapshot exists yet.
+        tip_row = next((r for r in tracking if r["id"] == chain_tip), None)
+        db_state_json = tip_row["db_state"] if tip_row else None
+        if db_state_json is not None:
+            db_state = db_state_from_json(db_state_json)
+        else:
+            db_state = await introspect_db_state(conn)
     finally:
         await conn.close()
 
     # ── Rename detection (interactive) ────────────────────────────────────────
-    # type_renames: list of (old_mod, old_table, new_mod, new_table)
-    # col_renames:  list of (mod, table, old_col, new_col)
     confirmed_type_renames: list[tuple[str, str, str, str]] = []
     confirmed_col_renames: list[tuple[str, str, str, str]] = []
 
@@ -935,11 +957,8 @@ async def _create_from_diff(
         if not click.confirm("Write migration?"):
             raise click.ClickException("Aborted.")
 
-    # Assemble migration body with -- pylon:step markers between transactional
-    # and non-transactional groups.
+    # Assemble migration body and write the file.
     body = _assemble_migration_body(ops)
-
-    # Write the file.
     onto = chain_tip
     content = render_migration_file(onto, body)
     short_id = compute_migration_short_id(body)
