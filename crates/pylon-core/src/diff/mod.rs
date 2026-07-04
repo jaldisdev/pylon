@@ -99,6 +99,26 @@ pub struct ColRenameCandidate {
     pub pg_type: String,
 }
 
+/// A column that is being made NOT NULL but currently contains (or could
+/// contain) NULL rows, requiring a fill expression to backfill existing rows
+/// before the constraint can be added.
+#[derive(Debug)]
+pub struct FillRequired {
+    /// Schema / Postgres schema name of the table.
+    pub module: String,
+    pub table: String,
+    pub column: String,
+    pub pg_type: String,
+    /// Python-level type name — used in the prompt ("property 'x' of 'Post'").
+    pub type_name: String,
+    /// True when the column doesn't exist yet (ADD COLUMN); false when it
+    /// already exists as nullable (nullability change).
+    pub is_new_column: bool,
+    /// The schema-level `default=` SQL, if one is declared.  When present it
+    /// can be used as an automatic fill expression without prompting the user.
+    pub default_sql: Option<String>,
+}
+
 // ── Diff operation ─────────────────────────────────────────────────────────────
 
 /// A single DDL operation produced by the diff engine.
@@ -117,7 +137,7 @@ pub struct DiffOp {
 /// All statements use plain (non-CONCURRENTLY) index creation — suitable for
 /// `watch` mode where everything runs inside a single transaction.
 pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<String>, String> {
-    Ok(diff_inner(target, current, false)?
+    Ok(diff_inner(target, current, false, &HashMap::new())?
         .into_iter()
         .map(|op| op.sql)
         .collect())
@@ -127,7 +147,7 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<S
 /// Index creation on pre-existing tables uses `CONCURRENTLY` and is marked
 /// `non_transactional = true` so `create` can insert step-boundary markers.
 pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<DiffOp>, String> {
-    diff_inner(target, current, true)
+    diff_inner(target, current, true, &HashMap::new())
 }
 
 /// Diff two live-database snapshots (used by squash to capture the net effect
@@ -314,8 +334,190 @@ pub fn diff_schema_ops_with_renames(
     }
 
     // ── Run the standard diff against the modified state ──────────────────────
-    let mut diff_ops = diff_inner(target, &modified, true)?;
+    let mut diff_ops = diff_inner(target, &modified, true, &HashMap::new())?;
     ops.append(&mut diff_ops);
+    Ok(ops)
+}
+
+/// Detect all properties that are being made NOT NULL but whose existing rows
+/// may contain NULL values and therefore require a fill expression.
+///
+/// Returns a `FillRequired` for:
+/// - New NOT NULL columns without a schema-level `default=` on existing tables.
+/// - Existing nullable columns that the target marks as NOT NULL (with or without
+///   a default — the default is surfaced as `default_sql` for auto-fill).
+///
+/// New tables are excluded (no rows yet).  PK columns are excluded (always NOT
+/// NULL by definition).
+pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec<FillRequired> {
+    let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
+        .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+        .collect();
+
+    let mut result: Vec<FillRequired> = Vec::new();
+
+    for td in &target.types {
+        if td.abstract_ || td.junction { continue; }
+        let Some(cur) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) else { continue };
+
+        let cur_col_map: HashMap<&str, &DbColumn> = cur.columns.iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        for p in &td.properties {
+            if p.nullable || p.is_pk { continue; }
+            match cur_col_map.get(p.name.as_str()) {
+                None => {
+                    // New required column — only needs a fill when there's no default.
+                    if p.default_sql.is_none() {
+                        result.push(FillRequired {
+                            module: td.module.clone(),
+                            table: td.table.clone(),
+                            column: p.name.clone(),
+                            pg_type: col_type_str(&p.pg_type).to_string(),
+                            type_name: td.name.clone(),
+                            is_new_column: true,
+                            default_sql: None,
+                        });
+                    }
+                }
+                Some(cur_col) if cur_col.nullable => {
+                    // Existing nullable column becoming NOT NULL.
+                    result.push(FillRequired {
+                        module: td.module.clone(),
+                        table: td.table.clone(),
+                        column: p.name.clone(),
+                        pg_type: col_type_str(&p.pg_type).to_string(),
+                        type_name: td.name.clone(),
+                        is_new_column: false,
+                        default_sql: p.default_sql.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        for l in &td.links {
+            if l.nullable { continue; }
+            let col = format!("{}_id", l.name);
+            match cur_col_map.get(col.as_str()) {
+                None => {
+                    result.push(FillRequired {
+                        module: td.module.clone(),
+                        table: td.table.clone(),
+                        column: col,
+                        pg_type: "uuid".to_string(),
+                        type_name: td.name.clone(),
+                        is_new_column: true,
+                        default_sql: None,
+                    });
+                }
+                Some(cur_col) if cur_col.nullable => {
+                    result.push(FillRequired {
+                        module: td.module.clone(),
+                        table: td.table.clone(),
+                        column: col,
+                        pg_type: "uuid".to_string(),
+                        type_name: td.name.clone(),
+                        is_new_column: false,
+                        default_sql: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    result
+}
+
+/// Full diff with confirmed renames and fill expressions applied.
+///
+/// `type_renames`: `(old_module, old_table, new_module, new_table)`.
+/// `col_renames`:  `(module, table, old_col, new_col)`.
+/// `fills`:        `(module, table, column, sql_expr)` — one entry per column
+///                 that needs a backfill before its NOT NULL constraint is set.
+///
+/// For each fill the function emits:
+///   1. `UPDATE … SET col = expr WHERE col IS NULL;`
+///   2. `ALTER TABLE … ALTER COLUMN col SET NOT NULL;`
+///
+/// For newly-added NOT NULL columns that are in the fills list the ADD COLUMN
+/// is emitted as nullable so the fill can succeed before the constraint is set.
+pub fn diff_schema_ops_with_renames_and_fills(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    type_renames: &[(String, String, String, String)],
+    col_renames: &[(String, String, String, String)],
+    fills: &[(String, String, String, String)],
+) -> Result<Vec<DiffOp>, String> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut modified = current.clone();
+
+    // ── Apply type renames ────────────────────────────────────────────────────
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        if old_mod == new_mod {
+            push_tx(&mut ops, format!(
+                "ALTER TABLE {} RENAME TO {};",
+                qn(old_mod, old_table), qi(new_table)
+            ));
+        } else {
+            push_tx(&mut ops, format!(
+                "ALTER TABLE {} SET SCHEMA {};",
+                qn(old_mod, old_table), qi(new_mod)
+            ));
+            push_tx(&mut ops, format!(
+                "ALTER TABLE {} RENAME TO {};",
+                qn(new_mod, old_table), qi(new_table)
+            ));
+        }
+        if let Some(t) = modified.tables.iter_mut()
+            .find(|t| &t.schema == old_mod && &t.name == old_table)
+        {
+            t.schema = new_mod.clone();
+            t.name = new_table.clone();
+        }
+    }
+
+    // ── Apply column renames ──────────────────────────────────────────────────
+    for (module, table, old_col, new_col) in col_renames {
+        push_tx(&mut ops, format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {};",
+            qn(module, table), qi(old_col), qi(new_col)
+        ));
+        if let Some(t) = modified.tables.iter_mut()
+            .find(|t| &t.schema == module && &t.name == table)
+        {
+            if let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col) {
+                col.name = new_col.clone();
+            }
+        }
+    }
+
+    // ── Build fill index so emit_column_diff can defer NOT NULL for fills ─────
+    let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for (module, table, col, _) in fills {
+        fill_index
+            .entry((module.clone(), table.clone()))
+            .or_default()
+            .insert(col.clone());
+    }
+
+    // ── Standard diff (renames already resolved in `modified`) ───────────────
+    let mut diff_ops = diff_inner(target, &modified, true, &fill_index)?;
+    ops.append(&mut diff_ops);
+
+    // ── Fill DDL: UPDATE backfill + SET NOT NULL ──────────────────────────────
+    for (module, table, col, fill_expr) in fills {
+        push_tx(&mut ops, format!(
+            "UPDATE {} SET {} = {} WHERE {} IS NULL;",
+            qn(module, table), qi(col), fill_expr, qi(col)
+        ));
+        push_tx(&mut ops, format!(
+            "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+            qn(module, table), qi(col)
+        ));
+    }
+
     Ok(ops)
 }
 
@@ -358,14 +560,11 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
             _ => {}
         }
         colour[i] = 1;
-        // Dependencies: FK links + multi-link targets.
+        // Dependencies: FK links only. Multilinks don't create FK columns on
+        // the source table — the junction table does — so they are not ordering
+        // constraints for the source type itself.
         for l in &types[i].links {
             if let Some(&dep) = idx_of.get(&l.target) {
-                visit(dep, types, idx_of, colour, order)?;
-            }
-        }
-        for ml in &types[i].multilinks {
-            if let Some(&dep) = idx_of.get(&ml.target) {
                 visit(dep, types, idx_of, colour, order)?;
             }
         }
@@ -386,7 +585,12 @@ fn col_type_str(pg_type: &str) -> &str {
 
 // ── Core diff implementation ──────────────────────────────────────────────────
 
-fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool) -> Result<Vec<DiffOp>, String> {
+fn diff_inner(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    for_migration: bool,
+    fill_index: &HashMap<(String, String), HashSet<String>>,
+) -> Result<Vec<DiffOp>, String> {
     let mut ops: Vec<DiffOp> = Vec::new();
 
     let cur_schemas: HashSet<&str> = current.schemas.iter().map(|s| s.as_str()).collect();
@@ -475,7 +679,13 @@ fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool)
                 emit_create_table(td, &mut ops);
                 new_tables.insert((td.module.clone(), td.table.clone()));
             }
-            Some(existing) => emit_column_diff(td, existing, &mut ops),
+            Some(existing) => {
+                let fill_cols = fill_index
+                    .get(&(td.module.clone(), td.table.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                emit_column_diff(td, existing, &mut ops, for_migration, &fill_cols);
+            }
         }
     }
 
@@ -665,32 +875,83 @@ fn emit_create_table(td: &TypeDescriptor, ops: &mut Vec<DiffOp>) {
 
 // ── Column diff for an existing table ─────────────────────────────────────────
 
-fn emit_column_diff(td: &TypeDescriptor, existing: &DbTable, ops: &mut Vec<DiffOp>) {
-    let existing_cols: HashSet<&str> = existing.columns.iter().map(|c| c.name.as_str()).collect();
+/// `for_migration`: true = migration-file mode, false = watch mode.
+/// `fill_cols`: column names that will be backfilled via a fill expression.
+///   For migration mode, new NOT NULL columns in this set are added as nullable
+///   first (the fill + SET NOT NULL comes later); in watch mode fills are unused.
+fn emit_column_diff(
+    td: &TypeDescriptor,
+    existing: &DbTable,
+    ops: &mut Vec<DiffOp>,
+    for_migration: bool,
+    fill_cols: &HashSet<String>,
+) {
+    let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
 
+    // ── Add new columns ───────────────────────────────────────────────────────
     for p in &td.properties {
-        if !existing_cols.contains(p.name.as_str()) {
-            let not_null = if p.nullable { "" } else { " NOT NULL" };
-            let default = p.default_sql.as_deref()
-                .map(|d| format!(" DEFAULT {}", d))
-                .unwrap_or_default();
+        if existing_col_map.contains_key(p.name.as_str()) { continue; }
+        let needs_fill = for_migration && !p.nullable && p.default_sql.is_none()
+            && fill_cols.contains(&p.name);
+        let not_null = if p.nullable || needs_fill { "" } else { " NOT NULL" };
+        let default = p.default_sql.as_deref()
+            .map(|d| format!(" DEFAULT {}", d))
+            .unwrap_or_default();
+        push_tx(ops, format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
+            qn(&td.module, &td.table), qi(&p.name), col_type_str(&p.pg_type), not_null, default
+        ));
+    }
+    for l in &td.links {
+        let col = format!("{}_id", l.name);
+        if existing_col_map.contains_key(col.as_str()) { continue; }
+        let needs_fill = for_migration && !l.nullable && fill_cols.contains(&col);
+        let not_null = if l.nullable || needs_fill { "" } else { " NOT NULL" };
+        push_tx(ops, format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{};",
+            qn(&td.module, &td.table), qi(&col), not_null
+        ));
+    }
+
+    // ── Nullability changes on existing columns ───────────────────────────────
+    for p in &td.properties {
+        let Some(cur) = existing_col_map.get(p.name.as_str()) else { continue };
+        if cur.is_generated { continue; }
+        if !cur.nullable && p.nullable {
+            // NOT NULL → nullable: always safe, no fill needed.
             push_tx(ops, format!(
-                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
-                qn(&td.module, &td.table), qi(&p.name), col_type_str(&p.pg_type), not_null, default
+                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                qn(&td.module, &td.table), qi(&p.name)
             ));
+        } else if cur.nullable && !p.nullable && !for_migration {
+            // nullable → NOT NULL: safe in watch mode (dev DB, typically no rows).
+            push_tx(ops, format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                qn(&td.module, &td.table), qi(&p.name)
+            ));
+            // In migration mode this is intentionally skipped; the fill mechanism
+            // emits UPDATE + SET NOT NULL after the main diff body.
         }
     }
     for l in &td.links {
         let col = format!("{}_id", l.name);
-        if !existing_cols.contains(col.as_str()) {
-            let not_null = if l.nullable { "" } else { " NOT NULL" };
+        let Some(cur) = existing_col_map.get(col.as_str()) else { continue };
+        if !cur.nullable && l.nullable {
             push_tx(ops, format!(
-                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{};",
-                qn(&td.module, &td.table), qi(&col), not_null
+                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                qn(&td.module, &td.table), qi(&col)
+            ));
+        } else if cur.nullable && !l.nullable && !for_migration {
+            push_tx(ops, format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                qn(&td.module, &td.table), qi(&col)
             ));
         }
     }
-    // Drop columns no longer in the target (skip Pylon-managed __*__ columns).
+
+    // ── Drop removed columns ──────────────────────────────────────────────────
     let target_cols: HashSet<String> = td.properties.iter().map(|p| p.name.clone())
         .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
         .collect();

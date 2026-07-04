@@ -754,6 +754,73 @@ def _rename_prompt_loop(
     return confirmed_type, confirmed_col, False
 
 
+def _fill_prompt_loop(
+    fill_candidates: list,
+    is_interactive: bool,
+    schema,
+) -> list[tuple]:
+    """Resolve fill expressions (PyQL) for columns being made NOT NULL.
+
+    Returns a list of (module, table, column, sql_expr) tuples ready for
+    `diff_schema_ops_with_renames_and_fills`. Raises `click.ClickException`
+    in non-interactive mode when any fill cannot be auto-derived from the
+    schema's declared default.
+    """
+    from pylon._core import compile_fill_expr
+
+    fills: list[tuple] = []
+    need_prompt: list[tuple] = []
+
+    for module, table, column, pg_type, type_name, is_new_column, default_sql in fill_candidates:
+        if default_sql is not None:
+            fills.append((module, table, column, default_sql))
+        else:
+            need_prompt.append((module, table, column, pg_type, type_name, is_new_column))
+
+    if not need_prompt:
+        return fills
+
+    if not is_interactive:
+        lines = [
+            "The following columns are being made NOT NULL but have no fill expression:"
+        ]
+        for module, table, column, pg_type, type_name, is_new_col in need_prompt:
+            kind = "new column" if is_new_col else "existing column"
+            lines.append(f"  {type_name}.{column} ({pg_type}, {kind})")
+        lines.append(
+            "Provide a fill expression via the schema's default= annotation, "
+            "or run interactively."
+        )
+        raise click.ClickException("\n".join(lines))
+
+    click.echo(
+        "\nSome columns are being made NOT NULL and need a fill expression\n"
+        "to backfill existing rows before the constraint is set.\n"
+        "Enter a PyQL expression (e.g. 'No content', 0, .other_field).\n"
+        "Press Ctrl+C to abort."
+    )
+
+    for module, table, column, pg_type, type_name, is_new_col in need_prompt:
+        kind = "new column" if is_new_col else "existing column"
+        click.echo(f"\n  {type_name}.{column}  ({pg_type}, {kind})")
+        click.echo(f'  Table: "{module}"."{table}"')
+
+        while True:
+            expr_str = click.prompt("  fill_expr>", prompt_suffix=" ").strip()
+            if not expr_str:
+                click.echo("  Expression cannot be empty.")
+                continue
+            try:
+                sql_expr = compile_fill_expr(type_name, expr_str, schema)
+            except Exception as exc:
+                click.echo(f"  Error: {exc}")
+                continue
+            fills.append((module, table, column, sql_expr))
+            break
+
+    return fills
+
+
 async def _create_from_diff(
     ctx: click.Context,
     name: str | None,
@@ -766,10 +833,11 @@ async def _create_from_diff(
         diff_schema_ops as _core_diff_schema_ops,
         detect_type_renames as _core_detect_type_renames,
         detect_col_renames as _core_detect_col_renames,
-        diff_schema_ops_with_renames as _core_diff_schema_ops_with_renames,
+        detect_fill_required as _core_detect_fill_required,
+        diff_schema_ops_with_renames_and_fills as _core_diff_schema_ops_with_renames_and_fills,
         render_migration_file,
         compute_migration_short_id,
-        verify_migration,
+        verify_migration,  # noqa: F401 — used by _apply_one
     )
     from pylon.schema._introspect import introspect_db_state
 
@@ -836,10 +904,14 @@ async def _create_from_diff(
             if quit_requested:
                 raise click.ClickException("Aborted.")
 
+    # ── Fill expression detection ─────────────────────────────────────────────
+    fill_candidates = _core_detect_fill_required(schema, db_state)
+    fills = _fill_prompt_loop(fill_candidates, is_interactive, schema)
+
     # ── Compute final diff ────────────────────────────────────────────────────
-    if confirmed_type_renames or confirmed_col_renames:
-        ops = _core_diff_schema_ops_with_renames(
-            schema, db_state, confirmed_type_renames, confirmed_col_renames
+    if confirmed_type_renames or confirmed_col_renames or fills:
+        ops = _core_diff_schema_ops_with_renames_and_fills(
+            schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
         )
     else:
         ops = _core_diff_schema_ops(schema, db_state)
