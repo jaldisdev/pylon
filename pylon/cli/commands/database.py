@@ -166,12 +166,9 @@ def restore(ctx: click.Context, file: str) -> None:
 @requires_config
 @click.pass_context
 def wipe(ctx: click.Context, force: bool) -> None:
-    """Delete all data and reset the user schema.
+    """Destroy all database contents.
 
-    Drops every non-system schema (preserving _pylon, public, pg_* and
-    information_schema), then re-runs 'database initialize' and
-    'migration migrate' to restore the schema from scratch.
-
+    Drops all user-defined modules and clears migration history.
     The database itself is NOT dropped.
     """
     db = ctx.obj["config"].database
@@ -179,37 +176,31 @@ def wipe(ctx: click.Context, force: bool) -> None:
 
     if not force:
         click.confirm(
-            f"This will wipe ALL data in '{dbname}' and reset the schema. Continue?",
+            f"This will destroy all data in '{dbname}'. Continue?",
             abort=True,
         )
 
-    async def do_wipe() -> list[str]:
+    async def do_wipe() -> None:
         conn = await asyncpg.connect(_pg_dsn(db))
         try:
             schemas = await _user_schemas(conn)
+            has_tracking = await conn.fetchval(
+                "SELECT to_regclass('_pylon.\"Migrations\"')"
+            )
             async with conn.transaction():
                 for schema in schemas:
                     await conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
-                    await conn.execute(f'CREATE SCHEMA "{schema}"')
-            return schemas
+                if has_tracking:
+                    await conn.execute('DELETE FROM _pylon."Migrations"')
+                    await conn.execute('DELETE FROM _pylon."Progress"')
         finally:
             await conn.close()
 
     try:
-        dropped = asyncio.run(do_wipe())
+        asyncio.run(do_wipe())
     except asyncpg.PostgresError as exc:
         _print_error("database error", str(exc))
         ctx.exit(1)
         return
 
-    if dropped:
-        click.echo(f"Wiped schemas: {', '.join(dropped)}")
-    else:
-        click.echo("No user schemas found — nothing to wipe.")
-
-    # Re-initialize _pylon stdlib.
-    ctx.invoke(initialize)
-
-    # Re-apply migrations.
-    from .migrations import migration
-    ctx.invoke(migration.commands["apply"])  # type: ignore[index]
+    click.echo("Database wiped.")
