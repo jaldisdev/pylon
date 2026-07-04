@@ -226,8 +226,11 @@ fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool)
                 .map(|c| format!("    CHECK ({})", c))
                 .collect();
             let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
+            // Postgres has no CREATE DOMAIN IF NOT EXISTS, so use the same
+            // exception-swallowing pattern we use for enums.
             push_tx(&mut ops, format!(
-                "CREATE DOMAIN {}.{} AS {}{};",
+                "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
                 qi(&s.module), qi(&s.name), s.pg_type, check_clause
             ));
         }
@@ -430,7 +433,7 @@ fn emit_create_table(td: &TypeDescriptor, ops: &mut Vec<DiffOp>) {
         lines.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
     push_tx(ops, format!(
-        "CREATE TABLE {} (\n{}\n);",
+        "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
         qn(&td.module, &td.table),
         lines.join(",\n")
     ));
@@ -546,7 +549,7 @@ fn emit_junction_table(
         .unwrap_or_else(|| qi(ml_target));
 
     push_tx(ops, format!(
-        "CREATE TABLE {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){},\n    PRIMARY KEY (source, target)\n);",
+        "CREATE TABLE IF NOT EXISTS {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){},\n    PRIMARY KEY (source, target)\n);",
         qn(&td.module, &jt_name),
         qn(&td.module, &td.table),
         src_on_delete,
@@ -723,7 +726,7 @@ fn emit_create_table_from_db(t: &DbTable, ops: &mut Vec<DiffOp>) {
         }
     }
     push_tx(ops, format!(
-        "CREATE TABLE {}.{} (\n{}\n);",
+        "CREATE TABLE IF NOT EXISTS {}.{} (\n{}\n);",
         qi(&t.schema), qi(&t.name),
         lines.join(",\n")
     ));
@@ -793,7 +796,7 @@ mod tests {
         let ops = diff_schema(&schema, &empty_state());
         let joined = ops.join("\n");
         assert!(joined.contains("CREATE SCHEMA IF NOT EXISTS \"catalog\""), "got:\n{joined}");
-        assert!(joined.contains("CREATE TABLE \"catalog\".\"Product\""), "got:\n{joined}");
+        assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""), "got:\n{joined}");
     }
 
     #[test]
