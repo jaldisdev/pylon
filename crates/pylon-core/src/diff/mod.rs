@@ -21,6 +21,8 @@ pub struct DbState {
     pub tables: Vec<DbTable>,
     pub enums: Vec<DbEnum>,
     pub domains: Vec<DbDomain>,
+    pub views: Vec<DbView>,
+    pub functions: Vec<DbFunction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +74,22 @@ pub struct DbEnum {
 pub struct DbDomain {
     pub schema: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbView {
+    pub schema: String,
+    pub name: String,
+    /// SHA-256 (first 16 hex chars) of the rendered DDL — detects definition changes.
+    pub body_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbFunction {
+    pub schema: String,
+    pub name: String,
+    /// SHA-256 (first 16 hex chars) of the rendered DDL — detects body changes.
+    pub body_hash: String,
 }
 
 // ── Schema → DbState projection ────────────────────────────────────────────────
@@ -305,7 +323,26 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         }
     }
 
-    DbState { schemas, tables, enums, domains }
+    // Views (interface types)
+    let views: Vec<DbView> = crate::export::interface_view_ddl_with_names(schema)
+        .into_iter()
+        .map(|(module, name, ddl)| DbView { schema: module, name, body_hash: ddl_hash(&ddl) })
+        .collect();
+
+    // User-defined functions
+    let functions: Vec<DbFunction> = crate::export::function_ddl_with_names(schema)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(module, name, ddl)| DbFunction { schema: module, name, body_hash: ddl_hash(&ddl) })
+        .collect();
+
+    DbState { schemas, tables, enums, domains, views, functions }
+}
+
+fn ddl_hash(ddl: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(ddl.as_bytes());
+    hex::encode(&digest[..8])
 }
 
 /// Serialize a `DbState` to a JSON string for storage in `_pylon."Migrations".db_state`.
@@ -849,6 +886,12 @@ fn diff_inner(
     let cur_domains: HashSet<(&str, &str)> = current.domains.iter()
         .map(|d| (d.schema.as_str(), d.name.as_str()))
         .collect();
+    let cur_views: HashMap<(&str, &str), &str> = current.views.iter()
+        .map(|v| ((v.schema.as_str(), v.name.as_str()), v.body_hash.as_str()))
+        .collect();
+    let cur_functions: HashMap<(&str, &str), &str> = current.functions.iter()
+        .map(|f| ((f.schema.as_str(), f.name.as_str()), f.body_hash.as_str()))
+        .collect();
 
     let type_map: HashMap<String, (&str, &str)> = target.types.iter()
         .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
@@ -859,46 +902,53 @@ fn diff_inner(
     for e in &target.enums  { target_schemas.insert(e.module.clone()); }
     for s in &target.scalars { target_schemas.insert(s.module.clone()); }
 
-    // ── Phase 1: schemas (IF NOT EXISTS — idempotent) ────────────────────────
+    // ── Phase 1: schemas ─────────────────────────────────────────────────────
     for schema in &target_schemas {
-        push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
+        if !cur_schemas.contains(schema.as_str()) {
+            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
+        }
     }
 
-    // ── Phase 2: enums (idempotent create + add-only member changes) ─────────
+    // ── Phase 2: enums ───────────────────────────────────────────────────────
     for e in &target.enums {
-        let members: Vec<String> = e.members.iter()
-            .map(|m| format!("'{}'", m.replace('\'', "''")))
-            .collect();
-        push_tx(&mut ops, format!(
-            "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
-             EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-            qi(&e.module), qi(&e.name), members.join(", ")
-        ));
-        // Also emit any members that exist in the target but not in the live DB.
-        if let Some(existing) = cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
-            let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
-            for member in &e.members {
-                if !existing_set.contains(member.as_str()) {
-                    push_tx(&mut ops, format!(
-                        "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                        qi(&e.module), qi(&e.name), member.replace('\'', "''")
-                    ));
+        match cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
+            None => {
+                let members: Vec<String> = e.members.iter()
+                    .map(|m| format!("'{}'", m.replace('\'', "''")))
+                    .collect();
+                push_tx(&mut ops, format!(
+                    "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
+                     EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+                    qi(&e.module), qi(&e.name), members.join(", ")
+                ));
+            }
+            Some(existing) => {
+                let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
+                for member in &e.members {
+                    if !existing_set.contains(member.as_str()) {
+                        push_tx(&mut ops, format!(
+                            "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                            qi(&e.module), qi(&e.name), member.replace('\'', "''")
+                        ));
+                    }
                 }
             }
         }
     }
 
-    // ── Phase 3: custom scalar domains (idempotent) ───────────────────────────
+    // ── Phase 3: custom scalar domains ───────────────────────────────────────
     for s in &target.scalars {
-        let checks: Vec<String> = s.check_constraints.iter()
-            .map(|c| format!("    CHECK ({})", c))
-            .collect();
-        let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
-        push_tx(&mut ops, format!(
-            "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
-             EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
-            qi(&s.module), qi(&s.name), s.pg_type, check_clause
-        ));
+        if !cur_domains.contains(&(s.module.as_str(), s.name.as_str())) {
+            let checks: Vec<String> = s.check_constraints.iter()
+                .map(|c| format!("    CHECK ({})", c))
+                .collect();
+            let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
+            push_tx(&mut ops, format!(
+                "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
+                qi(&s.module), qi(&s.name), s.pg_type, check_clause
+            ));
+        }
     }
 
     // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
@@ -1023,15 +1073,34 @@ fn diff_inner(
     }
 
     // ── Phase 10: interface views (after all tables exist) ───────────────────
-    for ddl in crate::export::interface_view_ddl(target) {
-        push_tx(&mut ops, ddl);
+    // In watch mode always re-emit (CREATE OR REPLACE VIEW is idempotent).
+    // In migration mode only emit new or changed views.
+    for (module, name, ddl) in crate::export::interface_view_ddl_with_names(target) {
+        let emit = if for_migration {
+            let hash = ddl_hash(&ddl);
+            cur_views.get(&(module.as_str(), name.as_str()))
+                .map(|&h| h != hash)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if emit { push_tx(&mut ops, ddl); }
     }
 
     // ── Phase 11: user-defined functions ─────────────────────────────────────
-    let fn_ddls = crate::export::function_ddl(target)
+    // Same conditional logic as views.
+    let fn_ddls = crate::export::function_ddl_with_names(target)
         .map_err(|e| e.to_string())?;
-    for ddl in fn_ddls {
-        push_tx(&mut ops, ddl);
+    for (module, name, ddl) in fn_ddls {
+        let emit = if for_migration {
+            let hash = ddl_hash(&ddl);
+            cur_functions.get(&(module.as_str(), name.as_str()))
+                .map(|&h| h != hash)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if emit { push_tx(&mut ops, ddl); }
     }
 
     // ── Phase 12: drop removed tables ────────────────────────────────────────

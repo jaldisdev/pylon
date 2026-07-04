@@ -590,26 +590,14 @@ fn emit_triggers(schema: &SchemaDescriptor, out: &mut String) {
 
 /// Return `CREATE OR REPLACE VIEW` DDL for every interface type in `schema`.
 pub fn interface_view_ddl(schema: &SchemaDescriptor) -> Vec<String> {
-    let mut out = String::new();
-    emit_interface_views(schema, &mut out);
-    // Split on the double-newline separator between statements.
-    out.split("\n\n")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    interface_view_ddl_with_names(schema)
+        .into_iter()
+        .map(|(_, _, ddl)| ddl)
         .collect()
 }
 
-/// Return `CREATE OR REPLACE FUNCTION` DDL for every user-defined function in `schema`.
-pub fn function_ddl(schema: &SchemaDescriptor) -> Result<Vec<String>, crate::error::PyQLError> {
-    schema.functions.iter()
-        .map(|fd| emit_one_function(fd, schema))
-        .collect()
-}
-
-// ── Phase 11: interface views ──────────────────────────────────────────────────
-
-fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
-    // Build reverse map: "module::Name" → concrete types that implement it
+/// Like `interface_view_ddl` but also returns the module and view name for each entry.
+pub fn interface_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
     let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
     for t in &schema.types {
         if !t.abstract_ {
@@ -618,30 +606,66 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
             }
         }
     }
-
+    let mut result = Vec::new();
     for t in &schema.types {
         if !(t.abstract_ && t.materialized) { continue; }
-
         let key = format!("{}::{}", t.module, t.name);
         let Some(impls) = implementors.get(&key) else { continue };
         if impls.is_empty() { continue; }
+        let mut ddl = String::new();
+        emit_one_interface_view(t, impls, &mut ddl);
+        let ddl = ddl.trim().to_string();
+        if !ddl.is_empty() {
+            result.push((t.module.clone(), t.name.clone(), ddl));
+        }
+    }
+    result
+}
 
-        // Columns: interface's own properties + link columns
-        let cols: Vec<String> = t.properties.iter()
-            .map(|p| qi(&p.name))
-            .chain(t.links.iter().map(|l| qi(&format!("{}_id", l.name))))
-            .collect();
-        let col_list = cols.join(", ");
+/// Return `CREATE OR REPLACE FUNCTION` DDL for every user-defined function in `schema`.
+pub fn function_ddl(schema: &SchemaDescriptor) -> Result<Vec<String>, crate::error::PyQLError> {
+    function_ddl_with_names(schema)
+        .map(|v| v.into_iter().map(|(_, _, ddl)| ddl).collect())
+}
 
-        let selects: Vec<String> = impls.iter()
-            .map(|impl_t| {
-                format!("    SELECT {} FROM {}", col_list, qn(&impl_t.module, &impl_t.table))
-            })
-            .collect();
+/// Like `function_ddl` but also returns the module and function name for each entry.
+pub fn function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
+    schema.functions.iter()
+        .map(|fd| emit_one_function(fd, schema).map(|ddl| (fd.module.clone(), fd.name.clone(), ddl)))
+        .collect()
+}
 
-        out.push_str(&format!("CREATE VIEW {} AS\n", qn(&t.module, &t.table)));
-        out.push_str(&selects.join("\n    UNION ALL\n"));
-        out.push_str(";\n\n");
+// ── Phase 11: interface views ──────────────────────────────────────────────────
+
+fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &mut String) {
+    let cols: Vec<String> = t.properties.iter()
+        .map(|p| qi(&p.name))
+        .chain(t.links.iter().map(|l| qi(&format!("{}_id", l.name))))
+        .collect();
+    let col_list = cols.join(", ");
+    let selects: Vec<String> = impls.iter()
+        .map(|impl_t| format!("    SELECT {} FROM {}", col_list, qn(&impl_t.module, &impl_t.table)))
+        .collect();
+    out.push_str(&format!("CREATE VIEW {} AS\n", qn(&t.module, &t.table)));
+    out.push_str(&selects.join("\n    UNION ALL\n"));
+    out.push_str(";\n\n");
+}
+
+fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
+    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
+    for t in &schema.types {
+        if !t.abstract_ {
+            for iface in &t.interfaces {
+                implementors.entry(iface.clone()).or_default().push(t);
+            }
+        }
+    }
+    for t in &schema.types {
+        if !(t.abstract_ && t.materialized) { continue; }
+        let key = format!("{}::{}", t.module, t.name);
+        let Some(impls) = implementors.get(&key) else { continue };
+        if impls.is_empty() { continue; }
+        emit_one_interface_view(t, impls, out);
     }
 }
 
