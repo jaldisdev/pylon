@@ -1432,6 +1432,14 @@ impl DbState {
             t.indexes.push(core::diff::DbIndex { name, is_unique, method });
         }
     }
+
+    fn add_view(&mut self, schema: String, name: String, body_hash: String) {
+        self.inner.views.push(core::diff::DbView { schema, name, body_hash });
+    }
+
+    fn add_function(&mut self, schema: String, name: String, body_hash: String) {
+        self.inner.functions.push(core::diff::DbFunction { schema, name, body_hash });
+    }
 }
 
 /// Compute ordered DDL SQL statements to bring `current` in sync with `target`.

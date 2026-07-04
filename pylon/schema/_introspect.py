@@ -109,6 +109,30 @@ WHERE ix.indisprimary = false
   AND t.relname = $2
 """
 
+_VIEWS_SQL = """
+SELECT table_schema AS schema, table_name AS name, view_definition
+FROM information_schema.views
+WHERE table_schema NOT LIKE 'pg_%'
+  AND table_schema <> ALL($1::text[])
+ORDER BY table_schema, table_name
+"""
+
+_FUNCTIONS_SQL = """
+SELECT n.nspname AS schema, p.proname AS name,
+       pg_get_functiondef(p.oid) AS definition
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prokind = 'f'
+  AND n.nspname NOT LIKE 'pg_%'
+  AND n.nspname <> ALL($1::text[])
+ORDER BY n.nspname, p.proname
+"""
+
+
+def _ddl_hash(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
 
 async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
     """Query pg_catalog and return a DbState describing the live database."""
@@ -180,5 +204,15 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
                 idx["is_unique"],
                 idx["method"],
             )
+
+    # Views
+    view_rows = await conn.fetch(_VIEWS_SQL, system)
+    for row in view_rows:
+        state.add_view(row["schema"], row["name"], _ddl_hash(row["view_definition"]))
+
+    # Functions
+    fn_rows = await conn.fetch(_FUNCTIONS_SQL, system)
+    for row in fn_rows:
+        state.add_function(row["schema"], row["name"], _ddl_hash(row["definition"]))
 
     return state
