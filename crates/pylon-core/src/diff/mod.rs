@@ -34,8 +34,6 @@ pub struct DbTable {
 #[derive(Debug)]
 pub struct DbColumn {
     pub name: String,
-    /// PostgreSQL type as returned by format_type() — not necessarily the same
-    /// spelling as in the schema descriptor, but existence checks use name only.
     pub pg_type: String,
     pub nullable: bool,
     pub is_generated: bool,
@@ -74,7 +72,46 @@ pub struct DbDomain {
     pub name: String,
 }
 
-// ── Identifier helpers ─────────────────────────────────────────────────────────
+// ── Diff operation ─────────────────────────────────────────────────────────────
+
+/// A single DDL operation produced by the diff engine.
+#[derive(Debug)]
+pub struct DiffOp {
+    pub sql: String,
+    /// When true the statement must run outside any transaction wrapper —
+    /// i.e. it uses `CONCURRENTLY`. `pylon migration create` will insert a
+    /// `-- pylon:step non-transactional` marker before these ops.
+    pub non_transactional: bool,
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Compute ordered DDL SQL strings to bring a database in sync with `target`.
+/// All statements use plain (non-CONCURRENTLY) index creation — suitable for
+/// `watch` mode where everything runs inside a single transaction.
+pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
+    diff_inner(target, current, false)
+        .into_iter()
+        .map(|op| op.sql)
+        .collect()
+}
+
+/// Compute ordered `DiffOp`s suitable for a migration file body.
+/// Index creation on pre-existing tables uses `CONCURRENTLY` and is marked
+/// `non_transactional = true` so `create` can insert step-boundary markers.
+pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Vec<DiffOp> {
+    diff_inner(target, current, true)
+}
+
+/// Diff two live-database snapshots (used by squash to capture the net effect
+/// of a range of migrations applied to an ephemeral shadow database).
+/// "before" = state at the start of the squashed range, "after" = state at
+/// the end. Returns DiffOps suitable for a migration file body.
+pub fn diff_states(before: &DbState, after: &DbState) -> Vec<DiffOp> {
+    diff_states_inner(before, after)
+}
+
+// ── Identifier helpers ────────────────────────────────────────────────────────
 
 fn qi(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -84,7 +121,7 @@ fn qn(schema: &str, name: &str) -> String {
     format!("{}.{}", qi(schema), qi(name))
 }
 
-// ── Topological sort of types (dependency order for CREATE TABLE) ──────────────
+// ── Topological sort (referenced types before referencing) ────────────────────
 
 fn topo_sort_types(types: &[TypeDescriptor]) -> Vec<usize> {
     let idx_of: HashMap<String, usize> = types
@@ -103,12 +140,9 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Vec<usize> {
         visited: &mut Vec<bool>,
         order: &mut Vec<usize>,
     ) {
-        if visited[i] {
-            return;
-        }
+        if visited[i] { return; }
         visited[i] = true;
-        let t = &types[i];
-        for l in &t.links {
+        for l in &types[i].links {
             if let Some(&dep) = idx_of.get(&l.target) {
                 visit(dep, types, idx_of, visited, order);
             }
@@ -119,96 +153,65 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Vec<usize> {
     for i in 0..types.len() {
         visit(i, types, &idx_of, &mut visited, &mut order);
     }
-
     order
 }
-
-// ── Helpers for emit_create_table ─────────────────────────────────────────────
 
 fn col_type_str(pg_type: &str) -> &str {
     pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(pg_type)
 }
 
-// ── Main diff entry point ─────────────────────────────────────────────────────
+// ── Core diff implementation ──────────────────────────────────────────────────
 
-/// Compute the ordered DDL SQL statements needed to bring a database described
-/// by `current` in sync with `target`. Returns an empty vec when nothing changed.
-pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
-    let mut ops: Vec<String> = Vec::new();
+fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
 
-    // Index current state for fast lookup.
     let cur_schemas: HashSet<&str> = current.schemas.iter().map(|s| s.as_str()).collect();
-    let cur_tables: HashMap<(&str, &str), &DbTable> = current
-        .tables
-        .iter()
+    let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
         .collect();
-    let cur_enums: HashMap<(&str, &str), &DbEnum> = current
-        .enums
-        .iter()
+    let cur_enums: HashMap<(&str, &str), &DbEnum> = current.enums.iter()
         .map(|e| ((e.schema.as_str(), e.name.as_str()), e))
         .collect();
-    let cur_domains: HashSet<(&str, &str)> = current
-        .domains
-        .iter()
+    let cur_domains: HashSet<(&str, &str)> = current.domains.iter()
         .map(|d| (d.schema.as_str(), d.name.as_str()))
         .collect();
 
-    // Build FK resolution map: "module::Name" → (module, table)
-    let type_map: HashMap<String, (&str, &str)> = target
-        .types
-        .iter()
+    let type_map: HashMap<String, (&str, &str)> = target.types.iter()
         .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
         .collect();
 
-    // Target module set
     let mut target_schemas: HashSet<String> = HashSet::new();
-    for t in &target.types {
-        target_schemas.insert(t.module.clone());
-    }
-    for e in &target.enums {
-        target_schemas.insert(e.module.clone());
-    }
-    for s in &target.scalars {
-        target_schemas.insert(s.module.clone());
-    }
+    for t in &target.types  { target_schemas.insert(t.module.clone()); }
+    for e in &target.enums  { target_schemas.insert(e.module.clone()); }
+    for s in &target.scalars { target_schemas.insert(s.module.clone()); }
 
     // ── Phase 1: new schemas ──────────────────────────────────────────────────
     for schema in &target_schemas {
         if !cur_schemas.contains(schema.as_str()) {
-            ops.push(format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
+            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
         }
     }
 
-    // ── Phase 2: new enums ────────────────────────────────────────────────────
+    // ── Phase 2: new / altered enums ──────────────────────────────────────────
     for e in &target.enums {
-        let key = (e.module.as_str(), e.name.as_str());
-        match cur_enums.get(&key) {
+        match cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
             None => {
-                let members: Vec<String> = e
-                    .members
-                    .iter()
+                let members: Vec<String> = e.members.iter()
                     .map(|m| format!("'{}'", m.replace('\'', "''")))
                     .collect();
-                ops.push(format!(
+                push_tx(&mut ops, format!(
                     "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
                      EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                    qi(&e.module),
-                    qi(&e.name),
-                    members.join(", ")
+                    qi(&e.module), qi(&e.name), members.join(", ")
                 ));
             }
             Some(existing) => {
-                // Postgres can't remove enum members; only add new ones.
-                let existing_set: HashSet<&str> =
-                    existing.members.iter().map(|m| m.as_str()).collect();
+                let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
                 for member in &e.members {
                     if !existing_set.contains(member.as_str()) {
-                        ops.push(format!(
+                        push_tx(&mut ops, format!(
                             "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                            qi(&e.module),
-                            qi(&e.name),
-                            member.replace('\'', "''")
+                            qi(&e.module), qi(&e.name), member.replace('\'', "''")
                         ));
                     }
                 }
@@ -219,37 +222,32 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> 
     // ── Phase 3: new custom scalar domains ────────────────────────────────────
     for s in &target.scalars {
         if !cur_domains.contains(&(s.module.as_str(), s.name.as_str())) {
-            let checks: Vec<String> = s
-                .check_constraints
-                .iter()
+            let checks: Vec<String> = s.check_constraints.iter()
                 .map(|c| format!("    CHECK ({})", c))
                 .collect();
-            let check_clause = if checks.is_empty() {
-                String::new()
-            } else {
-                format!("\n{}", checks.join("\n"))
-            };
-            ops.push(format!(
+            let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
+            push_tx(&mut ops, format!(
                 "CREATE DOMAIN {}.{} AS {}{};",
-                qi(&s.module),
-                qi(&s.name),
-                s.pg_type,
-                check_clause
+                qi(&s.module), qi(&s.name), s.pg_type, check_clause
             ));
         }
     }
 
-    // ── Phase 4 & 5: tables — create new, or alter existing ───────────────────
+    // ── Phase 4 & 5: tables (create new or alter existing) ────────────────────
     let sort_order = topo_sort_types(&target.types);
+
+    // Track which tables are created in this diff (needed for CONCURRENTLY decision).
+    let mut new_tables: HashSet<(String, String)> = HashSet::new();
 
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.junction {
-            continue;
-        }
+        if td.abstract_ || td.junction { continue; }
         let key = (td.module.as_str(), td.table.as_str());
         match cur_tables.get(&key) {
-            None => emit_create_table(td, &mut ops),
+            None => {
+                emit_create_table(td, &mut ops);
+                new_tables.insert((td.module.clone(), td.table.clone()));
+            }
             Some(existing) => emit_column_diff(td, existing, &mut ops),
         }
     }
@@ -257,9 +255,7 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> 
     // ── Phase 6: FK constraints for existing tables ───────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.junction {
-            continue;
-        }
+        if td.abstract_ || td.junction { continue; }
         if let Some(existing) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) {
             emit_fk_diff(td, existing, &type_map, &mut ops);
         }
@@ -268,101 +264,91 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> 
     // ── Phase 7: junction tables for new multi-links ──────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.junction {
-            continue;
-        }
+        if td.abstract_ || td.junction { continue; }
         for ml in &td.multilinks {
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
                 emit_junction_table(td, &ml.name, &ml.target, &ml.on_delete, &type_map, &mut ops);
+                new_tables.insert((td.module.clone(), jt));
             }
         }
     }
 
-    // ── Phase 8: vector columns + HNSW indexes ────────────────────────────────
+    // ── Phase 8: vector columns + indexes ─────────────────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.vector_indexes.is_empty() {
-            continue;
-        }
+        if td.abstract_ || td.vector_indexes.is_empty() { continue; }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str()));
+        let table_is_new = new_tables.contains(&(td.module.clone(), td.table.clone()));
+
         for vi in &td.vector_indexes {
             let col = vi.column_name();
             if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
                 continue;
             }
-            ops.push(format!(
+            push_tx(&mut ops, format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} vector({});",
-                qn(&td.module, &td.table),
-                qi(&col),
-                vi.dimensions
+                qn(&td.module, &td.table), qi(&col), vi.dimensions
             ));
             let idx_name = match &vi.index_name {
                 None => format!("{}__vector__", td.table),
                 Some(n) => format!("{}__vector_{}__", td.table, n),
             };
-            ops.push(format!(
-                "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});",
-                qi(&idx_name),
-                qn(&td.module, &td.table),
-                qi(&col),
-                vi.ops_class()
-            ));
+            // Pre-existing tables: CONCURRENTLY (non-transactional step in migration).
+            // New tables: plain CREATE INDEX (no rows, no locking concern).
+            let use_concurrently = for_migration && !table_is_new;
+            let idx_sql = if use_concurrently {
+                format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING hnsw ({} {});",
+                    qi(&idx_name), qn(&td.module, &td.table), qi(&col), vi.ops_class())
+            } else {
+                format!("CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});",
+                    qi(&idx_name), qn(&td.module, &td.table), qi(&col), vi.ops_class())
+            };
+            ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
         }
     }
 
     // ── Phase 9: search tsvector columns + GIN indexes ────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.search_indexes.is_empty() {
-            continue;
-        }
+        if td.abstract_ || td.search_indexes.is_empty() { continue; }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str()));
+        let table_is_new = new_tables.contains(&(td.module.clone(), td.table.clone()));
+
         for si in &td.search_indexes {
-            if si.backend != SearchBackend::Postgres {
-                continue;
-            }
+            if si.backend != SearchBackend::Postgres { continue; }
             let col = si.column_name();
             if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
                 continue;
             }
-            let parts: Vec<String> = si
-                .fields
-                .iter()
-                .map(|sf| {
-                    format!(
-                        "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
-                        qi(&sf.name),
-                        sf.weight.as_str()
-                    )
-                })
+            let parts: Vec<String> = si.fields.iter()
+                .map(|sf| format!(
+                    "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
+                    qi(&sf.name), sf.weight.as_str()
+                ))
                 .collect();
-            let expr = if parts.len() == 1 {
-                parts.into_iter().next().unwrap()
-            } else {
-                parts.join(" || ")
-            };
-            ops.push(format!(
+            let expr = if parts.len() == 1 { parts.into_iter().next().unwrap() } else { parts.join(" || ") };
+            push_tx(&mut ops, format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} tsvector GENERATED ALWAYS AS ({}) STORED;",
-                qn(&td.module, &td.table),
-                qi(&col),
-                expr
+                qn(&td.module, &td.table), qi(&col), expr
             ));
             let idx_name = match &si.index_name {
                 None => format!("{}__search__", td.table),
                 Some(n) => format!("{}__search_{}__", td.table, n),
             };
-            ops.push(format!(
-                "CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});",
-                qi(&idx_name),
-                qn(&td.module, &td.table),
-                qi(&col)
-            ));
+            let use_concurrently = for_migration && !table_is_new;
+            let idx_sql = if use_concurrently {
+                format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING gin ({});",
+                    qi(&idx_name), qn(&td.module, &td.table), qi(&col))
+            } else {
+                format!("CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});",
+                    qi(&idx_name), qn(&td.module, &td.table), qi(&col))
+            };
+            ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
         }
     }
 
-    // ── Phase 10: drop removed tables ────────────────────────────────────────
-    // Build the complete set of tables the target schema requires.
+    // ── Phase 10: drop removed tables ─────────────────────────────────────────
     let mut target_tables: HashSet<(String, String)> = HashSet::new();
     for td in &target.types {
         if !td.abstract_ {
@@ -374,13 +360,10 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> 
             }
         }
     }
-    // Drop everything in the live DB that no longer has a target counterpart,
-    // using CASCADE so FK/index dependencies are handled automatically.
-    // This covers both removed types and removed multi-links (orphaned junction tables).
     for cur_table in &current.tables {
         let key = (cur_table.schema.clone(), cur_table.name.clone());
         if !target_tables.contains(&key) {
-            ops.push(format!(
+            push_tx(&mut ops, format!(
                 "DROP TABLE IF EXISTS {} CASCADE;",
                 qn(&cur_table.schema, &cur_table.name)
             ));
@@ -388,179 +371,132 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> 
     }
 
     // ── Phase 11: drop removed enums ──────────────────────────────────────────
-    let target_enum_set: HashSet<(String, String)> = target
-        .enums
-        .iter()
+    let target_enum_set: HashSet<(String, String)> = target.enums.iter()
         .map(|e| (e.module.clone(), e.name.clone()))
         .collect();
     for cur_enum in &current.enums {
         if !target_enum_set.contains(&(cur_enum.schema.clone(), cur_enum.name.clone())) {
-            ops.push(format!(
+            push_tx(&mut ops, format!(
                 "DROP TYPE IF EXISTS {}.{} CASCADE;",
-                qi(&cur_enum.schema),
-                qi(&cur_enum.name)
+                qi(&cur_enum.schema), qi(&cur_enum.name)
             ));
         }
     }
 
-    // ── Phase 12: drop removed domains ───────────────────────────────────────
-    let target_domain_set: HashSet<(String, String)> = target
-        .scalars
-        .iter()
+    // ── Phase 12: drop removed domains ────────────────────────────────────────
+    let target_domain_set: HashSet<(String, String)> = target.scalars.iter()
         .map(|s| (s.module.clone(), s.name.clone()))
         .collect();
     for cur_domain in &current.domains {
         if !target_domain_set.contains(&(cur_domain.schema.clone(), cur_domain.name.clone())) {
-            ops.push(format!(
+            push_tx(&mut ops, format!(
                 "DROP DOMAIN IF EXISTS {}.{} CASCADE;",
-                qi(&cur_domain.schema),
-                qi(&cur_domain.name)
+                qi(&cur_domain.schema), qi(&cur_domain.name)
             ));
         }
     }
 
-    // ── Phase 13: drop removed schemas (only if now empty) ───────────────────
+    // ── Phase 13: drop removed schemas ────────────────────────────────────────
     for schema in &current.schemas {
         if !target_schemas.contains(schema) {
-            // Use IF EXISTS + CASCADE so we don't fail on non-empty schemas, but
-            // only do this if truly no target types remain in this schema.
-            ops.push(format!("DROP SCHEMA IF EXISTS {} CASCADE;", qi(schema)));
+            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", qi(schema)));
         }
     }
 
     ops
 }
 
+fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
+    ops.push(DiffOp { sql, non_transactional: false });
+}
+
 // ── CREATE TABLE for a new type ───────────────────────────────────────────────
 
-fn emit_create_table(td: &TypeDescriptor, ops: &mut Vec<String>) {
+fn emit_create_table(td: &TypeDescriptor, ops: &mut Vec<DiffOp>) {
     let mut lines: Vec<String> = Vec::new();
-
     for p in &td.properties {
         let not_null = if p.nullable { "" } else { " NOT NULL" };
-        let default = p
-            .default_sql
-            .as_deref()
+        let default = p.default_sql.as_deref()
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        let ct = col_type_str(&p.pg_type);
-        lines.push(format!("    {} {}{}{}", qi(&p.name), ct, not_null, default));
+        lines.push(format!("    {} {}{}{}", qi(&p.name), col_type_str(&p.pg_type), not_null, default));
     }
     for l in &td.links {
         let not_null = if l.nullable { "" } else { " NOT NULL" };
-        lines.push(format!(
-            "    {} uuid{}",
-            qi(&format!("{}_id", l.name)),
-            not_null
-        ));
+        lines.push(format!("    {} uuid{}", qi(&format!("{}_id", l.name)), not_null));
     }
-    let pk_cols: Vec<String> = td
-        .properties
-        .iter()
-        .filter(|p| p.is_pk)
-        .map(|p| qi(&p.name))
-        .collect();
+    let pk_cols: Vec<String> = td.properties.iter().filter(|p| p.is_pk).map(|p| qi(&p.name)).collect();
     if !pk_cols.is_empty() {
         lines.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
-    ops.push(format!(
+    push_tx(ops, format!(
         "CREATE TABLE {} (\n{}\n);",
         qn(&td.module, &td.table),
         lines.join(",\n")
     ));
 }
 
-// ── Column diff for existing table ────────────────────────────────────────────
+// ── Column diff for an existing table ─────────────────────────────────────────
 
-fn emit_column_diff(td: &TypeDescriptor, existing: &DbTable, ops: &mut Vec<String>) {
-    let existing_cols: HashSet<&str> =
-        existing.columns.iter().map(|c| c.name.as_str()).collect();
+fn emit_column_diff(td: &TypeDescriptor, existing: &DbTable, ops: &mut Vec<DiffOp>) {
+    let existing_cols: HashSet<&str> = existing.columns.iter().map(|c| c.name.as_str()).collect();
 
-    // Add new property columns
     for p in &td.properties {
         if !existing_cols.contains(p.name.as_str()) {
             let not_null = if p.nullable { "" } else { " NOT NULL" };
-            let default = p
-                .default_sql
-                .as_deref()
+            let default = p.default_sql.as_deref()
                 .map(|d| format!(" DEFAULT {}", d))
                 .unwrap_or_default();
-            let ct = col_type_str(&p.pg_type);
-            ops.push(format!(
+            push_tx(ops, format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
-                qn(&td.module, &td.table),
-                qi(&p.name),
-                ct,
-                not_null,
-                default
+                qn(&td.module, &td.table), qi(&p.name), col_type_str(&p.pg_type), not_null, default
             ));
         }
     }
-
-    // Add new link FK stub columns
     for l in &td.links {
         let col = format!("{}_id", l.name);
         if !existing_cols.contains(col.as_str()) {
             let not_null = if l.nullable { "" } else { " NOT NULL" };
-            ops.push(format!(
+            push_tx(ops, format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{};",
-                qn(&td.module, &td.table),
-                qi(&col),
-                not_null
+                qn(&td.module, &td.table), qi(&col), not_null
             ));
         }
     }
-
-    // Drop columns that no longer exist in the target.
-    // Keep id, __vector__*, __search__* (handled in their own phases).
-    let target_col_names: HashSet<String> = td
-        .properties
-        .iter()
-        .map(|p| p.name.clone())
+    // Drop columns no longer in the target (skip Pylon-managed __*__ columns).
+    let target_cols: HashSet<String> = td.properties.iter().map(|p| p.name.clone())
         .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
         .collect();
-
     for col in &existing.columns {
         let n = col.name.as_str();
-        if target_col_names.contains(n) {
-            continue;
-        }
-        // Pylon-managed special columns — handled by vector/search phases
-        if n.starts_with("__") && n.ends_with("__") {
-            continue;
-        }
-        ops.push(format!(
+        if target_cols.contains(n) { continue; }
+        if n.starts_with("__") && n.ends_with("__") { continue; }
+        push_tx(ops, format!(
             "ALTER TABLE {} DROP COLUMN IF EXISTS {};",
-            qn(&td.module, &td.table),
-            qi(n)
+            qn(&td.module, &td.table), qi(n)
         ));
     }
 }
 
-// ── FK diff for existing table ────────────────────────────────────────────────
+// ── FK diff for an existing table ─────────────────────────────────────────────
 
 fn emit_fk_diff(
     td: &TypeDescriptor,
     existing: &DbTable,
     type_map: &HashMap<String, (&str, &str)>,
-    ops: &mut Vec<String>,
+    ops: &mut Vec<DiffOp>,
 ) {
     use crate::schema::{DeleteAction, DeleteSide};
 
-    let existing_fk_names: HashSet<&str> =
-        existing.foreign_keys.iter().map(|fk| fk.constraint_name.as_str()).collect();
+    let existing_fk_names: HashSet<&str> = existing.foreign_keys.iter()
+        .map(|fk| fk.constraint_name.as_str())
+        .collect();
 
     for l in &td.links {
         let cname = format!("{}_{}_fkey", td.table, l.name);
-        if existing_fk_names.contains(cname.as_str()) {
-            continue;
-        }
-        let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else {
-            continue;
-        };
-        let on_delete = l
-            .on_delete
-            .iter()
+        if existing_fk_names.contains(cname.as_str()) { continue; }
+        let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
+        let on_delete = l.on_delete.iter()
             .find(|p| p.side == DeleteSide::Target)
             .map(|p| match &p.action {
                 DeleteAction::Restrict => " ON DELETE RESTRICT",
@@ -570,7 +506,7 @@ fn emit_fk_diff(
                 _ => " ON DELETE RESTRICT",
             })
             .unwrap_or(" ON DELETE RESTRICT");
-        ops.push(format!(
+        push_tx(ops, format!(
             "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id){};",
             qn(&td.module, &td.table),
             qi(&cname),
@@ -589,15 +525,13 @@ fn emit_junction_table(
     ml_target: &str,
     on_delete: &[crate::schema::OnDeletePolicy],
     type_map: &HashMap<String, (&str, &str)>,
-    ops: &mut Vec<String>,
+    ops: &mut Vec<DiffOp>,
 ) {
     use crate::schema::{DeleteAction, DeleteSide};
 
     let jt_name = format!("{}.{}", td.table, ml_name);
-
-    let src_on_delete = " ON DELETE CASCADE"; // source side always cascades
-    let tgt_on_delete = on_delete
-        .iter()
+    let src_on_delete = " ON DELETE CASCADE";
+    let tgt_on_delete = on_delete.iter()
         .find(|p| p.side == DeleteSide::Target)
         .map(|p| match &p.action {
             DeleteAction::Restrict => " ON DELETE RESTRICT",
@@ -608,12 +542,10 @@ fn emit_junction_table(
         })
         .unwrap_or(" ON DELETE RESTRICT");
 
-    let tgt_ref = type_map
-        .get(ml_target)
-        .map(|(m, t)| qn(m, t))
+    let tgt_ref = type_map.get(ml_target).map(|(m, t)| qn(m, t))
         .unwrap_or_else(|| qi(ml_target));
 
-    ops.push(format!(
+    push_tx(ops, format!(
         "CREATE TABLE {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){},\n    PRIMARY KEY (source, target)\n);",
         qn(&td.module, &jt_name),
         qn(&td.module, &td.table),
@@ -623,6 +555,203 @@ fn emit_junction_table(
     ));
 }
 
+// ── diff_states: diff two live-DB snapshots (for squash) ──────────────────────
+
+fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+
+    let before_schemas: HashSet<&str> = before.schemas.iter().map(|s| s.as_str()).collect();
+    let before_tables: HashMap<(&str, &str), &DbTable> = before.tables.iter()
+        .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+        .collect();
+    let before_enums: HashMap<(&str, &str), &DbEnum> = before.enums.iter()
+        .map(|e| ((e.schema.as_str(), e.name.as_str()), e))
+        .collect();
+    let before_domains: HashSet<(&str, &str)> = before.domains.iter()
+        .map(|d| (d.schema.as_str(), d.name.as_str()))
+        .collect();
+
+    // New schemas
+    for schema in &after.schemas {
+        if !before_schemas.contains(schema.as_str()) {
+            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
+        }
+    }
+
+    // New / altered enums
+    for e in &after.enums {
+        match before_enums.get(&(e.schema.as_str(), e.name.as_str())) {
+            None => {
+                let members: Vec<String> = e.members.iter()
+                    .map(|m| format!("'{}'", m.replace('\'', "''")))
+                    .collect();
+                push_tx(&mut ops, format!(
+                    "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
+                     EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+                    qi(&e.schema), qi(&e.name), members.join(", ")
+                ));
+            }
+            Some(existing) => {
+                let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
+                for member in &e.members {
+                    if !existing_set.contains(member.as_str()) {
+                        push_tx(&mut ops, format!(
+                            "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                            qi(&e.schema), qi(&e.name), member.replace('\'', "''")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // New domains (simplified: no type reconstruction from DbState)
+    for d in &after.domains {
+        if !before_domains.contains(&(d.schema.as_str(), d.name.as_str())) {
+            // We can't reconstruct the full domain DDL from pg_catalog cheaply;
+            // emit a placeholder that will be filled by the squash command.
+            push_tx(&mut ops, format!(
+                "-- TODO: recreate domain {}.{} (reconstruct DDL from source migrations)",
+                qi(&d.schema), qi(&d.name)
+            ));
+        }
+    }
+
+    // New tables
+    let mut new_tables: HashSet<(String, String)> = HashSet::new();
+    for t in &after.tables {
+        let key = (t.schema.as_str(), t.name.as_str());
+        match before_tables.get(&key) {
+            None => {
+                // Emit CREATE TABLE from introspected columns
+                emit_create_table_from_db(t, &mut ops);
+                new_tables.insert((t.schema.clone(), t.name.clone()));
+            }
+            Some(before_t) => {
+                // Diff columns
+                emit_column_diff_from_db(t, before_t, &mut ops);
+            }
+        }
+    }
+
+    // FK constraints for existing tables that gained new FKs
+    for t in &after.tables {
+        if let Some(before_t) = before_tables.get(&(t.schema.as_str(), t.name.as_str())) {
+            let before_fk_names: HashSet<&str> = before_t.foreign_keys.iter()
+                .map(|fk| fk.constraint_name.as_str())
+                .collect();
+            for fk in &t.foreign_keys {
+                if !before_fk_names.contains(fk.constraint_name.as_str()) {
+                    // Can't fully reconstruct FK DDL from DbForeignKey without ON DELETE info;
+                    // emit best-effort.
+                    push_tx(&mut ops, format!(
+                        "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{}(id);",
+                        qi(&t.schema), qi(&t.name), qi(&fk.constraint_name),
+                        qi(&fk.local_column), qi(&fk.ref_schema), qi(&fk.ref_table)
+                    ));
+                }
+            }
+        }
+    }
+
+    // New indexes on pre-existing tables (CONCURRENTLY)
+    for t in &after.tables {
+        let table_is_new = new_tables.contains(&(t.schema.clone(), t.name.clone()));
+        let before_idx_names: HashSet<&str> = before_tables
+            .get(&(t.schema.as_str(), t.name.as_str()))
+            .map(|bt| bt.indexes.iter().map(|i| i.name.as_str()).collect())
+            .unwrap_or_default();
+        for idx in &t.indexes {
+            if before_idx_names.contains(idx.name.as_str()) { continue; }
+            let use_concurrently = !table_is_new;
+            let concurrently = if use_concurrently { "CONCURRENTLY " } else { "" };
+            let unique = if idx.is_unique { "UNIQUE " } else { "" };
+            let idx_sql = format!(
+                "CREATE {unique}INDEX {concurrently}IF NOT EXISTS {} ON {}.{};",
+                qi(&idx.name), qi(&t.schema), qi(&t.name)
+            );
+            ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+        }
+    }
+
+    // Drop removed tables
+    let after_tables: HashSet<(&str, &str)> = after.tables.iter()
+        .map(|t| (t.schema.as_str(), t.name.as_str()))
+        .collect();
+    for t in &before.tables {
+        if !after_tables.contains(&(t.schema.as_str(), t.name.as_str())) {
+            push_tx(&mut ops, format!(
+                "DROP TABLE IF EXISTS {}.{} CASCADE;",
+                qi(&t.schema), qi(&t.name)
+            ));
+        }
+    }
+
+    // Drop removed enums
+    let after_enum_set: HashSet<(&str, &str)> = after.enums.iter()
+        .map(|e| (e.schema.as_str(), e.name.as_str()))
+        .collect();
+    for e in &before.enums {
+        if !after_enum_set.contains(&(e.schema.as_str(), e.name.as_str())) {
+            push_tx(&mut ops, format!(
+                "DROP TYPE IF EXISTS {}.{} CASCADE;",
+                qi(&e.schema), qi(&e.name)
+            ));
+        }
+    }
+
+    // Drop removed schemas
+    let after_schema_set: HashSet<&str> = after.schemas.iter().map(|s| s.as_str()).collect();
+    for schema in &before.schemas {
+        if !after_schema_set.contains(schema.as_str()) {
+            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", qi(schema)));
+        }
+    }
+
+    ops
+}
+
+fn emit_create_table_from_db(t: &DbTable, ops: &mut Vec<DiffOp>) {
+    let mut lines: Vec<String> = Vec::new();
+    for col in &t.columns {
+        let not_null = if col.nullable { "" } else { " NOT NULL" };
+        if col.is_generated {
+            // Can't reconstruct the generation expression from DbColumn alone.
+            lines.push(format!("    {} {} GENERATED ALWAYS AS (/* see source */) STORED", qi(&col.name), col.pg_type));
+        } else {
+            lines.push(format!("    {} {}{}", qi(&col.name), col.pg_type, not_null));
+        }
+    }
+    push_tx(ops, format!(
+        "CREATE TABLE {}.{} (\n{}\n);",
+        qi(&t.schema), qi(&t.name),
+        lines.join(",\n")
+    ));
+}
+
+fn emit_column_diff_from_db(after: &DbTable, before: &DbTable, ops: &mut Vec<DiffOp>) {
+    let before_cols: HashSet<&str> = before.columns.iter().map(|c| c.name.as_str()).collect();
+    let after_cols: HashSet<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+
+    for col in &after.columns {
+        if !before_cols.contains(col.name.as_str()) {
+            let not_null = if col.nullable { "" } else { " NOT NULL" };
+            push_tx(ops, format!(
+                "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} {}{};",
+                qi(&after.schema), qi(&after.name), qi(&col.name), col.pg_type, not_null
+            ));
+        }
+    }
+    for col in &before.columns {
+        if !after_cols.contains(col.name.as_str()) {
+            push_tx(ops, format!(
+                "ALTER TABLE {}.{} DROP COLUMN IF EXISTS {};",
+                qi(&after.schema), qi(&after.name), qi(&col.name)
+            ));
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -630,44 +759,27 @@ mod tests {
     use super::*;
     use crate::schema::{EnumDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 
-    fn empty_state() -> DbState {
-        DbState::default()
-    }
+    fn empty_state() -> DbState { DbState::default() }
 
     fn prop(name: &str, pg_type: &str, nullable: bool) -> PropertyDescriptor {
         PropertyDescriptor {
-            name: name.into(),
-            pg_type: pg_type.into(),
-            nullable,
+            name: name.into(), pg_type: pg_type.into(), nullable,
             default_sql: if name == "id" { Some("uuidv7()".into()) } else { None },
-            description: None,
-            check_constraints: vec![],
-            is_exclusive: name == "id",
-            is_pk: name == "id",
-            is_readonly: name == "id",
-            rewrites: vec![],
+            description: None, check_constraints: vec![],
+            is_exclusive: name == "id", is_pk: name == "id",
+            is_readonly: name == "id", rewrites: vec![],
         }
     }
 
     fn simple_type(module: &str, name: &str, table: &str) -> TypeDescriptor {
         TypeDescriptor {
-            name: name.into(),
-            module: module.into(),
-            table: table.into(),
-            abstract_: false,
-            materialized: false,
-            description: None,
-            parents: vec![],
-            interfaces: vec![],
+            name: name.into(), module: module.into(), table: table.into(),
+            abstract_: false, materialized: false, description: None,
+            parents: vec![], interfaces: vec![],
             properties: vec![prop("id", "uuid", false), prop("name", "text", true)],
-            links: vec![],
-            multilinks: vec![],
-            computed: vec![],
-            constraints: vec![],
-            indexes: vec![],
-            vector_indexes: vec![],
-            search_indexes: vec![],
-            triggers: vec![],
+            links: vec![], multilinks: vec![], computed: vec![],
+            constraints: vec![], indexes: vec![],
+            vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
             junction: false,
         }
     }
@@ -676,10 +788,7 @@ mod tests {
     fn test_new_schema_and_table() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("catalog", "Product", "Product")],
-            scalars: vec![],
-            enums: vec![],
-            globals: vec![],
-            functions: vec![],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         };
         let ops = diff_schema(&schema, &empty_state());
         let joined = ops.join("\n");
@@ -691,26 +800,19 @@ mod tests {
     fn test_no_ops_when_in_sync() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![],
-            enums: vec![],
-            globals: vec![],
-            functions: vec![],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(),
-                name: "Person".into(),
+                schema: "default".into(), name: "Person".into(),
                 columns: vec![
                     DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false },
                     DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false },
                 ],
-                foreign_keys: vec![],
-                indexes: vec![],
-                checks: vec![],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
-            enums: vec![],
-            domains: vec![],
+            enums: vec![], domains: vec![],
         };
         let ops = diff_schema(&schema, &state);
         assert!(ops.is_empty(), "expected no ops, got: {:?}", ops);
@@ -721,27 +823,19 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("email", "text", true));
         let schema = SchemaDescriptor {
-            types: vec![td],
-            scalars: vec![],
-            enums: vec![],
-            globals: vec![],
-            functions: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(),
-                name: "Person".into(),
+                schema: "default".into(), name: "Person".into(),
                 columns: vec![
                     DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false },
                     DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false },
                 ],
-                foreign_keys: vec![],
-                indexes: vec![],
-                checks: vec![],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
-            enums: vec![],
-            domains: vec![],
+            enums: vec![], domains: vec![],
         };
         let ops = diff_schema(&schema, &state);
         let joined = ops.join("\n");
@@ -751,15 +845,12 @@ mod tests {
     #[test]
     fn test_new_enum() {
         let schema = SchemaDescriptor {
-            types: vec![],
-            scalars: vec![],
+            types: vec![], scalars: vec![],
             enums: vec![EnumDescriptor {
-                name: "Status".into(),
-                module: "default".into(),
+                name: "Status".into(), module: "default".into(),
                 members: vec!["Active".into(), "Inactive".into()],
             }],
-            globals: vec![],
-            functions: vec![],
+            globals: vec![], functions: vec![],
         };
         let ops = diff_schema(&schema, &empty_state());
         let joined = ops.join("\n");
@@ -769,27 +860,72 @@ mod tests {
     #[test]
     fn test_drop_table() {
         let schema = SchemaDescriptor {
-            types: vec![],
-            scalars: vec![],
-            enums: vec![],
-            globals: vec![],
-            functions: vec![],
+            types: vec![], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(),
-                name: "OldType".into(),
-                columns: vec![],
-                foreign_keys: vec![],
-                indexes: vec![],
-                checks: vec![],
+                schema: "default".into(), name: "OldType".into(),
+                columns: vec![], foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
-            enums: vec![],
-            domains: vec![],
+            enums: vec![], domains: vec![],
         };
         let ops = diff_schema(&schema, &state);
         let joined = ops.join("\n");
         assert!(joined.contains("DROP TABLE IF EXISTS \"default\".\"OldType\" CASCADE"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_index_on_existing_table_is_concurrently() {
+        use crate::schema::{VectorIndexDescriptor};
+        let mut td = simple_type("default", "Post", "Post");
+        td.vector_indexes.push(VectorIndexDescriptor {
+            index_name: None,
+            fields: vec!["name".into()],
+            model: "test".into(),
+            metric: "cosine".into(),
+            dimensions: 1536,
+        });
+        let schema = SchemaDescriptor {
+            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+        };
+        // The table already exists in the DB (pre-existing).
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Post".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+            }],
+            enums: vec![], domains: vec![],
+        };
+        let ops = diff_schema_ops(&schema, &state);
+        let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
+        assert!(idx_op.non_transactional, "index on pre-existing table should be non-transactional");
+        assert!(idx_op.sql.contains("CONCURRENTLY"), "should use CONCURRENTLY: {}", idx_op.sql);
+    }
+
+    #[test]
+    fn test_index_on_new_table_is_transactional() {
+        use crate::schema::VectorIndexDescriptor;
+        let mut td = simple_type("default", "Post", "Post");
+        td.vector_indexes.push(VectorIndexDescriptor {
+            index_name: None,
+            fields: vec!["name".into()],
+            model: "test".into(),
+            metric: "cosine".into(),
+            dimensions: 1536,
+        });
+        let schema = SchemaDescriptor {
+            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+        };
+        // Table does NOT exist in the DB → it's new.
+        let ops = diff_schema_ops(&schema, &empty_state());
+        let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
+        assert!(!idx_op.non_transactional, "index on new table should be transactional");
+        assert!(!idx_op.sql.contains("CONCURRENTLY"), "should NOT use CONCURRENTLY: {}", idx_op.sql);
     }
 }
