@@ -212,6 +212,4 @@ def wipe(ctx: click.Context, force: bool) -> None:
 
     # Re-apply migrations.
     from .migrations import migration
-    migrate_cmd = migration.commands.get("migrate")  # type: ignore[union-attr]
-    if migrate_cmd:
-        ctx.invoke(migrate_cmd)
+    ctx.invoke(migration.commands["apply"])  # type: ignore[index]

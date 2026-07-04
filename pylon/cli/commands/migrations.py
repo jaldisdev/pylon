@@ -1,162 +1,534 @@
-import hashlib
-import subprocess
-import tempfile
+"""Migration commands — pylon migration <subcommand>."""
+
+from __future__ import annotations
+
+import asyncio
+import re
 from pathlib import Path
 
 import click
 
 from ..config import _print_error, requires_config
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _require_migrations_dir(ctx: click.Context, migrations_dir: Path) -> None:
-    if not migrations_dir.is_dir():
+_ADVISORY_LOCK_KEY = 7_461_999  # fixed session-level advisory-lock key for apply
+
+
+def _migrations_dir(config) -> Path:
+    return config.project.schema_dir / "migrations"
+
+
+def _require_migrations_dir(ctx: click.Context, d: Path) -> None:
+    if not d.is_dir():
         _print_error(
-            'migrations directory not found',
-            f'Expected at {migrations_dir}',
+            "migrations directory not found",
+            f"Expected at {d}. Create it with: mkdir -p {d}",
         )
         ctx.exit(1)
 
 
-def _next_seq(migrations_dir: Path) -> int:
-    existing = sorted(migrations_dir.glob('[0-9][0-9][0-9][0-9][0-9]_*.sql'))
-    if not existing:
-        return 1
-    return int(existing[-1].name[:5]) + 1
-
-
-def _short_hash(content: bytes) -> str:
-    return 'm1' + hashlib.sha256(content).hexdigest()[:6]
-
-
-def _pg_url(config) -> str:
+def _pg_dsn(config) -> str:
     db = config.database
     if db.dsn is not None:
-        return db.dsn.replace('pylon://', 'postgres://', 1)
-    pw_part = f':{db.password}@' if db.password else '@'
-    return f'postgres://{db.user}{pw_part}{db.host}:{db.port}/{db.name}'
+        return db.dsn.replace("pylon://", "postgresql://", 1)
+    pw = f":{db.password}" if db.password else ""
+    return f"postgresql://{db.user}{pw}@{db.host}:{db.port}/{db.name}"
 
+
+def _load_migrations(d: Path) -> list:
+    """Parse all migration files in `d`, returned unsorted."""
+    from pylon._core import parse_migration
+
+    files = sorted(d.glob("[0-9][0-9][0-9][0-9][0-9]_*.sql"))
+    result = []
+    for f in files:
+        content = f.read_text()
+        try:
+            m = parse_migration(content, f.stem)
+        except ValueError as exc:
+            raise click.ClickException(f"Bad migration file {f.name}: {exc}") from exc
+        result.append(m)
+    return result
+
+
+def _ordered_chain(migrations: list) -> list:
+    """Validate migrations and return them in chain order (oldest first)."""
+    from pylon._core import validate_migration_chain
+
+    if not migrations:
+        return []
+    try:
+        ordered_ids = validate_migration_chain(migrations)
+    except ValueError as exc:
+        raise click.ClickException(f"Migration chain error: {exc}") from exc
+    by_id = {m.id: m for m in migrations}
+    return [by_id[mid] for mid in ordered_ids]
+
+
+def _applied_tip(tracking: list[dict]) -> str | None:
+    """Compute the tip ID from _pylon."Migrations" rows (the one with no descendant)."""
+    if not tracking:
+        return None
+    applied_ids = {r["id"] for r in tracking}
+    onto_targets = {r["onto"] for r in tracking}
+    tips = applied_ids - onto_targets
+    return next(iter(tips)) if tips else None
+
+
+def _next_seq(d: Path) -> int:
+    existing = sorted(d.glob("[0-9][0-9][0-9][0-9][0-9]_*.sql"))
+    return int(existing[-1].name[:5]) + 1 if existing else 1
+
+
+def _parse_steps(body: str) -> list[tuple[bool, str]]:
+    """Split a migration body on -- pylon:step markers into (transactional, sql) pairs."""
+    steps: list[tuple[bool, str]] = []
+    current_transactional = True
+    current_parts: list[str] = []
+
+    for line in body.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == "-- pylon:step":
+            steps.append((current_transactional, "".join(current_parts)))
+            current_transactional = True
+            current_parts = []
+        elif stripped == "-- pylon:step non-transactional":
+            steps.append((current_transactional, "".join(current_parts)))
+            current_transactional = False
+            current_parts = []
+        else:
+            current_parts.append(line)
+
+    steps.append((current_transactional, "".join(current_parts)))
+    return steps
+
+
+async def _ensure_tracking_tables(conn) -> None:
+    await conn.execute(
+        'CREATE TABLE IF NOT EXISTS _pylon."Migrations" ('
+        "    id          text        PRIMARY KEY,"
+        "    onto        text        NOT NULL,"
+        "    filename    text        NOT NULL,"
+        "    applied_at  timestamptz NOT NULL DEFAULT now()"
+        ");"
+    )
+    await conn.execute(
+        'CREATE TABLE IF NOT EXISTS _pylon."Progress" ('
+        "    id          text        PRIMARY KEY,"
+        "    step_index  integer     NOT NULL,"
+        "    updated_at  timestamptz NOT NULL DEFAULT now()"
+        ");"
+    )
+
+
+async def _read_tracking(conn) -> list[dict]:
+    rows = await conn.fetch('SELECT id, onto, filename FROM _pylon."Migrations"')
+    return [dict(r) for r in rows]
+
+
+# ── CLI group ─────────────────────────────────────────────────────────────────
 
 @click.group()
 def migration() -> None:
     """Manage Pylon schema migrations."""
 
 
+# ── apply ─────────────────────────────────────────────────────────────────────
+
 @migration.command()
+@click.option("--to", "to_id", default=None, metavar="ID",
+              help="Stop applying at this migration ID.")
+@click.option("--dev-mode", is_flag=True, default=False,
+              help="Skip DDL already applied via 'watch'; just move the tracking pointer.")
+@click.option("--no-wait", is_flag=True, default=False,
+              help="Fail immediately if another 'apply' holds the lock.")
 @requires_config
 @click.pass_context
-def create(ctx: click.Context) -> None:
-    """Diff the current schema against the database and create a new migration file."""
-    import pylon
-    from pylon.schema._export import export
+def apply(ctx: click.Context, to_id: str | None, dev_mode: bool, no_wait: bool) -> None:
+    """Apply pending migrations to the database."""
+    asyncio.run(_apply(ctx, to_id, dev_mode, no_wait))
 
-    config = ctx.obj['config']
-    migrations_dir = config.project.schema_dir / 'migrations'
-    _require_migrations_dir(ctx, migrations_dir)
 
-    pylon.finalize()
-    desired_sql = export()
+async def _apply(
+    ctx: click.Context,
+    to_id: str | None,
+    dev_mode: bool,
+    no_wait: bool,
+) -> None:
+    import asyncpg
+    from pylon._core import verify_migration
 
-    with tempfile.TemporaryDirectory() as tmp:
-        schema_file = Path(tmp) / 'desired.sql'
-        schema_file.write_text(desired_sql)
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+    _require_migrations_dir(ctx, d)
 
-        result = subprocess.run(
-            [
-                'atlas', 'schema', 'diff',
-                '--from', _pg_url(config),
-                '--to', f'file://{schema_file}',
-                '--format', '{{ sql . }}',
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    migrations = _load_migrations(d)
+    chain = _ordered_chain(migrations)
 
-    diff_sql = result.stdout.strip()
-    if not diff_sql:
-        click.echo('No schema changes detected.')
-        return
+    conn = await asyncpg.connect(_pg_dsn(config))
+    try:
+        await _ensure_tracking_tables(conn)
 
-    content = diff_sql.encode()
-    seq = _next_seq(migrations_dir)
-    dest = migrations_dir / f'{seq:05d}_{_short_hash(content)}.sql'
-    dest.write_text(diff_sql)
-    click.echo(f'Created {dest}')
+        # Session-level advisory lock (§9.3)
+        if no_wait:
+            acquired = await conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)", _ADVISORY_LOCK_KEY
+            )
+            if not acquired:
+                raise click.ClickException(
+                    "Another 'pylon migration apply' is already running (--no-wait)."
+                )
+        else:
+            await conn.execute("SELECT pg_advisory_lock($1)", _ADVISORY_LOCK_KEY)
 
-    subprocess.run(
-        ['atlas', 'migrate', 'hash', '--dir', f'file://{migrations_dir}'],
-        check=True,
+        try:
+            tracking = await _read_tracking(conn)
+            applied_tip = _applied_tip(tracking)
+
+            if not chain:
+                click.echo("No migrations found.")
+                return
+
+            chain_ids = [m.id for m in chain]
+
+            if applied_tip is None:
+                pending_start = 0
+            elif applied_tip in chain_ids:
+                pending_start = chain_ids.index(applied_tip) + 1
+            else:
+                raise click.ClickException(
+                    f"Database tip {applied_tip!r} not found in on-disk chain — "
+                    "history has diverged. Resolve manually."
+                )
+
+            pending = chain[pending_start:]
+            if to_id is not None:
+                if to_id not in chain_ids:
+                    raise click.ClickException(f"--to target {to_id!r} not in chain.")
+                stop_idx = chain_ids.index(to_id)
+                if stop_idx < pending_start:
+                    raise click.ClickException(f"--to target {to_id!r} is already applied.")
+                pending = chain[pending_start : stop_idx + 1]
+
+            if not pending:
+                click.echo("Already up to date.")
+                return
+
+            for m in pending:
+                await _apply_one(conn, m, dev_mode, verify_migration)
+
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
+    finally:
+        await conn.close()
+
+
+async def _apply_one(conn, m, dev_mode: bool, verify_migration) -> None:
+    try:
+        verify_migration(m)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    steps = _parse_steps(m.body)
+
+    # Resume from recorded progress if a prior run failed mid-migration (§9.1)
+    progress_row = await conn.fetchrow(
+        'SELECT step_index FROM _pylon."Progress" WHERE id = $1', m.id
+    )
+    resume_from = (progress_row["step_index"] + 1) if progress_row else 0
+    multi_step = len(steps) > 1
+
+    for step_idx, (transactional, sql) in enumerate(steps):
+        if step_idx < resume_from:
+            continue
+        sql = sql.strip()
+        if not sql:
+            continue
+
+        if multi_step:
+            await conn.execute(
+                'INSERT INTO _pylon."Progress" (id, step_index) VALUES ($1, $2) '
+                "ON CONFLICT (id) DO UPDATE SET step_index = $2, updated_at = now()",
+                m.id, step_idx,
+            )
+
+        is_last = step_idx == len(steps) - 1
+
+        if transactional:
+            async with conn.transaction():
+                if not dev_mode:
+                    await conn.execute(sql)
+                if is_last:
+                    await _record_applied(conn, m)
+                    if multi_step:
+                        await conn.execute(
+                            'DELETE FROM _pylon."Progress" WHERE id = $1', m.id
+                        )
+        else:
+            if not dev_mode:
+                await _drop_invalid_concurrent_index(conn, sql)
+                await conn.execute(sql)
+            if is_last:
+                await _record_applied(conn, m)
+                if multi_step:
+                    await conn.execute(
+                        'DELETE FROM _pylon."Progress" WHERE id = $1', m.id
+                    )
+
+    click.echo(f"  Applied {m.filename}")
+
+
+async def _record_applied(conn, m) -> None:
+    await conn.execute(
+        'INSERT INTO _pylon."Migrations" (id, onto, filename) VALUES ($1, $2, $3)',
+        m.id, m.onto, m.filename,
     )
 
 
-@migration.command('list')
-@requires_config
-@click.pass_context
-def list_migrations(ctx: click.Context) -> None:
-    """List all migration files."""
-    config = ctx.obj['config']
-    migrations_dir = config.project.schema_dir / 'migrations'
-    _require_migrations_dir(ctx, migrations_dir)
-    files = sorted(migrations_dir.glob('[0-9][0-9][0-9][0-9][0-9]_*.sql'))
-    if not files:
-        click.echo('No migrations found.')
+async def _drop_invalid_concurrent_index(conn, sql: str) -> None:
+    """Before retrying a CONCURRENTLY step, drop any invalid index it left behind (§9.1)."""
+    match = re.search(
+        r'CREATE\s+INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?',
+        sql, re.IGNORECASE,
+    )
+    if not match:
         return
-    for f in files:
-        click.echo(f.name)
+    index_name = match.group(1)
+    invalid = await conn.fetchval(
+        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE c.relname = $1 AND NOT i.indisvalid",
+        index_name,
+    )
+    if invalid:
+        await conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{index_name}"')
 
+
+# ── status ────────────────────────────────────────────────────────────────────
 
 @migration.command()
-@click.argument('migration_name', required=False)
-@click.option('--dry-run', is_flag=True, default=False, help='Preview SQL without applying.')
 @requires_config
 @click.pass_context
-def migrate(ctx: click.Context, migration_name: str | None, dry_run: bool) -> None:
-    """Apply pending migrations to the database.
+def status(ctx: click.Context) -> None:
+    """Show applied tip, pending migrations, and chain validity."""
+    asyncio.run(_status(ctx))
 
-    When MIGRATION_NAME is given, that single file is executed directly.
-    Otherwise all pending migrations are applied via Atlas.
-    """
-    import asyncio
+
+async def _status(ctx: click.Context) -> None:
     import asyncpg
 
-    config = ctx.obj['config']
-    migrations_dir = config.project.schema_dir / 'migrations'
-    _require_migrations_dir(ctx, migrations_dir)
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+    _require_migrations_dir(ctx, d)
 
-    if migration_name:
-        target = migrations_dir / migration_name
-        if not target.is_file():
-            _print_error(
-                f'migration file not found: {migration_name}',
-                f'File must exist in {migrations_dir}',
-            )
-            ctx.exit(1)
+    migrations = _load_migrations(d)
+    chain = _ordered_chain(migrations)
 
-        sql = target.read_text()
+    conn = await asyncpg.connect(_pg_dsn(config))
+    try:
+        await _ensure_tracking_tables(conn)
+        tracking = await _read_tracking(conn)
+    finally:
+        await conn.close()
 
-        if dry_run:
-            click.echo(sql)
-            return
+    applied_tip = _applied_tip(tracking)
 
-        async def _apply() -> None:
-            conn = await asyncpg.connect(_pg_url(config))
-            try:
-                async with conn.transaction():
-                    await conn.execute(sql)
-            finally:
-                await conn.close()
-
-        asyncio.run(_apply())
-        click.echo(f'Applied {migration_name}.')
+    if not chain:
+        click.echo("No migrations on disk.")
+        if tracking:
+            click.echo(f"Database tip: {applied_tip} (no files — orphaned?)")
         return
 
-    cmd = [
-        'atlas', 'migrate', 'apply',
-        '--url', _pg_url(config),
-        '--dir', f'file://{migrations_dir}',
-    ]
+    chain_ids = [m.id for m in chain]
+    fs_tip = chain[-1].id
+
+    click.echo(f"Chain tip (disk):  {fs_tip}")
+    click.echo(f"Applied tip (db):  {applied_tip or '(none)'}")
+
+    if applied_tip is None:
+        pending = chain
+    elif applied_tip in chain_ids:
+        pending = chain[chain_ids.index(applied_tip) + 1:]
+    else:
+        click.echo("\n⚠  Database tip not found in on-disk chain — history has diverged.")
+        return
+
+    if pending:
+        click.echo(f"\n{len(pending)} pending migration(s):")
+        for m in pending:
+            click.echo(f"  {m.filename}")
+    else:
+        click.echo("\nDatabase is up to date.")
+
+
+# ── log ───────────────────────────────────────────────────────────────────────
+
+@migration.command("log")
+@click.option("--from-fs", "source", flag_value="fs", help="Walk on-disk chain.")
+@click.option("--from-db", "source", flag_value="db", help="Read tracking table.")
+@click.option("--newest-first", is_flag=True, default=False)
+@click.option("--limit", type=int, default=None, metavar="N")
+@requires_config
+@click.pass_context
+def log_cmd(
+    ctx: click.Context,
+    source: str | None,
+    newest_first: bool,
+    limit: int | None,
+) -> None:
+    """Print migration history from files (--from-fs) or database (--from-db)."""
+    if source is None:
+        raise click.UsageError("Specify --from-fs or --from-db.")
+    asyncio.run(_log(ctx, source, newest_first, limit))
+
+
+async def _log(
+    ctx: click.Context,
+    source: str,
+    newest_first: bool,
+    limit: int | None,
+) -> None:
+    import asyncpg
+
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+
+    if source == "fs":
+        _require_migrations_dir(ctx, d)
+        chain = _ordered_chain(_load_migrations(d))
+        entries = [{"id": m.id, "onto": m.onto, "ref": m.filename} for m in chain]
+    else:
+        conn = await asyncpg.connect(_pg_dsn(config))
+        try:
+            await _ensure_tracking_tables(conn)
+            rows = await conn.fetch(
+                'SELECT id, onto, filename, applied_at '
+                'FROM _pylon."Migrations" ORDER BY applied_at'
+            )
+        finally:
+            await conn.close()
+        entries = [
+            {"id": r["id"], "onto": r["onto"],
+             "ref": r["applied_at"].strftime("%Y-%m-%d %H:%M:%S UTC")}
+            for r in rows
+        ]
+
+    if newest_first:
+        entries = list(reversed(entries))
+    if limit is not None:
+        entries = entries[:limit]
+
+    if not entries:
+        click.echo("No migrations.")
+        return
+
+    for e in entries:
+        click.echo(f"{e['id']}  onto={e['onto']}  {e['ref']}")
+
+
+# ── create ────────────────────────────────────────────────────────────────────
+
+@migration.command()
+@click.option("--blank", is_flag=True, default=False,
+              help="Write a hand-editable stub without diffing the database.")
+@click.option("--name", default=None, metavar="SLUG",
+              help="Optional label appended to the filename.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Print the file content without writing it.")
+@requires_config
+@click.pass_context
+def create(ctx: click.Context, blank: bool, name: str | None, dry_run: bool) -> None:
+    """Generate a new migration file.
+
+    Use --blank to write a hand-editable stub (no database diffing required).
+    Schema-diffing 'create' is not yet implemented.
+    """
+    if not blank:
+        raise click.ClickException(
+            "Schema-diffing 'create' is not yet implemented. "
+            "Use --blank to write a hand-editable migration stub."
+        )
+    _create_blank(ctx, name, dry_run)
+
+
+def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
+    from pylon._core import blank_migration_body, render_migration_file, compute_migration_short_id
+
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+    _require_migrations_dir(ctx, d)
+
+    chain = _ordered_chain(_load_migrations(d))
+    onto = chain[-1].id if chain else "initial"
+
+    body = blank_migration_body()
+    content = render_migration_file(onto, body)
+    short_id = compute_migration_short_id(body)
+
+    seq = _next_seq(d)
+    stem = f"{seq:05d}_{short_id}"
+    if name:
+        stem = f"{stem}_{name}"
+    filename = f"{stem}.sql"
 
     if dry_run:
-        cmd += ['--dry-run']
+        click.echo(f"-- would write: {d / filename}")
+        click.echo(content)
+        return
 
-    subprocess.run(cmd, check=True)
+    (d / filename).write_text(content)
+    click.echo(f"Created {filename}")
+    click.echo("Edit the file, then run 'pylon migration rehash' to recompute its ID.")
+
+
+# ── rehash ────────────────────────────────────────────────────────────────────
+
+@migration.command()
+@click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@requires_config
+@click.pass_context
+def rehash(ctx: click.Context, file: Path) -> None:
+    """Recompute a hand-edited migration's ID and update its header and filename.
+
+    Only valid for the chain tip that hasn't been applied to any database yet.
+    """
+    from pylon._core import compute_migration_id, compute_migration_short_id, parse_migration
+
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+    _require_migrations_dir(ctx, d)
+
+    content = file.read_text()
+    m = parse_migration(content, file.stem)
+
+    # Guard: must be chain tip
+    chain = _ordered_chain(_load_migrations(d))
+    if chain and chain[-1].id != m.id:
+        raise click.ClickException(
+            f"{file.name} is not the chain tip — rehash is only valid for the tip."
+        )
+
+    new_id = compute_migration_id(m.body)
+    if new_id == m.id:
+        click.echo("ID is already correct — nothing to do.")
+        return
+
+    new_short = compute_migration_short_id(m.body)
+
+    # Rewrite the migration: line in the header
+    lines = content.splitlines(keepends=True)
+    lines[0] = f"-- migration: {new_id}\n"
+    file.write_text("".join(lines))
+
+    # Rename the file: keep seq + optional name suffix, replace short_id
+    stem = file.stem  # e.g. 00001_m1abc123_my_slug
+    parts = stem.split("_", 2)  # ["00001", "m1abc123", "my_slug"] or ["00001", "m1abc123"]
+    new_stem = f"{parts[0]}_{new_short}"
+    if len(parts) > 2:
+        new_stem = f"{new_stem}_{parts[2]}"
+    new_path = file.parent / f"{new_stem}.sql"
+    file.rename(new_path)
+
+    click.echo(f"Rehashed: {file.name} → {new_path.name}")
+    click.echo(f"  old ID: {m.id}")
+    click.echo(f"  new ID: {new_id}")

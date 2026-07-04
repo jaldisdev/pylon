@@ -1272,6 +1272,75 @@ fn compile_search_index_fetch(
     core::export::compile_search_index_fetch(type_name, index_name, &schema.inner).map_err(pyql_err)
 }
 
+// ── Migration ─────────────────────────────────────────────────────────────────
+
+/// Parsed migration file exposed to Python.
+#[pyclass]
+struct MigrationFile {
+    inner: core::migration::MigrationFile,
+}
+
+#[pymethods]
+impl MigrationFile {
+    #[getter] fn id(&self) -> &str { &self.inner.id }
+    #[getter] fn onto(&self) -> &str { &self.inner.onto }
+    #[getter] fn filename(&self) -> &str { &self.inner.filename }
+    #[getter] fn body(&self) -> &str { &self.inner.body }
+    #[getter] fn short_id(&self) -> &str { self.inner.short_id() }
+    #[getter] fn is_first(&self) -> bool { self.inner.is_first() }
+    #[getter] fn squashed(&self) -> Vec<String> { self.inner.squashed.clone() }
+}
+
+/// Parse a migration file's content. `filename` is for error messages only.
+#[pyfunction]
+fn parse_migration(content: &str, filename: &str) -> PyResult<MigrationFile> {
+    core::migration::parse(content, filename)
+        .map(|inner| MigrationFile { inner })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Verify a migration file's body matches its header ID.
+#[pyfunction]
+fn verify_migration(m: &MigrationFile) -> PyResult<()> {
+    core::migration::verify_integrity(&m.inner)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Validate a list of migration files form a single unbroken chain.
+/// Returns them in chain order (oldest first).
+#[pyfunction]
+fn validate_migration_chain(migrations: Vec<PyRef<MigrationFile>>) -> PyResult<Vec<String>> {
+    let owned: Vec<core::migration::MigrationFile> = migrations.iter().map(|m| m.inner.clone()).collect();
+    core::migration::validate_chain(&owned)
+        .map(|chain| chain.iter().map(|m| m.id.clone()).collect())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Compute a migration's full ID from its body.
+#[pyfunction]
+fn compute_migration_id(body: &str) -> String {
+    core::migration::compute_id(body)
+}
+
+/// Compute a migration's short ID (filename component) from its body.
+#[pyfunction]
+fn compute_migration_short_id(body: &str) -> String {
+    core::migration::compute_short_id(body)
+}
+
+/// Render a complete migration file string (header + body).
+#[pyfunction]
+#[pyo3(signature = (onto, body, squashed = None))]
+fn render_migration_file(onto: &str, body: &str, squashed: Option<Vec<String>>) -> String {
+    core::migration::render_file(onto, body, squashed.as_deref().unwrap_or(&[]))
+}
+
+/// Return the stub body for a blank migration.
+#[pyfunction]
+fn blank_migration_body() -> &'static str {
+    core::migration::blank_body()
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1447,5 +1516,15 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
     m.add_function(wrap_pyfunction!(compile_index_fetch, m)?)?;
     m.add_function(wrap_pyfunction!(compile_search_index_fetch, m)?)?;
+
+    // Migration
+    m.add_class::<MigrationFile>()?;
+    m.add_function(wrap_pyfunction!(parse_migration, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_migration, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_migration_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_migration_id, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_migration_short_id, m)?)?;
+    m.add_function(wrap_pyfunction!(render_migration_file, m)?)?;
+    m.add_function(wrap_pyfunction!(blank_migration_body, m)?)?;
     Ok(())
 }
