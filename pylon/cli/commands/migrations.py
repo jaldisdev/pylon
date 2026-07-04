@@ -215,8 +215,18 @@ async def _apply(
                 click.echo("Already up to date.")
                 return
 
+            applied_ids = {r["id"] for r in tracking}
             for m in pending:
+                # §12 squash compatibility: if any of this migration's squashed
+                # constituent IDs are already in the tracking table, the DB was
+                # updated via the old (pre-squash) chain — backfill and skip DDL.
+                if m.squashed and any(sid in applied_ids for sid in m.squashed):
+                    await _record_applied(conn, m)
+                    click.echo(f"  Backfilled {m.filename} (squash of already-applied migrations)")
+                    applied_ids.add(m.id)
+                    continue
                 await _apply_one(conn, m, dev_mode, verify_migration)
+                applied_ids.add(m.id)
 
         finally:
             await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
@@ -257,7 +267,27 @@ async def _apply_one(conn, m, dev_mode: bool, verify_migration) -> None:
 
         if transactional:
             async with conn.transaction():
-                if not dev_mode:
+                if dev_mode:
+                    # §9 dev-mode rebase: run DDL inside a savepoint so that "already
+                    # exists" errors (from watch having applied this earlier) roll back
+                    # only the step, not the outer transaction. Generated DDL uses
+                    # IF NOT EXISTS so this is usually a no-op.
+                    try:
+                        async with conn.transaction():  # nested → savepoint in asyncpg
+                            await conn.execute(sql)
+                    except Exception as exc:
+                        import asyncpg
+                        _dup = (
+                            asyncpg.DuplicateTableError,
+                            asyncpg.DuplicateColumnError,
+                            asyncpg.DuplicateSchemaError,
+                            asyncpg.DuplicateObjectError,
+                            asyncpg.DuplicateDatabaseError,
+                        )
+                        if not isinstance(exc, _dup):
+                            raise
+                        # Silently swallow: structure was already applied by watch.
+                else:
                     await conn.execute(sql)
                 if is_last:
                     await _record_applied(conn, m)
@@ -266,9 +296,10 @@ async def _apply_one(conn, m, dev_mode: bool, verify_migration) -> None:
                             'DELETE FROM _pylon."Progress" WHERE id = $1', m.id
                         )
         else:
-            if not dev_mode:
-                await _drop_invalid_concurrent_index(conn, sql)
-                await conn.execute(sql)
+            # Non-transactional (CONCURRENTLY): IF NOT EXISTS prevents errors when
+            # the index already exists from a prior watch or failed attempt.
+            await _drop_invalid_concurrent_index(conn, sql)
+            await conn.execute(sql)
             if is_last:
                 await _record_applied(conn, m)
                 if multi_step:
@@ -804,3 +835,203 @@ def rehash(ctx: click.Context, file: Path) -> None:
     click.echo(f"Rehashed: {file.name} → {new_path.name}")
     click.echo(f"  old ID: {m.id}")
     click.echo(f"  new ID: {new_id}")
+
+
+# ── squash ────────────────────────────────────────────────────────────────────
+
+@migration.command()
+@click.option("--from", "from_id", default=None, metavar="ID",
+              help="First migration in the range to squash (inclusive).")
+@click.option("--to", "to_id", default=None, metavar="ID",
+              help="Last migration in the range to squash (inclusive).")
+@click.option("--count", type=int, default=None, metavar="N",
+              help="Squash the last N migrations.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Print the squashed body without modifying any files.")
+@requires_config
+@click.pass_context
+def squash(
+    ctx: click.Context,
+    from_id: str | None,
+    to_id: str | None,
+    count: int | None,
+    dry_run: bool,
+) -> None:
+    """Collapse a contiguous range of migrations into a single file.
+
+    Uses an ephemeral shadow database to compute the net DDL, then replaces the
+    constituent files with one squashed migration that records their IDs in its
+    header (for tracking-table compatibility with databases that have already
+    applied the old chain).
+
+    Requires CREATEDB privilege on the target PostgreSQL server.
+    """
+    asyncio.run(_squash(ctx, from_id, to_id, count, dry_run))
+
+
+async def _squash(
+    ctx: click.Context,
+    from_id: str | None,
+    to_id: str | None,
+    count: int | None,
+    dry_run: bool,
+) -> None:
+    import secrets
+    import asyncpg
+    from pylon._core import (
+        diff_states as _core_diff_states,
+        render_migration_file,
+        compute_migration_short_id,
+        verify_migration,
+    )
+    from pylon.schema._introspect import introspect_db_state
+
+    config = ctx.obj["config"]
+    d = _migrations_dir(config)
+    _require_migrations_dir(ctx, d)
+
+    migrations = _load_migrations(d)
+    chain = _ordered_chain(migrations)
+
+    if not chain:
+        raise click.ClickException("No migrations to squash.")
+
+    chain_ids = [m.id for m in chain]
+
+    # ── Resolve the squash range ───────────────────────────────────────────────
+    if count is not None:
+        if from_id or to_id:
+            raise click.UsageError("Use --count OR --from/--to, not both.")
+        if count < 2:
+            raise click.ClickException("--count must be at least 2.")
+        if count > len(chain):
+            raise click.ClickException(
+                f"--count ({count}) exceeds chain length ({len(chain)})."
+            )
+        range_start = len(chain) - count
+        range_end = len(chain) - 1
+    elif from_id and to_id:
+        if from_id not in chain_ids:
+            raise click.ClickException(f"--from ID {from_id!r} not found in chain.")
+        if to_id not in chain_ids:
+            raise click.ClickException(f"--to ID {to_id!r} not found in chain.")
+        range_start = chain_ids.index(from_id)
+        range_end = chain_ids.index(to_id)
+        if range_start >= range_end:
+            raise click.ClickException("--from must precede --to in the chain.")
+    else:
+        raise click.UsageError("Specify --count or both --from and --to.")
+
+    squash_range = chain[range_start : range_end + 1]
+    squashed_ids = [m.id for m in squash_range]
+    onto = chain[range_start - 1].id if range_start > 0 else "initial"
+
+    click.echo(
+        f"Squashing {len(squash_range)} migration(s) "
+        f"({squash_range[0].short_id} … {squash_range[-1].short_id})…"
+    )
+
+    # ── Spin up ephemeral shadow database ──────────────────────────────────────
+    dsn = _pg_dsn(config)
+    shadow_name = f"_pylon_shadow_{secrets.token_hex(8)}"
+    click.echo(f"Creating shadow database {shadow_name!r}…")
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(f'CREATE DATABASE "{shadow_name}" TEMPLATE template0')
+    except asyncpg.InsufficientPrivilegeError:
+        await conn.close()
+        raise click.ClickException(
+            "Squash requires CREATEDB privilege on the PostgreSQL server."
+        )
+    finally:
+        await conn.close()
+
+    before_state = after_state = None
+    try:
+        shadow_dsn = _shadow_dsn(dsn, shadow_name)
+        shadow_conn = await asyncpg.connect(shadow_dsn)
+        try:
+            await shadow_conn.execute("CREATE SCHEMA IF NOT EXISTS _pylon")
+            await _ensure_tracking_tables(shadow_conn)
+
+            # Apply migrations before the squash range to reach the "before" state.
+            pre_range = chain[:range_start]
+            for m in pre_range:
+                await _apply_one(shadow_conn, m, False, verify_migration)
+
+            before_state = await introspect_db_state(shadow_conn)
+
+            # Apply the squash range to reach the "after" state.
+            for m in squash_range:
+                await _apply_one(shadow_conn, m, False, verify_migration)
+
+            after_state = await introspect_db_state(shadow_conn)
+        finally:
+            await shadow_conn.close()
+    finally:
+        drop_conn = await asyncpg.connect(dsn)
+        try:
+            await drop_conn.execute(f'DROP DATABASE IF EXISTS "{shadow_name}"')
+        finally:
+            await drop_conn.close()
+        click.echo(f"Dropped shadow database {shadow_name!r}.")
+
+    # ── Compute the net DDL ────────────────────────────────────────────────────
+    ops = _core_diff_states(before_state, after_state)
+
+    if not ops:
+        raise click.ClickException(
+            "Squash range produces no net DDL changes — nothing to write."
+        )
+
+    body = _assemble_migration_body(ops)
+    new_short_id = compute_migration_short_id(body)
+    content = render_migration_file(onto, body, squashed_ids)
+
+    # Sequence number = position of range_start in the final file list (1-indexed).
+    seq = range_start + 1
+    filename = f"{seq:05d}_{new_short_id}.sql"
+
+    if dry_run:
+        click.echo(f"\n-- would write: {d / filename}")
+        click.echo(content)
+        click.echo(
+            f"\n-- would delete: {', '.join(m.filename for m in squash_range)}"
+        )
+        click.echo(
+            f"-- files after {squash_range[-1].filename} would be renumbered from {seq + 1:05d}"
+        )
+        return
+
+    # ── Write squashed file, delete constituents, renumber ────────────────────
+    (d / filename).write_text(content)
+
+    for m in squash_range:
+        f = d / m.filename
+        if f.exists():
+            f.unlink()
+
+    _renumber_migrations(d)
+
+    click.echo(f"Squashed {len(squash_range)} migration(s) → {filename}")
+
+
+def _shadow_dsn(dsn: str, shadow_name: str) -> str:
+    """Return a copy of `dsn` with the database name replaced by `shadow_name`."""
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(dsn)
+    # Path is /dbname (possibly with ?params appended in the query component).
+    new_path = f"/{shadow_name}"
+    return urlunparse(parsed._replace(path=new_path))
+
+
+def _renumber_migrations(d: Path) -> None:
+    """Rename all migration files so their sequence prefixes are contiguous from 1."""
+    files = sorted(d.glob("[0-9][0-9][0-9][0-9][0-9]_*.sql"))
+    for new_idx, path in enumerate(files, start=1):
+        parts = path.stem.split("_", 1)  # ["00003", "m1abc123..."]
+        new_stem = f"{new_idx:05d}_{parts[1]}"
+        new_path = path.parent / f"{new_stem}.sql"
+        if new_path != path:
+            path.rename(new_path)
