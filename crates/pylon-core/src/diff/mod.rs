@@ -116,17 +116,17 @@ pub struct DiffOp {
 /// Compute ordered DDL SQL strings to bring a database in sync with `target`.
 /// All statements use plain (non-CONCURRENTLY) index creation — suitable for
 /// `watch` mode where everything runs inside a single transaction.
-pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
-    diff_inner(target, current, false)
+pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<String>, String> {
+    Ok(diff_inner(target, current, false)?
         .into_iter()
         .map(|op| op.sql)
-        .collect()
+        .collect())
 }
 
 /// Compute ordered `DiffOp`s suitable for a migration file body.
 /// Index creation on pre-existing tables uses `CONCURRENTLY` and is marked
 /// `non_transactional = true` so `create` can insert step-boundary markers.
-pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Vec<DiffOp> {
+pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<DiffOp>, String> {
     diff_inner(target, current, true)
 }
 
@@ -268,7 +268,7 @@ pub fn diff_schema_ops_with_renames(
     current: &DbState,
     type_renames: &[(String, String, String, String)],
     col_renames: &[(String, String, String, String)],
-) -> Vec<DiffOp> {
+) -> Result<Vec<DiffOp>, String> {
     let mut ops: Vec<DiffOp> = Vec::new();
     let mut modified = current.clone();
 
@@ -314,9 +314,9 @@ pub fn diff_schema_ops_with_renames(
     }
 
     // ── Run the standard diff against the modified state ──────────────────────
-    let mut diff_ops = diff_inner(target, &modified, true);
+    let mut diff_ops = diff_inner(target, &modified, true)?;
     ops.append(&mut diff_ops);
-    ops
+    Ok(ops)
 }
 
 // ── Identifier helpers ────────────────────────────────────────────────────────
@@ -331,37 +331,53 @@ fn qn(schema: &str, name: &str) -> String {
 
 // ── Topological sort (referenced types before referencing) ────────────────────
 
-fn topo_sort_types(types: &[TypeDescriptor]) -> Vec<usize> {
+fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
     let idx_of: HashMap<String, usize> = types
         .iter()
         .enumerate()
         .map(|(i, t)| (format!("{}::{}", t.module, t.name), i))
         .collect();
 
-    let mut visited = vec![false; types.len()];
+    // Three-colour DFS: 0=unvisited, 1=in current path (gray), 2=done (black).
+    let mut colour = vec![0u8; types.len()];
     let mut order: Vec<usize> = Vec::with_capacity(types.len());
 
     fn visit(
         i: usize,
         types: &[TypeDescriptor],
         idx_of: &HashMap<String, usize>,
-        visited: &mut Vec<bool>,
+        colour: &mut Vec<u8>,
         order: &mut Vec<usize>,
-    ) {
-        if visited[i] { return; }
-        visited[i] = true;
+    ) -> Result<(), String> {
+        match colour[i] {
+            2 => return Ok(()),   // already fully processed
+            1 => return Err(format!(  // back-edge → cycle
+                "circular type dependency involving '{}::{}'",
+                types[i].module, types[i].name
+            )),
+            _ => {}
+        }
+        colour[i] = 1;
+        // Dependencies: FK links + multi-link targets.
         for l in &types[i].links {
             if let Some(&dep) = idx_of.get(&l.target) {
-                visit(dep, types, idx_of, visited, order);
+                visit(dep, types, idx_of, colour, order)?;
             }
         }
+        for ml in &types[i].multilinks {
+            if let Some(&dep) = idx_of.get(&ml.target) {
+                visit(dep, types, idx_of, colour, order)?;
+            }
+        }
+        colour[i] = 2;
         order.push(i);
+        Ok(())
     }
 
     for i in 0..types.len() {
-        visit(i, types, &idx_of, &mut visited, &mut order);
+        visit(i, types, &idx_of, &mut colour, &mut order)?;
     }
-    order
+    Ok(order)
 }
 
 fn col_type_str(pg_type: &str) -> &str {
@@ -370,7 +386,7 @@ fn col_type_str(pg_type: &str) -> &str {
 
 // ── Core diff implementation ──────────────────────────────────────────────────
 
-fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool) -> Vec<DiffOp> {
+fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool) -> Result<Vec<DiffOp>, String> {
     let mut ops: Vec<DiffOp> = Vec::new();
 
     let cur_schemas: HashSet<&str> = current.schemas.iter().map(|s| s.as_str()).collect();
@@ -445,7 +461,7 @@ fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool)
     }
 
     // ── Phase 4 & 5: tables (create new or alter existing) ────────────────────
-    let sort_order = topo_sort_types(&target.types);
+    let sort_order = topo_sort_types(&target.types)?;
 
     // Track which tables are created in this diff (needed for CONCURRENTLY decision).
     let mut new_tables: HashSet<(String, String)> = HashSet::new();
@@ -614,7 +630,7 @@ fn diff_inner(target: &SchemaDescriptor, current: &DbState, for_migration: bool)
         }
     }
 
-    ops
+    Ok(ops)
 }
 
 fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
