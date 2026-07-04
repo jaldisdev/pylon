@@ -20,12 +20,7 @@ def _migrations_dir(config) -> Path:
 
 
 def _require_migrations_dir(ctx: click.Context, d: Path) -> None:
-    if not d.is_dir():
-        _print_error(
-            "migrations directory not found",
-            f"Expected at {d}. Create it with: mkdir -p {d}",
-        )
-        ctx.exit(1)
+    d.mkdir(parents=True, exist_ok=True)
 
 
 def _pg_dsn(config) -> str:
@@ -647,6 +642,118 @@ def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
     click.echo("Edit the file, then run 'pylon migration rehash' to recompute its ID.")
 
 
+_RENAME_HELP = """\
+  y   — accept rename (emit ALTER … RENAME)
+  n   — reject (emit DROP + CREATE instead)
+  l   — show the DDL statement(s) for this change
+  c   — list all changes confirmed so far
+  b   — go back to the previous question
+  s   — stop rename prompts and write a migration from what's confirmed so far
+  q   — quit without writing anything
+  h/? — show this help"""
+
+
+def _rename_prompt_loop(
+    type_candidates: list,
+    col_candidates: list,
+) -> tuple[list[tuple], list[tuple], bool]:
+    """Present each rename candidate interactively.
+
+    Returns (confirmed_type_renames, confirmed_col_renames, quit_requested).
+    quit_requested=True means the user chose 'q' — caller should abort.
+    """
+    # Build a flat list of prompt entries.
+    entries: list[dict] = []
+    for old_mod, old_table, new_mod, new_table, new_type_name, confidence in type_candidates:
+        pct = int(confidence * 100)
+        if old_mod == new_mod:
+            ddl = f'ALTER TABLE "{old_mod}"."{old_table}" RENAME TO "{new_table}";'
+        else:
+            ddl = (
+                f'ALTER TABLE "{old_mod}"."{old_table}" SET SCHEMA "{new_mod}";\n'
+                f'ALTER TABLE "{new_mod}"."{old_table}" RENAME TO "{new_table}";'
+            )
+        entries.append({
+            "question": f"did you rename type '{old_mod}::{old_table}' to '{new_type_name}' ({pct}%)?",
+            "ddl": ddl,
+            "kind": "type",
+            "data": (old_mod, old_table, new_mod, new_table),
+        })
+    for mod, table, old_col, new_col, pg_type in col_candidates:
+        entries.append({
+            "question": (
+                f"did you rename property '{old_col}' to '{new_col}' "
+                f"on '{mod}::{table}' ({pg_type})?"
+            ),
+            "ddl": f'ALTER TABLE "{mod}"."{table}" RENAME COLUMN "{old_col}" TO "{new_col}";',
+            "kind": "col",
+            "data": (mod, table, old_col, new_col),
+        })
+
+    if not entries:
+        return [], [], False
+
+    decisions: list[bool | None] = [None] * len(entries)
+    idx = 0
+
+    while idx < len(entries):
+        e = entries[idx]
+        click.echo(f"\n{e['question']}")
+
+        confirmed_ddls = [
+            entries[i]["ddl"] for i in range(len(entries)) if decisions[i] is True
+        ]
+
+        while True:
+            raw = click.prompt("", prompt_suffix="[y,n,l,c,b,s,q,?] ").strip().lower()
+            if raw == "y":
+                decisions[idx] = True
+                idx += 1
+                break
+            elif raw == "n":
+                decisions[idx] = False
+                idx += 1
+                break
+            elif raw == "l":
+                for line in e["ddl"].splitlines():
+                    click.echo(f"  {line}")
+            elif raw == "c":
+                if confirmed_ddls:
+                    click.echo("Confirmed so far:")
+                    for ddl in confirmed_ddls:
+                        for line in ddl.splitlines():
+                            click.echo(f"  {line}")
+                else:
+                    click.echo("  (nothing confirmed yet)")
+            elif raw == "b":
+                if idx > 0:
+                    idx -= 1
+                    decisions[idx] = None
+                else:
+                    click.echo("  Already at the first question.")
+                break  # re-enter outer loop at new idx
+            elif raw == "s":
+                # Stop prompting; write a migration from what's confirmed so far.
+                idx = len(entries)
+                break
+            elif raw == "q":
+                return [], [], True
+            elif raw in ("h", "?"):
+                click.echo(_RENAME_HELP)
+            else:
+                click.echo(f"  Unknown option. Enter y, n, l, c, b, s, q, or ?")
+
+    confirmed_type: list[tuple] = []
+    confirmed_col: list[tuple] = []
+    for i, e in enumerate(entries):
+        if decisions[i] is True:
+            if e["kind"] == "type":
+                confirmed_type.append(e["data"])
+            else:
+                confirmed_col.append(e["data"])
+    return confirmed_type, confirmed_col, False
+
+
 async def _create_from_diff(
     ctx: click.Context,
     name: str | None,
@@ -657,6 +764,9 @@ async def _create_from_diff(
     import asyncpg
     from pylon._core import (
         diff_schema_ops as _core_diff_schema_ops,
+        detect_type_renames as _core_detect_type_renames,
+        detect_col_renames as _core_detect_col_renames,
+        diff_schema_ops_with_renames as _core_diff_schema_ops_with_renames,
         render_migration_file,
         compute_migration_short_id,
         verify_migration,
@@ -707,8 +817,32 @@ async def _create_from_diff(
     finally:
         await conn.close()
 
-    # Compute the diff — returns [(sql, non_transactional), ...].
-    ops = _core_diff_schema_ops(schema, db_state)
+    # ── Rename detection (interactive) ────────────────────────────────────────
+    # type_renames: list of (old_mod, old_table, new_mod, new_table)
+    # col_renames:  list of (mod, table, old_col, new_col)
+    confirmed_type_renames: list[tuple[str, str, str, str]] = []
+    confirmed_col_renames: list[tuple[str, str, str, str]] = []
+
+    is_interactive = not non_interactive and sys.stdout.isatty()
+
+    if is_interactive:
+        type_candidates = _core_detect_type_renames(schema, db_state)
+        col_candidates = _core_detect_col_renames(schema, db_state)
+
+        if type_candidates or col_candidates:
+            confirmed_type_renames, confirmed_col_renames, quit_requested = (
+                _rename_prompt_loop(type_candidates, col_candidates)
+            )
+            if quit_requested:
+                raise click.ClickException("Aborted.")
+
+    # ── Compute final diff ────────────────────────────────────────────────────
+    if confirmed_type_renames or confirmed_col_renames:
+        ops = _core_diff_schema_ops_with_renames(
+            schema, db_state, confirmed_type_renames, confirmed_col_renames
+        )
+    else:
+        ops = _core_diff_schema_ops(schema, db_state)
 
     if not ops:
         click.echo("No schema changes detected.")
@@ -723,8 +857,8 @@ async def _create_from_diff(
     if has_concurrent:
         click.echo("\n  Note: CONCURRENTLY statements run outside a transaction wrapper.")
 
-    # Confirm unless --non-interactive or not a TTY.
-    if not non_interactive and sys.stdout.isatty():
+    # Final write confirmation (always ask unless --non-interactive or no TTY).
+    if is_interactive:
         click.echo()
         if not click.confirm("Write migration?"):
             raise click.ClickException("Aborted.")

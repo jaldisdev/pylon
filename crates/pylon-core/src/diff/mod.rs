@@ -12,7 +12,7 @@ use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
 // ── Live database state ────────────────────────────────────────────────────────
 
 /// Snapshot of the live PostgreSQL database, built by Python from pg_catalog queries.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DbState {
     /// User-managed schema names (excludes _pylon, public, pg_* etc.).
     pub schemas: Vec<String>,
@@ -21,7 +21,7 @@ pub struct DbState {
     pub domains: Vec<DbDomain>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbTable {
     pub schema: String,
     pub name: String,
@@ -31,7 +31,7 @@ pub struct DbTable {
     pub checks: Vec<DbCheck>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbColumn {
     pub name: String,
     pub pg_type: String,
@@ -39,7 +39,7 @@ pub struct DbColumn {
     pub is_generated: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbForeignKey {
     pub constraint_name: String,
     pub local_column: String,
@@ -47,29 +47,56 @@ pub struct DbForeignKey {
     pub ref_table: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbIndex {
     pub name: String,
     pub is_unique: bool,
     pub method: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbCheck {
     pub constraint_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbEnum {
     pub schema: String,
     pub name: String,
     pub members: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbDomain {
     pub schema: String,
     pub name: String,
+}
+
+// ── Rename candidates ─────────────────────────────────────────────────────────
+
+/// A detected potential type (table) rename: a dropped table whose column
+/// structure closely matches a newly-created type.
+#[derive(Debug)]
+pub struct TypeRenameCandidate {
+    pub old_module: String,
+    pub old_table: String,
+    pub new_module: String,
+    pub new_table: String,
+    /// Python-level type name for the new type (used in the prompt).
+    pub new_type_name: String,
+    /// Jaccard similarity of column sets: 0.0–1.0.
+    pub confidence: f64,
+}
+
+/// A detected potential column rename within an existing table: a dropped
+/// column and an added column with the same Postgres type.
+#[derive(Debug)]
+pub struct ColRenameCandidate {
+    pub module: String,
+    pub table: String,
+    pub old_col: String,
+    pub new_col: String,
+    pub pg_type: String,
 }
 
 // ── Diff operation ─────────────────────────────────────────────────────────────
@@ -109,6 +136,187 @@ pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Vec<Diff
 /// the end. Returns DiffOps suitable for a migration file body.
 pub fn diff_states(before: &DbState, after: &DbState) -> Vec<DiffOp> {
     diff_states_inner(before, after)
+}
+
+/// Detect potential type (table) renames: tables that exist in `current` but
+/// not in `target`, paired with types that exist in `target` but not in
+/// `current`, where the column-set Jaccard similarity meets a threshold.
+pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<TypeRenameCandidate> {
+    let target_keys: HashSet<(&str, &str)> = target.types.iter()
+        .filter(|t| !t.abstract_ && !t.junction)
+        .map(|t| (t.module.as_str(), t.table.as_str()))
+        .collect();
+    let current_keys: HashSet<(&str, &str)> = current.tables.iter()
+        .map(|t| (t.schema.as_str(), t.name.as_str()))
+        .collect();
+
+    let dropped: Vec<&DbTable> = current.tables.iter()
+        .filter(|t| !target_keys.contains(&(t.schema.as_str(), t.name.as_str())))
+        .collect();
+    let created: Vec<&TypeDescriptor> = target.types.iter()
+        .filter(|t| !t.abstract_ && !t.junction)
+        .filter(|t| !current_keys.contains(&(t.module.as_str(), t.table.as_str())))
+        .collect();
+
+    if dropped.is_empty() || created.is_empty() {
+        return vec![];
+    }
+
+    let mut candidates: Vec<TypeRenameCandidate> = Vec::new();
+    for dropped_t in &dropped {
+        let old_cols: HashSet<&str> = dropped_t.columns.iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| !n.starts_with("__"))
+            .collect();
+        for new_type in &created {
+            let new_cols: HashSet<&str> = new_type.properties.iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            let intersection = old_cols.intersection(&new_cols).count();
+            let union_size = old_cols.union(&new_cols).count();
+            if union_size == 0 { continue; }
+            let confidence = intersection as f64 / union_size as f64;
+            if confidence >= 0.4 {
+                candidates.push(TypeRenameCandidate {
+                    old_module: dropped_t.schema.clone(),
+                    old_table: dropped_t.name.clone(),
+                    new_module: new_type.module.clone(),
+                    new_table: new_type.table.clone(),
+                    new_type_name: new_type.name.clone(),
+                    confidence,
+                });
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    candidates
+}
+
+/// Detect potential column renames within tables that exist in both `current`
+/// and `target`. A candidate is a (dropped_col, added_col) pair in the same
+/// table with the same Postgres type.
+pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<ColRenameCandidate> {
+    let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
+        .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+        .collect();
+
+    let mut candidates: Vec<ColRenameCandidate> = Vec::new();
+    for td in &target.types {
+        if td.abstract_ || td.junction { continue; }
+        let Some(cur) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) else { continue };
+
+        // Target columns as owned Vec to avoid temporary String lifetime issues.
+        let target_cols: Vec<(String, String)> = td.properties.iter()
+            .map(|p| (p.name.clone(), col_type_str(&p.pg_type).to_string()))
+            .chain(td.links.iter().map(|l| (format!("{}_id", l.name), "uuid".to_string())))
+            .collect();
+
+        // Current columns (skip internal __*__ columns).
+        let cur_cols: Vec<(&str, &str)> = cur.columns.iter()
+            .filter(|c| !c.name.starts_with("__"))
+            .map(|c| (c.name.as_str(), c.pg_type.as_str()))
+            .collect();
+
+        // Dropped: in current but not in target.
+        let dropped: Vec<(&str, &str)> = cur_cols.iter().copied()
+            .filter(|(name, _)| !target_cols.iter().any(|(t, _)| t.as_str() == *name))
+            .collect();
+        // Added: in target but not in current.
+        let added: Vec<(&str, &str)> = target_cols.iter()
+            .filter(|(name, _)| !cur_cols.iter().any(|&(c, _)| c == name.as_str()))
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        if dropped.is_empty() || added.is_empty() { continue; }
+
+        // Match dropped↔added pairs by Postgres type.
+        // Only propose when unambiguous: exactly one dropped and one added per type.
+        let mut dropped_by_type: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, pg_type) in &dropped {
+            dropped_by_type.entry(pg_type).or_default().push(name);
+        }
+        let mut added_by_type: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, pg_type) in &added {
+            added_by_type.entry(pg_type).or_default().push(name);
+        }
+
+        for (pg_type, dropped_names) in &dropped_by_type {
+            if let Some(added_names) = added_by_type.get(pg_type) {
+                if dropped_names.len() == 1 && added_names.len() == 1 {
+                    candidates.push(ColRenameCandidate {
+                        module: td.module.clone(),
+                        table: td.table.clone(),
+                        old_col: dropped_names[0].to_string(),
+                        new_col: added_names[0].to_string(),
+                        pg_type: pg_type.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// Like `diff_schema_ops` but incorporates confirmed renames: emits
+/// ALTER TABLE RENAME (for types) and ALTER TABLE RENAME COLUMN (for columns)
+/// instead of DROP + CREATE pairs for renamed objects.
+///
+/// `type_renames`: `(old_module, old_table, new_module, new_table)` tuples.
+/// `col_renames`:  `(module, table, old_col, new_col)` tuples.
+pub fn diff_schema_ops_with_renames(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    type_renames: &[(String, String, String, String)],
+    col_renames: &[(String, String, String, String)],
+) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut modified = current.clone();
+
+    // ── Emit type rename DDL and update modified state ────────────────────────
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        if old_mod == new_mod {
+            push_tx(&mut ops, format!(
+                "ALTER TABLE {} RENAME TO {};",
+                qn(old_mod, old_table), qi(new_table)
+            ));
+        } else {
+            push_tx(&mut ops, format!(
+                "ALTER TABLE {} SET SCHEMA {};",
+                qn(old_mod, old_table), qi(new_mod)
+            ));
+            push_tx(&mut ops, format!(
+                "ALTER TABLE {} RENAME TO {};",
+                qn(new_mod, old_table), qi(new_table)
+            ));
+        }
+        // Make diff_inner think the new name already exists (with old columns).
+        if let Some(t) = modified.tables.iter_mut()
+            .find(|t| &t.schema == old_mod && &t.name == old_table)
+        {
+            t.schema = new_mod.clone();
+            t.name = new_table.clone();
+        }
+    }
+
+    // ── Emit column rename DDL and update modified state ──────────────────────
+    for (module, table, old_col, new_col) in col_renames {
+        push_tx(&mut ops, format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {};",
+            qn(module, table), qi(old_col), qi(new_col)
+        ));
+        if let Some(t) = modified.tables.iter_mut()
+            .find(|t| &t.schema == module && &t.name == table)
+        {
+            if let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col) {
+                col.name = new_col.clone();
+            }
+        }
+    }
+
+    // ── Run the standard diff against the modified state ──────────────────────
+    let mut diff_ops = diff_inner(target, &modified, true);
+    ops.append(&mut diff_ops);
+    ops
 }
 
 // ── Identifier helpers ────────────────────────────────────────────────────────
