@@ -43,6 +43,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_plain_indexes(schema, &mut out);
     emit_triggers(schema, &mut out);
     emit_interface_views(schema, &mut out);
+    emit_interface_exclusive_triggers(schema, &mut out);
     emit_object_functions(schema, &mut out)?;
     emit_vector_columns(schema, &mut out);
     emit_vector_indexes(schema, &mut out);
@@ -697,6 +698,160 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
+// ── Phase 11.5: interface exclusive constraint triggers ────────────────────────
+
+/// Structured description of one cross-table exclusive constraint trigger group.
+/// Used by the diff engine to detect added/removed triggers without re-parsing DDL.
+pub struct ExclTriggerInfo {
+    pub fn_module: String,
+    pub fn_name: String,
+    pub fn_ddl: String,
+    pub impl_module: String,
+    pub impl_table: String,
+    pub ins_trigger_name: String,
+    pub ins_ddl: String,
+    pub upd_trigger_name: String,
+    pub upd_ddl: String,
+}
+
+fn excl_fn_name(iface_table: &str, fields: &[String]) -> String {
+    format!("_excl_{}_{}", iface_table, fields.join("_"))
+}
+
+fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescriptor) -> ExclTriggerInfo {
+    let fn_name = excl_fn_name(&iface.table, fields);
+    let fn_qname = format!("{}.{}", pg_schema(&iface.module), qi(&fn_name));
+    let view_qname = qn(&iface.module, &iface.table);
+    let tbl_qname = qn(&impl_t.module, &impl_t.table);
+
+    let field_conds: Vec<String> = fields.iter()
+        .map(|f| format!("{} = NEW.{}", qi(f), qi(f)))
+        .collect();
+    let where_clause = format!("{} AND \"id\" <> NEW.\"id\"", field_conds.join(" AND "));
+
+    let detail_keys = fields.join(", ");
+    let detail_vals = fields.iter()
+        .map(|f| format!("NEW.{}::text", qi(f)))
+        .collect::<Vec<_>>()
+        .join(" || ', ' || ");
+
+    let fn_ddl = format!(
+        "CREATE OR REPLACE FUNCTION {}()\n\
+         RETURNS trigger LANGUAGE plpgsql AS $$\n\
+         BEGIN\n\
+           IF EXISTS (\n\
+             SELECT 1 FROM {}\n\
+             WHERE {}\n\
+           ) THEN\n\
+             RAISE unique_violation\n\
+               USING CONSTRAINT = '{}',\n\
+                     DETAIL = format('Key ({})=(%s) already exists.', {});\n\
+           END IF;\n\
+           RETURN NEW;\n\
+         END;\n\
+         $$;",
+        fn_qname, view_qname, where_clause, fn_name, detail_keys, detail_vals,
+    );
+
+    let ins_trigger_name = format!("{}_ins", fn_name);
+    let upd_trigger_name = format!("{}_upd", fn_name);
+    let of_cols = fields.iter().map(|f| qi(f)).collect::<Vec<_>>().join(", ");
+    let when_clause = fields.iter()
+        .map(|f| format!("OLD.{} IS DISTINCT FROM NEW.{}", qi(f), qi(f)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let ins_ddl = format!(
+        "CREATE CONSTRAINT TRIGGER {}\n\
+         AFTER INSERT ON {}\n\
+         DEFERRABLE INITIALLY DEFERRED\n\
+         FOR EACH ROW EXECUTE FUNCTION {}();",
+        qi(&ins_trigger_name), tbl_qname, fn_qname,
+    );
+    let upd_ddl = format!(
+        "CREATE CONSTRAINT TRIGGER {}\n\
+         AFTER UPDATE OF {} ON {}\n\
+         DEFERRABLE INITIALLY DEFERRED\n\
+         FOR EACH ROW WHEN ({})\n\
+         EXECUTE FUNCTION {}();",
+        qi(&upd_trigger_name), of_cols, tbl_qname, when_clause, fn_qname,
+    );
+
+    ExclTriggerInfo {
+        fn_module: iface.module.clone(),
+        fn_name,
+        fn_ddl,
+        impl_module: impl_t.module.clone(),
+        impl_table: impl_t.table.clone(),
+        ins_trigger_name,
+        ins_ddl,
+        upd_trigger_name,
+        upd_ddl,
+    }
+}
+
+/// Collect all cross-table exclusive constraint trigger specs for `schema`.
+///
+/// Returns one `ExclTriggerInfo` per (interface exclusive constraint, concrete implementor).
+/// The same `fn_name` may appear multiple times (once per implementor); callers should
+/// deduplicate when emitting `CREATE OR REPLACE FUNCTION`.
+pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclTriggerInfo> {
+    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
+    for t in &schema.types {
+        if !t.abstract_ {
+            for iface in &t.interfaces {
+                implementors.entry(iface.clone()).or_default().push(t);
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if !(t.abstract_ && t.materialized) { continue; }
+        let key = format!("{}::{}", t.module, t.name);
+        let Some(impls) = implementors.get(&key) else { continue };
+        if impls.is_empty() { continue; }
+
+        for p in &t.properties {
+            if !p.is_exclusive || p.is_pk { continue; }
+            let fields = vec![p.name.clone()];
+            for impl_t in impls {
+                result.push(make_excl_info(t, &fields, impl_t));
+            }
+        }
+        for l in &t.links {
+            if !l.is_exclusive { continue; }
+            let fields = vec![format!("{}_id", l.name)];
+            for impl_t in impls {
+                result.push(make_excl_info(t, &fields, impl_t));
+            }
+        }
+        for c in &t.constraints {
+            if let TypeConstraint::Exclusive { fields, .. } = c {
+                for impl_t in impls {
+                    result.push(make_excl_info(t, fields, impl_t));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn emit_interface_exclusive_triggers(schema: &SchemaDescriptor, out: &mut String) {
+    use std::collections::HashSet;
+    let mut fn_emitted: HashSet<String> = HashSet::new();
+    for info in interface_exclusive_trigger_infos(schema) {
+        if fn_emitted.insert(info.fn_name.clone()) {
+            out.push_str(&info.fn_ddl);
+            out.push_str("\n\n");
+        }
+        out.push_str(&info.ins_ddl);
+        out.push('\n');
+        out.push_str(&info.upd_ddl);
+        out.push_str("\n\n");
+    }
+}
+
 // ── Phase 12: user-defined functions ─────────────────────────────────────────
 
 fn emit_scalar_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
@@ -1136,7 +1291,7 @@ mod tests {
         };
         let schema = minimal_schema(vec![fd.clone()]);
         let ddl = emit_one_function(&fd, &schema).unwrap();
-        assert!(ddl.contains("CREATE OR REPLACE FUNCTION \"default\".\"adults\"()"), "got:\n{}", ddl);
+        assert!(ddl.contains("CREATE OR REPLACE FUNCTION \"public\".\"adults\"()"), "got:\n{}", ddl);
         assert!(ddl.contains("RETURNS TABLE("), "got:\n{}", ddl);
         assert!(ddl.contains("\"id\" uuid"), "got:\n{}", ddl);
         assert!(ddl.contains("\"age\" int8"), "got:\n{}", ddl);
@@ -1162,8 +1317,8 @@ mod tests {
             functions: vec![], aliases: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
-        assert!(ddl.contains("CREATE SEQUENCE \"default\".\"OrderNumber_seq\""), "got:\n{}", ddl);
-        assert!(ddl.contains("CREATE DOMAIN \"default\".\"OrderNumber\" AS int8"), "got:\n{}", ddl);
+        assert!(ddl.contains("CREATE SEQUENCE \"public\".\"OrderNumber_seq\""), "got:\n{}", ddl);
+        assert!(ddl.contains("CREATE DOMAIN \"public\".\"OrderNumber\" AS int8"), "got:\n{}", ddl);
         // Sequence must precede domain in the output
         let seq_pos = ddl.find("CREATE SEQUENCE").unwrap();
         let dom_pos = ddl.find("CREATE DOMAIN").unwrap();

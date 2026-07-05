@@ -41,6 +41,8 @@ pub struct DbTable {
     pub foreign_keys: Vec<DbForeignKey>,
     pub indexes: Vec<DbIndex>,
     pub checks: Vec<DbCheck>,
+    #[serde(default)]
+    pub triggers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +151,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .map(|s| DbSequence { schema: s.module.clone(), name: format!("{}_seq", s.name) })
         .collect();
 
+    let excl_trigger_names = expected_excl_trigger_names(schema);
     let mut tables: Vec<DbTable> = Vec::new();
 
     for td in &schema.types {
@@ -285,6 +288,10 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             }
         }
 
+        let triggers = excl_trigger_names
+            .get(&(td.module.clone(), td.table.clone()))
+            .cloned()
+            .unwrap_or_default();
         tables.push(DbTable {
             schema: td.module.clone(),
             name: td.table.clone(),
@@ -292,6 +299,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             foreign_keys,
             indexes,
             checks,
+            triggers,
         });
 
         // Junction tables for multi-links
@@ -346,6 +354,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 foreign_keys: jt_fks,
                 indexes: vec![],
                 checks: vec![],
+                triggers: vec![],
             });
         }
     }
@@ -380,6 +389,64 @@ pub fn db_state_to_json(state: &DbState) -> String {
 /// Deserialize a `DbState` from the JSON stored in `_pylon."Migrations".db_state`.
 pub fn db_state_from_json(json: &str) -> Result<DbState, String> {
     serde_json::from_str(json).map_err(|e| e.to_string())
+}
+
+impl DbState {
+    /// Add a constraint trigger name to an existing table entry.
+    pub fn add_trigger(&mut self, module: &str, table: &str, trigger_name: &str) {
+        if let Some(t) = self.tables.iter_mut().find(|t| t.schema == module && t.name == table) {
+            t.triggers.push(trigger_name.to_string());
+        }
+    }
+}
+
+/// Compute the expected constraint trigger names per concrete table for all
+/// interface-level exclusive constraints in `schema`.
+///
+/// Returns a map from `(module, table)` to the list of trigger names that
+/// should exist on that concrete table.
+fn expected_excl_trigger_names(schema: &SchemaDescriptor) -> HashMap<(String, String), Vec<String>> {
+    use crate::schema::TypeConstraint;
+
+    let mut impl_map: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
+    for t in &schema.types {
+        if !t.abstract_ {
+            for iface in &t.interfaces {
+                impl_map.entry(iface.clone()).or_default().push(t);
+            }
+        }
+    }
+
+    let mut result: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for t in &schema.types {
+        if !(t.abstract_ && t.materialized) { continue; }
+        let key = format!("{}::{}", t.module, t.name);
+        let Some(impls) = impl_map.get(&key) else { continue };
+        if impls.is_empty() { continue; }
+
+        let mut fields_list: Vec<Vec<String>> = Vec::new();
+        for p in &t.properties {
+            if p.is_exclusive && !p.is_pk { fields_list.push(vec![p.name.clone()]); }
+        }
+        for l in &t.links {
+            if l.is_exclusive { fields_list.push(vec![format!("{}_id", l.name)]); }
+        }
+        for c in &t.constraints {
+            if let TypeConstraint::Exclusive { fields, .. } = c { fields_list.push(fields.clone()); }
+        }
+
+        for fields in &fields_list {
+            let fn_name = format!("_excl_{}_{}", t.table, fields.join("_"));
+            for impl_t in impls {
+                let entry = result
+                    .entry((impl_t.module.clone(), impl_t.table.clone()))
+                    .or_default();
+                entry.push(format!("{}_ins", fn_name));
+                entry.push(format!("{}_upd", fn_name));
+            }
+        }
+    }
+    result
 }
 
 // ── Rename candidates ─────────────────────────────────────────────────────────
@@ -1165,6 +1232,56 @@ fn diff_inner(
         if emit { push_tx(&mut ops, ddl); }
     }
 
+    // ── Phase 11.5: interface exclusive constraint triggers ──────────────────
+    {
+        let infos = crate::export::interface_exclusive_trigger_infos(target);
+        let cur_trigger_map: HashMap<(&str, &str), HashSet<&str>> = current.tables.iter()
+            .map(|t| (
+                (t.schema.as_str(), t.name.as_str()),
+                t.triggers.iter().map(|n| n.as_str()).collect::<HashSet<_>>(),
+            ))
+            .collect();
+
+        // Track expected triggers per table (for the drop phase below).
+        let mut expected_trigger_map: HashMap<(String, String), HashSet<String>> = HashMap::new();
+        // Track which trigger functions have been emitted in this diff pass.
+        let mut fn_emitted: HashSet<String> = HashSet::new();
+
+        for info in &infos {
+            let table_key = (info.impl_module.clone(), info.impl_table.clone());
+            expected_trigger_map.entry(table_key).or_default()
+                .extend([info.ins_trigger_name.clone(), info.upd_trigger_name.clone()]);
+
+            let cur = cur_trigger_map
+                .get(&(info.impl_module.as_str(), info.impl_table.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            let need_ins = !cur.contains(info.ins_trigger_name.as_str());
+            let need_upd = !cur.contains(info.upd_trigger_name.as_str());
+            if need_ins || need_upd {
+                if fn_emitted.insert(info.fn_name.clone()) {
+                    push_tx(&mut ops, info.fn_ddl.clone());
+                }
+                if need_ins { push_tx(&mut ops, info.ins_ddl.clone()); }
+                if need_upd { push_tx(&mut ops, info.upd_ddl.clone()); }
+            }
+        }
+
+        // Drop triggers that no longer exist in the target schema.
+        for cur_table in &current.tables {
+            let key = (cur_table.schema.clone(), cur_table.name.clone());
+            let expected = expected_trigger_map.get(&key).cloned().unwrap_or_default();
+            for trigger_name in &cur_table.triggers {
+                if !expected.contains(trigger_name) {
+                    push_tx(&mut ops, format!(
+                        "DROP TRIGGER IF EXISTS {} ON {};",
+                        qi(trigger_name), qn(&cur_table.schema, &cur_table.name)
+                    ));
+                }
+            }
+        }
+    }
+
     // ── Phase 12: drop removed tables ────────────────────────────────────────
     let mut target_tables: HashSet<(String, String)> = HashSet::new();
     for td in &target.types {
@@ -1195,7 +1312,7 @@ fn diff_inner(
         if !target_enum_set.contains(&(cur_enum.schema.clone(), cur_enum.name.clone())) {
             push_tx(&mut ops, format!(
                 "DROP TYPE IF EXISTS {}.{} CASCADE;",
-                qi(&cur_enum.schema), qi(&cur_enum.name)
+                pg_schema(&cur_enum.schema), qi(&cur_enum.name)
             ));
         }
     }
@@ -1208,7 +1325,7 @@ fn diff_inner(
         if !target_domain_set.contains(&(cur_domain.schema.clone(), cur_domain.name.clone())) {
             push_tx(&mut ops, format!(
                 "DROP DOMAIN IF EXISTS {}.{} CASCADE;",
-                qi(&cur_domain.schema), qi(&cur_domain.name)
+                pg_schema(&cur_domain.schema), qi(&cur_domain.name)
             ));
         }
     }
@@ -1222,7 +1339,7 @@ fn diff_inner(
         if !target_sequence_set.contains(&(cur_seq.schema.clone(), cur_seq.name.clone())) {
             push_tx(&mut ops, format!(
                 "DROP SEQUENCE IF EXISTS {}.{};",
-                qi(&cur_seq.schema), qi(&cur_seq.name)
+                pg_schema(&cur_seq.schema), qi(&cur_seq.name)
             ));
         }
     }
@@ -1795,7 +1912,7 @@ mod tests {
                     DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
                     DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
             }],
             enums: vec![], domains: vec![],
             ..DbState::default()
@@ -1819,7 +1936,7 @@ mod tests {
                     DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
                     DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
             }],
             enums: vec![], domains: vec![],
             ..DbState::default()
@@ -1841,7 +1958,7 @@ mod tests {
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("CREATE TYPE \"default\".\"Status\" AS ENUM"), "got:\n{joined}");
+        assert!(joined.contains("CREATE TYPE \"public\".\"Status\" AS ENUM"), "got:\n{joined}");
     }
 
     #[test]
@@ -1853,14 +1970,14 @@ mod tests {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
                 schema: "default".into(), name: "OldType".into(),
-                columns: vec![], foreign_keys: vec![], indexes: vec![], checks: vec![],
+                columns: vec![], foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
             }],
             enums: vec![], domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("DROP TABLE IF EXISTS \"default\".\"OldType\" CASCADE"), "got:\n{joined}");
+        assert!(joined.contains("DROP TABLE IF EXISTS \"public\".\"OldType\" CASCADE"), "got:\n{joined}");
     }
 
     #[test]
@@ -1886,7 +2003,7 @@ mod tests {
                     DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
                     DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
             }],
             enums: vec![], domains: vec![],
             ..DbState::default()
@@ -1937,8 +2054,8 @@ mod tests {
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("CREATE SEQUENCE IF NOT EXISTS \"default\".\"OrderNumber_seq\""), "got:\n{joined}");
-        assert!(joined.contains("CREATE DOMAIN \"default\".\"OrderNumber\" AS int8"), "got:\n{joined}");
+        assert!(joined.contains("CREATE SEQUENCE IF NOT EXISTS \"public\".\"OrderNumber_seq\""), "got:\n{joined}");
+        assert!(joined.contains("CREATE DOMAIN \"public\".\"OrderNumber\" AS int8"), "got:\n{joined}");
         // Sequence must precede domain
         let seq_pos = joined.find("CREATE SEQUENCE").unwrap();
         let dom_pos = joined.find("CREATE DOMAIN").unwrap();
@@ -1974,7 +2091,7 @@ mod tests {
         };
         let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("DROP DOMAIN IF EXISTS \"default\".\"OrderNumber\""), "got:\n{joined}");
-        assert!(joined.contains("DROP SEQUENCE IF EXISTS \"default\".\"OrderNumber_seq\""), "got:\n{joined}");
+        assert!(joined.contains("DROP DOMAIN IF EXISTS \"public\".\"OrderNumber\""), "got:\n{joined}");
+        assert!(joined.contains("DROP SEQUENCE IF EXISTS \"public\".\"OrderNumber_seq\""), "got:\n{joined}");
     }
 }

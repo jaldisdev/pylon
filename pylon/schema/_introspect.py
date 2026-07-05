@@ -156,6 +156,18 @@ WHERE p.prokind = 'f'
 ORDER BY n.nspname, p.proname
 """
 
+_TRIGGERS_SQL = """
+SELECT t.tgname AS name, n.nspname AS pg_schema, c.relname AS table_name
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT t.tgisinternal
+  AND t.tgconstraint != 0
+  AND n.nspname NOT LIKE 'pg_%'
+  AND n.nspname <> ALL($1::text[])
+ORDER BY n.nspname, c.relname, t.tgname
+"""
+
 
 def _ddl_hash(text: str) -> str:
     import hashlib
@@ -253,5 +265,11 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
     fn_rows = await conn.fetch(_FUNCTIONS_SQL, object_excludes)
     for row in fn_rows:
         state.add_function(_pg_to_module(row["schema"]), row["name"], _ddl_hash(row["definition"]))
+
+    # Constraint triggers (cross-table exclusive enforcement)
+    trigger_rows = await conn.fetch(_TRIGGERS_SQL, object_excludes)
+    for row in trigger_rows:
+        module = _pg_to_module(row["pg_schema"])
+        state.add_trigger(module, row["table_name"], row["name"])
 
     return state

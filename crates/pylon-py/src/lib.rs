@@ -1410,7 +1410,7 @@ impl DbState {
         self.inner.domains.push(core::diff::DbDomain { schema, name });
     }
 
-    /// Add a table. Columns, FKs, indexes, and checks are set via add_column etc.
+    /// Add a table. Columns, FKs, indexes, checks, and triggers are set via add_column etc.
     fn add_table(&mut self, schema: String, name: String) {
         self.inner.tables.push(core::diff::DbTable {
             schema,
@@ -1419,7 +1419,12 @@ impl DbState {
             foreign_keys: vec![],
             indexes: vec![],
             checks: vec![],
+            triggers: vec![],
         });
+    }
+
+    fn add_trigger(&mut self, schema: &str, table: &str, trigger_name: String) {
+        self.inner.add_trigger(schema, table, &trigger_name);
     }
 
     fn add_column(
