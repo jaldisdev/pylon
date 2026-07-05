@@ -1002,6 +1002,30 @@ impl GlobalDescriptor {
     }
 }
 
+// ── Alias descriptor ───────────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct AliasDescriptor {
+    inner: core::schema::AliasDescriptor,
+}
+
+#[pymethods]
+impl AliasDescriptor {
+    #[new]
+    fn new(name: String, module: String, expr: String) -> Self {
+        Self { inner: core::schema::AliasDescriptor { name, module, expr } }
+    }
+
+    #[getter]
+    fn name(&self) -> &str { &self.inner.name }
+
+    #[getter]
+    fn module(&self) -> &str { &self.inner.module }
+
+    #[getter]
+    fn expr(&self) -> &str { &self.inner.expr }
+}
+
 // ── Function descriptors ────────────────────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -1101,13 +1125,14 @@ pub struct SchemaDescriptor {
 #[pymethods]
 impl SchemaDescriptor {
     #[new]
-    #[pyo3(signature = (*, types = None, scalars = None, enums = None, globals = None, functions = None))]
+    #[pyo3(signature = (*, types = None, scalars = None, enums = None, globals = None, functions = None, aliases = None))]
     fn new(
         types: Option<Vec<PyRef<TypeDescriptor>>>,
         scalars: Option<Vec<PyRef<ScalarDescriptor>>>,
         enums: Option<Vec<PyRef<EnumDescriptor>>>,
         globals: Option<Vec<PyRef<GlobalDescriptor>>>,
         functions: Option<Vec<PyRef<FunctionDescriptor>>>,
+        aliases: Option<Vec<PyRef<AliasDescriptor>>>,
     ) -> Self {
         Self {
             inner: core::schema::SchemaDescriptor {
@@ -1135,6 +1160,11 @@ impl SchemaDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|f| f.inner.clone())
+                    .collect(),
+                aliases: aliases
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|a| a.inner.clone())
                     .collect(),
             },
         }
@@ -1749,6 +1779,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScalarDescriptor>()?;
     m.add_class::<EnumDescriptor>()?;
     m.add_class::<GlobalDescriptor>()?;
+    m.add_class::<AliasDescriptor>()?;
     m.add_class::<FunctionParamDescriptor>()?;
     m.add_class::<FunctionDescriptor>()?;
     m.add_class::<SchemaDescriptor>()?;

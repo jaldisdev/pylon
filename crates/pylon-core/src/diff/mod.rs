@@ -1663,7 +1663,7 @@ mod tests {
     fn test_new_schema_and_table() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("catalog", "Product", "Product")],
-            scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -1675,7 +1675,7 @@ mod tests {
     fn test_no_ops_when_in_sync() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -1699,7 +1699,7 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("email", "text", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -1727,7 +1727,7 @@ mod tests {
                 name: "Status".into(), module: "default".into(),
                 members: vec!["Active".into(), "Inactive".into()],
             }],
-            globals: vec![], functions: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -1737,7 +1737,7 @@ mod tests {
     #[test]
     fn test_drop_table() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![], scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -1765,7 +1765,7 @@ mod tests {
             dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         // The table already exists in the DB (pre-existing).
         let state = DbState {
@@ -1799,7 +1799,7 @@ mod tests {
             dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         // Table does NOT exist in the DB → it's new.
         let ops = diff_schema_ops(&schema, &empty_state()).unwrap();
@@ -1822,7 +1822,7 @@ mod tests {
     #[test]
     fn test_new_sequence_creates_sequence_and_domain() {
         let schema = SchemaDescriptor {
-            types: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
@@ -1838,7 +1838,7 @@ mod tests {
     #[test]
     fn test_no_ops_sequence_already_exists() {
         let schema = SchemaDescriptor {
-            types: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
         };
         let state = DbState {
@@ -1854,7 +1854,7 @@ mod tests {
     #[test]
     fn test_drop_removed_sequence() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            types: vec![], scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],

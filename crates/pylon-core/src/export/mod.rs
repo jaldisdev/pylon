@@ -1052,6 +1052,7 @@ mod tests {
             enums: vec![],
             globals: vec![],
             functions: fns,
+            aliases: vec![],
         }
     }
 
@@ -1137,7 +1138,7 @@ mod tests {
             }],
             enums: vec![],
             globals: vec![],
-            functions: vec![],
+            functions: vec![], aliases: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("CREATE SEQUENCE \"default\".\"OrderNumber_seq\""), "got:\n{}", ddl);

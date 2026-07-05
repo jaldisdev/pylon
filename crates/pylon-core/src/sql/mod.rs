@@ -2364,7 +2364,7 @@ mod tests {
             scalars: vec![],
             enums: vec![],
             globals: vec![],
-            functions: vec![],
+            functions: vec![], aliases: vec![],
         }
     }
 
@@ -2539,7 +2539,7 @@ mod tests {
                     indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
                 },
             ],
-            scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
         }
     }
 

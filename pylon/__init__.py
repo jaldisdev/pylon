@@ -34,6 +34,8 @@ from .schema import (
     FieldMeta,
     Float32,
     Float64,
+    Alias,
+    AliasDescriptor,
     Global,
     GlobalDescriptor,
     Index,
@@ -162,6 +164,8 @@ __all__ = [
     "SearchMode",
     "SearchWeight",
     # Schema — globals
+    "Alias",
+    "AliasDescriptor",
     "Global",
     "GlobalDescriptor",
     "collect_module_globals",

@@ -319,6 +319,16 @@ pub struct FunctionDescriptor {
     pub body: String,
 }
 
+// ── Alias descriptor ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AliasDescriptor {
+    pub name: String,
+    pub module: String,
+    /// PyQL expression string (the alias body).
+    pub expr: String,
+}
+
 // ── Top-level schema ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -328,4 +338,5 @@ pub struct SchemaDescriptor {
     pub enums: Vec<EnumDescriptor>,
     pub globals: Vec<GlobalDescriptor>,
     pub functions: Vec<FunctionDescriptor>,
+    pub aliases: Vec<AliasDescriptor>,
 }
