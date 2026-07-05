@@ -977,17 +977,6 @@ pub fn compile_search_index_fetch(
     ))
 }
 
-/// Compile a schema-level PyQL expression fragment to a raw SQL expression string.
-///
-/// Separate entry point from `compile()` — called only by the schema exporter,
-/// never by application code.
-pub(crate) fn compile_fragment(
-    _expression: &str,
-    _context: &FragmentContext,
-    _schema: &SchemaDescriptor,
-) -> Result<String, PyQLError> {
-    todo!("Fragment compilation not yet implemented")
-}
 
 #[cfg(test)]
 mod tests {
@@ -1152,13 +1141,3 @@ mod tests {
     }
 }
 
-/// Enclosing context for compiling a schema-level PyQL fragment.
-#[derive(Debug, Clone)]
-pub struct FragmentContext {
-    /// Module-qualified name of the enclosing type, e.g. `default::Product`.
-    pub enclosing_type: String,
-    /// Name of the field this fragment belongs to, if any.
-    pub field_name: Option<String>,
-    /// Variables in scope for this fragment, e.g. `__subject__` for constraints/rewrites.
-    pub scope_vars: Vec<String>,
-}

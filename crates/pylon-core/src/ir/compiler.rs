@@ -373,7 +373,7 @@ impl<'a> Compiler<'a> {
         &mut self,
         outer: &ast::SelectStmt,
         result: &Expr,
-        distinct: bool,
+        _distinct: bool,
     ) -> Result<Option<IrStmt>, PyQLError> {
         let (global_name, shape_elements): (&str, &[ast::ShapeElement]) = match result {
             Expr::Global(name) => (name.as_str(), &[]),
@@ -1547,7 +1547,6 @@ impl<'a> Compiler<'a> {
         alias: &str,
     ) -> Result<IrExpr, PyQLError> {
         let ml = Self::resolve_multilink(td, ml_name).unwrap();
-        let ml_target = ml.target.clone();
         let ml_through = ml.through.clone();
         let td_module = td.module.clone();
         let td_name = td.name.clone();
@@ -3248,7 +3247,7 @@ impl<'a> Compiler<'a> {
         output_alias: &str,
         ml_name: &str,
         td: &TypeDescriptor,
-        parent_alias: &str,
+        _parent_alias: &str,
         module: &str,
         el: &ShapeElement,
     ) -> Result<IrShapeField, PyQLError> {
@@ -4801,7 +4800,6 @@ impl<'a> Compiler<'a> {
     ) -> Result<Option<IrFunctionSelect>, PyQLError> {
         use crate::schema::FunctionDescriptor;
 
-        let effective_module = fc.module.as_deref().unwrap_or("default");
         let fd: Option<&FunctionDescriptor> = self.schema.functions.iter().find(|f| {
             let module_matches = fc.module.as_deref().map(|m| m == f.module.as_str()).unwrap_or(true);
             module_matches && f.name == fc.name && f.return_is_object
