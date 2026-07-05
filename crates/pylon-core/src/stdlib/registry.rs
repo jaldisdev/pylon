@@ -338,6 +338,8 @@ END"#)),
 
         // ── std:: bytes ──────────────────────────────────────────────────────
         f("std", "bytes_get_bit", vec![p("b", Bytes), p("n", Int64)], Int64, B("get_bit")),
+        f("std", "bytes_get",     vec![p("b", Bytes), p("n", Int64)], Int64, E("get_byte($1, $2)")),
+        f("std", "from_hex",      vec![p("s", Str)],                  Bytes, E("decode($1, 'hex')")),
         f("std", "to_bytes",
             vec![p("s", Str), p("encoding", Str)],
             Bytes,
