@@ -2053,6 +2053,21 @@ impl<'a> Compiler<'a> {
                 Err(self.type_err("expression is not valid in free SELECT context"))
             }
 
+            Expr::Set(elems) if elems.is_empty() => Ok(IrExpr::Null),
+
+            Expr::Set(elems) => {
+                let compiled: Result<Vec<_>, _> =
+                    elems.iter().map(|e| self.compile_free_expr(e)).collect();
+                let mut compiled = compiled?;
+                if compiled.len() == 1 {
+                    Ok(compiled.remove(0))
+                } else {
+                    Err(self.type_err(
+                        "multi-element set literal is not supported in free SELECT context",
+                    ))
+                }
+            }
+
             // detached has no effect in already-free context
             Expr::Detached(inner) => self.compile_free_expr(inner),
 
