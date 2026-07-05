@@ -2471,7 +2471,7 @@ mod tests {
         assert!(out.sql.contains("'default::Person'::text"));
         assert!(out.sql.contains("\"name\"::text"));
         assert!(out.sql.contains("\"age\"::int8"));
-        assert!(out.sql.contains("FROM \"default\".\"Person\""));
+        assert!(out.sql.contains("FROM \"public\".\"Person\""));
         assert!(out.sql.contains(") AS result"));
     }
 
@@ -2487,7 +2487,7 @@ mod tests {
         let out = compile_and_emit(
             "SELECT <default::Person><uuid>'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'",
         );
-        assert!(out.sql.contains("FROM \"default\".\"Person\""));
+        assert!(out.sql.contains("FROM \"public\".\"Person\""));
         assert!(out.sql.contains("WHERE"));
         assert!(out.sql.contains("'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'"));
     }
@@ -2496,7 +2496,7 @@ mod tests {
     fn test_select_single_link() {
         let out = compile_and_emit("SELECT Person { name, company { name } }");
         assert!(out.sql.contains("'default::Company'::text"));
-        assert!(out.sql.contains("FROM \"default\".\"Company\""));
+        assert!(out.sql.contains("FROM \"public\".\"Company\""));
         // join condition: parent FK column = target PK
         assert!(out.sql.contains("\"company_id\" = "));
     }
@@ -2572,7 +2572,7 @@ mod tests {
         let ir = crate::ir::compile(&ast, &schema).unwrap();
         let out = emit(&ir);
         // Junction table is the PersonFriend table, not the standard dotted name
-        assert!(out.sql.contains("\"default\".\"PersonFriend\""));
+        assert!(out.sql.contains("\"public\".\"PersonFriend\""));
         // Source FK column (person → Person) and target FK column (friend → Person)
         assert!(out.sql.contains("\"friend\""));
         assert!(out.sql.contains("\"person\""));
@@ -2614,7 +2614,7 @@ mod tests {
     #[test]
     fn test_insert_returning() {
         let out = compile_and_emit("INSERT Person { name := 'Alice', age := 30 }");
-        assert!(out.sql.contains("INSERT INTO \"default\".\"Person\""));
+        assert!(out.sql.contains("INSERT INTO \"public\".\"Person\""));
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
         assert!(out.sql.contains(") AS result"));
@@ -2629,7 +2629,7 @@ mod tests {
     #[test]
     fn test_update_returning() {
         let out = compile_and_emit("UPDATE Person FILTER .name = $name SET { age := 31 }");
-        assert!(out.sql.contains("UPDATE \"default\".\"Person\""));
+        assert!(out.sql.contains("UPDATE \"public\".\"Person\""));
         assert!(out.sql.contains("SET"));
         // Bare UPDATE returns pk only
         assert!(out.sql.contains("RETURNING"));
@@ -2640,7 +2640,7 @@ mod tests {
     #[test]
     fn test_delete_returning() {
         let out = compile_and_emit("DELETE Person FILTER .id = $id");
-        assert!(out.sql.contains("DELETE FROM \"default\".\"Person\""));
+        assert!(out.sql.contains("DELETE FROM \"public\".\"Person\""));
         // Bare DELETE returns pk only
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
@@ -2812,7 +2812,7 @@ mod tests {
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         // CTE exposes raw columns via SELECT *
         assert!(out.sql.contains("SELECT *"));
-        assert!(out.sql.contains("FROM \"default\".\"Person\""));
+        assert!(out.sql.contains("FROM \"public\".\"Person\""));
         // CTE carries the inner filter
         assert!(out.sql.contains("WHERE"));
         // Outer SELECT projects its own shape
@@ -2842,7 +2842,7 @@ mod tests {
         assert!(out.sql.contains("SELECT"));
         // The subquery must select the pk (id) of Company
         assert!(out.sql.contains("\"id\""));
-        assert!(out.sql.contains("FROM \"default\".\"Company\""));
+        assert!(out.sql.contains("FROM \"public\".\"Company\""));
         // Filter param must appear
         assert!(out.sql.contains("$2")); // $1 = name, $2 = co
     }
@@ -2854,7 +2854,7 @@ mod tests {
         );
         assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
-        assert!(out.sql.contains("FROM \"default\".\"Company\""));
+        assert!(out.sql.contains("FROM \"public\".\"Company\""));
     }
 
     #[test]
@@ -3041,14 +3041,14 @@ mod tests {
     fn test_user_fn_scalar_call() {
         let schema = make_schema_with_fns();
         let out = compile_and_emit_with("SELECT mysum(1, 2)", &schema);
-        assert!(out.sql.contains("\"default\".\"mysum\"(1, 2)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"mysum\""), "got:\n{}", out.sql);
     }
 
     #[test]
     fn test_user_fn_object_select_no_shape() {
         let schema = make_schema_with_fns();
         let out = compile_and_emit_with("SELECT adults()", &schema);
-        assert!(out.sql.contains("\"default\".\"adults\"()"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"adults\"()"), "got:\n{}", out.sql);
         assert!(out.sql.contains("FROM"), "got:\n{}", out.sql);
     }
 
@@ -3056,7 +3056,7 @@ mod tests {
     fn test_user_fn_object_select_with_shape() {
         let schema = make_schema_with_fns();
         let out = compile_and_emit_with("SELECT adults() { name }", &schema);
-        assert!(out.sql.contains("\"default\".\"adults\"()"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"adults\"()"), "got:\n{}", out.sql);
         assert!(out.sql.contains("\"name\""), "got:\n{}", out.sql);
     }
 
@@ -3070,7 +3070,7 @@ mod tests {
             &schema,
         );
         assert!(
-            out.sql.contains("SELECT * FROM \"default\".\"adults\"()"),
+            out.sql.contains("SELECT * FROM \"public\".\"adults\"()"),
             "CTE source must be SELECT * FROM fn(), got:\n{}",
             out.sql,
         );
