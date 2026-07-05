@@ -1,6 +1,6 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLinkProp, IrLiteral, IrMultiLinkField,
+    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkField,
     IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
     IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect,
     IrShapeField, IrSingleLinkField, IrFtsSearch, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
@@ -395,7 +395,7 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
 }
 
 /// Emit the CTE clause for a junction table INSERT (append / replace-insert).
-fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, idx: usize, cte_name: &str) -> String {
+fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, _idx: usize, cte_name: &str) -> String {
     let vals_ref = emit_multilink_values_subquery(&mutation.values);
     let ins = format!(
         "INSERT INTO {} ({}, {})\nSELECT \"_ids\".\"id\", \"_v\".\"id\" FROM \"_ids\" CROSS JOIN {} AS \"_v\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}",
@@ -410,7 +410,7 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, idx: usize, cte_name: &str
 }
 
 /// Emit the CTE clause for a junction table DELETE (remove).
-fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, idx: usize, cte_name: &str) -> String {
+fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, _idx: usize, cte_name: &str) -> String {
     let vals_ref = emit_multilink_values_subquery(&mutation.values);
     let del = format!(
         "DELETE FROM {}\nWHERE {} IN (SELECT \"id\" FROM \"_ids\")\n  AND {} IN (SELECT \"id\" FROM {})\nRETURNING {}, {}",
@@ -475,7 +475,7 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
 }
 
 fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
-    use crate::query::{Cardinality, ShapeNode};
+    use crate::query::ShapeNode;
 
     if sel.items.is_empty() {
         return SqlOutput {
