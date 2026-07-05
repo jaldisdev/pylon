@@ -192,11 +192,13 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
 pub fn compile_fn_body(
     fn_desc: &crate::schema::FunctionDescriptor,
     schema: &SchemaDescriptor,
-) -> Result<IrStmt, crate::error::PyQLError> {
+) -> Result<super::IrOutput, crate::error::PyQLError> {
     use crate::parse;
+    use crate::parse::ast::Stmt;
 
     let body = fn_desc.body.trim().to_string();
-    let body = if body.starts_with("select") || body.starts_with("SELECT") {
+    let body = if body.starts_with("select") || body.starts_with("SELECT")
+            || body.starts_with("with") || body.starts_with("WITH") {
         body
     } else {
         format!("select {}", body)
@@ -207,7 +209,22 @@ pub fn compile_fn_body(
     for p in &fn_desc.params {
         c.fn_params.insert(p.name.clone(), p.pg_type.clone());
     }
-    c.compile_stmt(&ast)
+
+    let (ctes, ir) = if let Stmt::With(w) = &ast {
+        let mut cte_defs = vec![];
+        for alias in &w.aliases {
+            let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
+            let type_name = cte_stmt_type(&ir_stmt);
+            c.cte_types.insert(alias.name.clone(), type_name.clone());
+            cte_defs.push(super::IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name });
+        }
+        let main = c.compile_stmt(&w.stmt)?;
+        (cte_defs, main)
+    } else {
+        (vec![], c.compile_stmt(&ast)?)
+    };
+
+    Ok(super::IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
 }
 
 /// Compile a single PyQL expression in the context of a named type.
@@ -236,6 +253,22 @@ pub fn compile_expr_unaliased(
     let td = c.resolve_type(type_name)?;
     let ir = c.compile_expr(expr, td, "")?;
     Ok((ir, c.params))
+}
+
+/// Compile a PyQL scalar expression to a SQL string for use as a column DEFAULT.
+///
+/// Wraps the expression in `SELECT <expr>`, compiles it as a free scalar, and
+/// returns the emitted SQL expression (without the SELECT wrapper).
+pub fn compile_scalar_default(pyql: &str, schema: &SchemaDescriptor) -> Result<String, String> {
+    use crate::parse::ast::Stmt;
+    let full = format!("SELECT {}", pyql);
+    let ast = crate::parse::parse(&full).map_err(|e| e.message)?;
+    let Stmt::Select(sel) = &ast else {
+        return Err("default expression must be a select statement".into());
+    };
+    let mut c = Compiler::new(schema);
+    let ir = c.compile_free_expr(&sel.result).map_err(|e| e.to_string())?;
+    Ok(crate::sql::emit_expr(&ir))
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────────

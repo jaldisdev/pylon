@@ -2184,17 +2184,22 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
 ///
 /// For scalar functions (`FreeSelect`) emits just the expression — e.g. `"a" + "b"`.
 /// For object functions (`Select`, `FunctionSelect`) emits a full `SELECT … FROM …`.
-pub fn emit_fn_body(stmt: &IrStmt) -> String {
-    match stmt {
+pub fn emit_fn_body(ir: &crate::ir::IrOutput) -> String {
+    let body = match &ir.stmt {
         IrStmt::FreeSelect(sel) => {
             if let Some(IrFreeExpr::Scalar(e)) = sel.items.first() {
-                // Wrap in a complete SELECT statement for PostgreSQL LANGUAGE SQL body.
                 format!("SELECT {}", emit_expr(e))
             } else {
                 emit_free_select(sel).sql
             }
         }
         other => emit_dml_as_cte_source(other),
+    };
+    if ir.ctes.is_empty() {
+        body
+    } else {
+        let cte_prefix = emit_cte_prefix(&ir.ctes);
+        format!("{}{}", cte_prefix, body)
     }
 }
 
@@ -2240,6 +2245,7 @@ mod tests {
                             pg_type: "uuid".into(),
                             nullable: false,
                             default_sql: Some("uuidv7()".into()),
+                        default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: true,
@@ -2252,6 +2258,7 @@ mod tests {
                             pg_type: "text".into(),
                             nullable: false,
                             default_sql: None,
+                        default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
@@ -2264,6 +2271,7 @@ mod tests {
                             pg_type: "int8".into(),
                             nullable: true,
                             default_sql: None,
+                        default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
@@ -2277,6 +2285,7 @@ mod tests {
                         target: "default::Company".into(),
                         nullable: true,
                         description: None,
+                        default_pyql: None,
                         is_exclusive: false,
                         is_readonly: false,
                         rewrites: vec![],
@@ -2288,6 +2297,7 @@ mod tests {
                         through: None,
                         nullable: false,
                         description: None,
+                        default_pyql: None,
                         on_delete: vec![],
                     }],
                     computed: vec![],
@@ -2312,6 +2322,7 @@ mod tests {
                         pg_type: "text".into(),
                         nullable: false,
                         default_sql: None,
+                        default_pyql: None,
                         description: None,
                         check_constraints: vec![],
                         is_exclusive: false,
@@ -2343,6 +2354,7 @@ mod tests {
                         pg_type: "text".into(),
                         nullable: false,
                         default_sql: None,
+                        default_pyql: None,
                         description: None,
                         check_constraints: vec![],
                         is_exclusive: false,
@@ -2494,12 +2506,14 @@ mod tests {
         let id_prop = || PropertyDescriptor {
             name: "id".into(), pg_type: "uuid".into(), nullable: false,
             default_sql: Some("gen_random_uuid()".into()), description: None,
+                        default_pyql: None,
             check_constraints: vec![], is_exclusive: true, is_pk: true,
             is_readonly: true, rewrites: vec![],
         };
         let name_prop = || PropertyDescriptor {
             name: "name".into(), pg_type: "text".into(), nullable: false,
             default_sql: None, description: None, check_constraints: vec![],
+                        default_pyql: None,
             is_exclusive: false, is_pk: false, is_readonly: false, rewrites: vec![],
         };
         SchemaDescriptor {
@@ -2514,7 +2528,7 @@ mod tests {
                         name: "friends".into(),
                         target: "default::Person".into(),
                         through: Some("default::PersonFriend".into()),
-                        nullable: false, description: None, on_delete: vec![],
+                        nullable: false, description: None, default_pyql: None, on_delete: vec![],
                     }],
                     computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
                 },
@@ -2526,13 +2540,13 @@ mod tests {
                     links: vec![
                         LinkDescriptor {
                             name: "person".into(), target: "default::Person".into(),
-                            nullable: false, description: None, is_exclusive: false,
-                            is_readonly: false, rewrites: vec![], on_delete: vec![],
+                            nullable: false, description: None, default_pyql: None,
+                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
                         },
                         LinkDescriptor {
                             name: "friend".into(), target: "default::Person".into(),
-                            nullable: false, description: None, is_exclusive: false,
-                            is_readonly: false, rewrites: vec![], on_delete: vec![],
+                            nullable: false, description: None, default_pyql: None,
+                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
                         },
                     ],
                     multilinks: vec![], computed: vec![], constraints: vec![],
@@ -2671,6 +2685,7 @@ mod tests {
             pg_type: "text".into(),
             nullable: true,
             default_sql: None,
+                        default_pyql: None,
             description: None,
             check_constraints: vec![],
             is_exclusive: false,

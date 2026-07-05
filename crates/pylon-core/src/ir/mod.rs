@@ -10,6 +10,7 @@ pub use compiler::compile;
 pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_fn_body;
+pub use compiler::compile_scalar_default;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 
@@ -729,6 +730,7 @@ mod tests {
                             pg_type: "uuid".into(),
                             nullable: false,
                             default_sql: Some("uuidv7()".into()),
+                        default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: true,
@@ -741,6 +743,7 @@ mod tests {
                             pg_type: "text".into(),
                             nullable: false,
                             default_sql: None,
+                        default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
@@ -753,6 +756,7 @@ mod tests {
                             pg_type: "int8".into(),
                             nullable: true,
                             default_sql: None,
+                        default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
@@ -766,6 +770,7 @@ mod tests {
                         target: "default::Company".into(),
                         nullable: true,
                         description: None,
+                        default_pyql: None,
                         is_exclusive: false,
                         is_readonly: false,
                         rewrites: vec![],
@@ -777,6 +782,7 @@ mod tests {
                         through: None,
                         nullable: false,
                         description: None,
+                        default_pyql: None,
                         on_delete: vec![],
                     }],
                     computed: vec![],
@@ -801,6 +807,7 @@ mod tests {
                         pg_type: "text".into(),
                         nullable: false,
                         default_sql: None,
+                        default_pyql: None,
                         description: None,
                         check_constraints: vec![],
                         is_exclusive: false,
@@ -832,6 +839,7 @@ mod tests {
                         pg_type: "text".into(),
                         nullable: false,
                         default_sql: None,
+                        default_pyql: None,
                         description: None,
                         check_constraints: vec![],
                         is_exclusive: false,

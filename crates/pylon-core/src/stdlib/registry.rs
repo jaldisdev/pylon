@@ -324,6 +324,18 @@ END"#)),
         f( "std", "json_object_unpack", vec![p("j", Json)],                           set_of(tup(vec![Str, Json])), E("jsonb_each($1)")),
         f( "std", "json_array_length",  vec![p("j", Json)],                           opt(Int64),    B("jsonb_array_length")),
 
+        // ── std:: bitwise ────────────────────────────────────────────────────
+        f("std", "bit_lshift", vec![p("val", Int16), p("n", Int64)], Int16, E("(($1::int8 << $2)::int2)")),
+        f("std", "bit_lshift", vec![p("val", Int32), p("n", Int64)], Int32, E("(($1::int8 << $2)::int4)")),
+        f("std", "bit_lshift", vec![p("val", Int64), p("n", Int64)], Int64, E("($1 << $2)")),
+        f("std", "bit_rshift", vec![p("val", Int16), p("n", Int64)], Int16, E("(($1::int8 >> $2)::int2)")),
+        f("std", "bit_rshift", vec![p("val", Int32), p("n", Int64)], Int32, E("(($1::int8 >> $2)::int4)")),
+        f("std", "bit_rshift", vec![p("val", Int64), p("n", Int64)], Int64, E("($1 >> $2)")),
+        f("std", "to_hex",     vec![p("n", Int16)],                   Str,  E("to_hex($1::int8)")),
+        f("std", "to_hex",     vec![p("n", Int32)],                   Str,  E("to_hex($1::int8)")),
+        f("std", "to_hex",     vec![p("n", Int64)],                   Str,  B("to_hex")),
+        f("std", "to_hex",     vec![p("n", Int32)],                   Str,  E("to_hex($1::int8)")),
+
         // ── std:: bytes ──────────────────────────────────────────────────────
         f("std", "bytes_get_bit", vec![p("b", Bytes), p("n", Int64)], Int64, B("get_bit")),
         f("std", "to_bytes",

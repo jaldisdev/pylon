@@ -66,10 +66,14 @@ SELECT
     a.attname AS name,
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS pg_type,
     NOT a.attnotnull AS nullable,
-    a.attgenerated = 's' AS is_generated
+    a.attgenerated = 's' AS is_generated,
+    CASE WHEN a.atthasdef AND a.attgenerated = '' THEN
+        pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+    END AS column_default
 FROM pg_attribute a
 JOIN pg_class c ON c.oid = a.attrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 WHERE n.nspname = $1
   AND c.relname = $2
   AND a.attnum > 0
@@ -190,6 +194,7 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
                 col["pg_type"],
                 col["nullable"],
                 col["is_generated"],
+                col["column_default"],
             )
 
         fk_rows = await conn.fetch(_FKS_SQL, schema, name)

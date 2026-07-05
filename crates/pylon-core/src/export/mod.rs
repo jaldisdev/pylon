@@ -692,7 +692,7 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
     use crate::sql::emit_fn_body;
 
     // Compile the body PyQL to an IR statement.
-    let ir_stmt = compile_fn_body(fd, schema).map_err(|e| {
+    let ir_output = compile_fn_body(fd, schema).map_err(|e| {
         let msg = format!("error in function '{}::{}' body: {}", fd.module, fd.name, e);
         PyQLError::Fragment(PyQLFragmentError {
             message: msg,
@@ -702,7 +702,7 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
     })?;
 
     // Emit the raw SQL body.
-    let body_sql = emit_fn_body(&ir_stmt);
+    let body_sql = emit_fn_body(&ir_output);
 
     // Parameter list: "name" pg_type, ...
     let params_sql = fd.params.iter()
@@ -1013,6 +1013,7 @@ mod tests {
                     pg_type: "uuid".into(),
                     nullable: false,
                     default_sql: Some("uuidv7()".into()),
+                        default_pyql: None,
                     description: None,
                     check_constraints: vec![],
                     is_exclusive: true,
@@ -1025,6 +1026,7 @@ mod tests {
                     pg_type: "int8".into(),
                     nullable: true,
                     default_sql: None,
+                        default_pyql: None,
                     description: None,
                     check_constraints: vec![],
                     is_exclusive: false,
