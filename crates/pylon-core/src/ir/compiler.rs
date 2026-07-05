@@ -600,7 +600,7 @@ impl<'a> Compiler<'a> {
             )));
         }
         Ok(IrExpr::EnumLiteral {
-            pg_type: format!("\"{}\".\"{}\"", ed.module, ed.name),
+            pg_type: format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name),
             variant: variant.to_string(),
         })
     }
@@ -1921,7 +1921,7 @@ impl<'a> Compiler<'a> {
                     None => tc.ty.name.clone(),
                 };
                 let pg_type = if let Some(ed) = self.resolve_enum(&qname) {
-                    format!("\"{}\".\"{}\"", ed.module, ed.name)
+                    format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name)
                 } else {
                     type_expr_to_pg(&tc.ty)?
                 };
@@ -3502,7 +3502,7 @@ impl<'a> Compiler<'a> {
                     None => tc.ty.name.clone(),
                 };
                 let pg_type = if let Some(ed) = self.resolve_enum(&qname) {
-                    format!("\"{}\".\"{}\"", ed.module, ed.name)
+                    format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name)
                 } else {
                     type_expr_to_pg(&tc.ty)?
                 };

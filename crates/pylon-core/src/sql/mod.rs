@@ -111,6 +111,10 @@ fn pg_schema(module: &str) -> String {
     if module == "default" { "\"public\"".into() } else { qi(module) }
 }
 
+pub fn pg_schema_str(module: &str) -> String {
+    pg_schema(module)
+}
+
 fn qn(module: &str, name: &str) -> String {
     format!("{}.{}", pg_schema(module), qi(name))
 }

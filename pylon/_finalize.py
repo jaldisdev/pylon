@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pylon._core import SchemaDescriptor
 
+RESERVED_MODULE_NAMES: frozenset[str] = frozenset({
+    "public", "pg_catalog", "information_schema", "pg_toast",
+})
+
 
 def _import_schema_dir(schema_dir: Path) -> None:
     """Import every .py file in schema_dir as a top-level module.
@@ -40,6 +44,11 @@ def _import_schema_dir(schema_dir: Path) -> None:
         stem = py_file.stem
         if stem.startswith("_"):
             continue
+        if stem in RESERVED_MODULE_NAMES:
+            raise ValueError(
+                f"'{stem}.py' is not a valid module name: '{stem}' is a reserved "
+                f"PostgreSQL schema name. Use a different name."
+            )
         if stem not in sys.modules:
             importlib.import_module(stem)
 

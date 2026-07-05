@@ -579,10 +579,17 @@ def _reload_schema(config):
     if schema_dir_str not in sys.path:
         sys.path.insert(0, schema_dir_str)
 
+    from pylon._finalize import RESERVED_MODULE_NAMES
     for py_file in sorted(schema_dir.glob("*.py")):
         stem = py_file.stem
-        if not stem.startswith("_"):
-            importlib.import_module(stem)
+        if stem.startswith("_"):
+            continue
+        if stem in RESERVED_MODULE_NAMES:
+            raise click.ClickException(
+                f"'{stem}.py' is not a valid module name: '{stem}' is a reserved "
+                f"PostgreSQL schema name. Use a different name."
+            )
+        importlib.import_module(stem)
 
     from pylon.schema._registry import snapshot, functions_snapshot
     types, enums, custom_scalars = snapshot()
