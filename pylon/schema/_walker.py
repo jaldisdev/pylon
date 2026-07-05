@@ -387,6 +387,10 @@ def _collect_inherited_cit(cls: type) -> tuple[list[Any], list[Any], list[Any]]:
 # ── PG type resolution ─────────────────────────────────────────────────────────
 
 
+def _pg_schema(module: str) -> str:
+    return "public" if module == "default" else module
+
+
 def _to_pg_type(scalar_type: Any) -> str:
     from ._scalars import PG_TYPE_MAP, Scalar, _PylonScalar, SHORTHAND_MAP
     from ._enums import Enum as PylonEnum
@@ -418,7 +422,7 @@ def _to_pg_type(scalar_type: Any) -> str:
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonEnum):
         mod = getattr(scalar_type, "__pylon_module__", None) or \
             (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
-        return f'"{mod.replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
+        return f'"{_pg_schema(mod).replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
 
     # Generic Python types (list[str], dict, etc.) → jsonb
     origin = typing.get_origin(scalar_type)
@@ -589,7 +593,7 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
                     (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
                 )
                 seq_name = f"{scalar_type.__name__}_seq"
-                default_sql = f"""nextval('"{mod}"."{seq_name}"')"""
+                default_sql = f"""nextval('"{_pg_schema(mod)}"."{seq_name}"')"""
             break
     default_pyql = None
     if default_sql is None:

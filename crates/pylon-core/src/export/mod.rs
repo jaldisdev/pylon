@@ -32,6 +32,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_schemas(schema, &mut out);
     emit_enums(schema, &mut out);
     emit_scalars(schema, &mut out);
+    emit_scalar_functions(schema, &mut out)?;
     emit_tables(schema, &mut out);
     emit_fk_constraints(schema, &type_map, &mut out);
     emit_link_source_triggers(schema, &type_map, &mut out);
@@ -42,7 +43,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_plain_indexes(schema, &mut out);
     emit_triggers(schema, &mut out);
     emit_interface_views(schema, &mut out);
-    emit_functions(schema, &mut out)?;
+    emit_object_functions(schema, &mut out)?;
     emit_vector_columns(schema, &mut out);
     emit_vector_indexes(schema, &mut out);
     emit_search_columns(schema, &mut out);
@@ -58,9 +59,12 @@ fn qi(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Schema-qualified name: "module"."name"
+fn pg_schema(module: &str) -> String {
+    if module == "default" { "\"public\"".into() } else { qi(module) }
+}
+
 fn qn(module: &str, name: &str) -> String {
-    format!("{}.{}", qi(module), qi(name))
+    format!("{}.{}", pg_schema(module), qi(name))
 }
 
 // ── FNV-1a hash for stable auto-generated constraint/trigger names ─────────────
@@ -104,10 +108,11 @@ fn emit_schemas(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types   { modules.insert(&t.module); }
     for s in &schema.scalars { modules.insert(&s.module); }
     for e in &schema.enums   { modules.insert(&e.module); }
-    for module in &modules {
-        out.push_str(&format!("CREATE SCHEMA IF NOT EXISTS {};\n", qi(module)));
+    let non_default: Vec<&str> = modules.into_iter().filter(|m| *m != "default").collect();
+    for module in &non_default {
+        out.push_str(&format!("CREATE SCHEMA IF NOT EXISTS {};\n", pg_schema(module)));
     }
-    if !modules.is_empty() {
+    if !non_default.is_empty() {
         out.push('\n');
     }
 }
@@ -121,7 +126,7 @@ fn emit_enums(schema: &SchemaDescriptor, out: &mut String) {
             .collect();
         out.push_str(&format!(
             "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n",
-            qi(&e.module),
+            pg_schema(&e.module),
             qi(&e.name),
             members.join(", "),
         ));
@@ -138,7 +143,7 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
         if s.is_sequence {
             out.push_str(&format!(
                 "CREATE SEQUENCE {}.{};\n",
-                qi(&s.module),
+                pg_schema(&s.module),
                 qi(&format!("{}_seq", s.name)),
             ));
         }
@@ -152,7 +157,7 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
         };
         out.push_str(&format!(
             "CREATE DOMAIN {}.{} AS {}{};\n",
-            qi(&s.module),
+            pg_schema(&s.module),
             qi(&s.name),
             s.pg_type,
             check_clause,
@@ -642,6 +647,22 @@ pub fn function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String,
         .collect()
 }
 
+/// DDL for scalar (non-object-returning) functions only — safe to emit before tables.
+pub fn scalar_function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
+    schema.functions.iter()
+        .filter(|fd| !fd.return_is_object)
+        .map(|fd| emit_one_function(fd, schema).map(|ddl| (fd.module.clone(), fd.name.clone(), ddl)))
+        .collect()
+}
+
+/// DDL for object-returning functions only — must be emitted after tables exist.
+pub fn object_function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
+    schema.functions.iter()
+        .filter(|fd| fd.return_is_object)
+        .map(|fd| emit_one_function(fd, schema).map(|ddl| (fd.module.clone(), fd.name.clone(), ddl)))
+        .collect()
+}
+
 // ── Phase 11: interface views ──────────────────────────────────────────────────
 
 fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &mut String) {
@@ -678,8 +699,17 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
 
 // ── Phase 12: user-defined functions ─────────────────────────────────────────
 
-fn emit_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
-    for fd in &schema.functions {
+fn emit_scalar_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
+    for fd in schema.functions.iter().filter(|fd| !fd.return_is_object) {
+        let ddl = emit_one_function(fd, schema)?;
+        out.push_str(&ddl);
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn emit_object_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
+    for fd in schema.functions.iter().filter(|fd| fd.return_is_object) {
         let ddl = emit_one_function(fd, schema)?;
         out.push_str(&ddl);
         out.push('\n');

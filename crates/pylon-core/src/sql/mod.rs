@@ -107,8 +107,12 @@ fn qi(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+fn pg_schema(module: &str) -> String {
+    if module == "default" { "\"public\"".into() } else { qi(module) }
+}
+
 fn qn(module: &str, name: &str) -> String {
-    format!("{}.{}", qi(module), qi(name))
+    format!("{}.{}", pg_schema(module), qi(name))
 }
 
 fn sql_str(s: &str) -> String {
@@ -289,7 +293,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             // Expose raw columns so the outer SELECT can project its own shape,
             // mirroring how IrStmt::Select works as a CTE source.
             let args_sql = sel.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
-            let fn_call = format!("{}.{}({})", qi(&sel.fn_module), qi(&sel.fn_name), args_sql);
+            let fn_call = format!("{}.{}({})", pg_schema(&sel.fn_module), qi(&sel.fn_name), args_sql);
             let mut sql = format!("    SELECT * FROM {} AS {}", fn_call, qi(&sel.alias));
             append_filter(&mut sql, &sel.filter);
             append_order_by(&mut sql, &sel.order_by);
@@ -1770,7 +1774,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 return sql;
             }
             let name = match &f.schema {
-                Some(s) => format!("{}.{}", qi(s), qi(&f.name)),
+                Some(s) => format!("{}.{}", pg_schema(s), qi(&f.name)),
                 None => f.name.clone(),
             };
             format!("{}({})", name, args.join(", "))
@@ -2146,7 +2150,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
     let distinct = if sel.distinct { "DISTINCT " } else { "" };
 
     let args_sql = sel.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
-    let fn_call = format!("{}.{}({})", qi(&sel.fn_module), qi(&sel.fn_name), args_sql);
+    let fn_call = format!("{}.{}({})", pg_schema(&sel.fn_module), qi(&sel.fn_name), args_sql);
 
     let from_clause = if sel.polymorphic {
         // Polymorphic: we can't peek inside the function — assume it returns

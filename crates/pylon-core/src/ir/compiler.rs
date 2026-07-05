@@ -4674,10 +4674,16 @@ impl<'a> Compiler<'a> {
                         fd.module, fd.name, fd.params.len(), args.len()
                     )));
                 }
+                let cast_args = fd.params.iter().zip(args).map(|(p, a)| {
+                    IrExpr::TypeCast(Box::new(super::IrTypeCast {
+                        expr: a,
+                        pg_type: p.pg_type.clone(),
+                    }))
+                }).collect();
                 return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
                     schema: Some(fd.module.clone()),
                     name: fd.name.clone(),
-                    args,
+                    args: cast_args,
                     sql_template: None,
                 }));
             }
