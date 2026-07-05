@@ -176,6 +176,7 @@ fn main() {
         enums: vec![],
         globals: vec![],
         functions: vec![],
+        aliases: vec![],
     };
 
     let queries = [

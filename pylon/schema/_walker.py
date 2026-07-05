@@ -1035,6 +1035,7 @@ def walk(
     custom_scalars: list[type],
     globals_: list[Any],
     functions: list[Any] | None = None,
+    aliases: list[Any] | None = None,
 ) -> Any:
     """Walk the collected schema and return a pylon._core.SchemaDescriptor.
 
@@ -1074,6 +1075,10 @@ def walk(
         _build_function_descriptor(f, type_map, class_to_qname, _core)
         for f in (functions or [])
     ]
+    alias_descs = [
+        _core.AliasDescriptor(name=a.name, module=a.module, expr=a.expr)
+        for a in (aliases or [])
+    ]
 
     return _core.SchemaDescriptor(
         types=type_descs,
@@ -1081,4 +1086,5 @@ def walk(
         enums=enum_descs,
         globals=global_descs,
         functions=fn_descs,
+        aliases=alias_descs,
     )

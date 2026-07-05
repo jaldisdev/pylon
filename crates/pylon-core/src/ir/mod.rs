@@ -853,7 +853,7 @@ mod tests {
             scalars: vec![],
             enums: vec![],
             globals: vec![],
-            functions: vec![],
+            functions: vec![], aliases: vec![],
         }
     }
 
@@ -1147,6 +1147,17 @@ mod tests {
         ));
     }
 
+    fn make_schema_with_alias() -> SchemaDescriptor {
+        use crate::schema::AliasDescriptor;
+        let mut schema = make_schema();
+        schema.aliases.push(AliasDescriptor {
+            name: "ActivePersons".into(),
+            module: "default".into(),
+            expr: "select Person filter .age >= 18".into(),
+        });
+        schema
+    }
+
     fn make_schema_with_sequence() -> crate::schema::SchemaDescriptor {
         use crate::schema::ScalarDescriptor;
         let mut schema = make_schema();
@@ -1193,5 +1204,45 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT sequence_next(Person)").unwrap();
         assert!(super::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
+    fn test_alias_bare_compiles_to_type_select() {
+        let schema = make_schema_with_alias();
+        let ast = parse::parse("SELECT ActivePersons").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("\"person\""), "expected person table, got: {sql}");
+        assert!(sql.contains("18"), "expected age filter, got: {sql}");
+    }
+
+    #[test]
+    fn test_alias_with_outer_filter_merges() {
+        let schema = make_schema_with_alias();
+        let ast = parse::parse("SELECT ActivePersons FILTER .name = 'Alice'").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("\"person\""), "expected person table, got: {sql}");
+        assert!(sql.contains("18"), "expected alias filter, got: {sql}");
+        assert!(sql.contains("'Alice'"), "expected outer filter, got: {sql}");
+    }
+
+    #[test]
+    fn test_alias_module_qualified_resolves() {
+        let schema = make_schema_with_alias();
+        let ast = parse::parse("SELECT default::ActivePersons").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("\"person\""), "expected person table, got: {sql}");
+    }
+
+    #[test]
+    fn test_alias_with_shape() {
+        let schema = make_schema_with_alias();
+        let ast = parse::parse("SELECT ActivePersons { name, age }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("\"name\""), "expected name field, got: {sql}");
+        assert!(sql.contains("\"age\""), "expected age field, got: {sql}");
     }
 }

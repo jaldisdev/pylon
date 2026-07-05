@@ -404,6 +404,88 @@ impl<'a> Compiler<'a> {
         Ok(Some(ir))
     }
 
+    fn try_compile_alias_select(
+        &mut self,
+        outer: &ast::SelectStmt,
+        result: &Expr,
+        distinct: bool,
+    ) -> Result<Option<IrStmt>, PyQLError> {
+        // Extract the bare path name and any outer shape elements.
+        let (path_name, shape_elements): (&str, &[ast::ShapeElement]) = match result {
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    (n.as_str(), &[])
+                } else {
+                    return Ok(None);
+                }
+            }
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::Path(p)) if !p.partial && p.steps.len() == 1 => {
+                    if let ast::PathStep::Name(n) = &p.steps[0] {
+                        (n.as_str(), sh.elements.as_slice())
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        // Match against schema aliases (bare name or module::name).
+        let alias = self.schema.aliases.iter().find(|a| {
+            a.name == path_name || format!("{}::{}", a.module, a.name) == path_name
+        });
+        let alias = match alias {
+            Some(a) => a.clone(),
+            None => return Ok(None),
+        };
+
+        let inner_ast = crate::parse::parse(&alias.expr)?;
+        let inner_sel = match inner_ast {
+            Stmt::Select(sel) => sel,
+            _ => return Err(self.type_err(&format!(
+                "alias '{}' expression must be a select statement", alias.name
+            ))),
+        };
+
+        // Merge outer shape / filter / modifiers over the alias's select.
+        let merged_result = if shape_elements.is_empty() {
+            inner_sel.result.clone()
+        } else {
+            Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: Some(inner_sel.result.clone()),
+                elements: shape_elements.to_vec(),
+            }))
+        };
+
+        let merged_filter = match (&inner_sel.filter, &outer.filter) {
+            (Some(a), Some(b)) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                left: a.clone(),
+                op: ast::BinOpKind::And,
+                right: b.clone(),
+            }))),
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b.clone(),
+        };
+
+        let merged = ast::SelectStmt {
+            result: merged_result,
+            filter: merged_filter,
+            order_by: if outer.order_by.is_empty() {
+                inner_sel.order_by.clone()
+            } else {
+                outer.order_by.clone()
+            },
+            offset: outer.offset.clone().or(inner_sel.offset.clone()),
+            limit: outer.limit.clone().or(inner_sel.limit.clone()),
+        };
+
+        let _ = distinct; // alias selects honour the outer distinct if applied
+        let ir = self.compile_stmt(&Stmt::Select(merged))?;
+        Ok(Some(ir))
+    }
+
     fn compile_global(&mut self, raw_name: &str) -> Result<IrExpr, PyQLError> {
         let global = self.schema.globals.iter().find(|g| {
             g.name == raw_name || format!("{}::{}", g.module, g.name) == raw_name
@@ -532,6 +614,11 @@ impl<'a> Compiler<'a> {
                     Expr::Detached(inner) => (false, inner.as_ref()),
                     other => (false, other),
                 };
+
+                // `select alias_name [{ shape }]` — inline the alias expression.
+                if let Some(ir) = self.try_compile_alias_select(s, result, distinct)? {
+                    return Ok(ir);
+                }
 
                 // `select global name [{ shape }]` — inline the computed expression.
                 if let Some(ir) = self.try_compile_global_select(s, result, distinct)? {

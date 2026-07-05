@@ -2,6 +2,7 @@ from ._base import BaseObject
 from ._export import export
 from ._walker import SchemaError
 from ._globals import Global, GlobalDescriptor, collect_module_globals
+from ._aliases import Alias, AliasDescriptor, collect_module_aliases
 from ._constraints import (
     Default,
     Description,
