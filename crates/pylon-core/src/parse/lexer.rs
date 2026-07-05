@@ -161,6 +161,12 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self, pos: Position) -> Result<Token, PyQLSyntaxError> {
         let ch = self.current();
 
+        // Backtick-quoted identifiers: `Order`, `default`::`Filter`, etc.
+        // Allows any keyword to be used as a type or field name.
+        if ch == b'`' {
+            return self.lex_backtick_ident(pos);
+        }
+
         // String literals (including raw: r'...' / r"...")
         if ch == b'\'' || ch == b'"' {
             return self.lex_string(pos);
@@ -344,6 +350,25 @@ impl<'a> Lexer<'a> {
                 .map(Token::IntLit)
                 .map_err(|_| self.err(pos, &format!("integer overflow '{s}'")))
         }
+    }
+
+    fn lex_backtick_ident(&mut self, pos: Position) -> Result<Token, PyQLSyntaxError> {
+        self.advance(); // consume opening backtick
+        let mut buf = String::new();
+        loop {
+            if self.pos >= self.input.len() {
+                return Err(self.err(pos, "unterminated backtick identifier"));
+            }
+            let ch = self.advance();
+            if ch == b'`' {
+                break;
+            }
+            buf.push(ch as char);
+        }
+        if buf.is_empty() {
+            return Err(self.err(pos, "backtick identifier must not be empty"));
+        }
+        Ok(Token::Ident(buf))
     }
 
     fn lex_raw_string(&mut self, pos: Position) -> Result<Token, PyQLSyntaxError> {

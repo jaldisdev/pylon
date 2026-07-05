@@ -865,13 +865,14 @@ pub struct ScalarDescriptor {
 #[pymethods]
 impl ScalarDescriptor {
     #[new]
-    #[pyo3(signature = (name, module, base, pg_type, *, check_constraints = None))]
+    #[pyo3(signature = (name, module, base, pg_type, *, check_constraints = None, is_sequence = false))]
     fn new(
         name: String,
         module: String,
         base: String,
         pg_type: String,
         check_constraints: Option<Vec<String>>,
+        is_sequence: bool,
     ) -> Self {
         Self {
             inner: core::schema::ScalarDescriptor {
@@ -880,6 +881,7 @@ impl ScalarDescriptor {
                 base,
                 pg_type,
                 check_constraints: check_constraints.unwrap_or_default(),
+                is_sequence,
             },
         }
     }
@@ -1431,6 +1433,10 @@ impl DbState {
         {
             t.indexes.push(core::diff::DbIndex { name, is_unique, method });
         }
+    }
+
+    fn add_sequence(&mut self, schema: String, name: String) {
+        self.inner.sequences.push(core::diff::DbSequence { schema, name });
     }
 
     fn add_view(&mut self, schema: String, name: String, body_hash: String) {

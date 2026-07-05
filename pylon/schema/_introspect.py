@@ -109,6 +109,14 @@ WHERE ix.indisprimary = false
   AND t.relname = $2
 """
 
+_SEQUENCES_SQL = """
+SELECT schemaname AS schema, sequencename AS name
+FROM pg_sequences
+WHERE schemaname NOT LIKE 'pg_%'
+  AND schemaname <> ALL($1::text[])
+ORDER BY schemaname, sequencename
+"""
+
 _VIEWS_SQL = """
 SELECT table_schema AS schema, table_name AS name, view_definition
 FROM information_schema.views
@@ -204,6 +212,11 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
                 idx["is_unique"],
                 idx["method"],
             )
+
+    # Sequences
+    seq_rows = await conn.fetch(_SEQUENCES_SQL, system)
+    for row in seq_rows:
+        state.add_sequence(row["schema"], row["name"])
 
     # Views
     view_rows = await conn.fetch(_VIEWS_SQL, system)

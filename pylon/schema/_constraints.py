@@ -25,6 +25,21 @@ class _NowType:
 Now = _NowType()
 
 
+class _SequenceNextType:
+    _inst: "_SequenceNextType | None" = None
+
+    def __new__(cls) -> "_SequenceNextType":
+        if cls._inst is None:
+            cls._inst = super().__new__(cls)
+        return cls._inst
+
+    def __repr__(self) -> str:
+        return "SequenceNext"
+
+
+SequenceNext = _SequenceNextType()
+
+
 class Default(_FieldConstraint):
     """Server-side default. Only Default(Now) is supported in the initial spec.
 

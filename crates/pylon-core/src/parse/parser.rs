@@ -45,17 +45,62 @@ impl Parser {
     }
 
     fn eat_ident(&mut self) -> Result<String, PyQLSyntaxError> {
+        let name = self.keyword_as_ident();
+        if let Some(s) = name {
+            self.advance();
+            return Ok(s);
+        }
         match self.current().clone() {
-            Token::Ident(s) => {
-                self.advance();
-                Ok(s)
-            }
-            // Allow keyword tokens to double as identifiers in name positions.
-            // EdgeQL allows e.g. `select { set := 1 }` where `set` is a field name.
-            Token::Set => { self.advance(); Ok("set".to_string()) }
-            Token::First => { self.advance(); Ok("first".to_string()) }
-            Token::Last => { self.advance(); Ok("last".to_string()) }
+            Token::Ident(s) => { self.advance(); Ok(s) }
             other => Err(self.err(&format!("expected identifier, got {other:?}"))),
+        }
+    }
+
+    /// If the current token is a keyword that is also a legal identifier,
+    /// return its string form without consuming it. Returns `None` for tokens
+    /// that are never valid identifiers (punctuation, literals, EOF).
+    fn keyword_as_ident(&self) -> Option<String> {
+        match self.current() {
+            Token::Select    => Some("select".into()),
+            Token::Insert    => Some("insert".into()),
+            Token::Update    => Some("update".into()),
+            Token::Delete    => Some("delete".into()),
+            Token::Filter    => Some("filter".into()),
+            Token::Order     => Some("Order".into()),
+            Token::By        => Some("by".into()),
+            Token::Asc       => Some("asc".into()),
+            Token::Desc      => Some("desc".into()),
+            Token::First     => Some("first".into()),
+            Token::Last      => Some("last".into()),
+            Token::Limit     => Some("limit".into()),
+            Token::Offset    => Some("offset".into()),
+            Token::With      => Some("with".into()),
+            Token::For       => Some("for".into()),
+            Token::In        => Some("in".into()),
+            Token::Union     => Some("union".into()),
+            Token::Except    => Some("except".into()),
+            Token::Intersect => Some("intersect".into()),
+            Token::Not       => Some("not".into()),
+            Token::And       => Some("and".into()),
+            Token::Or        => Some("or".into()),
+            Token::Exists    => Some("exists".into()),
+            Token::Distinct  => Some("distinct".into()),
+            Token::If        => Some("if".into()),
+            Token::Else      => Some("else".into()),
+            Token::Set       => Some("set".into()),
+            Token::Is        => Some("is".into()),
+            Token::Optional  => Some("optional".into()),
+            Token::Required  => Some("required".into()),
+            Token::Unless    => Some("unless".into()),
+            Token::Conflict  => Some("conflict".into()),
+            Token::Detached  => Some("detached".into()),
+            Token::Group     => Some("group".into()),
+            Token::Using     => Some("using".into()),
+            Token::Like      => Some("like".into()),
+            Token::Ilike     => Some("ilike".into()),
+            Token::True      => Some("true".into()),
+            Token::False     => Some("false".into()),
+            _ => None,
         }
     }
 

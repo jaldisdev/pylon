@@ -1146,4 +1146,52 @@ mod tests {
             IrFreeExpr::Scalar(IrExpr::Slice { is_array: true, .. })
         ));
     }
+
+    fn make_schema_with_sequence() -> crate::schema::SchemaDescriptor {
+        use crate::schema::ScalarDescriptor;
+        let mut schema = make_schema();
+        schema.scalars.push(ScalarDescriptor {
+            name: "OrderNumber".into(),
+            module: "default".into(),
+            base: "Sequence".into(),
+            pg_type: "int8".into(),
+            check_constraints: vec![],
+            is_sequence: true,
+        });
+        schema
+    }
+
+    fn compile_seq(query: &str) -> String {
+        let schema = make_schema_with_sequence();
+        let ast = parse::parse(query).expect("parse failed");
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!("expected FreeSelect") };
+        let IrFreeExpr::Scalar(expr) = &fs.items[0] else { panic!("expected scalar") };
+        crate::sql::emit_expr(expr)
+    }
+
+    #[test]
+    fn test_sequence_next_emits_nextval() {
+        let sql = compile_seq("SELECT sequence_next(OrderNumber)");
+        assert_eq!(sql, r#"nextval('"default"."OrderNumber_seq"')"#, "got: {sql}");
+    }
+
+    #[test]
+    fn test_sequence_reset_no_val_emits_setval_initial() {
+        let sql = compile_seq("SELECT sequence_reset(OrderNumber)");
+        assert_eq!(sql, r#"setval('"default"."OrderNumber_seq"', 1, false)"#, "got: {sql}");
+    }
+
+    #[test]
+    fn test_sequence_reset_with_val_emits_setval() {
+        let sql = compile_seq("SELECT sequence_reset(OrderNumber, 1000)");
+        assert_eq!(sql, r#"setval('"default"."OrderNumber_seq"', 1000, true)"#, "got: {sql}");
+    }
+
+    #[test]
+    fn test_sequence_next_rejects_non_sequence_type() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT sequence_next(Person)").unwrap();
+        assert!(super::compile(&ast, &schema).is_err());
+    }
 }

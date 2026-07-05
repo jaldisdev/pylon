@@ -1735,6 +1735,13 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FunctionCall(f) => {
+                // sequence_next / sequence_reset: type-ref arg → nextval/setval SQL
+                if (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && (f.name == "sequence_next" || f.name == "sequence_reset")
+                {
+                    return self.compile_sequence_fn(f);
+                }
+
                 // assert_single with SubQuery arg → _pylon.assert_single(ARRAY(subquery))
                 if (f.module.is_none() || f.module.as_deref() == Some("std"))
                     && f.name == "assert_single"
@@ -4552,6 +4559,97 @@ impl<'a> Compiler<'a> {
             args,
             sql_template,
         }))
+    }
+
+    // ── Sequence function helpers ──────────────────────────────────────────────────
+
+    /// Compile `sequence_next(SeqType)` → `nextval('"module"."Name_seq"')`
+    /// and `sequence_reset(SeqType[, val])` → `setval(...)`.
+    fn compile_sequence_fn(&mut self, fc: &ast::FunctionCall) -> Result<IrExpr, PyQLError> {
+        let (module, scalar_name) = self.resolve_sequence_scalar_arg(fc)?;
+
+        if fc.name == "sequence_next" {
+            if fc.args.len() != 1 {
+                return Err(self.type_err("sequence_next takes exactly 1 argument"));
+            }
+            let sql = format!("nextval('\"{}\".\"{}_seq\"')", module, scalar_name);
+            return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                schema: None,
+                name: "nextval".into(),
+                args: vec![],
+                sql_template: Some(sql),
+            }));
+        }
+
+        // sequence_reset
+        match fc.args.len() {
+            1 => {
+                let sql = format!("setval('\"{}\".\"{}_seq\"', 1, false)", module, scalar_name);
+                Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    schema: None,
+                    name: "setval".into(),
+                    args: vec![],
+                    sql_template: Some(sql),
+                }))
+            }
+            2 => {
+                let val = self.compile_free_expr(&fc.args[1])?;
+                let sql = format!("setval('\"{}\".\"{}_seq\"', $1, true)", module, scalar_name);
+                Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    schema: None,
+                    name: "setval".into(),
+                    args: vec![val],
+                    sql_template: Some(sql),
+                }))
+            }
+            _ => Err(self.type_err("sequence_reset takes 1 or 2 arguments")),
+        }
+    }
+
+    /// Resolve the first argument of a sequence function to `(module, scalar_name)`.
+    /// The argument must be an unqualified path that names a sequence scalar in the schema.
+    fn resolve_sequence_scalar_arg(&self, fc: &ast::FunctionCall) -> Result<(String, String), PyQLError> {
+        use crate::parse::ast::{Expr, Path, PathStep};
+
+        let arg = fc.args.first().ok_or_else(|| self.type_err(
+            &format!("{}() requires a sequence scalar type as its first argument", fc.name)
+        ))?;
+
+        // The parser encodes `module::Name` as a single PathStep::Name("module::Name"),
+        // so we split on "::" here to recover the module part.
+        let (arg_module, arg_name): (Option<&str>, &str) = match arg {
+            Expr::Path(Path { steps, partial: false }) => match steps.as_slice() {
+                [PathStep::Name(s)] => {
+                    if let Some((m, n)) = s.split_once("::") {
+                        (Some(m), n)
+                    } else {
+                        (None, s.as_str())
+                    }
+                }
+                _ => return Err(self.type_err(&format!(
+                    "{}(): first argument must be a sequence scalar type name (e.g. OrderNumber or default::OrderNumber)",
+                    fc.name
+                ))),
+            },
+            _ => return Err(self.type_err(&format!(
+                "{}(): first argument must be a sequence scalar type name (e.g. OrderNumber or default::OrderNumber)",
+                fc.name
+            ))),
+        };
+
+        let scalar = self.schema.scalars.iter().find(|s| {
+            s.is_sequence
+                && s.name == arg_name
+                && arg_module.map(|m| m == s.module.as_str()).unwrap_or(true)
+        });
+
+        match scalar {
+            Some(s) => Ok((s.module.clone(), s.name.clone())),
+            None => Err(self.type_err(&format!(
+                "{}(): '{}' is not a known sequence scalar type",
+                fc.name, arg_name
+            ))),
+        }
     }
 
     // ── User-defined function helpers ─────────────────────────────────────────────

@@ -17,6 +17,7 @@ from ._constraints import (
     OneOf,
     Readonly,
     Regexp,
+    SequenceNext,
 )
 from ._decorators import (
     abstract_decorator as abstract,
@@ -74,6 +75,7 @@ from ._scalars import (
     LocalDateTime,
     LocalTime,
     Scalar,
+    Sequence,
     Str,
     scalar,
 )

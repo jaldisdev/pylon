@@ -626,6 +626,13 @@ END"#)),
             Tuple(vec![Int64, Int64, Str, Int64, Array(Box::new(Str))]),
             E(env!("PYLON_VERSION_ROW"))),
 
+        // ── std:: sequences ──────────────────────────────────────────────────
+        // TranspilerIntrinsic: first arg is a sequence scalar type name resolved
+        // by the compiler; emits nextval(...) / setval(...) directly.
+        f("std", "sequence_next",  vec![p("seq", Any)],                  Int64, I("sequence_next")),
+        f("std", "sequence_reset", vec![p("seq", Any)],                  Int64, I("sequence_reset")),
+        f("std", "sequence_reset", vec![p("seq", Any), p("val", Int64)], Int64, I("sequence_reset")),
+
         // ── pgvector:: ────────────────────────────────────────────────────────
         f("pgvector", "euclidean_distance",  vec![p("a", Vector), p("b", Vector)], Float64, E("($1 <-> $2)")),
         f("pgvector", "cosine_distance",     vec![p("a", Vector), p("b", Vector)], Float64, E("($1 <=> $2)")),

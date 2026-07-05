@@ -268,6 +268,8 @@ pub struct ScalarDescriptor {
     pub pg_type: String,
     /// Pre-compiled SQL CHECK expressions for the DOMAIN constraint.
     pub check_constraints: Vec<String>,
+    /// True when the scalar extends `pylon.Sequence` — generates a PostgreSQL SEQUENCE.
+    pub is_sequence: bool,
 }
 
 #[derive(Debug, Clone)]

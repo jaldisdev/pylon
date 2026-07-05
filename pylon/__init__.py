@@ -68,6 +68,8 @@ from .schema import (
     Regexp,
     Restrict,
     Scalar,
+    Sequence,
+    SequenceNext,
     Source,
     Str,
     Target,
@@ -149,6 +151,7 @@ __all__ = [
     "OneOf",
     "Readonly",
     "Regexp",
+    "SequenceNext",
     # Schema — indexes
     "Index",
     "VectorField",
@@ -177,6 +180,7 @@ __all__ = [
     "LocalDate",
     "LocalDateTime",
     "LocalTime",
+    "Sequence",
     "Str",
     "UUID",
 ]

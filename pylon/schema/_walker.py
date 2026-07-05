@@ -535,7 +535,8 @@ def _field_checks_and_exclusive(
 
 
 def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
-    from ._scalars import UUID
+    from ._constraints import Default, _SequenceNextType
+    from ._scalars import UUID, Scalar as PylonScalar
 
     is_pk = name == "id" and meta.scalar_type is UUID
     if is_pk:
@@ -552,7 +553,21 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
 
     pg_type = _to_pg_type(meta.scalar_type)
     checks, is_exclusive = _field_checks_and_exclusive(meta, name)
-    default_sql = _make_default_sql(meta)
+
+    # SequenceNext default: generate nextval('"module"."Name_seq"')
+    default_sql = None
+    for c in meta.constraints:
+        if isinstance(c, Default) and isinstance(c.sentinel, _SequenceNextType):
+            scalar_type = meta.scalar_type
+            if isinstance(scalar_type, type) and issubclass(scalar_type, PylonScalar):
+                mod = getattr(scalar_type, "__pylon_module__", None) or (
+                    (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+                )
+                seq_name = f"{scalar_type.__name__}_seq"
+                default_sql = f"""nextval('"{mod}"."{seq_name}"')"""
+            break
+    if default_sql is None:
+        default_sql = _make_default_sql(meta)
 
     rewrites = [
         _core.RewriteEntry(on=int(r.on), handler=r.handler)
@@ -802,11 +817,12 @@ def _build_type_descriptor(
 
 
 def _build_scalar_descriptor(cls: type, _core: Any) -> Any:
-    from ._scalars import PG_TYPE_MAP, _PylonScalar
+    from ._scalars import PG_TYPE_MAP, Sequence as SequenceScalar, _PylonScalar
 
     base_cls = getattr(cls, "__pylon_base__", None)
     base_name = base_cls.__name__ if base_cls else "Str"
     pg_type = PG_TYPE_MAP.get(base_cls, "text") if base_cls else "text"
+    is_sequence = isinstance(base_cls, type) and issubclass(base_cls, SequenceScalar)
 
     # Inline constraints on the scalar itself (from @pylon.scalar(Str, MinValue(0)))
     scalar_constraints = getattr(cls, "__pylon_constraints__", ())
@@ -825,6 +841,7 @@ def _build_scalar_descriptor(cls: type, _core: Any) -> Any:
         base=base_name,
         pg_type=pg_type,
         check_constraints=checks,
+        is_sequence=is_sequence,
     )
 
 
