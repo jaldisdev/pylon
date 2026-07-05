@@ -521,8 +521,9 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
             } else {
                 // `result` is a ROW() composite for top-level asyncpg decoding.
                 // `v` is the unwrapped scalar for use in CteRef expression context.
+                // Wrap in a subquery so volatile functions (nextval, etc.) are called once.
                 let e = emit_expr(expr);
-                format!("SELECT ROW({e}) AS result, {e} AS v")
+                format!("SELECT ROW(v) AS result, v FROM (SELECT {e} AS v) AS _scalar")
             }
         }
         IrFreeExpr::FreeObject(fields) => {
@@ -2386,10 +2387,10 @@ mod tests {
         let out = emit(&ir);
         // Three UNION ALL branches
         assert_eq!(out.sql.matches("UNION ALL").count(), 2);
-        assert!(out.sql.contains("ROW(1)"));
-        assert!(out.sql.contains("ROW(2)"));
-        assert!(out.sql.contains("ROW(3)"));
-        assert!(out.sql.contains("AS result"));
+        assert!(out.sql.contains("1 AS v"));
+        assert!(out.sql.contains("2 AS v"));
+        assert!(out.sql.contains("3 AS v"));
+        assert!(out.sql.contains("ROW(v) AS result"));
         assert!(matches!(out.shape.root, crate::query::ShapeNode::Scalar { .. }));
     }
 
@@ -2429,8 +2430,8 @@ mod tests {
         let ast = parse::parse("SELECT 'hello'").unwrap();
         let ir = ir::compile(&ast, &schema).unwrap();
         let out = emit(&ir);
-        assert!(out.sql.contains("ROW('hello')"));
-        assert!(out.sql.contains("AS result"));
+        assert!(out.sql.contains("SELECT 'hello' AS v"));
+        assert!(out.sql.contains("ROW(v) AS result"));
         assert!(matches!(out.shape.root, crate::query::ShapeNode::Scalar { .. }));
     }
 

@@ -80,6 +80,11 @@ class Bytes(_PylonScalar):
     pass
 
 
+class Sequence(_PylonScalar):
+    """Marker for auto-incrementing sequence scalars (backed by a PostgreSQL SEQUENCE + DOMAIN)."""
+    pass
+
+
 # Python shorthand → canonical Pylon scalar.
 SHORTHAND_MAP: dict[type, type[_PylonScalar]] = {
     str: Str,
@@ -112,6 +117,7 @@ PG_TYPE_MAP: dict[type[_PylonScalar], str] = {
     UUID: "uuid",
     JSON: "jsonb",
     Bytes: "bytea",
+    Sequence: "int8",
 }
 
 

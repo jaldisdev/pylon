@@ -135,6 +135,13 @@ fn emit_enums(schema: &SchemaDescriptor, out: &mut String) {
 
 fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
     for s in &schema.scalars {
+        if s.is_sequence {
+            out.push_str(&format!(
+                "CREATE SEQUENCE {}.{};\n",
+                qi(&s.module),
+                qi(&format!("{}_seq", s.name)),
+            ));
+        }
         let checks: Vec<String> = s.check_constraints.iter()
             .map(|c| format!("    CHECK ({})", c))
             .collect();
@@ -1113,6 +1120,32 @@ mod tests {
         assert!(ddl.contains("\"age\" int8"), "got:\n{}", ddl);
         assert!(ddl.contains("STABLE"), "got:\n{}", ddl);
         assert!(ddl.contains("SELECT * FROM"), "got:\n{}", ddl);
+    }
+
+    #[test]
+    fn test_emit_sequence_scalar_ddl() {
+        use crate::schema::ScalarDescriptor;
+        let schema = SchemaDescriptor {
+            types: vec![],
+            scalars: vec![ScalarDescriptor {
+                name: "OrderNumber".into(),
+                module: "default".into(),
+                base: "Sequence".into(),
+                pg_type: "int8".into(),
+                check_constraints: vec![],
+                is_sequence: true,
+            }],
+            enums: vec![],
+            globals: vec![],
+            functions: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("CREATE SEQUENCE \"default\".\"OrderNumber_seq\""), "got:\n{}", ddl);
+        assert!(ddl.contains("CREATE DOMAIN \"default\".\"OrderNumber\" AS int8"), "got:\n{}", ddl);
+        // Sequence must precede domain in the output
+        let seq_pos = ddl.find("CREATE SEQUENCE").unwrap();
+        let dom_pos = ddl.find("CREATE DOMAIN").unwrap();
+        assert!(seq_pos < dom_pos, "sequence must appear before domain");
     }
 }
 

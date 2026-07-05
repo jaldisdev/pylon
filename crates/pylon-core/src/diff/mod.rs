@@ -17,11 +17,19 @@ use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DbState {
     /// User-managed schema names (excludes _pylon, public, pg_* etc.).
+    #[serde(default)]
     pub schemas: Vec<String>,
+    #[serde(default)]
     pub tables: Vec<DbTable>,
+    #[serde(default)]
     pub enums: Vec<DbEnum>,
+    #[serde(default)]
     pub domains: Vec<DbDomain>,
+    #[serde(default)]
+    pub sequences: Vec<DbSequence>,
+    #[serde(default)]
     pub views: Vec<DbView>,
+    #[serde(default)]
     pub functions: Vec<DbFunction>,
 }
 
@@ -77,6 +85,12 @@ pub struct DbDomain {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbSequence {
+    pub schema: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbView {
     pub schema: String,
     pub name: String,
@@ -125,6 +139,12 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
     // Domains (custom scalars)
     let domains: Vec<DbDomain> = schema.scalars.iter()
         .map(|s| DbDomain { schema: s.module.clone(), name: s.name.clone() })
+        .collect();
+
+    // Sequences (sequence scalars only)
+    let sequences: Vec<DbSequence> = schema.scalars.iter()
+        .filter(|s| s.is_sequence)
+        .map(|s| DbSequence { schema: s.module.clone(), name: format!("{}_seq", s.name) })
         .collect();
 
     let mut tables: Vec<DbTable> = Vec::new();
@@ -336,7 +356,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .map(|(module, name, ddl)| DbFunction { schema: module, name, body_hash: ddl_hash(&ddl) })
         .collect();
 
-    DbState { schemas, tables, enums, domains, views, functions }
+    DbState { schemas, tables, enums, domains, sequences, views, functions }
 }
 
 fn ddl_hash(ddl: &str) -> String {
@@ -886,6 +906,9 @@ fn diff_inner(
     let cur_domains: HashSet<(&str, &str)> = current.domains.iter()
         .map(|d| (d.schema.as_str(), d.name.as_str()))
         .collect();
+    let cur_sequences: HashSet<(&str, &str)> = current.sequences.iter()
+        .map(|s| (s.schema.as_str(), s.name.as_str()))
+        .collect();
     let cur_views: HashMap<(&str, &str), &str> = current.views.iter()
         .map(|v| ((v.schema.as_str(), v.name.as_str()), v.body_hash.as_str()))
         .collect();
@@ -932,6 +955,19 @@ fn diff_inner(
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    // ── Phase 2.5: sequences (for sequence scalars) ───────────────────────────
+    for s in &target.scalars {
+        if s.is_sequence {
+            let seq_name = format!("{}_seq", s.name);
+            if !cur_sequences.contains(&(s.module.as_str(), seq_name.as_str())) {
+                push_tx(&mut ops, format!(
+                    "CREATE SEQUENCE IF NOT EXISTS {}.{};",
+                    qi(&s.module), qi(&seq_name)
+                ));
             }
         }
     }
@@ -1147,6 +1183,20 @@ fn diff_inner(
             push_tx(&mut ops, format!(
                 "DROP DOMAIN IF EXISTS {}.{} CASCADE;",
                 qi(&cur_domain.schema), qi(&cur_domain.name)
+            ));
+        }
+    }
+
+    // ── Phase 14.5: drop removed sequences ───────────────────────────────────
+    let target_sequence_set: HashSet<(String, String)> = target.scalars.iter()
+        .filter(|s| s.is_sequence)
+        .map(|s| (s.module.clone(), format!("{}_seq", s.name)))
+        .collect();
+    for cur_seq in &current.sequences {
+        if !target_sequence_set.contains(&(cur_seq.schema.clone(), cur_seq.name.clone())) {
+            push_tx(&mut ops, format!(
+                "DROP SEQUENCE IF EXISTS {}.{};",
+                qi(&cur_seq.schema), qi(&cur_seq.name)
             ));
         }
     }
@@ -1615,7 +1665,7 @@ mod tests {
             types: vec![simple_type("catalog", "Product", "Product")],
             scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         };
-        let ops = diff_schema(&schema, &empty_state());
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
         assert!(joined.contains("CREATE SCHEMA IF NOT EXISTS \"catalog\""), "got:\n{joined}");
         assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""), "got:\n{joined}");
@@ -1638,8 +1688,9 @@ mod tests {
                 foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
             enums: vec![], domains: vec![],
+            ..DbState::default()
         };
-        let ops = diff_schema(&schema, &state);
+        let ops = diff_schema(&schema, &state).unwrap();
         assert!(ops.is_empty(), "expected no ops, got: {:?}", ops);
     }
 
@@ -1661,8 +1712,9 @@ mod tests {
                 foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
             enums: vec![], domains: vec![],
+            ..DbState::default()
         };
-        let ops = diff_schema(&schema, &state);
+        let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
         assert!(joined.contains("ADD COLUMN IF NOT EXISTS \"email\""), "got:\n{joined}");
     }
@@ -1677,7 +1729,7 @@ mod tests {
             }],
             globals: vec![], functions: vec![],
         };
-        let ops = diff_schema(&schema, &empty_state());
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
         assert!(joined.contains("CREATE TYPE \"default\".\"Status\" AS ENUM"), "got:\n{joined}");
     }
@@ -1694,8 +1746,9 @@ mod tests {
                 columns: vec![], foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
             enums: vec![], domains: vec![],
+            ..DbState::default()
         };
-        let ops = diff_schema(&schema, &state);
+        let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
         assert!(joined.contains("DROP TABLE IF EXISTS \"default\".\"OldType\" CASCADE"), "got:\n{joined}");
     }
@@ -1726,8 +1779,9 @@ mod tests {
                 foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
             enums: vec![], domains: vec![],
+            ..DbState::default()
         };
-        let ops = diff_schema_ops(&schema, &state);
+        let ops = diff_schema_ops(&schema, &state).unwrap();
         let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
         assert!(idx_op.non_transactional, "index on pre-existing table should be non-transactional");
         assert!(idx_op.sql.contains("CONCURRENTLY"), "should use CONCURRENTLY: {}", idx_op.sql);
@@ -1748,9 +1802,69 @@ mod tests {
             types: vec![td], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
         };
         // Table does NOT exist in the DB → it's new.
-        let ops = diff_schema_ops(&schema, &empty_state());
+        let ops = diff_schema_ops(&schema, &empty_state()).unwrap();
         let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
         assert!(!idx_op.non_transactional, "index on new table should be transactional");
         assert!(!idx_op.sql.contains("CONCURRENTLY"), "should NOT use CONCURRENTLY: {}", idx_op.sql);
+    }
+
+    fn sequence_scalar(module: &str, name: &str) -> crate::schema::ScalarDescriptor {
+        crate::schema::ScalarDescriptor {
+            name: name.into(),
+            module: module.into(),
+            base: "Sequence".into(),
+            pg_type: "int8".into(),
+            check_constraints: vec![],
+            is_sequence: true,
+        }
+    }
+
+    #[test]
+    fn test_new_sequence_creates_sequence_and_domain() {
+        let schema = SchemaDescriptor {
+            types: vec![], enums: vec![], globals: vec![], functions: vec![],
+            scalars: vec![sequence_scalar("default", "OrderNumber")],
+        };
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
+        let joined = ops.join("\n");
+        assert!(joined.contains("CREATE SEQUENCE IF NOT EXISTS \"default\".\"OrderNumber_seq\""), "got:\n{joined}");
+        assert!(joined.contains("CREATE DOMAIN \"default\".\"OrderNumber\" AS int8"), "got:\n{joined}");
+        // Sequence must precede domain
+        let seq_pos = joined.find("CREATE SEQUENCE").unwrap();
+        let dom_pos = joined.find("CREATE DOMAIN").unwrap();
+        assert!(seq_pos < dom_pos, "sequence must be created before domain");
+    }
+
+    #[test]
+    fn test_no_ops_sequence_already_exists() {
+        let schema = SchemaDescriptor {
+            types: vec![], enums: vec![], globals: vec![], functions: vec![],
+            scalars: vec![sequence_scalar("default", "OrderNumber")],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            domains: vec![DbDomain { schema: "default".into(), name: "OrderNumber".into() }],
+            sequences: vec![DbSequence { schema: "default".into(), name: "OrderNumber_seq".into() }],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        assert!(ops.is_empty(), "expected no ops when sequence and domain exist, got: {:?}", ops);
+    }
+
+    #[test]
+    fn test_drop_removed_sequence() {
+        let schema = SchemaDescriptor {
+            types: vec![], scalars: vec![], enums: vec![], globals: vec![], functions: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            domains: vec![DbDomain { schema: "default".into(), name: "OrderNumber".into() }],
+            sequences: vec![DbSequence { schema: "default".into(), name: "OrderNumber_seq".into() }],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        let joined = ops.join("\n");
+        assert!(joined.contains("DROP DOMAIN IF EXISTS \"default\".\"OrderNumber\""), "got:\n{joined}");
+        assert!(joined.contains("DROP SEQUENCE IF EXISTS \"default\".\"OrderNumber_seq\""), "got:\n{joined}");
     }
 }
