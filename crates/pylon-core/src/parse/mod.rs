@@ -189,4 +189,32 @@ mod tests {
         let stmt = parse("DELETE Person FILTER .name = 'Alice'").unwrap();
         assert!(matches!(stmt, Stmt::Delete(_)));
     }
+
+    #[test]
+    fn test_if_else_postfix() {
+        let stmt = parse("SELECT 'yes' IF 1 = 1 ELSE 'no'").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::IfElse(ie) = sel.result else { panic!("expected IfElse") };
+        assert!(matches!(ie.if_expr, Expr::Literal(Literal::Str(_))));
+        assert!(matches!(ie.condition, Expr::BinOp(_)));
+        assert!(matches!(ie.else_expr, Expr::Literal(Literal::Str(_))));
+    }
+
+    #[test]
+    fn test_if_then_else_prefix() {
+        let stmt = parse("SELECT IF 1 = 1 THEN 'yes' ELSE 'no'").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::IfElse(ie) = sel.result else { panic!("expected IfElse") };
+        assert!(matches!(ie.if_expr, Expr::Literal(Literal::Str(_))));
+        assert!(matches!(ie.condition, Expr::BinOp(_)));
+        assert!(matches!(ie.else_expr, Expr::Literal(Literal::Str(_))));
+    }
+
+    #[test]
+    fn test_if_then_else_chained() {
+        let stmt = parse("SELECT IF 1 = 1 THEN 'a' ELSE IF 2 = 2 THEN 'b' ELSE 'c'").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::IfElse(outer) = sel.result else { panic!("expected IfElse") };
+        assert!(matches!(outer.else_expr, Expr::IfElse(_)));
+    }
 }

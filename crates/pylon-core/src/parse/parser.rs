@@ -86,6 +86,7 @@ impl Parser {
             Token::Exists    => Some("exists".into()),
             Token::Distinct  => Some("distinct".into()),
             Token::If        => Some("if".into()),
+            Token::Then      => Some("then".into()),
             Token::Else      => Some("else".into()),
             Token::Set       => Some("set".into()),
             Token::Is        => Some("is".into()),
@@ -414,6 +415,22 @@ impl Parser {
     }
 
     fn parse_if_else(&mut self) -> Result<Expr, PyQLSyntaxError> {
+        // conventional prefix: if condition then value else fallback
+        if matches!(self.current(), Token::If) {
+            self.advance();
+            let condition = self.parse_or()?;
+            self.eat(&Token::Then)?;
+            let if_expr = self.parse_or()?;
+            self.eat(&Token::Else)?;
+            let else_expr = self.parse_if_else()?;
+            return Ok(Expr::IfElse(Box::new(IfElse {
+                if_expr,
+                condition,
+                else_expr,
+            })));
+        }
+
+        // Python-style postfix: value if condition else fallback
         let expr = self.parse_or()?;
         if matches!(self.current(), Token::If) {
             self.advance();
