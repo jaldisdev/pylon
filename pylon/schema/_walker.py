@@ -465,18 +465,41 @@ def _python_value_to_sql(value: Any) -> str | None:
 
 
 def _make_default_sql(meta: Any) -> str | None:
-    from ._constraints import Default
-    from ._constraints import _NowType
+    """Return a SQL literal/expression for the property's default, or None."""
+    import decimal as _decimal
+    from ._constraints import Default, _NowType, _SequenceNextType
 
     for c in meta.constraints:
         if isinstance(c, Default):
-            if isinstance(c.sentinel, _NowType):
+            s = c.sentinel
+            if isinstance(s, _NowType):
                 return "now()"
-            # Other Default sentinels: no server-side expression yet.
-            return None
+            if isinstance(s, _SequenceNextType):
+                return None  # handled separately in _make_property_desc
+            if isinstance(s, str):
+                return None  # PyQL expression — handled by _make_default_pyql
+            if s is None:
+                return "NULL"
+            # bool must be checked before int (bool is a subclass of int)
+            if isinstance(s, bool):
+                return "true" if s else "false"
+            if isinstance(s, (int, float, _decimal.Decimal)):
+                return str(s)
+            return None  # unknown sentinel
 
     if meta.default is not MISSING and meta.default is not None:
         return _python_value_to_sql(meta.default)
+
+    return None
+
+
+def _make_default_pyql(meta: Any) -> str | None:
+    """Return a PyQL expression string from Default(str), or None."""
+    from ._constraints import Default, _SequenceNextType, _NowType
+
+    for c in meta.constraints:
+        if isinstance(c, Default) and isinstance(c.sentinel, str):
+            return c.sentinel
 
     return None
 
@@ -540,11 +563,13 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
 
     is_pk = name == "id" and meta.scalar_type is UUID
     if is_pk:
+        id_default_pyql = _make_default_pyql(meta)
         return _core.PropertyDescriptor(
             name="id",
             pg_type="uuid",
             nullable=False,
-            default_sql="uuidv7()",
+            default_sql=None if id_default_pyql else "uuidv7()",
+            default_pyql=id_default_pyql,
             description=meta.description,
             check_constraints=[],
             is_exclusive=True,
@@ -566,8 +591,11 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
                 seq_name = f"{scalar_type.__name__}_seq"
                 default_sql = f"""nextval('"{mod}"."{seq_name}"')"""
             break
+    default_pyql = None
     if default_sql is None:
         default_sql = _make_default_sql(meta)
+    if default_sql is None:
+        default_pyql = _make_default_pyql(meta)
 
     rewrites = [
         _core.RewriteEntry(on=int(r.on), handler=r.handler)
@@ -579,6 +607,7 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         pg_type=pg_type,
         nullable=meta.nullable,
         default_sql=default_sql,
+        default_pyql=default_pyql,
         description=meta.description,
         check_constraints=checks,
         is_exclusive=is_exclusive,
@@ -604,6 +633,7 @@ def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
         name=name,
         target=meta.link_target,  # already a qualified string
         nullable=meta.nullable,
+        default_pyql=_make_default_pyql(meta),
         description=meta.description,
         is_exclusive=is_exclusive,
         is_readonly=meta.is_readonly,
@@ -618,6 +648,7 @@ def _make_multilink_desc(name: str, meta: Any, _core: Any) -> Any:
         target=meta.link_target,  # already a qualified string
         through=meta.through,      # already a qualified string or None
         nullable=meta.nullable,
+        default_pyql=_make_default_pyql(meta),
         description=meta.description,
         on_delete=_make_on_delete_policies(meta.on_delete, _core),
     )

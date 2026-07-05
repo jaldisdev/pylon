@@ -186,6 +186,7 @@ impl PropertyDescriptor {
         nullable,
         *,
         default_sql = None,
+        default_pyql = None,
         description = None,
         check_constraints = None,
         is_exclusive = false,
@@ -198,6 +199,7 @@ impl PropertyDescriptor {
         pg_type: String,
         nullable: bool,
         default_sql: Option<String>,
+        default_pyql: Option<String>,
         description: Option<String>,
         check_constraints: Option<Vec<String>>,
         is_exclusive: bool,
@@ -211,6 +213,7 @@ impl PropertyDescriptor {
                 pg_type,
                 nullable,
                 default_sql,
+                default_pyql,
                 description,
                 check_constraints: check_constraints.unwrap_or_default(),
                 is_exclusive,
@@ -284,6 +287,7 @@ impl LinkDescriptor {
         target,
         nullable,
         *,
+        default_pyql = None,
         description = None,
         is_exclusive = false,
         is_readonly = false,
@@ -294,6 +298,7 @@ impl LinkDescriptor {
         name: String,
         target: String,
         nullable: bool,
+        default_pyql: Option<String>,
         description: Option<String>,
         is_exclusive: bool,
         is_readonly: bool,
@@ -305,6 +310,7 @@ impl LinkDescriptor {
                 name,
                 target,
                 nullable,
+                default_pyql,
                 description,
                 is_exclusive,
                 is_readonly,
@@ -367,6 +373,7 @@ impl MultiLinkDescriptor {
         *,
         through = None,
         nullable = false,
+        default_pyql = None,
         description = None,
         on_delete = None
     ))]
@@ -375,6 +382,7 @@ impl MultiLinkDescriptor {
         target: String,
         through: Option<String>,
         nullable: bool,
+        default_pyql: Option<String>,
         description: Option<String>,
         on_delete: Option<Vec<PyRef<OnDeletePolicy>>>,
     ) -> Self {
@@ -384,6 +392,7 @@ impl MultiLinkDescriptor {
                 target,
                 through,
                 nullable,
+                default_pyql,
                 description,
                 on_delete: on_delete
                     .unwrap_or_default()
@@ -1421,11 +1430,12 @@ impl DbState {
         pg_type: String,
         nullable: bool,
         is_generated: bool,
+        column_default: Option<String>,
     ) {
         if let Some(t) = self.inner.tables.iter_mut()
             .find(|t| t.schema == schema && t.name == table)
         {
-            t.columns.push(core::diff::DbColumn { name, pg_type, nullable, is_generated });
+            t.columns.push(core::diff::DbColumn { name, pg_type, nullable, is_generated, column_default });
         }
     }
 

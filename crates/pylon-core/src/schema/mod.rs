@@ -42,6 +42,9 @@ pub struct PropertyDescriptor {
     pub nullable: bool,
     /// SQL expression for the column DEFAULT clause.
     pub default_sql: Option<String>,
+    /// PyQL expression to be compiled to SQL at DDL-emit time.
+    /// Takes precedence over `default_sql` when both could be set (they won't be).
+    pub default_pyql: Option<String>,
     pub description: Option<String>,
     /// Pre-compiled SQL CHECK expressions, e.g. `"price >= 0"`.
     pub check_constraints: Vec<String>,
@@ -61,6 +64,7 @@ pub struct LinkDescriptor {
     pub target: String,
     pub nullable: bool,
     pub description: Option<String>,
+    pub default_pyql: Option<String>,
     /// True when a UNIQUE constraint applies to this FK column alone.
     pub is_exclusive: bool,
     /// True when the transpiler should reject PyQL updates targeting this field.
@@ -78,6 +82,7 @@ pub struct MultiLinkDescriptor {
     pub through: Option<String>,
     pub nullable: bool,
     pub description: Option<String>,
+    pub default_pyql: Option<String>,
     pub on_delete: Vec<OnDeletePolicy>,
 }
 

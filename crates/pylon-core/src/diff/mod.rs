@@ -49,6 +49,8 @@ pub struct DbColumn {
     pub pg_type: String,
     pub nullable: bool,
     pub is_generated: bool,
+    #[serde(default)]
+    pub column_default: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +162,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 pg_type: col_type_str(&p.pg_type).to_string(),
                 nullable: p.nullable,
                 is_generated: false,
+                column_default: resolve_default(p, schema),
             });
         }
         for l in &td.links {
@@ -168,6 +171,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 pg_type: "uuid".to_string(),
                 nullable: l.nullable,
                 is_generated: false,
+                column_default: resolve_link_default(l, schema),
             });
         }
         // Generated columns for vector indexes
@@ -179,6 +183,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                     pg_type: format!("vector({})", vi.dimensions),
                     nullable: true,
                     is_generated: false,
+                    column_default: None,
                 });
             }
         }
@@ -192,6 +197,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                     pg_type: "tsvector".to_string(),
                     nullable: true,
                     is_generated: true,
+                    column_default: None,
                 });
             }
         }
@@ -292,8 +298,8 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         for ml in &td.multilinks {
             let jt_name = format!("{}.{}", td.table, ml.name);
             let mut jt_columns = vec![
-                DbColumn { name: "source".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false },
-                DbColumn { name: "target".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false },
+                DbColumn { name: "source".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
+                DbColumn { name: "target".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
             ];
 
             // Extra columns from the through junction type
@@ -309,6 +315,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                             pg_type,
                             nullable: p.nullable,
                             is_generated: false,
+                            column_default: p.default_sql.clone(),
                         });
                     }
                 }
@@ -999,7 +1006,7 @@ fn diff_inner(
         let key = (td.module.as_str(), td.table.as_str());
         match cur_tables.get(&key) {
             None => {
-                emit_create_table(td, &mut ops);
+                emit_create_table(td, target, &mut ops);
                 new_tables.insert((td.module.clone(), td.table.clone()));
             }
             Some(existing) => {
@@ -1007,7 +1014,7 @@ fn diff_inner(
                     .get(&(td.module.clone(), td.table.clone()))
                     .cloned()
                     .unwrap_or_default();
-                emit_column_diff(td, existing, &mut ops, for_migration, &fill_cols);
+                emit_column_diff(td, existing, &mut ops, for_migration, &fill_cols, target);
             }
         }
     }
@@ -1215,20 +1222,44 @@ fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
     ops.push(DiffOp { sql, non_transactional: false });
 }
 
+// ── Default resolution ────────────────────────────────────────────────────────
+
+/// Return the effective SQL DEFAULT for a property, compiling `default_pyql`
+/// with the schema IR compiler if needed.
+fn resolve_default(p: &crate::schema::PropertyDescriptor, schema: &SchemaDescriptor) -> Option<String> {
+    if let Some(sql) = &p.default_sql {
+        return Some(sql.clone());
+    }
+    if let Some(pyql) = &p.default_pyql {
+        return crate::ir::compile_scalar_default(pyql, schema).ok();
+    }
+    None
+}
+
+fn resolve_link_default(l: &crate::schema::LinkDescriptor, schema: &SchemaDescriptor) -> Option<String> {
+    if let Some(pyql) = &l.default_pyql {
+        return crate::ir::compile_scalar_default(pyql, schema).ok();
+    }
+    None
+}
+
 // ── CREATE TABLE for a new type ───────────────────────────────────────────────
 
-fn emit_create_table(td: &TypeDescriptor, ops: &mut Vec<DiffOp>) {
+fn emit_create_table(td: &TypeDescriptor, schema: &SchemaDescriptor, ops: &mut Vec<DiffOp>) {
     let mut lines: Vec<String> = Vec::new();
     for p in &td.properties {
         let not_null = if p.nullable { "" } else { " NOT NULL" };
-        let default = p.default_sql.as_deref()
+        let default = resolve_default(p, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type_str(&p.pg_type), not_null, default));
     }
     for l in &td.links {
         let not_null = if l.nullable { "" } else { " NOT NULL" };
-        lines.push(format!("    {} uuid{}", qi(&format!("{}_id", l.name)), not_null));
+        let default = resolve_link_default(l, schema)
+            .map(|d| format!(" DEFAULT {}", d))
+            .unwrap_or_default();
+        lines.push(format!("    {} uuid{}{}", qi(&format!("{}_id", l.name)), not_null, default));
     }
     let pk_cols: Vec<String> = td.properties.iter().filter(|p| p.is_pk).map(|p| qi(&p.name)).collect();
     if !pk_cols.is_empty() {
@@ -1253,6 +1284,7 @@ fn emit_column_diff(
     ops: &mut Vec<DiffOp>,
     for_migration: bool,
     fill_cols: &HashSet<String>,
+    schema: &SchemaDescriptor,
 ) {
     let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter()
         .map(|c| (c.name.as_str(), c))
@@ -1261,10 +1293,11 @@ fn emit_column_diff(
     // ── Add new columns ───────────────────────────────────────────────────────
     for p in &td.properties {
         if existing_col_map.contains_key(p.name.as_str()) { continue; }
-        let needs_fill = for_migration && !p.nullable && p.default_sql.is_none()
+        let eff_default = resolve_default(p, schema);
+        let needs_fill = for_migration && !p.nullable && eff_default.is_none()
             && fill_cols.contains(&p.name);
         let not_null = if p.nullable || needs_fill { "" } else { " NOT NULL" };
-        let default = p.default_sql.as_deref()
+        let default = eff_default
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
         push_tx(ops, format!(
@@ -1275,15 +1308,20 @@ fn emit_column_diff(
     for l in &td.links {
         let col = format!("{}_id", l.name);
         if existing_col_map.contains_key(col.as_str()) { continue; }
-        let needs_fill = for_migration && !l.nullable && fill_cols.contains(&col);
+        let eff_default = resolve_link_default(l, schema);
+        let needs_fill = for_migration && !l.nullable && eff_default.is_none()
+            && fill_cols.contains(&col);
         let not_null = if l.nullable || needs_fill { "" } else { " NOT NULL" };
+        let default = eff_default
+            .map(|d| format!(" DEFAULT {}", d))
+            .unwrap_or_default();
         push_tx(ops, format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{};",
-            qn(&td.module, &td.table), qi(&col), not_null
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{}{};",
+            qn(&td.module, &td.table), qi(&col), not_null, default
         ));
     }
 
-    // ── Nullability changes on existing columns ───────────────────────────────
+    // ── Nullability + DEFAULT changes on existing columns ─────────────────────
     for p in &td.properties {
         let Some(cur) = existing_col_map.get(p.name.as_str()) else { continue };
         if cur.is_generated { continue; }
@@ -1302,6 +1340,31 @@ fn emit_column_diff(
             // In migration mode this is intentionally skipped; the fill mechanism
             // emits UPDATE + SET NOT NULL after the main diff body.
         }
+
+        // DEFAULT changes
+        let target_default = resolve_default(p, schema);
+        let db_default = cur.column_default.as_deref();
+        match (&target_default, db_default) {
+            (Some(want), Some(have)) if want != have => {
+                push_tx(ops, format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                    qn(&td.module, &td.table), qi(&p.name), want
+                ));
+            }
+            (Some(want), None) => {
+                push_tx(ops, format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                    qn(&td.module, &td.table), qi(&p.name), want
+                ));
+            }
+            (None, Some(_)) => {
+                push_tx(ops, format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                    qn(&td.module, &td.table), qi(&p.name)
+                ));
+            }
+            _ => {}
+        }
     }
     for l in &td.links {
         let col = format!("{}_id", l.name);
@@ -1316,6 +1379,30 @@ fn emit_column_diff(
                 "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
                 qn(&td.module, &td.table), qi(&col)
             ));
+        }
+
+        let target_default = resolve_link_default(l, schema);
+        let db_default = cur.column_default.as_deref();
+        match (&target_default, db_default) {
+            (Some(want), Some(have)) if want != have => {
+                push_tx(ops, format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                    qn(&td.module, &td.table), qi(&col), want
+                ));
+            }
+            (Some(want), None) => {
+                push_tx(ops, format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                    qn(&td.module, &td.table), qi(&col), want
+                ));
+            }
+            (None, Some(_)) => {
+                push_tx(ops, format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                    qn(&td.module, &td.table), qi(&col)
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -1640,6 +1727,7 @@ mod tests {
         PropertyDescriptor {
             name: name.into(), pg_type: pg_type.into(), nullable,
             default_sql: if name == "id" { Some("uuidv7()".into()) } else { None },
+                        default_pyql: None,
             description: None, check_constraints: vec![],
             is_exclusive: name == "id", is_pk: name == "id",
             is_readonly: name == "id", rewrites: vec![],
@@ -1682,8 +1770,8 @@ mod tests {
             tables: vec![DbTable {
                 schema: "default".into(), name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false },
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
                 foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
@@ -1706,8 +1794,8 @@ mod tests {
             tables: vec![DbTable {
                 schema: "default".into(), name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false },
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
                 foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
@@ -1773,8 +1861,8 @@ mod tests {
             tables: vec![DbTable {
                 schema: "default".into(), name: "Post".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false },
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
                 foreign_keys: vec![], indexes: vec![], checks: vec![],
             }],
