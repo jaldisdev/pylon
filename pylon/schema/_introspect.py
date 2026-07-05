@@ -2,7 +2,8 @@
 
 Queries the live database and returns a populated DbState (pylon._core.DbState)
 describing the current user-managed schema structure. System schemas (_pylon,
-public, pg_*, information_schema) are excluded automatically.
+pg_*, information_schema) are excluded automatically. The public Postgres schema
+is treated as the default Pylon module.
 """
 
 from __future__ import annotations
@@ -13,14 +14,29 @@ if TYPE_CHECKING:
     import asyncpg
     from pylon._core import DbState
 
-# Schemas we never manage or diff against.
-_SYSTEM_SCHEMAS = (
+# Excluded from the module-listing query only — public is handled as "default".
+_SCHEMA_LIST_EXCLUDES = (
     "_pylon",
     "public",
     "pg_catalog",
     "information_schema",
     "pg_toast",
 )
+
+# Excluded from all object queries (tables, enums, …) — public is included here
+# so we pick up default-module objects.
+_OBJECT_EXCLUDES = (
+    "_pylon",
+    "pg_catalog",
+    "information_schema",
+    "pg_toast",
+)
+
+
+def _pg_to_module(schema: str) -> str:
+    """Translate a Postgres schema name to the Pylon module name."""
+    return "default" if schema == "public" else schema
+
 
 _SCHEMAS_SQL = """
 SELECT nspname
@@ -151,44 +167,49 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
     from pylon._core import DbState
 
     state = DbState()
-    system = list(_SYSTEM_SCHEMAS)
+    schema_excludes = list(_SCHEMA_LIST_EXCLUDES)
+    object_excludes = list(_OBJECT_EXCLUDES)
 
-    # Schemas
-    schemas = await conn.fetch(_SCHEMAS_SQL, system)
+    # The default module always exists (mapped to public).
+    state.add_schema("default")
+
+    # User-defined modules (non-default).
+    schemas = await conn.fetch(_SCHEMAS_SQL, schema_excludes)
     for row in schemas:
         state.add_schema(row["nspname"])
 
     # Enums (collect members per enum)
-    enum_rows = await conn.fetch(_ENUMS_SQL, system)
+    enum_rows = await conn.fetch(_ENUMS_SQL, object_excludes)
     current_enum: tuple[str, str] | None = None
     members: list[str] = []
     for row in enum_rows:
         key = (row["schema"], row["name"])
         if key != current_enum:
             if current_enum is not None:
-                state.add_enum(current_enum[0], current_enum[1], members)
+                state.add_enum(_pg_to_module(current_enum[0]), current_enum[1], members)
             current_enum = key
             members = []
         members.append(row["member"])
     if current_enum is not None:
-        state.add_enum(current_enum[0], current_enum[1], members)
+        state.add_enum(_pg_to_module(current_enum[0]), current_enum[1], members)
 
     # Domains
-    domain_rows = await conn.fetch(_DOMAINS_SQL, system)
+    domain_rows = await conn.fetch(_DOMAINS_SQL, object_excludes)
     for row in domain_rows:
-        state.add_domain(row["schema"], row["name"])
+        state.add_domain(_pg_to_module(row["schema"]), row["name"])
 
     # Tables + columns + FKs + indexes
-    table_rows = await conn.fetch(_TABLES_SQL, system)
+    table_rows = await conn.fetch(_TABLES_SQL, object_excludes)
     for trow in table_rows:
-        schema = trow["schema"]
+        pg_schema = trow["schema"]
+        module = _pg_to_module(pg_schema)
         name = trow["name"]
-        state.add_table(schema, name)
+        state.add_table(module, name)
 
-        col_rows = await conn.fetch(_COLUMNS_SQL, schema, name)
+        col_rows = await conn.fetch(_COLUMNS_SQL, pg_schema, name)
         for col in col_rows:
             state.add_column(
-                schema,
+                module,
                 name,
                 col["name"],
                 col["pg_type"],
@@ -197,21 +218,21 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
                 col["column_default"],
             )
 
-        fk_rows = await conn.fetch(_FKS_SQL, schema, name)
+        fk_rows = await conn.fetch(_FKS_SQL, pg_schema, name)
         for fk in fk_rows:
             state.add_foreign_key(
-                schema,
+                module,
                 name,
                 fk["constraint_name"],
                 fk["local_column"],
-                fk["ref_schema"],
+                _pg_to_module(fk["ref_schema"]),
                 fk["ref_table"],
             )
 
-        idx_rows = await conn.fetch(_INDEXES_SQL, schema, name)
+        idx_rows = await conn.fetch(_INDEXES_SQL, pg_schema, name)
         for idx in idx_rows:
             state.add_index(
-                schema,
+                module,
                 name,
                 idx["name"],
                 idx["is_unique"],
@@ -219,18 +240,18 @@ async def introspect_db_state(conn: "asyncpg.Connection") -> "DbState":
             )
 
     # Sequences
-    seq_rows = await conn.fetch(_SEQUENCES_SQL, system)
+    seq_rows = await conn.fetch(_SEQUENCES_SQL, object_excludes)
     for row in seq_rows:
-        state.add_sequence(row["schema"], row["name"])
+        state.add_sequence(_pg_to_module(row["schema"]), row["name"])
 
     # Views
-    view_rows = await conn.fetch(_VIEWS_SQL, system)
+    view_rows = await conn.fetch(_VIEWS_SQL, object_excludes)
     for row in view_rows:
-        state.add_view(row["schema"], row["name"], _ddl_hash(row["view_definition"]))
+        state.add_view(_pg_to_module(row["schema"]), row["name"], _ddl_hash(row["view_definition"]))
 
     # Functions
-    fn_rows = await conn.fetch(_FUNCTIONS_SQL, system)
+    fn_rows = await conn.fetch(_FUNCTIONS_SQL, object_excludes)
     for row in fn_rows:
-        state.add_function(row["schema"], row["name"], _ddl_hash(row["definition"]))
+        state.add_function(_pg_to_module(row["schema"]), row["name"], _ddl_hash(row["definition"]))
 
     return state

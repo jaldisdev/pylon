@@ -837,8 +837,12 @@ fn qi(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+fn pg_schema(module: &str) -> String {
+    if module == "default" { "\"public\"".into() } else { qi(module) }
+}
+
 fn qn(schema: &str, name: &str) -> String {
-    format!("{}.{}", qi(schema), qi(name))
+    format!("{}.{}", pg_schema(schema), qi(name))
 }
 
 // ── Topological sort (referenced types before referencing) ────────────────────
@@ -934,8 +938,9 @@ fn diff_inner(
 
     // ── Phase 1: schemas ─────────────────────────────────────────────────────
     for schema in &target_schemas {
+        if schema == "default" { continue; } // public always exists
         if !cur_schemas.contains(schema.as_str()) {
-            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
+            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(schema)));
         }
     }
 
@@ -949,7 +954,7 @@ fn diff_inner(
                 push_tx(&mut ops, format!(
                     "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
                      EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                    qi(&e.module), qi(&e.name), members.join(", ")
+                    pg_schema(&e.module), qi(&e.name), members.join(", ")
                 ));
             }
             Some(existing) => {
@@ -958,7 +963,7 @@ fn diff_inner(
                     if !existing_set.contains(member.as_str()) {
                         push_tx(&mut ops, format!(
                             "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                            qi(&e.module), qi(&e.name), member.replace('\'', "''")
+                            pg_schema(&e.module), qi(&e.name), member.replace('\'', "''")
                         ));
                     }
                 }
@@ -973,7 +978,7 @@ fn diff_inner(
             if !cur_sequences.contains(&(s.module.as_str(), seq_name.as_str())) {
                 push_tx(&mut ops, format!(
                     "CREATE SEQUENCE IF NOT EXISTS {}.{};",
-                    qi(&s.module), qi(&seq_name)
+                    pg_schema(&s.module), qi(&seq_name)
                 ));
             }
         }
@@ -989,9 +994,24 @@ fn diff_inner(
             push_tx(&mut ops, format!(
                 "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
                  EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
-                qi(&s.module), qi(&s.name), s.pg_type, check_clause
+                pg_schema(&s.module), qi(&s.name), s.pg_type, check_clause
             ));
         }
+    }
+
+    // ── Phase 3.5: scalar functions (before tables — table DEFAULTs may call them) ──
+    let scalar_fn_ddls = crate::export::scalar_function_ddl_with_names(target)
+        .map_err(|e| e.to_string())?;
+    for (module, name, ddl) in scalar_fn_ddls {
+        let emit = if for_migration {
+            let hash = ddl_hash(&ddl);
+            cur_functions.get(&(module.as_str(), name.as_str()))
+                .map(|&h| h != hash)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if emit { push_tx(&mut ops, ddl); }
     }
 
     // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
@@ -1130,11 +1150,10 @@ fn diff_inner(
         if emit { push_tx(&mut ops, ddl); }
     }
 
-    // ── Phase 11: user-defined functions ─────────────────────────────────────
-    // Same conditional logic as views.
-    let fn_ddls = crate::export::function_ddl_with_names(target)
+    // ── Phase 11: object-returning functions (after tables and views exist) ──
+    let obj_fn_ddls = crate::export::object_function_ddl_with_names(target)
         .map_err(|e| e.to_string())?;
-    for (module, name, ddl) in fn_ddls {
+    for (module, name, ddl) in obj_fn_ddls {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
             cur_functions.get(&(module.as_str(), name.as_str()))
@@ -1210,8 +1229,9 @@ fn diff_inner(
 
     // ── Phase 15: drop removed schemas ───────────────────────────────────────
     for schema in &current.schemas {
+        if schema == "default" { continue; } // never drop public
         if !target_schemas.contains(schema) {
-            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", qi(schema)));
+            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(schema)));
         }
     }
 
@@ -1535,8 +1555,9 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
 
     // New schemas
     for schema in &after.schemas {
+        if schema == "default" { continue; } // public always exists
         if !before_schemas.contains(schema.as_str()) {
-            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", qi(schema)));
+            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(schema)));
         }
     }
 
@@ -1550,7 +1571,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
                 push_tx(&mut ops, format!(
                     "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
                      EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                    qi(&e.schema), qi(&e.name), members.join(", ")
+                    pg_schema(&e.schema), qi(&e.name), members.join(", ")
                 ));
             }
             Some(existing) => {
@@ -1559,7 +1580,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
                     if !existing_set.contains(member.as_str()) {
                         push_tx(&mut ops, format!(
                             "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                            qi(&e.schema), qi(&e.name), member.replace('\'', "''")
+                            pg_schema(&e.schema), qi(&e.name), member.replace('\'', "''")
                         ));
                     }
                 }
@@ -1574,7 +1595,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
             // emit a placeholder that will be filled by the squash command.
             push_tx(&mut ops, format!(
                 "-- TODO: recreate domain {}.{} (reconstruct DDL from source migrations)",
-                qi(&d.schema), qi(&d.name)
+                pg_schema(&d.schema), qi(&d.name)
             ));
         }
     }
@@ -1608,8 +1629,8 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
                     // emit best-effort.
                     push_tx(&mut ops, format!(
                         "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{}(id);",
-                        qi(&t.schema), qi(&t.name), qi(&fk.constraint_name),
-                        qi(&fk.local_column), qi(&fk.ref_schema), qi(&fk.ref_table)
+                        pg_schema(&t.schema), qi(&t.name), qi(&fk.constraint_name),
+                        qi(&fk.local_column), pg_schema(&fk.ref_schema), qi(&fk.ref_table)
                     ));
                 }
             }
@@ -1630,7 +1651,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
             let unique = if idx.is_unique { "UNIQUE " } else { "" };
             let idx_sql = format!(
                 "CREATE {unique}INDEX {concurrently}IF NOT EXISTS {} ON {}.{};",
-                qi(&idx.name), qi(&t.schema), qi(&t.name)
+                qi(&idx.name), pg_schema(&t.schema), qi(&t.name)
             );
             ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
         }
@@ -1644,7 +1665,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
         if !after_tables.contains(&(t.schema.as_str(), t.name.as_str())) {
             push_tx(&mut ops, format!(
                 "DROP TABLE IF EXISTS {}.{} CASCADE;",
-                qi(&t.schema), qi(&t.name)
+                pg_schema(&t.schema), qi(&t.name)
             ));
         }
     }
@@ -1657,7 +1678,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
         if !after_enum_set.contains(&(e.schema.as_str(), e.name.as_str())) {
             push_tx(&mut ops, format!(
                 "DROP TYPE IF EXISTS {}.{} CASCADE;",
-                qi(&e.schema), qi(&e.name)
+                pg_schema(&e.schema), qi(&e.name)
             ));
         }
     }
@@ -1665,8 +1686,9 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
     // Drop removed schemas
     let after_schema_set: HashSet<&str> = after.schemas.iter().map(|s| s.as_str()).collect();
     for schema in &before.schemas {
+        if schema == "default" { continue; } // never drop public
         if !after_schema_set.contains(schema.as_str()) {
-            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", qi(schema)));
+            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(schema)));
         }
     }
 
@@ -1686,7 +1708,7 @@ fn emit_create_table_from_db(t: &DbTable, ops: &mut Vec<DiffOp>) {
     }
     push_tx(ops, format!(
         "CREATE TABLE IF NOT EXISTS {}.{} (\n{}\n);",
-        qi(&t.schema), qi(&t.name),
+        pg_schema(&t.schema), qi(&t.name),
         lines.join(",\n")
     ));
 }
@@ -1700,7 +1722,7 @@ fn emit_column_diff_from_db(after: &DbTable, before: &DbTable, ops: &mut Vec<Dif
             let not_null = if col.nullable { "" } else { " NOT NULL" };
             push_tx(ops, format!(
                 "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} {}{};",
-                qi(&after.schema), qi(&after.name), qi(&col.name), col.pg_type, not_null
+                pg_schema(&after.schema), qi(&after.name), qi(&col.name), col.pg_type, not_null
             ));
         }
     }
@@ -1708,7 +1730,7 @@ fn emit_column_diff_from_db(after: &DbTable, before: &DbTable, ops: &mut Vec<Dif
         if !after_cols.contains(col.name.as_str()) {
             push_tx(ops, format!(
                 "ALTER TABLE {}.{} DROP COLUMN IF EXISTS {};",
-                qi(&after.schema), qi(&after.name), qi(&col.name)
+                pg_schema(&after.schema), qi(&after.name), qi(&col.name)
             ));
         }
     }
