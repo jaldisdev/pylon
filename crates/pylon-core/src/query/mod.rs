@@ -1,6 +1,27 @@
+use std::sync::{OnceLock, RwLock};
+use lru::LruCache;
+use std::num::NonZeroUsize;
+
 use crate::error::PyQLError;
 use crate::schema::SchemaDescriptor;
 use crate::{ir, parse, sql};
+
+const CACHE_CAPACITY: usize = 1024;
+
+static QUERY_CACHE: OnceLock<RwLock<LruCache<String, CompiledQuery>>> = OnceLock::new();
+
+fn query_cache() -> &'static RwLock<LruCache<String, CompiledQuery>> {
+    QUERY_CACHE.get_or_init(|| {
+        RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()))
+    })
+}
+
+/// Discard all cached compiled queries. Call when the schema is reloaded.
+pub fn clear_query_cache() {
+    if let Some(cache) = QUERY_CACHE.get() {
+        cache.write().unwrap().clear();
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cardinality {
@@ -165,9 +186,23 @@ pub fn compile_fill_expr(
 
 /// Compile a PyQL query string to SQL against `schema`.
 ///
+/// Results are cached in a process-global LRU (capacity 1024). Call
+/// `clear_query_cache()` when the schema is reloaded to avoid stale entries.
 /// Synchronous — compilation is CPU-bound; async lives at the DB execution layer.
 /// Raises `PyQLError` on any grammar, type, or resolution failure.
 pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, PyQLError> {
+    {
+        let mut cache = query_cache().write().unwrap();
+        if let Some(cached) = cache.get(query) {
+            return Ok(cached.clone());
+        }
+    }
+    let compiled = compile_uncached(query, schema)?;
+    query_cache().write().unwrap().put(query.to_string(), compiled.clone());
+    Ok(compiled)
+}
+
+fn compile_uncached(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, PyQLError> {
     let ast = parse::parse(query)?;
     let ir_out = ir::compile(&ast, schema)?;
     let sql_out = sql::emit(&ir_out);
