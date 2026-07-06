@@ -1632,6 +1632,13 @@ fn db_state_from_json(json: &str) -> PyResult<DbState> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
+/// Discard all cached compiled queries. Must be called after a schema reload
+/// so stale compiled SQL is not reused against the new schema.
+#[pyfunction]
+fn clear_query_cache() {
+    core::query::clear_query_cache();
+}
+
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
 fn shape_node_to_py<'py>(
@@ -1832,6 +1839,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;
 
     Ok(())
 }

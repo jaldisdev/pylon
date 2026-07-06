@@ -150,5 +150,7 @@ def _set_schema(schema: SchemaDescriptor) -> None:
     Called by framework startup hooks to eagerly set the singleton before
     any queries are compiled.
     """
+    from pylon._core import clear_query_cache
     global _singleton
     _singleton = schema
+    clear_query_cache()
