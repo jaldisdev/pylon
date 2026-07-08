@@ -131,6 +131,81 @@ class TestTranspile:
                 _transpile("select 1", {})
 
 
+class TestMergeArgs:
+    def test_no_args_returns_kwargs_unchanged(self):
+        from pylon.client import _merge_args
+
+        kw = {"name": "Alice"}
+        result = _merge_args((), kw)
+        assert result is kw
+
+    def test_args_mapped_to_string_indices(self):
+        from pylon.client import _merge_args
+
+        result = _merge_args(("Alice", 30), {})
+        assert result == {"0": "Alice", "1": 30}
+
+    def test_args_and_kwargs_merged(self):
+        from pylon.client import _merge_args
+
+        result = _merge_args(("Alice",), {"age": 30})
+        assert result == {"0": "Alice", "age": 30}
+
+    def test_kwargs_win_over_args_on_collision(self):
+        from pylon.client import _merge_args
+
+        result = _merge_args(("original",), {"0": "override"})
+        assert result["0"] == "override"
+
+
+class TestTranspilePositional:
+    def _make_compiled(self, param_names):
+        c = MagicMock()
+        c.sql = "SELECT $1"
+        c.param_names = param_names
+        return c
+
+    def test_positional_arg_bound_by_index_name(self):
+        from pylon.client import _transpile
+
+        compiled = self._make_compiled(["0"])
+        with patch("pylon.query.compile", return_value=compiled):
+            _, params, _ = _transpile("select $0", {"0": "Alice"})
+        assert params == ["Alice"]
+
+    def test_two_positional_args_in_order(self):
+        from pylon.client import _transpile
+
+        compiled = self._make_compiled(["0", "1"])
+        with patch("pylon.query.compile", return_value=compiled):
+            _, params, _ = _transpile("select $0, $1", {"0": "Alice", "1": 30})
+        assert params == ["Alice", 30]
+
+
+class TestClientQueryPositional:
+    def test_positional_args_forwarded_to_transpile(self):
+        async def _run():
+            pool, conn = _make_pool(fetch_result=[])
+            client = _client_with_pool(pool)
+
+            received_kwargs: dict = {}
+
+            async def fake_resolve(pyql, kwargs, config, globals_=None):
+                received_kwargs.update(kwargs)
+                compiled = _fake_compiled()
+                compiled.param_names = []
+                compiled.inference_plan = None
+                return compiled, "SELECT 1", []
+
+            with patch("pylon.client._compile_and_resolve", side_effect=fake_resolve), \
+                 patch("pylon.client._hydrate", return_value=[]):
+                await client.query("select Person filter .name = $0", "Alice")
+
+            assert received_kwargs == {"0": "Alice"}
+
+        run(_run())
+
+
 class TestHydrate:
     def _make_compiled(self):
         return MagicMock()
@@ -169,7 +244,7 @@ class TestHydrate:
 def _fake_compiled(sql: str = "SELECT 1"):
     c = MagicMock()
     c.sql = sql
-    c.deferred_search_plan = None
+    c.inference_plan = None
     return c
 
 

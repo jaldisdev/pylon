@@ -763,10 +763,15 @@ impl Parser {
                 }
             }
 
-            // Parameter `$name`
+            // Parameter `$name` or positional `$0`, `$1`, …
             Token::Dollar => {
                 self.advance();
-                let name = self.eat_ident()?;
+                let name = if let Token::IntLit(n) = self.current().clone() {
+                    self.advance();
+                    n.to_string()
+                } else {
+                    self.eat_ident()?
+                };
                 Ok(Expr::Parameter(name))
             }
 

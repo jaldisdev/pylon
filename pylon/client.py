@@ -98,15 +98,15 @@ class AsyncTransaction:
     # Query helpers — identical signatures to Client
     # ------------------------------------------------------------------
 
-    async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
+    async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
-        sql, params, compiled = _transpile(pyql, kwargs)
+        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs))
         records = list(await self._conn.fetch(sql, *params))
         return _hydrate(records, compiled)
 
-    async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
+    async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
-        sql, params, compiled = _transpile(pyql, kwargs)
+        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs))
         rows = await self._conn.fetch(sql, *params)
         if len(rows) > 1:
             raise ResultCardinalityError(
@@ -116,24 +116,24 @@ class AsyncTransaction:
             return None
         return _hydrate(list(rows), compiled)[0]
 
-    async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
+    async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Return exactly one result; raise if the set is empty or has >1 row."""
-        result = await self.query_single(pyql, **kwargs)
+        result = await self.query_single(pyql, *args, **kwargs)
         if result is None:
             raise NoDataError("query_required_single returned an empty result set.")
         return result
 
-    async def execute(self, pyql: str, **kwargs: Any) -> None:
+    async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
-        sql, params, _ = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
         await self._conn.execute(sql, *params)
 
-    async def query_json(self, pyql: str, **kwargs: Any) -> str:
+    async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
 
         Returns ``"[]"`` when the result set is empty.
         """
-        sql, params, _ = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
         return (
             await self._conn.fetchval(
                 f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
@@ -141,9 +141,9 @@ class AsyncTransaction:
             or "[]"
         )
 
-    async def query_single_json(self, pyql: str, **kwargs: Any) -> str | None:
+    async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
-        sql, params, _ = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
         rows = await self._conn.fetch(sql, *params)
         if len(rows) > 1:
             raise ResultCardinalityError(
@@ -155,9 +155,9 @@ class AsyncTransaction:
             f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
         )
 
-    async def query_required_single_json(self, pyql: str, **kwargs: Any) -> str:
+    async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Return exactly one result as a JSON string; raise if the set is empty."""
-        result = await self.query_single_json(pyql, **kwargs)
+        result = await self.query_single_json(pyql, *args, **kwargs)
         if result is None:
             raise NoDataError(
                 "query_required_single_json returned an empty result set."
@@ -312,10 +312,10 @@ class Client:
         """
         return ClientWithGlobals(self, globals_, warnings=self._warnings)
 
-    async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
+    async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(pyql, kwargs, self._config)
+        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -329,14 +329,14 @@ class Client:
             raise _fmt_pg_error(exc) from exc
         return _hydrate(records, compiled)
 
-    async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
+    async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Execute *pyql* and return at most one result, or ``None``.
 
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if more
         than one object matches.
         """
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(pyql, kwargs, self._config)
+        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -356,21 +356,21 @@ class Client:
             return None
         return _hydrate(list(rows), compiled)[0]
 
-    async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
+    async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Execute *pyql* and return exactly one result.
 
         Raises :class:`~pylon.exceptions.NoDataError` if the set is empty.
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if >1 row.
         """
-        result = await self.query_single(pyql, **kwargs)
+        result = await self.query_single(pyql, *args, **kwargs)
         if result is None:
             raise NoDataError("query_required_single returned an empty result set.")
         return result
 
-    async def execute(self, pyql: str, **kwargs: Any) -> None:
+    async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
         async with pool.acquire() as conn:
             try:
                 await conn.execute(sql, *params)
@@ -381,13 +381,13 @@ class Client:
             except asyncpg.PostgresError as exc:
                 raise _fmt_pg_error(exc) from exc
 
-    async def query_json(self, pyql: str, **kwargs: Any) -> str:
+    async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
 
         Returns ``"[]"`` when the result set is empty.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
         async with pool.acquire() as conn:
             return (
                 await conn.fetchval(
@@ -396,14 +396,14 @@ class Client:
                 or "[]"
             )
 
-    async def query_single_json(self, pyql: str, **kwargs: Any) -> str | None:
+    async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Execute *pyql* and return at most one result as a JSON string, or ``None``.
 
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if more than one
         object matches.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, kwargs)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -417,13 +417,13 @@ class Client:
                 f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
             )
 
-    async def query_required_single_json(self, pyql: str, **kwargs: Any) -> str:
+    async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return exactly one result as a JSON string.
 
         Raises :class:`~pylon.exceptions.NoDataError` if the set is empty.
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if >1 row.
         """
-        result = await self.query_single_json(pyql, **kwargs)
+        result = await self.query_single_json(pyql, *args, **kwargs)
         if result is None:
             raise NoDataError(
                 "query_required_single_json returned an empty result set."
@@ -539,9 +539,9 @@ class ClientWithGlobals:
     def _require_pool(self) -> Any:
         return self._client._require_pool()
 
-    async def query(self, pyql: str, **kwargs: Any) -> list[Any]:
+    async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, kwargs, self._globals)
+        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -551,9 +551,9 @@ class ClientWithGlobals:
             raise _fmt_pg_error(exc) from exc
         return _hydrate(records, compiled)
 
-    async def query_single(self, pyql: str, **kwargs: Any) -> Any | None:
+    async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, kwargs, self._globals)
+        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -569,21 +569,21 @@ class ClientWithGlobals:
             return None
         return _hydrate(list(rows), compiled)[0]
 
-    async def query_required_single(self, pyql: str, **kwargs: Any) -> Any:
-        result = await self.query_single(pyql, **kwargs)
+    async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
+        result = await self.query_single(pyql, *args, **kwargs)
         if result is None:
             raise NoDataError("query_required_single returned an empty result set.")
         return result
 
-    async def execute(self, pyql: str, **kwargs: Any) -> None:
+    async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, kwargs, self._globals)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         async with pool.acquire() as conn:
             await conn.execute(sql, *params)
 
-    async def query_json(self, pyql: str, **kwargs: Any) -> str:
+    async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, kwargs, self._globals)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         async with pool.acquire() as conn:
             return (
                 await conn.fetchval(
@@ -841,6 +841,12 @@ def _make_provider(model_cfg):
         model=model_cfg.model,
         api_key=model_cfg.secret,
     )
+
+
+def _merge_args(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
+    if not args:
+        return kwargs
+    return {str(i): v for i, v in enumerate(args)} | kwargs
 
 
 def _transpile(

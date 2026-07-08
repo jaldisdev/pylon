@@ -1268,4 +1268,28 @@ mod tests {
         assert!(sql.contains("\"name\""), "expected name field, got: {sql}");
         assert!(sql.contains("\"age\""), "expected age field, got: {sql}");
     }
+
+    #[test]
+    fn test_positional_param_names() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .name = $0").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        assert_eq!(ir.params, vec!["0"]);
+    }
+
+    #[test]
+    fn test_multiple_positional_param_names_in_order() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .name = $0 AND .age > $1").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        assert_eq!(ir.params, vec!["0", "1"]);
+    }
+
+    #[test]
+    fn test_repeated_positional_param_single_slot() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .name = $0 OR .nickname = $0").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        assert_eq!(ir.params, vec!["0"], "repeated $0 must occupy a single slot");
+    }
 }
