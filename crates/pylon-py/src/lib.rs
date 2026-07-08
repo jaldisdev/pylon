@@ -1255,19 +1255,31 @@ impl CompiledQuery {
         pyo3::types::PyList::new(py, &self.inner.warnings).unwrap()
     }
 
-    /// Returns a `DeferredSearchPlan` dict if this query requires two-phase remote execution,
-    /// or `None` for pure-SQL queries.
+    /// Returns an `InferencePlan` dict if this query requires a pre-execution model call,
+    /// or `None` for pure-SQL queries. The dict always has a `"kind"` key: `"search"` or `"embedding"`.
     #[getter]
-    fn deferred_search_plan<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
+    fn inference_plan<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
         use pyo3::types::PyDict;
-        match &self.inner.deferred_search_plan {
+        use core::query::InferencePlan;
+        match &self.inner.inference_plan {
             None => Ok(py.None().into_bound(py)),
-            Some(plan) => {
+            Some(InferencePlan::Search { index_name, query_param_name, query_literal, size }) => {
                 let d = PyDict::new(py);
-                d.set_item("index_name", &plan.index_name)?;
-                d.set_item("query_param_name", &plan.query_param_name)?;
-                d.set_item("query_literal", plan.query_literal.as_deref())?;
-                d.set_item("size", plan.size)?;
+                d.set_item("kind", "search")?;
+                d.set_item("index_name", index_name)?;
+                d.set_item("query_param_name", query_param_name)?;
+                d.set_item("query_literal", query_literal.as_deref())?;
+                d.set_item("size", size)?;
+                Ok(d.into_any())
+            }
+            Some(InferencePlan::Embedding { model_name, type_name, index_name, query_param_name, query_literal }) => {
+                let d = PyDict::new(py);
+                d.set_item("kind", "embedding")?;
+                d.set_item("model_name", model_name)?;
+                d.set_item("type_name", type_name)?;
+                d.set_item("index_name", index_name.as_deref())?;
+                d.set_item("query_param_name", query_param_name)?;
+                d.set_item("query_literal", query_literal.as_deref())?;
                 Ok(d.into_any())
             }
         }

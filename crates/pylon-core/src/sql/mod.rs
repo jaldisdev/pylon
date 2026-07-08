@@ -7,12 +7,12 @@ use crate::ir::{
     IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
-use crate::query::{Cardinality, DeferredSearchPlan, ShapeDescriptor, ShapeNode};
+use crate::query::{Cardinality, InferencePlan, ShapeDescriptor, ShapeNode};
 
 pub struct SqlOutput {
     pub sql: String,
     pub shape: ShapeDescriptor,
-    pub deferred_search_plan: Option<DeferredSearchPlan>,
+    pub inference_plan: Option<InferencePlan>,
 }
 
 /// Emit the SQL body for a computed global CTE — a plain scalar query with a `value` column.
@@ -215,7 +215,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
                 fields: root_fields,
             },
         },
-        deferred_search_plan: None,
+        inference_plan: None,
     }
 }
 
@@ -491,7 +491,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
             shape: ShapeDescriptor {
                 root: ShapeNode::Scalar { name: String::new(), position: 0 },
             },
-            deferred_search_plan: None,
+            inference_plan: None,
         };
     }
 
@@ -513,7 +513,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
                 shape: ShapeDescriptor {
                     root: ShapeNode::Scalar { name: String::new(), position: 0 },
                 },
-                deferred_search_plan: None,
+                inference_plan: None,
             };
         }
     }
@@ -565,7 +565,7 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, deferred_search_plan: None }
+    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, inference_plan: None }
 }
 
 fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
@@ -801,7 +801,7 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         element: Box::new(element_node),
     };
 
-    SqlOutput { sql, shape: ShapeDescriptor { root }, deferred_search_plan: None }
+    SqlOutput { sql, shape: ShapeDescriptor { root }, inference_plan: None }
 }
 
 fn emit_poly_union_type_only(implementors: &[IrPolyImplementor]) -> String {
@@ -885,7 +885,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, deferred_search_plan: None }
+    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, inference_plan: None }
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────
@@ -898,7 +898,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
         let empty = SqlOutput {
             sql: "SELECT NULL AS result WHERE FALSE".to_string(),
             shape: ShapeDescriptor { root: ShapeNode::Scalar { name: String::new(), position: 0 } },
-            deferred_search_plan: None,
+            inference_plan: None,
         };
         return empty;
     }
@@ -923,7 +923,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
                 "{}SELECT \"_body\".result\nFROM {}\nCROSS JOIN LATERAL (\n    {}\n) AS \"_body\"",
                 cte_prefix, values_from, indent_body,
             );
-            SqlOutput { sql, shape: body_out.shape, deferred_search_plan: None }
+            SqlOutput { sql, shape: body_out.shape, inference_plan: None }
         }
     }
 }
@@ -968,7 +968,7 @@ fn emit_for_insert(
     if let Some(r) = returning_sql {
         sql.push_str(&r);
     }
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
@@ -1093,7 +1093,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut sql, conflict); }
         let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
         if let Some(r) = returning_sql { sql.push_str(&r); }
-        return SqlOutput { sql, shape, deferred_search_plan: None };
+        return SqlOutput { sql, shape, inference_plan: None };
     }
 
     // Enqueue path: wrap INSERT in a CTE so we can append the outbox inserts.
@@ -1114,7 +1114,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         cte_parts.join(",\n"),
         select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
     );
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────
@@ -1160,7 +1160,7 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     );
 
     let (shape, _) = emit_returning_shape(&upd.target, &upd.returning, true);
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
@@ -1192,7 +1192,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         if !user_ctes.is_empty() {
             sql = format!("{}{}", emit_cte_prefix(user_ctes), sql);
         }
-        return SqlOutput { sql, shape, deferred_search_plan: None };
+        return SqlOutput { sql, shape, inference_plan: None };
     }
 
     if !has_any_multilink && (!upd.enqueue_vector.is_empty() || !upd.enqueue_search.is_empty()) {
@@ -1224,7 +1224,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             cte_parts.join(",\n"),
             select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
         );
-        return SqlOutput { sql, shape: shape2, deferred_search_plan: None };
+        return SqlOutput { sql, shape: shape2, inference_plan: None };
     }
 
     // CTE-based UPDATE for junction table mutations.
@@ -1303,7 +1303,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         result_expr,
         qi(alias),
     );
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
@@ -1323,7 +1323,7 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
         append_filter(&mut sql, &del.filter);
         let (shape, returning_sql) = emit_returning_shape(&del.target, &del.returning, true);
         if let Some(r) = returning_sql { sql.push_str(&r); }
-        return SqlOutput { sql, shape, deferred_search_plan: None };
+        return SqlOutput { sql, shape, inference_plan: None };
     }
 
     // Wrap DELETE in a CTE to enqueue OpenSearch delete jobs.
@@ -1344,7 +1344,7 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
         cte_parts.join(",\n"),
         select_sql.unwrap_or_else(|| "SELECT * FROM \"_del\"".to_string()),
     );
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
@@ -1380,7 +1380,7 @@ fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
     );
 
     let (shape, _) = emit_returning_shape(&del.target, &del.returning, true);
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 // ── RETURNING helper ─────────────────────────────────────────────────────────
@@ -1996,7 +1996,16 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    let inference_plan = vs.inference_model.as_ref().map(|model_name| {
+        InferencePlan::Embedding {
+            model_name: model_name.clone(),
+            type_name: vs.inference_type_name.clone().unwrap_or_default(),
+            index_name: vs.inference_index_name.clone().unwrap_or(None),
+            query_param_name: vs.inference_query_param_name.clone().unwrap_or_default(),
+            query_literal: vs.inference_query_literal.clone(),
+        }
+    });
+    SqlOutput { sql, shape, inference_plan }
 }
 
 // ── FTS search ───────────────────────────────────────────────────────────────
@@ -2061,7 +2070,7 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    SqlOutput { sql, shape, deferred_search_plan: None }
+    SqlOutput { sql, shape, inference_plan: None }
 }
 
 fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
@@ -2128,13 +2137,13 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    let deferred_search_plan = Some(DeferredSearchPlan {
+    let inference_plan = Some(InferencePlan::Search {
         index_name: fs.deferred_index_name.clone().unwrap_or_default(),
         query_param_name: fs.deferred_query_param_name.clone().unwrap_or_default(),
         query_literal: fs.deferred_query_literal.clone(),
         size,
     });
-    SqlOutput { sql, shape, deferred_search_plan }
+    SqlOutput { sql, shape, inference_plan }
 }
 
 // ── Function select ──────────────────────────────────────────────────────────
@@ -2184,7 +2193,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
                 fields: root_fields,
             },
         },
-        deferred_search_plan: None,
+        inference_plan: None,
     }
 }
 

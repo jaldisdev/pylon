@@ -126,25 +126,42 @@ pub enum QueryParam {
     Uuid([u8; 16]),
 }
 
-/// The output of a successful PyQL compilation.
-/// Immutable and safe to cache and reuse across requests.
-/// Execution plan for a deferred (remote) `fts::search` query.
-/// The Python client uses this to drive the two-phase execution:
-/// 1. Call the remote search backend with `query_param_name`'s value → get (id, score) pairs
-/// 2. Inject them as `__deferred_ids__` / `__deferred_scores__` params and run `sql` against Postgres
+/// Pre-execution inference plan — set when the query requires an external model call
+/// before the SQL can be executed.  Python switches on the variant.
 #[derive(Debug, Clone)]
-pub struct DeferredSearchPlan {
-    /// OpenSearch index to query.
-    pub index_name: String,
-    /// The user's query-text kwarg name (e.g. `"query"` for `fts::search(T, $query)`).
-    /// Empty string when the query text is an inline literal.
-    pub query_param_name: String,
-    /// Inline literal query text — set when the query is `fts::search(T, 'literal text')`.
-    pub query_literal: Option<String>,
-    /// Requested result size (limit), if known at compile time.
-    pub size: Option<usize>,
+pub enum InferencePlan {
+    /// `fts::search` with OpenSearch backend.
+    /// Python fetches (id, score) pairs from OpenSearch, then injects them as
+    /// `__deferred_ids__` / `__deferred_scores__` params and runs `sql` against Postgres.
+    Search {
+        /// OpenSearch index name.
+        index_name: String,
+        /// Name of the user's query-text param; empty string when an inline literal.
+        query_param_name: String,
+        /// Inline literal query text.
+        query_literal: Option<String>,
+        /// Requested result size (limit), if known at compile time.
+        size: Option<usize>,
+    },
+    /// `vector::search(TypeName, query := $text)` text overload.
+    /// Python embeds the text via the configured model provider, then injects the
+    /// resulting vector as `__deferred_vec__` and runs `sql` against Postgres.
+    Embedding {
+        /// Embedding model identifier from the schema, e.g. `"mistral-embed"`.
+        model_name: String,
+        /// Qualified type name for provider lookup, e.g. `"default::Product"`.
+        type_name: String,
+        /// Vector index name for provider lookup (`None` = default index).
+        index_name: Option<String>,
+        /// Name of the user's `query :=` param; empty string when an inline literal.
+        query_param_name: String,
+        /// Inline literal query text.
+        query_literal: Option<String>,
+    },
 }
 
+/// The output of a successful PyQL compilation.
+/// Immutable and safe to cache and reuse across requests.
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
     /// PostgreSQL SQL string ready for execution.
@@ -158,8 +175,8 @@ pub struct CompiledQuery {
     pub shape: ShapeDescriptor,
     /// Non-fatal warnings produced during compilation.
     pub warnings: Vec<String>,
-    /// Set when the query uses a deferred (remote) backend; drives two-phase execution.
-    pub deferred_search_plan: Option<DeferredSearchPlan>,
+    /// Set when the query requires a pre-execution model call.
+    pub inference_plan: Option<InferencePlan>,
 }
 
 /// Compile a PyQL expression string in the context of a named type to a bare SQL
@@ -212,6 +229,6 @@ fn compile_uncached(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQu
         params: Vec::new(),
         shape: sql_out.shape,
         warnings: ir_out.warnings,
-        deferred_search_plan: sql_out.deferred_search_plan,
+        inference_plan: sql_out.inference_plan,
     })
 }

@@ -484,6 +484,9 @@ pub enum IrExpr {
 ///
 /// Emits a single SELECT from the type's table that computes the distance
 /// inline and returns a virtual `{ object, distance }` shape.
+///
+/// Text overload: `vector::search(Type, query := $text)` — the Python layer
+/// embeds the text first and injects the resulting vector as `__deferred_vec__`.
 #[derive(Debug, Clone)]
 pub struct IrVectorSearch {
     /// The searched type as an `IrSource` (table + alias).
@@ -493,6 +496,7 @@ pub struct IrVectorSearch {
     /// pgvector distance operator: `<=>`, `<->`, or `<#>`.
     pub distance_op: &'static str,
     /// The query vector expression (e.g. `$1::vector`).
+    /// For the text overload this is the `__deferred_vec__` param cast to vector.
     pub query_expr: IrExpr,
     /// Fields to include in the `object` sub-tuple (from the `object { … }` shape).
     /// Empty means no explicit shape was given; the SQL emitter uses all properties.
@@ -503,6 +507,17 @@ pub struct IrVectorSearch {
     pub order_by_distance: Option<IrSortDir>,
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
+    // ── text overload (inference) fields ──────────────────────────────────────
+    /// Name of the user's `query :=` param; empty string when an inline literal.
+    pub inference_query_param_name: Option<String>,
+    /// Inline literal query text when `query := 'some text'`.
+    pub inference_query_literal: Option<String>,
+    /// Embedding model identifier from the `VectorIndexDescriptor`, e.g. `"mistral-embed"`.
+    pub inference_model: Option<String>,
+    /// Qualified type name for provider lookup, e.g. `"default::Product"`.
+    pub inference_type_name: Option<String>,
+    /// Vector index name for provider lookup (`None` = default index).
+    pub inference_index_name: Option<Option<String>>,
 }
 
 // ── Full-text search ──────────────────────────────────────────────────────────

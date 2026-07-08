@@ -68,7 +68,8 @@ class VectorIndexWorker(IndexWorker):
             raise ValueError(
                 f"VectorIndexWorker: no VectorIndex '{key}' on type '{type_name}'"
             )
-        table = f'"{td.module}"."{td.table}"'
+        pg_schema = "public" if td.module == "default" else td.module
+        table = f'"{pg_schema}"."{td.table}"'
         col = f'"{vi.column_name}"'
         return table, col
 
