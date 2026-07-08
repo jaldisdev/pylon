@@ -43,6 +43,7 @@ _BACKOFF_CAP = 5
 class IndexKind(str, Enum):
     VECTOR = "Vector"
     OPEN_SEARCH = "OpenSearch"
+    MEILISEARCH = "Meilisearch"
 
 
 class IndexWorker:

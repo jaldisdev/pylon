@@ -2012,7 +2012,7 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
 
 fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
     use crate::schema::SearchBackend;
-    if fs.backend == SearchBackend::OpenSearch {
+    if fs.backend != SearchBackend::Postgres {
         return emit_fts_search_deferred(fs);
     }
 
@@ -2137,7 +2137,12 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
+    let backend_str = match fs.backend {
+        crate::schema::SearchBackend::Meilisearch => "meilisearch",
+        _ => "opensearch",
+    };
     let inference_plan = Some(InferencePlan::Search {
+        backend: backend_str.to_string(),
         index_name: fs.deferred_index_name.clone().unwrap_or_default(),
         query_param_name: fs.deferred_query_param_name.clone().unwrap_or_default(),
         query_literal: fs.deferred_query_literal.clone(),

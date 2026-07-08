@@ -131,8 +131,9 @@ fn render_function(desc: &FnDescriptor, def: &PylonFnDef) -> String {
 /// to the same object/index into a single outstanding job.
 pub const INDEX_OUTBOX_DDL: &str = concat!(
     "DO $$ BEGIN\n",
-    "    CREATE TYPE _pylon.\"IndexKind\" AS ENUM ('Vector', 'OpenSearch');\n",
+    "    CREATE TYPE _pylon.\"IndexKind\" AS ENUM ('Vector', 'OpenSearch', 'Meilisearch');\n",
     "EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n",
+    "ALTER TYPE _pylon.\"IndexKind\" ADD VALUE IF NOT EXISTS 'Meilisearch';\n",
     "DO $$ BEGIN\n",
     "    CREATE TYPE _pylon.\"IndexOutboxStatus\" AS ENUM ('Pending', 'Processing', 'Failed');\n",
     "EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n\n",

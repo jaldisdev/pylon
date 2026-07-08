@@ -130,11 +130,13 @@ pub enum QueryParam {
 /// before the SQL can be executed.  Python switches on the variant.
 #[derive(Debug, Clone)]
 pub enum InferencePlan {
-    /// `fts::search` with OpenSearch backend.
-    /// Python fetches (id, score) pairs from OpenSearch, then injects them as
+    /// `fts::search` with a remote backend (OpenSearch or Meilisearch).
+    /// Python fetches (id, score) pairs from the backend, then injects them as
     /// `__deferred_ids__` / `__deferred_scores__` params and runs `sql` against Postgres.
     Search {
-        /// OpenSearch index name.
+        /// Remote backend identifier: `"opensearch"` or `"meilisearch"`.
+        backend: String,
+        /// Remote index name.
         index_name: String,
         /// Name of the user's query-text param; empty string when an inline literal.
         query_param_name: String,

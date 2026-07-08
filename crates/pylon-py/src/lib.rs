@@ -598,6 +598,7 @@ impl SearchIndexDescriptor {
     ) -> Self {
         let b = match backend.as_str() {
             "OpenSearch" => core::schema::SearchBackend::OpenSearch,
+            "Meilisearch" => core::schema::SearchBackend::Meilisearch,
             _ => core::schema::SearchBackend::Postgres,
         };
         Self {
@@ -613,6 +614,7 @@ impl SearchIndexDescriptor {
         match &self.inner.backend {
             core::schema::SearchBackend::Postgres => "Postgres",
             core::schema::SearchBackend::OpenSearch => "OpenSearch",
+            core::schema::SearchBackend::Meilisearch => "Meilisearch",
         }
     }
     #[getter]
@@ -1263,9 +1265,10 @@ impl CompiledQuery {
         use core::query::InferencePlan;
         match &self.inner.inference_plan {
             None => Ok(py.None().into_bound(py)),
-            Some(InferencePlan::Search { index_name, query_param_name, query_literal, size }) => {
+            Some(InferencePlan::Search { backend, index_name, query_param_name, query_literal, size }) => {
                 let d = PyDict::new(py);
                 d.set_item("kind", "search")?;
+                d.set_item("backend", backend)?;
                 d.set_item("index_name", index_name)?;
                 d.set_item("query_param_name", query_param_name)?;
                 d.set_item("query_literal", query_literal.as_deref())?;

@@ -131,6 +131,7 @@ class VectorIndex:
 class SearchBackend(Enum):
     Postgres = "Postgres"
     OpenSearch = "OpenSearch"
+    Meilisearch = "Meilisearch"
 
 
 class SearchWeight(Enum):

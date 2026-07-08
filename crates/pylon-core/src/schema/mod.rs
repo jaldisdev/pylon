@@ -103,6 +103,7 @@ pub struct ComputedDescriptor {
 pub enum SearchBackend {
     Postgres,
     OpenSearch,
+    Meilisearch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

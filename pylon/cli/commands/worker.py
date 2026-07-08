@@ -63,10 +63,10 @@ def worker() -> None:
 @requires_config
 @click.pass_context
 def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: str) -> None:
-    """Start index workers (vector and/or OpenSearch).
+    """Start index workers for all configured indexes.
 
-    Auto-discovers all VectorIndex and OpenSearch-backed SearchIndex declarations
-    from the schema and processes IndexOutbox rows until interrupted.
+    Auto-discovers VectorIndex and SearchIndex declarations from the schema
+    and processes IndexOutbox rows until interrupted.
     """
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
@@ -76,7 +76,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
 
     import pylon
     from pylon.vector.sync import VectorIndexWorker
-    from pylon.search import OpenSearchClient, OpenSearchWorker
+    from pylon.search import OpenSearchClient, OpenSearchWorker, MeilisearchClient, MeilisearchWorker
     import pylon.query as _q
 
     pylon.finalize()
@@ -89,20 +89,25 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
         for td in schema.types
         for si in td.search_indexes
     )
+    want_meilisearch = any(
+        si.backend == "Meilisearch"
+        for td in schema.types
+        for si in td.search_indexes
+    )
 
-    if not providers and not want_opensearch:
+    if not providers and not want_opensearch and not want_meilisearch:
         _print_error(
             "no index workers to start",
-            "Add VectorIndex or SearchIndex(backend=OpenSearch) to your schema, "
+            "Add VectorIndex or SearchIndex(backend=...) to your schema, "
             "and configure [models.*] / [search] in pylon.toml.",
         )
         ctx.exit(1)
         return
 
-    if want_opensearch and not config.search_registry:
+    if (want_opensearch or want_meilisearch) and not config.search_registry:
         _print_error(
-            "OpenSearch indexes defined but no [search] config found",
-            "Add [search] host/port to pylon.toml.",
+            "search indexes defined but no [search] config found",
+            "Add [search] host/port/backend to pylon.toml.",
         )
         ctx.exit(1)
         return
@@ -113,6 +118,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     async def run() -> None:
         tasks = []
         conns = []
+        clients = []
 
         if providers:
             conn = await asyncpg.connect(dsn)
@@ -126,20 +132,37 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             )
             tasks.append(w.run())
 
-        os_client = None
         if want_opensearch:
             search_cfg = config.search_registry["default"]
             base_url = f"http://{search_cfg.host}:{search_cfg.port}"
             auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
-            os_client = OpenSearchClient(base_url, auth=auth)
-            await os_client.__aenter__()
+            client = OpenSearchClient(base_url, auth=auth)
+            await client.__aenter__()
+            clients.append(client)
             conn = await asyncpg.connect(dsn)
             conns.append(conn)
-            w = OpenSearchWorker(conn, schema=schema, client=os_client)
+            w = OpenSearchWorker(conn, schema=schema, client=client)
             w.batch_size = batch_size
             w.poll_interval = poll_interval
             log.info(
                 "OpenSearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs",
+                base_url, batch_size, poll_interval,
+            )
+            tasks.append(w.run())
+
+        if want_meilisearch:
+            search_cfg = config.search_registry["default"]
+            base_url = f"http://{search_cfg.host}:{search_cfg.port}"
+            client = MeilisearchClient(base_url, api_key=search_cfg.api_key)
+            await client.__aenter__()
+            clients.append(client)
+            conn = await asyncpg.connect(dsn)
+            conns.append(conn)
+            w = MeilisearchWorker(conn, schema=schema, client=client)
+            w.batch_size = batch_size
+            w.poll_interval = poll_interval
+            log.info(
+                "MeilisearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs",
                 base_url, batch_size, poll_interval,
             )
             tasks.append(w.run())
@@ -149,8 +172,8 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
         finally:
             for conn in conns:
                 await conn.close()
-            if os_client is not None:
-                await os_client.__aexit__(None, None, None)
+            for client in clients:
+                await client.__aexit__(None, None, None)
 
     try:
         asyncio.run(run())

@@ -1,4 +1,5 @@
 from .worker import OpenSearchWorker
-from .http import OpenSearchClient
+from .opensearch import OpenSearchClient
+from .meilisearch import MeilisearchClient, MeilisearchWorker
 
-__all__ = ["OpenSearchClient", "OpenSearchWorker"]
+__all__ = ["OpenSearchClient", "OpenSearchWorker", "MeilisearchClient", "MeilisearchWorker"]
