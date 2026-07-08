@@ -76,12 +76,16 @@ class DatabaseConfig:
 
 @dataclass(slots=True, frozen=True)
 class SearchConfig:
-    """OpenSearch connection."""
+    """Search backend connection (OpenSearch or Meilisearch)."""
 
     host: str
     port: int
+    backend: Literal["opensearch", "meilisearch"] = "opensearch"
+    # OpenSearch: HTTP basic auth
     user: str | None = None
     password: str | None = None
+    # Meilisearch: bearer API key
+    api_key: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +207,18 @@ def _build_database(raw: dict[str, object]) -> DatabaseConfig:
 
 def _build_search(raw: dict[str, object]) -> SearchConfig:
     password = _resolve_secret(raw, "password", "password_env")
+    api_key = _resolve_secret(raw, "api_key", "api_key_env")
     user_val = raw.get("user")
+    backend_val = raw.get("backend", "opensearch")
+    if backend_val not in ("opensearch", "meilisearch"):
+        raise ValueError(f"SearchConfig: backend must be 'opensearch' or 'meilisearch', got {backend_val!r}")
     return SearchConfig(
         host=str(raw["host"]),
         port=int(raw["port"]),  # type: ignore[arg-type]
+        backend=backend_val,  # type: ignore[arg-type]
         user=str(user_val) if user_val is not None else None,
         password=password,
+        api_key=api_key,
     )
 
 

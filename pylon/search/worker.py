@@ -7,7 +7,7 @@ from typing import Any
 from pylon._core import compile_search_index_fetch
 from pylon.worker import IndexKind, IndexWorker
 
-from .http import OpenSearchClient
+from .opensearch import OpenSearchClient
 
 log = logging.getLogger(__name__)
 

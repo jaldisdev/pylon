@@ -769,19 +769,23 @@ async def _compile_and_resolve(
     query_text = _resolve_query_text(plan, kwargs)
 
     if plan["kind"] == "search":
-        # fts::search OpenSearch path — fetch (id, score) pairs, inject as array params.
-        from pylon.search.http import OpenSearchClient
-
+        # fts::search deferred path — fetch (id, score) pairs, inject as array params.
         search_cfg = config.search_registry.get("default")
         if search_cfg is None:
             raise InterfaceError(
-                "fts::search with OpenSearch backend requires [search] config in pylon.toml"
+                "fts::search requires [search] config in pylon.toml"
             )
         base_url = f"http://{search_cfg.host}:{search_cfg.port}"
-        auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
         size = plan["size"] or 100
-        async with OpenSearchClient(base_url, auth=auth) as os_client:
-            hits = await os_client.search(plan["index_name"], query_text or "", size=size)
+        if plan["backend"] == "meilisearch":
+            from pylon.search.meilisearch import MeilisearchClient
+            async with MeilisearchClient(base_url, api_key=search_cfg.api_key) as client:
+                hits = await client.search(plan["index_name"], query_text or "", size=size)
+        else:
+            from pylon.search.opensearch import OpenSearchClient
+            auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
+            async with OpenSearchClient(base_url, auth=auth) as client:
+                hits = await client.search(plan["index_name"], query_text or "", size=size)
         ids = [h[0] for h in hits]
         scores = [h[1] for h in hits]
         extra = {"__deferred_ids__": ids, "__deferred_scores__": scores}

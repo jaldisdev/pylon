@@ -5137,7 +5137,8 @@ impl<'a> Compiler<'a> {
 
         let backend = si.backend.clone();
         let search_col = si.column_name();
-        let deferred_index_name = if backend == SearchBackend::OpenSearch {
+        let is_deferred = backend != SearchBackend::Postgres;
+        let deferred_index_name = if is_deferred {
             Some(si.deferred_index_name(&td.module, &td.name))
         } else {
             None
@@ -5153,7 +5154,7 @@ impl<'a> Compiler<'a> {
         let deferred_ids_param;
         let deferred_scores_param;
 
-        if backend == SearchBackend::OpenSearch {
+        if is_deferred {
             let ids_idx = self.param_index("__deferred_ids__");
             let scores_idx = self.param_index("__deferred_scores__");
             deferred_ids_param = Some(ids_idx);

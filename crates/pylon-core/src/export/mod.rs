@@ -1130,11 +1130,11 @@ pub fn compile_search_index_fetch(
 
     use crate::schema::SearchBackend;
     let si = td.search_indexes.iter()
-        .find(|si| si.index_name.as_deref() == index_name && si.backend == SearchBackend::OpenSearch)
+        .find(|si| si.index_name.as_deref() == index_name && si.backend != SearchBackend::Postgres)
         .ok_or_else(|| {
             let key = index_name.unwrap_or("<default>");
             PyQLError::Fragment(PyQLFragmentError {
-                message: format!("compile_search_index_fetch: no OpenSearch SearchIndex '{}' on type '{}'", key, type_name),
+                message: format!("compile_search_index_fetch: no remote SearchIndex '{}' on type '{}'", key, type_name),
                 context: type_name.to_string(),
                 position: crate::error::Position { line: 0, col: 0 },
             })
