@@ -4880,8 +4880,14 @@ impl<'a> Compiler<'a> {
 
     // ── vector::search ────────────────────────────────────────────────────────────
 
-    /// Try to compile `vector::search(TypeName, $vec [, index_name := '…'])` from a
-    /// function-call AST node.  Returns `None` if the call is not `vector::search`.
+    /// Try to compile `vector::search` from a function-call AST node.
+    ///
+    /// Two overloads are supported:
+    /// - `vector::search(TypeName, $vec [, index_name := '…'])` — pre-computed vector
+    /// - `vector::search(TypeName, query := $text [, index_name := '…'])` — text overload;
+    ///   the Python layer embeds the text and injects `__deferred_vec__` before execution.
+    ///
+    /// Returns `None` if the call is not `vector::search`.
     fn try_compile_vector_search(
         &mut self,
         fc: &ast::FunctionCall,
@@ -4891,8 +4897,17 @@ impl<'a> Compiler<'a> {
         if fc.module.as_deref() != Some("vector") || fc.name != "search" {
             return Ok(None);
         }
-        if fc.args.len() < 2 {
-            return Err(self.type_err("vector::search requires at least 2 arguments: (TypeName, $query_vector)"));
+
+        // Detect text overload: `query :=` kwarg present (no positional second arg needed).
+        let text_query_arg = fc.kwargs.iter()
+            .find(|(k, _)| k == "query")
+            .map(|(_, v)| v);
+        let is_text_overload = text_query_arg.is_some();
+
+        if !is_text_overload && fc.args.len() < 2 {
+            return Err(self.type_err(
+                "vector::search requires either a positional vector argument or `query := $text`"
+            ));
         }
 
         // First argument: a bare type name reference (e.g. `Product` or `default::Product`).
@@ -4929,13 +4944,49 @@ impl<'a> Compiler<'a> {
             _               => "<=>",  // cosine (default)
         };
 
-        // Second argument: the query vector expression.
-        let raw_query_expr = self.compile_free_expr(&fc.args[1])?;
-        // Cast to vector so pgvector can pick up the correct operator.
-        let query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
-            expr: raw_query_expr,
-            pg_type: "vector".to_string(),
-        }));
+        // Build query expression and inference fields.
+        let (query_expr, inference_query_param_name, inference_query_literal,
+             inference_model, inference_type_name, inference_index_name);
+
+        if is_text_overload {
+            // Text overload: register __deferred_vec__ as the SQL param; Python injects
+            // the embedding result into it before executing the query.
+            let vec_idx = self.param_index("__deferred_vec__");
+            let vec_param = IrExpr::Param { index: vec_idx };
+            // Cast float8[] → vector so asyncpg can encode the Python list[float] natively.
+            let inner_cast = IrExpr::TypeCast(Box::new(IrTypeCast {
+                expr: vec_param,
+                pg_type: "float8[]".to_string(),
+            }));
+            query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
+                expr: inner_cast,
+                pg_type: "vector".to_string(),
+            }));
+            let query_arg = text_query_arg.unwrap();
+            inference_query_param_name = Some(match query_arg {
+                ast::Expr::Parameter(name) => name.clone(),
+                _ => String::new(),
+            });
+            inference_query_literal = match query_arg {
+                ast::Expr::Literal(ast::Literal::Str(s)) => Some(s.clone()),
+                _ => None,
+            };
+            inference_model = Some(vi.model.clone());
+            inference_type_name = Some(type_qname.clone());
+            inference_index_name = Some(index_name.clone());
+        } else {
+            // Vector overload: second positional arg is the pre-computed vector.
+            let raw_query_expr = self.compile_free_expr(&fc.args[1])?;
+            query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
+                expr: raw_query_expr,
+                pg_type: "vector".to_string(),
+            }));
+            inference_query_param_name = None;
+            inference_query_literal = None;
+            inference_model = None;
+            inference_type_name = None;
+            inference_index_name = None;
+        }
 
         let alias = self.fresh_alias();
         let source = IrSource {
@@ -4982,6 +5033,11 @@ impl<'a> Compiler<'a> {
             order_by_distance,
             offset,
             limit,
+            inference_query_param_name,
+            inference_query_literal,
+            inference_model,
+            inference_type_name,
+            inference_index_name,
         }))
     }
 
