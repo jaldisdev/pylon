@@ -3090,4 +3090,23 @@ mod tests {
         );
         assert!(out.sql.contains("\"age\""), "outer filter must reference raw column, got:\n{}", out.sql);
     }
+
+    #[test]
+    fn test_positional_param_compiles_to_dollar_n() {
+        let out = compile_and_emit("SELECT Person FILTER .name = $0");
+        assert!(out.sql.contains("$1"), "expected $1 placeholder, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_multiple_positional_params_compile_in_order() {
+        let out = compile_and_emit("SELECT Person FILTER .name = $0 AND .age > $1");
+        assert!(out.sql.contains("$1"), "expected $1, got:\n{}", out.sql);
+        assert!(out.sql.contains("$2"), "expected $2, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_repeated_positional_param_reuses_slot() {
+        let out = compile_and_emit("SELECT Person FILTER .name = $0 OR .nickname = $0");
+        assert_eq!(out.sql.matches("$1").count(), 2, "both uses must reference $1, got:\n{}", out.sql);
+    }
 }

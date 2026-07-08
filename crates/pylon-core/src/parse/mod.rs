@@ -55,6 +55,24 @@ mod tests {
     }
 
     #[test]
+    fn test_positional_param_parsed() {
+        let expr = parse_expr("$0").unwrap();
+        assert!(matches!(expr, Expr::Parameter(n) if n == "0"));
+    }
+
+    #[test]
+    fn test_multiple_positional_params_parsed() {
+        let stmt = parse("SELECT Person FILTER .name = $0 AND .age > $1").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let filter = sel.filter.unwrap();
+        let Expr::BinOp(outer) = filter else { panic!("not a binop") };
+        let Expr::BinOp(left) = *outer.left else { panic!("left not binop") };
+        assert!(matches!(left.right, Expr::Parameter(n) if n == "0"));
+        let Expr::BinOp(right) = *outer.right else { panic!("right not binop") };
+        assert!(matches!(right.right, Expr::Parameter(n) if n == "1"));
+    }
+
+    #[test]
     fn test_select_nested_shape() {
         let stmt = parse("SELECT Person { name, posts { title, body } }").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
