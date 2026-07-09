@@ -66,9 +66,9 @@ mod tests {
         let Stmt::Select(sel) = stmt else { panic!() };
         let filter = sel.filter.unwrap();
         let Expr::BinOp(outer) = filter else { panic!("not a binop") };
-        let Expr::BinOp(left) = *outer.left else { panic!("left not binop") };
+        let Expr::BinOp(left) = outer.left else { panic!("left not binop") };
         assert!(matches!(left.right, Expr::Parameter(n) if n == "0"));
-        let Expr::BinOp(right) = *outer.right else { panic!("right not binop") };
+        let Expr::BinOp(right) = outer.right else { panic!("right not binop") };
         assert!(matches!(right.right, Expr::Parameter(n) if n == "1"));
     }
 

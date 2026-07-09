@@ -1821,6 +1821,10 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 .join(" UNION ALL ");
             format!("(SELECT {}(v) FROM ({}) AS _set(v))", fn_name, union_all)
         }
+        IrExpr::AggOverQuery { fn_name, inner } => {
+            let inner_sql = emit_select_stmt(inner).sql;
+            format!("(SELECT {}(*) FROM ({}) _agg)", fn_name, inner_sql)
+        }
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
 
         IrExpr::CteRef { name, scalar } => {
@@ -3092,6 +3096,34 @@ mod tests {
     }
 
     #[test]
+    fn test_count_type_ref_compiles_to_agg_over_query() {
+        let out = compile_and_emit("SELECT count(Person)");
+        assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_count_qualified_type_ref_compiles_to_agg_over_query() {
+        let out = compile_and_emit("SELECT count(default::Person)");
+        assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_count_subquery_compiles_to_agg_over_query() {
+        let out = compile_and_emit("SELECT count((select Person))");
+        assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_count_subquery_with_filter() {
+        let out = compile_and_emit("SELECT count((select Person filter .name = 'Alice'))");
+        assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
+        assert!(out.sql.contains("\"name\""), "expected filter on name, got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_positional_param_compiles_to_dollar_n() {
         let out = compile_and_emit("SELECT Person FILTER .name = $0");
         assert!(out.sql.contains("$1"), "expected $1 placeholder, got:\n{}", out.sql);
@@ -3106,7 +3138,7 @@ mod tests {
 
     #[test]
     fn test_repeated_positional_param_reuses_slot() {
-        let out = compile_and_emit("SELECT Person FILTER .name = $0 OR .nickname = $0");
+        let out = compile_and_emit("SELECT Person FILTER .name = $0 OR .name = $0");
         assert_eq!(out.sql.matches("$1").count(), 2, "both uses must reference $1, got:\n{}", out.sql);
     }
 }

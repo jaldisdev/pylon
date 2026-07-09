@@ -441,6 +441,9 @@ pub enum IrExpr {
     /// An aggregate function applied to an inline set literal `fn({e1, e2, ...})`.
     /// Emits: `(SELECT fn_name(v) FROM (SELECT e1 UNION ALL ...) AS _set(v))`
     AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
+    /// An aggregate function applied to a full SELECT query: `count(Person)` or `count((select Person))`.
+    /// Emits: `(SELECT fn_name(*) FROM (inner) _agg)`
+    AggOverQuery { fn_name: String, inner: Box<IrSelect> },
     /// A reference to a named CTE used in expression context.
     /// `scalar = true`  → emits `(SELECT "result" FROM "cte_name")`
     /// `scalar = false` → emits `(SELECT "id"     FROM "cte_name")`
@@ -1288,7 +1291,7 @@ mod tests {
     #[test]
     fn test_repeated_positional_param_single_slot() {
         let schema = make_schema();
-        let ast = parse::parse("SELECT Person FILTER .name = $0 OR .nickname = $0").unwrap();
+        let ast = parse::parse("SELECT Person FILTER .name = $0 OR .name = $0").unwrap();
         let ir = super::compile(&ast, &schema).expect("compile failed");
         assert_eq!(ir.params, vec!["0"], "repeated $0 must occupy a single slot");
     }
