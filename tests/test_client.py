@@ -250,16 +250,18 @@ def _fake_compiled(sql: str = "SELECT 1"):
 
 def _client_with_pool(pool: MagicMock):
     """Return a Client whose internal pool is already set to *pool*."""
-    from pylon.client import Client
+    from pylon.client import Client, _PoolRef
 
     cfg_db = DatabaseConfig(host="h", port=5432, name="db", user="u")
     cfg = MagicMock()
     cfg.database = cfg_db
     client = Client.__new__(Client)
     client._config = cfg
-    client._pool = pool
-    client._lock = asyncio.Lock()
+    ref = _PoolRef()
+    ref.pool = pool
+    client._ref = ref
     client._warnings = True
+    client._globals = {}
     return client
 
 
@@ -457,6 +459,50 @@ class TestClientQuery:
                 await client.query_required_single_json("select User")
 
         run(_run())
+
+
+# ---------------------------------------------------------------------------
+# with_globals — returns a Client sharing the same pool
+# ---------------------------------------------------------------------------
+
+
+class TestWithGlobals:
+    def test_returns_client_instance(self):
+        from pylon.client import Client
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_globals({"default::x": 1})
+        assert isinstance(view, Client)
+
+    def test_shares_pool_ref(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_globals({"default::x": 1})
+        assert view._ref is client._ref
+
+    def test_globals_merged(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        client._globals = {"default::a": 1}
+        view = client.with_globals({"default::b": 2})
+        assert view._globals == {"default::a": 1, "default::b": 2}
+
+    def test_chained_with_globals_merges(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_globals({"default::a": 1}).with_globals({"default::b": 2})
+        assert view._globals == {"default::a": 1, "default::b": 2}
+
+    def test_later_connection_visible_to_view(self):
+        """Pool connected after with_globals() must be visible via the shared ref."""
+        from pylon.client import _PoolRef
+        pool, _ = _make_pool()
+        client = _client_with_pool(None)  # not yet connected
+        client._ref.pool = None
+        view = client.with_globals({"default::x": 1})
+        # Simulate connection on original
+        client._ref.pool = pool
+        assert view._require_pool() is pool
 
 
 # ---------------------------------------------------------------------------

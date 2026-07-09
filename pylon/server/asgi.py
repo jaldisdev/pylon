@@ -51,6 +51,8 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
         path, method = scope["path"], scope["method"]
         if path == "/api/schema" and method == "GET":
             await _handle_get_schema(send)
+        elif path == "/api/globals" and method == "GET":
+            await _handle_get_globals(send)
         elif path == "/api/connections" and method == "GET":
             await _handle_get_connections(config, send)
         elif path == "/api/models" and method == "GET":
@@ -257,6 +259,33 @@ async def _handle_get_schema(send: Send) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /api/globals
+# ---------------------------------------------------------------------------
+#
+# Powers the top bar's globals pill bar + configuration modal. Only *settable*
+# session globals are listed — computed globals (Global[T, "select ..."]) are
+# derived at query time, never user-set, so they're filtered out here rather
+# than the frontend having to know to skip them.
+
+
+async def _handle_get_globals(send: Send) -> None:
+    from pylon.query import _get_schema
+
+    schema = _get_schema()
+    globals_ = [
+        {
+            "module": g["module"],
+            "name": g["name"],
+            "typeName": _TYPE_NAME_BY_CLASS.get(g["scalar_type"]),
+            "required": g["required"],
+        }
+        for g in schema.globals()
+        if not g["computed"]
+    ]
+    await _send_json(send, 200, {"globals": globals_})
+
+
+# ---------------------------------------------------------------------------
 # /api/connections
 # ---------------------------------------------------------------------------
 #
@@ -337,10 +366,15 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
     body = await _read_json_body(receive)
     pyql = body.get("pyql", "")
     params = body.get("params") or {}
+    # Session globals configured via the top bar's globals modal — keyed by
+    # "module::name", threaded through client.with_globals() for this query
+    # only (the client itself stays global/stateless across requests).
+    globals_ = body.get("globals") or {}
 
     start = time.perf_counter()
     try:
-        rows = await client.query(pyql, **params)
+        target = client.with_globals(globals_) if globals_ else client
+        rows = await target.query(pyql, **params)
     except PylonError as exc:
         await _send_json(send, 400, {"error": str(exc)})
         return
