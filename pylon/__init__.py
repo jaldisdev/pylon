@@ -1,6 +1,6 @@
 from ._finalize import finalize
 from .client import AsyncTransaction, Client, create_async_client
-from .config import Config, DatabaseConfig, ModelConfig, SearchConfig
+from .config import Config, DatabaseConfig, ModelConfig, SearchConfig, UiConfig, WebserverConfig
 from .datatypes import Object
 from .exceptions import PylonError
 
@@ -100,6 +100,8 @@ __all__ = [
     "ModelConfig",
     "PylonError",
     "SearchConfig",
+    "UiConfig",
+    "WebserverConfig",
     "create_async_client",
     # Schema — decorators
     "abstract",

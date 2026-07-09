@@ -10,6 +10,7 @@ from .commands.database import database
 from .commands.info import info_cmd
 from .commands.migrations import migration
 from .commands.query import query_cmd, repl
+from .commands.serve import serve
 from .commands.version import version
 from .commands.worker import worker
 from .config import NO_CONFIG_HINT, _print_error, requires_config
@@ -83,6 +84,7 @@ cli.add_command(worker)
 cli.add_command(version)
 cli.add_command(query_cmd)
 cli.add_command(info_cmd)
+cli.add_command(serve)
 
 
 # --- shortcuts ----------------------------------------------------------------
