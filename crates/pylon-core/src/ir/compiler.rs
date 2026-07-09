@@ -1876,6 +1876,55 @@ impl<'a> Compiler<'a> {
                         }));
                     }
                 }
+                // count(TypeName) or count((select TypeName ...))
+                // Aggregate function with a single schema-type ref or subquery arg → AggOverQuery.
+                if f.args.len() == 1 {
+                    let arg = &f.args[0];
+                    let inner_sel: Option<ast::SelectStmt> = match arg {
+                        Expr::Path(p) if !p.partial => {
+                            // Resolve as a schema type if it matches a known type (not enum).
+                            let qname = p.steps.iter().filter_map(|s| {
+                                if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None }
+                            }).collect::<Vec<_>>().join("::");
+                            let is_schema_type = self.schema.types.iter().any(|t| {
+                                format!("{}::{}", t.module, t.name) == qname || t.name == qname
+                            });
+                            if is_schema_type {
+                                Some(ast::SelectStmt {
+                                    result: arg.clone(),
+                                    filter: None,
+                                    order_by: vec![],
+                                    offset: None,
+                                    limit: None,
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        Expr::SubQuery(stmt) => {
+                            if let ast::Stmt::Select(inner) = stmt.as_ref() {
+                                Some(inner.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(sel) = inner_sel {
+                        use crate::stdlib::{lookup, ImplStrategy};
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let overloads = lookup(ns, &f.name);
+                        let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
+                        if let Some(d) = best {
+                            if let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy {
+                                let fn_name = sql_name.to_string();
+                                let inner_ir = self.compile_select(&sel, false)?;
+                                return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner_ir) });
+                            }
+                        }
+                    }
+                }
+
                 // If any argument is a set literal, this must be an aggregate.
                 // Compile as AggOverSet rather than a regular function call.
                 let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
