@@ -223,6 +223,15 @@ class RetryingTransaction:
 # ---------------------------------------------------------------------------
 
 
+class _PoolRef:
+    """Shared mutable pool holder so Client.with_globals() siblings stay in sync."""
+    __slots__ = ("pool", "lock")
+
+    def __init__(self) -> None:
+        self.pool: asyncpg.Pool | None = None
+        self.lock = asyncio.Lock()
+
+
 class Client:
     """Async Pylon client — asyncpg pool wrapper with PyQL transpilation.
 
@@ -237,9 +246,9 @@ class Client:
 
             config = load_config()
         self._config = config
-        self._pool: asyncpg.Pool | None = None
-        self._lock = asyncio.Lock()
+        self._ref = _PoolRef()
         self._warnings = warnings
+        self._globals: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -250,14 +259,14 @@ class Client:
 
         Safe to call multiple times; subsequent calls are no-ops.
         """
-        async with self._lock:
-            if self._pool is not None:
+        async with self._ref.lock:
+            if self._ref.pool is not None:
                 return
             dsn = self._config.database.dsn or _build_dsn(self._config.database)
             # Swap the pylon:// scheme for postgresql:// if present.
             dsn = dsn.replace("pylon://", "postgresql://", 1)
             try:
-                self._pool = await asyncpg.create_pool(
+                self._ref.pool = await asyncpg.create_pool(
                     dsn,
                     min_size=self._config.database.pool_min_size,
                     max_size=self._config.database.pool_max_size,
@@ -274,10 +283,10 @@ class Client:
 
     async def aclose(self) -> None:
         """Close the connection pool and release all resources."""
-        async with self._lock:
-            if self._pool is not None:
-                await self._pool.close()
-                self._pool = None
+        async with self._ref.lock:
+            if self._ref.pool is not None:
+                await self._ref.pool.close()
+                self._ref.pool = None
 
     # Support ``async with Client(config) as client:``
     async def __aenter__(self) -> "Client":
@@ -292,30 +301,38 @@ class Client:
     # ------------------------------------------------------------------
 
     def _require_pool(self) -> asyncpg.Pool:
-        if self._pool is None:
+        if self._ref.pool is None:
             raise ClientConnectionClosedError(
                 "Client is not connected. Call await client.ensure_connected() first."
             )
-        return self._pool
+        return self._ref.pool
 
     # ------------------------------------------------------------------
     # Query interface
     # ------------------------------------------------------------------
 
-    def with_globals(self, globals_: dict[str, Any]) -> "ClientWithGlobals":
-        """Return a thin wrapper that injects *globals_* into every query.
+    def with_globals(self, globals_: dict[str, Any]) -> "Client":
+        """Return a client view that injects *globals_* into every query.
+
+        The returned client shares the same connection pool.  Globals are
+        keyed by their qualified name (``"module::name"``).
 
         Usage::
 
             authed = client.with_globals({"default::current_user_id": user_id})
             posts = await authed.query("select Post { title }")
         """
-        return ClientWithGlobals(self, globals_, warnings=self._warnings)
+        c = Client.__new__(Client)
+        c._config = self._config
+        c._ref = self._ref
+        c._warnings = self._warnings
+        c._globals = {**self._globals, **globals_}
+        return c
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config)
+        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config, self._globals)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -336,7 +353,7 @@ class Client:
         than one object matches.
         """
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config)
+        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config, self._globals)
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -370,7 +387,7 @@ class Client:
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         async with pool.acquire() as conn:
             try:
                 await conn.execute(sql, *params)
@@ -387,7 +404,7 @@ class Client:
         Returns ``"[]"`` when the result set is empty.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         async with pool.acquire() as conn:
             return (
                 await conn.fetchval(
@@ -403,7 +420,7 @@ class Client:
         object matches.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -490,7 +507,7 @@ class Client:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
-        state = "connected" if self._pool is not None else "disconnected"
+        state = "connected" if self._ref.pool is not None else "disconnected"
         db = self._config.database
         target = db.dsn or f"{db.host}:{db.port}/{db.name}"
         return f"<Client [{state}] {target}>"
@@ -513,84 +530,6 @@ def create_async_client(config: Config | None = None) -> Client:
                 ``pylon.toml`` from the working tree.
     """
     return Client(config)
-
-
-# ---------------------------------------------------------------------------
-# ClientWithGlobals — thin globals-injecting wrapper
-# ---------------------------------------------------------------------------
-
-
-class ClientWithGlobals:
-    """Wraps a :class:`Client` and injects a fixed globals dict into every query.
-
-    Obtain via :meth:`Client.with_globals`.  Globals are keyed by their
-    qualified name (``"module::name"``).
-    """
-
-    def __init__(self, client: Client, globals_: dict[str, Any], *, warnings: bool = True) -> None:
-        self._client = client
-        self._globals = globals_
-        self._warnings = warnings
-
-    def with_globals(self, globals_: dict[str, Any]) -> "ClientWithGlobals":
-        """Return a new wrapper with the given globals merged on top."""
-        return ClientWithGlobals(self._client, {**self._globals, **globals_}, warnings=self._warnings)
-
-    def _require_pool(self) -> Any:
-        return self._client._require_pool()
-
-    async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
-        pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals)
-        if self._warnings:
-            _emit_warnings(compiled)
-        try:
-            async with pool.acquire() as conn:
-                records = list(await conn.fetch(sql, *params))
-        except asyncpg.PostgresError as exc:
-            raise _fmt_pg_error(exc) from exc
-        return _hydrate(records, compiled)
-
-    async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
-        pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals)
-        if self._warnings:
-            _emit_warnings(compiled)
-        try:
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(sql, *params)
-        except asyncpg.PostgresError as exc:
-            raise _fmt_pg_error(exc) from exc
-        if len(rows) > 1:
-            raise ResultCardinalityError(
-                f"query_single expected at most one result, got {len(rows)}."
-            )
-        if not rows:
-            return None
-        return _hydrate(list(rows), compiled)[0]
-
-    async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
-        result = await self.query_single(pyql, *args, **kwargs)
-        if result is None:
-            raise NoDataError("query_required_single returned an empty result set.")
-        return result
-
-    async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
-        pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
-        async with pool.acquire() as conn:
-            await conn.execute(sql, *params)
-
-    async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
-        pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
-        async with pool.acquire() as conn:
-            return (
-                await conn.fetchval(
-                    f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
-                )
-                or "[]"
-            )
 
 
 # ---------------------------------------------------------------------------
