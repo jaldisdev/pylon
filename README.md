@@ -1,6 +1,6 @@
 # Pylon
 
-Async PostgreSQL mapper for the JALDIS platform. Provides a schema definition DSL, an OQL query language, OpenSearch integration, and vector index support.
+Async PostgreSQL mapper for the JALDIS platform. Provides a schema definition DSL, an PyQL query language, OpenSearch integration, and vector index support.
 
 ## Requirements
 

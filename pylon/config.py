@@ -105,6 +105,34 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
+# WebserverConfig / UiConfig
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class WebserverConfig:
+    """``[webserver]`` — where `pylon serve`'s ASGI process binds.
+
+    Applies regardless of what's mounted on it (``/api``, ``/metrics``, the SPA).
+    """
+
+    host: str = "localhost"
+    port: int = 5656
+
+
+@dataclass(slots=True, frozen=True)
+class UiConfig:
+    """``[ui]`` — whether `pylon serve` mounts the built React SPA at ``/``.
+
+    Kept separate from ``[webserver]`` so enabling/disabling the GUI never
+    touches network config, and changing the port never touches whether the
+    GUI exists.
+    """
+
+    enabled: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -131,6 +159,8 @@ class Config:
     search: SearchConfig | SearchRegistry | None = None
     models: ModelConfig | ModelRegistry | None = None
     connections: dict[str, DatabaseConfig] = field(default_factory=dict)
+    webserver: WebserverConfig = field(default_factory=WebserverConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
 
     # ------------------------------------------------------------------
     # Normalised accessors
@@ -377,7 +407,35 @@ def load_config(path: str | Path | None = None) -> Config:
         pyql=str(pyql_raw) if pyql_raw is not None else None,
     )
 
-    return Config(database=database, project=project, search=search, models=models, connections=connections)
+    # ------------------------------------------------------------------
+    # [webserver] / [ui]
+    # ------------------------------------------------------------------
+    # Both dataclasses use slots=True, so unset fields must be omitted from the
+    # constructor call (not looked up as class attributes — slots replaces those
+    # with plain descriptors, not the default values) for the dataclass default
+    # to apply.
+    webserver_kwargs: dict[str, object] = {}
+    if isinstance(raw_webserver := raw.get("webserver"), dict):
+        if "host" in raw_webserver:
+            webserver_kwargs["host"] = str(raw_webserver["host"])
+        if "port" in raw_webserver:
+            webserver_kwargs["port"] = int(raw_webserver["port"])  # type: ignore[arg-type]
+    webserver = WebserverConfig(**webserver_kwargs)
+
+    ui_kwargs: dict[str, object] = {}
+    if isinstance(raw_ui := raw.get("ui"), dict) and "enabled" in raw_ui:
+        ui_kwargs["enabled"] = bool(raw_ui["enabled"])
+    ui = UiConfig(**ui_kwargs)
+
+    return Config(
+        database=database,
+        project=project,
+        search=search,
+        models=models,
+        connections=connections,
+        webserver=webserver,
+        ui=ui,
+    )
 
 
 __all__ = [
@@ -386,5 +444,7 @@ __all__ = [
     "DatabaseConfig",
     "SearchConfig",
     "ModelConfig",
+    "WebserverConfig",
+    "UiConfig",
     "load_config",
 ]
