@@ -1,17 +1,22 @@
 from __future__ import annotations
 
-from .base import ModelProvider
+from .base import Message, ModelProvider
 
 MAX_BATCH = 2048
 
 
 class OpenAIProvider(ModelProvider):
-    """Generic OpenAI-compatible embedding provider.
+    """Generic OpenAI-compatible provider — embeddings and chat completions.
 
-    Works with any endpoint that follows the OpenAI embeddings API:
+    Embeddings:
       POST {api_url}/embeddings
       Authorization: Bearer {api_key}
       {"model": "...", "input": ["text", ...]}
+
+    Chat completions:
+      POST {api_url}/chat/completions
+      Authorization: Bearer {api_key}
+      {"model": "...", "messages": [{"role": ..., "content": ...}, ...]}
 
     Compatible providers: OpenAI, Mistral, any OpenAI-compatible endpoint.
     """
@@ -46,3 +51,12 @@ class OpenAIProvider(ModelProvider):
             items = sorted(data["data"], key=lambda x: x["index"])
             results.extend(item["embedding"] for item in items)
         return results
+
+    async def chat(self, messages: list[Message]) -> str:
+        response = await self._client.post(
+            "/chat/completions",
+            json={"model": self._model, "messages": messages},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]

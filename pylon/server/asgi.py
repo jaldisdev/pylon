@@ -51,8 +51,14 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
         path, method = scope["path"], scope["method"]
         if path == "/api/schema" and method == "GET":
             await _handle_get_schema(send)
+        elif path == "/api/connections" and method == "GET":
+            await _handle_get_connections(config, send)
+        elif path == "/api/models" and method == "GET":
+            await _handle_get_models(config, send)
         elif path == "/api/query" and method == "POST":
             await _handle_run_query(connection["client"], receive, send)
+        elif path == "/api/ai/chat" and method == "POST":
+            await _handle_ai_chat(config, connection["client"], receive, send)
         elif config.ui.enabled:
             await _serve_static(path, send)
         else:
@@ -131,17 +137,30 @@ async def _send_json(send: Send, status: int, payload: Any) -> None:
 # *string* (`Link["Company"]` written before Company is defined) — both are
 # handled below.
 
-# Scalar marker classes (pylon.UUID, pylon.DateTime, ..., plus stdlib
-# uuid.UUID used for the injected `id` field) that get a `<tag>` prefix in the
-# frontend's JsonTree, matching gel-ui's inspector. Plain str/int/float/bool/
-# json scalars need no tag — their JS type already says enough.
-_SCALAR_TAG_BY_NAME = {
-    "UUID": "uuid",
-    "DateTime": "datetime",
-    "LocalDateTime": "local_datetime",
-    "LocalDate": "date",
-    "LocalTime": "time",
-    "Duration": "duration",
+# Canonical PyQL/EdgeQL-style type names for every scalar marker class
+# (pylon.Str, pylon.UUID, ..., plus stdlib uuid.UUID used for the injected
+# `id` field) — shown below the field name in the Data Explorer's column
+# headers, and used by the frontend to decide which types get a `<tag>`
+# prefix on values (uuid/datetime/etc — plain str/int/bool/json don't need
+# one, their JS type already says enough).
+_TYPE_NAME_BY_CLASS = {
+    "Str": "std::str",
+    "Int16": "std::int16",
+    "Int32": "std::int32",
+    "Int64": "std::int64",
+    "Float32": "std::float32",
+    "Float64": "std::float64",
+    "Decimal": "std::decimal",
+    "Bool": "std::bool",
+    "DateTime": "std::datetime",
+    "LocalDateTime": "cal::local_datetime",
+    "LocalDate": "cal::local_date",
+    "LocalTime": "cal::local_time",
+    "Duration": "std::duration",
+    "UUID": "std::uuid",
+    "JSON": "std::json",
+    "Bytes": "std::bytes",
+    "Sequence": "std::int64",  # sequences are backed by int64
 }
 
 
@@ -170,8 +189,13 @@ def _resolve_target(target: Any, owning_cls: type) -> str:
     return _type_qualname(target)
 
 
+def _scalar_type_name(scalar_type: Any) -> str | None:
+    name = scalar_type.__name__ if isinstance(scalar_type, type) else None
+    return _TYPE_NAME_BY_CLASS.get(name) if name else None
+
+
 def _classify_field(annotation: Any, owning_cls: type, enum_classes: set[type]) -> dict[str, Any]:
-    """Returns the {kind, target?, scalarTag?} fragment for one field."""
+    """Returns the {kind, target?, typeName?} fragment for one field."""
     _, inner = _unwrap_optional(annotation)
 
     if isinstance(inner, LinkAnnotation):
@@ -179,7 +203,10 @@ def _classify_field(annotation: Any, owning_cls: type, enum_classes: set[type]) 
     if isinstance(inner, MultiLinkAnnotation):
         return {"kind": "multiLink", "target": _resolve_target(inner.target_type, owning_cls)}
     if isinstance(inner, ComputedAnnotation):
-        return {"kind": "computed"}
+        # return_type is usually a plain scalar class; Computed[MultiLink[...], ...]
+        # (a computed backlink) is a real but rarer shape we don't resolve here.
+        type_name = _scalar_type_name(inner.return_type)
+        return {"kind": "computed", "typeName": type_name} if type_name else {"kind": "computed"}
 
     # PropertyAnnotation wraps constrained/defaulted properties; a bare scalar
     # type hint (e.g. `name: pylon.Str`, or the injected `id: uuid.UUID | None`)
@@ -189,9 +216,14 @@ def _classify_field(annotation: Any, owning_cls: type, enum_classes: set[type]) 
     if isinstance(scalar_type, type) and scalar_type in enum_classes:
         return {"kind": "enum", "target": _type_qualname(scalar_type)}
 
-    scalar_name = scalar_type.__name__ if isinstance(scalar_type, type) else None
-    scalar_tag = _SCALAR_TAG_BY_NAME.get(scalar_name) if scalar_name else None
-    return {"kind": "property", "scalarTag": scalar_tag} if scalar_tag else {"kind": "property"}
+    type_name = _scalar_type_name(scalar_type)
+    return {"kind": "property", "typeName": type_name} if type_name else {"kind": "property"}
+
+
+def _vector_index_field_names(vi: Any) -> list[str]:
+    """Field names (not "Type.field" refs) a VectorIndex was declared with —
+    i.e. exactly what got embedded for it."""
+    return [vf.ref.split(".", 1)[1] for vf in vi._vector_fields]
 
 
 async def _handle_get_schema(send: Send) -> None:
@@ -206,6 +238,13 @@ async def _handle_get_schema(send: Send) -> None:
                 {"name": name, **_classify_field(annotation, cls, enum_classes)}
                 for name, annotation in _merged_annotations(cls).items()
             ],
+            # Powers the AI tab's Type select (only types with >=1 entry here
+            # are offered) and Index select (offered only when there's more
+            # than one). indexName is None for a bare/default VectorIndex.
+            "vectorIndexes": [
+                {"indexName": vi.index_name, "model": vi.model, "fields": _vector_index_field_names(vi)}
+                for vi in getattr(cls.__pylon_config__, "vector_indexes", [])
+            ],
         }
         for cls in registered_types
     ]
@@ -215,6 +254,48 @@ async def _handle_get_schema(send: Send) -> None:
     ]
 
     await _send_json(send, 200, {"types": types, "enums": enums})
+
+
+# ---------------------------------------------------------------------------
+# /api/connections
+# ---------------------------------------------------------------------------
+#
+# Powers the top bar's connection-switcher dropdown and the frontend's :branch
+# URL validation (an unrecognized segment renders 404 instead of a tab).
+# config.connections is keyed "default" for the base [database] block plus
+# one entry per [database.<name>] sub-table; "default" is surfaced to the
+# frontend as "main", reusing the branch name the UI already hardcodes.
+
+
+async def _handle_get_connections(config: Config, send: Send) -> None:
+    others = sorted(name for name in config.connections if name != "default")
+    connections = ["main", *others]
+    await _send_json(
+        send,
+        200,
+        {
+            "project": config.project.name if config.project else None,
+            "connections": connections,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# /api/models
+# ---------------------------------------------------------------------------
+#
+# Powers the AI tab's Model select — only "chat"-purpose models (see
+# ModelConfig.purpose in pylon/config.py). Embedding models are never listed
+# here; they're selected implicitly via a type's VectorIndex, not by the user.
+
+
+async def _handle_get_models(config: Config, send: Send) -> None:
+    models = [
+        {"name": name, "model": cfg.model, "apiStyle": cfg.api_style}
+        for name, cfg in config.models_registry.items()
+        if cfg.purpose == "chat"
+    ]
+    await _send_json(send, 200, {"models": models})
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +347,114 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
     duration_ms = (time.perf_counter() - start) * 1000
 
     await _send_json(send, 200, {"rows": [_to_jsonable(r) for r in rows], "duration_ms": duration_ms})
+
+
+# ---------------------------------------------------------------------------
+# /api/ai/chat
+# ---------------------------------------------------------------------------
+#
+# The AI tab's RAG loop: runs vector::search for context, templates the (for
+# now, hardcoded-default — see pylon-ui's AI tab plan) system/user prompt
+# around it, and calls the selected chat-purpose model. No prompt-template
+# registry exists in Pylon yet, so this is the one place that default prompt
+# text lives; a real registry (like Gel's `builtin::rag-default`) is future
+# work, not something to fake here.
+
+_DEFAULT_PROMPT_SYSTEM = """You are an expert Q&A system.
+Always answer questions based on the provided context information. Never use prior knowledge.
+Follow these additional rules:
+1. Never directly reference the given context in your answer.
+2. Never include phrases like 'Based on the context, ...' or any similar phrases in your responses.
+3. When the context does not provide information about the question, answer with 'No information available.'.
+Context information is below:
+{context}
+Given the context information above and not prior knowledge, answer the user query."""
+
+_DEFAULT_PROMPT_USER = "Query: {query}\nAnswer:"
+
+
+def _make_chat_provider(model_cfg):
+    from pylon.vector.models import AnthropicProvider, OpenAIProvider
+
+    if model_cfg.api_style == "anthropic":
+        return AnthropicProvider(api_url=model_cfg.api_url, model=model_cfg.model, api_key=model_cfg.secret)
+    return OpenAIProvider(api_url=model_cfg.api_url, model=model_cfg.model, api_key=model_cfg.secret)
+
+
+def _resolve_vector_index_fields(pylon_type: str, index_name: str | None) -> list[str]:
+    """Looks up the VectorIndex matching *index_name* on *pylon_type* and
+    returns its field names — so /api/ai/chat's context is built from what
+    the similarity search actually matched on, not an arbitrary object dump
+    of whatever fields happen to be requested for display."""
+    module, _, name = pylon_type.partition("::")
+    registered_types, _, _ = schema_snapshot()
+    for cls in registered_types:
+        if _infer_module(cls) != module or cls.__name__ != name:
+            continue
+        for vi in getattr(cls.__pylon_config__, "vector_indexes", []):
+            if vi.index_name == index_name:
+                return _vector_index_field_names(vi)
+    return []
+
+
+async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send: Send) -> None:
+    body = await _read_json_body(receive)
+    model_name = body.get("modelName", "")
+    pylon_type = body.get("pylonType", "")
+    index_name = body.get("indexName")
+    search_query = body.get("searchQuery", "")
+    message = body.get("message", "")
+    history = body.get("history") or []
+
+    model_cfg = config.models_registry.get(model_name)
+    if model_cfg is None or model_cfg.purpose != "chat":
+        await _send_json(send, 400, {"error": f"'{model_name}' is not a configured chat model"})
+        return
+
+    index_fields = _resolve_vector_index_fields(pylon_type, index_name)
+    if not index_fields:
+        await _send_json(
+            send, 400, {"error": f"no VectorIndex found on '{pylon_type}' matching index_name={index_name!r}"}
+        )
+        return
+
+    shape = ", ".join(index_fields)
+    index_clause = ", index_name := <str>$indexName" if index_name else ""
+    pyql = (
+        f"select vector::search({pylon_type}, query := <str>$searchQuery{index_clause}) "
+        f"{{ object {{ {shape} }}, distance }} order by .distance limit 5"
+    )
+    params: dict[str, object] = {"searchQuery": search_query}
+    if index_name:
+        params["indexName"] = index_name
+
+    try:
+        rows = await client.query(pyql, **params)
+    except PylonError as exc:
+        await _send_json(send, 400, {"error": str(exc)})
+        return
+
+    results = [_to_jsonable(r) for r in rows]
+    # One line per result, just the indexed fields concatenated — the same
+    # text that was embedded, not a "key: value" dump of the whole object.
+    context = "\n".join(
+        "- " + ". ".join(str(result["object"].get(f, "")) for f in index_fields) for result in results
+    )
+
+    messages = [
+        {"role": "system", "content": _DEFAULT_PROMPT_SYSTEM.format(context=context)},
+        *history,
+        {"role": "user", "content": _DEFAULT_PROMPT_USER.format(query=message)},
+    ]
+
+    provider = _make_chat_provider(model_cfg)
+    try:
+        reply = await provider.chat(messages)
+    except Exception as exc:  # noqa: BLE001 — surface provider/network errors to the UI
+        await _send_json(send, 502, {"error": f"chat model request failed: {exc}"})
+        return
+
+    await _send_json(send, 200, {"reply": reply, "results": results})
 
 
 # ---------------------------------------------------------------------------

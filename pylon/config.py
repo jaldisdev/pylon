@@ -95,13 +95,18 @@ class SearchConfig:
 
 @dataclass(slots=True, frozen=True)
 class ModelConfig:
-    """Model provider connection for embedding generation and vector index population."""
+    """Model provider connection for embedding generation, vector index
+    population, or chat completions (see *purpose*)."""
 
     api_style: Literal["openai", "anthropic"]
     api_url: str
     model: str
     client_id: str | None = None
     secret: str | None = None
+    # "embedding" models are selected by name from a VectorIndex declaration
+    # (pylon.VectorIndex(..., model="...")) and never user-facing at query
+    # time. "chat" models are the ones the AI tab's Model select offers.
+    purpose: Literal["embedding", "chat"] = "embedding"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +263,9 @@ def _build_model(raw: dict[str, object]) -> ModelConfig:
         raise ValueError(
             f"ModelConfig: api_style must be 'openai' or 'anthropic', got {api_style!r}"
         )
+    purpose = raw.get("purpose", "embedding")
+    if purpose not in ("embedding", "chat"):
+        raise ValueError(f"ModelConfig: purpose must be 'embedding' or 'chat', got {purpose!r}")
     secret = _resolve_secret(raw, "secret", "secret_env")
     client_id_val = raw.get("client_id")
     return ModelConfig(
@@ -266,6 +274,7 @@ def _build_model(raw: dict[str, object]) -> ModelConfig:
         model=str(raw["model"]),
         client_id=str(client_id_val) if client_id_val is not None else None,
         secret=secret,
+        purpose=purpose,  # type: ignore[arg-type]
     )
 
 
@@ -280,7 +289,7 @@ _DATABASE_SCALAR_KEYS = frozenset(
 )
 _SEARCH_SCALAR_KEYS = frozenset({"host", "port", "user", "password", "password_env"})
 _MODELS_SCALAR_KEYS = frozenset(
-    {"api_style", "api_url", "model", "client_id", "secret", "secret_env"}
+    {"api_style", "api_url", "model", "client_id", "secret", "secret_env", "purpose"}
 )
 
 
