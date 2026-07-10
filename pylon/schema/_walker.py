@@ -163,10 +163,10 @@ def _resolve_links(
     type_map: dict[str, type],
     class_to_qname: dict[int, str],
 ) -> None:
-    """Mutate FieldMeta.link_target / .through to qualified name strings."""
+    """Mutate PointerMeta.link_target / .through to qualified name strings."""
     for cls in types:
         cfg = cls.__pylon_config__
-        for field_name, meta in cfg.fields.items():
+        for field_name, meta in cfg.pointers.items():
             if meta.kind in ("link", "multilink") and meta.link_target is not None:
                 label = f"{cfg.module}::{cfg.name}.{field_name} link_target"
                 meta.link_target = _resolve_target(
@@ -197,7 +197,7 @@ def _detect_required_link_cycles(
         cfg = cls.__pylon_config__
         src_qname = class_to_qname[id(cls)]
         targets: set[str] = set()
-        for meta in cfg.fields.values():
+        for meta in cfg.pointers.values():
             if meta.kind == "link" and not meta.nullable and isinstance(meta.link_target, str):
                 targets.add(meta.link_target)
         adj[src_qname] = targets
@@ -249,7 +249,7 @@ def _validate_junctions(
 
     for cls in types:
         cfg = cls.__pylon_config__
-        for fn, meta in cfg.fields.items():
+        for fn, meta in cfg.pointers.items():
             if meta.kind != "multilink" or meta.through is None:
                 continue
             through_qname = meta.through  # already resolved to a qname string
@@ -303,7 +303,7 @@ def _validate_interfaces(
         if cfg.abstract:
             continue  # abstract types themselves are not checked
 
-        effective = _effective_fields(cls)
+        effective = _effective_pointers(cls)
 
         for base in cls.__mro__[1:]:
             if not _is_pylon_type(base):
@@ -312,7 +312,7 @@ def _validate_interfaces(
             if not (bcfg.abstract and bcfg.materialized):
                 continue  # not an interface
 
-            for field_name, imeta in bcfg.fields.items():
+            for field_name, imeta in bcfg.pointers.items():
                 if field_name not in effective:
                     raise SchemaError(
                         f"{cfg.module}::{cfg.name} does not satisfy interface "
@@ -330,16 +330,16 @@ def _validate_interfaces(
 # ── Inheritance flattening ─────────────────────────────────────────────────────
 
 
-def _effective_fields(cls: type) -> dict[str, Any]:
-    """Collect all Pylon fields visible on cls, merging inherited fields.
+def _effective_pointers(cls: type) -> dict[str, Any]:
+    """Collect all Pylon pointers visible on cls, merging inherited pointers.
 
-    Walks the MRO from most-distant ancestor to cls itself. Own fields shadow
-    inherited fields with the same name.
+    Walks the MRO from most-distant ancestor to cls itself. Own pointers shadow
+    inherited pointers with the same name.
     """
     result: dict[str, Any] = {}
     for base in reversed(cls.__mro__):
         if _is_pylon_type(base):
-            result.update(base.__pylon_config__.fields)
+            result.update(base.__pylon_config__.pointers)
     return result
 
 
@@ -751,7 +751,7 @@ def _make_trigger_desc(trig: Any, _core: Any) -> Any:
 
 def _make_exclusive_constraint(c: Any, _core: Any) -> Any:
     # c is an Exclusive instance with .fields and .unless
-    return _core.ExclusiveConstraint(fields=list(c.fields), unless=c.unless)
+    return _core.ExclusiveConstraint(fields=list(c.pointers), unless=c.unless)
 
 
 def _make_expression_constraint(c: Any, _core: Any) -> Any:
@@ -770,7 +770,7 @@ def _build_type_descriptor(
     from ._constraints import Exclusive, Expression
 
     cfg = cls.__pylon_config__
-    effective = _effective_fields(cls)
+    effective = _effective_pointers(cls)
     parents, interfaces = _find_pylon_parents(cls, class_to_qname)
 
     properties: list[Any] = []
@@ -1087,7 +1087,7 @@ def walk(
     # Phase 1 — build indexes
     type_map, class_to_qname = _build_type_index(types)
 
-    # Phase 2 — resolve lazy refs (mutates FieldMeta in-place)
+    # Phase 2 — resolve lazy refs (mutates PointerMeta in-place)
     _resolve_links(types, type_map, class_to_qname)
 
     # Phase 3 — cycle detection

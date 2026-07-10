@@ -26,7 +26,7 @@ from pylon.schema._walker import (
     SchemaError,
     _build_type_index,
     _detect_required_link_cycles,
-    _effective_fields,
+    _effective_pointers,
     _find_pylon_parents,
     _make_default_sql,
     _python_value_to_sql,
@@ -192,7 +192,7 @@ class TestEffectiveFields:
         class Standalone:
             name: str
 
-        eff = _effective_fields(Standalone)
+        eff = _effective_pointers(Standalone)
         assert "name" in eff
         assert "id" in eff  # always injected
 
@@ -205,7 +205,7 @@ class TestEffectiveFields:
         class Child(Base):
             name: str
 
-        eff = _effective_fields(Child)
+        eff = _effective_pointers(Child)
         assert "created_at" in eff
         assert "name" in eff
 
@@ -218,7 +218,7 @@ class TestEffectiveFields:
         class AChild(ABase):
             x: pylon.Int64  # type: ignore[assignment]
 
-        eff = _effective_fields(AChild)
+        eff = _effective_pointers(AChild)
         # AChild's own 'x' is Int64, not Str
         assert eff["x"].scalar_type is pylon.Int64
 
@@ -231,7 +231,7 @@ class TestEffectiveFields:
         class Leaf(Root):
             val: str
 
-        eff = _effective_fields(Leaf)
+        eff = _effective_pointers(Leaf)
         assert list(eff.keys()).count("id") == 1
 
 
@@ -288,7 +288,7 @@ class TestLinkResolution:
         types = [Author, Post]
         tmap, cid = _build_type_index(types)
         _resolve_links(types, tmap, cid)
-        assert Post.__pylon_config__.fields["author"].link_target == "t::Author"
+        assert Post.__pylon_config__.pointers["author"].link_target == "t::Author"
 
     def test_through_resolved(self):
         @pylon.type(module="t", name="TagType")
@@ -311,8 +311,8 @@ class TestLinkResolution:
         types = [TagType, ProductType, JunctionType, CatalogType]
         tmap, cid = _build_type_index(types)
         _resolve_links(types, tmap, cid)
-        assert CatalogType.__pylon_config__.fields["items"].link_target == "t::ProductType"
-        assert CatalogType.__pylon_config__.fields["items"].through == "t::JunctionType"
+        assert CatalogType.__pylon_config__.pointers["items"].link_target == "t::ProductType"
+        assert CatalogType.__pylon_config__.pointers["items"].through == "t::JunctionType"
 
     def test_unregistered_target_raises(self):
         @pylon.type(module="t", name="OrphanPost")
@@ -325,8 +325,8 @@ class TestLinkResolution:
             x: str
 
         # Patch field to point to SomeOtherType class (not in index for this test)
-        from pylon.schema._meta import FieldMeta
-        OrphanPost.__pylon_config__.fields["ref"] = FieldMeta(
+        from pylon.schema._meta import PointerMeta
+        OrphanPost.__pylon_config__.pointers["ref"] = PointerMeta(
             name="ref",
             kind="link",
             scalar_type=None,
@@ -372,10 +372,10 @@ class TestCycleDetection:
         class NodeY:
             pass
 
-        from pylon.schema._meta import FieldMeta
+        from pylon.schema._meta import PointerMeta
 
         # X→Y (required), Y→X (required) — deadlock
-        NodeX.__pylon_config__.fields["y"] = FieldMeta(
+        NodeX.__pylon_config__.pointers["y"] = PointerMeta(
             name="y",
             kind="link",
             scalar_type=None,
@@ -385,7 +385,7 @@ class TestCycleDetection:
             default_factory=MISSING,
             link_target=NodeY,
         )
-        NodeY.__pylon_config__.fields["x"] = FieldMeta(
+        NodeY.__pylon_config__.pointers["x"] = PointerMeta(
             name="x",
             kind="link",
             scalar_type=None,
@@ -411,10 +411,10 @@ class TestCycleDetection:
         class NullB:
             pass
 
-        from pylon.schema._meta import FieldMeta
+        from pylon.schema._meta import PointerMeta
 
         # A→B (nullable) — not a deadlock
-        NullA.__pylon_config__.fields["b"] = FieldMeta(
+        NullA.__pylon_config__.pointers["b"] = PointerMeta(
             name="b",
             kind="link",
             scalar_type=None,
@@ -424,7 +424,7 @@ class TestCycleDetection:
             default_factory=MISSING,
             link_target=NullB,
         )
-        NullB.__pylon_config__.fields["a"] = FieldMeta(
+        NullB.__pylon_config__.pointers["a"] = PointerMeta(
             name="a",
             kind="link",
             scalar_type=None,
@@ -562,10 +562,10 @@ class TestDefaultSql:
         assert _python_value_to_sql(None) is None
 
     def test_default_now_gives_now(self):
-        from pylon.schema._meta import FieldMeta
+        from pylon.schema._meta import PointerMeta
         from pylon.schema._constraints import Default, Now
 
-        meta = FieldMeta(
+        meta = PointerMeta(
             name="created_at",
             kind="property",
             scalar_type=pylon.DateTime,
@@ -577,9 +577,9 @@ class TestDefaultSql:
         assert _make_default_sql(meta) == "now()"
 
     def test_scalar_default_converted(self):
-        from pylon.schema._meta import FieldMeta
+        from pylon.schema._meta import PointerMeta
 
-        meta = FieldMeta(
+        meta = PointerMeta(
             name="score",
             kind="property",
             scalar_type=pylon.Float64,
@@ -591,9 +591,9 @@ class TestDefaultSql:
         assert _make_default_sql(meta) == "0.0"
 
     def test_no_default_returns_none(self):
-        from pylon.schema._meta import FieldMeta
+        from pylon.schema._meta import PointerMeta
 
-        meta = FieldMeta(
+        meta = PointerMeta(
             name="name",
             kind="property",
             scalar_type=pylon.Str,

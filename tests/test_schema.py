@@ -216,41 +216,41 @@ class TestIdInjection:
 
 class TestPropertyField:
     def test_shorthand_str_resolved(self):
-        f = Product.__pylon_config__.fields["name"]
+        f = Product.__pylon_config__.pointers["name"]
         assert f.kind == "property"
         assert f.scalar_type is pylon.Str
         assert f.nullable is False
 
     def test_shorthand_float_resolved(self):
-        assert Product.__pylon_config__.fields["score"].scalar_type is pylon.Float64
+        assert Product.__pylon_config__.pointers["score"].scalar_type is pylon.Float64
 
     def test_explicit_pylon_scalar(self):
-        assert Product.__pylon_config__.fields["price"].scalar_type is pylon.Decimal
+        assert Product.__pylon_config__.pointers["price"].scalar_type is pylon.Decimal
 
     def test_field_description_extracted(self):
-        assert Product.__pylon_config__.fields["price"].description == "Price excl. tax"
+        assert Product.__pylon_config__.pointers["price"].description == "Price excl. tax"
 
     def test_description_absent_from_constraints(self):
-        constraints = Product.__pylon_config__.fields["price"].constraints
+        constraints = Product.__pylon_config__.pointers["price"].constraints
         assert not any(isinstance(c, Description) for c in constraints)
 
     def test_min_value_in_constraints(self):
-        constraints = Product.__pylon_config__.fields["price"].constraints
+        constraints = Product.__pylon_config__.pointers["price"].constraints
         assert any(isinstance(c, MinValue) for c in constraints)
 
     def test_exclusive_bare_class_in_constraints(self):
-        constraints = Product.__pylon_config__.fields["slug"].constraints
+        constraints = Product.__pylon_config__.pointers["slug"].constraints
         assert any(c is Exclusive for c in constraints)
 
     def test_max_len_in_constraints(self):
-        constraints = Product.__pylon_config__.fields["slug"].constraints
+        constraints = Product.__pylon_config__.pointers["slug"].constraints
         assert any(isinstance(c, MaxLen) and c.length == 120 for c in constraints)
 
     def test_scalar_default_preserved(self):
-        assert Product.__pylon_config__.fields["score"].default == 0.0
+        assert Product.__pylon_config__.pointers["score"].default == 0.0
 
     def test_default_now_python_side_none(self):
-        f = Auditable.__pylon_config__.fields["created_at"]
+        f = Auditable.__pylon_config__.pointers["created_at"]
         assert f.default is None
         assert any(isinstance(c, Default) and c.sentinel is Now for c in f.constraints)
 
@@ -270,7 +270,7 @@ class TestReadonlyConstraint:
         class Immut:
             slug: Property[str, Readonly]
 
-        f = Immut.__pylon_config__.fields["slug"]
+        f = Immut.__pylon_config__.pointers["slug"]
         assert f.is_readonly is True
 
     def test_property_not_readonly_by_default(self):
@@ -278,14 +278,14 @@ class TestReadonlyConstraint:
         class Normal:
             slug: str
 
-        assert Normal.__pylon_config__.fields["slug"].is_readonly is False
+        assert Normal.__pylon_config__.pointers["slug"].is_readonly is False
 
     def test_readonly_removed_from_constraints(self):
         @pylon.type
         class WithReadonly:
             code: Property[str, Readonly, MaxLen(10)]
 
-        constraints = WithReadonly.__pylon_config__.fields["code"].constraints
+        constraints = WithReadonly.__pylon_config__.pointers["code"].constraints
         assert not any(c is Readonly for c in constraints)
         assert any(isinstance(c, MaxLen) for c in constraints)
 
@@ -294,7 +294,7 @@ class TestReadonlyConstraint:
         class HasReadonlyLink:
             owner: Link[Category, Readonly]
 
-        f = HasReadonlyLink.__pylon_config__.fields["owner"]
+        f = HasReadonlyLink.__pylon_config__.pointers["owner"]
         assert f.is_readonly is True
 
     def test_link_not_readonly_by_default(self):
@@ -302,14 +302,14 @@ class TestReadonlyConstraint:
         class HasNormalLink:
             ref: Link[Category]
 
-        assert HasNormalLink.__pylon_config__.fields["ref"].is_readonly is False
+        assert HasNormalLink.__pylon_config__.pointers["ref"].is_readonly is False
 
     def test_readonly_coexists_with_exclusive_on_property(self):
         @pylon.type
         class Multi:
             code: Property[str, Exclusive, Readonly]
 
-        f = Multi.__pylon_config__.fields["code"]
+        f = Multi.__pylon_config__.pointers["code"]
         assert f.is_readonly is True
         assert any(c is Exclusive for c in f.constraints)
 
@@ -321,10 +321,10 @@ class TestReadonlyConstraint:
 
 class TestLinkField:
     def test_kind(self):
-        assert Product.__pylon_config__.fields["category"].kind == "link"
+        assert Product.__pylon_config__.pointers["category"].kind == "link"
 
     def test_target_type(self):
-        assert Product.__pylon_config__.fields["category"].link_target is Category
+        assert Product.__pylon_config__.pointers["category"].link_target is Category
 
     def test_required_link_in_init(self):
         assert (
@@ -339,10 +339,10 @@ class TestLinkField:
         )
 
     def test_nullable_link_flag(self):
-        assert Product.__pylon_config__.fields["alt_category"].nullable is True
+        assert Product.__pylon_config__.pointers["alt_category"].nullable is True
 
     def test_non_nullable_link_flag(self):
-        assert Product.__pylon_config__.fields["category"].nullable is False
+        assert Product.__pylon_config__.pointers["category"].nullable is False
 
     def test_nullable_link_instance_value(self):
         assert _make_product().alt_category is None
@@ -355,19 +355,19 @@ class TestLinkField:
 
 class TestMultiLinkField:
     def test_kind(self):
-        assert Catalog.__pylon_config__.fields["products"].kind == "multilink"
+        assert Catalog.__pylon_config__.pointers["products"].kind == "multilink"
 
     def test_through_type_stored(self):
-        assert Catalog.__pylon_config__.fields["products"].through is ProductTag
+        assert Catalog.__pylon_config__.pointers["products"].through is ProductTag
 
     def test_no_through_when_absent(self):
-        assert Catalog.__pylon_config__.fields["optional_tags"].through is None
+        assert Catalog.__pylon_config__.pointers["optional_tags"].through is None
 
     def test_default_empty_list(self):
         assert Catalog().products == []
 
     def test_nullable_multilink_flag(self):
-        assert Catalog.__pylon_config__.fields["optional_tags"].nullable is True
+        assert Catalog.__pylon_config__.pointers["optional_tags"].nullable is True
 
 
 # ---------------------------------------------------------------------------
@@ -377,10 +377,10 @@ class TestMultiLinkField:
 
 class TestComputedField:
     def test_kind(self):
-        assert Product.__pylon_config__.fields["full_name"].kind == "computed"
+        assert Product.__pylon_config__.pointers["full_name"].kind == "computed"
 
     def test_expression_stored(self):
-        f = Product.__pylon_config__.fields["full_name"]
+        f = Product.__pylon_config__.pointers["full_name"]
         assert f.expression == '.first ++ " " ++ .last'
 
     def test_excluded_from_init(self):
@@ -407,7 +407,7 @@ class TestComputedField:
 
 class TestNullableFields:
     def test_str_or_none_flag(self):
-        assert Product.__pylon_config__.fields["description"].nullable is True
+        assert Product.__pylon_config__.pointers["description"].nullable is True
 
     def test_implicit_none_default_in_init(self):
         assert (
@@ -421,7 +421,7 @@ class TestNullableFields:
         )
 
     def test_nullable_property_annotation_on_interface(self):
-        assert Publishable.__pylon_config__.fields["published_at"].nullable is True
+        assert Publishable.__pylon_config__.pointers["published_at"].nullable is True
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +437,7 @@ class TestDefaults:
         assert _make_product().score == 0.0
 
     def test_mutable_default_uses_factory(self):
-        f = Product.__pylon_config__.fields["tags_list"]
+        f = Product.__pylon_config__.pointers["tags_list"]
         assert f.default is MISSING
         assert f.default_factory is not None
 
@@ -677,16 +677,16 @@ class TestNaming:
 
 class TestPylonConfig:
     def test_fields_dict_populated(self):
-        assert len(Product.__pylon_config__.fields) > 0
+        assert len(Product.__pylon_config__.pointers) > 0
 
     def test_field_names_match_dataclass(self):
-        cfg_keys = set(Product.__pylon_config__.fields.keys())
+        cfg_keys = set(Product.__pylon_config__.pointers.keys())
         dc_keys = set(Product.__dataclass_fields__.keys())
         assert cfg_keys.issubset(dc_keys)
 
     def test_field_meta_type(self):
-        for f in Product.__pylon_config__.fields.values():
-            assert isinstance(f, pylon.FieldMeta)
+        for f in Product.__pylon_config__.pointers.values():
+            assert isinstance(f, pylon.PointerMeta)
 
     def test_pylon_config_on_class_not_instance(self):
         # __pylon_config__ must be a class attribute, not stored per-instance.
@@ -854,7 +854,7 @@ class TestMutationRewrite:
         class T:
             name: Property[str, Rewrite(On.Insert, '.name ++ " (created)"')]
 
-        f = T.__pylon_config__.fields["name"]
+        f = T.__pylon_config__.pointers["name"]
         assert len(f.rewrites) == 1
 
     def test_rewrite_attributes(self):
@@ -862,7 +862,7 @@ class TestMutationRewrite:
         class T:
             name: Property[str, Rewrite(On.Update, '.name ++ " (updated)"')]
 
-        r = T.__pylon_config__.fields["name"].rewrites[0]
+        r = T.__pylon_config__.pointers["name"].rewrites[0]
         assert r.on == On.Update
         assert r.handler == '.name ++ " (updated)"'
 
@@ -871,7 +871,7 @@ class TestMutationRewrite:
         class T:
             name: Property[str, MaxLen(50), Rewrite(On.Insert, ".name")]
 
-        f = T.__pylon_config__.fields["name"]
+        f = T.__pylon_config__.pointers["name"]
         assert not any(isinstance(c, Rewrite) for c in f.constraints)
         assert any(isinstance(c, MaxLen) for c in f.constraints)
 
@@ -884,7 +884,7 @@ class TestMutationRewrite:
                 Rewrite(On.Update, '.name ++ " (updated)"'),
             ]
 
-        f = T.__pylon_config__.fields["name"]
+        f = T.__pylon_config__.pointers["name"]
         assert len(f.rewrites) == 2
         ons = {r.on for r in f.rewrites}
         assert On.Insert in ons
@@ -898,11 +898,11 @@ class TestMutationRewrite:
                 Rewrite(On.Delete, "update T set { deleted_at := datetime_current() }"),
             ]
 
-        r = T.__pylon_config__.fields["group"].rewrites[0]
+        r = T.__pylon_config__.pointers["group"].rewrites[0]
         assert r.on == On.Delete
 
     def test_rewrites_empty_by_default(self):
-        f = Product.__pylon_config__.fields["name"]
+        f = Product.__pylon_config__.pointers["name"]
         assert f.rewrites == []
 
     def test_rewrite_on_link(self):
@@ -910,7 +910,7 @@ class TestMutationRewrite:
         class T:
             ref: Link[Category, Rewrite(On.Update, ".expr")]
 
-        f = T.__pylon_config__.fields["ref"]
+        f = T.__pylon_config__.pointers["ref"]
         assert len(f.rewrites) == 1
         assert f.rewrites[0].on == On.Update
 
@@ -919,7 +919,7 @@ class TestMutationRewrite:
         class T:
             name: Property[str, MaxLen(10), Rewrite(On.Insert, ".name")]
 
-        f = T.__pylon_config__.fields["name"]
+        f = T.__pylon_config__.pointers["name"]
         assert len(f.constraints) == 1
         assert isinstance(f.constraints[0], MaxLen)
 
