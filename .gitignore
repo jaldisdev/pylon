@@ -55,3 +55,6 @@ Cargo.lock
 
 # pylon
 pylon.toml
+
+# pylon-ui build output, copied in by the deploy workflow (see pylon/server/asgi.py)
+pylon/server/static/

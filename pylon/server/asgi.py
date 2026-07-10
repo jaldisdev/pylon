@@ -374,13 +374,13 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
     start = time.perf_counter()
     try:
         target = client.with_globals(globals_) if globals_ else client
-        rows = await target.query(pyql, **params)
+        objects = await target.query(pyql, **params)
     except PylonError as exc:
         await _send_json(send, 400, {"error": str(exc)})
         return
     duration_ms = (time.perf_counter() - start) * 1000
 
-    await _send_json(send, 200, {"rows": [_to_jsonable(r) for r in rows], "duration_ms": duration_ms})
+    await _send_json(send, 200, {"objects": [_to_jsonable(o) for o in objects], "duration_ms": duration_ms})
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +436,11 @@ async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send
     model_name = body.get("modelName", "")
     pylon_type = body.get("pylonType", "")
     index_name = body.get("indexName")
-    search_query = body.get("searchQuery", "")
+    # Optional PyQL expression narrowing which objects vector::search's first
+    # argument scopes over, e.g. "select Type filter .field = value" —
+    # embedded as-is inside vector::search(({context_query}), ...). Empty/
+    # unset falls back to searching every object of pylon_type (status quo).
+    context_query = body.get("contextQuery") or None
     message = body.get("message", "")
     history = body.get("history") or []
 
@@ -454,21 +458,25 @@ async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send
 
     shape = ", ".join(index_fields)
     index_clause = ", index_name := <str>$indexName" if index_name else ""
+    search_target = f"({context_query})" if context_query else pylon_type
+    # The chat message itself is both the vector::search query text *and*
+    # the LLM's question (see _DEFAULT_PROMPT_USER below) — no separate
+    # search-text field anymore.
     pyql = (
-        f"select vector::search({pylon_type}, query := <str>$searchQuery{index_clause}) "
+        f"select vector::search({search_target}, query := <str>$queryText{index_clause}) "
         f"{{ object {{ {shape} }}, distance }} order by .distance limit 5"
     )
-    params: dict[str, object] = {"searchQuery": search_query}
+    params: dict[str, object] = {"queryText": message}
     if index_name:
         params["indexName"] = index_name
 
     try:
-        rows = await client.query(pyql, **params)
+        objects = await client.query(pyql, **params)
     except PylonError as exc:
         await _send_json(send, 400, {"error": str(exc)})
         return
 
-    results = [_to_jsonable(r) for r in rows]
+    results = [_to_jsonable(o) for o in objects]
     # One line per result, just the indexed fields concatenated — the same
     # text that was embedded, not a "key: value" dump of the whole object.
     context = "\n".join(

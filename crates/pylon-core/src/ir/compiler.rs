@@ -4959,18 +4959,44 @@ impl<'a> Compiler<'a> {
             ));
         }
 
-        // First argument: a bare type name reference (e.g. `Product` or `default::Product`).
-        let type_qname = match &fc.args[0] {
-            ast::Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    let td = self.resolve_type(n)
-                        .map_err(|_| self.type_err(&format!("vector::search: '{}' is not a known type", n)))?;
-                    format!("{}::{}", td.module, td.name)
+        // First argument: a type name or a filtered subquery narrowing the candidate set.
+        //   - Bare name:     `Product` or `default::Product`
+        //   - Subquery:      `(select Product filter .price < 100)`
+        //
+        // For the subquery form we store the raw inner filter AST and compile it below,
+        // after the source alias is generated, so property column refs use the right alias.
+        let (type_qname, inner_filter_ast): (String, Option<ast::Expr>) = match &fc.args[0] {
+            ast::Expr::Path(p) if !p.partial => {
+                let name = p.steps.iter()
+                    .filter_map(|s| if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None })
+                    .collect::<Vec<_>>().join("::");
+                let td = self.resolve_type(&name)
+                    .map_err(|_| self.type_err(&format!("vector::search: '{}' is not a known type", name)))?;
+                (format!("{}::{}", td.module, td.name), None)
+            }
+            ast::Expr::SubQuery(stmt) => {
+                if let ast::Stmt::Select(inner_sel) = stmt.as_ref() {
+                    let inner_type_name = match &inner_sel.result {
+                        ast::Expr::Path(p) if !p.partial => {
+                            p.steps.iter()
+                                .filter_map(|s| if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None })
+                                .collect::<Vec<_>>().join("::")
+                        }
+                        _ => return Err(self.type_err(
+                            "vector::search: subquery first argument must select a single type (e.g. select Product filter …)"
+                        )),
+                    };
+                    let td = self.resolve_type(&inner_type_name)
+                        .map_err(|_| self.type_err(&format!("vector::search: '{}' is not a known type", inner_type_name)))?;
+                    let qname = format!("{}::{}", td.module, td.name);
+                    (qname, inner_sel.filter.clone())
                 } else {
-                    return Err(self.type_err("vector::search: first argument must be a type name"));
+                    return Err(self.type_err("vector::search: subquery first argument must be a SELECT"));
                 }
             }
-            _ => return Err(self.type_err("vector::search: first argument must be a bare type name")),
+            _ => return Err(self.type_err(
+                "vector::search: first argument must be a type name or a filtered subquery (e.g. select Product filter …)"
+            )),
         };
 
         // Optional named argument: index_name := '…'
@@ -5044,6 +5070,13 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
         };
 
+        // Compile inner_filter_ast (from subquery first arg) now that we have the alias,
+        // so property column refs (e.g. `.price`) use the correct table alias.
+        let pre_filter: Option<IrExpr> = match inner_filter_ast {
+            Some(ref f) => Some(self.compile_expr(f, &td, &alias)?),
+            None => None,
+        };
+
         // Compile the object shape from `object { … }` inside the shape elements.
         // `elements` is the outer shape (`{ object { … }, distance }`).
         // We find the `object` element and take its sub-shape; everything else is ignored
@@ -5070,7 +5103,18 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let (filter, order_by_distance, offset, limit) = self.compile_vs_modifiers(s)?;
+        let (outer_filter, order_by_distance, offset, limit) = self.compile_vs_modifiers(s)?;
+
+        // Merge pre_filter (from subquery first arg) with any outer filter via AND.
+        let filter = match (pre_filter, outer_filter) {
+            (Some(a), Some(b)) => Some(IrExpr::BinOp(Box::new(IrBinOp {
+                left: a,
+                op: ast::BinOpKind::And,
+                right: b,
+            }))),
+            (Some(f), None) | (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
 
         Ok(Some(IrVectorSearch {
             source,
