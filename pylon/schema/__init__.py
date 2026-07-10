@@ -58,7 +58,7 @@ from ._lazy import lazy
 from ._registry import snapshot as schema_snapshot
 from ._functions import Volatility, Language, function as function_decorator
 from ._triggers import On, Rewrite, Timing, Trigger
-from ._meta import FieldMeta, PylonConfig
+from ._meta import PointerMeta, PylonConfig
 from ._scalars import (
     JSON,
     UUID,
@@ -163,7 +163,7 @@ __all__ = [
     "named_tuple",
     "named_tuples_snapshot",
     # Introspection
-    "FieldMeta",
+    "PointerMeta",
     "PylonConfig",
     # Lazy forward references
     "lazy",

@@ -26,7 +26,9 @@ from pylon.config import Config
 from pylon.exceptions import PylonError
 from pylon.schema._decorators import _get_own_annotations, _infer_module, _unwrap_optional
 from pylon.schema._fields import ComputedAnnotation, LinkAnnotation, MultiLinkAnnotation, PropertyAnnotation
+from pylon.schema._meta import PointerMeta
 from pylon.schema._registry import snapshot as schema_snapshot
+from pylon.schema._walker import _effective_pointers
 
 Scope = dict[str, Any]
 Receive = Callable[[], Awaitable[dict[str, Any]]]
@@ -129,19 +131,19 @@ async def _send_json(send: Send, status: int, payload: Any) -> None:
 # in-memory registry) rather than pg_catalog — no DB round trip needed, and it
 # resolves things pg_catalog structurally can't: a Link's Postgres column is
 # named `company_id`, not `company`; a MultiLink has no column on its owning
-# type at all (it's a separate junction table). Determining which fields are
+# type at all (it's a separate junction table). Determining which pointers are
 # links/multi-links (and their target type), vs. plain properties, requires
 # reading the PyQL-level Property/Link/MultiLink/Computed annotations directly
 # — confirmed empirically against the real demo schema, not guessed:
-# `python3 -c "..."` against pylon-demo showed e.g. bare scalar fields with no
-# Property[...] wrapper at all (`name: pylon.Str`), and Link/MultiLink target
-# types that are sometimes the actual class, sometimes a forward-reference
-# *string* (`Link["Company"]` written before Company is defined) — both are
-# handled below.
+# `python3 -c "..."` against pylon-demo showed e.g. bare scalar properties with
+# no Property[...] wrapper at all (`name: pylon.Str`), and Link/MultiLink
+# target types that are sometimes the actual class, sometimes a forward-
+# reference *string* (`Link["Company"]` written before Company is defined) —
+# both are handled below.
 
 # Canonical PyQL-style type names for every scalar marker class
 # (pylon.Str, pylon.UUID, ..., plus stdlib uuid.UUID used for the injected
-# `id` field) — shown below the field name in the Data Explorer's column
+# `id` property) — shown below the pointer name in the Data Explorer's column
 # headers, and used by the frontend to decide which types get a `<tag>`
 # prefix on values (uuid/datetime/etc — plain str/int/bool/json don't need
 # one, their JS type already says enough).
@@ -171,8 +173,8 @@ def _type_qualname(cls: type) -> str:
 
 
 def _merged_annotations(cls: type) -> dict[str, Any]:
-    """Field annotations across the whole MRO (base classes first), mirroring
-    how the schema DSL merges inherited fields — e.g. Account's `email` shows
+    """Pointer annotations across the whole MRO (base classes first), mirroring
+    how the schema DSL merges inherited pointers — e.g. Account's `email` shows
     up on Individual/Organization, but only via their base class's __dict__,
     not their own (confirmed: bare cls.__annotations__ misses it)."""
     merged: dict[str, Any] = {}
@@ -184,7 +186,7 @@ def _merged_annotations(cls: type) -> dict[str, Any]:
 def _resolve_target(target: Any, owning_cls: type) -> str:
     """Link/MultiLink target_type is either the real class or a forward-ref
     string (e.g. Link["Company"]) — a string is assumed to name a type in the
-    referencing field's own module, the same convention PyQL/PyQL use for
+    referencing pointer's own module, the same convention PyQL/PyQL use for
     unqualified same-module references."""
     if isinstance(target, str):
         return f"{_infer_module(owning_cls)}::{target}"
@@ -196,30 +198,56 @@ def _scalar_type_name(scalar_type: Any) -> str | None:
     return _TYPE_NAME_BY_CLASS.get(name) if name else None
 
 
-def _classify_field(annotation: Any, owning_cls: type, enum_classes: set[type]) -> dict[str, Any]:
-    """Returns the {kind, target?, typeName?} fragment for one field."""
+def _pointer_editability(meta: PointerMeta) -> dict[str, Any]:
+    """readonly/required/hasDefault/through — sourced from Pylon's own
+    PointerMeta (cls.__pylon_config__.pointers), which the raw type annotation
+    alone can't tell us. Only meaningful for property/link (readonly/required/
+    hasDefault) and multilink (through, the junction type) — computed pointers
+    are never editable regardless, so nothing is added for them."""
+    if meta.kind in ("property", "link"):
+        return {
+            "readonly": meta.is_readonly,
+            "required": not meta.nullable,
+            "hasDefault": meta.default is not dataclasses.MISSING or meta.default_factory is not dataclasses.MISSING,
+        }
+    if meta.kind == "multilink" and meta.through is not None:
+        # Resolved to a qualified "module::Name" string by pylon.finalize()'s
+        # walker (_walker.py's _resolve_links) before this handler ever runs.
+        return {"through": meta.through}
+    return {}
+
+
+def _classify_pointer(
+    annotation: Any, owning_cls: type, enum_classes: set[type], meta: PointerMeta | None
+) -> dict[str, Any]:
+    """Returns the {kind, target?, typeName?, readonly?, required?, hasDefault?,
+    through?} fragment for one property/link/multiLink/computed pointer."""
     _, inner = _unwrap_optional(annotation)
 
     if isinstance(inner, LinkAnnotation):
-        return {"kind": "link", "target": _resolve_target(inner.target_type, owning_cls)}
-    if isinstance(inner, MultiLinkAnnotation):
-        return {"kind": "multiLink", "target": _resolve_target(inner.target_type, owning_cls)}
-    if isinstance(inner, ComputedAnnotation):
+        result = {"kind": "link", "target": _resolve_target(inner.target_type, owning_cls)}
+    elif isinstance(inner, MultiLinkAnnotation):
+        result = {"kind": "multiLink", "target": _resolve_target(inner.target_type, owning_cls)}
+    elif isinstance(inner, ComputedAnnotation):
         # return_type is usually a plain scalar class; Computed[MultiLink[...], ...]
         # (a computed backlink) is a real but rarer shape we don't resolve here.
         type_name = _scalar_type_name(inner.return_type)
-        return {"kind": "computed", "typeName": type_name} if type_name else {"kind": "computed"}
+        result = {"kind": "computed", "typeName": type_name} if type_name else {"kind": "computed"}
+    else:
+        # PropertyAnnotation wraps constrained/defaulted properties; a bare
+        # scalar type hint (e.g. `name: pylon.Str`, or the injected
+        # `id: uuid.UUID | None`) is an unconstrained property — both are
+        # plain scalar properties.
+        scalar_type = inner.scalar_type if isinstance(inner, PropertyAnnotation) else inner
+        if isinstance(scalar_type, type) and scalar_type in enum_classes:
+            result = {"kind": "enum", "target": _type_qualname(scalar_type)}
+        else:
+            type_name = _scalar_type_name(scalar_type)
+            result = {"kind": "property", "typeName": type_name} if type_name else {"kind": "property"}
 
-    # PropertyAnnotation wraps constrained/defaulted properties; a bare scalar
-    # type hint (e.g. `name: pylon.Str`, or the injected `id: uuid.UUID | None`)
-    # is an unconstrained property — both are plain scalar fields.
-    scalar_type = inner.scalar_type if isinstance(inner, PropertyAnnotation) else inner
-
-    if isinstance(scalar_type, type) and scalar_type in enum_classes:
-        return {"kind": "enum", "target": _type_qualname(scalar_type)}
-
-    type_name = _scalar_type_name(scalar_type)
-    return {"kind": "property", "typeName": type_name} if type_name else {"kind": "property"}
+    if meta is not None:
+        result.update(_pointer_editability(meta))
+    return result
 
 
 def _vector_index_field_names(vi: Any) -> list[str]:
@@ -228,28 +256,35 @@ def _vector_index_field_names(vi: Any) -> list[str]:
     return [vf.ref.split(".", 1)[1] for vf in vi._vector_fields]
 
 
+def _build_type_entry(cls: type, enum_classes: set[type]) -> dict[str, Any]:
+    pointer_metas = _effective_pointers(cls)  # computed once per type, not per pointer
+    return {
+        "module": _infer_module(cls),
+        "name": cls.__name__,
+        # Real Pylon inheritance info (@pylon.abstract/@pylon.interface +
+        # concrete subtypes) — lets the Data Explorer offer a subtype
+        # picker when inserting into an abstract/interface type.
+        "abstract": cls.__pylon_config__.abstract,
+        "bases": [_type_qualname(base) for base in cls.__bases__ if hasattr(base, "__pylon_config__")],
+        "pointers": [
+            {"name": name, **_classify_pointer(annotation, cls, enum_classes, pointer_metas.get(name))}
+            for name, annotation in _merged_annotations(cls).items()
+        ],
+        # Powers the AI tab's Type select (only types with >=1 entry here
+        # are offered) and Index select (offered only when there's more
+        # than one). indexName is None for a bare/default VectorIndex.
+        "vectorIndexes": [
+            {"indexName": vi.index_name, "model": vi.model, "fields": _vector_index_field_names(vi)}
+            for vi in getattr(cls.__pylon_config__, "vector_indexes", [])
+        ],
+    }
+
+
 async def _handle_get_schema(send: Send) -> None:
     registered_types, registered_enums, _ = schema_snapshot()
     enum_classes = set(registered_enums)
 
-    types = [
-        {
-            "module": _infer_module(cls),
-            "name": cls.__name__,
-            "fields": [
-                {"name": name, **_classify_field(annotation, cls, enum_classes)}
-                for name, annotation in _merged_annotations(cls).items()
-            ],
-            # Powers the AI tab's Type select (only types with >=1 entry here
-            # are offered) and Index select (offered only when there's more
-            # than one). indexName is None for a bare/default VectorIndex.
-            "vectorIndexes": [
-                {"indexName": vi.index_name, "model": vi.model, "fields": _vector_index_field_names(vi)}
-                for vi in getattr(cls.__pylon_config__, "vector_indexes", [])
-            ],
-        }
-        for cls in registered_types
-    ]
+    types = [_build_type_entry(cls, enum_classes) for cls in registered_types]
     enums = [
         {"module": _infer_module(cls), "name": cls.__name__, "members": [member.name for member in cls]}
         for cls in registered_enums

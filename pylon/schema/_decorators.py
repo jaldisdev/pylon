@@ -19,7 +19,7 @@ from ._fields import (
 )
 from ._indexes import Index, SearchIndex, VectorIndex
 from ._triggers import Rewrite, Trigger
-from ._meta import MISSING, FieldMeta, PylonConfig
+from ._meta import MISSING, PointerMeta, PylonConfig
 from ._scalars import SHORTHAND_MAP
 from ._scalars import UUID as PylonUUID
 
@@ -95,7 +95,7 @@ def _resolve_default(
     return cls_default, MISSING
 
 
-# ── Annotation → FieldMeta ─────────────────────────────────────────────────────
+# ── Annotation → PointerMeta ─────────────────────────────────────────────────────
 
 
 def _annotation_to_meta(
@@ -103,7 +103,7 @@ def _annotation_to_meta(
     annotation: Any,
     nullable: bool,
     cls_default: Any,
-) -> FieldMeta:
+) -> PointerMeta:
     if isinstance(annotation, PropertyAnnotation):
         description = next(
             (c.text for c in annotation.constraints if isinstance(c, Description)), None
@@ -115,7 +115,7 @@ def _annotation_to_meta(
             if not isinstance(c, (Description, Rewrite)) and c is not Readonly
         ]
         default, factory = _resolve_default(cls_default, annotation.constraints)
-        return FieldMeta(
+        return PointerMeta(
             name=name,
             kind="property",
             scalar_type=annotation.scalar_type,
@@ -138,7 +138,7 @@ def _annotation_to_meta(
             c for c in annotation.constraints
             if not isinstance(c, (Description, Rewrite)) and c is not Readonly
         ]
-        return FieldMeta(
+        return PointerMeta(
             name=name,
             kind="link",
             scalar_type=None,
@@ -154,7 +154,7 @@ def _annotation_to_meta(
         )
 
     if isinstance(annotation, MultiLinkAnnotation):
-        return FieldMeta(
+        return PointerMeta(
             name=name,
             kind="multilink",
             scalar_type=None,
@@ -168,7 +168,7 @@ def _annotation_to_meta(
         )
 
     if isinstance(annotation, ComputedAnnotation):
-        return FieldMeta(
+        return PointerMeta(
             name=name,
             kind="computed",
             scalar_type=annotation.return_type,
@@ -182,7 +182,7 @@ def _annotation_to_meta(
     # Shorthand: raw Python type (str, int, bool, uuid.UUID, …).
     scalar_type = SHORTHAND_MAP.get(annotation, annotation)
     default, factory = _resolve_default(cls_default, [])
-    return FieldMeta(
+    return PointerMeta(
         name=name,
         kind="property",
         scalar_type=scalar_type,
@@ -221,7 +221,7 @@ def _inject_repr(cls: type) -> None:
     cls.__repr__ = __repr__  # type: ignore[method-assign]
 
 
-def _prepare_dataclass(cls: type, field_metas: dict[str, FieldMeta]) -> None:
+def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None:
     """Inject dataclasses.field() specs into the class dict before @dataclass runs.
 
     @dataclass only understands mutable defaults when expressed as
@@ -229,7 +229,7 @@ def _prepare_dataclass(cls: type, field_metas: dict[str, FieldMeta]) -> None:
     field(default=None) for nullable fields that have no explicit class-level
     attribute.
     """
-    for name, meta in field_metas.items():
+    for name, meta in pointer_metas.items():
         if meta.kind == "computed":
             setattr(cls, name, dataclasses.field(init=False, default=None))
             continue
@@ -378,7 +378,7 @@ def _build_type(
 
     annotations = _collect_annotations(cls)
 
-    field_metas: dict[str, FieldMeta] = {}
+    pointer_metas: dict[str, PointerMeta] = {}
     for field_name, annotation in annotations.items():
         if field_name.startswith("_"):
             continue
@@ -395,9 +395,9 @@ def _build_type(
                 f"Junction type {cls.__name__!r}: field {field_name!r} is a "
                 f"{meta.kind!r}; junction types only support scalar properties."
             )
-        field_metas[field_name] = meta
+        pointer_metas[field_name] = meta
 
-    _prepare_dataclass(cls, field_metas)
+    _prepare_dataclass(cls, pointer_metas)
     dataclasses.dataclass(cls, kw_only=True)
     _inject_repr(cls)
 
@@ -411,7 +411,7 @@ def _build_type(
         table=resolved_table,
         abstract=abstract,
         materialized=materialized,
-        fields=field_metas,
+        pointers=pointer_metas,
         constraints=class_constraints,
         indexes=class_indexes,
         vector_indexes=class_vector_indexes,

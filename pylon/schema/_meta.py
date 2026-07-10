@@ -7,8 +7,8 @@ MISSING = dataclasses.MISSING
 
 
 @dataclasses.dataclass
-class FieldMeta:
-    """Metadata for a single field on a Pylon type."""
+class PointerMeta:
+    """Metadata for a single property/link/multilink/computed pointer on a Pylon type."""
 
     name: str
     kind: str  # 'property' | 'link' | 'multilink' | 'computed'
@@ -40,7 +40,7 @@ class PylonConfig:
     table: str
     abstract: bool
     materialized: bool
-    fields: dict[str, FieldMeta] = dataclasses.field(default_factory=dict)
+    pointers: dict[str, PointerMeta] = dataclasses.field(default_factory=dict)
     constraints: list[Any] = dataclasses.field(default_factory=list)
     indexes: list[Any] = dataclasses.field(default_factory=list)
     vector_indexes: list[Any] = dataclasses.field(default_factory=list)
