@@ -3095,6 +3095,88 @@ mod tests {
         assert!(out.sql.contains("\"age\""), "outer filter must reference raw column, got:\n{}", out.sql);
     }
 
+    // ── vector::search tests ──────────────────────────────────────────────────
+
+    fn make_schema_with_vector() -> SchemaDescriptor {
+        use crate::schema::VectorIndexDescriptor;
+        let mut s = make_schema();
+        if let Some(td) = s.types.iter_mut().find(|t| t.name == "Person") {
+            td.vector_indexes.push(VectorIndexDescriptor {
+                index_name: None,
+                fields: vec!["name".into()],
+                model: "test-embed".into(),
+                metric: "cosine".into(),
+                dimensions: 4,
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn test_vector_search_bare_type_name() {
+        let schema = make_schema_with_vector();
+        let out = compile_and_emit_with(
+            "WITH search := vector::search(Person, <pgvector::vector>[1.0, 2.0, 3.0, 4.0]) \
+             SELECT search { object { name }, distance }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_vector_search_qualified_type_name() {
+        let schema = make_schema_with_vector();
+        let out = compile_and_emit_with(
+            "WITH search := vector::search(default::Person, <pgvector::vector>[1.0, 2.0, 3.0, 4.0]) \
+             SELECT search { object { name }, distance }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_vector_search_subquery_filter_included_in_where() {
+        let schema = make_schema_with_vector();
+        let out = compile_and_emit_with(
+            "WITH search := vector::search((select Person filter .name = 'Alice'), <pgvector::vector>[1.0, 2.0, 3.0, 4.0]) \
+             SELECT search { object { name }, distance }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(out.sql.contains("\"name\""), "expected name filter, got:\n{}", out.sql);
+        assert!(out.sql.contains("Alice"), "expected filter value, got:\n{}", out.sql);
+        assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_vector_search_subquery_filter_combined_with_outer_property_filter() {
+        let schema = make_schema_with_vector();
+        let out = compile_and_emit_with(
+            "WITH search := vector::search((select Person filter .age > 18), <pgvector::vector>[1.0, 2.0, 3.0, 4.0]) \
+             SELECT search { object { name }, distance }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"age\""), "expected age pre-filter, got:\n{}", out.sql);
+        assert!(out.sql.contains("18"), "expected filter value 18, got:\n{}", out.sql);
+        assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_vector_search_text_overload_with_subquery_filter() {
+        let schema = make_schema_with_vector();
+        let out = compile_and_emit_with(
+            "WITH search := vector::search((select Person filter .name = 'Alice'), query := $q) \
+             SELECT search { object { name }, distance }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(out.sql.contains("Alice"), "expected pre-filter value, got:\n{}", out.sql);
+        assert!(out.sql.contains("float8[]"), "expected float8[] cast for deferred vec param, got:\n{}", out.sql);
+        assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
+    }
+
     #[test]
     fn test_count_type_ref_compiles_to_agg_over_query() {
         let out = compile_and_emit("SELECT count(Person)");
