@@ -3223,4 +3223,36 @@ mod tests {
         let out = compile_and_emit("SELECT Person FILTER .name = $0 OR .name = $0");
         assert_eq!(out.sql.matches("$1").count(), 2, "both uses must reference $1, got:\n{}", out.sql);
     }
+
+    #[test]
+    fn test_cast_to_nonexistent_type_names_full_type() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .name = <default::Ghost>$name").unwrap();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected compile error for unknown type"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unknown type 'default::Ghost'"),
+                    "expected full type name in error, got: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_to_nonexistent_unqualified_type_names_type() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .name = <Ghost>$name").unwrap();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected compile error for unknown type"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unknown type 'Ghost'"),
+                    "expected type name in error, got: {msg}",
+                );
+            }
+        }
+    }
 }

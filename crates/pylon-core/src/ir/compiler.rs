@@ -5470,7 +5470,7 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         Some("std") | None => ty.name.as_str(),
         Some(m) => {
             return Err(PyQLError::Type(PyQLTypeError {
-                message: format!("unknown type module '{m}'"),
+                message: format!("unknown type '{}::{}'", m, ty.name),
                 position: Position { line: 0, col: 0 },
             }))
         }
@@ -5492,12 +5492,7 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         "time" => "time",
         "duration" => "interval",
         other => return Err(PyQLError::Type(PyQLTypeError {
-            message: format!(
-                "unknown cast type '{other}'; \
-                 valid scalar types are: str, bool, int16, int32, int64, \
-                 float32, float64, decimal, json, uuid, bytes, \
-                 datetime, date, time, duration"
-            ),
+            message: format!("unknown type '{other}'"),
             position: Position { line: 0, col: 0 },
         })),
     }
