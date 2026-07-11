@@ -59,6 +59,8 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
             await _handle_get_connections(config, send)
         elif path == "/api/models" and method == "GET":
             await _handle_get_models(config, send)
+        elif path == "/api/stats" and method == "GET":
+            await _handle_get_stats(connection["client"], send)
         elif path == "/api/query" and method == "POST":
             await _handle_run_query(connection["client"], receive, send)
         elif path == "/api/ai/chat" and method == "POST":
@@ -360,6 +362,46 @@ async def _handle_get_models(config: Config, send: Send) -> None:
         if cfg.purpose == "chat"
     ]
     await _send_json(send, 200, {"models": models})
+
+
+# ---------------------------------------------------------------------------
+# /api/stats
+# ---------------------------------------------------------------------------
+#
+# Powers the Dashboard tab's two headline numbers. "objects" is a live-tuple
+# estimate straight from Postgres's own autovacuum-maintained statistics
+# (pg_stat_user_tables.n_live_tup) rather than a real `count(*)` over every
+# type — an exact count would mean one query per table (or a big UNION ALL),
+# which doesn't scale and isn't what the upstream engine's own dashboard does either; this is
+# an estimate, same tradeoff. "_pylon" is Pylon's own internal schema
+# (migrations bookkeeping etc — never user data), excluded the same way
+# pg_catalog/information_schema are. "types" is every registered schema type
+# (concrete, abstract, interface, junction — schema_snapshot()'s first
+# element already includes all four, confirmed via _decorators.py's shared
+# _build_type() registering every one of them) plus registered custom scalars
+# — no DB round trip needed, this is purely the in-memory registry.
+
+
+async def _handle_get_stats(client: Client, send: Send) -> None:
+    registered_types, _, registered_scalars = schema_snapshot()
+
+    async with client.raw_connection() as conn:
+        estimated_objects = await conn.fetchval(
+            """
+            SELECT SUM(n_live_tup)::bigint AS estimated_total_objects
+            FROM pg_stat_user_tables
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema', '_pylon')
+            """
+        )
+
+    await _send_json(
+        send,
+        200,
+        {
+            "objects": estimated_objects or 0,
+            "types": len(registered_types) + len(registered_scalars),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
