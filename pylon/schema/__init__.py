@@ -51,6 +51,7 @@ from ._pointers import (
     Restrict,
     Source,
     Target,
+    Tuple,
     through,
 )
 from ._indexes import Index, SearchBackend, SearchPointer, SearchIndex, SearchMode, SearchWeight, VectorPointer, VectorIndex
@@ -101,6 +102,7 @@ __all__ = [
     "Link",
     "MultiLink",
     "Computed",
+    "Tuple",
     "through",
     # Deletion policies
     "OnDelete",

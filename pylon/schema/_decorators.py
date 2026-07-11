@@ -16,6 +16,7 @@ from ._pointers import (
     LinkAnnotation,
     MultiLinkAnnotation,
     PropertyAnnotation,
+    TupleAnnotation,
 )
 from ._indexes import Index, SearchIndex, VectorIndex
 from ._triggers import Rewrite, Trigger
@@ -165,6 +166,18 @@ def _annotation_to_meta(
             link_target=annotation.target_type,
             through=annotation.through_type,
             on_delete=list(annotation.on_delete),
+        )
+
+    if isinstance(annotation, TupleAnnotation):
+        default, factory = _resolve_default(cls_default, [])
+        return PointerMeta(
+            name=name,
+            kind="property",
+            scalar_type=annotation,
+            nullable=nullable,
+            constraints=[],
+            default=default,
+            default_factory=factory,
         )
 
     if isinstance(annotation, ComputedAnnotation):

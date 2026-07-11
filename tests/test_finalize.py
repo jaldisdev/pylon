@@ -681,6 +681,23 @@ class TestWalkIntegration:
         schema = walk(types, enums, scalars, [], named_tuples=named_tuples_snapshot())
         assert schema.named_tuple_count == 1
 
+    def test_schema_with_structural_tuple(self):
+        from pylon.schema._walker import walk
+
+        @pylon.type(module="geo", name="Shape")
+        class Shape:
+            label: str
+            pair: pylon.Tuple[pylon.Str, pylon.Bool]
+            rgb: pylon.Tuple[("r", pylon.Int16), ("g", pylon.Int16), ("b", pylon.Int16)]
+            nested: pylon.Tuple[
+                ("origin", pylon.Tuple[("x", pylon.Float64), ("y", pylon.Float64)]),
+                ("size", pylon.Float64),
+            ] | None
+
+        types, enums, scalars = snapshot()
+        schema = walk(types, enums, scalars, [])
+        assert schema.type_count == 1
+
     def test_schema_with_link(self):
         from pylon.schema._walker import walk
 
