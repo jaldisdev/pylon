@@ -65,10 +65,15 @@ pub enum ShapeNode {
         elements: Vec<ShapeNode>,
     },
     /// Named tuple decoded from jsonb. When `type_name` is Some, hydrated to the registered class.
+    /// `members` carries the full per-member decode plan when statically known (a registered
+    /// NamedTupleDescriptor's members, a structural `pylon.Tuple[...]` property's tuple_members,
+    /// or a `<tuple<...>>`/nominal cast's own target type) — `None` falls back to decoding the
+    /// raw jsonb value generically (dict/list, no per-member typing).
     NamedTuple {
         name: String,
         position: usize,
         type_name: Option<String>,
+        members: Option<Vec<JsonMember>>,
     },
     /// Enum value arrived as text; hydrated to the Python enum class keyed by `enum_type`.
     Enum {
@@ -106,6 +111,34 @@ pub enum ShapeNode {
         /// Shape node for each element in the elements array.
         element: Box<ShapeNode>,
     },
+}
+
+/// One member's decode plan within a jsonb-backed tuple value
+/// (`ShapeNode::NamedTuple.members`) — recursive so a member can itself be a
+/// nested tuple.
+#[derive(Debug, Clone)]
+pub struct JsonMember {
+    /// `None` for a positional/unnamed element of a structural tuple
+    /// (the value is a jsonb array); `Some` for a named member (a jsonb
+    /// object key) — either a nominal named-tuple field or a named
+    /// structural element.
+    pub key: Option<String>,
+    pub kind: JsonMemberKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum JsonMemberKind {
+    /// Plain scalar — the jsonb value's own native JSON type is already
+    /// correct (number/string/bool), used as-is.
+    Scalar,
+    /// Value arrived as a jsonb string; hydrate to the Python enum class
+    /// keyed by `enum_type` (Pylon-qualified name, e.g. `default::Gender`).
+    Enum { enum_type: String },
+    /// Nested tuple member — recurse. `type_name` hydrates to a registered
+    /// dataclass when present (nominal); `None` decodes to a plain tuple
+    /// (all-positional members) or a dynamically-built dataclass (named,
+    /// unregistered structural).
+    Tuple { type_name: Option<String>, members: Vec<JsonMember> },
 }
 
 /// Opaque handle to the output shape of a compiled query.

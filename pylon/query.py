@@ -34,6 +34,61 @@ def deserialize(
     return [_decode(record["result"], shape, registry) for record in records]
 
 
+def _decode_json_member(value: Any, node: dict, registry: dict[str, type]) -> Any:
+    """Decode one member's own value within a jsonb-backed tuple — the
+    recursive counterpart of `_decode`'s composite-ROW-position walk, but for
+    a jsonb dict/list's own keys/positions instead."""
+    kind = node["kind"]
+    if kind == "enum":
+        if value is None:
+            return None
+        enum_type = node["enum_type"]
+        short = enum_type.split("::")[-1]
+        cls = registry.get(enum_type) or registry.get(short)
+        return cls(value) if cls is not None else value
+    if kind == "tuple":
+        return _decode_json_tuple(value, node, registry)
+    return value  # "scalar" — jsonb's own native JSON type is already correct
+
+
+def _decode_json_tuple(value: Any, node: dict, registry: dict[str, type]) -> Any:
+    """Decode a jsonb tuple/named-tuple value using its statically-known
+    member shape (`node["members"]`) — a real Python tuple for positional
+    members, the registered dataclass for a nominal type, or a dynamically
+    built dataclass (mirroring pylon.datatypes.Object) for an unregistered
+    structural named tuple. Falls back to the raw jsonb value when no member
+    shape was available at compile time."""
+    if value is None:
+        return None
+
+    members = node.get("members")
+    type_name = node.get("type_name")
+    if members is None:
+        if type_name and isinstance(value, dict):
+            cls = registry.get(type_name)
+            if cls is not None:
+                return cls(**value)
+        return value
+
+    positional = all(m["key"] is None for m in members)
+    if positional:
+        return tuple(
+            _decode_json_member(value[i] if isinstance(value, list) else None, m, registry)
+            for i, m in enumerate(members)
+        )
+
+    kwargs = {
+        m["key"]: _decode_json_member(value.get(m["key"]) if isinstance(value, dict) else None, m, registry)
+        for m in members
+    }
+    if type_name:
+        cls = registry.get(type_name)
+        if cls is not None:
+            return cls(**kwargs)
+    from pylon.datatypes import Object
+    return Object(**kwargs)
+
+
 def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
     kind = node["kind"]
 
@@ -74,17 +129,11 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
 
     if kind == "named_tuple":
         pos = node.get("position", 0)
-        # Root-level named tuples arrive as the raw decoded jsonb dict; nested ones
+        # Root-level named tuples arrive as the raw decoded jsonb value (dict
+        # for named members, list for positional/unnamed ones); nested ones
         # sit at a positional index inside the parent composite row.
-        raw = value if (value is None or isinstance(value, dict)) else value[pos]
-        if raw is None:
-            return None
-        type_name = node.get("type_name")
-        if type_name and isinstance(raw, dict):
-            cls = registry.get(type_name)
-            if cls is not None:
-                return cls(**raw)
-        return raw
+        raw = value if (value is None or isinstance(value, (dict, list))) else value[pos]
+        return _decode_json_tuple(raw, node, registry)
 
     if kind == "enum":
         raw = value[node["position"]]

@@ -170,6 +170,76 @@ impl RewriteEntry {
     }
 }
 
+// ── Tuple member descriptor (recursive) ────────────────────────────────────────
+
+/// One member's type within a named-tuple/tuple-shaped value. `kind` selects
+/// which of `pg_type` (scalar) / `module`+`type_name` (enum, nominal named
+/// tuple) / `members` (nested tuple) is meaningful.
+#[pyclass(module = "pylon._core", frozen)]
+pub struct TupleMember {
+    inner: core::schema::TupleMemberDescriptor,
+}
+
+#[pymethods]
+impl TupleMember {
+    #[new]
+    #[pyo3(signature = (
+        name,
+        kind,
+        *,
+        pg_type = None,
+        module = None,
+        type_name = None,
+        members = None,
+    ))]
+    fn new(
+        name: Option<String>,
+        kind: &str,
+        pg_type: Option<String>,
+        module: Option<String>,
+        type_name: Option<String>,
+        members: Option<Vec<PyRef<TupleMember>>>,
+    ) -> PyResult<Self> {
+        let kind = match kind {
+            "scalar" => core::schema::TupleMemberKind::Scalar {
+                pg_type: pg_type.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("TupleMember(kind='scalar') requires pg_type")
+                })?,
+            },
+            "enum" => core::schema::TupleMemberKind::Enum {
+                module: module.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("TupleMember(kind='enum') requires module")
+                })?,
+                name: type_name.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("TupleMember(kind='enum') requires type_name")
+                })?,
+            },
+            "namedTuple" => core::schema::TupleMemberKind::NamedTuple {
+                module: module.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("TupleMember(kind='namedTuple') requires module")
+                })?,
+                name: type_name.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("TupleMember(kind='namedTuple') requires type_name")
+                })?,
+            },
+            "tuple" => core::schema::TupleMemberKind::Tuple {
+                members: members.unwrap_or_default().iter().map(|m| m.inner.clone()).collect(),
+            },
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown TupleMember kind '{other}' (expected scalar/enum/namedTuple/tuple)"
+                )))
+            }
+        };
+        Ok(Self { inner: core::schema::TupleMemberDescriptor { name, kind } })
+    }
+
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+}
+
 // ── Pointer descriptors ────────────────────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -192,7 +262,8 @@ impl PropertyDescriptor {
         is_exclusive = false,
         is_pk = false,
         is_readonly = false,
-        rewrites = None
+        rewrites = None,
+        tuple_members = None
     ))]
     fn new(
         name: String,
@@ -206,6 +277,7 @@ impl PropertyDescriptor {
         is_pk: bool,
         is_readonly: bool,
         rewrites: Option<Vec<PyRef<RewriteEntry>>>,
+        tuple_members: Option<Vec<PyRef<TupleMember>>>,
     ) -> Self {
         Self {
             inner: core::schema::PropertyDescriptor {
@@ -224,6 +296,8 @@ impl PropertyDescriptor {
                     .iter()
                     .map(|r| r.inner.clone())
                     .collect(),
+                tuple_members: tuple_members
+                    .map(|ms| ms.iter().map(|m| m.inner.clone()).collect()),
             },
         }
     }
@@ -961,9 +1035,14 @@ pub struct NamedTupleDescriptor {
 #[pymethods]
 impl NamedTupleDescriptor {
     #[new]
-    fn new(name: String, module: String) -> Self {
+    #[pyo3(signature = (name, module, *, members = None))]
+    fn new(name: String, module: String, members: Option<Vec<PyRef<TupleMember>>>) -> Self {
         Self {
-            inner: core::schema::NamedTupleDescriptor { name, module },
+            inner: core::schema::NamedTupleDescriptor {
+                name,
+                module,
+                members: members.unwrap_or_default().iter().map(|m| m.inner.clone()).collect(),
+            },
         }
     }
 
@@ -1692,6 +1771,38 @@ fn clear_query_cache() {
 
 // ── Shape conversion ───────────────────────────────────────────────────────────
 
+/// Recursive per-member decode plan for a jsonb-backed tuple value
+/// (`ShapeNode::NamedTuple.members`) — see `core::query::JsonMember`.
+fn json_member_to_py<'py>(
+    py: Python<'py>,
+    member: &core::query::JsonMember,
+) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
+    use pyo3::types::{PyDict, PyList};
+    use core::query::JsonMemberKind;
+
+    let d = PyDict::new(py);
+    d.set_item("key", member.key.as_deref())?;
+    match &member.kind {
+        JsonMemberKind::Scalar => {
+            d.set_item("kind", "scalar")?;
+        }
+        JsonMemberKind::Enum { enum_type } => {
+            d.set_item("kind", "enum")?;
+            d.set_item("enum_type", enum_type.as_str())?;
+        }
+        JsonMemberKind::Tuple { type_name, members } => {
+            d.set_item("kind", "tuple")?;
+            d.set_item("type_name", type_name.as_deref())?;
+            let py_members = PyList::new(
+                py,
+                members.iter().map(|m| json_member_to_py(py, m)).collect::<PyResult<Vec<_>>>()?,
+            )?;
+            d.set_item("members", py_members)?;
+        }
+    }
+    Ok(d.into_any())
+}
+
 fn shape_node_to_py<'py>(
     py: Python<'py>,
     node: &core::query::ShapeNode,
@@ -1743,11 +1854,21 @@ fn shape_node_to_py<'py>(
         ShapeNode::JsonScalar => {
             d.set_item("kind", "json_scalar")?;
         }
-        ShapeNode::NamedTuple { name, position, type_name } => {
+        ShapeNode::NamedTuple { name, position, type_name, members } => {
             d.set_item("kind", "named_tuple")?;
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
             d.set_item("type_name", type_name.as_deref())?;
+            match members {
+                Some(ms) => {
+                    let py_members = PyList::new(
+                        py,
+                        ms.iter().map(|m| json_member_to_py(py, m)).collect::<PyResult<Vec<_>>>()?,
+                    )?;
+                    d.set_item("members", py_members)?;
+                }
+                None => d.set_item("members", py.None())?,
+            }
         }
         ShapeNode::Enum { name, position, enum_type } => {
             d.set_item("kind", "enum")?;
@@ -1833,6 +1954,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Pointer descriptors
     m.add_class::<RewriteEntry>()?;
+    m.add_class::<TupleMember>()?;
     m.add_class::<PropertyDescriptor>()?;
     m.add_class::<LinkDescriptor>()?;
     m.add_class::<MultiLinkDescriptor>()?;

@@ -611,6 +611,13 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         for r in meta.rewrites
     ]
 
+    from ._pointers import TupleAnnotation
+    tuple_members = (
+        [_build_tuple_member(e.name, e.type_, _core) for e in meta.scalar_type.elements]
+        if isinstance(meta.scalar_type, TupleAnnotation)
+        else None
+    )
+
     return _core.PropertyDescriptor(
         name=name,
         pg_type=pg_type,
@@ -623,6 +630,7 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         is_pk=False,
         is_readonly=meta.is_readonly,
         rewrites=rewrites,
+        tuple_members=tuple_members,
     )
 
 
@@ -893,11 +901,44 @@ def _build_enum_descriptor(cls: type, _core: Any) -> Any:
     return _core.EnumDescriptor(name=cls.__name__, module=module, members=members)
 
 
+def _build_tuple_member(name: str | None, annotation: Any, _core: Any) -> Any:
+    """Build one _core.TupleMember from a raw member type annotation — a
+    plain scalar/enum type, a registered NamedTuple class, or a nested
+    TupleAnnotation (pylon.Tuple[...]). Shared by nominal named-tuple
+    dataclass fields and structural pylon.Tuple[...] elements; recurses for a
+    nested tuple member."""
+    from ._named_tuples import NamedTuple as PylonNamedTuple
+    from ._enums import Enum as PylonEnum
+    from ._pointers import TupleAnnotation
+
+    if isinstance(annotation, TupleAnnotation):
+        members = [_build_tuple_member(e.name, e.type_, _core) for e in annotation.elements]
+        return _core.TupleMember(name, "tuple", members=members)
+
+    if isinstance(annotation, type) and issubclass(annotation, PylonNamedTuple):
+        mod = getattr(annotation, "__pylon_module__", None) or (
+            (annotation.__module__ or "default").rpartition(".")[-1] or "default"
+        )
+        return _core.TupleMember(name, "namedTuple", module=mod, type_name=annotation.__name__)
+
+    if isinstance(annotation, type) and issubclass(annotation, PylonEnum):
+        mod = getattr(annotation, "__pylon_module__", None) or (
+            (annotation.__module__ or "default").rpartition(".")[-1] or "default"
+        )
+        return _core.TupleMember(name, "enum", module=mod, type_name=annotation.__name__)
+
+    return _core.TupleMember(name, "scalar", pg_type=_to_pg_type(annotation))
+
+
 def _build_named_tuple_descriptor(cls: type, _core: Any) -> Any:
     module = getattr(cls, "__pylon_module__", None) or (
         (cls.__module__ or "default").rpartition(".")[-1] or "default"
     )
-    return _core.NamedTupleDescriptor(name=cls.__name__, module=module)
+    members = [
+        _build_tuple_member(name, annotation, _core)
+        for name, annotation in cls.__annotations__.items()
+    ]
+    return _core.NamedTupleDescriptor(name=cls.__name__, module=module, members=members)
 
 
 def _build_global_descriptor(g: Any, _core: Any) -> Any:

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pylon.query import _decode, deserialize
+from pylon.query import _decode, _decode_json_tuple, deserialize
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -145,6 +145,122 @@ class TestDecodeArray:
         shape = self._posts_shape()
         outer = ("default::Person", "Alice", None)
         assert _decode(outer, shape, {}) == []
+
+
+# ── _decode named_tuple / _decode_json_tuple ───────────────────────────────────
+
+
+def _member(key: str | None, kind: str = "scalar", **extra) -> dict:
+    return {"key": key, "kind": kind, **extra}
+
+
+def _named_tuple(
+    name: str, position: int, members: list | None, type_name: str | None = None
+) -> dict:
+    return {
+        "kind": "named_tuple",
+        "name": name,
+        "position": position,
+        "type_name": type_name,
+        "members": members,
+    }
+
+
+class TestDecodeJsonTuple:
+    def test_positional_members_decode_to_real_tuple(self):
+        node = _named_tuple("", 0, [_member(None), _member(None)])
+        result = _decode(["1", 3], node, {})
+        assert result == ("1", 3)
+        assert isinstance(result, tuple)
+
+    def test_named_members_no_registered_class_build_dynamic_object(self):
+        from pylon.datatypes import Object
+
+        node = _named_tuple("", 0, [_member("street"), _member("zip")])
+        result = _decode({"street": "123 Main St", "zip": "94107"}, node, {})
+        assert isinstance(result, Object)
+        assert result.street == "123 Main St"
+        assert result.zip == "94107"
+
+    def test_named_members_with_registered_class_hydrates_dataclass(self):
+        @dataclass
+        class Point:
+            x: float
+            y: float
+
+        node = _named_tuple("", 0, [_member("x"), _member("y")], type_name="Point")
+        result = _decode({"x": 1.0, "y": 2.0}, node, {"Point": Point})
+        assert result == Point(x=1.0, y=2.0)
+
+    def test_nested_tuple_member_decodes_recursively(self):
+        node = _named_tuple(
+            "",
+            0,
+            [
+                _member(
+                    "origin",
+                    kind="tuple",
+                    members=[_member("x"), _member("y")],
+                ),
+                _member("size"),
+            ],
+        )
+        value = {"origin": {"x": 1.0, "y": 2.0}, "size": 3.0}
+        result = _decode(value, node, {})
+        from pylon.datatypes import Object
+
+        assert isinstance(result, Object)
+        assert result.origin == Object(x=1.0, y=2.0)
+        assert result.size == 3.0
+
+    def test_enum_member_hydrates_registered_enum(self):
+        from enum import Enum
+
+        class Status(Enum):
+            Active = "Active"
+
+        node = _named_tuple(
+            "", 0, [_member("status", kind="enum", enum_type="default::Status")]
+        )
+        result = _decode({"status": "Active"}, node, {"default::Status": Status})
+        assert result.status is Status.Active
+
+    def test_none_value_returns_none(self):
+        node = _named_tuple("", 0, [_member(None)])
+        assert _decode(None, node, {}) is None
+
+    def test_no_members_falls_back_to_raw_dict(self):
+        # Pre-existing behavior for shapes without statically-known member
+        # info (e.g. a bare uncast named-tuple literal) — the raw jsonb dict
+        # passes through unchanged, or hydrates a registered class from it
+        # directly if one's registered.
+        node = _named_tuple("", 0, None, type_name="Point")
+
+        @dataclass
+        class Point:
+            x: float
+            y: float
+
+        result = _decode({"x": 1.0, "y": 2.0}, node, {"Point": Point})
+        assert result == Point(x=1.0, y=2.0)
+
+    def test_no_members_no_registered_class_returns_raw_dict(self):
+        node = _named_tuple("", 0, None)
+        assert _decode({"a": 1}, node, {}) == {"a": 1}
+
+    def test_nested_position_reads_from_parent_tuple(self):
+        # Nested named tuple sits at a positional index inside the parent
+        # composite ROW (matches _decode's object/array pattern).
+        node = _named_tuple("location", 2, [_member("x"), _member("y")])
+        outer = ("default::Person", "Alice", {"x": 1.0, "y": 2.0})
+        result = _decode(outer, node, {})
+        from pylon.datatypes import Object
+
+        assert result == Object(x=1.0, y=2.0)
+
+    def test_decode_json_tuple_helper_directly(self):
+        node = _named_tuple("", 0, [_member(None), _member(None)])
+        assert _decode_json_tuple(["1", 3], node, {}) == ("1", 3)
 
 
 # ── deserialize (top-level) ────────────────────────────────────────────────────
