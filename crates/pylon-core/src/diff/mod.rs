@@ -1870,7 +1870,7 @@ mod tests {
             description: None, check_constraints: vec![],
             is_exclusive: name == "id", is_pk: name == "id",
             is_readonly: name == "id", rewrites: vec![],
-        }
+        tuple_members: None, }
     }
 
     fn simple_type(module: &str, name: &str, table: &str) -> TypeDescriptor {

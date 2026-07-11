@@ -235,6 +235,10 @@ pub struct IrScalarPointer {
     pub column: String,
     /// The PostgreSQL type string, e.g. `text`, `int8`.
     pub pg_type: String,
+    /// `Some` when this property is a named-tuple type (nominal, via the
+    /// `__nt__:` `pg_type` marker, or structural, via `pylon.Tuple[...]`)
+    /// whose member shape is statically known — see `TupleCastShape`.
+    pub tuple_shape: Option<TupleCastShape>,
 }
 
 /// A single-valued FK link included in the output shape.
@@ -480,6 +484,8 @@ pub enum IrExpr {
     EnumLiteral { pg_type: String, variant: String },
     /// Named tuple construction: `(x := 1.0, y := 2.0)` → `jsonb_build_object('x', 1.0, 'y', 2.0)`.
     NamedTuple(Vec<(String, IrExpr)>),
+    /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
+    Tuple(Vec<IrExpr>),
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.
     GlobalParam { index: usize, pg_type: String },
     /// Computed global reference: emits `(SELECT "value" FROM "cte_name")`.
@@ -488,6 +494,10 @@ pub enum IrExpr {
     Subscript { expr: Box<IrExpr>, index: Box<IrExpr>, is_array: bool },
     /// Named tuple / jsonb field access: `(expr)->'field'` (returns jsonb).
     JsonbField { expr: Box<IrExpr>, field: String },
+    /// Positional tuple index into a jsonb array: `(expr)->index` (returns jsonb).
+    /// Runtime fallback for `.N` tuple indexing when `expr` isn't a literal
+    /// tuple constant-foldable at compile time (e.g. a $param or cast result).
+    JsonbIndex { expr: Box<IrExpr>, index: usize },
     /// Slice access `expr[lower:upper]`: `substr` for strings/bytes, PG subscript for arrays.
     Slice {
         expr: Box<IrExpr>,
@@ -636,6 +646,19 @@ pub struct IrTypeCast {
     pub expr: IrExpr,
     /// PostgreSQL cast target, e.g. `text`, `int8`, `uuid`.
     pub pg_type: String,
+    /// `Some` when the cast target is a named-tuple type (nominal or
+    /// structural) whose member shape is statically known — drives building
+    /// a rich `ShapeNode::NamedTuple` with real per-member decode instead of
+    /// an opaque jsonb blob.
+    pub tuple_shape: Option<TupleCastShape>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TupleCastShape {
+    /// `Some` for a nominal `@pylon.named_tuple` cast target (hydrates to
+    /// the registered dataclass); `None` for a structural `tuple<...>`.
+    pub type_name: Option<String>,
+    pub members: Vec<crate::query::JsonMember>,
 }
 
 #[derive(Debug, Clone)]
@@ -777,7 +800,7 @@ mod tests {
                             is_pk: true,
                             is_readonly: true,
                             rewrites: vec![],
-                        },
+                        tuple_members: None, },
                         PropertyDescriptor {
                             name: "name".into(),
                             pg_type: "text".into(),
@@ -790,7 +813,7 @@ mod tests {
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        },
+                        tuple_members: None, },
                         PropertyDescriptor {
                             name: "age".into(),
                             pg_type: "int8".into(),
@@ -803,7 +826,7 @@ mod tests {
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        },
+                        tuple_members: None, },
                     ],
                     links: vec![LinkDescriptor {
                         name: "company".into(),
@@ -854,7 +877,7 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    }],
+                    tuple_members: None, }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -886,7 +909,7 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    }],
+                    tuple_members: None, }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],

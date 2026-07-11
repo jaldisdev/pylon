@@ -55,6 +55,11 @@ pub struct PropertyDescriptor {
     /// True when the transpiler should reject PyQL updates targeting this pointer.
     pub is_readonly: bool,
     pub rewrites: Vec<RewriteEntry>,
+    /// `Some` only for a structural `pylon.Tuple[...]`-typed property — its
+    /// element shape, for decode-time `ShapeNode` building. A *nominal*
+    /// `@pylon.named_tuple`-typed property instead carries its shape via the
+    /// `__nt__:module::Name` `pg_type` marker + `NamedTupleDescriptor.members`.
+    pub tuple_members: Option<Vec<TupleMemberDescriptor>>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,14 +290,36 @@ pub struct EnumDescriptor {
     pub members: Vec<String>,
 }
 
-/// A registered (nominal) `@pylon.named_tuple` type — just enough for cast-target
-/// resolution (`<module::Name>expr` → jsonb). Member structure isn't represented
-/// here at all: it's never validated at compile time, matching the same trust
-/// boundary a plain `<json>` cast already has.
+/// One member's type within a named-tuple/tuple-shaped value — recursive so a
+/// member can itself be a nested tuple. Drives decode-time shape building
+/// (`ShapeNode`) so a jsonb-backed tuple value decodes with real per-member
+/// types instead of an opaque dict/list.
+#[derive(Debug, Clone)]
+pub enum TupleMemberKind {
+    Scalar { pg_type: String },
+    Enum { module: String, name: String },
+    /// A member typed as a registered `@pylon.named_tuple` class.
+    NamedTuple { module: String, name: String },
+    /// A member typed as a nested structural `pylon.Tuple[...]`.
+    Tuple { members: Vec<TupleMemberDescriptor> },
+}
+
+#[derive(Debug, Clone)]
+pub struct TupleMemberDescriptor {
+    /// `None` for an unnamed/positional element of a structural tuple.
+    pub name: Option<String>,
+    pub kind: TupleMemberKind,
+}
+
+/// A registered (nominal) `@pylon.named_tuple` type — used both for cast-target
+/// resolution (`<module::Name>expr` → jsonb) and, via `members`, for decoding a
+/// value read back from a column/cast of this type with real per-member types
+/// instead of an opaque dict.
 #[derive(Debug, Clone)]
 pub struct NamedTupleDescriptor {
     pub name: String,
     pub module: String,
+    pub members: Vec<TupleMemberDescriptor>,
 }
 
 #[derive(Debug, Clone)]

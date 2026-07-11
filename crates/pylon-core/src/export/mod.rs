@@ -1194,7 +1194,7 @@ mod tests {
                     is_pk: true,
                     is_readonly: true,
                     rewrites: vec![],
-                },
+                tuple_members: None, },
                 PropertyDescriptor {
                     name: "age".into(),
                     pg_type: "int8".into(),
@@ -1207,7 +1207,7 @@ mod tests {
                     is_pk: false,
                     is_readonly: false,
                     rewrites: vec![],
-                },
+                tuple_members: None, },
             ],
             links: vec![],
             multilinks: vec![],

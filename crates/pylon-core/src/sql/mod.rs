@@ -706,6 +706,9 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
     matches!(expr, IrExpr::Array(_))
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
         || matches!(expr, IrExpr::NamedTuple(_))
+        || matches!(expr, IrExpr::Tuple(_))
+        || matches!(expr, IrExpr::JsonbField { .. })
+        || matches!(expr, IrExpr::JsonbIndex { .. })
 }
 
 fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
@@ -797,11 +800,21 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
 fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match item {
+        IrFreeExpr::Scalar(IrExpr::TypeCast(c)) if c.tuple_shape.is_some() => {
+            let shape = c.tuple_shape.as_ref().unwrap();
+            ShapeNode::NamedTuple {
+                name: String::new(),
+                position: 0,
+                type_name: shape.type_name.clone(),
+                members: Some(shape.members.clone()),
+            }
+        }
         IrFreeExpr::Scalar(IrExpr::TypeCast(c)) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
         IrFreeExpr::Scalar(IrExpr::NamedTuple(_)) => ShapeNode::NamedTuple {
             name: String::new(),
             position: 0,
             type_name: None,
+            members: None,
         },
         IrFreeExpr::Scalar(e) if is_raw_scalar(e) => ShapeNode::RawScalar,
         IrFreeExpr::Scalar(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
@@ -1056,11 +1069,13 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
         IrPathResult::Scalar(ir_expr) => {
             // Named tuples / jsonb field accesses can't be decoded inside ROW() — emit raw.
             let is_nt = matches!(ir_expr, IrExpr::NamedTuple(_))
+                || matches!(ir_expr, IrExpr::Tuple(_))
                 || matches!(ir_expr, IrExpr::JsonbField { .. })
+                || matches!(ir_expr, IrExpr::JsonbIndex { .. })
                 || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"));
             if is_nt {
                 let expr_sql = format!("{} AS result", emit_expr(ir_expr));
-                let shape = if matches!(ir_expr, IrExpr::JsonbField { .. }) {
+                let shape = if matches!(ir_expr, IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Tuple(_)) {
                     ShapeNode::RawScalar
                 } else {
                     let type_name = match ir_expr {
@@ -1068,7 +1083,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                             pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
                         _ => None,
                     };
-                    ShapeNode::NamedTuple { name: String::new(), position: 0, type_name }
+                    ShapeNode::NamedTuple { name: String::new(), position: 0, type_name, members: None }
                 };
                 (expr_sql, shape)
             } else {
@@ -1733,6 +1748,7 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
             name: f.alias.clone(),
             position: pos,
             type_name: Some(nt_name.to_string()),
+            members: f.tuple_shape.as_ref().map(|s| s.members.clone()),
         });
     }
     // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to asyncpg's
@@ -1745,6 +1761,22 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
             format!("{}.{}::text", qi(table_alias), qi(&f.column))
         };
         return (sql, ShapeNode::Enum { name: f.alias.clone(), position: pos, enum_type });
+    }
+    // A structural pylon.Tuple[...]-typed property — same jsonb column shape
+    // as the nominal `__nt__:` case above, just with no registered dataclass
+    // to hydrate (type_name stays None).
+    if let Some(shape) = &f.tuple_shape {
+        let sql = if table_alias.is_empty() {
+            format!("{}::jsonb", qi(&f.column))
+        } else {
+            format!("{}.{}::jsonb", qi(table_alias), qi(&f.column))
+        };
+        return (sql, ShapeNode::NamedTuple {
+            name: f.alias.clone(),
+            position: pos,
+            type_name: shape.type_name.clone(),
+            members: Some(shape.members.clone()),
+        });
     }
     let sql = if table_alias.is_empty() {
         format!("{}::{}", qi(&f.column), f.pg_type)
@@ -2077,6 +2109,11 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("jsonb_build_object({})", pairs.join(", "))
         }
 
+        IrExpr::Tuple(elems) => {
+            let items: Vec<String> = elems.iter().map(emit_expr).collect();
+            format!("jsonb_build_array({})", items.join(", "))
+        }
+
         IrExpr::Subscript { expr, index, is_array } => {
             let e = emit_expr(expr);
             let i = emit_expr(index);
@@ -2116,6 +2153,10 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::JsonbField { expr, field } => {
             format!("({}->{})", emit_expr(expr), sql_str(field))
+        }
+
+        IrExpr::JsonbIndex { expr, index } => {
+            format!("({}->{})", emit_expr(expr), index)
         }
 
         IrExpr::FnParam { name, .. } => qi(name),
@@ -2500,7 +2541,7 @@ mod tests {
                             is_pk: true,
                             is_readonly: true,
                             rewrites: vec![],
-                        },
+                        tuple_members: None, },
                         PropertyDescriptor {
                             name: "name".into(),
                             pg_type: "text".into(),
@@ -2513,7 +2554,7 @@ mod tests {
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        },
+                        tuple_members: None, },
                         PropertyDescriptor {
                             name: "age".into(),
                             pg_type: "int8".into(),
@@ -2526,7 +2567,7 @@ mod tests {
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        },
+                        tuple_members: None, },
                     ],
                     links: vec![LinkDescriptor {
                         name: "company".into(),
@@ -2577,7 +2618,7 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    }],
+                    tuple_members: None, }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -2609,7 +2650,7 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    }],
+                    tuple_members: None, }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -2758,13 +2799,13 @@ mod tests {
                         default_pyql: None,
             check_constraints: vec![], is_exclusive: true, is_pk: true,
             is_readonly: true, rewrites: vec![],
-        };
+        tuple_members: None, };
         let name_prop = || PropertyDescriptor {
             name: "name".into(), pg_type: "text".into(), nullable: false,
             default_sql: None, description: None, check_constraints: vec![],
                         default_pyql: None,
             is_exclusive: false, is_pk: false, is_readonly: false, rewrites: vec![],
-        };
+        tuple_members: None, };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
@@ -2834,13 +2875,13 @@ mod tests {
             default_sql: Some("gen_random_uuid()".into()), description: None,
             default_pyql: None, check_constraints: vec![], is_exclusive: true,
             is_pk: true, is_readonly: true, rewrites: vec![],
-        };
+        tuple_members: None, };
         let name_prop = || PropertyDescriptor {
             name: "name".into(), pg_type: "text".into(), nullable: false,
             default_sql: None, description: None, check_constraints: vec![],
             default_pyql: None, is_exclusive: false, is_pk: false,
             is_readonly: false, rewrites: vec![],
-        };
+        tuple_members: None, };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
@@ -2876,7 +2917,7 @@ mod tests {
                         default_sql: None, default_pyql: None, description: None,
                         check_constraints: vec![], is_exclusive: false, is_pk: false,
                         is_readonly: false, rewrites: vec![],
-                    }],
+                    tuple_members: None, }],
                     // No declared Link pointers — matches pylon-demo's actual
                     // ProductTag, which relies on multilink_junction_info's
                     // "source"/"target" defaults.
@@ -3215,7 +3256,7 @@ mod tests {
                 RewriteEntry { on: 1, handler: "str_lower(.name)".into() },  // INSERT
                 RewriteEntry { on: 2, handler: "str_lower(.name)".into() },  // UPDATE
             ],
-        });
+        tuple_members: None, });
         schema
     }
 
@@ -3776,9 +3817,126 @@ mod tests {
         schema.named_tuples.push(NamedTupleDescriptor {
             name: "Point".into(),
             module: "default".into(),
+            members: vec![],
         });
         let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
         assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_nominal_named_tuple_cast_shape_carries_real_members() {
+        use crate::schema::{TupleMemberDescriptor, TupleMemberKind};
+        let mut schema = make_schema();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+            members: vec![
+                TupleMemberDescriptor { name: Some("x".into()), kind: TupleMemberKind::Scalar { pg_type: "float8".into() } },
+                TupleMemberDescriptor { name: Some("y".into()), kind: TupleMemberKind::Scalar { pg_type: "float8".into() } },
+            ],
+        });
+        let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
+        match &out.shape.root {
+            crate::query::ShapeNode::NamedTuple { type_name, members, .. } => {
+                assert_eq!(type_name.as_deref(), Some("default::Point"));
+                let members = members.as_ref().expect("expected resolved members");
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].key.as_deref(), Some("x"));
+                assert_eq!(members[1].key.as_deref(), Some("y"));
+            }
+            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_structural_tuple_property_read_shape_carries_real_members() {
+        use crate::schema::{TupleMemberDescriptor, TupleMemberKind};
+        let schema = SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: "Person".into(),
+                module: "default".into(),
+                table: "Person".into(),
+                abstract_: false,
+                materialized: false,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
+                properties: vec![PropertyDescriptor {
+                    name: "address".into(),
+                    pg_type: "jsonb".into(),
+                    nullable: true,
+                    default_sql: None,
+                    default_pyql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: false,
+                    is_pk: false,
+                    is_readonly: false,
+                    rewrites: vec![],
+                    tuple_members: Some(vec![
+                        TupleMemberDescriptor {
+                            name: Some("street".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                        TupleMemberDescriptor {
+                            name: Some("zip".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                    ]),
+                }],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+            }],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+        };
+        let out = compile_and_emit_with("SELECT Person { address }", &schema);
+        assert!(out.sql.contains("::jsonb"), "got:\n{}", out.sql);
+        match &out.shape.root {
+            crate::query::ShapeNode::Object { pointers, .. } => {
+                let address = pointers
+                    .iter()
+                    .find(|p| matches!(p, crate::query::ShapeNode::NamedTuple { name, .. } if name == "address"))
+                    .expect("expected address pointer in shape");
+                match address {
+                    crate::query::ShapeNode::NamedTuple { type_name, members, .. } => {
+                        assert_eq!(*type_name, None);
+                        let members = members.as_ref().expect("expected resolved members");
+                        assert_eq!(members.len(), 2);
+                        assert_eq!(members[0].key.as_deref(), Some("street"));
+                        assert_eq!(members[1].key.as_deref(), Some("zip"));
+                    }
+                    other => panic!("expected NamedTuple, got {other:?}"),
+                }
+            }
+            other => panic!("expected ShapeNode::Object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_structural_tuple_cast_shape_carries_real_members() {
+        let out = compile_and_emit("SELECT <tuple<street: str, zip: str>>$p");
+        match &out.shape.root {
+            crate::query::ShapeNode::NamedTuple { type_name, members, .. } => {
+                assert_eq!(*type_name, None);
+                let members = members.as_ref().expect("expected resolved members");
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].key.as_deref(), Some("street"));
+                assert_eq!(members[1].key.as_deref(), Some("zip"));
+            }
+            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3808,5 +3966,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_tuple_index_on_non_literal_falls_back_to_jsonb_index() {
+        // `.1` only constant-folds against a literal tuple; anything else
+        // (a $param, a cast result, …) needs a genuine runtime jsonb index
+        // instead of erroring "only supported on tuple literals".
+        let out = compile_and_emit("SELECT (<tuple<int64, str>>('1', 3)).1");
+        assert!(out.sql.contains("->1"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_positional_tuple_literal_cast_to_tuple_type_compiles() {
+        // Each element must be cast to its own declared type — '1' isn't
+        // silently jsonb-wrapped unchanged as a string; it's coerced to
+        // int8, matching real EdgeQL per-element cast semantics.
+        let out = compile_and_emit("SELECT <tuple<int64, str>>(1, 'x')");
+        assert!(out.sql.contains("jsonb_build_array((1)::int8, ('x')::text)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_positional_tuple_literal_cast_coerces_mismatched_literal_types() {
+        // The exact case that was silently wrong: casting a string literal to
+        // int64 and an int literal to str must actually coerce each one, not
+        // just pass the raw literal through untouched.
+        let out = compile_and_emit("SELECT <tuple<int64, str>>('1', 3)");
+        assert!(out.sql.contains("jsonb_build_array(('1')::int8, (3)::text)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_nested_tuple_literal_cast_applies_casts_recursively() {
+        let out = compile_and_emit(
+            "SELECT <tuple<point: tuple<x: float64, y: float64>, label: str>>(point := ('1', 2), label := 5)",
+        );
+        assert!(
+            out.sql.contains(
+                "jsonb_build_object('point', jsonb_build_object('x', ('1')::float8, 'y', (2)::float8), 'label', (5)::text)"
+            ),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_positional_tuple_literal_nested_inside_named_tuple_compiles() {
+        let out = compile_and_emit("SELECT (point := (1, 2), label := 'origin')");
+        assert!(out.sql.contains("jsonb_build_array(1, 2)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("jsonb_build_object("), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_positional_tuple_literal_in_schema_bound_shape_field_compiles() {
+        let out = compile_and_emit("SELECT Person { name, pair := (1, 2) }");
+        assert!(out.sql.contains("jsonb_build_array(1, 2)"), "got:\n{}", out.sql);
     }
 }

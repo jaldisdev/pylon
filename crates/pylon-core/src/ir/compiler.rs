@@ -21,7 +21,7 @@ use super::{
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
     IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
-    VectorEnqueueInfo, SearchEnqueueInfo,
+    VectorEnqueueInfo, SearchEnqueueInfo, TupleCastShape,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -599,12 +599,141 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// Convert a schema-level `TupleMemberDescriptor` into a decode-time
+    /// `JsonMember` — recurses for a nested tuple member, resolving a nested
+    /// *nominal* member's own registered members too.
+    fn tuple_member_to_json_member(&self, m: &crate::schema::TupleMemberDescriptor) -> crate::query::JsonMember {
+        use crate::schema::TupleMemberKind;
+        let kind = match &m.kind {
+            TupleMemberKind::Scalar { .. } => crate::query::JsonMemberKind::Scalar,
+            TupleMemberKind::Enum { module, name } => crate::query::JsonMemberKind::Enum {
+                enum_type: format!("{}::{}", module, name),
+            },
+            TupleMemberKind::NamedTuple { module, name } => {
+                let qname = format!("{}::{}", module, name);
+                let nested_members = self
+                    .resolve_named_tuple(&qname)
+                    .map(|nt| nt.members.iter().map(|mm| self.tuple_member_to_json_member(mm)).collect())
+                    .unwrap_or_default();
+                crate::query::JsonMemberKind::Tuple { type_name: Some(qname), members: nested_members }
+            }
+            TupleMemberKind::Tuple { members } => crate::query::JsonMemberKind::Tuple {
+                type_name: None,
+                members: members.iter().map(|mm| self.tuple_member_to_json_member(mm)).collect(),
+            },
+        };
+        crate::query::JsonMember { key: m.name.clone(), kind }
+    }
+
+    /// Convert a parsed cast-target `ast::TupleTypeElement` into a decode-time
+    /// `JsonMember` — the cast-syntax counterpart of `tuple_member_to_json_member`.
+    fn ast_tuple_element_to_json_member(&self, elem: &ast::TupleTypeElement) -> crate::query::JsonMember {
+        crate::query::JsonMember {
+            key: elem.name.clone(),
+            kind: self.ast_type_expr_to_json_member_kind(&elem.ty),
+        }
+    }
+
+    fn ast_type_expr_to_json_member_kind(&self, ty: &ast::TypeExpr) -> crate::query::JsonMemberKind {
+        if let ast::TypeExpr::Tuple { elements } = ty {
+            return crate::query::JsonMemberKind::Tuple {
+                type_name: None,
+                members: elements.iter().map(|e| self.ast_tuple_element_to_json_member(e)).collect(),
+            };
+        }
+        let Some((module, name)) = ty.as_named() else {
+            return crate::query::JsonMemberKind::Scalar;
+        };
+        let qname = match module {
+            Some(m) => format!("{}::{}", m, name),
+            None => name.to_string(),
+        };
+        if let Some(ed) = self.resolve_enum(&qname) {
+            return crate::query::JsonMemberKind::Enum {
+                enum_type: format!("{}::{}", ed.module, ed.name),
+            };
+        }
+        if let Some(nt) = self.resolve_named_tuple(&qname) {
+            return crate::query::JsonMemberKind::Tuple {
+                type_name: Some(format!("{}::{}", nt.module, nt.name)),
+                members: nt.members.iter().map(|m| self.tuple_member_to_json_member(m)).collect(),
+            };
+        }
+        crate::query::JsonMemberKind::Scalar
+    }
+
+    /// Resolve a cast's own target-type shape for decode-time `ShapeNode`
+    /// building — a structural `tuple<...>` cast resolves its elements
+    /// directly; a nominal `<module::Name>` cast resolves via the registered
+    /// `NamedTupleDescriptor`'s members. `None` for a plain scalar/enum
+    /// cast target.
+    fn resolve_tuple_cast_shape(&self, ty: &ast::TypeExpr) -> Option<TupleCastShape> {
+        match ty {
+            ast::TypeExpr::Tuple { elements } => Some(TupleCastShape {
+                type_name: None,
+                members: elements.iter().map(|e| self.ast_tuple_element_to_json_member(e)).collect(),
+            }),
+            _ => {
+                let (module, name) = ty.as_named()?;
+                let qname = match module {
+                    Some(m) => format!("{}::{}", m, name),
+                    None => name.to_string(),
+                };
+                let nt = self.resolve_named_tuple(&qname)?;
+                Some(TupleCastShape {
+                    type_name: Some(format!("{}::{}", nt.module, nt.name)),
+                    members: nt.members.iter().map(|m| self.tuple_member_to_json_member(m)).collect(),
+                })
+            }
+        }
+    }
+
+    /// Resolve a property's tuple-type shape for decode-time `ShapeNode`
+    /// building — a nominal `__nt__:module::Name` `pg_type` marker resolves
+    /// via the registered `NamedTupleDescriptor`'s own members; a structural
+    /// `pylon.Tuple[...]` property carries its own `tuple_members` directly.
+    fn resolve_property_tuple_shape(&self, prop: &PropertyDescriptor) -> Option<TupleCastShape> {
+        if let Some(qname) = prop.pg_type.strip_prefix("__nt__:") {
+            let nt = self.resolve_named_tuple(qname)?;
+            return Some(TupleCastShape {
+                type_name: Some(qname.to_string()),
+                members: nt.members.iter().map(|m| self.tuple_member_to_json_member(m)).collect(),
+            });
+        }
+        prop.tuple_members.as_ref().map(|members| TupleCastShape {
+            type_name: None,
+            members: members.iter().map(|m| self.tuple_member_to_json_member(m)).collect(),
+        })
+    }
+
     /// Emit a bare `<pg_type>expr` scalar cast as a free-select statement — shared
     /// by the enum/named-tuple/structural-tuple cast cases in `compile_stmt`'s
-    /// top-level `Expr::TypeCast` handling.
+    /// top-level `Expr::TypeCast` handling. For a structural tuple cast whose
+    /// source is itself a tuple/named-tuple literal, applies each element's
+    /// own cast by position (see `try_compile_tuple_literal_cast_free`)
+    /// instead of jsonb-wrapping the raw uncast literal values.
     fn scalar_cast_free_select(&mut self, tc: &ast::TypeCast, pg_type: String, distinct: bool) -> Result<IrStmt, PyQLError> {
-        let inner = self.compile_free_expr(&tc.expr)?;
-        let cast_expr = IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type }));
+        let cast_expr = match &tc.ty {
+            ast::TypeExpr::Tuple { elements } => {
+                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                match self.try_compile_tuple_literal_cast_free(elements, &tc.expr)? {
+                    // The literal-decompose path already applies each element's own
+                    // cast — still wrap in TypeCast so `tuple_shape` reaches SQL
+                    // emission for decode-time ShapeNode building (jsonb_build_*
+                    // already produces jsonb, so the outer `::jsonb` is a no-op).
+                    Some(ir) => IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })),
+                    None => {
+                        let inner = self.compile_free_expr(&tc.expr)?;
+                        IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
+                    }
+                }
+            }
+            _ => {
+                let inner = self.compile_free_expr(&tc.expr)?;
+                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
+            }
+        };
         Ok(IrStmt::FreeSelect(IrFreeSelect {
             items: vec![IrFreeExpr::Scalar(cast_expr)],
             order_by: vec![],
@@ -634,6 +763,116 @@ impl<'a> Compiler<'a> {
             return Ok("jsonb".to_string());
         }
         type_expr_to_pg(ty)
+    }
+
+    /// Cast one tuple-type element's source value to `target_ty` — recurses
+    /// via `try_compile_tuple_literal_cast_free` when both the element's own
+    /// type and its source value are themselves a nested tuple/named-tuple
+    /// literal, so nesting applies per-element casts all the way down;
+    /// otherwise a plain scalar/enum/nominal-named-tuple cast.
+    fn compile_tuple_element_cast_free(
+        &mut self,
+        target_ty: &ast::TypeExpr,
+        value: &Expr,
+    ) -> Result<IrExpr, PyQLError> {
+        if let ast::TypeExpr::Tuple { elements } = target_ty {
+            if let Some(ir) = self.try_compile_tuple_literal_cast_free(elements, value)? {
+                return Ok(ir);
+            }
+        }
+        let inner = self.compile_free_expr(value)?;
+        let pg_type = self.resolve_cast_pg_type(target_ty)?;
+        Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape: None })))
+    }
+
+    /// When casting a tuple/named-tuple *literal* to a structural tuple type,
+    /// apply each target element's own cast to its corresponding source value
+    /// by position — e.g. `<tuple<int64, str>>('1', 3)` must coerce '1' to
+    /// int64 and 3 to str, not just jsonb-wrap the raw literal values
+    /// unchanged. Returns `None` when the source isn't a literal tuple/named-
+    /// tuple of matching arity (e.g. a `$param`) — the whole value already
+    /// arrives pre-shaped in that case, so the caller's generic jsonb-cast
+    /// path handles it instead.
+    fn try_compile_tuple_literal_cast_free(
+        &mut self,
+        target_elements: &[ast::TupleTypeElement],
+        source: &Expr,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let source_values: Vec<&Expr> = match source {
+            Expr::Tuple(vals) if vals.len() == target_elements.len() => vals.iter().collect(),
+            Expr::NamedTuple(fields) if fields.len() == target_elements.len() => {
+                fields.iter().map(|(_, v)| v).collect()
+            }
+            _ => return Ok(None),
+        };
+        let named = target_elements.iter().all(|e| e.name.is_some());
+        let mut casted = Vec::with_capacity(target_elements.len());
+        for (elem, value) in target_elements.iter().zip(source_values) {
+            casted.push(self.compile_tuple_element_cast_free(&elem.ty, value)?);
+        }
+        if named {
+            let fields = target_elements
+                .iter()
+                .zip(casted)
+                .map(|(e, v)| (e.name.clone().unwrap(), v))
+                .collect();
+            Ok(Some(IrExpr::NamedTuple(fields)))
+        } else {
+            Ok(Some(IrExpr::Tuple(casted)))
+        }
+    }
+
+    /// Schema-bound counterpart of `compile_tuple_element_cast_free` — see
+    /// its docs. Needed alongside it because `compile_expr`'s recursive calls
+    /// thread `td`/`alias` that `compile_free_expr` doesn't have.
+    fn compile_tuple_element_cast(
+        &mut self,
+        target_ty: &ast::TypeExpr,
+        value: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        if let ast::TypeExpr::Tuple { elements } = target_ty {
+            if let Some(ir) = self.try_compile_tuple_literal_cast(elements, value, td, alias)? {
+                return Ok(ir);
+            }
+        }
+        let inner = self.compile_expr(value, td, alias)?;
+        let pg_type = self.resolve_cast_pg_type(target_ty)?;
+        Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape: None })))
+    }
+
+    /// Schema-bound counterpart of `try_compile_tuple_literal_cast_free` —
+    /// see its docs.
+    fn try_compile_tuple_literal_cast(
+        &mut self,
+        target_elements: &[ast::TupleTypeElement],
+        source: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let source_values: Vec<&Expr> = match source {
+            Expr::Tuple(vals) if vals.len() == target_elements.len() => vals.iter().collect(),
+            Expr::NamedTuple(fields) if fields.len() == target_elements.len() => {
+                fields.iter().map(|(_, v)| v).collect()
+            }
+            _ => return Ok(None),
+        };
+        let named = target_elements.iter().all(|e| e.name.is_some());
+        let mut casted = Vec::with_capacity(target_elements.len());
+        for (elem, value) in target_elements.iter().zip(source_values) {
+            casted.push(self.compile_tuple_element_cast(&elem.ty, value, td, alias)?);
+        }
+        if named {
+            let fields = target_elements
+                .iter()
+                .zip(casted)
+                .map(|(e, v)| (e.name.clone().unwrap(), v))
+                .collect();
+            Ok(Some(IrExpr::NamedTuple(fields)))
+        } else {
+            Ok(Some(IrExpr::Tuple(casted)))
+        }
     }
 
     fn compile_enum_access(&self, type_ref: &str, variant: &str) -> Result<IrExpr, PyQLError> {
@@ -2026,9 +2265,17 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::TypeCast(tc) => {
+                if let ast::TypeExpr::Tuple { elements } = &tc.ty {
+                    if let Some(ir) = self.try_compile_tuple_literal_cast_free(elements, &tc.expr)? {
+                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                        let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
+                    }
+                }
                 let inner = self.compile_free_expr(&tc.expr)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
+                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
             }
 
             Expr::BinOp(b) => {
@@ -2083,6 +2330,14 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::NamedTuple(ir))
             }
 
+            Expr::Tuple(elems) => {
+                let ir = elems
+                    .iter()
+                    .map(|e| self.compile_free_expr(e))
+                    .collect::<Result<Vec<_>, PyQLError>>()?;
+                Ok(IrExpr::Tuple(ir))
+            }
+
             Expr::FieldAccess { expr: inner, field } => {
                 if let Expr::NamedTuple(fields) = inner.as_ref() {
                     let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
@@ -2117,9 +2372,12 @@ impl<'a> Compiler<'a> {
                         })?;
                         self.compile_free_expr(val)
                     }
-                    _ => Err(self.type_err(
-                        "positional tuple index is only supported on tuple literals",
-                    )),
+                    // Not a literal to constant-fold — emit a generic runtime
+                    // jsonb positional access (`$param.1`, `(<tuple<...>>expr).1`, …).
+                    _ => {
+                        let ir = self.compile_free_expr(inner)?;
+                        Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
+                    }
                 }
             }
 
@@ -3009,6 +3267,7 @@ impl<'a> Compiler<'a> {
                 alias: p.name.clone(),
                 column: p.name.clone(),
                 pg_type: p.pg_type.clone(),
+                tuple_shape: self.resolve_property_tuple_shape(p),
             }))
             .collect();
 
@@ -3194,6 +3453,7 @@ impl<'a> Compiler<'a> {
                     alias: prop.name.clone(),
                     column: prop.name.clone(),
                     pg_type: prop.pg_type.clone(),
+                    tuple_shape: self.resolve_property_tuple_shape(&prop),
                 })],
                 filter: Some(filter),
                 order_by: vec![],
@@ -3335,6 +3595,7 @@ impl<'a> Compiler<'a> {
                 alias: prop_name.clone(),
                 column: prop_name,
                 pg_type: prop_type,
+                tuple_shape: self.resolve_property_tuple_shape(prop),
             })],
             filter: Some(filter),
             order_by: vec![],
@@ -3426,6 +3687,7 @@ impl<'a> Compiler<'a> {
                 alias: pointer_name.to_string(),
                 column: p.name.clone(),
                 pg_type: p.pg_type.clone(),
+                tuple_shape: self.resolve_property_tuple_shape(p),
             }));
         }
 
@@ -3732,9 +3994,17 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::TypeCast(tc) => {
+                if let ast::TypeExpr::Tuple { elements } = &tc.ty {
+                    if let Some(ir) = self.try_compile_tuple_literal_cast(elements, &tc.expr, td, alias)? {
+                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                        let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
+                    }
+                }
                 let inner = self.compile_expr(&tc.expr, td, alias)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
+                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
             }
 
             Expr::IfElse(ie) => {
@@ -3757,6 +4027,14 @@ impl<'a> Compiler<'a> {
                     .map(|(name, e)| Ok((name.clone(), self.compile_expr(e, td, alias)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
                 Ok(IrExpr::NamedTuple(ir))
+            }
+
+            Expr::Tuple(elems) => {
+                let ir = elems
+                    .iter()
+                    .map(|e| self.compile_expr(e, td, alias))
+                    .collect::<Result<Vec<_>, PyQLError>>()?;
+                Ok(IrExpr::Tuple(ir))
             }
 
             Expr::FieldAccess { expr: inner, field } => {
@@ -3799,14 +4077,16 @@ impl<'a> Compiler<'a> {
                         }))?;
                         self.compile_expr(val, td, alias)
                     }
-                    _ => Err(PyQLError::Type(PyQLTypeError {
-                        message: "positional tuple index is only supported on tuple literals".into(),
-                        position: Position { line: 0, col: 0 },
-                    })),
+                    // Not a literal to constant-fold — emit a generic runtime
+                    // jsonb positional access.
+                    _ => {
+                        let ir = self.compile_expr(inner, td, alias)?;
+                        Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
+                    }
                 }
             }
 
-            Expr::Shape(_) | Expr::Tuple(_) | Expr::Set(_) => {
+            Expr::Shape(_) | Expr::Set(_) => {
                 Err(PyQLError::Type(PyQLTypeError {
                     message: "shapes and set literals are not valid in expression context".into(),
                     position: Position { line: 0, col: 0 },
@@ -4138,6 +4418,7 @@ impl<'a> Compiler<'a> {
                         alias: prop.name.clone(),
                         column: prop.name.clone(),
                         pg_type: prop.pg_type.clone(),
+                        tuple_shape: self.resolve_property_tuple_shape(prop),
                     })],
                     filter: Some(IrExpr::BinOp(Box::new(IrBinOp {
                         left: IrExpr::ColumnRef {
@@ -4913,7 +5194,7 @@ impl<'a> Compiler<'a> {
                     IrExpr::TypeCast(Box::new(super::IrTypeCast {
                         expr: a,
                         pg_type: p.pg_type.clone(),
-                    }))
+                    tuple_shape: None, }))
                 }).collect();
                 return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
                     schema: Some(fd.module.clone()),
@@ -5218,11 +5499,11 @@ impl<'a> Compiler<'a> {
             let inner_cast = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: vec_param,
                 pg_type: "float8[]".to_string(),
-            }));
+            tuple_shape: None, }));
             query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: inner_cast,
                 pg_type: "vector".to_string(),
-            }));
+            tuple_shape: None, }));
             let query_arg = text_query_arg.unwrap();
             inference_query_param_name = Some(match query_arg {
                 ast::Expr::Parameter(name) => name.clone(),
@@ -5241,7 +5522,7 @@ impl<'a> Compiler<'a> {
             query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: raw_query_expr,
                 pg_type: "vector".to_string(),
-            }));
+            tuple_shape: None, }));
             inference_query_param_name = None;
             inference_query_literal = None;
             inference_model = None;
@@ -5575,7 +5856,7 @@ impl<'a> Compiler<'a> {
                     alias: p.name.clone(),
                     column: p.name.clone(),
                     pg_type: p.pg_type.clone(),
-                })
+                tuple_shape: None, })
             })
             .collect()
     }
@@ -5887,7 +6168,7 @@ pub(super) fn substitute_col_refs(
         IrExpr::TypeCast(c) => IrExpr::TypeCast(Box::new(IrTypeCast {
             expr: substitute_col_refs(c.expr, bindings),
             pg_type: c.pg_type,
-        })),
+        tuple_shape: None, })),
         IrExpr::IfElse(ie) => IrExpr::IfElse(Box::new(IrIfElse {
             condition: substitute_col_refs(ie.condition, bindings),
             if_: substitute_col_refs(ie.if_, bindings),
