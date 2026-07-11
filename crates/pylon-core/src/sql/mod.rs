@@ -1,9 +1,9 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
-    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkField,
+    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkPointer,
     IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrMultiLinkValueSource, IrNulls,
-    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarField,
-    IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrFtsSearch, IrSort, IrSortDir,
+    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarPointer,
+    IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
     IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
@@ -160,7 +160,7 @@ fn emit_poly_union(implementors: &[IrPolyImplementor], columns: &[String]) -> St
 
 fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     let alias = &sel.source.alias;
-    let (field_exprs, shape_fields) = build_shape(&sel.shape, alias);
+    let (pointer_exprs, shape_pointers) = build_shape(&sel.shape, alias);
 
     let type_expr = if sel.polymorphic {
         format!("{}.\"__type__\"", qi(alias))
@@ -168,7 +168,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         type_disc(&sel.source.type_name)
     };
     let mut parts = vec![type_expr];
-    parts.extend(field_exprs);
+    parts.extend(pointer_exprs);
     let tuple = parts.join(",\n    ");
 
     let distinct = if sel.distinct { "DISTINCT " } else { "" };
@@ -206,7 +206,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    let root_fields = prepend_type(shape_fields);
+    let root_pointers = prepend_type(shape_pointers);
     SqlOutput {
         sql,
         shape: ShapeDescriptor {
@@ -215,7 +215,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
                 type_name: Some(sel.source.type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
-                pointers: root_fields,
+                pointers: root_pointers,
             },
         },
         inference_plan: None,
@@ -900,7 +900,7 @@ fn emit_array_source(src: &IrArraySource) -> String {
     match src {
         IrArraySource::Select(s) => {
             let scalar = match s.shape.first() {
-                Some(IrShapeField::Scalar(sf)) =>
+                Some(IrShapePointer::Scalar(sf)) =>
                     format!("{}.{}", qi(&s.source.alias), qi(&sf.column)),
                 _ => format!("{}.\"id\"", qi(&s.source.alias)),
             };
@@ -952,7 +952,7 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
     let alias = &grp.source.alias;
     let (shape_exprs, shape_nodes) = build_shape(&grp.shape, alias);
 
-    // Build the elements ROW: type discriminator at pos 0, then shape fields.
+    // Build the elements ROW: type discriminator at pos 0, then shape pointers.
     let mut elem_row_parts = vec![type_disc(&grp.source.type_name)];
     elem_row_parts.extend(shape_exprs);
     let elem_row = elem_row_parts.join(",\n            ");
@@ -1011,7 +1011,7 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         group_by_sql,
     );
 
-    // ShapeNode for each element (Object with the selected fields).
+    // ShapeNode for each element (Object with the selected pointers).
     let element_node = ShapeNode::Object {
         name: String::new(),
         type_name: Some(grp.source.type_name.clone()),
@@ -1091,16 +1091,16 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
             }
         }
         IrPathResult::Object { alias, type_name, shape } => {
-            let (field_exprs, field_nodes) = build_shape(shape, alias);
+            let (pointer_exprs, pointer_nodes) = build_shape(shape, alias);
             let mut parts = vec![type_disc(type_name)];
-            parts.extend(field_exprs);
+            parts.extend(pointer_exprs);
             let expr = format!("(\n    {}\n) AS result", parts.join(",\n    "));
             let shape_root = ShapeNode::Object {
                 name: String::new(),
                 type_name: Some(type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
-                pointers: prepend_type(field_nodes),
+                pointers: prepend_type(pointer_nodes),
             };
             (expr, shape_root)
         }
@@ -1266,7 +1266,7 @@ fn enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], source_cte: &str, offset: 
 /// mirroring `emit_returning_shape` but for the CTE-wrapper SELECT path.
 fn shape_select_from_cte(
     target: &IrSource,
-    returning: &[IrShapeField],
+    returning: &[IrShapePointer],
     cte_name: &str,
 ) -> (ShapeDescriptor, Option<String>) {
     if returning.is_empty() {
@@ -1275,19 +1275,19 @@ fn shape_select_from_cte(
             None,
         );
     }
-    let (field_exprs, shape_fields) = build_shape(returning, "");
+    let (pointer_exprs, shape_pointers) = build_shape(returning, "");
     let mut parts = vec![type_disc(&target.type_name)];
-    parts.extend(field_exprs);
+    parts.extend(pointer_exprs);
     let tuple = parts.join(",\n    ");
     let sql = format!("SELECT (\n    {}\n) AS result\nFROM {}", tuple, qi(cte_name));
-    let root_fields = prepend_type(shape_fields);
+    let root_pointers = prepend_type(shape_pointers);
     let shape = ShapeDescriptor {
         root: ShapeNode::Object {
             name: String::new(),
             type_name: Some(target.type_name.clone()),
             position: 0,
             cardinality: Cardinality::Required,
-            pointers: root_fields,
+            pointers: root_pointers,
         },
     };
     (shape, Some(sql))
@@ -1454,9 +1454,9 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // CTE-based UPDATE for junction table mutations.
     let result_expr = if !upd.returning.is_empty() {
-        let (field_exprs, _) = build_shape(&upd.returning, alias);
+        let (pointer_exprs, _) = build_shape(&upd.returning, alias);
         let mut parts = vec![type_disc(&upd.target.type_name)];
-        parts.extend(field_exprs);
+        parts.extend(pointer_exprs);
         parts.join(",\n    ")
     } else {
         format!("{}.id", qi(alias))
@@ -1611,7 +1611,7 @@ fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
 /// `with_alias`: UPDATE/DELETE can use the table alias; INSERT cannot.
 fn emit_returning_shape(
     target: &IrSource,
-    returning: &[IrShapeField],
+    returning: &[IrShapePointer],
     with_alias: bool,
 ) -> (ShapeDescriptor, Option<String>) {
     if returning.is_empty() {
@@ -1624,21 +1624,21 @@ fn emit_returning_shape(
     }
 
     let alias = if with_alias { target.alias.as_str() } else { "" };
-    let (field_exprs, shape_fields) = build_shape(returning, alias);
+    let (pointer_exprs, shape_pointers) = build_shape(returning, alias);
 
     let mut parts = vec![type_disc(&target.type_name)];
-    parts.extend(field_exprs);
+    parts.extend(pointer_exprs);
     let tuple = parts.join(",\n    ");
     let sql = format!("\nRETURNING (\n    {}\n) AS result", tuple);
 
-    let root_fields = prepend_type(shape_fields);
+    let root_pointers = prepend_type(shape_pointers);
     let shape = ShapeDescriptor {
         root: ShapeNode::Object {
             name: String::new(),
             type_name: Some(target.type_name.clone()),
             position: 0,
             cardinality: Cardinality::Required,
-            pointers: root_fields,
+            pointers: root_pointers,
         },
     };
     (shape, Some(sql))
@@ -1646,7 +1646,7 @@ fn emit_returning_shape(
 
 // ── Shape emission ───────────────────────────────────────────────────────────
 
-fn emit_scalar_set(f: &IrScalarSetField, pos: usize) -> (String, ShapeNode) {
+fn emit_scalar_set(f: &IrScalarSetPointer, pos: usize) -> (String, ShapeNode) {
     let from_sql = if !f.poly_implementors.is_empty() {
         format!("(\n{}\n) AS {}",
             emit_poly_union(&f.poly_implementors, &f.poly_columns),
@@ -1667,38 +1667,38 @@ fn emit_scalar_set(f: &IrScalarSetField, pos: usize) -> (String, ShapeNode) {
     (sql, node)
 }
 
-/// Build SQL expressions and ShapeNodes for `fields`, starting at position 1
+/// Build SQL expressions and ShapeNodes for `pointers`, starting at position 1
 /// (position 0 is always the type discriminator, added by the caller).
 fn build_shape(
-    fields: &[IrShapeField],
+    pointers: &[IrShapePointer],
     table_alias: &str,
 ) -> (Vec<String>, Vec<ShapeNode>) {
     let mut exprs = Vec::new();
     let mut nodes = Vec::new();
 
-    for (i, field) in fields.iter().enumerate() {
+    for (i, pointer) in pointers.iter().enumerate() {
         let pos = i + 1;
-        match field {
-            IrShapeField::Scalar(f) => {
+        match pointer {
+            IrShapePointer::Scalar(f) => {
                 let (sql, node) = emit_scalar(f, table_alias, pos);
                 exprs.push(sql);
                 nodes.push(node);
             }
-            IrShapeField::SingleLink(f) => {
+            IrShapePointer::SingleLink(f) => {
                 let (sql, node) = emit_single_link(f, table_alias, pos);
                 exprs.push(sql);
                 nodes.push(node);
             }
-            IrShapeField::MultiLink(f) => {
+            IrShapePointer::MultiLink(f) => {
                 let (sql, node) = emit_multi_link(f, table_alias, pos);
                 exprs.push(sql);
                 nodes.push(node);
             }
-            IrShapeField::Computed(f) => {
+            IrShapePointer::Computed(f) => {
                 exprs.push(emit_expr(&f.expr));
                 nodes.push(ShapeNode::Scalar { name: f.alias.clone(), position: pos });
             }
-            IrShapeField::ScalarSet(f) => {
+            IrShapePointer::ScalarSet(f) => {
                 let (sql, node) = emit_scalar_set(f, pos);
                 exprs.push(sql);
                 nodes.push(node);
@@ -1722,7 +1722,7 @@ fn pg_quoted_to_pylon(pg_type: &str) -> String {
     }
 }
 
-fn emit_scalar(f: &IrScalarField, table_alias: &str, pos: usize) -> (String, ShapeNode) {
+fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, ShapeNode) {
     if let Some(nt_name) = f.pg_type.strip_prefix("__nt__:") {
         let sql = if table_alias.is_empty() {
             format!("{}::jsonb", qi(&f.column))
@@ -1755,7 +1755,7 @@ fn emit_scalar(f: &IrScalarField, table_alias: &str, pos: usize) -> (String, Sha
 }
 
 fn emit_single_link(
-    f: &IrSingleLinkField,
+    f: &IrSingleLinkPointer,
     parent_alias: &str,
     pos: usize,
 ) -> (String, ShapeNode) {
@@ -1803,7 +1803,7 @@ fn emit_single_link(
 }
 
 fn emit_multi_link(
-    f: &IrMultiLinkField,
+    f: &IrMultiLinkPointer,
     parent_alias: &str,
     pos: usize,
 ) -> (String, ShapeNode) {
@@ -2142,7 +2142,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 let pk_col = sel
                     .shape
                     .iter()
-                    .find_map(|f| if let IrShapeField::Scalar(s) = f { Some(s.column.as_str()) } else { None })
+                    .find_map(|f| if let IrShapePointer::Scalar(s) = f { Some(s.column.as_str()) } else { None })
                     .unwrap_or("id");
                 format!(
                     "(SELECT {}.{}\nFROM {} AS {}",
@@ -2173,7 +2173,7 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
     // Build the object sub-tuple.  If object_shape is empty, include all properties
     // (type disc + id implicitly come from build_shape when no elements provided;
     //  with no shape elements the shape is empty, so we fall back to "just id").
-    // Use build_shape when there are explicit shape fields; otherwise emit a minimal tuple.
+    // Use build_shape when there are explicit shape pointers; otherwise emit a minimal tuple.
     let (obj_tuple, object_shape_nodes) = if vs.object_shape.is_empty() {
         // No explicit shape: produce (type_disc, id) as minimum.
         let type_expr = type_disc(&vs.source.type_name);
@@ -2182,10 +2182,10 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
         let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
         (tuple, vec![id_node])
     } else {
-        let (field_exprs, shape_fields) = build_shape(&vs.object_shape, alias);
+        let (pointer_exprs, shape_pointers) = build_shape(&vs.object_shape, alias);
         let mut parts = vec![type_disc(&vs.source.type_name)];
-        parts.extend(field_exprs);
-        (parts.join(",\n    "), prepend_type(shape_fields))
+        parts.extend(pointer_exprs);
+        (parts.join(",\n    "), prepend_type(shape_pointers))
     };
 
     // Outer tuple: NULL (type slot), object sub-tuple at pos 1, distance at pos 2.
@@ -2255,10 +2255,10 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
         let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
         (tuple, vec![id_node])
     } else {
-        let (field_exprs, shape_fields) = build_shape(&fs.object_shape, alias);
+        let (pointer_exprs, shape_pointers) = build_shape(&fs.object_shape, alias);
         let mut parts = vec![type_disc(&fs.source.type_name)];
-        parts.extend(field_exprs);
-        (parts.join(",\n    "), prepend_type(shape_fields))
+        parts.extend(pointer_exprs);
+        (parts.join(",\n    "), prepend_type(shape_pointers))
     };
 
     let outer = format!(
@@ -2313,10 +2313,10 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
         (tuple, vec![id_node])
     } else {
-        let (field_exprs, shape_fields) = build_shape(&fs.object_shape, alias);
+        let (pointer_exprs, shape_pointers) = build_shape(&fs.object_shape, alias);
         let mut parts = vec![type_disc(&fs.source.type_name)];
-        parts.extend(field_exprs);
-        (parts.join(",\n    "), prepend_type(shape_fields))
+        parts.extend(pointer_exprs);
+        (parts.join(",\n    "), prepend_type(shape_pointers))
     };
 
     let outer = format!(
@@ -2381,7 +2381,7 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
 
 fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
     let alias = &sel.alias;
-    let (field_exprs, shape_fields) = build_shape(&sel.shape, alias);
+    let (pointer_exprs, shape_pointers) = build_shape(&sel.shape, alias);
 
     let type_expr = if sel.polymorphic {
         format!("{}.\"__type__\"", qi(alias))
@@ -2389,7 +2389,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
         type_disc(&sel.type_name)
     };
     let mut parts = vec![type_expr];
-    parts.extend(field_exprs);
+    parts.extend(pointer_exprs);
     let tuple = parts.join(",\n    ");
     let distinct = if sel.distinct { "DISTINCT " } else { "" };
 
@@ -2412,7 +2412,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    let root_fields = prepend_type(shape_fields);
+    let root_pointers = prepend_type(shape_pointers);
     SqlOutput {
         sql,
         shape: ShapeDescriptor {
@@ -2421,7 +2421,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
                 type_name: Some(sel.type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
-                pointers: root_fields,
+                pointers: root_pointers,
             },
         },
         inference_plan: None,
@@ -3369,7 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_computed_field_in_shape_emits_expression() {
+    fn test_computed_pointer_in_shape_emits_expression() {
         let mut schema = make_schema();
         schema.types[0].computed.push(crate::schema::ComputedDescriptor {
             name: "upper_name".into(),

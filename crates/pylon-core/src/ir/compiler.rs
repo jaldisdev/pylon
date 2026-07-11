@@ -13,13 +13,13 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrArraySource, IrBinOp, IrComputedField, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
+    IrArraySource, IrBinOp, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
     IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrComputedGlobalCte,
     IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
-    IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
+    IrMultiLinkClear, IrMultiLinkPointer, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrMultiLinkValueSource,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
-    IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
+    IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
     IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
     VectorEnqueueInfo, SearchEnqueueInfo,
 };
@@ -229,7 +229,7 @@ pub fn compile_fn_body(
 }
 
 /// Compile a single PyQL expression in the context of a named type.
-/// Used for schema fragments: computed fields, rewrite handlers, constraint exprs.
+/// Used for schema fragments: computed pointers, rewrite handlers, constraint exprs.
 pub fn compile_expr_in_type(
     expr: &Expr,
     type_name: &str,
@@ -936,7 +936,7 @@ impl<'a> Compiler<'a> {
     // ── PATH SELECT ───────────────────────────────────────────────────────────────
 
     /// `select TypeName.link.prop` / `select TypeName.link { shape }`.
-    /// Walks the path, building JOIN steps, then projects the final field or object.
+    /// Walks the path, building JOIN steps, then projects the final pointer or object.
     fn compile_path_select(
         &mut self,
         sel: &ast::SelectStmt,
@@ -1318,7 +1318,7 @@ impl<'a> Compiler<'a> {
 
     /// Compile an expression that contains a type-rooted absolute path as a flat
     /// path select, iterating over the root type and projecting the expression as
-    /// a scalar computed field.
+    /// a scalar computed pointer.
     fn compile_expr_as_path_select(
         &mut self,
         sel: &ast::SelectStmt,
@@ -1411,7 +1411,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// `exists` in schema-bound expression context (FILTER, computed field, etc.).
+    /// `exists` in schema-bound expression context (FILTER, computed pointer, etc.).
     fn compile_exists_operand(
         &mut self,
         operand: &Expr,
@@ -1441,28 +1441,28 @@ impl<'a> Compiler<'a> {
             // exists .link → alias.link_id IS NOT NULL
             // exists .multilink → EXISTS(SELECT 1 FROM junction WHERE src = alias.id)
             Expr::Path(p) if p.partial && p.steps.len() == 1 => {
-                let field_name = match &p.steps[0] {
+                let pointer_name = match &p.steps[0] {
                     ast::PathStep::Name(n) => n.as_str(),
                     _ => return Err(self.type_err("exists: invalid path step")),
                 };
-                if let Some(prop) = Self::resolve_property(td, field_name) {
+                if let Some(prop) = Self::resolve_property(td, pointer_name) {
                     return Ok(ir_is_not_null(IrExpr::ColumnRef {
                         alias: alias.to_string(),
                         column: prop.name.clone(),
                         pg_type: prop.pg_type.clone(),
                     }));
                 }
-                if let Some(link) = Self::resolve_link(td, field_name) {
+                if let Some(link) = Self::resolve_link(td, pointer_name) {
                     return Ok(ir_is_not_null(IrExpr::ColumnRef {
                         alias: alias.to_string(),
                         column: format!("{}_id", link.name),
                         pg_type: "uuid".to_string(),
                     }));
                 }
-                if Self::resolve_multilink(td, field_name).is_some() {
-                    return self.compile_multilink_exists_check(field_name, td, alias);
+                if Self::resolve_multilink(td, pointer_name).is_some() {
+                    return self.compile_multilink_exists_check(pointer_name, td, alias);
                 }
-                Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
+                Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
             }
 
             // exists (select ...) → EXISTS(SELECT 1 FROM ...)
@@ -1817,7 +1817,7 @@ impl<'a> Compiler<'a> {
         Ok(IrFreeSelect { items, order_by, offset, limit, distinct })
     }
 
-    /// Compile an expression that has no schema type context (no .field references).
+    /// Compile an expression that has no schema type context (no .name references).
     fn compile_free_expr(&mut self, expr: &Expr) -> Result<IrExpr, PyQLError> {
         match expr {
             Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
@@ -2071,7 +2071,7 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::Path(p) if p.partial => Err(self.type_err(
-                "property reference (.field) is not valid in free SELECT; \
+                "property reference (.name) is not valid in free SELECT; \
                  use a schema-bound SELECT instead",
             )),
 
@@ -2445,14 +2445,14 @@ impl<'a> Compiler<'a> {
         let mut multi_link_appends = vec![];
         let mut scalar_elements: Vec<ShapeElement> = vec![];
         for el in &ins.shape {
-            let field_name = match path_leaf(&el.path) {
+            let pointer_name = match path_leaf(&el.path) {
                 Ok(n) => n,
                 Err(_) => { scalar_elements.push(el.clone()); continue; }
             };
-            if let Some(ml) = Self::resolve_multilink(td, field_name) {
+            if let Some(ml) = Self::resolve_multilink(td, pointer_name) {
                 match el.op {
                     ShapeOp::Remove => return Err(self.type_err(&format!(
-                        "cannot use `-=` for multi-link '{field_name}' in an insert; \
+                        "cannot use `-=` for multi-link '{pointer_name}' in an insert; \
                          there is nothing to remove from yet"
                     ))),
                     ShapeOp::Assign | ShapeOp::Append => {
@@ -2536,27 +2536,27 @@ impl<'a> Compiler<'a> {
         elements
             .iter()
             .map(|el| {
-                let field_name = path_leaf(&el.path)?;
+                let pointer_name = path_leaf(&el.path)?;
                 let expr = el.compexpr.as_ref().ok_or_else(|| {
                     PyQLError::Type(PyQLTypeError {
-                        message: format!("INSERT field '{field_name}' has no value expression"),
+                        message: format!("INSERT pointer '{pointer_name}' has no value expression"),
                         position: Position { line: 0, col: 0 },
                     })
                 })?;
 
-                // Validate the field exists
-                let column = if let Some(p) = Self::resolve_property(td, field_name) {
+                // Validate the pointer exists
+                let column = if let Some(p) = Self::resolve_property(td, pointer_name) {
                     if deny_readonly && p.is_readonly {
                         return Err(PyQLError::Type(PyQLTypeError {
-                            message: format!("cannot update property '{field_name}': it is declared as read-only"),
+                            message: format!("cannot update property '{pointer_name}': it is declared as read-only"),
                             position: Position { line: 0, col: 0 },
                         }));
                     }
                     p.name.clone()
-                } else if let Some(l) = Self::resolve_link(td, field_name) {
+                } else if let Some(l) = Self::resolve_link(td, pointer_name) {
                     if deny_readonly && l.is_readonly {
                         return Err(PyQLError::Type(PyQLTypeError {
-                            message: format!("cannot update link '{field_name}': it is declared as read-only"),
+                            message: format!("cannot update link '{pointer_name}': it is declared as read-only"),
                             position: Position { line: 0, col: 0 },
                         }));
                     }
@@ -2569,7 +2569,7 @@ impl<'a> Compiler<'a> {
                     }
                     fk_col
                 } else {
-                    return Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)));
+                    return Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)));
                 };
 
                 // `{}` (empty set) in assignment position means NULL.
@@ -2609,12 +2609,12 @@ impl<'a> Compiler<'a> {
         let mut scalar_elements: Vec<ShapeElement> = vec![];
 
         for el in &upd.shape {
-            let field_name = match path_leaf(&el.path) {
+            let pointer_name = match path_leaf(&el.path) {
                 Ok(n) => n,
                 Err(_) => { scalar_elements.push(el.clone()); continue; }
             };
 
-            if let Some(ml) = Self::resolve_multilink(td, field_name) {
+            if let Some(ml) = Self::resolve_multilink(td, pointer_name) {
                 let (jt, module, src_col, tgt_col, through_td) =
                     self.multilink_junction_info(td, ml)?;
 
@@ -2692,7 +2692,7 @@ impl<'a> Compiler<'a> {
             vec![]
         };
 
-        // Only enqueue indexes whose source fields are touched by this update.
+        // Only enqueue indexes whose source pointers are touched by this update.
         let written_cols: std::collections::HashSet<&str> =
             assignments.iter().map(|(c, _)| c.as_str()).collect();
         let type_name = format!("{}::{}", td.module, td.name);
@@ -2916,27 +2916,27 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
         module: &str,
-    ) -> Result<Vec<IrShapeField>, PyQLError> {
+    ) -> Result<Vec<IrShapePointer>, PyQLError> {
         if elements.is_empty() {
             // No explicit shape: implicit { id } only, matching the upstream engine semantics.
             return Ok(Self::pk_returning(td));
         }
 
-        let mut fields = vec![];
+        let mut pointers = vec![];
         for el in elements {
             if let Some(splat) = &el.splat {
                 // Check if this is a type-intersection splat: [is Type].*
                 if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first() {
                     let type_ref = type_ref.clone();
-                    fields.extend(self.compile_type_intersection_splat(&type_ref, splat, td, alias)?);
+                    pointers.extend(self.compile_type_intersection_splat(&type_ref, splat, td, alias)?);
                 } else {
-                    fields.extend(self.compile_splat(splat, td, alias, module)?);
+                    pointers.extend(self.compile_splat(splat, td, alias, module)?);
                 }
             } else {
-                fields.push(self.compile_shape_element(el, td, alias, module)?);
+                pointers.push(self.compile_shape_element(el, td, alias, module)?);
             }
         }
-        Ok(fields)
+        Ok(pointers)
     }
 
     /// Expand `*` → all scalars; `**` → all scalars + all single links with implicit `{ id }`.
@@ -2946,11 +2946,11 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
         module: &str,
-    ) -> Result<Vec<IrShapeField>, PyQLError> {
-        let mut fields: Vec<IrShapeField> = td
+    ) -> Result<Vec<IrShapePointer>, PyQLError> {
+        let mut pointers: Vec<IrShapePointer> = td
             .properties
             .iter()
-            .map(|p| IrShapeField::Scalar(IrScalarField {
+            .map(|p| IrShapePointer::Scalar(IrScalarPointer {
                 alias: p.name.clone(),
                 column: p.name.clone(),
                 pg_type: p.pg_type.clone(),
@@ -2961,7 +2961,7 @@ impl<'a> Compiler<'a> {
             let expr_ast = crate::parse::parse_expr(&cd.expression)
                 .map_err(|e| PyQLError::Syntax(e))?;
             let ir = self.compile_expr(&expr_ast, td, alias)?;
-            fields.push(IrShapeField::Computed(IrComputedField {
+            pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 alias: cd.name.clone(),
                 expr: ir,
             }));
@@ -2987,7 +2987,7 @@ impl<'a> Compiler<'a> {
                     dml_source: None,
                     polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                 };
-                fields.push(IrShapeField::SingleLink(IrSingleLinkField {
+                pointers.push(IrShapePointer::SingleLink(IrSingleLinkPointer {
                     alias: l.name.clone(),
                     fk_column: format!("{}_id", l.name),
                     target_pk: "id".to_string(),
@@ -3065,7 +3065,7 @@ impl<'a> Compiler<'a> {
                     polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
                 };
 
-                fields.push(IrShapeField::MultiLink(IrMultiLinkField {
+                pointers.push(IrShapePointer::MultiLink(IrMultiLinkPointer {
                     alias: ml.name.clone(),
                     join,
                     subquery,
@@ -3074,7 +3074,7 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        Ok(fields)
+        Ok(pointers)
     }
 
     // ── Type-intersection helpers ─────────────────────────────────────────────────
@@ -3086,7 +3086,7 @@ impl<'a> Compiler<'a> {
         splat: &ast::Splat,
         parent_td: &TypeDescriptor,
         parent_alias: &str,
-    ) -> Result<Vec<IrShapeField>, PyQLError> {
+    ) -> Result<Vec<IrShapePointer>, PyQLError> {
         let type_name = match &type_ref.module {
             Some(m) => format!("{}::{}", m, type_ref.name),
             None => type_ref.name.clone(),
@@ -3113,7 +3113,7 @@ impl<'a> Compiler<'a> {
             vec![]
         };
 
-        let mut fields = vec![];
+        let mut pointers = vec![];
         for prop in props {
             let sub_alias = self.fresh_alias();
             let filter = IrExpr::BinOp(Box::new(IrBinOp {
@@ -3135,7 +3135,7 @@ impl<'a> Compiler<'a> {
                     table: concrete_table.clone(),
                     alias: sub_alias,
                 },
-                shape: vec![IrShapeField::Scalar(IrScalarField {
+                shape: vec![IrShapePointer::Scalar(IrScalarPointer {
                     alias: prop.name.clone(),
                     column: prop.name.clone(),
                     pg_type: prop.pg_type.clone(),
@@ -3148,13 +3148,13 @@ impl<'a> Compiler<'a> {
                 dml_source: None,
                 polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
             };
-            fields.push(IrShapeField::Computed(IrComputedField {
+            pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 alias: prop.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
             }));
         }
 
-        // For deep splat, include single-link fields as subqueries
+        // For deep splat, include single-link pointers as subqueries
         for link in links {
             let target_td = self.resolve_type(&link.target)?;
             let sub_alias = self.fresh_alias();
@@ -3187,32 +3187,32 @@ impl<'a> Compiler<'a> {
                 dml_source: None,
                 polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
             };
-            fields.push(IrShapeField::Computed(IrComputedField {
+            pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 alias: link.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
             }));
         }
 
-        Ok(fields)
+        Ok(pointers)
     }
 
-    /// Compile `[is ConcreteType].field_name` → `IrShapeField`.
-    fn compile_type_intersection_field(
+    /// Compile `[is ConcreteType].pointer_name` → `IrShapePointer`.
+    fn compile_type_intersection_pointer(
         &mut self,
         type_ref: &ast::ObjectRef,
         tail_steps: &[ast::PathStep],
         parent_alias: &str,
-    ) -> Result<IrShapeField, PyQLError> {
+    ) -> Result<IrShapePointer, PyQLError> {
         let expr = self.compile_type_intersection_expr_steps(type_ref, tail_steps, parent_alias)?;
         // Alias is the last Name step
         let alias = match tail_steps.last() {
             Some(ast::PathStep::Name(n)) => n.clone(),
-            _ => return Err(self.type_err("type intersection field must end with a field name")),
+            _ => return Err(self.type_err("type intersection must end with a pointer name")),
         };
-        Ok(IrShapeField::Computed(IrComputedField { alias, expr }))
+        Ok(IrShapePointer::Computed(IrComputedPointer { alias, expr }))
     }
 
-    /// Compile `[is Type].field` as an `IrExpr` (for computed field / expression context).
+    /// Compile `[is Type].name` as an `IrExpr` (for computed pointer / expression context).
     fn compile_type_intersection_expr(
         &mut self,
         steps: &[ast::PathStep],
@@ -3227,7 +3227,7 @@ impl<'a> Compiler<'a> {
         self.compile_type_intersection_expr_steps(&type_ref, &steps[1..], parent_alias)
     }
 
-    /// Shared: build scalar subquery for `[is ConcreteType]` + tail field steps.
+    /// Shared: build scalar subquery for `[is ConcreteType]` + tail pointer steps.
     fn compile_type_intersection_expr_steps(
         &mut self,
         type_ref: &ast::ObjectRef,
@@ -3243,15 +3243,15 @@ impl<'a> Compiler<'a> {
         let concrete_qname = format!("{}::{}", concrete_td.module, concrete_td.name);
         let concrete_table = concrete_td.table.clone();
 
-        let field_name = match tail_steps.first() {
+        let pointer_name = match tail_steps.first() {
             Some(PathStep::Name(n)) => n.as_str(),
             _ => return Err(self.type_err(
-                "type intersection must be followed by a field name, e.g. [is Type].field"
+                "type intersection must be followed by a pointer name, e.g. [is Type].name"
             )),
         };
 
-        let prop = concrete_td.properties.iter().find(|p| p.name == field_name)
-            .ok_or_else(|| self.field_err(field_name, &concrete_qname))?;
+        let prop = concrete_td.properties.iter().find(|p| p.name == pointer_name)
+            .ok_or_else(|| self.field_err(pointer_name, &concrete_qname))?;
         let prop_name = prop.name.clone();
         let prop_type = prop.pg_type.clone();
 
@@ -3276,7 +3276,7 @@ impl<'a> Compiler<'a> {
                 table: concrete_table,
                 alias: sub_alias,
             },
-            shape: vec![IrShapeField::Scalar(IrScalarField {
+            shape: vec![IrShapePointer::Scalar(IrScalarPointer {
                 alias: prop_name.clone(),
                 column: prop_name,
                 pg_type: prop_type,
@@ -3297,21 +3297,21 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
         module: &str,
-    ) -> Result<IrShapeField, PyQLError> {
-        // Type intersection field: [is Type].field_name (without compexpr)
+    ) -> Result<IrShapePointer, PyQLError> {
+        // Type intersection pointer: [is Type].pointer_name (without compexpr)
         if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first() {
             if el.compexpr.is_none() && el.path.steps.len() >= 2 {
                 let type_ref = type_ref.clone();
-                return self.compile_type_intersection_field(&type_ref, &el.path.steps[1..], alias);
+                return self.compile_type_intersection_pointer(&type_ref, &el.path.steps[1..], alias);
             }
         }
 
-        let field_name = path_leaf(&el.path)?;
+        let pointer_name = path_leaf(&el.path)?;
 
         // __type__ is a virtual property: the fully-qualified type name as a string.
         // It's always injected at position 0 for internal use; explicit inclusion adds
-        // it as a regular computed field at a later position so Python can read it.
-        if field_name == "__type__" && el.compexpr.is_none() {
+        // it as a regular computed pointer at a later position so Python can read it.
+        if pointer_name == "__type__" && el.compexpr.is_none() {
             let expr = if td.abstract_ && td.materialized {
                 IrExpr::ColumnRef {
                     alias: alias.to_string(),
@@ -3321,61 +3321,61 @@ impl<'a> Compiler<'a> {
             } else {
                 IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
             };
-            return Ok(IrShapeField::Computed(IrComputedField {
+            return Ok(IrShapePointer::Computed(IrComputedPointer {
                 alias: "__type__".to_string(),
                 expr,
             }));
         }
 
-        // Computed override: `field := expr`
+        // Computed override: `pointer := expr`
         if let Some(compexpr) = &el.compexpr {
-            // `alias := .multilink` → rename a multilink, same semantics as a regular field
+            // `alias := .multilink` → rename a multilink, same semantics as a regular pointer
             if let Expr::Path(p) = compexpr {
                 if p.partial && p.steps.len() == 1 {
                     if let ast::PathStep::Name(ml_name) = &p.steps[0] {
                         if Self::resolve_multilink(td, ml_name).is_some() {
                             let ml_name = ml_name.clone();
-                            return self.compile_multilink_field(
-                                field_name, &ml_name, td, alias, module, el,
+                            return self.compile_multilink_pointer(
+                                pointer_name, &ml_name, td, alias, module, el,
                             );
                         }
                     }
                 }
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
-            // Cross-scope TypeIs: promote to set-valued shape field.
+            // Cross-scope TypeIs: promote to set-valued shape pointer.
             if let IrExpr::ArrayFromSelect(src) = ir {
                 if let IrArraySource::RawExpr { source, poly_implementors, poly_columns, expr } = *src {
-                    return Ok(IrShapeField::ScalarSet(IrScalarSetField {
-                        alias: field_name.to_string(),
+                    return Ok(IrShapePointer::ScalarSet(IrScalarSetPointer {
+                        alias: pointer_name.to_string(),
                         source,
                         poly_implementors,
                         poly_columns,
                         bool_expr: expr,
                     }));
                 }
-                return Ok(IrShapeField::Computed(IrComputedField {
-                    alias: field_name.to_string(),
+                return Ok(IrShapePointer::Computed(IrComputedPointer {
+                    alias: pointer_name.to_string(),
                     expr: IrExpr::ArrayFromSelect(src),
                 }));
             }
-            return Ok(IrShapeField::Computed(IrComputedField {
-                alias: field_name.to_string(),
+            return Ok(IrShapePointer::Computed(IrComputedPointer {
+                alias: pointer_name.to_string(),
                 expr: ir,
             }));
         }
 
         // Scalar property
-        if let Some(p) = Self::resolve_property(td, field_name) {
-            return Ok(IrShapeField::Scalar(IrScalarField {
-                alias: field_name.to_string(),
+        if let Some(p) = Self::resolve_property(td, pointer_name) {
+            return Ok(IrShapePointer::Scalar(IrScalarPointer {
+                alias: pointer_name.to_string(),
                 column: p.name.clone(),
                 pg_type: p.pg_type.clone(),
             }));
         }
 
         // Single link
-        if let Some(l) = Self::resolve_link(td, field_name) {
+        if let Some(l) = Self::resolve_link(td, pointer_name) {
             let target_td = self.resolve_type(&l.target)?;
             let sub_alias = self.fresh_alias();
             let nested_elements = el.nested.as_deref().unwrap_or(&[]);
@@ -3396,8 +3396,8 @@ impl<'a> Compiler<'a> {
                 dml_source: None,
                 polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
             };
-            return Ok(IrShapeField::SingleLink(IrSingleLinkField {
-                alias: field_name.to_string(),
+            return Ok(IrShapePointer::SingleLink(IrSingleLinkPointer {
+                alias: pointer_name.to_string(),
                 fk_column: format!("{}_id", l.name),
                 target_pk: "id".to_string(),
                 subquery,
@@ -3405,25 +3405,25 @@ impl<'a> Compiler<'a> {
         }
 
         // Multi-link
-        if Self::resolve_multilink(td, field_name).is_some() {
-            return self.compile_multilink_field(field_name, field_name, td, alias, module, el);
+        if Self::resolve_multilink(td, pointer_name).is_some() {
+            return self.compile_multilink_pointer(pointer_name, pointer_name, td, alias, module, el);
         }
 
-        // Schema-defined computed field
-        if let Some(cd) = td.computed.iter().find(|c| c.name == field_name) {
+        // Schema-defined computed pointer
+        if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name) {
             let expr_ast = crate::parse::parse_expr(&cd.expression)
                 .map_err(|e| PyQLError::Syntax(e))?;
             let ir = self.compile_expr(&expr_ast, td, alias)?;
-            return Ok(IrShapeField::Computed(IrComputedField {
-                alias: field_name.to_string(),
+            return Ok(IrShapePointer::Computed(IrComputedPointer {
+                alias: pointer_name.to_string(),
                 expr: ir,
             }));
         }
 
-        Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
+        Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
     }
 
-    fn compile_multilink_field(
+    fn compile_multilink_pointer(
         &mut self,
         output_alias: &str,
         ml_name: &str,
@@ -3431,7 +3431,7 @@ impl<'a> Compiler<'a> {
         _parent_alias: &str,
         module: &str,
         el: &ShapeElement,
-    ) -> Result<IrShapeField, PyQLError> {
+    ) -> Result<IrShapePointer, PyQLError> {
         let ml = Self::resolve_multilink(td, ml_name)
             .expect("caller verified multilink exists")
             .clone();
@@ -3535,7 +3535,7 @@ impl<'a> Compiler<'a> {
             polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
         };
 
-        Ok(IrShapeField::MultiLink(IrMultiLinkField {
+        Ok(IrShapePointer::MultiLink(IrMultiLinkPointer {
             alias: output_alias.to_string(),
             join,
             subquery,
@@ -3974,12 +3974,12 @@ impl<'a> Compiler<'a> {
                 }
             }
             return Err(PyQLError::Type(PyQLTypeError {
-                message: "absolute paths are not valid in expression context; use .field".into(),
+                message: "absolute paths are not valid in expression context; use .name".into(),
                 position: Position { line: 0, col: 0 },
             }));
         }
 
-        // Type intersection in expression: [is Type].field — scalar subquery
+        // Type intersection in expression: [is Type].name — scalar subquery
         if p.partial && matches!(p.steps.first(), Some(ast::PathStep::TypeIntersection(_))) {
             return self.compile_type_intersection_expr(&p.steps, td, alias);
         }
@@ -3995,7 +3995,7 @@ impl<'a> Compiler<'a> {
             }));
         }
 
-        let field_name = match &p.steps[0] {
+        let pointer_name = match &p.steps[0] {
             ast::PathStep::Name(n) => n.as_str(),
             _ => {
                 return Err(PyQLError::Type(PyQLTypeError {
@@ -4007,7 +4007,7 @@ impl<'a> Compiler<'a> {
 
         // __type__ as an expression: for polymorphic (interface) types, read from the
         // inline union column; for concrete types, emit the static qualified name.
-        if field_name == "__type__" {
+        if pointer_name == "__type__" {
             return Ok(if td.abstract_ && td.materialized {
                 IrExpr::ColumnRef {
                     alias: alias.to_string(),
@@ -4019,7 +4019,7 @@ impl<'a> Compiler<'a> {
             });
         }
 
-        if let Some(prop) = Self::resolve_property(td, field_name) {
+        if let Some(prop) = Self::resolve_property(td, pointer_name) {
             return Ok(IrExpr::ColumnRef {
                 alias: alias.to_string(),
                 column: prop.name.clone(),
@@ -4027,7 +4027,7 @@ impl<'a> Compiler<'a> {
             });
         }
 
-        if let Some(link) = Self::resolve_link(td, field_name) {
+        if let Some(link) = Self::resolve_link(td, pointer_name) {
             // FK column reference (uuid) — e.g. `.company` → `t0."company_id"`
             return Ok(IrExpr::ColumnRef {
                 alias: alias.to_string(),
@@ -4036,14 +4036,14 @@ impl<'a> Compiler<'a> {
             });
         }
 
-        // Schema-defined computed field: inline the expression in place.
-        if let Some(cd) = td.computed.iter().find(|c| c.name == field_name) {
+        // Schema-defined computed pointer: inline the expression in place.
+        if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name) {
             let expr_ast = crate::parse::parse_expr(&cd.expression)
                 .map_err(|e| PyQLError::Syntax(e))?;
             return self.compile_expr(&expr_ast, td, alias);
         }
 
-        Err(self.field_err(field_name, &format!("{}::{}", td.module, td.name)))
+        Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
     }
 
     fn compile_path_2step(
@@ -4059,7 +4059,7 @@ impl<'a> Compiler<'a> {
                 position: Position { line: 0, col: 0 },
             })),
         };
-        let field_name = match &p.steps[1] {
+        let pointer_name = match &p.steps[1] {
             ast::PathStep::Name(n) => n.as_str(),
             _ => return Err(PyQLError::Type(PyQLTypeError {
                 message: "type intersections are not valid in expression context".into(),
@@ -4069,7 +4069,7 @@ impl<'a> Compiler<'a> {
 
         if let Some(link) = Self::resolve_link(td, link_name) {
             let fk_col = format!("{}_id", link_name);
-            if field_name == "id" {
+            if pointer_name == "id" {
                 return Ok(IrExpr::ColumnRef {
                     alias: alias.to_string(),
                     column: fk_col,
@@ -4077,7 +4077,7 @@ impl<'a> Compiler<'a> {
                 });
             }
             let target_td = self.resolve_type(&link.target)?;
-            if let Some(prop) = Self::resolve_property(target_td, field_name) {
+            if let Some(prop) = Self::resolve_property(target_td, pointer_name) {
                 let ft_alias = self.fresh_alias();
                 return Ok(IrExpr::Subquery(Box::new(IrSelect {
                     source: IrSource {
@@ -4085,7 +4085,7 @@ impl<'a> Compiler<'a> {
                         table: target_td.table.clone(),
                         alias: ft_alias.clone(),
                     },
-                    shape: vec![IrShapeField::Scalar(IrScalarField {
+                    shape: vec![IrShapePointer::Scalar(IrScalarPointer {
                         alias: prop.name.clone(),
                         column: prop.name.clone(),
                         pg_type: prop.pg_type.clone(),
@@ -4112,14 +4112,14 @@ impl<'a> Compiler<'a> {
                 })));
             }
             let target_name = link.target.clone();
-            return Err(self.field_err(field_name, &target_name));
+            return Err(self.field_err(pointer_name, &target_name));
         }
 
         if Self::resolve_multilink(td, link_name).is_some() {
             return Err(PyQLError::Type(PyQLTypeError {
                 message: format!(
-                    "multi-link path '.{link_name}.{field_name}' must be used inside a comparison, \
-                     e.g.: filter .{link_name}.{field_name} = value"
+                    "multi-link path '.{link_name}.{pointer_name}' must be used inside a comparison, \
+                     e.g.: filter .{link_name}.{pointer_name} = value"
                 ),
                 position: Position { line: 0, col: 0 },
             }));
@@ -4272,8 +4272,8 @@ impl<'a> Compiler<'a> {
         let target_td = self.resolve_type(target_qname)?;
 
         // Single property or link FK
-        if let [PathStep::Name(field_name)] = steps {
-            if let Some(prop) = Self::resolve_property(target_td, field_name) {
+        if let [PathStep::Name(pointer_name)] = steps {
+            if let Some(prop) = Self::resolve_property(target_td, pointer_name) {
                 let col = IrExpr::ColumnRef {
                     alias: t_alias.to_string(),
                     column: prop.name.clone(),
@@ -4281,7 +4281,7 @@ impl<'a> Compiler<'a> {
                 };
                 return Ok(Some(Self::apply_comparison(col, comparison)));
             }
-            if let Some(link) = Self::resolve_link(target_td, field_name) {
+            if let Some(link) = Self::resolve_link(target_td, pointer_name) {
                 let col = IrExpr::ColumnRef {
                     alias: t_alias.to_string(),
                     column: format!("{}_id", link.name),
@@ -4289,7 +4289,7 @@ impl<'a> Compiler<'a> {
                 };
                 return Ok(Some(Self::apply_comparison(col, comparison)));
             }
-            return Err(self.field_err(field_name, target_qname));
+            return Err(self.field_err(pointer_name, target_qname));
         }
 
         // Two forward steps: link then property (single FK join)
@@ -4404,14 +4404,14 @@ impl<'a> Compiler<'a> {
         // Warn: multi-link traversal in a comparison returns a set, not a single boolean.
         // The query works (compiled as EXISTS), but `any()` makes the intent explicit.
         {
-            let field_path: Vec<_> = path_steps.iter().map(|s| match s {
+            let pointer_path: Vec<_> = path_steps.iter().map(|s| match s {
                 ast::PathStep::Name(n) => n.as_str(),
                 _ => "?",
             }).collect();
             self.warnings.push(format!(
                 "possibly more than one element returned by an expression in a FILTER clause \
                  (multi-link '.{}'); wrap with any() to make intent explicit",
-                field_path.join("."),
+                pointer_path.join("."),
             ));
         }
 
@@ -4548,7 +4548,7 @@ impl<'a> Compiler<'a> {
         // steps should have at least 1 element
         let first_name = match steps.first() {
             Some(ast::PathStep::Name(n)) => n.clone(),
-            _ => return Err(self.type_err("expected field or link name in path")),
+            _ => return Err(self.type_err("expected a property or link name in path")),
         };
 
         let target_td = self.resolve_type(target_type)?;
@@ -5217,15 +5217,15 @@ impl<'a> Compiler<'a> {
         // Compile the object shape from `object { … }` inside the shape elements.
         // `elements` is the outer shape (`{ object { … }, distance }`).
         // We find the `object` element and take its sub-shape; everything else is ignored
-        // at compile time (distance is always emitted; unknown fields are an error).
-        let mut object_shape: Vec<IrShapeField> = vec![];
+        // at compile time (distance is always emitted; unknown pointers are an error).
+        let mut object_shape: Vec<IrShapePointer> = vec![];
         for el in elements {
             if el.splat.is_some() { continue; } // ignore splat in outer shape
-            let field_name = match el.path.steps.first() {
+            let pointer_name = match el.path.steps.first() {
                 Some(ast::PathStep::Name(n)) => n.as_str(),
                 _ => continue,
             };
-            match field_name {
+            match pointer_name {
                 "distance" => { /* always emitted; no sub-shape */ }
                 "object" => {
                     let sub_els = el.nested.as_deref().unwrap_or(&[]);
@@ -5233,7 +5233,7 @@ impl<'a> Compiler<'a> {
                 }
                 other => {
                     return Err(self.type_err(&format!(
-                        "vector::search result has no field '{}'; valid fields are 'object' and 'distance'",
+                        "vector::search result has no pointer '{}'; valid pointers are 'object' and 'distance'",
                         other
                     )));
                 }
@@ -5415,14 +5415,14 @@ impl<'a> Compiler<'a> {
         };
 
         // Compile the object shape from `object { … }` in the outer shape.
-        let mut object_shape: Vec<IrShapeField> = vec![];
+        let mut object_shape: Vec<IrShapePointer> = vec![];
         for el in elements {
             if el.splat.is_some() { continue; }
-            let field_name = match el.path.steps.first() {
+            let pointer_name = match el.path.steps.first() {
                 Some(ast::PathStep::Name(n)) => n.as_str(),
                 _ => continue,
             };
-            match field_name {
+            match pointer_name {
                 "score" => { /* always emitted */ }
                 "object" => {
                     let sub_els = el.nested.as_deref().unwrap_or(&[]);
@@ -5430,7 +5430,7 @@ impl<'a> Compiler<'a> {
                 }
                 other => {
                     return Err(self.type_err(&format!(
-                        "fts::search result has no field '{}'; valid fields are 'object' and 'score'",
+                        "fts::search result has no pointer '{}'; valid pointers are 'object' and 'score'",
                         other
                     )));
                 }
@@ -5517,12 +5517,12 @@ impl<'a> Compiler<'a> {
 
     /// For bare DML (not wrapped in SELECT) return only primary-key properties,
     /// matching the upstream engine: `INSERT … ` returns `{ id }`, same for UPDATE/DELETE.
-    fn pk_returning(td: &TypeDescriptor) -> Vec<IrShapeField> {
+    fn pk_returning(td: &TypeDescriptor) -> Vec<IrShapePointer> {
         td.properties
             .iter()
             .filter(|p| p.is_pk)
             .map(|p| {
-                IrShapeField::Scalar(IrScalarField {
+                IrShapePointer::Scalar(IrScalarPointer {
                     alias: p.name.clone(),
                     column: p.name.clone(),
                     pg_type: p.pg_type.clone(),
@@ -5572,12 +5572,12 @@ fn has_any_link_props(vals: &IrMultiLinkValues) -> bool {
     }
 }
 
-/// Extract the single field name from a relative path used in a shape element.
+/// Extract the single pointer name from a relative path used in a shape element.
 fn path_leaf(p: &ast::Path) -> Result<&str, PyQLError> {
     match p.steps.as_slice() {
         [ast::PathStep::Name(n)] => Ok(n.as_str()),
         _ => Err(PyQLError::Type(PyQLTypeError {
-            message: "expected a simple field name in shape element".into(),
+            message: "expected a simple pointer name in shape element".into(),
             position: Position { line: 0, col: 0 },
         })),
     }

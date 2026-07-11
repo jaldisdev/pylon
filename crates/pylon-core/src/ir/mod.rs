@@ -58,8 +58,8 @@ pub enum IrForIterator {
 #[derive(Debug, Clone)]
 pub struct IrGroup {
     pub source: IrSource,
-    /// Fields projected into each element of the `elements` array.
-    pub shape: Vec<IrShapeField>,
+    /// Pointers projected into each element of the `elements` array.
+    pub shape: Vec<IrShapePointer>,
     /// Ordered list of (key_name, key_expr) — what we GROUP BY.
     pub keys: Vec<(String, IrExpr)>,
 }
@@ -110,7 +110,7 @@ pub enum IrPathResult {
     /// Final result is a scalar expression (column ref or computed expr like EXISTS).
     Scalar(IrExpr),
     /// Final step is a link — return the linked objects with the given shape.
-    Object { alias: String, type_name: String, shape: Vec<IrShapeField> },
+    Object { alias: String, type_name: String, shape: Vec<IrShapePointer> },
 }
 
 // ── FREE SELECT (expressions, set literals, tuples, free objects) ───────────────
@@ -145,7 +145,7 @@ pub enum IrFreeExpr {
 /// Source for `ARRAY(SELECT scalar FROM ...)` — used by assert functions.
 #[derive(Debug, Clone)]
 pub enum IrArraySource {
-    /// Inner is a regular schema SELECT; first scalar field is the array element.
+    /// Inner is a regular schema SELECT; first scalar pointer is the array element.
     Select(IrSelect),
     /// Inner is a path traversal SELECT; scalar result is the array element.
     PathSelect(IrPathSelect),
@@ -164,7 +164,7 @@ pub enum IrArraySource {
 #[derive(Debug, Clone)]
 pub struct IrSelect {
     pub source: IrSource,
-    pub shape: Vec<IrShapeField>,
+    pub shape: Vec<IrShapePointer>,
     pub filter: Option<IrExpr>,
     pub order_by: Vec<IrSort>,
     pub offset: Option<IrExpr>,
@@ -206,10 +206,10 @@ pub struct IrSource {
     pub alias: String,
 }
 
-/// A set-valued scalar computed field from cross-scope `TypeIs`.
+/// A set-valued scalar computed pointer from cross-scope `TypeIs`.
 /// Emits `COALESCE(array_agg(ROW(bool_expr)::record), ARRAY[]::record[]) FROM source`.
 #[derive(Debug, Clone)]
-pub struct IrScalarSetField {
+pub struct IrScalarSetPointer {
     pub alias: String,
     pub source: IrSource,
     pub poly_implementors: Vec<IrPolyImplementor>,
@@ -218,17 +218,17 @@ pub struct IrScalarSetField {
 }
 
 #[derive(Debug, Clone)]
-pub enum IrShapeField {
-    Scalar(IrScalarField),
-    SingleLink(IrSingleLinkField),
-    MultiLink(IrMultiLinkField),
-    Computed(IrComputedField),
-    ScalarSet(IrScalarSetField),
+pub enum IrShapePointer {
+    Scalar(IrScalarPointer),
+    SingleLink(IrSingleLinkPointer),
+    MultiLink(IrMultiLinkPointer),
+    Computed(IrComputedPointer),
+    ScalarSet(IrScalarSetPointer),
 }
 
 /// A property column included in the output shape.
 #[derive(Debug, Clone)]
-pub struct IrScalarField {
+pub struct IrScalarPointer {
     /// The output key (what the user wrote, e.g. `name`).
     pub alias: String,
     /// The PostgreSQL column name on the source table.
@@ -240,7 +240,7 @@ pub struct IrScalarField {
 /// A single-valued FK link included in the output shape.
 /// Emitted as a correlated scalar subquery.
 #[derive(Debug, Clone)]
-pub struct IrSingleLinkField {
+pub struct IrSingleLinkPointer {
     pub alias: String,
     /// FK column on the source table, e.g. `category_id`.
     pub fk_column: String,
@@ -253,7 +253,7 @@ pub struct IrSingleLinkField {
 /// A multi-valued link included in the output shape.
 /// Emitted as a correlated subquery using `array_agg(ROW(...)::record)`.
 #[derive(Debug, Clone)]
-pub struct IrMultiLinkField {
+pub struct IrMultiLinkPointer {
     pub alias: String,
     /// Join table or FK column identifying the source side.
     pub join: IrMultiLinkJoin,
@@ -293,9 +293,9 @@ pub enum IrMultiLinkJoin {
     },
 }
 
-/// A computed field: an expression aliased to a name.
+/// A computed pointer: an expression aliased to a name.
 #[derive(Debug, Clone)]
-pub struct IrComputedField {
+pub struct IrComputedPointer {
     pub alias: String,
     pub expr: IrExpr,
 }
@@ -303,7 +303,7 @@ pub struct IrComputedField {
 // ── Vector index enqueue ────────────────────────────────────────────────────────
 
 /// Identifies one vector index that needs an outbox row written when a
-/// mutation touches its source fields.
+/// mutation touches its source pointers.
 #[derive(Debug, Clone)]
 pub struct VectorEnqueueInfo {
     /// Schema-qualified type name, e.g. `"default::Product"`.
@@ -332,7 +332,7 @@ pub struct IrInsert {
     /// Schema-defined rewrites that override or augment the inserted columns.
     pub rewrites: Vec<IrRewrite>,
     /// Shape to return after insert (for RETURNING clause).
-    pub returning: Vec<IrShapeField>,
+    pub returning: Vec<IrShapePointer>,
     /// Vector indexes on this type that need outbox rows written.
     pub enqueue_vector: Vec<VectorEnqueueInfo>,
     /// OpenSearch-backed SearchIndexes that need outbox rows written.
@@ -361,8 +361,8 @@ pub struct IrUpdate {
     pub assignments: Vec<(String, IrExpr)>,
     /// Schema-defined rewrites appended to the SET clause.
     pub rewrites: Vec<IrRewrite>,
-    pub returning: Vec<IrShapeField>,
-    /// Vector indexes whose source fields are touched by this update.
+    pub returning: Vec<IrShapePointer>,
+    /// Vector indexes whose source pointers are touched by this update.
     pub enqueue_vector: Vec<VectorEnqueueInfo>,
     /// OpenSearch-backed SearchIndexes that need outbox rows written.
     pub enqueue_search: Vec<SearchEnqueueInfo>,
@@ -433,7 +433,7 @@ pub enum IrMultiLinkValueSource {
 pub struct IrDelete {
     pub target: IrSource,
     pub filter: Option<IrExpr>,
-    pub returning: Vec<IrShapeField>,
+    pub returning: Vec<IrShapePointer>,
     /// Populated when deleting from an interface type; one entry per concrete implementor.
     pub poly_implementors: Vec<IrPolyImplementor>,
     /// OpenSearch-backed SearchIndexes that need delete outbox rows written.
@@ -454,7 +454,7 @@ pub enum IrExpr {
     FunctionCall(IrFunctionCall),
     TypeCast(Box<IrTypeCast>),
     IfElse(Box<IrIfElse>),
-    /// A scalar subquery (used for computed fields that are themselves selects).
+    /// A scalar subquery (used for computed pointers that are themselves selects).
     Subquery(Box<IrSelect>),
     /// An array literal: `[1, 2, 3]`.
     Array(Vec<IrExpr>),
@@ -523,9 +523,9 @@ pub struct IrVectorSearch {
     /// The query vector expression (e.g. `$1::vector`).
     /// For the text overload this is the `__deferred_vec__` param cast to vector.
     pub query_expr: IrExpr,
-    /// Fields to include in the `object` sub-tuple (from the `object { … }` shape).
+    /// Pointers to include in the `object` sub-tuple (from the `object { … }` shape).
     /// Empty means no explicit shape was given; the SQL emitter uses all properties.
-    pub object_shape: Vec<IrShapeField>,
+    pub object_shape: Vec<IrShapePointer>,
     pub filter: Option<IrExpr>,
     /// `None` = no ORDER BY; `Some(dir)` = ORDER BY distance in that direction.
     /// Only distance ordering is supported for v1.
@@ -563,8 +563,8 @@ pub struct IrFtsSearch {
     pub tsquery_fn: &'static str,
     /// The query text expression (e.g. `$1`).
     pub query_expr: IrExpr,
-    /// Fields to include in the `object` sub-tuple.
-    pub object_shape: Vec<IrShapeField>,
+    /// Pointers to include in the `object` sub-tuple.
+    pub object_shape: Vec<IrShapePointer>,
     pub filter: Option<IrExpr>,
     pub order_by_rank: Option<IrSortDir>,
     pub offset: Option<IrExpr>,
@@ -600,7 +600,7 @@ pub struct IrFunctionSelect {
     pub poly_implementors: Vec<IrPolyImplementor>,
     /// Interface column names for the UNION ALL branches.
     pub poly_columns: Vec<String>,
-    pub shape: Vec<IrShapeField>,
+    pub shape: Vec<IrShapePointer>,
     pub filter: Option<IrExpr>,
     pub order_by: Vec<IrSort>,
     pub offset: Option<IrExpr>,
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(sel.source.table, "person");
         assert_eq!(sel.source.type_name, "default::Person");
         assert_eq!(sel.shape.len(), 2);
-        assert!(matches!(sel.shape[0], IrShapeField::Scalar(_)));
+        assert!(matches!(sel.shape[0], IrShapePointer::Scalar(_)));
     }
 
     #[test]
@@ -934,7 +934,7 @@ mod tests {
         let ir = compile("SELECT Person { name, company { name } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         assert_eq!(sel.shape.len(), 2);
-        let IrShapeField::SingleLink(link) = &sel.shape[1] else { panic!("expected SingleLink") };
+        let IrShapePointer::SingleLink(link) = &sel.shape[1] else { panic!("expected SingleLink") };
         assert_eq!(link.alias, "company");
         assert_eq!(link.fk_column, "company_id");
         assert_eq!(link.subquery.source.table, "company");
@@ -944,7 +944,7 @@ mod tests {
     fn test_select_multi_link() {
         let ir = compile("SELECT Person { name, posts { title } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        let IrShapeField::MultiLink(ml) = &sel.shape[1] else { panic!("expected MultiLink") };
+        let IrShapePointer::MultiLink(ml) = &sel.shape[1] else { panic!("expected MultiLink") };
         assert_eq!(ml.alias, "posts");
         assert_eq!(ml.subquery.source.table, "post");
         let IrMultiLinkJoin::Standard { junction_table, .. } = &ml.join else { panic!() };
@@ -957,7 +957,7 @@ mod tests {
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         // Bare SELECT Type returns only { id }, matching the upstream engine semantics.
         assert_eq!(sel.shape.len(), 1);
-        let IrShapeField::Scalar(f) = &sel.shape[0] else { panic!() };
+        let IrShapePointer::Scalar(f) = &sel.shape[0] else { panic!() };
         assert_eq!(f.alias, "id");
     }
 
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_field_error() {
+    fn test_unknown_pointer_error() {
         let schema = make_schema();
         let ast = parse::parse("SELECT Person { nonexistent }").unwrap();
         assert!(super::compile(&ast, &schema).is_err());
@@ -1087,7 +1087,7 @@ mod tests {
 
     fn make_schema_with_computed() -> SchemaDescriptor {
         let mut schema = make_schema();
-        // Add a computed field to Person
+        // Add a computed pointer to Person
         schema.types[0].computed.push(ComputedDescriptor {
             name: "upper_name".into(),
             expression: "str_upper(.name)".into(),
@@ -1097,22 +1097,22 @@ mod tests {
     }
 
     #[test]
-    fn test_computed_field_in_shape() {
+    fn test_computed_pointer_in_shape() {
         let schema = make_schema_with_computed();
         let ast = parse::parse("SELECT Person { upper_name }").unwrap();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        // upper_name should compile to a Computed shape field
-        assert!(sel.shape.iter().any(|f| matches!(f, IrShapeField::Computed(c) if c.alias == "upper_name")));
+        // upper_name should compile to a Computed shape pointer
+        assert!(sel.shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "upper_name")));
     }
 
     #[test]
-    fn test_computed_field_in_expression_context() {
+    fn test_computed_pointer_in_expression_context() {
         let schema = make_schema_with_computed();
         let ast = parse::parse("SELECT Person { x := str_lower(.upper_name) }").unwrap();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        assert!(sel.shape.iter().any(|f| matches!(f, IrShapeField::Computed(c) if c.alias == "x")));
+        assert!(sel.shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "x")));
     }
 
     #[test]
@@ -1290,8 +1290,8 @@ mod tests {
         let ast = parse::parse("SELECT ActivePersons { name, age }").unwrap();
         let ir = super::compile(&ast, &schema).expect("compile failed");
         let sql = crate::sql::emit(&ir).sql;
-        assert!(sql.contains("\"name\""), "expected name field, got: {sql}");
-        assert!(sql.contains("\"age\""), "expected age field, got: {sql}");
+        assert!(sql.contains("\"name\""), "expected name pointer, got: {sql}");
+        assert!(sql.contains("\"age\""), "expected age pointer, got: {sql}");
     }
 
     #[test]
