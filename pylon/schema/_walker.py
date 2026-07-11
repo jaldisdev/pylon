@@ -418,6 +418,11 @@ def _to_pg_type(scalar_type: Any) -> str:
             (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
         return f"__nt__:{mod}::{scalar_type.__name__}"
 
+    # Structural tuple type (pylon.Tuple[...]) → plain jsonb, no registered type to decode into
+    from ._pointers import TupleAnnotation
+    if isinstance(scalar_type, TupleAnnotation):
+        return "jsonb"
+
     # Enum type → schema-qualified PostgreSQL ENUM type reference
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonEnum):
         mod = getattr(scalar_type, "__pylon_module__", None) or \

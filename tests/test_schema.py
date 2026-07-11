@@ -28,9 +28,12 @@ from pylon.schema import (
     Rewrite,
     Timing,
     Trigger,
+    Tuple,
     through,
 )
+from pylon.schema._pointers import TupleAnnotation
 from pylon.schema._scalars import PG_TYPE_MAP, SHORTHAND_MAP
+from pylon.schema._walker import _to_pg_type
 
 MISSING = dataclasses.MISSING
 REQUIRED = inspect.Parameter.empty
@@ -257,6 +260,65 @@ class TestPropertyField:
     def test_default_now_optional_in_init(self):
         sig = inspect.signature(Auditable.__init__)
         assert sig.parameters["created_at"].default is None
+
+
+# ---------------------------------------------------------------------------
+# Structural tuple types (pylon.Tuple[...])
+# ---------------------------------------------------------------------------
+
+
+class TestTupleField:
+    def test_unnamed_elements(self):
+        ann = Tuple[pylon.Str, pylon.Bool]
+        assert isinstance(ann, TupleAnnotation)
+        assert [e.name for e in ann.elements] == [None, None]
+        assert [e.type_ for e in ann.elements] == [pylon.Str, pylon.Bool]
+
+    def test_named_elements(self):
+        ann = Tuple[("r", pylon.Int16), ("g", pylon.Int16), ("b", pylon.Int16)]
+        assert [e.name for e in ann.elements] == ["r", "g", "b"]
+        assert [e.type_ for e in ann.elements] == [pylon.Int16, pylon.Int16, pylon.Int16]
+
+    def test_nested_tuple_element(self):
+        ann = Tuple[
+            ("origin", Tuple[("x", pylon.Float64), ("y", pylon.Float64)]),
+            ("size", pylon.Float64),
+        ]
+        origin = ann.elements[0].type_
+        assert isinstance(origin, TupleAnnotation)
+        assert [e.name for e in origin.elements] == ["x", "y"]
+
+    def test_mixed_named_and_unnamed_rejected(self):
+        with pytest.raises(TypeError, match="all named .* or all unnamed"):
+            Tuple[("x", pylon.Float64), pylon.Bool]
+
+    def test_empty_rejected(self):
+        with pytest.raises(TypeError, match="at least one element"):
+            Tuple[()]
+
+    def test_resolves_to_jsonb_pg_type(self):
+        assert _to_pg_type(Tuple[pylon.Str, pylon.Bool]) == "jsonb"
+        assert _to_pg_type(Tuple[("r", pylon.Int16)]) == "jsonb"
+
+    def test_optional_via_union(self):
+        @pylon.type
+        class HasTuple:
+            pair: Tuple[pylon.Str, pylon.Bool] | None
+
+        f = HasTuple.__pylon_config__.pointers["pair"]
+        assert f.kind == "property"
+        assert isinstance(f.scalar_type, TupleAnnotation)
+        assert f.nullable is True
+
+    def test_property_meta_scalar_type_is_annotation(self):
+        @pylon.type
+        class HasRequiredTuple:
+            rgb: Tuple[("r", pylon.Int16), ("g", pylon.Int16), ("b", pylon.Int16)]
+
+        f = HasRequiredTuple.__pylon_config__.pointers["rgb"]
+        assert f.kind == "property"
+        assert f.nullable is False
+        assert [e.name for e in f.scalar_type.elements] == ["r", "g", "b"]
 
 
 # ---------------------------------------------------------------------------

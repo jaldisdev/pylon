@@ -75,6 +75,7 @@ from .schema import (
     Source,
     Str,
     Target,
+    Tuple,
     Volatility,
     abstract,
     collect_module_globals,
@@ -129,6 +130,7 @@ __all__ = [
     "Link",
     "MultiLink",
     "Property",
+    "Tuple",
     "through",
     # Schema — deletion policies
     "OnDelete",

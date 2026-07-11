@@ -251,6 +251,78 @@ class MultiLink:
         return MultiLinkAnnotation(target_type=target_type, through_type=through_type, on_delete=on_delete)
 
 
+class TupleElement:
+    """One member of a structural tuple type: `(name, type)` or a bare type."""
+
+    __slots__ = ("name", "type_")
+
+    def __init__(self, name: str | None, type_: Any) -> None:
+        self.name = name
+        self.type_ = type_
+
+    def __repr__(self) -> str:
+        return f"TupleElement({self.name!r}, {self.type_!r})"
+
+
+class TupleAnnotation:
+    """Structural tuple pointer annotation.
+
+    Usage::
+
+        pair: Tuple[Str, Bool]
+        rgb: Tuple[("r", Int16), ("g", Int16), ("b", Int16)]
+        shape: Tuple[("origin", Tuple[("x", Float64), ("y", Float64)]), ("size", Float64)]
+    """
+
+    __slots__ = ("elements",)
+
+    def __init__(self, elements: list[TupleElement]) -> None:
+        self.elements = elements
+
+    def __or__(self, other: Any) -> Any:
+        if other is None:
+            return typing.Union[self, type(None)]
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"TupleAnnotation({self.elements!r})"
+
+
+class Tuple:
+    """Structural tuple pointer annotation (Gel's inline `tuple<...>` equivalent).
+
+    Usage::
+
+        pair: Tuple[Str, Bool]                                # unnamed elements
+        rgb: Tuple[("r", Int16), ("g", Int16), ("b", Int16)]   # named elements
+        shape: Tuple[("origin", Tuple[("x", Float64), ("y", Float64)]), ("size", Float64)]
+    """
+
+    @classmethod
+    def __class_getitem__(cls, params: Any) -> TupleAnnotation:
+        if not isinstance(params, tuple):
+            params = (params,)
+        if not params:
+            raise TypeError("Tuple[...] requires at least one element")
+
+        def _is_named_item(p: Any) -> bool:
+            return isinstance(p, tuple) and len(p) == 2 and isinstance(p[0], str)
+
+        named_flags = [_is_named_item(p) for p in params]
+        if any(named_flags) and not all(named_flags):
+            raise TypeError(
+                "Tuple[...] elements must be all named ('name', Type) or all "
+                "unnamed Type, not mixed"
+            )
+
+        if all(named_flags):
+            elements = [TupleElement(name=p[0], type_=p[1]) for p in params]
+        else:
+            elements = [TupleElement(name=None, type_=p) for p in params]
+
+        return TupleAnnotation(elements=elements)
+
+
 class Computed:
     """Computed pointer — evaluated as a PyQL expression at query time.
 
