@@ -90,7 +90,7 @@ def finalize(
     from pylon.config import load_config
     from pylon.schema._globals import collect_module_globals
     from pylon.schema._aliases import collect_module_aliases
-    from pylon.schema._registry import snapshot, functions_snapshot
+    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot
     from pylon.schema._walker import walk
     from pylon.query import _set_schema
 
@@ -114,6 +114,15 @@ def finalize(
             aliases_.extend(collect_module_aliases(mod))
 
     functions = functions_snapshot()
-    schema = walk(types, enums, custom_scalars, globals_, functions=functions, aliases=aliases_)
+    named_tuples = named_tuples_snapshot()
+    schema = walk(
+        types,
+        enums,
+        custom_scalars,
+        globals_,
+        functions=functions,
+        aliases=aliases_,
+        named_tuples=named_tuples,
+    )
     _set_schema(schema)
     return schema

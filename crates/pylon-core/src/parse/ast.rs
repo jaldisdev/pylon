@@ -332,10 +332,40 @@ pub struct TypeCast {
     pub ty: TypeExpr,
 }
 
+/// A type expression appearing in a cast (`<TypeExpr>expr`) or a type-is check
+/// (`expr[is TypeExpr]`, `expr IS TypeExpr`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeExpr {
-    pub module: Option<String>,
-    pub name: String,
+pub enum TypeExpr {
+    /// A named/qualified type reference: `str`, `default::Point`, `cal::local_date`.
+    Named { module: Option<String>, name: String },
+    /// A structural tuple type: `tuple<str, bool>` or `tuple<r: int16, g: int16>`.
+    /// Elements are either all-named or all-unnamed (checked at parse time) and may
+    /// nest arbitrarily (an element's own `ty` can itself be `TypeExpr::Tuple`).
+    Tuple { elements: Vec<TupleTypeElement> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TupleTypeElement {
+    pub name: Option<String>,
+    pub ty: Box<TypeExpr>,
+}
+
+impl TypeExpr {
+    /// Convenience constructor for the common unqualified-name case (matches the
+    /// old plain-struct call sites before `TypeExpr` became an enum).
+    pub fn named(module: Option<String>, name: impl Into<String>) -> Self {
+        TypeExpr::Named { module, name: name.into() }
+    }
+
+    /// `(module, name)` for a `Named` type expr; `None` for `Tuple` — used by the
+    /// object-type-cast / `IS` / type-intersection contexts, which only ever mean
+    /// something for a named schema type (never a structural tuple).
+    pub fn as_named(&self) -> Option<(Option<&str>, &str)> {
+        match self {
+            TypeExpr::Named { module, name } => Some((module.as_deref(), name.as_str())),
+            TypeExpr::Tuple { .. } => None,
+        }
+    }
 }
 
 // ── If / Else ──────────────────────────────────────────────────────────────────

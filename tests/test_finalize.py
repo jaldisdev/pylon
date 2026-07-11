@@ -663,6 +663,24 @@ class TestWalkIntegration:
         assert schema.type_count == 1
         assert schema.enum_count == 1
 
+    def test_schema_with_named_tuple(self):
+        from pylon.schema._walker import walk
+        from pylon.schema._registry import named_tuples_snapshot
+
+        @pylon.named_tuple
+        class Point(pylon.NamedTuple):
+            x: pylon.Float64
+            y: pylon.Float64
+
+        @pylon.type(module="geo", name="Place")
+        class Place:
+            name: str
+            location: pylon.Property[Point] | None
+
+        types, enums, scalars = snapshot()
+        schema = walk(types, enums, scalars, [], named_tuples=named_tuples_snapshot())
+        assert schema.named_tuple_count == 1
+
     def test_schema_with_link(self):
         from pylon.schema._walker import walk
 

@@ -900,6 +900,7 @@ mod tests {
             ],
             scalars: vec![],
             enums: vec![],
+            named_tuples: vec![],
             globals: vec![],
             functions: vec![], aliases: vec![],
         }
