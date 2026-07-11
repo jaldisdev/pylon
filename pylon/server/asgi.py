@@ -27,7 +27,7 @@ from pylon.exceptions import PylonError
 from pylon.schema._decorators import _get_own_annotations, _infer_module, _unwrap_optional
 from pylon.schema._pointers import ComputedAnnotation, LinkAnnotation, MultiLinkAnnotation, PropertyAnnotation
 from pylon.schema._meta import PointerMeta
-from pylon.schema._registry import snapshot as schema_snapshot
+from pylon.schema._registry import named_tuples_snapshot, snapshot as schema_snapshot
 from pylon.schema._walker import _effective_pointers
 
 Scope = dict[str, Any]
@@ -220,7 +220,11 @@ def _pointer_editability(meta: PointerMeta) -> dict[str, Any]:
 
 
 def _classify_pointer(
-    annotation: Any, owning_cls: type, enum_classes: set[type], meta: PointerMeta | None
+    annotation: Any,
+    owning_cls: type,
+    enum_classes: set[type],
+    meta: PointerMeta | None,
+    named_tuple_classes: set[type],
 ) -> dict[str, Any]:
     """Returns the {kind, target?, typeName?, readonly?, required?, hasDefault?,
     through?} fragment for one property/link/multiLink/computed pointer."""
@@ -243,6 +247,8 @@ def _classify_pointer(
         scalar_type = inner.scalar_type if isinstance(inner, PropertyAnnotation) else inner
         if isinstance(scalar_type, type) and scalar_type in enum_classes:
             result = {"kind": "enum", "target": _type_qualname(scalar_type)}
+        elif isinstance(scalar_type, type) and scalar_type in named_tuple_classes:
+            result = {"kind": "namedTuple", "target": _type_qualname(scalar_type)}
         else:
             type_name = _scalar_type_name(scalar_type)
             result = {"kind": "property", "typeName": type_name} if type_name else {"kind": "property"}
@@ -258,7 +264,37 @@ def _vector_index_pointer_names(vi: Any) -> list[str]:
     return [vp.ref.split(".", 1)[1] for vp in vi._vector_pointers]
 
 
-def _build_type_entry(cls: type, enum_classes: set[type]) -> dict[str, Any]:
+def _classify_named_tuple_member(
+    annotation: Any, enum_classes: set[type], named_tuple_classes: set[type]
+) -> dict[str, Any]:
+    """Returns the {kind, target?, typeName?, required} fragment for one
+    named-tuple member. A member is always a plain dataclass field — never a
+    Link/MultiLink/Computed, since those annotations only exist on
+    @pylon.type-decorated schema types, not value types."""
+    nullable, inner = _unwrap_optional(annotation)
+    if isinstance(inner, type) and inner in named_tuple_classes:
+        result: dict[str, Any] = {"kind": "namedTuple", "target": _type_qualname(inner)}
+    elif isinstance(inner, type) and inner in enum_classes:
+        result = {"kind": "enum", "target": _type_qualname(inner)}
+    else:
+        type_name = _scalar_type_name(inner)
+        result = {"kind": "scalar", "typeName": type_name} if type_name else {"kind": "scalar"}
+    result["required"] = not nullable
+    return result
+
+
+def _build_named_tuple_entry(cls: type, enum_classes: set[type], named_tuple_classes: set[type]) -> dict[str, Any]:
+    return {
+        "module": _infer_module(cls),
+        "name": cls.__name__,
+        "members": [
+            {"name": name, **_classify_named_tuple_member(annotation, enum_classes, named_tuple_classes)}
+            for name, annotation in _merged_annotations(cls).items()
+        ],
+    }
+
+
+def _build_type_entry(cls: type, enum_classes: set[type], named_tuple_classes: set[type]) -> dict[str, Any]:
     pointer_metas = _effective_pointers(cls)  # computed once per type, not per pointer
     return {
         "module": _infer_module(cls),
@@ -269,7 +305,10 @@ def _build_type_entry(cls: type, enum_classes: set[type]) -> dict[str, Any]:
         "abstract": cls.__pylon_config__.abstract,
         "bases": [_type_qualname(base) for base in cls.__bases__ if hasattr(base, "__pylon_config__")],
         "pointers": [
-            {"name": name, **_classify_pointer(annotation, cls, enum_classes, pointer_metas.get(name))}
+            {
+                "name": name,
+                **_classify_pointer(annotation, cls, enum_classes, pointer_metas.get(name), named_tuple_classes),
+            }
             for name, annotation in _merged_annotations(cls).items()
         ],
         # Powers the AI tab's Type select (only types with >=1 entry here
@@ -285,14 +324,19 @@ def _build_type_entry(cls: type, enum_classes: set[type]) -> dict[str, Any]:
 async def _handle_get_schema(send: Send) -> None:
     registered_types, registered_enums, _ = schema_snapshot()
     enum_classes = set(registered_enums)
+    registered_named_tuples = named_tuples_snapshot()
+    named_tuple_classes = set(registered_named_tuples)
 
-    types = [_build_type_entry(cls, enum_classes) for cls in registered_types]
+    types = [_build_type_entry(cls, enum_classes, named_tuple_classes) for cls in registered_types]
     enums = [
         {"module": _infer_module(cls), "name": cls.__name__, "members": [member.name for member in cls]}
         for cls in registered_enums
     ]
+    named_tuples = [
+        _build_named_tuple_entry(cls, enum_classes, named_tuple_classes) for cls in registered_named_tuples
+    ]
 
-    await _send_json(send, 200, {"types": types, "enums": enums})
+    await _send_json(send, 200, {"types": types, "enums": enums, "namedTuples": named_tuples})
 
 
 # ---------------------------------------------------------------------------

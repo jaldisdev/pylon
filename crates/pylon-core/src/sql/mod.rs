@@ -2472,7 +2472,7 @@ mod tests {
     use crate::parse;
     use crate::schema::{
         FunctionDescriptor, FunctionParamDescriptor, LinkDescriptor, MultiLinkDescriptor,
-        PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -2623,6 +2623,7 @@ mod tests {
             ],
             scalars: vec![],
             enums: vec![],
+            named_tuples: vec![],
             globals: vec![],
             functions: vec![], aliases: vec![],
         }
@@ -2801,7 +2802,7 @@ mod tests {
                     indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
                 },
             ],
-            scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
         }
     }
 
@@ -2884,7 +2885,7 @@ mod tests {
                     junction: true,
                 },
             ],
-            scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
         }
     }
 
@@ -3744,6 +3745,66 @@ mod tests {
                 assert!(
                     msg.contains("unknown type 'Ghost'"),
                     "expected type name in error, got: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_structural_tuple_cast_unnamed_resolves_to_jsonb() {
+        let out = compile_and_emit("SELECT <tuple<str, bool>>$p");
+        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_structural_tuple_cast_named_resolves_to_jsonb() {
+        let out = compile_and_emit("SELECT <tuple<x: float64, y: float64>>$p");
+        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_structural_tuple_cast_nested_resolves_to_jsonb() {
+        let out = compile_and_emit(
+            "SELECT <tuple<point: tuple<x: float64, y: float64>, label: str>>$p",
+        );
+        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_nominal_named_tuple_cast_resolves_to_jsonb() {
+        let mut schema = make_schema();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+        });
+        let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
+        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_tuple_cast_mixed_named_and_unnamed_elements_rejected() {
+        match parse::parse("SELECT <tuple<x: float64, bool>>$p") {
+            Ok(_) => panic!("expected parse error for mixed named/unnamed tuple elements"),
+            Err(e) => assert!(
+                e.to_string().contains("all named or all unnamed"),
+                "got: {}",
+                e
+            ),
+        }
+    }
+
+    #[test]
+    fn test_is_with_tuple_type_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER Person is tuple<x: float64, y: float64>")
+            .unwrap();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected error for IS with a tuple type"),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("cannot use IS with a tuple type"),
+                    "got: {}",
+                    e
                 );
             }
         }

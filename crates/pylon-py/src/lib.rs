@@ -954,6 +954,31 @@ impl EnumDescriptor {
 }
 
 #[pyclass(module = "pylon._core", frozen)]
+pub struct NamedTupleDescriptor {
+    inner: core::schema::NamedTupleDescriptor,
+}
+
+#[pymethods]
+impl NamedTupleDescriptor {
+    #[new]
+    fn new(name: String, module: String) -> Self {
+        Self {
+            inner: core::schema::NamedTupleDescriptor { name, module },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    #[getter]
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
 pub struct GlobalDescriptor {
     inner: core::schema::GlobalDescriptor,
 }
@@ -1136,11 +1161,12 @@ pub struct SchemaDescriptor {
 #[pymethods]
 impl SchemaDescriptor {
     #[new]
-    #[pyo3(signature = (*, types = None, scalars = None, enums = None, globals = None, functions = None, aliases = None))]
+    #[pyo3(signature = (*, types = None, scalars = None, enums = None, named_tuples = None, globals = None, functions = None, aliases = None))]
     fn new(
         types: Option<Vec<PyRef<TypeDescriptor>>>,
         scalars: Option<Vec<PyRef<ScalarDescriptor>>>,
         enums: Option<Vec<PyRef<EnumDescriptor>>>,
+        named_tuples: Option<Vec<PyRef<NamedTupleDescriptor>>>,
         globals: Option<Vec<PyRef<GlobalDescriptor>>>,
         functions: Option<Vec<PyRef<FunctionDescriptor>>>,
         aliases: Option<Vec<PyRef<AliasDescriptor>>>,
@@ -1161,6 +1187,11 @@ impl SchemaDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|e| e.inner.clone())
+                    .collect(),
+                named_tuples: named_tuples
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|n| n.inner.clone())
                     .collect(),
                 globals: globals
                     .unwrap_or_default()
@@ -1199,6 +1230,11 @@ impl SchemaDescriptor {
     #[getter]
     fn enum_count(&self) -> usize {
         self.inner.enums.len()
+    }
+
+    #[getter]
+    fn named_tuple_count(&self) -> usize {
+        self.inner.named_tuples.len()
     }
 
     #[getter]
@@ -1815,6 +1851,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TypeDescriptor>()?;
     m.add_class::<ScalarDescriptor>()?;
     m.add_class::<EnumDescriptor>()?;
+    m.add_class::<NamedTupleDescriptor>()?;
     m.add_class::<GlobalDescriptor>()?;
     m.add_class::<AliasDescriptor>()?;
     m.add_class::<FunctionParamDescriptor>()?;

@@ -591,7 +591,7 @@ def _reload_schema(config):
             )
         importlib.import_module(stem)
 
-    from pylon.schema._registry import snapshot, functions_snapshot
+    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot
     types, enums, custom_scalars = snapshot()
     globals_: list = []
     for py_file in sorted(schema_dir.glob("*.py")):
@@ -599,7 +599,14 @@ def _reload_schema(config):
         if not stem.startswith("_") and stem in sys.modules:
             globals_.extend(collect_module_globals(sys.modules[stem]))
 
-    schema = walk(types, enums, custom_scalars, globals_, functions=functions_snapshot())
+    schema = walk(
+        types,
+        enums,
+        custom_scalars,
+        globals_,
+        functions=functions_snapshot(),
+        named_tuples=named_tuples_snapshot(),
+    )
     return schema
 
 

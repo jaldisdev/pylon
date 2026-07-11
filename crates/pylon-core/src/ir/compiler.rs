@@ -590,6 +590,52 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// Resolve a registered (nominal) `@pylon.named_tuple` type by name — used only
+    /// to recognize a cast target as a named tuple (member structure isn't
+    /// validated here; the value is trusted the same way a plain `<json>` cast is).
+    fn resolve_named_tuple(&self, name: &str) -> Option<&'a crate::schema::NamedTupleDescriptor> {
+        self.schema.named_tuples.iter().find(|nt| {
+            nt.name == name || format!("{}::{}", nt.module, nt.name) == name
+        })
+    }
+
+    /// Emit a bare `<pg_type>expr` scalar cast as a free-select statement — shared
+    /// by the enum/named-tuple/structural-tuple cast cases in `compile_stmt`'s
+    /// top-level `Expr::TypeCast` handling.
+    fn scalar_cast_free_select(&mut self, tc: &ast::TypeCast, pg_type: String, distinct: bool) -> Result<IrStmt, PyQLError> {
+        let inner = self.compile_free_expr(&tc.expr)?;
+        let cast_expr = IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type }));
+        Ok(IrStmt::FreeSelect(IrFreeSelect {
+            items: vec![IrFreeExpr::Scalar(cast_expr)],
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct,
+        }))
+    }
+
+    /// Resolve a cast's target `pg_type` string — shared by both `Expr::TypeCast`
+    /// compile sites (`compile_free_expr`/`compile_expr`). A structural tuple
+    /// always resolves to jsonb; a named type checks enum, then registered named
+    /// tuple, then falls back to the built-in scalar/pgvector/cal type list.
+    fn resolve_cast_pg_type(&self, ty: &ast::TypeExpr) -> Result<String, PyQLError> {
+        if matches!(ty, ast::TypeExpr::Tuple { .. }) {
+            return Ok("jsonb".to_string());
+        }
+        let (module, name) = ty.as_named().expect("checked above: not Tuple");
+        let qname = match module {
+            Some(m) => format!("{}::{}", m, name),
+            None => name.to_string(),
+        };
+        if let Some(ed) = self.resolve_enum(&qname) {
+            return Ok(format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name));
+        }
+        if self.resolve_named_tuple(&qname).is_some() {
+            return Ok("jsonb".to_string());
+        }
+        type_expr_to_pg(ty)
+    }
+
     fn compile_enum_access(&self, type_ref: &str, variant: &str) -> Result<IrExpr, PyQLError> {
         let ed = self.resolve_enum(type_ref).ok_or_else(|| {
             self.type_err(&format!("unknown type '{}'", type_ref))
@@ -698,58 +744,67 @@ impl<'a> Compiler<'a> {
 
                 // (<Module::Type>expr) { shape } — parenthesised id-lookup with shape.
                 // The parens are stripped by the parser, leaving Shape { expr: TypeCast }.
+                // Only meaningful for a named schema type — a structural tuple cast
+                // never denotes an object-type lookup.
                 if let Expr::Shape(sh) = result {
                     if let Some(Expr::TypeCast(tc)) = sh.expr.as_ref() {
-                        if tc.ty.module.as_deref().map(|m| !["std","cal","math","sys","pgvector"].contains(&m)).unwrap_or(false) {
-                            let id_filter = Expr::BinOp(Box::new(ast::BinOp {
-                                left: Expr::Path(ast::Path::relative("id")),
-                                op: ast::BinOpKind::Eq,
-                                right: tc.expr.clone(),
-                            }));
-                            let merged_filter = match &s.filter {
-                                None => Some(id_filter),
-                                Some(existing) => Some(Expr::BinOp(Box::new(ast::BinOp {
-                                    left: id_filter,
-                                    op: ast::BinOpKind::And,
-                                    right: existing.clone(),
-                                }))),
-                            };
-                            let synthetic = ast::SelectStmt {
-                                result: Expr::Shape(Box::new(ast::ShapeExpr {
-                                    expr: Some(Expr::Path(ast::Path::absolute(&tc.ty.name))),
-                                    elements: sh.elements.clone(),
-                                })),
-                                filter: merged_filter,
-                                order_by: s.order_by.clone(),
-                                offset: s.offset.clone(),
-                                limit: s.limit.clone(),
-                            };
-                            return self.compile_select(&synthetic, distinct).map(IrStmt::Select);
+                        if let Some((module, name)) = tc.ty.as_named() {
+                            if module.map(|m| !["std","cal","math","sys","pgvector"].contains(&m)).unwrap_or(false) {
+                                let id_filter = Expr::BinOp(Box::new(ast::BinOp {
+                                    left: Expr::Path(ast::Path::relative("id")),
+                                    op: ast::BinOpKind::Eq,
+                                    right: tc.expr.clone(),
+                                }));
+                                let merged_filter = match &s.filter {
+                                    None => Some(id_filter),
+                                    Some(existing) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                                        left: id_filter,
+                                        op: ast::BinOpKind::And,
+                                        right: existing.clone(),
+                                    }))),
+                                };
+                                let synthetic = ast::SelectStmt {
+                                    result: Expr::Shape(Box::new(ast::ShapeExpr {
+                                        expr: Some(Expr::Path(ast::Path::absolute(name))),
+                                        elements: sh.elements.clone(),
+                                    })),
+                                    filter: merged_filter,
+                                    order_by: s.order_by.clone(),
+                                    offset: s.offset.clone(),
+                                    limit: s.limit.clone(),
+                                };
+                                return self.compile_select(&synthetic, distinct).map(IrStmt::Select);
+                            }
                         }
                     }
                 }
-                // <Module::Type>expr — schema object lookup by id, or enum cast.
-                // Stdlib modules are handled by compile_free_expr; only user schema modules route here.
+                // <Module::Type>expr — schema object lookup by id, or a scalar cast
+                // (enum, registered named tuple, or a bare structural `tuple<...>`).
+                // Stdlib modules are handled by compile_free_expr; only user schema
+                // modules (or a structural tuple, which has no module at all) route here.
                 const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector"];
                 if let Expr::TypeCast(tc) = result {
-                    let qname = match tc.ty.module.as_deref() {
-                        Some(m) => format!("{}::{}", m, tc.ty.name),
-                        None => tc.ty.name.clone(),
-                    };
-                    if let Some(ed) = self.resolve_enum(&qname) {
-                        let pg_type = format!("\"{}\".\"{}\"", ed.module, ed.name);
-                        let inner = self.compile_free_expr(&tc.expr)?;
-                        let cast_expr = IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type }));
-                        return Ok(IrStmt::FreeSelect(IrFreeSelect {
-                            items: vec![IrFreeExpr::Scalar(cast_expr)],
-                            order_by: vec![],
-                            offset: None,
-                            limit: None,
-                            distinct,
-                        }));
+                    // A structural tuple cast is always a plain scalar (jsonb) cast —
+                    // never an object-type lookup — so it's handled directly, before
+                    // any of the qname-based (named-type-only) checks below.
+                    if matches!(&tc.ty, ast::TypeExpr::Tuple { .. }) {
+                        return self.scalar_cast_free_select(tc, "jsonb".to_string(), distinct);
                     }
-                    if tc.ty.module.as_deref().map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false) {
-                        return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
+                    if let Some((module, name)) = tc.ty.as_named() {
+                        let qname = match module {
+                            Some(m) => format!("{}::{}", m, name),
+                            None => name.to_string(),
+                        };
+                        if let Some(ed) = self.resolve_enum(&qname) {
+                            let pg_type = format!("\"{}\".\"{}\"", ed.module, ed.name);
+                            return self.scalar_cast_free_select(tc, pg_type, distinct);
+                        }
+                        if self.resolve_named_tuple(&qname).is_some() {
+                            return self.scalar_cast_free_select(tc, "jsonb".to_string(), distinct);
+                        }
+                        if module.map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false) {
+                            return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
+                        }
                     }
                 }
                 // Path traversal: `select TypeName.link.prop` or `select TypeName.link { shape }`.
@@ -820,8 +875,10 @@ impl<'a> Compiler<'a> {
                                 let src_td = self.resolve_type(src_name)?;
                                 {
                                     let src_qname = format!("{}::{}", src_td.module, src_td.name);
-                                    let check_module = ty.module.as_deref().unwrap_or(&src_td.module);
-                                    let check_name = format!("{}::{}", check_module, ty.name);
+                                    let (ty_module, ty_name) = ty.as_named()
+                                        .ok_or_else(|| self.type_err("cannot use IS with a tuple type"))?;
+                                    let check_module = ty_module.unwrap_or(&src_td.module);
+                                    let check_name = format!("{}::{}", check_module, ty_name);
                                     self.resolve_type(&check_name)?;
                                     let check_qname = check_name;
                                     let src_table = src_td.table.clone();
@@ -923,8 +980,12 @@ impl<'a> Compiler<'a> {
                 right: existing.clone(),
             }))),
         };
+        // Callers only reach this function after confirming `tc.ty` is `Named`
+        // (a structural tuple is never an object-type lookup).
+        let (_, name) = tc.ty.as_named()
+            .ok_or_else(|| self.type_err("cannot use a tuple type as a schema object cast"))?;
         let synthetic = ast::SelectStmt {
-            result: Expr::Path(ast::Path::absolute(&tc.ty.name)),
+            result: Expr::Path(ast::Path::absolute(name)),
             filter: merged_filter,
             order_by: sel.order_by.clone(),
             offset: sel.offset.clone(),
@@ -1966,15 +2027,7 @@ impl<'a> Compiler<'a> {
 
             Expr::TypeCast(tc) => {
                 let inner = self.compile_free_expr(&tc.expr)?;
-                let qname = match tc.ty.module.as_deref() {
-                    Some(m) => format!("{}::{}", m, tc.ty.name),
-                    None => tc.ty.name.clone(),
-                };
-                let pg_type = if let Some(ed) = self.resolve_enum(&qname) {
-                    format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name)
-                } else {
-                    type_expr_to_pg(&tc.ty)?
-                };
+                let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
             }
 
@@ -2398,8 +2451,10 @@ impl<'a> Compiler<'a> {
             Stmt::Select(sel) => {
                 // <Module::Type>expr — type name comes from the cast target
                 if let Expr::TypeCast(tc) = &sel.result {
-                    if tc.ty.module.as_deref().map(|m| m != "std").unwrap_or(false) {
-                        return Ok(tc.ty.name.clone());
+                    if let Some((module, name)) = tc.ty.as_named() {
+                        if module.map(|m| m != "std").unwrap_or(false) {
+                            return Ok(name.to_string());
+                        }
                     }
                 }
                 // SELECT-over-SELECT: get the type from the inner select's result
@@ -3678,15 +3733,7 @@ impl<'a> Compiler<'a> {
 
             Expr::TypeCast(tc) => {
                 let inner = self.compile_expr(&tc.expr, td, alias)?;
-                let qname = match tc.ty.module.as_deref() {
-                    Some(m) => format!("{}::{}", m, tc.ty.name),
-                    None => tc.ty.name.clone(),
-                };
-                let pg_type = if let Some(ed) = self.resolve_enum(&qname) {
-                    format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name)
-                } else {
-                    type_expr_to_pg(&tc.ty)?
-                };
+                let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type })))
             }
 
@@ -3832,8 +3879,10 @@ impl<'a> Compiler<'a> {
             _ => (self_qname.clone(), false),
         };
 
-        let check_module = ty.module.as_deref().unwrap_or(td.module.as_str());
-        let check_qname = format!("{}::{}", check_module, ty.name);
+        let (ty_module, ty_name) = ty.as_named()
+            .ok_or_else(|| self.type_err("cannot use IS with a tuple type"))?;
+        let check_module = ty_module.unwrap_or(td.module.as_str());
+        let check_qname = format!("{}::{}", check_module, ty_name);
         self.resolve_type(&check_qname)?;
 
         if !cross_scope {
@@ -5585,9 +5634,19 @@ fn path_leaf(p: &ast::Path) -> Result<&str, PyQLError> {
 
 /// Map a PyQL type expression to a PostgreSQL type string.
 fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
+    let Some((module, bare_name)) = ty.as_named() else {
+        // Callers resolve a structural tuple to "jsonb" directly before ever
+        // reaching this function (see `resolve_cast_pg_type`) — reaching here
+        // with one would be an internal bug, not a user-facing scenario.
+        return Err(PyQLError::Type(PyQLTypeError {
+            message: "internal error: structural tuple type reached type_expr_to_pg".into(),
+            position: Position { line: 0, col: 0 },
+        }));
+    };
+
     // pgvector:: types map directly to PostgreSQL types.
-    if ty.module.as_deref() == Some("pgvector") {
-        return match ty.name.as_str() {
+    if module == Some("pgvector") {
+        return match bare_name {
             "vector" => Ok("vector".to_string()),
             other => Err(PyQLError::Type(PyQLTypeError {
                 message: format!("unknown pgvector type '{other}'; valid types are: vector"),
@@ -5597,8 +5656,8 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
     }
 
     // cal:: types map directly to PostgreSQL types.
-    if ty.module.as_deref() == Some("cal") {
-        let pg = match ty.name.as_str() {
+    if module == Some("cal") {
+        let pg = match bare_name {
             "local_datetime" => "timestamp",
             "local_date"     => "date",
             "local_time"     => "time",
@@ -5615,11 +5674,11 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         return Ok(pg.to_string());
     }
 
-    let name = match ty.module.as_deref() {
-        Some("std") | None => ty.name.as_str(),
+    let name = match module {
+        Some("std") | None => bare_name,
         Some(m) => {
             return Err(PyQLError::Type(PyQLTypeError {
-                message: format!("unknown type '{}::{}'", m, ty.name),
+                message: format!("unknown type '{}::{}'", m, bare_name),
                 position: Position { line: 0, col: 0 },
             }))
         }

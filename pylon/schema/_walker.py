@@ -888,6 +888,13 @@ def _build_enum_descriptor(cls: type, _core: Any) -> Any:
     return _core.EnumDescriptor(name=cls.__name__, module=module, members=members)
 
 
+def _build_named_tuple_descriptor(cls: type, _core: Any) -> Any:
+    module = getattr(cls, "__pylon_module__", None) or (
+        (cls.__module__ or "default").rpartition(".")[-1] or "default"
+    )
+    return _core.NamedTupleDescriptor(name=cls.__name__, module=module)
+
+
 def _build_global_descriptor(g: Any, _core: Any) -> Any:
     from ._scalars import _PylonScalar
 
@@ -1071,6 +1078,7 @@ def walk(
     globals_: list[Any],
     functions: list[Any] | None = None,
     aliases: list[Any] | None = None,
+    named_tuples: list[type] | None = None,
 ) -> Any:
     """Walk the collected schema and return a pylon._core.SchemaDescriptor.
 
@@ -1105,6 +1113,9 @@ def walk(
     ]
     scalar_descs = [_build_scalar_descriptor(cls, _core) for cls in custom_scalars]
     enum_descs = [_build_enum_descriptor(cls, _core) for cls in enums]
+    named_tuple_descs = [
+        _build_named_tuple_descriptor(cls, _core) for cls in (named_tuples or [])
+    ]
     global_descs = [_build_global_descriptor(g, _core) for g in globals_]
     fn_descs = [
         _build_function_descriptor(f, type_map, class_to_qname, _core)
@@ -1119,6 +1130,7 @@ def walk(
         types=type_descs,
         scalars=scalar_descs,
         enums=enum_descs,
+        named_tuples=named_tuple_descs,
         globals=global_descs,
         functions=fn_descs,
         aliases=alias_descs,

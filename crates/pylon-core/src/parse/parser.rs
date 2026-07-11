@@ -633,6 +633,15 @@ impl Parser {
         if i >= n { return false; }
         // must start with an identifier
         if !matches!(self.tokens[i].token, Token::Ident(_)) { return false; }
+        // `<tuple<...` — a structural tuple cast. The outer `<...>` isn't
+        // balance-checkable with this simple lookahead (nesting can go arbitrarily
+        // deep), but a bare identifier "tuple" immediately followed by `<` is never
+        // a legitimate comparison operand, so treat it unconditionally as a cast.
+        if let Token::Ident(name) = &self.tokens[i].token {
+            if name == "tuple" && i + 1 < n && matches!(self.tokens[i + 1].token, Token::Lt) {
+                return true;
+            }
+        }
         i += 1;
         if i >= n { return false; }
         // optional `::` Name
@@ -647,14 +656,61 @@ impl Parser {
     }
 
     fn parse_type_expr(&mut self) -> Result<TypeExpr, PyQLSyntaxError> {
+        // `tuple` is a contextual keyword: a bare identifier "tuple" immediately
+        // followed by `<` starts a structural tuple type instead of a plain named
+        // type reference — no real schema type would ever be named "tuple" and
+        // written this way, so no reserved-word conflict.
+        if matches!(self.current(), Token::Ident(s) if s == "tuple") && matches!(self.peek_ahead(1), Token::Lt) {
+            self.advance(); // "tuple"
+            self.advance(); // "<"
+            let elements = self.parse_tuple_type_elements()?;
+            self.eat(&Token::Gt)?;
+            return Ok(TypeExpr::Tuple { elements });
+        }
+
         let first = self.eat_ident()?;
         if matches!(self.current(), Token::ColonColon) {
             self.advance();
             let name = self.eat_ident()?;
-            Ok(TypeExpr { module: Some(first), name })
+            Ok(TypeExpr::named(Some(first), name))
         } else {
-            Ok(TypeExpr { module: None, name: first })
+            Ok(TypeExpr::named(None, first))
         }
+    }
+
+    /// Comma-separated `tuple<...>` elements — each either a bare `TypeExpr`
+    /// (unnamed/positional element) or `name: TypeExpr` (named element). Nesting
+    /// is handled for free since each element's own type is parsed via the same
+    /// `parse_type_expr`. Rejects a mix of named and unnamed elements.
+    fn parse_tuple_type_elements(&mut self) -> Result<Vec<TupleTypeElement>, PyQLSyntaxError> {
+        let mut elements = vec![];
+        loop {
+            // A named element starts with `ident ':'` — checked via lookahead so a
+            // bare type reference (which also starts with an identifier) isn't
+            // mistaken for one; `::` (module separator) is a different token so
+            // this can't collide with `module::Name`.
+            let name = if matches!(self.current(), Token::Ident(_)) && matches!(self.peek_ahead(1), Token::Colon) {
+                let n = self.eat_ident()?;
+                self.eat(&Token::Colon)?;
+                Some(n)
+            } else {
+                None
+            };
+            let ty = self.parse_type_expr()?;
+            elements.push(TupleTypeElement { name, ty: Box::new(ty) });
+
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        let named_count = elements.iter().filter(|e| e.name.is_some()).count();
+        if named_count != 0 && named_count != elements.len() {
+            return Err(self.err("tuple elements must be all named or all unnamed, not mixed"));
+        }
+        Ok(elements)
     }
 
     // Postfix: shape `{...}`, dot traversal, type intersection `[is T]`, link prop `@prop`
@@ -790,7 +846,7 @@ impl Parser {
                 self.advance();
                 // Emit as <decimal>str — compiles to 'value'::numeric
                 Ok(Expr::TypeCast(Box::new(TypeCast {
-                    ty: TypeExpr { module: Some("std".to_string()), name: "decimal".to_string() },
+                    ty: TypeExpr::named(Some("std".to_string()), "decimal"),
                     expr: Expr::Literal(Literal::Str(s)),
                 })))
             }

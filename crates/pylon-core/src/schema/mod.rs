@@ -285,6 +285,16 @@ pub struct EnumDescriptor {
     pub members: Vec<String>,
 }
 
+/// A registered (nominal) `@pylon.named_tuple` type — just enough for cast-target
+/// resolution (`<module::Name>expr` → jsonb). Member structure isn't represented
+/// here at all: it's never validated at compile time, matching the same trust
+/// boundary a plain `<json>` cast already has.
+#[derive(Debug, Clone)]
+pub struct NamedTupleDescriptor {
+    pub name: String,
+    pub module: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalDescriptor {
     pub name: String,
@@ -342,6 +352,7 @@ pub struct SchemaDescriptor {
     pub types: Vec<TypeDescriptor>,
     pub scalars: Vec<ScalarDescriptor>,
     pub enums: Vec<EnumDescriptor>,
+    pub named_tuples: Vec<NamedTupleDescriptor>,
     pub globals: Vec<GlobalDescriptor>,
     pub functions: Vec<FunctionDescriptor>,
     pub aliases: Vec<AliasDescriptor>,

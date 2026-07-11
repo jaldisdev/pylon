@@ -1226,6 +1226,7 @@ mod tests {
             types: vec![person_type()],
             scalars: vec![],
             enums: vec![],
+            named_tuples: vec![],
             globals: vec![],
             functions: fns,
             aliases: vec![],
@@ -1313,6 +1314,7 @@ mod tests {
                 is_sequence: true,
             }],
             enums: vec![],
+            named_tuples: vec![],
             globals: vec![],
             functions: vec![], aliases: vec![],
         };
