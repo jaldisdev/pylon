@@ -25,7 +25,13 @@ from pylon.client import Client
 from pylon.config import Config
 from pylon.exceptions import PylonError
 from pylon.schema._decorators import _get_own_annotations, _infer_module, _unwrap_optional
-from pylon.schema._pointers import ComputedAnnotation, LinkAnnotation, MultiLinkAnnotation, PropertyAnnotation
+from pylon.schema._pointers import (
+    ComputedAnnotation,
+    LinkAnnotation,
+    MultiLinkAnnotation,
+    PropertyAnnotation,
+    TupleAnnotation,
+)
 from pylon.schema._meta import PointerMeta
 from pylon.schema._registry import named_tuples_snapshot, snapshot as schema_snapshot
 from pylon.schema._walker import _effective_pointers
@@ -249,6 +255,11 @@ def _classify_pointer(
             result = {"kind": "enum", "target": _type_qualname(scalar_type)}
         elif isinstance(scalar_type, type) and scalar_type in named_tuple_classes:
             result = {"kind": "namedTuple", "target": _type_qualname(scalar_type)}
+        elif isinstance(scalar_type, TupleAnnotation):
+            result = {
+                "kind": "namedTuple",
+                "members": _classify_tuple_elements(scalar_type, enum_classes, named_tuple_classes),
+            }
         else:
             type_name = _scalar_type_name(scalar_type)
             result = {"kind": "property", "typeName": type_name} if type_name else {"kind": "property"}
@@ -264,21 +275,48 @@ def _vector_index_pointer_names(vi: Any) -> list[str]:
     return [vp.ref.split(".", 1)[1] for vp in vi._vector_pointers]
 
 
+def _classify_member_type(
+    annotation: Any, enum_classes: set[type], named_tuple_classes: set[type]
+) -> dict[str, Any]:
+    """Returns the {kind, target?, typeName?, members?} fragment for one
+    tuple-member's *type* (no `required` — that's caller-specific: a nominal
+    named-tuple dataclass field can be `X | None`, a structural tuple<...>
+    element cannot). Shared by nominal named-tuple members and structural
+    pylon.Tuple[...] elements, recursing for a nested Tuple[...] element."""
+    if isinstance(annotation, TupleAnnotation):
+        return {
+            "kind": "namedTuple",
+            "members": _classify_tuple_elements(annotation, enum_classes, named_tuple_classes),
+        }
+    if isinstance(annotation, type) and annotation in named_tuple_classes:
+        return {"kind": "namedTuple", "target": _type_qualname(annotation)}
+    if isinstance(annotation, type) and annotation in enum_classes:
+        return {"kind": "enum", "target": _type_qualname(annotation)}
+    type_name = _scalar_type_name(annotation)
+    return {"kind": "scalar", "typeName": type_name} if type_name else {"kind": "scalar"}
+
+
+def _classify_tuple_elements(
+    tuple_ann: TupleAnnotation, enum_classes: set[type], named_tuple_classes: set[type]
+) -> list[dict[str, Any]]:
+    """Returns the {name, kind, target?, typeName?, members?} fragment list
+    for a structural pylon.Tuple[...]'s elements. `name` is None for an
+    unnamed/positional element."""
+    return [
+        {"name": elem.name, **_classify_member_type(elem.type_, enum_classes, named_tuple_classes)}
+        for elem in tuple_ann.elements
+    ]
+
+
 def _classify_named_tuple_member(
     annotation: Any, enum_classes: set[type], named_tuple_classes: set[type]
 ) -> dict[str, Any]:
-    """Returns the {kind, target?, typeName?, required} fragment for one
-    named-tuple member. A member is always a plain dataclass field — never a
-    Link/MultiLink/Computed, since those annotations only exist on
+    """Returns the {kind, target?, typeName?, members?, required} fragment
+    for one named-tuple member. A member is always a plain dataclass field —
+    never a Link/MultiLink/Computed, since those annotations only exist on
     @pylon.type-decorated schema types, not value types."""
     nullable, inner = _unwrap_optional(annotation)
-    if isinstance(inner, type) and inner in named_tuple_classes:
-        result: dict[str, Any] = {"kind": "namedTuple", "target": _type_qualname(inner)}
-    elif isinstance(inner, type) and inner in enum_classes:
-        result = {"kind": "enum", "target": _type_qualname(inner)}
-    else:
-        type_name = _scalar_type_name(inner)
-        result = {"kind": "scalar", "typeName": type_name} if type_name else {"kind": "scalar"}
+    result = _classify_member_type(inner, enum_classes, named_tuple_classes)
     result["required"] = not nullable
     return result
 

@@ -300,13 +300,26 @@ class Tuple:
 
     @classmethod
     def __class_getitem__(cls, params: Any) -> TupleAnnotation:
-        if not isinstance(params, tuple):
+        def _is_named_item(p: Any) -> bool:
+            return (
+                isinstance(p, tuple)
+                and len(p) == 2
+                and isinstance(p[0], str)
+                and not isinstance(p[1], str)
+            )
+
+        if _is_named_item(params):
+            # Tuple[("name", Type)] — a single named element. Python's subscript
+            # syntax doesn't add an extra wrapping tuple when the bracket
+            # contains one already-parenthesized item, so this arrives
+            # unwrapped and indistinguishable from Tuple["name", Type] (two
+            # unnamed elements) by shape alone; re-wrap it here. Safe because a
+            # bare `str` can never legitimately be an unnamed element's type.
+            params = (params,)
+        elif not isinstance(params, tuple):
             params = (params,)
         if not params:
             raise TypeError("Tuple[...] requires at least one element")
-
-        def _is_named_item(p: Any) -> bool:
-            return isinstance(p, tuple) and len(p) == 2 and isinstance(p[0], str)
 
         named_flags = [_is_named_item(p) for p in params]
         if any(named_flags) and not all(named_flags):
