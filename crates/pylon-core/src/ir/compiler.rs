@@ -2439,7 +2439,40 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
         };
 
-        let assignments = self.compile_assignments(&ins.shape, td, &alias)?;
+        // Multi-link shape elements (`tags := ...` / `tags += ...`) populate
+        // the junction table once the row exists; everything else goes
+        // through the normal scalar/link assignment path.
+        let mut multi_link_appends = vec![];
+        let mut scalar_elements: Vec<ShapeElement> = vec![];
+        for el in &ins.shape {
+            let field_name = match path_leaf(&el.path) {
+                Ok(n) => n,
+                Err(_) => { scalar_elements.push(el.clone()); continue; }
+            };
+            if let Some(ml) = Self::resolve_multilink(td, field_name) {
+                match el.op {
+                    ShapeOp::Remove => return Err(self.type_err(&format!(
+                        "cannot use `-=` for multi-link '{field_name}' in an insert; \
+                         there is nothing to remove from yet"
+                    ))),
+                    ShapeOp::Assign | ShapeOp::Append => {
+                        if let Some(expr) = &el.compexpr {
+                            let (jt, module, src_col, tgt_col, through_td) =
+                                self.multilink_junction_info(td, ml)?;
+                            let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
+                            multi_link_appends.push(IrMultiLinkMutation {
+                                junction_table: jt, module, source_col: src_col,
+                                target_col: tgt_col, values,
+                            });
+                        }
+                    }
+                }
+            } else {
+                scalar_elements.push(el.clone());
+            }
+        }
+
+        let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
         // Compile INSERT rewrites; substitute column refs so they are valid in VALUES.
         let assignment_map: HashMap<String, IrExpr> =
             assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
@@ -2471,6 +2504,7 @@ impl<'a> Compiler<'a> {
             returning,
             enqueue_vector,
             enqueue_search,
+            multi_link_appends,
         })
     }
 

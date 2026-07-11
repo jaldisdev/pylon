@@ -337,6 +337,11 @@ pub struct IrInsert {
     pub enqueue_vector: Vec<VectorEnqueueInfo>,
     /// OpenSearch-backed SearchIndexes that need outbox rows written.
     pub enqueue_search: Vec<SearchEnqueueInfo>,
+    /// `tags := expr` / `tags += expr` in the insert shape — populates the
+    /// junction table for a multi-link at creation time. Unlike IrUpdate,
+    /// there's no clear/remove list: a brand-new row has no prior junction
+    /// rows to clear or remove from.
+    pub multi_link_appends: Vec<IrMultiLinkMutation>,
 }
 
 #[derive(Debug, Clone)]

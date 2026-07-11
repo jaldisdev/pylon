@@ -177,6 +177,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
     let from_clause = if let Some(dml) = &sel.dml_source {
         let mut cte_parts = match dml.as_ref() {
             IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, "_dml"),
+            IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, "_dml"),
             _ => vec![format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml))],
         };
         let (enqueue_v, enqueue_s) = match dml.as_ref() {
@@ -396,16 +397,64 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     parts
 }
 
+fn insert_has_any_multilink(ins: &IrInsert) -> bool {
+    !ins.multi_link_appends.is_empty()
+}
+
+/// Builds the CTE chain for an INSERT with multi-link (junction table)
+/// assignments at creation time — same top-level-CTE constraint as
+/// `emit_update_multilink_ctes` (junction INSERTs are themselves
+/// data-modifying). The row itself is inserted first (`{name}__ids`, via
+/// `RETURNING *`) so the junction CTEs can reference its freshly-generated id.
+fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
+    let ids_name = format!("{}__ids", name);
+    let mut parts: Vec<String> = vec![];
+
+    let rewrite_cols: std::collections::HashSet<&str> =
+        ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+    let cols: Vec<String> = ins.assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(c, _)| qi(c))
+        .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
+        .collect();
+    let vals: Vec<String> = ins.assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(_, e)| emit_expr(e))
+        .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
+        .collect();
+    let mut insert_sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        source_ref(&ins.target), cols.join(", "), vals.join(", "),
+    );
+    if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
+    insert_sql.push_str("\nRETURNING *");
+    parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, insert_sql));
+
+    for (i, app) in ins.multi_link_appends.iter().enumerate() {
+        parts.push(emit_ml_append_cte(app, &ids_name, &format!("{}__ml_add_{}", name, i)));
+    }
+
+    parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
+    parts
+}
+
 /// Expands a list of user-bound WITH names into their top-level CTE parts —
-/// usually one part per name, except an UPDATE with any multi-link mutation
-/// expands into several sibling parts (see emit_update_multilink_ctes) since
-/// those can't be nested inside a single name's own CTE body.
+/// usually one part per name, except an UPDATE or INSERT with any multi-link
+/// mutation expands into several sibling parts (see
+/// emit_update_multilink_ctes / emit_insert_multilink_ctes) since those can't
+/// be nested inside a single name's own CTE body.
 fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
     let mut parts: Vec<String> = vec![];
     for c in ctes {
         if let IrStmt::Update(upd) = &c.stmt {
             if update_has_any_multilink(upd) {
                 parts.extend(emit_update_multilink_ctes(upd, &c.name));
+                continue;
+            }
+        }
+        if let IrStmt::Insert(ins) = &c.stmt {
+            if insert_has_any_multilink(ins) {
+                parts.extend(emit_insert_multilink_ctes(ins, &c.name));
                 continue;
             }
         }
@@ -1260,7 +1309,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         vals.push(emit_expr(&rw.expr));
     }
 
-    if ins.enqueue_vector.is_empty() && ins.enqueue_search.is_empty() {
+    if ins.enqueue_vector.is_empty() && ins.enqueue_search.is_empty() && !insert_has_any_multilink(ins) {
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
             source_ref(&ins.target), cols.join(", "), vals.join(", "),
@@ -1271,15 +1320,21 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         return SqlOutput { sql, shape, inference_plan: None };
     }
 
-    // Enqueue path: wrap INSERT in a CTE so we can append the outbox inserts.
-    let mut insert_sql = format!(
-        "    INSERT INTO {} ({}) VALUES ({})",
-        source_ref(&ins.target), cols.join(", "), vals.join(", "),
-    );
-    if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
-    insert_sql.push_str("\n    RETURNING \"id\"");
-
-    let mut cte_parts = vec![format!("\"_w\" AS (\n{}\n)", insert_sql)];
+    // Wrap path: needed for outbox enqueue CTEs and/or (see
+    // emit_insert_multilink_ctes) junction-table population, both of which
+    // require the row's own id, so the plain single-statement INSERT above
+    // can't be used.
+    let mut cte_parts = if insert_has_any_multilink(ins) {
+        emit_insert_multilink_ctes(ins, "_w")
+    } else {
+        let mut insert_sql = format!(
+            "    INSERT INTO {} ({}) VALUES ({})",
+            source_ref(&ins.target), cols.join(", "), vals.join(", "),
+        );
+        if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
+        insert_sql.push_str("\n    RETURNING \"id\"");
+        vec![format!("\"_w\" AS (\n{}\n)", insert_sql)]
+    };
     cte_parts.extend(enqueue_ctes(&ins.enqueue_vector, "_w"));
     cte_parts.extend(enqueue_search_ctes(&ins.enqueue_search, "_w", ins.enqueue_vector.len()));
 
@@ -2904,6 +2959,56 @@ mod tests {
         match crate::ir::compile(&ast, &schema) {
             Ok(_) => panic!("expected a compile error for link property on a remove (-=)"),
             Err(e) => assert!(e.to_string().contains("removing"), "expected a remove-related error, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_with_multilink_assignment() {
+        // Regression test: `insert Product { tags := ... }` used to fail with
+        // "object type 'default::Product' has no link or property 'tags'" —
+        // compile_assignments_inner never checked resolve_multilink, and
+        // IrInsert had no multi-link handling at all.
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "INSERT Product { name := $name, tags := (SELECT Tag FILTER .id = $tid) { @weight := <float64>$w } }",
+            &schema,
+        );
+        // The row insert must happen before the junction insert references its id.
+        assert!(out.sql.contains("\"_w__ids\" AS (\nINSERT INTO"), "missing row-insert CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"_w__ml_add_0\" AS ("), "missing junction-append CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"weight\""), "missing weight column:\n{}", out.sql);
+        assert!(out.sql.contains("\"_w\" AS (\n    SELECT * FROM \"_w__ids\"\n)"), "missing _w passthrough:\n{}", out.sql);
+        assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_bound_insert_with_multilink_assignment() {
+        // Same as above, but bound via WITH (the Data Explorer's actual
+        // shape) — exercises emit_user_cte_parts's insert_has_any_multilink
+        // branch instead of emit_insert_stmt's bare-statement path.
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "with insert0 := (insert Product { name := $name, tags := (select Tag filter .id = $tid) }) select insert0",
+            &schema,
+        );
+        assert!(out.sql.contains("\"insert0__ids\" AS (\nINSERT INTO"), "missing row-insert CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"insert0__ml_add_0\" AS ("), "missing junction-append CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"insert0\" AS (\n    SELECT * FROM \"insert0__ids\"\n)"), "missing insert0 passthrough:\n{}", out.sql);
+        assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_insert_multilink_remove_rejected() {
+        let schema = make_schema_with_through_and_prop();
+        let ast = crate::parse::parse(
+            "INSERT Product { name := $name, tags -= (SELECT Tag FILTER .id = $tid) }",
+        ).unwrap();
+        match crate::ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error for `-=` on a multi-link at insert time"),
+            Err(e) => assert!(
+                e.to_string().contains("nothing to remove"),
+                "expected a 'nothing to remove yet' error, got: {e}"
+            ),
         }
     }
 
