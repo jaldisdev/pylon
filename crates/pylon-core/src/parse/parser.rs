@@ -1107,7 +1107,9 @@ impl Parser {
             return Ok(ShapeElement::splat(Splat::Shallow));
         }
 
-        // Link property in a nested shape: `@name`
+        // Link property in a nested shape: `@name` (read), or `@name := expr`
+        // (write — only valid attached to a multi-link mutation's target
+        // expression, e.g. `(select Tag filter ...) { @weight := <float64>$w }`).
         if matches!(self.current(), Token::At) {
             self.advance();
             let name = self.eat_ident()?;
@@ -1115,11 +1117,17 @@ impl Parser {
                 steps: vec![PathStep::LinkProp(name)],
                 partial: true,
             };
+            let compexpr = if matches!(self.current(), Token::ColonEq) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             return Ok(ShapeElement {
                 path,
                 splat: None,
                 nested: None,
-                compexpr: None,
+                compexpr,
                 op: ShapeOp::Assign,
                 filter: None,
                 order_by: vec![],

@@ -1,10 +1,10 @@
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkField,
-    IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarField, IrScalarSetField, IrSelect,
-    IrShapeField, IrSingleLinkField, IrFtsSearch, IrSort, IrSortDir, IrSource, IrStmt, IrUpdate,
-    IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
+    IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrMultiLinkValueSource, IrNulls,
+    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarField,
+    IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrFtsSearch, IrSort, IrSortDir,
+    IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, InferencePlan, ShapeDescriptor, ShapeNode};
@@ -419,28 +419,76 @@ fn emit_cte_prefix(ctes: &[IrCteDef]) -> String {
     format!("WITH\n{}\n", emit_user_cte_parts(ctes).join(",\n"))
 }
 
-/// Emit `(SELECT id FROM ...)` sub-expression for a multi-link values source.
-fn emit_multilink_values_subquery(vals: &IrMultiLinkValues) -> String {
-    match vals {
-        IrMultiLinkValues::CteRef(name) => {
-            // Just the CTE name; will be aliased at the call site.
-            format!("\"{}\"", name)
+/// Collects every link-property name assigned anywhere in a multilink value
+/// tree (both sides of any nested `union`), in first-seen order — the SQL
+/// layer needs one consistent column list across every unioned branch, even
+/// when different targets set different (or no) properties.
+fn collect_link_prop_names(vals: &IrMultiLinkValues, names: &mut Vec<String>) {
+    for (name, _) in &vals.link_props {
+        if !names.contains(name) {
+            names.push(name.clone());
         }
-        IrMultiLinkValues::Select(s) => {
+    }
+    if let IrMultiLinkValueSource::Union(a, b) = &vals.source {
+        collect_link_prop_names(a, names);
+        collect_link_prop_names(b, names);
+    }
+}
+
+/// `, <expr> AS "name"` for each entry in `prop_names` — the value assigned to
+/// *this* node if any, else a bare `NULL` (Postgres infers its type from the
+/// other union branch's typed value in the same column position; if no
+/// branch ever sets it, the INSERT's target column type coerces it).
+fn emit_link_prop_cols(vals: &IrMultiLinkValues, prop_names: &[String]) -> String {
+    prop_names
+        .iter()
+        .map(|name| match vals.link_props.iter().find(|(n, _)| n == name) {
+            Some((_, expr)) => format!(", {} AS {}", emit_expr(expr), qi(name)),
+            None => format!(", NULL AS {}", qi(name)),
+        })
+        .collect()
+}
+
+/// Emit `(SELECT id[, prop, ...] FROM ...)` sub-expression for a multi-link
+/// values source. `prop_names` is the full set of link-property names used
+/// anywhere in the enclosing mutation (see `collect_link_prop_names`) — every
+/// leaf projects all of them so a `union` of heterogeneous branches has a
+/// consistent column list.
+fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String]) -> String {
+    if let IrMultiLinkValueSource::Union(a, b) = &vals.source {
+        return format!(
+            "({}\nUNION ALL\n{})",
+            emit_multilink_values_subquery(a, prop_names),
+            emit_multilink_values_subquery(b, prop_names),
+        );
+    }
+
+    let prop_cols = emit_link_prop_cols(vals, prop_names);
+
+    match &vals.source {
+        IrMultiLinkValueSource::CteRef(name) => {
+            if prop_cols.is_empty() {
+                // Just the CTE name; will be aliased at the call site.
+                format!("\"{}\"", name)
+            } else {
+                format!("(SELECT \"_s\".\"id\"{} FROM \"{}\" AS \"_s\")", prop_cols, name)
+            }
+        }
+        IrMultiLinkValueSource::Select(s) => {
             let alias = &s.source.alias;
             let mut sql = format!(
-                "(SELECT {}.\"id\" FROM {} AS {}",
-                qi(alias), source_ref(&s.source), qi(alias)
+                "(SELECT {}.\"id\"{} FROM {} AS {}",
+                qi(alias), prop_cols, source_ref(&s.source), qi(alias)
             );
             append_filter(&mut sql, &s.filter);
             sql.push(')');
             sql
         }
-        IrMultiLinkValues::PathSelect(ps) => {
+        IrMultiLinkValueSource::PathSelect(ps) => {
             let root_alias = &ps.root.alias;
             let mut sql = format!(
-                "(SELECT {}.\"id\" FROM {} AS {}",
-                qi(root_alias), source_ref(&ps.root), qi(root_alias)
+                "(SELECT {}.\"id\"{} FROM {} AS {}",
+                qi(root_alias), prop_cols, source_ref(&ps.root), qi(root_alias)
             );
             for join in &ps.joins {
                 sql.push_str(&emit_path_join_sql(join));
@@ -449,6 +497,7 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues) -> String {
             sql.push(')');
             sql
         }
+        IrMultiLinkValueSource::Union(..) => unreachable!("handled above"),
     }
 }
 
@@ -502,15 +551,39 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
 /// callers hoisting this into a shared top-level WITH block alongside other
 /// user-bound statements pass a name prefixed for collision-safety instead).
 fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
-    let vals_ref = emit_multilink_values_subquery(&mutation.values);
+    let mut prop_names = vec![];
+    collect_link_prop_names(&mutation.values, &mut prop_names);
+    let vals_ref = emit_multilink_values_subquery(&mutation.values, &prop_names);
+
+    let extra_cols: String = prop_names.iter().map(|n| format!(", {}", qi(n))).collect();
+    let extra_select: String = prop_names.iter().map(|n| format!(", \"_v\".{}", qi(n))).collect();
+
+    // Re-checking an already-linked target with a new property value must
+    // update in place rather than error — a bare `DO NOTHING` (the no-
+    // properties case) would silently keep the old value instead.
+    let conflict_clause = if prop_names.is_empty() {
+        "ON CONFLICT DO NOTHING".to_string()
+    } else {
+        let sets: Vec<String> = prop_names.iter()
+            .map(|n| format!("{} = EXCLUDED.{}", qi(n), qi(n)))
+            .collect();
+        format!(
+            "ON CONFLICT ({}, {}) DO UPDATE SET {}",
+            qi(&mutation.source_col), qi(&mutation.target_col), sets.join(", "),
+        )
+    };
+
     let ins = format!(
-        "INSERT INTO {} ({}, {})\nSELECT \"{}\".\"id\", \"_v\".\"id\" FROM \"{}\" CROSS JOIN {} AS \"_v\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}",
+        "INSERT INTO {} ({}, {}{})\nSELECT \"{}\".\"id\", \"_v\".\"id\"{} FROM \"{}\" CROSS JOIN {} AS \"_v\"\n{}\nRETURNING {}, {}",
         qn(&mutation.module, &mutation.junction_table),
         qi(&mutation.source_col),
         qi(&mutation.target_col),
+        extra_cols,
         ids_name,
+        extra_select,
         ids_name,
         vals_ref,
+        conflict_clause,
         qi(&mutation.source_col),
         qi(&mutation.target_col),
     );
@@ -520,7 +593,9 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: 
 /// Emit the CTE clause for a junction table DELETE (remove). See
 /// emit_ml_append_cte re: `ids_name`.
 fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
-    let vals_ref = emit_multilink_values_subquery(&mutation.values);
+    // Removal never carries link-property assignments (rejected at compile
+    // time in ir/compiler.rs), so no extra columns are ever needed here.
+    let vals_ref = emit_multilink_values_subquery(&mutation.values, &[]);
     let del = format!(
         "DELETE FROM {}\nWHERE {} IN (SELECT \"id\" FROM \"{}\")\n  AND {} IN (SELECT \"id\" FROM {})\nRETURNING {}, {}",
         qn(&mutation.module, &mutation.junction_table),
@@ -2688,6 +2763,165 @@ mod tests {
         assert!(out.sql.contains("\"person\""));
         // Still emits array_agg pattern
         assert!(out.sql.contains("array_agg(ROW("));
+    }
+
+    /// Product/Tag/ProductTag — the actual real-world shape link properties
+    /// were built for (mirrors pylon-demo). Deliberately *not* built off
+    /// `make_schema_with_through` (Person self-linking to Person): a
+    /// same-type through-link hits a pre-existing, unrelated column-
+    /// resolution bug in `multilink_junction_info` (both source_col and
+    /// target_col resolve to the same link name when source type == target
+    /// type) — tracked separately, not fixed here.
+    fn make_schema_with_through_and_prop() -> SchemaDescriptor {
+        let id_prop = || PropertyDescriptor {
+            name: "id".into(), pg_type: "uuid".into(), nullable: false,
+            default_sql: Some("gen_random_uuid()".into()), description: None,
+            default_pyql: None, check_constraints: vec![], is_exclusive: true,
+            is_pk: true, is_readonly: true, rewrites: vec![],
+        };
+        let name_prop = || PropertyDescriptor {
+            name: "name".into(), pg_type: "text".into(), nullable: false,
+            default_sql: None, description: None, check_constraints: vec![],
+            default_pyql: None, is_exclusive: false, is_pk: false,
+            is_readonly: false, rewrites: vec![],
+        };
+        SchemaDescriptor {
+            types: vec![
+                TypeDescriptor {
+                    name: "Product".into(), module: "default".into(), table: "Product".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), name_prop()],
+                    links: vec![],
+                    multilinks: vec![MultiLinkDescriptor {
+                        name: "tags".into(),
+                        target: "default::Tag".into(),
+                        through: Some("default::ProductTag".into()),
+                        nullable: false, description: None, default_pyql: None, on_delete: vec![],
+                    }],
+                    computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![],
+                    search_indexes: vec![], triggers: vec![], junction: false,
+                },
+                TypeDescriptor {
+                    name: "Tag".into(), module: "default".into(), table: "Tag".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), name_prop()],
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
+                    junction: false,
+                },
+                TypeDescriptor {
+                    name: "ProductTag".into(), module: "default".into(), table: "Product.tags".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), PropertyDescriptor {
+                        name: "weight".into(), pg_type: "float8".into(), nullable: false,
+                        default_sql: None, default_pyql: None, description: None,
+                        check_constraints: vec![], is_exclusive: false, is_pk: false,
+                        is_readonly: false, rewrites: vec![],
+                    }],
+                    // No declared Link pointers — matches pylon-demo's actual
+                    // ProductTag, which relies on multilink_junction_info's
+                    // "source"/"target" defaults.
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
+                    junction: true,
+                },
+            ],
+            scalars: vec![], enums: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_multilink_append_with_link_property() {
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "UPDATE Product FILTER .id = $id SET { tags += (SELECT Tag FILTER .id = $tid) { @weight := <float64>$w } }",
+            &schema,
+        );
+        // Extra junction column present in both the INSERT column list and the SELECT list.
+        assert!(out.sql.contains("\"weight\""), "missing weight column:\n{}", out.sql);
+        // Re-linking an existing pair with a new weight must update in place,
+        // not silently keep the old value (a bare `DO NOTHING` would).
+        assert!(
+            out.sql.contains("ON CONFLICT (\"source\", \"target\") DO UPDATE SET \"weight\" = EXCLUDED.\"weight\""),
+            "missing upsert conflict clause:\n{}", out.sql
+        );
+    }
+
+    #[test]
+    fn test_multilink_append_union_with_different_link_property_values() {
+        // The realistic Data Explorer scenario: multiple checked targets in
+        // one `+=`, each with its own distinct property value — expressed as
+        // a `union` of individually-shaped target selects.
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "UPDATE Product FILTER .id = $id SET { \
+                tags += (SELECT Tag FILTER .id = $aid) { @weight := <float64>$w1 } \
+                    union (SELECT Tag FILTER .id = $bid) { @weight := <float64>$w2 } \
+            }",
+            &schema,
+        );
+        assert!(out.sql.contains("UNION ALL"), "expected a UNION ALL between the two shaped targets:\n{}", out.sql);
+        // Both branches must select the same "weight" column (with their own
+        // value) so the union has a consistent column list.
+        assert_eq!(out.sql.matches("AS \"weight\"").count(), 2, "each union branch must project its own weight:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_multilink_append_without_link_property_keeps_do_nothing() {
+        // No `@prop := ...` anywhere — must keep the original DO NOTHING
+        // behavior (no spurious upsert/extra columns for the common case).
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "UPDATE Product FILTER .id = $id SET { tags += (SELECT Tag FILTER .id = $tid) }",
+            &schema,
+        );
+        assert!(out.sql.contains("ON CONFLICT DO NOTHING"), "expected plain DO NOTHING when no link properties are set:\n{}", out.sql);
+        assert!(!out.sql.contains("\"weight\""), "unexpected weight column with no link property assignment:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_multilink_link_property_rejected_on_standard_junction() {
+        // Person.posts is a Standard (implicit) junction — no user-declared
+        // properties, so `@prop := ...` must be rejected at compile time.
+        let ast = crate::parse::parse(
+            "UPDATE Person FILTER .id = $id SET { posts += (SELECT Post FILTER .title = $t) { @weight := <float64>$w } }",
+        ).unwrap();
+        match crate::ir::compile(&ast, &make_schema()) {
+            Ok(_) => panic!("expected a compile error for link property on a Standard junction"),
+            Err(e) => assert!(e.to_string().contains("through"), "expected a through(...)-related error, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_multilink_link_property_rejected_on_remove() {
+        let schema = make_schema_with_through_and_prop();
+        let ast = crate::parse::parse(
+            "UPDATE Product FILTER .id = $id SET { tags -= (SELECT Tag FILTER .id = $tid) { @weight := <float64>$w } }",
+        ).unwrap();
+        match crate::ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error for link property on a remove (-=)"),
+            Err(e) => assert!(e.to_string().contains("removing"), "expected a remove-related error, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_multilink_junction_info_disambiguates_self_referencing_through_type() {
+        // Regression test for a self-referencing through-link (Person.friends
+        // via PersonFriend, which declares two Person-typed links: "person"
+        // and "friend"). Naively matching purely by target type resolves
+        // *both* source_col and target_col to the same first-matching link
+        // ("person"), silently collapsing the junction to a single column
+        // and losing the other side entirely.
+        let schema = make_schema_with_through();
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { friends += (SELECT Person FILTER .id = $fid) }",
+            &schema,
+        );
+        assert!(out.sql.contains("(\"person\", \"friend\")"), "expected two distinct FK columns:\n{}", out.sql);
+        assert!(!out.sql.contains("(\"person\", \"person\")"), "source/target collapsed to the same column:\n{}", out.sql);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use super::{
     IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrComputedGlobalCte,
     IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
     IrMultiLinkClear, IrMultiLinkField, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
+    IrMultiLinkValueSource,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrScalarField, IrScalarSetField, IrSelect, IrShapeField, IrSingleLinkField, IrSort, IrSortDir, IrSource, IrStmt,
     IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
@@ -2580,7 +2581,7 @@ impl<'a> Compiler<'a> {
             };
 
             if let Some(ml) = Self::resolve_multilink(td, field_name) {
-                let (jt, module, src_col, tgt_col) =
+                let (jt, module, src_col, tgt_col, through_td) =
                     self.multilink_junction_info(td, ml)?;
 
                 match el.op {
@@ -2602,7 +2603,7 @@ impl<'a> Compiler<'a> {
                                 module: module.clone(),
                                 source_col: src_col.clone(),
                             });
-                            let values = self.compile_multilink_values(expr)?;
+                            let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_replaces.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
                                 target_col: tgt_col, values,
@@ -2611,7 +2612,7 @@ impl<'a> Compiler<'a> {
                     }
                     ShapeOp::Append => {
                         if let Some(expr) = &el.compexpr {
-                            let values = self.compile_multilink_values(expr)?;
+                            let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
                                 target_col: tgt_col, values,
@@ -2620,7 +2621,13 @@ impl<'a> Compiler<'a> {
                     }
                     ShapeOp::Remove => {
                         if let Some(expr) = &el.compexpr {
-                            let values = self.compile_multilink_values(expr)?;
+                            let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
+                            if has_any_link_props(&values) {
+                                return Err(self.type_err(
+                                    "link properties (`@prop := value`) cannot be assigned \
+                                     when removing a link (`-=`)"
+                                ));
+                            }
                             multi_link_removals.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
                                 target_col: tgt_col, values,
@@ -2674,18 +2681,24 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    /// Extract junction table info for a multi-link: (junction_table, module, source_col, target_col).
+    /// Extract junction table info for a multi-link: (junction_table, module,
+    /// source_col, target_col, through_td). `through_td` is the junction
+    /// type's own TypeDescriptor for a `through(...)` multi-link (needed to
+    /// validate/compile `@prop := expr` link-property assignments against its
+    /// real properties) — `None` for a Standard (implicit) junction table,
+    /// which has no user-declared properties at all.
     fn multilink_junction_info(
         &mut self,
         td: &TypeDescriptor,
         ml: &MultiLinkDescriptor,
-    ) -> Result<(String, String, String, String), PyQLError> {
+    ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
         match &ml.through {
             None => Ok((
                 format!("{}.{}", td.table, ml.name),
                 td.module.clone(),
                 "source".to_string(),
                 "target".to_string(),
+                None,
             )),
             Some(through_qname) => {
                 let through_td = self.resolve_type(through_qname)?;
@@ -2695,27 +2708,106 @@ impl<'a> Compiler<'a> {
                     .map(|l| l.name.clone())
                     .unwrap_or_else(|| "source".to_string());
                 let tgt_type = &ml.target;
+                // A self-referencing through-link (source type == target
+                // type, e.g. Person.friends via a PersonFriend with two
+                // Person-typed links) would otherwise match the same link
+                // for both sides — prefer a differently-named one first,
+                // matching the tie-break already used for the read-side
+                // join resolution elsewhere in this file.
                 let target_col = through_td.links.iter()
-                    .find(|l| &l.target == tgt_type)
+                    .find(|l| &l.target == tgt_type && l.name != source_col)
+                    .or_else(|| through_td.links.iter().find(|l| &l.target == tgt_type))
                     .map(|l| l.name.clone())
                     .unwrap_or_else(|| "target".to_string());
-                Ok((through_td.table.clone(), through_td.module.clone(), source_col, target_col))
+                Ok((through_td.table.clone(), through_td.module.clone(), source_col, target_col, Some(through_td)))
             }
         }
     }
 
-    /// Compile the RHS of a multilink `+=`, `-=`, or `:= expr` into an `IrMultiLinkValues`.
-    fn compile_multilink_values(&mut self, expr: &Expr) -> Result<IrMultiLinkValues, PyQLError> {
+    /// Compile the RHS of a multilink `+=`, `-=`, or `:= expr` into an
+    /// `IrMultiLinkValues`. `td`/`alias` are the record being updated (link-
+    /// property value expressions like `@weight := <float64>$w` compile
+    /// against this scope, same as any other UPDATE SET assignment — they
+    /// cannot reference the linked target's own properties, only the outer
+    /// record's or bound params/literals). `through_td` is the junction
+    /// type's own TypeDescriptor for a `through(...)` multi-link, or `None`
+    /// for a Standard junction (which has no properties to assign).
+    fn compile_multilink_values(
+        &mut self,
+        expr: &Expr,
+        td: &'a TypeDescriptor,
+        alias: &str,
+        through_td: Option<&'a TypeDescriptor>,
+    ) -> Result<IrMultiLinkValues, PyQLError> {
+        // `a union b` — combine both sides; each keeps its own link_props
+        // (different targets in one `+=` can carry different property values).
+        if let Expr::Union(a, b) = expr {
+            let left = self.compile_multilink_values(a, td, alias, through_td)?;
+            let right = self.compile_multilink_values(b, td, alias, through_td)?;
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::Union(Box::new(left), Box::new(right)),
+                link_props: vec![],
+            });
+        }
+
+        // `expr { @prop := value, ... }` — link-property assignments layered
+        // onto an inner target-selecting expression.
+        if let Expr::Shape(shape) = expr {
+            let inner_expr = shape.expr.as_ref().ok_or_else(|| {
+                self.type_err("multilink value shape must have a base expression")
+            })?;
+            let mut inner = self.compile_multilink_values(inner_expr, td, alias, through_td)?;
+
+            let Some(through) = through_td else {
+                return Err(self.type_err(
+                    "link properties (`@prop := value`) are only valid on a multi-link \
+                     declared with `through(...)`"
+                ));
+            };
+
+            for el in &shape.elements {
+                let prop_name = match el.path.steps.as_slice() {
+                    [ast::PathStep::LinkProp(name)] => name.clone(),
+                    _ => return Err(self.type_err(
+                        "only `@prop := value` link-property assignments are valid here"
+                    )),
+                };
+                let prop = Self::resolve_property(through, &prop_name).ok_or_else(|| {
+                    self.field_err(&prop_name, &format!("{}::{}", through.module, through.name))
+                })?;
+                if prop.is_readonly {
+                    return Err(self.type_err(&format!(
+                        "cannot set link property '{prop_name}': it is declared as read-only"
+                    )));
+                }
+                let value_expr = el.compexpr.as_ref().ok_or_else(|| {
+                    self.type_err(&format!("link property '{prop_name}' must be assigned a value"))
+                })?;
+                let ir_expr = self.compile_expr(value_expr, td, alias)?;
+                inner.link_props.push((prop.name.clone(), ir_expr));
+            }
+            return Ok(inner);
+        }
+
         // CTE reference: bare name matching a registered CTE
         if let Some(name) = self.resolve_cte_name(expr) {
-            return Ok(IrMultiLinkValues::CteRef(name.to_string()));
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::CteRef(name.to_string()),
+                link_props: vec![],
+            });
         }
 
         // Parenthesised subquery
         if let Expr::SubQuery(inner) = expr {
             return match self.compile_stmt(inner)? {
-                IrStmt::Select(s) => Ok(IrMultiLinkValues::Select(Box::new(s))),
-                IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues::PathSelect(Box::new(ps))),
+                IrStmt::Select(s) => Ok(IrMultiLinkValues {
+                    source: IrMultiLinkValueSource::Select(Box::new(s)),
+                    link_props: vec![],
+                }),
+                IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues {
+                    source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
+                    link_props: vec![],
+                }),
                 _ => Err(self.type_err(
                     "multilink value must resolve to a SELECT or path query"
                 )),
@@ -2733,8 +2825,14 @@ impl<'a> Compiler<'a> {
                     limit: None,
                 };
                 return match self.compile_stmt(&Stmt::Select(fake_sel))? {
-                    IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues::PathSelect(Box::new(ps))),
-                    IrStmt::Select(s) => Ok(IrMultiLinkValues::Select(Box::new(s))),
+                    IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues {
+                        source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
+                        link_props: vec![],
+                    }),
+                    IrStmt::Select(s) => Ok(IrMultiLinkValues {
+                        source: IrMultiLinkValueSource::Select(Box::new(s)),
+                        link_props: vec![],
+                    }),
                     _ => Err(self.type_err("expected a path expression for multilink value")),
                 };
             }
@@ -5422,6 +5520,18 @@ impl<'a> Compiler<'a> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
+
+/// True if any node in a multilink value tree (including both sides of any
+/// nested `union`) carries a `@prop := value` link-property assignment.
+fn has_any_link_props(vals: &IrMultiLinkValues) -> bool {
+    if !vals.link_props.is_empty() {
+        return true;
+    }
+    match &vals.source {
+        IrMultiLinkValueSource::Union(a, b) => has_any_link_props(a) || has_any_link_props(b),
+        _ => false,
+    }
+}
 
 /// Extract the single field name from a relative path used in a shape element.
 fn path_leaf(p: &ast::Path) -> Result<&str, PyQLError> {
