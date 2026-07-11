@@ -5,7 +5,7 @@ from typing import Literal
 
 from . import _collector
 
-# Characters that distinguish a PyQL expression from a bare field name.
+# Characters that distinguish a PyQL expression from a bare pointer name.
 _EXPR_CHARS = frozenset("(). +-*/<>=!|&")
 
 
@@ -18,7 +18,7 @@ class Index:
 
     Usage::
 
-        Index('name')                           # single field
+        Index('name')                           # single pointer
         Index(('last_name', 'first_name'))      # composite
         Index('str_lower(.name)')               # PyQL expression index
         Index('name', unless='.archived_at')    # partial index
@@ -26,23 +26,23 @@ class Index:
     Uniqueness is always expressed via Exclusive, never via Index.
     """
 
-    field: str | tuple[str, ...]
+    pointer: str | tuple[str, ...]
     unless: str | None
     is_expression: bool
 
     def __init__(
         self,
-        field: str | tuple[str, ...],
+        pointer: str | tuple[str, ...],
         *,
         unless: str | None = None,
     ) -> None:
-        self.field = tuple(field) if not isinstance(field, str) else field
+        self.pointer = tuple(pointer) if not isinstance(pointer, str) else pointer
         self.unless = unless
-        self.is_expression = isinstance(self.field, str) and _is_expression(self.field)
+        self.is_expression = isinstance(self.pointer, str) and _is_expression(self.pointer)
         _collector.register(self)
 
     def __repr__(self) -> str:
-        parts = [repr(self.field)]
+        parts = [repr(self.pointer)]
         if self.unless is not None:
             parts.append(f"unless={self.unless!r}")
         return f"Index({', '.join(parts)})"
@@ -51,21 +51,21 @@ class Index:
 Metric = Literal["cosine", "euclidean", "inner_product"]
 
 
-class VectorField:
-    """A field included in a VectorIndex, referenced as a lazy annotation string.
+class VectorPointer:
+    """A pointer included in a VectorIndex, referenced as a lazy annotation string.
 
-    Use the ``'TypeName.field_name'`` form — the type prefix is validated
+    Use the ``'TypeName.pointer_name'`` form — the type prefix is validated
     during ``pylon.finalize()`` against the enclosing type::
 
-        pylon.VectorField('Product.name')
-        pylon.VectorField('Product.description')
+        pylon.VectorPointer('Product.name')
+        pylon.VectorPointer('Product.description')
     """
 
     def __init__(self, ref: str) -> None:
         self.ref = ref
 
     def __repr__(self) -> str:
-        return f"VectorField({self.ref!r})"
+        return f"VectorPointer({self.ref!r})"
 
 
 class VectorIndex:
@@ -79,7 +79,7 @@ class VectorIndex:
             name: Property[str]
             description: Property[str]
             pylon.VectorIndex(
-                fields=[pylon.VectorField('Product.name'), pylon.VectorField('Product.description')],
+                pointers=[pylon.VectorPointer('Product.name'), pylon.VectorPointer('Product.description')],
                 model='mistral-embed',
             )
 
@@ -89,27 +89,27 @@ class VectorIndex:
         class Product(pylon.BaseObject):
             name: Property[str]
             summary_index = pylon.VectorIndex(
-                fields=[pylon.VectorField('Product.name')],
+                pointers=[pylon.VectorPointer('Product.name')],
                 model='mistral-embed',
             )
     """
 
     index_name: str | None
-    _vector_fields: list[VectorField]
+    _vector_pointers: list[VectorPointer]
     model: str
     metric: Metric
     dimensions: int
 
     def __init__(
         self,
-        fields: list[VectorField],
+        pointers: list[VectorPointer],
         model: str,
         *,
         metric: Metric = "cosine",
         dimensions: int = 1024,
     ) -> None:
         self.index_name = None
-        self._vector_fields = list(fields)
+        self._vector_pointers = list(pointers)
         self.model = model
         self.metric = metric
         self.dimensions = dimensions
@@ -119,7 +119,7 @@ class VectorIndex:
         self.index_name = name
 
     def __repr__(self) -> str:
-        parts = [f"fields={self.fields!r}", f"model={self.model!r}"]
+        parts = [f"pointers={self._vector_pointers!r}", f"model={self.model!r}"]
         if self.index_name is not None:
             parts.append(f"index_name={self.index_name!r}")
         return f"VectorIndex({', '.join(parts)})"
@@ -147,14 +147,14 @@ class SearchMode(Enum):
     PhrasePrefix = "PhrasePrefix"
 
 
-class SearchField:
-    """A field included in a SearchIndex, referenced as a lazy annotation string.
+class SearchPointer:
+    """A pointer included in a SearchIndex, referenced as a lazy annotation string.
 
-    Use the ``'TypeName.field_name'`` form — the type prefix is validated
+    Use the ``'TypeName.pointer_name'`` form — the type prefix is validated
     during ``pylon.finalize()`` against the enclosing type::
 
-        pylon.SearchField('Product.name', weight_category=pylon.SearchWeight.A)
-        pylon.SearchField('Product.description', weight_category=pylon.SearchWeight.B)
+        pylon.SearchPointer('Product.name', weight_category=pylon.SearchWeight.A)
+        pylon.SearchPointer('Product.description', weight_category=pylon.SearchWeight.B)
     """
 
     def __init__(self, ref: str, *, weight_category: SearchWeight = SearchWeight.A) -> None:
@@ -162,7 +162,7 @@ class SearchField:
         self.weight_category = weight_category
 
     def __repr__(self) -> str:
-        return f"SearchField({self.ref!r}, weight_category={self.weight_category!r})"
+        return f"SearchPointer({self.ref!r}, weight_category={self.weight_category!r})"
 
 
 class SearchIndex:
@@ -180,9 +180,9 @@ class SearchIndex:
             description: pylon.Property[pylon.Str] | None
             pylon.SearchIndex(
                 backend=pylon.SearchBackend.Postgres,
-                fields=[
-                    pylon.SearchField('Product.name', weight_category=pylon.SearchWeight.A),
-                    pylon.SearchField('Product.description', weight_category=pylon.SearchWeight.B),
+                pointers=[
+                    pylon.SearchPointer('Product.name', weight_category=pylon.SearchWeight.A),
+                    pylon.SearchPointer('Product.description', weight_category=pylon.SearchWeight.B),
                 ],
             )
 
@@ -193,25 +193,25 @@ class SearchIndex:
             name: pylon.Str
             typeahead = pylon.SearchIndex(
                 backend=pylon.SearchBackend.Postgres,
-                fields=[pylon.SearchField('Product.name', weight_category=pylon.SearchWeight.A)],
+                pointers=[pylon.SearchPointer('Product.name', weight_category=pylon.SearchWeight.A)],
             )
     """
 
     index_name: str | None
     backend: SearchBackend
-    _search_fields: list[SearchField]
+    _search_pointers: list[SearchPointer]
 
-    def __init__(self, backend: SearchBackend, fields: list[SearchField]) -> None:
+    def __init__(self, backend: SearchBackend, pointers: list[SearchPointer]) -> None:
         self.index_name = None
         self.backend = backend
-        self._search_fields = list(fields)
+        self._search_pointers = list(pointers)
         _collector.register(self)
 
     def __set_name__(self, owner: type, name: str) -> None:
         self.index_name = name
 
     def __repr__(self) -> str:
-        parts = [f"backend={self.backend!r}", f"fields={self._search_fields!r}"]
+        parts = [f"backend={self.backend!r}", f"pointers={self._search_pointers!r}"]
         if self.index_name is not None:
             parts.append(f"index_name={self.index_name!r}")
         return f"SearchIndex({', '.join(parts)})"

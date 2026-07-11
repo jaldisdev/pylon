@@ -142,7 +142,7 @@ class MeilisearchWorker(IndexWorker):
         base = f"{module}__{tname}".lower()
         return f"{base}__{index_name.lower()}" if index_name else base
 
-    def _search_index_fields(self, type_name: str, index_name: str | None) -> list[str]:
+    def _search_index_pointers(self, type_name: str, index_name: str | None) -> list[str]:
         td = next(
             (t for t in self._schema.types if f"{t.module}::{t.name}" == type_name),
             None,
@@ -150,7 +150,7 @@ class MeilisearchWorker(IndexWorker):
         if td is None:
             return []
         si = next((s for s in td.search_indexes if s.index_name == index_name), None)
-        return [f.name for f in si.fields] if si else []
+        return [p.name for p in si.pointers] if si else []
 
     async def process_batch(self, rows: list[Any]) -> None:
         groups: dict[tuple[str, str | None, str], list[Any]] = defaultdict(list)
@@ -183,13 +183,13 @@ class MeilisearchWorker(IndexWorker):
             if not records:
                 continue
 
-            field_names = self._search_index_fields(type_name, index_name)
+            pointer_names = self._search_index_pointers(type_name, index_name)
             for record in records:
                 doc_id = str(record["id"])
                 source_text = record["source_text"] or ""
-                if field_names and "\n" in source_text:
-                    parts = source_text.split("\n", maxsplit=len(field_names) - 1)
-                    doc_body = {name: part for name, part in zip(field_names, parts)}
+                if pointer_names and "\n" in source_text:
+                    parts = source_text.split("\n", maxsplit=len(pointer_names) - 1)
+                    doc_body = {name: part for name, part in zip(pointer_names, parts)}
                 else:
                     doc_body = {"text": source_text}
                 try:

@@ -45,13 +45,13 @@ pub enum ShapeNode {
     /// Object shape.
     /// `type_name = Some(s)` → named schema type decoded to a registered dataclass.
     /// `type_name = None`    → free type decoded to Pylon's generic Object dataclass.
-    /// `name` is the field name within the parent (empty string for the root).
+    /// `name` is the pointer name within the parent (empty string for the root).
     Object {
         name: String,
         type_name: Option<String>,
         position: usize,
         cardinality: Cardinality,
-        fields: Vec<ShapeNode>,
+        pointers: Vec<ShapeNode>,
     },
     /// `record[]` column decoded to a Python list.
     Array {
@@ -184,9 +184,9 @@ pub struct CompiledQuery {
 /// Compile a PyQL expression string in the context of a named type to a bare SQL
 /// expression suitable for use in an UPDATE SET clause.
 ///
-/// Column references (`.field`) are emitted without a table alias because UPDATE
+/// Pointer references (`.name`) are emitted without a table alias because UPDATE
 /// SET expressions reference the current row directly.  Query parameters (`$name`)
-/// are rejected — fill expressions must be literal values or field references.
+/// are rejected — fill expressions must be literal values or pointer references.
 pub fn compile_fill_expr(
     type_name: &str,
     expr_str: &str,

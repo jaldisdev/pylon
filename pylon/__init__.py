@@ -6,7 +6,7 @@ from .exceptions import PylonError
 
 # ── Schema decorators ──────────────────────────────────────────────────────────
 # ── Schema base types & introspection ─────────────────────────────────────────
-# ── Field annotations ──────────────────────────────────────────────────────────
+# ── Pointer annotations ────────────────────────────────────────────────────────
 # ── Constraints ────────────────────────────────────────────────────────────────
 # ── Indexes ────────────────────────────────────────────────────────────────────
 # ── Built-in scalars ───────────────────────────────────────────────────────────
@@ -39,10 +39,10 @@ from .schema import (
     Global,
     GlobalDescriptor,
     Index,
-    VectorField,
+    VectorPointer,
     VectorIndex,
     SearchBackend,
-    SearchField,
+    SearchPointer,
     SearchIndex,
     SearchMode,
     SearchWeight,
@@ -124,7 +124,7 @@ __all__ = [
     "PylonConfig",
     "Scalar",
     "lazy",
-    # Schema — field annotations
+    # Schema — pointer annotations
     "Computed",
     "Link",
     "MultiLink",
@@ -158,10 +158,10 @@ __all__ = [
     "SequenceNext",
     # Schema — indexes
     "Index",
-    "VectorField",
+    "VectorPointer",
     "VectorIndex",
     "SearchBackend",
-    "SearchField",
+    "SearchPointer",
     "SearchIndex",
     "SearchMode",
     "SearchWeight",

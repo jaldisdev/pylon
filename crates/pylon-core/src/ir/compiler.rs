@@ -2656,7 +2656,7 @@ impl<'a> Compiler<'a> {
             assignments.iter().map(|(c, _)| c.as_str()).collect();
         let type_name = format!("{}::{}", td.module, td.name);
         let enqueue_vector = td.vector_indexes.iter()
-            .filter(|vi| vi.fields.iter().any(|f| written_cols.contains(f.as_str())))
+            .filter(|vi| vi.pointers.iter().any(|f| written_cols.contains(f.as_str())))
             .map(|vi| VectorEnqueueInfo {
                 type_name: type_name.clone(),
                 index_name: vi.index_name.clone(),

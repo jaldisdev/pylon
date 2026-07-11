@@ -75,7 +75,7 @@ pyo3::create_exception!(
     pylon._core,
     PylonCardinalityViolationError,
     PylonExecutionError,
-    "A single-cardinality field received multiple values."
+    "A single-cardinality pointer received multiple values."
 );
 pyo3::create_exception!(
     pylon._core,
@@ -170,7 +170,7 @@ impl RewriteEntry {
     }
 }
 
-// ── Field descriptors ──────────────────────────────────────────────────────────
+// ── Pointer descriptors ────────────────────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
 pub struct PropertyDescriptor {
@@ -475,21 +475,21 @@ pub struct IndexDescriptor {
 impl IndexDescriptor {
     #[new]
     #[pyo3(signature = (
-        fields,
+        pointers,
         *,
         expression = None,
         unique = false,
         unless = None
     ))]
     fn new(
-        fields: Vec<String>,
+        pointers: Vec<String>,
         expression: Option<String>,
         unique: bool,
         unless: Option<String>,
     ) -> Self {
         Self {
             inner: core::schema::IndexDescriptor {
-                fields,
+                pointers,
                 expression,
                 unique,
                 unless,
@@ -498,8 +498,8 @@ impl IndexDescriptor {
     }
 
     #[getter]
-    fn fields(&self) -> Vec<String> {
-        self.inner.fields.clone()
+    fn pointers(&self) -> Vec<String> {
+        self.inner.pointers.clone()
     }
 
     #[getter]
@@ -526,9 +526,9 @@ pub struct VectorIndexDescriptor {
 #[pymethods]
 impl VectorIndexDescriptor {
     #[new]
-    #[pyo3(signature = (fields, model, metric, dimensions, *, index_name = None))]
+    #[pyo3(signature = (pointers, model, metric, dimensions, *, index_name = None))]
     fn new(
-        fields: Vec<String>,
+        pointers: Vec<String>,
         model: String,
         metric: String,
         dimensions: u32,
@@ -537,7 +537,7 @@ impl VectorIndexDescriptor {
         Self {
             inner: core::schema::VectorIndexDescriptor {
                 index_name,
-                fields,
+                pointers,
                 model,
                 metric,
                 dimensions,
@@ -548,7 +548,7 @@ impl VectorIndexDescriptor {
     #[getter]
     fn index_name(&self) -> Option<&str> { self.inner.index_name.as_deref() }
     #[getter]
-    fn fields(&self) -> Vec<String> { self.inner.fields.clone() }
+    fn pointers(&self) -> Vec<String> { self.inner.pointers.clone() }
     #[getter]
     fn model(&self) -> &str { &self.inner.model }
     #[getter]
@@ -560,12 +560,12 @@ impl VectorIndexDescriptor {
 }
 
 #[pyclass(module = "pylon._core", frozen)]
-pub struct SearchFieldDescriptor {
-    inner: core::schema::SearchFieldDescriptor,
+pub struct SearchPointerDescriptor {
+    inner: core::schema::SearchPointerDescriptor,
 }
 
 #[pymethods]
-impl SearchFieldDescriptor {
+impl SearchPointerDescriptor {
     #[new]
     fn new(name: String, weight: String) -> Self {
         let w = match weight.as_str() {
@@ -574,7 +574,7 @@ impl SearchFieldDescriptor {
             "D" => core::schema::SearchWeight::D,
             _ => core::schema::SearchWeight::A,
         };
-        Self { inner: core::schema::SearchFieldDescriptor { name, weight: w } }
+        Self { inner: core::schema::SearchPointerDescriptor { name, weight: w } }
     }
     #[getter]
     fn name(&self) -> &str { &self.inner.name }
@@ -590,10 +590,10 @@ pub struct SearchIndexDescriptor {
 #[pymethods]
 impl SearchIndexDescriptor {
     #[new]
-    #[pyo3(signature = (backend, fields, *, index_name = None))]
+    #[pyo3(signature = (backend, pointers, *, index_name = None))]
     fn new(
         backend: String,
-        fields: Vec<PyRef<SearchFieldDescriptor>>,
+        pointers: Vec<PyRef<SearchPointerDescriptor>>,
         index_name: Option<String>,
     ) -> Self {
         let b = match backend.as_str() {
@@ -605,7 +605,7 @@ impl SearchIndexDescriptor {
             inner: core::schema::SearchIndexDescriptor {
                 index_name,
                 backend: b,
-                fields: fields.iter().map(|f| f.inner.clone()).collect(),
+                pointers: pointers.iter().map(|f| f.inner.clone()).collect(),
             },
         }
     }
@@ -618,8 +618,8 @@ impl SearchIndexDescriptor {
         }
     }
     #[getter]
-    fn fields(&self) -> Vec<SearchFieldDescriptor> {
-        self.inner.fields.iter().map(|f| SearchFieldDescriptor { inner: f.clone() }).collect()
+    fn pointers(&self) -> Vec<SearchPointerDescriptor> {
+        self.inner.pointers.iter().map(|f| SearchPointerDescriptor { inner: f.clone() }).collect()
     }
     #[getter]
     fn index_name(&self) -> Option<&str> { self.inner.index_name.as_deref() }
@@ -657,7 +657,7 @@ impl TriggerDescriptor {
     }
 }
 
-/// Composite UNIQUE constraint across multiple fields.
+/// Composite UNIQUE constraint across multiple pointers.
 #[pyclass(module = "pylon._core", frozen)]
 pub struct ExclusiveConstraint {
     inner: core::schema::TypeConstraint,
@@ -666,17 +666,17 @@ pub struct ExclusiveConstraint {
 #[pymethods]
 impl ExclusiveConstraint {
     #[new]
-    #[pyo3(signature = (fields, *, unless = None))]
-    fn new(fields: Vec<String>, unless: Option<String>) -> Self {
+    #[pyo3(signature = (pointers, *, unless = None))]
+    fn new(pointers: Vec<String>, unless: Option<String>) -> Self {
         Self {
-            inner: core::schema::TypeConstraint::Exclusive { fields, unless },
+            inner: core::schema::TypeConstraint::Exclusive { pointers, unless },
         }
     }
 
     #[getter]
-    fn fields(&self) -> Vec<String> {
+    fn pointers(&self) -> Vec<String> {
         match &self.inner {
-            core::schema::TypeConstraint::Exclusive { fields, .. } => fields.clone(),
+            core::schema::TypeConstraint::Exclusive { pointers, .. } => pointers.clone(),
             _ => unreachable!(),
         }
     }
@@ -1670,7 +1670,7 @@ fn shape_node_to_py<'py>(
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
         }
-        ShapeNode::Object { name, type_name, position, cardinality, fields } => {
+        ShapeNode::Object { name, type_name, position, cardinality, pointers } => {
             d.set_item("kind", "object")?;
             d.set_item("name", name.as_str())?;
             d.set_item("type_name", type_name.as_deref())?;
@@ -1680,11 +1680,11 @@ fn shape_node_to_py<'py>(
                 Cardinality::Optional => "optional",
                 Cardinality::Many    => "many",
             })?;
-            let py_fields = PyList::new(
+            let py_pointers = PyList::new(
                 py,
-                fields.iter().map(|f| shape_node_to_py(py, f)).collect::<PyResult<Vec<_>>>()?,
+                pointers.iter().map(|f| shape_node_to_py(py, f)).collect::<PyResult<Vec<_>>>()?,
             )?;
-            d.set_item("fields", py_fields)?;
+            d.set_item("pointers", py_pointers)?;
         }
         ShapeNode::Array { name, position, element } => {
             d.set_item("kind", "array")?;
@@ -1795,7 +1795,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Deletion policy
     m.add_class::<OnDeletePolicy>()?;
 
-    // Field descriptors
+    // Pointer descriptors
     m.add_class::<RewriteEntry>()?;
     m.add_class::<PropertyDescriptor>()?;
     m.add_class::<LinkDescriptor>()?;
@@ -1805,7 +1805,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Type-level constructs
     m.add_class::<IndexDescriptor>()?;
     m.add_class::<VectorIndexDescriptor>()?;
-    m.add_class::<SearchFieldDescriptor>()?;
+    m.add_class::<SearchPointerDescriptor>()?;
     m.add_class::<SearchIndexDescriptor>()?;
     m.add_class::<TriggerDescriptor>()?;
     m.add_class::<ExclusiveConstraint>()?;

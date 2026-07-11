@@ -460,7 +460,7 @@ class TestClassBodyConstraints:
         assert len(constraints) == 1
         exc = constraints[0]
         assert isinstance(exc, Exclusive)
-        assert exc.fields == ("category", "slug")
+        assert exc.pointers == ("category", "slug")
 
     def test_expression_constraint_stored(self):
         @pylon.type
@@ -501,13 +501,13 @@ class TestClassBodyIndexes:
 
     def test_single_field(self):
         idx = Product.__pylon_config__.indexes[0]
-        assert idx.field == "name"
+        assert idx.pointer == "name"
         assert idx.is_expression is False
         assert idx.unless is None
 
     def test_composite(self):
         idx = Product.__pylon_config__.indexes[1]
-        assert idx.field == ("slug", "name")
+        assert idx.pointer == ("slug", "name")
 
     def test_expression_index(self):
         idx = Product.__pylon_config__.indexes[2]

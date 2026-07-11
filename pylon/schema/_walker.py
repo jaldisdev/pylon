@@ -166,14 +166,14 @@ def _resolve_links(
     """Mutate PointerMeta.link_target / .through to qualified name strings."""
     for cls in types:
         cfg = cls.__pylon_config__
-        for field_name, meta in cfg.pointers.items():
+        for pointer_name, meta in cfg.pointers.items():
             if meta.kind in ("link", "multilink") and meta.link_target is not None:
-                label = f"{cfg.module}::{cfg.name}.{field_name} link_target"
+                label = f"{cfg.module}::{cfg.name}.{pointer_name} link_target"
                 meta.link_target = _resolve_target(
                     meta.link_target, cls, class_to_qname, type_map, label
                 )
             if meta.kind == "multilink" and meta.through is not None:
-                label = f"{cfg.module}::{cfg.name}.{field_name} through"
+                label = f"{cfg.module}::{cfg.name}.{pointer_name} through"
                 meta.through = _resolve_target(
                     meta.through, cls, class_to_qname, type_map, label
                 )
@@ -241,7 +241,7 @@ def _validate_junctions(
 
     Enforces:
     - Each junction type is referenced by exactly one MultiLink.
-    - Junction types have no link or multilink fields (already enforced at decoration time,
+    - Junction types have no link or multilink pointers (already enforced at decoration time,
       but re-checked here for types that arrive from non-decorator paths).
     """
     # Build reverse map: junction_qname → (source_type_cfg, ml_name)
@@ -284,7 +284,7 @@ def _validate_junctions(
             raise SchemaError(
                 f"Junction type {qname!r} is not referenced by any MultiLink. "
                 f"Junction types must be used as the 'through' parameter of exactly "
-                f"one MultiLink field."
+                f"one MultiLink pointer."
             )
 
     return junction_to_ml
@@ -312,17 +312,17 @@ def _validate_interfaces(
             if not (bcfg.abstract and bcfg.materialized):
                 continue  # not an interface
 
-            for field_name, imeta in bcfg.pointers.items():
-                if field_name not in effective:
+            for pointer_name, imeta in bcfg.pointers.items():
+                if pointer_name not in effective:
                     raise SchemaError(
                         f"{cfg.module}::{cfg.name} does not satisfy interface "
-                        f"{bcfg.module}::{bcfg.name}: missing field {field_name!r}"
+                        f"{bcfg.module}::{bcfg.name}: missing pointer {pointer_name!r}"
                     )
                 # Kind must match
-                cmeta = effective[field_name]
+                cmeta = effective[pointer_name]
                 if cmeta.kind != imeta.kind:
                     raise SchemaError(
-                        f"{cfg.module}::{cfg.name}.{field_name}: interface expects "
+                        f"{cfg.module}::{cfg.name}.{pointer_name}: interface expects "
                         f"kind={imeta.kind!r}, got kind={cmeta.kind!r}"
                     )
 
@@ -515,7 +515,7 @@ def _field_checks_and_exclusive(
     meta: Any,
     col: str,
 ) -> tuple[list[str], bool]:
-    """Return (check_sql_list, is_exclusive) for the field's constraints."""
+    """Return (check_sql_list, is_exclusive) for the pointer's constraints."""
     from ._constraints import (
         Exclusive,
         MaxExValue,
@@ -558,7 +558,7 @@ def _field_checks_and_exclusive(
     return checks, is_exclusive
 
 
-# ── Field descriptor builders ──────────────────────────────────────────────────
+# ── Pointer descriptor builders ────────────────────────────────────────────────
 
 
 def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
@@ -672,40 +672,40 @@ def _make_computed_desc(name: str, meta: Any, _core: Any) -> Any:
 def _make_index_desc(idx: Any, _core: Any) -> Any:
     if idx.is_expression:
         return _core.IndexDescriptor(
-            fields=[],
-            expression=idx.field if isinstance(idx.field, str) else None,
+            pointers=[],
+            expression=idx.pointer if isinstance(idx.pointer, str) else None,
             unique=False,
             unless=idx.unless,
         )
-    fields = list(idx.field) if isinstance(idx.field, (tuple, list)) else [idx.field]
+    pointers = list(idx.pointer) if isinstance(idx.pointer, (tuple, list)) else [idx.pointer]
     return _core.IndexDescriptor(
-        fields=fields,
+        pointers=pointers,
         expression=None,
         unique=False,
         unless=idx.unless,
     )
 
 
-def _resolve_vector_field(ref: str, type_name: str, valid_fields: set[str]) -> str:
+def _resolve_vector_pointer(ref: str, type_name: str, valid_pointers: set[str]) -> str:
     if "." in ref:
-        prefix, field = ref.rsplit(".", 1)
+        prefix, pointer = ref.rsplit(".", 1)
         if prefix != type_name:
             raise SchemaError(
-                f"VectorField {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
+                f"VectorPointer {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
             )
     else:
-        field = ref
-    if field not in valid_fields:
+        pointer = ref
+    if pointer not in valid_pointers:
         raise SchemaError(
-            f"VectorField {ref!r}: field {field!r} not found on type {type_name!r}"
+            f"VectorPointer {ref!r}: pointer {pointer!r} not found on type {type_name!r}"
         )
-    return field
+    return pointer
 
 
-def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_fields: set[str]) -> Any:
-    fields = [_resolve_vector_field(vf.ref, type_name, valid_fields) for vf in vi._vector_fields]
+def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_pointers: set[str]) -> Any:
+    pointers = [_resolve_vector_pointer(vp.ref, type_name, valid_pointers) for vp in vi._vector_pointers]
     return _core.VectorIndexDescriptor(
-        fields=fields,
+        pointers=pointers,
         model=vi.model,
         metric=vi.metric,
         dimensions=vi.dimensions,
@@ -713,30 +713,30 @@ def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_fields: s
     )
 
 
-def _resolve_search_field(ref: str, type_name: str, valid_fields: set[str]) -> str:
+def _resolve_search_pointer(ref: str, type_name: str, valid_pointers: set[str]) -> str:
     if "." in ref:
-        prefix, field = ref.rsplit(".", 1)
+        prefix, pointer = ref.rsplit(".", 1)
         if prefix != type_name:
             raise SchemaError(
-                f"SearchField {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
+                f"SearchPointer {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
             )
     else:
-        field = ref
-    if field not in valid_fields:
+        pointer = ref
+    if pointer not in valid_pointers:
         raise SchemaError(
-            f"SearchField {ref!r}: field {field!r} not found on type {type_name!r}"
+            f"SearchPointer {ref!r}: pointer {pointer!r} not found on type {type_name!r}"
         )
-    return field
+    return pointer
 
 
-def _make_search_index_desc(si: Any, _core: Any, type_name: str, valid_fields: set[str]) -> Any:
-    fields = []
-    for sf in si._search_fields:
-        field_name = _resolve_search_field(sf.ref, type_name, valid_fields)
-        fields.append(_core.SearchFieldDescriptor(name=field_name, weight=sf.weight_category.value))
+def _make_search_index_desc(si: Any, _core: Any, type_name: str, valid_pointers: set[str]) -> Any:
+    pointers = []
+    for sp in si._search_pointers:
+        pointer_name = _resolve_search_pointer(sp.ref, type_name, valid_pointers)
+        pointers.append(_core.SearchPointerDescriptor(name=pointer_name, weight=sp.weight_category.value))
     return _core.SearchIndexDescriptor(
         backend=si.backend.value,
-        fields=fields,
+        pointers=pointers,
         index_name=si.index_name,
     )
 
@@ -750,8 +750,8 @@ def _make_trigger_desc(trig: Any, _core: Any) -> Any:
 
 
 def _make_exclusive_constraint(c: Any, _core: Any) -> Any:
-    # c is an Exclusive instance with .fields and .unless
-    return _core.ExclusiveConstraint(fields=list(c.pointers), unless=c.unless)
+    # c is an Exclusive instance with .pointers and .unless
+    return _core.ExclusiveConstraint(pointers=list(c.pointers), unless=c.unless)
 
 
 def _make_expression_constraint(c: Any, _core: Any) -> Any:
@@ -778,15 +778,15 @@ def _build_type_descriptor(
     multilinks: list[Any] = []
     computed: list[Any] = []
 
-    for field_name, meta in effective.items():
+    for pointer_name, meta in effective.items():
         if meta.kind == "property":
-            properties.append(_make_property_desc(field_name, meta, _core))
+            properties.append(_make_property_desc(pointer_name, meta, _core))
         elif meta.kind == "link":
-            links.append(_make_link_desc(field_name, meta, _core))
+            links.append(_make_link_desc(pointer_name, meta, _core))
         elif meta.kind == "multilink":
-            multilinks.append(_make_multilink_desc(field_name, meta, _core))
+            multilinks.append(_make_multilink_desc(pointer_name, meta, _core))
         elif meta.kind == "computed":
-            computed.append(_make_computed_desc(field_name, meta, _core))
+            computed.append(_make_computed_desc(pointer_name, meta, _core))
 
     # Merge in class-level C/I/T from abstract non-materialized parents.
     inherited_constraints, inherited_indexes, inherited_triggers = (
@@ -1079,7 +1079,7 @@ def walk(
     2.  Lazy forward-reference resolution
     3.  Required-link cycle detection
     4.  Interface conformance validation
-    5.  Inheritance flattening (fields + constraints/indexes/triggers from abstract parents)
+    5.  Inheritance flattening (pointers + constraints/indexes/triggers from abstract parents)
     6.  PyO3 descriptor construction
     """
     from pylon import _core  # local import to allow testing without Rust binary

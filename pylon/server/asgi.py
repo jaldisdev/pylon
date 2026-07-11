@@ -25,7 +25,7 @@ from pylon.client import Client
 from pylon.config import Config
 from pylon.exceptions import PylonError
 from pylon.schema._decorators import _get_own_annotations, _infer_module, _unwrap_optional
-from pylon.schema._fields import ComputedAnnotation, LinkAnnotation, MultiLinkAnnotation, PropertyAnnotation
+from pylon.schema._pointers import ComputedAnnotation, LinkAnnotation, MultiLinkAnnotation, PropertyAnnotation
 from pylon.schema._meta import PointerMeta
 from pylon.schema._registry import snapshot as schema_snapshot
 from pylon.schema._walker import _effective_pointers
@@ -250,10 +250,10 @@ def _classify_pointer(
     return result
 
 
-def _vector_index_field_names(vi: Any) -> list[str]:
-    """Field names (not "Type.field" refs) a VectorIndex was declared with —
+def _vector_index_pointer_names(vi: Any) -> list[str]:
+    """Pointer names (not "Type.pointer" refs) a VectorIndex was declared with —
     i.e. exactly what got embedded for it."""
-    return [vf.ref.split(".", 1)[1] for vf in vi._vector_fields]
+    return [vp.ref.split(".", 1)[1] for vp in vi._vector_pointers]
 
 
 def _build_type_entry(cls: type, enum_classes: set[type]) -> dict[str, Any]:
@@ -274,7 +274,7 @@ def _build_type_entry(cls: type, enum_classes: set[type]) -> dict[str, Any]:
         # are offered) and Index select (offered only when there's more
         # than one). indexName is None for a bare/default VectorIndex.
         "vectorIndexes": [
-            {"indexName": vi.index_name, "model": vi.model, "fields": _vector_index_field_names(vi)}
+            {"indexName": vi.index_name, "model": vi.model, "pointers": _vector_index_pointer_names(vi)}
             for vi in getattr(cls.__pylon_config__, "vector_indexes", [])
         ],
     }
@@ -450,11 +450,11 @@ def _make_chat_provider(model_cfg):
     return OpenAIProvider(api_url=model_cfg.api_url, model=model_cfg.model, api_key=model_cfg.secret)
 
 
-def _resolve_vector_index_fields(pylon_type: str, index_name: str | None) -> list[str]:
+def _resolve_vector_index_pointers(pylon_type: str, index_name: str | None) -> list[str]:
     """Looks up the VectorIndex matching *index_name* on *pylon_type* and
-    returns its field names — so /api/ai/chat's context is built from what
+    returns its pointer names — so /api/ai/chat's context is built from what
     the similarity search actually matched on, not an arbitrary object dump
-    of whatever fields happen to be requested for display."""
+    of whatever pointers happen to be requested for display."""
     module, _, name = pylon_type.partition("::")
     registered_types, _, _ = schema_snapshot()
     for cls in registered_types:
@@ -462,7 +462,7 @@ def _resolve_vector_index_fields(pylon_type: str, index_name: str | None) -> lis
             continue
         for vi in getattr(cls.__pylon_config__, "vector_indexes", []):
             if vi.index_name == index_name:
-                return _vector_index_field_names(vi)
+                return _vector_index_pointer_names(vi)
     return []
 
 
@@ -472,7 +472,7 @@ async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send
     pylon_type = body.get("pylonType", "")
     index_name = body.get("indexName")
     # Optional PyQL expression narrowing which objects vector::search's first
-    # argument scopes over, e.g. "select Type filter .field = value" —
+    # argument scopes over, e.g. "select Type filter .property = value" —
     # embedded as-is inside vector::search(({context_query}), ...). Empty/
     # unset falls back to searching every object of pylon_type (status quo).
     context_query = body.get("contextQuery") or None
@@ -484,19 +484,19 @@ async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send
         await _send_json(send, 400, {"error": f"'{model_name}' is not a configured chat model"})
         return
 
-    index_fields = _resolve_vector_index_fields(pylon_type, index_name)
-    if not index_fields:
+    index_pointers = _resolve_vector_index_pointers(pylon_type, index_name)
+    if not index_pointers:
         await _send_json(
             send, 400, {"error": f"no VectorIndex found on '{pylon_type}' matching index_name={index_name!r}"}
         )
         return
 
-    shape = ", ".join(index_fields)
+    shape = ", ".join(index_pointers)
     index_clause = ", index_name := <str>$indexName" if index_name else ""
     search_target = f"({context_query})" if context_query else pylon_type
     # The chat message itself is both the vector::search query text *and*
     # the LLM's question (see _DEFAULT_PROMPT_USER below) — no separate
-    # search-text field anymore.
+    # search-text input anymore.
     pyql = (
         f"select vector::search({search_target}, query := <str>$queryText{index_clause}) "
         f"{{ object {{ {shape} }}, distance }} order by .distance limit 5"
@@ -512,10 +512,10 @@ async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send
         return
 
     results = [_to_jsonable(o) for o in objects]
-    # One line per result, just the indexed fields concatenated — the same
+    # One line per result, just the indexed pointers concatenated — the same
     # text that was embedded, not a "key: value" dump of the whole object.
     context = "\n".join(
-        "- " + ". ".join(str(result["object"].get(f, "")) for f in index_fields) for result in results
+        "- " + ". ".join(str(result["object"].get(p, "")) for p in index_pointers) for result in results
     )
 
     messages = [

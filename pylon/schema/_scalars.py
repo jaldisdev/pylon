@@ -5,7 +5,7 @@ import decimal
 import uuid as _uuid_mod
 from typing import Any
 
-from ._constraints import _FieldConstraint
+from ._constraints import _PointerConstraint
 
 # ── Built-in scalar marker types ──────────────────────────────────────────────
 
@@ -148,7 +148,7 @@ class Scalar:
     """
 
     __pylon_base__: type[_PylonScalar]
-    __pylon_constraints__: tuple[_FieldConstraint, ...]
+    __pylon_constraints__: tuple[_PointerConstraint, ...]
 
     @staticmethod
     def validate(value: Any) -> None:
@@ -170,7 +170,7 @@ class Scalar:
 
 def scalar(
     base_type: type[_PylonScalar],
-    *constraints: _FieldConstraint,
+    *constraints: _PointerConstraint,
 ) -> type[Scalar] | Any:
     """Define a custom scalar type.
 

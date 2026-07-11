@@ -476,7 +476,7 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
             }
         }
         for c in &t.constraints {
-            if let TypeConstraint::Exclusive { fields, unless } = c {
+            if let TypeConstraint::Exclusive { pointers: fields, unless } = c {
                 let cols: Vec<String> = fields.iter().map(|f| qi(f)).collect();
                 let where_clause = unless.as_deref()
                     .map(|u| format!(" WHERE NOT ({})", u))
@@ -543,7 +543,7 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
             let body = if let Some(expr) = &idx.expression {
                 format!("({})", expr)
             } else {
-                let cols: Vec<String> = idx.fields.iter().map(|f| qi(f)).collect();
+                let cols: Vec<String> = idx.pointers.iter().map(|f| qi(f)).collect();
                 format!("({})", cols.join(", "))
             };
             let where_clause = idx.unless.as_deref()
@@ -827,7 +827,7 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             }
         }
         for c in &t.constraints {
-            if let TypeConstraint::Exclusive { fields, .. } = c {
+            if let TypeConstraint::Exclusive { pointers: fields, .. } = c {
                 for impl_t in impls {
                     result.push(make_excl_info(t, fields, impl_t));
                 }
@@ -1003,7 +1003,7 @@ fn emit_search_columns(schema: &SchemaDescriptor, out: &mut String) {
             if si.backend != SearchBackend::Postgres { continue; }
 
             // Build: setweight(to_tsvector('english', coalesce(col, '')), 'W') || ...
-            let parts: Vec<String> = si.fields.iter().map(|sf| {
+            let parts: Vec<String> = si.pointers.iter().map(|sf| {
                 let col = qi(&sf.name);
                 let w = sf.weight.as_str();
                 format!("setweight(to_tsvector('english', coalesce({col}, '')), '{w}')")
@@ -1090,7 +1090,7 @@ pub fn compile_index_fetch(
             })
         })?;
 
-    let field_exprs = vi.fields.iter().map(|f| {
+    let field_exprs = vi.pointers.iter().map(|f| {
         // Resolve the field's pg_type to decide whether an explicit cast is needed.
         let pg_type = td.properties.iter()
             .find(|p| p.name == *f)
@@ -1140,7 +1140,7 @@ pub fn compile_search_index_fetch(
             })
         })?;
 
-    let field_exprs = si.fields.iter().map(|sf| {
+    let field_exprs = si.pointers.iter().map(|sf| {
         let pg_type = td.properties.iter()
             .find(|p| p.name == sf.name)
             .map(|p| p.pg_type.as_str())
