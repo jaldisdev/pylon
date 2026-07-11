@@ -170,7 +170,7 @@ def _consume_descriptions(params: list[Any]) -> list[Any]:
     """Unregister any Description instances from the collector.
 
     Description.__init__ always registers; when a Description appears inside
-    Property[T, ...] or Link[T, ...] it belongs to the field, not the type,
+    Property[T, ...] or Link[T, ...] it belongs to the pointer, not the type,
     so we pull it back out of the pending list.
     """
     for p in params:
@@ -179,11 +179,11 @@ def _consume_descriptions(params: list[Any]) -> list[Any]:
     return params
 
 
-# ── Field annotation classes ───────────────────────────────────────────────────
+# ── Pointer annotation classes ─────────────────────────────────────────────────
 
 
 class Property:
-    """Scalar field annotation.
+    """Scalar pointer annotation.
 
     Usage::
 
@@ -204,7 +204,7 @@ class Property:
 
 
 class Link:
-    """Single-link field annotation (many-to-one or one-to-one).
+    """Single-link pointer annotation (many-to-one or one-to-one).
 
     Usage::
 
@@ -226,7 +226,7 @@ class Link:
 
 
 class MultiLink:
-    """Multi-link field annotation (one-to-many or many-to-many).
+    """Multi-link pointer annotation (one-to-many or many-to-many).
 
     Usage::
 
@@ -252,9 +252,9 @@ class MultiLink:
 
 
 class Computed:
-    """Computed field — evaluated as a PyQL expression at query time.
+    """Computed pointer — evaluated as a PyQL expression at query time.
 
-    Computed fields are volatile: they are excluded from __init__ and cannot
+    Computed pointers are volatile: they are excluded from __init__ and cannot
     appear in indexes or constraints. Their value is populated from the query
     response.
 

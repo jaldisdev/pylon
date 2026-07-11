@@ -32,7 +32,7 @@ pub struct RewriteEntry {
     pub handler: String,
 }
 
-// ── Field descriptors ──────────────────────────────────────────────────────────
+// ── Pointer descriptors ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PropertyDescriptor {
@@ -52,7 +52,7 @@ pub struct PropertyDescriptor {
     pub is_exclusive: bool,
     /// True when this column is the table primary key.
     pub is_pk: bool,
-    /// True when the transpiler should reject PyQL updates targeting this field.
+    /// True when the transpiler should reject PyQL updates targeting this pointer.
     pub is_readonly: bool,
     pub rewrites: Vec<RewriteEntry>,
 }
@@ -67,7 +67,7 @@ pub struct LinkDescriptor {
     pub default_pyql: Option<String>,
     /// True when a UNIQUE constraint applies to this FK column alone.
     pub is_exclusive: bool,
-    /// True when the transpiler should reject PyQL updates targeting this field.
+    /// True when the transpiler should reject PyQL updates targeting this pointer.
     pub is_readonly: bool,
     pub rewrites: Vec<RewriteEntry>,
     pub on_delete: Vec<OnDeletePolicy>,
@@ -126,7 +126,7 @@ impl SearchWeight {
 }
 
 #[derive(Debug, Clone)]
-pub struct SearchFieldDescriptor {
+pub struct SearchPointerDescriptor {
     pub name: String,
     pub weight: SearchWeight,
 }
@@ -135,7 +135,7 @@ pub struct SearchFieldDescriptor {
 pub struct SearchIndexDescriptor {
     pub index_name: Option<String>,
     pub backend: SearchBackend,
-    pub fields: Vec<SearchFieldDescriptor>,
+    pub pointers: Vec<SearchPointerDescriptor>,
 }
 
 impl SearchIndexDescriptor {
@@ -160,8 +160,8 @@ impl SearchIndexDescriptor {
 pub struct VectorIndexDescriptor {
     /// `None` = default (bare) index; `Some(name)` = named index.
     pub index_name: Option<String>,
-    /// Source fields whose text is concatenated to form the embedding input.
-    pub fields: Vec<String>,
+    /// Source pointers whose text is concatenated to form the embedding input.
+    pub pointers: Vec<String>,
     /// Embedding model identifier, e.g. `"mistral-embed"`.
     pub model: String,
     /// Distance metric: `"cosine"` | `"euclidean"` | `"inner_product"`.
@@ -191,8 +191,8 @@ impl VectorIndexDescriptor {
 
 #[derive(Debug, Clone)]
 pub struct IndexDescriptor {
-    /// Column names for a simple or composite index; empty when is_expression=true.
-    pub fields: Vec<String>,
+    /// Pointer names for a simple or composite index; empty when is_expression=true.
+    pub pointers: Vec<String>,
     /// PyQL expression for an expression index.
     pub expression: Option<String>,
     pub unique: bool,
@@ -211,9 +211,9 @@ pub struct TriggerDescriptor {
 
 #[derive(Debug, Clone)]
 pub enum TypeConstraint {
-    /// Composite UNIQUE INDEX across multiple fields.
+    /// Composite UNIQUE INDEX across multiple pointers.
     Exclusive {
-        fields: Vec<String>,
+        pointers: Vec<String>,
         unless: Option<String>,
     },
     /// Arbitrary CHECK constraint expressed as a PyQL boolean expression.
@@ -239,13 +239,13 @@ pub struct TypeDescriptor {
     pub parents: Vec<String>,
     /// Qualified names of interface parents.
     pub interfaces: Vec<String>,
-    /// Flattened property fields (includes inherited from abstract parents).
+    /// Flattened properties (includes inherited from abstract parents).
     pub properties: Vec<PropertyDescriptor>,
-    /// Flattened link fields.
+    /// Flattened links.
     pub links: Vec<LinkDescriptor>,
-    /// Flattened multi-link fields.
+    /// Flattened multi-links.
     pub multilinks: Vec<MultiLinkDescriptor>,
-    /// Computed (virtual) fields.
+    /// Computed (virtual) pointers.
     pub computed: Vec<ComputedDescriptor>,
     /// Composite UNIQUE and CHECK constraints (own + inherited from abstract parents).
     pub constraints: Vec<TypeConstraint>,

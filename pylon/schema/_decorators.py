@@ -11,7 +11,7 @@ from typing import Any
 
 from . import _collector
 from ._constraints import Default, Description, Exclusive, Expression, Readonly
-from ._fields import (
+from ._pointers import (
     ComputedAnnotation,
     LinkAnnotation,
     MultiLinkAnnotation,
@@ -372,30 +372,30 @@ def _build_type(
         else ((cls.__doc__ or "").strip() or None)
     )
 
-    # Inject the id field when no parent Pylon type already provides one.
+    # Inject the id property when no parent Pylon type already provides one.
     if not _has_pylon_base(cls):
         _inject_id(cls)
 
     annotations = _collect_annotations(cls)
 
     pointer_metas: dict[str, PointerMeta] = {}
-    for field_name, annotation in annotations.items():
-        if field_name.startswith("_"):
+    for pointer_name, annotation in annotations.items():
+        if pointer_name.startswith("_"):
             continue
-        if junction and field_name in ("source", "target"):
+        if junction and pointer_name in ("source", "target"):
             raise ValueError(
                 f"Junction type {cls.__name__!r}: 'source' and 'target' are reserved "
                 f"names — they are injected automatically by Pylon."
             )
         nullable, inner = _unwrap_optional(annotation)
-        cls_default = cls.__dict__.get(field_name, MISSING)
-        meta = _annotation_to_meta(field_name, inner, nullable, cls_default)
+        cls_default = cls.__dict__.get(pointer_name, MISSING)
+        meta = _annotation_to_meta(pointer_name, inner, nullable, cls_default)
         if junction and meta.kind != "property":
             raise ValueError(
-                f"Junction type {cls.__name__!r}: field {field_name!r} is a "
+                f"Junction type {cls.__name__!r}: pointer {pointer_name!r} is a "
                 f"{meta.kind!r}; junction types only support scalar properties."
             )
-        pointer_metas[field_name] = meta
+        pointer_metas[pointer_name] = meta
 
     _prepare_dataclass(cls, pointer_metas)
     dataclasses.dataclass(cls, kw_only=True)
@@ -471,7 +471,7 @@ def abstract_decorator(
 ) -> Any:
     """@pylon.abstract — abstract base type; no DB object is created.
 
-    Fields and constraints defined here are inherited by concrete subtypes.
+    Pointers and constraints defined here are inherited by concrete subtypes.
 
     Usage::
 

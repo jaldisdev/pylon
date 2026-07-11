@@ -248,8 +248,8 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
     # Schema object or free object
     # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
     selected = {
-        f["name"] for f in shape.get("fields", [])
-        if not (f["name"] == "__type__" and f["position"] == 0)
+        p["name"] for p in shape.get("pointers", [])
+        if not (p["name"] == "__type__" and p["position"] == 0)
     }
     type_name = shape.get("type_name") or ""
 
@@ -262,7 +262,7 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
                 if k in selected
             }
             # __display_type__ is the internal sentinel used as the type label in _format_results.
-            # Keeping it separate from __type__ lets an explicit `__type__` field show in the output.
+            # Keeping it separate from __type__ lets an explicit `__type__` pointer show in the output.
             d["__display_type__"] = vars(obj).get("__pylon_type__") or type_name or type(obj).__name__
         elif isinstance(obj, dict):
             d = {k: v for k, v in obj.items() if k in selected}
@@ -387,14 +387,14 @@ def _format_named_tuple(v: object) -> str:
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         mod = getattr(type(v), "__pylon_module__", None)
         qname = f"{mod}::{type(v).__name__}" if mod else type(v).__name__
-        fields = {k: val for k, val in vars(v).items() if not k.startswith("__pylon_")}
+        pointers = {k: val for k, val in vars(v).items() if not k.startswith("__pylon_")}
     elif isinstance(v, dict):
         qname = ""
-        fields = v
+        pointers = v
     else:
         return str(v)
     prefix = f"{_type(qname)} " if qname else ""
-    pairs = ", ".join(f"{_key(k)} := {_value(val)}" for k, val in fields.items())
+    pairs = ", ".join(f"{_key(k)} := {_value(val)}" for k, val in pointers.items())
     return f"{prefix}({pairs})"
 
 
@@ -419,8 +419,8 @@ def _pformat_value(v: object, depth: int, max_width: int) -> str:
     """Pretty-print a value, recursively expanding objects that are too wide."""
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         qname = vars(v).get("__pylon_type__") or type(v).__name__
-        fields = {k: val for k, val in vars(v).items() if k != "__pylon_type__"}
-        return _pformat_object(qname, fields, depth, max_width)
+        pointers = {k: val for k, val in vars(v).items() if k != "__pylon_type__"}
+        return _pformat_object(qname, pointers, depth, max_width)
     if isinstance(v, dict):
         return _pformat_object("", v, depth, max_width)
     from pylon.datatypes import PylonSet
@@ -430,17 +430,17 @@ def _pformat_value(v: object, depth: int, max_width: int) -> str:
     return _value(v)
 
 
-def _pformat_object(type_name: str, fields: dict, depth: int, max_width: int) -> str:
+def _pformat_object(type_name: str, pointers: dict, depth: int, max_width: int) -> str:
     """Format an object as single-line if it fits, otherwise expand to multi-line."""
     prefix = f"{_type(type_name)} " if type_name else ""
-    pairs_compact = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in fields.items())
+    pairs_compact = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in pointers.items())
     compact = f"{prefix}{_brace('{')}{pairs_compact}{_brace('}')}"
     if _visual_len(compact) <= max_width - depth * 2:
         return compact
     indent = "  " * (depth + 1)
     closing = "  " * depth
-    field_strs = [f"{_key(k)}: {_pformat_value(v, depth + 1, max_width)}" for k, v in fields.items()]
-    inner = f",\n{indent}".join(field_strs)
+    pointer_strs = [f"{_key(k)}: {_pformat_value(v, depth + 1, max_width)}" for k, v in pointers.items()]
+    inner = f",\n{indent}".join(pointer_strs)
     return f"{prefix}{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
 
 
@@ -467,14 +467,14 @@ def _format_group_row(obj: dict, depth: int, max_width: int) -> str:
         elem_strs = [_pformat_value(e, depth + 2, max_width) for e in elements]
     elements_str = _format_set(elem_strs)
 
-    fields = {
+    parts = {
         "key": key_str,
         "grouping": grouping_str,
         "elements": elements_str,
     }
     indent = "  " * (depth + 1)
     closing = "  " * depth
-    inner = f",\n{indent}".join(f"{_key(k)}: {v}" for k, v in fields.items())
+    inner = f",\n{indent}".join(f"{_key(k)}: {v}" for k, v in parts.items())
     return f"{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
 
 

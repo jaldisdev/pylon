@@ -241,7 +241,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         }
         for (i, constraint) in td.constraints.iter().enumerate() {
             use crate::schema::TypeConstraint;
-            if let TypeConstraint::Exclusive { fields, .. } = constraint {
+            if let TypeConstraint::Exclusive { pointers: fields, .. } = constraint {
                 // Postgres auto-names these; mirror the convention.
                 let idx_name = format!("{}_{}_{}_key", td.table, fields.join("_"), i);
                 indexes.push(DbIndex { name: idx_name, is_unique: true, method: "btree".to_string() });
@@ -252,7 +252,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             let name = if idx.expression.is_some() {
                 format!("{}__expr{}_idx", td.table, i)
             } else {
-                format!("{}__{}_idx", td.table, idx.fields.join("_"))
+                format!("{}__{}_idx", td.table, idx.pointers.join("_"))
             };
             indexes.push(DbIndex { name, is_unique: idx.unique, method: "btree".to_string() });
         }
@@ -432,7 +432,7 @@ fn expected_excl_trigger_names(schema: &SchemaDescriptor) -> HashMap<(String, St
             if l.is_exclusive { fields_list.push(vec![format!("{}_id", l.name)]); }
         }
         for c in &t.constraints {
-            if let TypeConstraint::Exclusive { fields, .. } = c { fields_list.push(fields.clone()); }
+            if let TypeConstraint::Exclusive { pointers: fields, .. } = c { fields_list.push(fields.clone()); }
         }
 
         for fields in &fields_list {
@@ -1175,7 +1175,7 @@ fn diff_inner(
             if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
                 continue;
             }
-            let parts: Vec<String> = si.fields.iter()
+            let parts: Vec<String> = si.pointers.iter()
                 .map(|sf| format!(
                     "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
                     qi(&sf.name), sf.weight.as_str()
@@ -1986,7 +1986,7 @@ mod tests {
         let mut td = simple_type("default", "Post", "Post");
         td.vector_indexes.push(VectorIndexDescriptor {
             index_name: None,
-            fields: vec!["name".into()],
+            pointers: vec!["name".into()],
             model: "test".into(),
             metric: "cosine".into(),
             dimensions: 1536,
@@ -2020,7 +2020,7 @@ mod tests {
         let mut td = simple_type("default", "Post", "Post");
         td.vector_indexes.push(VectorIndexDescriptor {
             index_name: None,
-            fields: vec!["name".into()],
+            pointers: vec!["name".into()],
             model: "test".into(),
             metric: "cosine".into(),
             dimensions: 1536,

@@ -214,7 +214,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
                 type_name: Some(sel.source.type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
-                fields: root_fields,
+                pointers: root_fields,
             },
         },
         inference_plan: None,
@@ -686,7 +686,7 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
             type_name: None,
             position: 0,
             cardinality: Cardinality::Many,
-            fields: fields
+            pointers: fields
                 .iter()
                 .enumerate()
                 .map(|(i, (name, _))| ShapeNode::Scalar { name: name.clone(), position: i })
@@ -893,7 +893,7 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         type_name: Some(grp.source.type_name.clone()),
         position: 0,
         cardinality: Cardinality::Many,
-        fields: prepend_type(shape_nodes),
+        pointers: prepend_type(shape_nodes),
     };
 
     let root = ShapeNode::Group {
@@ -976,7 +976,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 type_name: Some(type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
-                fields: prepend_type(field_nodes),
+                pointers: prepend_type(field_nodes),
             };
             (expr, shape_root)
         }
@@ -1163,7 +1163,7 @@ fn shape_select_from_cte(
             type_name: Some(target.type_name.clone()),
             position: 0,
             cardinality: Cardinality::Required,
-            fields: root_fields,
+            pointers: root_fields,
         },
     };
     (shape, Some(sql))
@@ -1508,7 +1508,7 @@ fn emit_returning_shape(
             type_name: Some(target.type_name.clone()),
             position: 0,
             cardinality: Cardinality::Required,
-            fields: root_fields,
+            pointers: root_fields,
         },
     };
     (shape, Some(sql))
@@ -1667,7 +1667,7 @@ fn emit_single_link(
         type_name: Some(sub.source.type_name.clone()),
         position: pos,
         cardinality: Cardinality::Optional,
-        fields: prepend_type(sub_nodes),
+        pointers: prepend_type(sub_nodes),
     };
     (sql, node)
 }
@@ -1752,7 +1752,7 @@ fn emit_multi_link(
             type_name: Some(sub.source.type_name.clone()),
             position: 0,
             cardinality: Cardinality::Required,
-            fields: prepend_type(sub_nodes),
+            pointers: prepend_type(sub_nodes),
         }),
     };
     (sql, node)
@@ -2083,7 +2083,7 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
         type_name: Some(vs.source.type_name.clone()),
         position: 1,
         cardinality: Cardinality::Many,
-        fields: object_shape_nodes,
+        pointers: object_shape_nodes,
     };
     let shape = ShapeDescriptor {
         root: ShapeNode::VectorSearch {
@@ -2157,7 +2157,7 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
         type_name: Some(fs.source.type_name.clone()),
         position: 1,
         cardinality: Cardinality::Many,
-        fields: object_shape_nodes,
+        pointers: object_shape_nodes,
     };
     let shape = ShapeDescriptor {
         root: ShapeNode::FtsSearch {
@@ -2224,7 +2224,7 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         type_name: Some(fs.source.type_name.clone()),
         position: 1,
         cardinality: Cardinality::Many,
-        fields: object_shape_nodes,
+        pointers: object_shape_nodes,
     };
     let shape = ShapeDescriptor {
         root: ShapeNode::FtsSearch {
@@ -2291,7 +2291,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
                 type_name: Some(sel.type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
-                fields: root_fields,
+                pointers: root_fields,
             },
         },
         inference_plan: None,
@@ -2533,13 +2533,13 @@ mod tests {
         assert!(out.sql.contains("'bar'"));
         assert!(out.sql.contains("42"));
         assert!(out.sql.contains("AS result"));
-        // Shape should describe an object with fields foo and n
-        let crate::query::ShapeNode::Object { fields, type_name, .. } = &out.shape.root
+        // Shape should describe an object with pointers foo and n
+        let crate::query::ShapeNode::Object { pointers, type_name, .. } = &out.shape.root
             else { panic!("expected Object shape") };
         assert!(type_name.is_none());
-        assert_eq!(fields.len(), 2);
-        assert!(matches!(&fields[0], crate::query::ShapeNode::Scalar { name, position: 0 } if name == "foo"));
-        assert!(matches!(&fields[1], crate::query::ShapeNode::Scalar { name, position: 1 } if name == "n"));
+        assert_eq!(pointers.len(), 2);
+        assert!(matches!(&pointers[0], crate::query::ShapeNode::Scalar { name, position: 0 } if name == "foo"));
+        assert!(matches!(&pointers[1], crate::query::ShapeNode::Scalar { name, position: 1 } if name == "n"));
     }
 
     #[test]
@@ -2693,25 +2693,25 @@ mod tests {
     #[test]
     fn test_shape_descriptor_scalars() {
         let out = compile_and_emit("SELECT Person { name, age }");
-        let ShapeNode::Object { fields, .. } = &out.shape.root else { panic!() };
-        assert_eq!(fields.len(), 3); // __type__, name, age
-        assert!(matches!(&fields[0], ShapeNode::Scalar { name, position: 0 } if name == "__type__"));
-        assert!(matches!(&fields[1], ShapeNode::Scalar { name, position: 1 } if name == "name"));
-        assert!(matches!(&fields[2], ShapeNode::Scalar { name, position: 2 } if name == "age"));
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else { panic!() };
+        assert_eq!(pointers.len(), 3); // __type__, name, age
+        assert!(matches!(&pointers[0], ShapeNode::Scalar { name, position: 0 } if name == "__type__"));
+        assert!(matches!(&pointers[1], ShapeNode::Scalar { name, position: 1 } if name == "name"));
+        assert!(matches!(&pointers[2], ShapeNode::Scalar { name, position: 2 } if name == "age"));
     }
 
     #[test]
     fn test_shape_descriptor_multi_link() {
         let out = compile_and_emit("SELECT Person { name, posts { title } }");
-        let ShapeNode::Object { fields, .. } = &out.shape.root else { panic!() };
-        // fields: [__type__, name, posts]
-        assert_eq!(fields.len(), 3);
-        let ShapeNode::Array { name, position, element } = &fields[2] else { panic!() };
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else { panic!() };
+        // pointers: [__type__, name, posts]
+        assert_eq!(pointers.len(), 3);
+        let ShapeNode::Array { name, position, element } = &pointers[2] else { panic!() };
         assert_eq!(name, "posts");
         assert_eq!(*position, 2);
-        let ShapeNode::Object { fields: elem_fields, .. } = element.as_ref() else { panic!() };
-        // element fields: [__type__, title]
-        assert_eq!(elem_fields.len(), 2);
+        let ShapeNode::Object { pointers: elem_pointers, .. } = element.as_ref() else { panic!() };
+        // element pointers: [__type__, title]
+        assert_eq!(elem_pointers.len(), 2);
     }
 
     #[test]
@@ -2729,11 +2729,11 @@ mod tests {
         assert!(out.sql.contains("'default::Person'::text"));
         assert!(out.sql.contains(") AS result"));
         // Bare INSERT returns pk only (the upstream engine behaviour)
-        let ShapeNode::Object { cardinality, fields, .. } = &out.shape.root else { panic!() };
+        let ShapeNode::Object { cardinality, pointers, .. } = &out.shape.root else { panic!() };
         assert_eq!(*cardinality, Cardinality::Required);
         // Only __type__ and id — not name or age
-        assert!(fields.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "id")));
-        assert!(!fields.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name")));
+        assert!(pointers.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "id")));
+        assert!(!pointers.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name")));
     }
 
     #[test]
@@ -3257,7 +3257,7 @@ mod tests {
         if let Some(td) = s.types.iter_mut().find(|t| t.name == "Person") {
             td.vector_indexes.push(VectorIndexDescriptor {
                 index_name: None,
-                fields: vec!["name".into()],
+                pointers: vec!["name".into()],
                 model: "test-embed".into(),
                 metric: "cosine".into(),
                 dimensions: 4,

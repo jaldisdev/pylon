@@ -3,7 +3,7 @@ from __future__ import annotations
 from . import _collector
 
 
-class _FieldConstraint:
+class _PointerConstraint:
     """Marker base for all constraint objects."""
 
 
@@ -40,10 +40,10 @@ class _SequenceNextType:
 SequenceNext = _SequenceNextType()
 
 
-class Default(_FieldConstraint):
+class Default(_PointerConstraint):
     """Server-side default. Only Default(Now) is supported in the initial spec.
 
-    At the Python level the field is optional and defaults to None; the DDL
+    At the Python level the pointer is optional and defaults to None; the DDL
     generator emits DEFAULT NOW() (or the appropriate expression) in the column
     definition.
     """
@@ -55,10 +55,10 @@ class Default(_FieldConstraint):
         return f"Default({self.sentinel!r})"
 
 
-# ── Field-level constraints ────────────────────────────────────────────────────
+# ── Pointer-level constraints ───────────────────────────────────────────────────
 
 
-class OneOf(_FieldConstraint):
+class OneOf(_PointerConstraint):
     """Restricts a property to an explicit set of allowed values."""
 
     def __init__(self, *values: object) -> None:
@@ -68,7 +68,7 @@ class OneOf(_FieldConstraint):
         return f"OneOf({', '.join(repr(v) for v in self.values)})"
 
 
-class MaxValue(_FieldConstraint):
+class MaxValue(_PointerConstraint):
     """Inclusive upper bound on a numeric property."""
 
     def __init__(self, value: int | float) -> None:
@@ -78,7 +78,7 @@ class MaxValue(_FieldConstraint):
         return f"MaxValue({self.value!r})"
 
 
-class MaxExValue(_FieldConstraint):
+class MaxExValue(_PointerConstraint):
     """Exclusive upper bound on a numeric property."""
 
     def __init__(self, value: int | float) -> None:
@@ -88,7 +88,7 @@ class MaxExValue(_FieldConstraint):
         return f"MaxExValue({self.value!r})"
 
 
-class MinValue(_FieldConstraint):
+class MinValue(_PointerConstraint):
     """Inclusive lower bound on a numeric property."""
 
     def __init__(self, value: int | float) -> None:
@@ -98,7 +98,7 @@ class MinValue(_FieldConstraint):
         return f"MinValue({self.value!r})"
 
 
-class MinExValue(_FieldConstraint):
+class MinExValue(_PointerConstraint):
     """Exclusive lower bound on a numeric property."""
 
     def __init__(self, value: int | float) -> None:
@@ -108,7 +108,7 @@ class MinExValue(_FieldConstraint):
         return f"MinExValue({self.value!r})"
 
 
-class MaxLen(_FieldConstraint):
+class MaxLen(_PointerConstraint):
     """Maximum character/element length for string properties."""
 
     def __init__(self, length: int) -> None:
@@ -118,7 +118,7 @@ class MaxLen(_FieldConstraint):
         return f"MaxLen({self.length!r})"
 
 
-class MinLen(_FieldConstraint):
+class MinLen(_PointerConstraint):
     """Minimum character/element length for string properties."""
 
     def __init__(self, length: int) -> None:
@@ -128,7 +128,7 @@ class MinLen(_FieldConstraint):
         return f"MinLen({self.length!r})"
 
 
-class Regexp(_FieldConstraint):
+class Regexp(_PointerConstraint):
     """Regular-expression pattern constraint for string properties."""
 
     def __init__(self, pattern: str) -> None:
@@ -138,13 +138,13 @@ class Regexp(_FieldConstraint):
         return f"Regexp({self.pattern!r})"
 
 
-# ── Dual-use: field annotation or class-body type description ──────────────────
+# ── Dual-use: pointer annotation or class-body type description ────────────────
 
 
-class Description(_FieldConstraint):
-    """Human-readable description for a type, field, or link.
+class Description(_PointerConstraint):
+    """Human-readable description for a type, property, or link.
 
-    Used inside a field annotation::
+    Used inside a pointer annotation::
 
         price: Property[pylon.Decimal, Description('Price excl. tax')]
 
@@ -154,7 +154,7 @@ class Description(_FieldConstraint):
         class Product:
             Description('A product available for purchase.')
 
-    When used inside Property[T, ...] or Link[T, ...], the field annotation
+    When used inside Property[T, ...] or Link[T, ...], the pointer annotation
     builder calls _collector.unregister() to remove it from the drain list so
     it is not mistakenly treated as the type-level description.
     """
@@ -167,14 +167,14 @@ class Description(_FieldConstraint):
         return f"Description({self.text!r})"
 
 
-# ── Constraints with both field-level and class-body forms ─────────────────────
+# ── Constraints with both pointer-level and class-body forms ───────────────────
 
 
-class Exclusive(_FieldConstraint):
+class Exclusive(_PointerConstraint):
     """Unique constraint.
 
     Bare class reference inside ``Property[T, Exclusive]`` or
-    ``Link[T, Exclusive]``: marks the field unique; the class itself is used,
+    ``Link[T, Exclusive]``: marks the pointer unique; the class itself is used,
     no instance is created and nothing is registered.
 
     Instantiated in the class body for composite uniqueness::
@@ -186,38 +186,39 @@ class Exclusive(_FieldConstraint):
     it up as a class-level constraint.
     """
 
-    fields: tuple[str, ...]
+    pointers: tuple[str, ...]
     unless: str | None
 
     def __init__(
         self,
-        fields: str | tuple[str, ...],
+        pointers: str | tuple[str, ...],
         *,
         unless: str | None = None,
     ) -> None:
-        self.fields = (fields,) if isinstance(fields, str) else tuple(fields)
+        self.pointers = (pointers,) if isinstance(pointers, str) else tuple(pointers)
         self.unless = unless
         _collector.register(self)
 
     def __repr__(self) -> str:
-        parts = [repr(self.fields)]
+        parts = [repr(self.pointers)]
         if self.unless is not None:
             parts.append(f"unless={self.unless!r}")
         return f"Exclusive({', '.join(parts)})"
 
 
-class Readonly(_FieldConstraint):
+class Readonly(_PointerConstraint):
     """Marks a property or link as read-only in PyQL.
 
-    The field can still be written at the database level; the transpiler rejects
-    any PyQL update that tries to assign to it.  Used as a bare class reference::
+    The pointer can still be written at the database level; the transpiler
+    rejects any PyQL update that tries to assign to it.  Used as a bare class
+    reference::
 
         created_by: Link[User, Readonly]
         slug: Property[str, Readonly, MaxLen(120)]
     """
 
 
-class Expression(_FieldConstraint):
+class Expression(_PointerConstraint):
     """Arbitrary PyQL boolean expression declared in the class body.
 
     Uses ``__subject__`` to reference the current object::

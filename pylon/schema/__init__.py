@@ -37,7 +37,7 @@ from ._enums import enum_decorator as enum
 from ._named_tuples import NamedTuple
 from ._named_tuples import named_tuple_decorator as named_tuple
 from ._registry import named_tuples_snapshot
-from ._fields import (
+from ._pointers import (
     Allow,
     Computed,
     DeferredRestrict,
@@ -53,7 +53,7 @@ from ._fields import (
     Target,
     through,
 )
-from ._indexes import Index, SearchBackend, SearchField, SearchIndex, SearchMode, SearchWeight, VectorField, VectorIndex
+from ._indexes import Index, SearchBackend, SearchPointer, SearchIndex, SearchMode, SearchWeight, VectorPointer, VectorIndex
 from ._lazy import lazy
 from ._registry import snapshot as schema_snapshot
 from ._functions import Volatility, Language, function as function_decorator
@@ -96,7 +96,7 @@ __all__ = [
     "BaseObject",
     "Scalar",
     "Enum",
-    # Field annotations
+    # Pointer annotations
     "Property",
     "Link",
     "MultiLink",
@@ -129,10 +129,10 @@ __all__ = [
     "Regexp",
     # Indexes
     "Index",
-    "VectorField",
+    "VectorPointer",
     "VectorIndex",
     "SearchBackend",
-    "SearchField",
+    "SearchPointer",
     "SearchIndex",
     "SearchMode",
     "SearchWeight",

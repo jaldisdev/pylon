@@ -1,8 +1,8 @@
 """Tests for the vector index pipeline.
 
 Covers:
-  - VectorField / VectorIndex construction
-  - Walker field resolution (_resolve_vector_field, _make_vector_index_desc)
+  - VectorPointer / VectorIndex construction
+  - Walker pointer resolution (_resolve_vector_pointer, _make_vector_index_desc)
   - OpenAIProvider and AnthropicProvider (mocked httpx)
   - IndexWorker drain lock
   - VectorIndexWorker.process_batch (mocked asyncpg + compile_index_fetch)
@@ -13,12 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import pylon.schema as pylon
-from pylon.schema._indexes import VectorField, VectorIndex
+from pylon.schema._indexes import VectorPointer, VectorIndex
 from pylon.schema._registry import clear as clear_registry, snapshot
 from pylon.schema._walker import (
     SchemaError,
     _make_vector_index_desc,
-    _resolve_vector_field,
+    _resolve_vector_pointer,
 )
 
 
@@ -44,47 +44,47 @@ def _isolated_registry():
         register_scalar(s)
 
 
-# ── VectorField ───────────────────────────────────────────────────────────────
+# ── VectorPointer ───────────────────────────────────────────────────────────────
 
 
-class TestVectorField:
+class TestVectorPointer:
     def test_stores_ref(self):
-        assert VectorField("Product.name").ref == "Product.name"
+        assert VectorPointer("Product.name").ref == "Product.name"
 
-    def test_plain_field_name(self):
-        assert VectorField("name").ref == "name"
+    def test_plain_pointer_name(self):
+        assert VectorPointer("name").ref == "name"
 
     def test_repr(self):
-        assert repr(VectorField("Product.name")) == "VectorField('Product.name')"
+        assert repr(VectorPointer("Product.name")) == "VectorPointer('Product.name')"
 
 
 # ── VectorIndex ───────────────────────────────────────────────────────────────
 
 
 class TestVectorIndex:
-    def test_stores_vector_fields(self):
+    def test_stores_vector_pointers(self):
         vi = VectorIndex(
-            fields=[VectorField("Product.name"), VectorField("Product.description")],
+            pointers=[VectorPointer("Product.name"), VectorPointer("Product.description")],
             model="mistral-embed",
         )
-        assert len(vi._vector_fields) == 2
-        assert vi._vector_fields[0].ref == "Product.name"
-        assert vi._vector_fields[1].ref == "Product.description"
+        assert len(vi._vector_pointers) == 2
+        assert vi._vector_pointers[0].ref == "Product.name"
+        assert vi._vector_pointers[1].ref == "Product.description"
 
     def test_defaults(self):
-        vi = VectorIndex(fields=[VectorField("Product.name")], model="mistral-embed")
+        vi = VectorIndex(pointers=[VectorPointer("Product.name")], model="mistral-embed")
         assert vi.metric == "cosine"
         assert vi.dimensions == 1024
         assert vi.index_name is None
 
     def test_named_via_set_name(self):
-        vi = VectorIndex(fields=[VectorField("Product.name")], model="mistral-embed")
+        vi = VectorIndex(pointers=[VectorPointer("Product.name")], model="mistral-embed")
         vi.__set_name__(None, "summary_index")
         assert vi.index_name == "summary_index"
 
     def test_custom_metric_and_dimensions(self):
         vi = VectorIndex(
-            fields=[VectorField("Product.name")],
+            pointers=[VectorPointer("Product.name")],
             model="text-embedding-3-small",
             metric="euclidean",
             dimensions=512,
@@ -93,41 +93,41 @@ class TestVectorIndex:
         assert vi.dimensions == 512
 
 
-# ── Field resolution ──────────────────────────────────────────────────────────
+# ── Pointer resolution ──────────────────────────────────────────────────────────
 
 
-class TestResolveVectorField:
+class TestResolveVectorPointer:
     def test_qualified_ref(self):
-        result = _resolve_vector_field("Product.name", "Product", {"name", "description"})
+        result = _resolve_vector_pointer("Product.name", "Product", {"name", "description"})
         assert result == "name"
 
     def test_plain_ref(self):
-        result = _resolve_vector_field("name", "Product", {"name", "description"})
+        result = _resolve_vector_pointer("name", "Product", {"name", "description"})
         assert result == "name"
 
     def test_wrong_type_prefix_raises(self):
         with pytest.raises(SchemaError, match="does not match"):
-            _resolve_vector_field("Order.name", "Product", {"name"})
+            _resolve_vector_pointer("Order.name", "Product", {"name"})
 
-    def test_unknown_qualified_field_raises(self):
+    def test_unknown_qualified_pointer_raises(self):
         with pytest.raises(SchemaError, match="not found"):
-            _resolve_vector_field("Product.missing", "Product", {"name", "description"})
+            _resolve_vector_pointer("Product.missing", "Product", {"name", "description"})
 
-    def test_unknown_plain_field_raises(self):
+    def test_unknown_plain_pointer_raises(self):
         with pytest.raises(SchemaError, match="not found"):
-            _resolve_vector_field("missing", "Product", {"name"})
+            _resolve_vector_pointer("missing", "Product", {"name"})
 
 
 class TestMakeVectorIndexDesc:
-    def test_resolves_fields_and_passes_to_core(self):
+    def test_resolves_pointers_and_passes_to_core(self):
         core = MagicMock()
         vi = VectorIndex(
-            fields=[VectorField("Product.name"), VectorField("Product.description")],
+            pointers=[VectorPointer("Product.name"), VectorPointer("Product.description")],
             model="mistral-embed",
         )
         _make_vector_index_desc(vi, core, "Product", {"name", "description"})
         core.VectorIndexDescriptor.assert_called_once_with(
-            fields=["name", "description"],
+            pointers=["name", "description"],
             model="mistral-embed",
             metric="cosine",
             dimensions=1024,
@@ -136,20 +136,20 @@ class TestMakeVectorIndexDesc:
 
     def test_plain_refs_resolved(self):
         core = MagicMock()
-        vi = VectorIndex(fields=[VectorField("name")], model="mistral-embed")
+        vi = VectorIndex(pointers=[VectorPointer("name")], model="mistral-embed")
         _make_vector_index_desc(vi, core, "Product", {"name"})
         core.VectorIndexDescriptor.assert_called_once()
-        assert core.VectorIndexDescriptor.call_args.kwargs["fields"] == ["name"]
+        assert core.VectorIndexDescriptor.call_args.kwargs["pointers"] == ["name"]
 
     def test_bad_ref_raises_schema_error(self):
         core = MagicMock()
-        vi = VectorIndex(fields=[VectorField("Product.nonexistent")], model="mistral-embed")
+        vi = VectorIndex(pointers=[VectorPointer("Product.nonexistent")], model="mistral-embed")
         with pytest.raises(SchemaError):
             _make_vector_index_desc(vi, core, "Product", {"name"})
 
     def test_named_index_passed_through(self):
         core = MagicMock()
-        vi = VectorIndex(fields=[VectorField("Product.name")], model="mistral-embed")
+        vi = VectorIndex(pointers=[VectorPointer("Product.name")], model="mistral-embed")
         vi.__set_name__(None, "my_index")
         _make_vector_index_desc(vi, core, "Product", {"name"})
         assert core.VectorIndexDescriptor.call_args.kwargs["index_name"] == "my_index"

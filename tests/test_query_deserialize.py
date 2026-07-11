@@ -34,19 +34,19 @@ def _scalar(name: str, pos: int) -> dict:
 def _object(
     name: str,
     type_name: str,
-    fields: list,
+    pointers: list,
     *,
     position: int = 0,
     cardinality: str = "many",
 ) -> dict:
-    type_field = {"kind": "scalar", "name": "__type__", "position": 0}
+    type_pointer = {"kind": "scalar", "name": "__type__", "position": 0}
     return {
         "kind": "object",
         "name": name,
         "type_name": type_name,
         "position": position,
         "cardinality": cardinality,
-        "fields": [type_field] + fields,
+        "pointers": [type_pointer] + pointers,
     }
 
 

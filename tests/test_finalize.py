@@ -196,7 +196,7 @@ class TestEffectiveFields:
         assert "name" in eff
         assert "id" in eff  # always injected
 
-    def test_inherits_abstract_parent_fields(self):
+    def test_inherits_abstract_parent_pointers(self):
         @pylon.abstract(module="t", name="Base")
         class Base:
             created_at: pylon.DateTime
