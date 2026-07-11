@@ -390,19 +390,36 @@ pub struct IrMultiLinkMutation {
     pub source_col: String,
     /// Column on the junction table referencing the target object's id.
     pub target_col: String,
-    /// The set of target objects.
+    /// The set of target objects (plus any `@prop := expr` link-property
+    /// assignments attached to them).
     pub values: IrMultiLinkValues,
+}
+
+/// The set of target object ids for a multi-link mutation, plus any
+/// link-property assignments (`@prop := expr`) attached directly to this
+/// source — e.g. `(select Tag filter .id = $a) { @weight := <float64>$w }`.
+/// A `Union` node's own `link_props` is always empty; each side carries its
+/// own instead (different targets in one `+=` can have different property
+/// values — see `emit_ml_append_cte` in sql/mod.rs for how the SQL layer
+/// reconciles a heterogeneous property-name set across union branches).
+#[derive(Debug, Clone)]
+pub struct IrMultiLinkValues {
+    pub source: IrMultiLinkValueSource,
+    pub link_props: Vec<(String, IrExpr)>,
 }
 
 /// How to obtain the target object IDs for a multi-link mutation.
 #[derive(Debug, Clone)]
-pub enum IrMultiLinkValues {
+pub enum IrMultiLinkValueSource {
     /// Reference to a named CTE: `FROM "cte_name"`.
     CteRef(String),
     /// A regular schema SELECT (use source table + filter to get ids).
     Select(Box<IrSelect>),
     /// A path-traversal SELECT (root + joins, final result is the id).
     PathSelect(Box<IrPathSelect>),
+    /// `a union b` — combine two target sets (e.g. distinct-typed adds, or an
+    /// existing-select add alongside a same-batch forward-referenced insert).
+    Union(Box<IrMultiLinkValues>, Box<IrMultiLinkValues>),
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────────
