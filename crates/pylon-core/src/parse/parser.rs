@@ -400,7 +400,7 @@ impl Parser {
     // ── Expressions ─────────────────────────────────────────────────────────────
 
     // Precedence (lowest → highest):
-    //   union → if/else → or → and → not → comparison → coalesce → add/concat → mul → pow → unary → postfix
+    //   union/except → if/else → or → and → not → comparison → coalesce → add/concat → mul → pow → unary → postfix
 
     pub fn parse_expr(&mut self) -> Result<Expr, PyQLSyntaxError> {
         self.parse_union()
@@ -408,10 +408,18 @@ impl Parser {
 
     fn parse_union(&mut self) -> Result<Expr, PyQLSyntaxError> {
         let mut left = self.parse_if_else()?;
-        while matches!(self.current(), Token::Union) {
-            self.advance();
-            let right = self.parse_if_else()?;
-            left = Expr::Union(Box::new(left), Box::new(right));
+        loop {
+            if matches!(self.current(), Token::Union) {
+                self.advance();
+                let right = self.parse_if_else()?;
+                left = Expr::Union(Box::new(left), Box::new(right));
+            } else if matches!(self.current(), Token::Except) {
+                self.advance();
+                let right = self.parse_if_else()?;
+                left = Expr::Except(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
         }
         Ok(left)
     }

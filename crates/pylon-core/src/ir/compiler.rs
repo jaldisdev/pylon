@@ -3744,6 +3744,11 @@ impl<'a> Compiler<'a> {
                 position: Position { line: 0, col: 0 },
             })),
 
+            Expr::Except(_, _) => Err(PyQLError::Type(PyQLTypeError {
+                message: "except is not valid in expression context".into(),
+                position: Position { line: 0, col: 0 },
+            })),
+
             // detached in schema-bound context: compile inner as an independent subquery,
             // bypassing the implicit root-matches-td correlation rewrite.
             Expr::Detached(inner) => {
