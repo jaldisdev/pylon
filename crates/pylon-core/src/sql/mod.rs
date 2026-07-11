@@ -175,13 +175,15 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
 
     // SELECT-over-DML: wrap inner statement in a CTE, select from it.
     let from_clause = if let Some(dml) = &sel.dml_source {
-        let cte_sql = emit_dml_as_cte_source(dml);
+        let mut cte_parts = match dml.as_ref() {
+            IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, "_dml"),
+            _ => vec![format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml))],
+        };
         let (enqueue_v, enqueue_s) = match dml.as_ref() {
             IrStmt::Insert(ins) => (ins.enqueue_vector.as_slice(), ins.enqueue_search.as_slice()),
             IrStmt::Update(upd) => (upd.enqueue_vector.as_slice(), upd.enqueue_search.as_slice()),
             _ => (&[][..], &[][..]),
         };
-        let mut cte_parts = vec![format!("\"_dml\" AS (\n{}\n)", cte_sql)];
         cte_parts.extend(enqueue_ctes(enqueue_v, "_dml"));
         cte_parts.extend(enqueue_search_ctes(enqueue_s, "_dml", enqueue_v.len()));
         format!("WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
@@ -249,6 +251,14 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql
         }
         IrStmt::Update(upd) => {
+            // Callers must route an update with any multi-link (junction
+            // table) mutation through emit_update_multilink_ctes instead —
+            // junction INSERT/DELETE CTEs are data-modifying and Postgres
+            // requires those to sit at the *top level* of the query, so they
+            // can't be nested inside this function's single-CTE-body return
+            // value. See emit_cte_prefix and emit_select_stmt's dml_source
+            // branch, both of which check has_any_multilink before calling
+            // this function at all.
             let alias = &upd.target.alias;
             let mut sets: Vec<String> = upd.assignments.iter()
                 .map(|(col, expr)| format!("    {} = {}", qi(col), emit_expr(expr)))
@@ -316,12 +326,97 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
 
 // ── User CTE helpers ────────────────────────────────────────────────────────
 
+fn update_has_any_multilink(upd: &IrUpdate) -> bool {
+    !upd.multi_link_clears.is_empty()
+        || !upd.multi_link_replaces.is_empty()
+        || !upd.multi_link_appends.is_empty()
+        || !upd.multi_link_removals.is_empty()
+}
+
+/// Builds the CTE chain for an UPDATE with multi-link (junction table)
+/// mutations, bound to a single external `name` (a user WITH-binding, or the
+/// implicit "_dml" wrapper for `SELECT (UPDATE ...)`). Junction INSERT/DELETE
+/// statements are themselves data-modifying, and Postgres requires
+/// data-modifying CTEs to sit at the *top level* of the query — they can't
+/// be nested inside another CTE's own body (confirmed live: nesting them
+/// raises "WITH clause containing a data-modifying statement must be at the
+/// top level"). So this returns a flat list of sibling CTE parts, prefixed
+/// by `name` to stay collision-free alongside any other bound statements in
+/// the same WITH block, ending in a `"{name}" AS (SELECT * FROM
+/// "{name}__ids")` passthrough — every other reference to `name` keeps
+/// seeing the updated row's full columns exactly as `RETURNING *` would have
+/// exposed them.
+fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
+    let alias = &upd.target.alias;
+    let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
+    let ids_name = format!("{}__ids", name);
+    let mut parts: Vec<String> = vec![];
+
+    if has_scalar_changes {
+        let mut sets: Vec<String> = upd.assignments.iter()
+            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+            .collect();
+        for rw in &upd.rewrites {
+            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
+        }
+        let mut upd_sql = format!(
+            "UPDATE {} AS {}\nSET {}",
+            source_ref(&upd.target), qi(alias), sets.join(", "),
+        );
+        append_filter(&mut upd_sql, &upd.filter);
+        upd_sql.push_str("\nRETURNING *");
+        parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, upd_sql));
+    } else {
+        let mut sel = format!(
+            "SELECT {}.* FROM {} AS {}",
+            qi(alias), source_ref(&upd.target), qi(alias),
+        );
+        append_filter(&mut sel, &upd.filter);
+        parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sel));
+    }
+
+    for (i, clr) in upd.multi_link_clears.iter().enumerate() {
+        let del = format!(
+            "DELETE FROM {} WHERE {} IN (SELECT id FROM \"{}\")",
+            qn(&clr.module, &clr.junction_table), qi(&clr.source_col), ids_name,
+        );
+        parts.push(format!("\"{}__clr_{}\" AS (\n{}\n)", name, i, del));
+    }
+    for (i, app) in upd.multi_link_appends.iter().enumerate() {
+        parts.push(emit_ml_append_cte(app, &ids_name, &format!("{}__ml_add_{}", name, i)));
+    }
+    for (i, rem) in upd.multi_link_removals.iter().enumerate() {
+        parts.push(emit_ml_remove_cte(rem, &ids_name, &format!("{}__ml_rm_{}", name, i)));
+    }
+    for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
+        parts.push(emit_ml_append_cte(rep, &ids_name, &format!("{}__ml_rep_{}", name, i)));
+    }
+
+    parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
+    parts
+}
+
+/// Expands a list of user-bound WITH names into their top-level CTE parts —
+/// usually one part per name, except an UPDATE with any multi-link mutation
+/// expands into several sibling parts (see emit_update_multilink_ctes) since
+/// those can't be nested inside a single name's own CTE body.
+fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
+    let mut parts: Vec<String> = vec![];
+    for c in ctes {
+        if let IrStmt::Update(upd) = &c.stmt {
+            if update_has_any_multilink(upd) {
+                parts.extend(emit_update_multilink_ctes(upd, &c.name));
+                continue;
+            }
+        }
+        parts.push(format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)));
+    }
+    parts
+}
+
 /// Emit `WITH "name" AS (...), ...` prefix (WITH keyword + trailing newline included).
 fn emit_cte_prefix(ctes: &[IrCteDef]) -> String {
-    let parts: Vec<String> = ctes.iter()
-        .map(|c| format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)))
-        .collect();
-    format!("WITH\n{}\n", parts.join(",\n"))
+    format!("WITH\n{}\n", emit_user_cte_parts(ctes).join(",\n"))
 }
 
 /// Emit `(SELECT id FROM ...)` sub-expression for a multi-link values source.
@@ -403,13 +498,18 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
 }
 
 /// Emit the CTE clause for a junction table INSERT (append / replace-insert).
-fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, _idx: usize, cte_name: &str) -> String {
+/// `ids_name` is the row-source CTE to join against (usually "_ids", but
+/// callers hoisting this into a shared top-level WITH block alongside other
+/// user-bound statements pass a name prefixed for collision-safety instead).
+fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
     let vals_ref = emit_multilink_values_subquery(&mutation.values);
     let ins = format!(
-        "INSERT INTO {} ({}, {})\nSELECT \"_ids\".\"id\", \"_v\".\"id\" FROM \"_ids\" CROSS JOIN {} AS \"_v\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}",
+        "INSERT INTO {} ({}, {})\nSELECT \"{}\".\"id\", \"_v\".\"id\" FROM \"{}\" CROSS JOIN {} AS \"_v\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}",
         qn(&mutation.module, &mutation.junction_table),
         qi(&mutation.source_col),
         qi(&mutation.target_col),
+        ids_name,
+        ids_name,
         vals_ref,
         qi(&mutation.source_col),
         qi(&mutation.target_col),
@@ -417,13 +517,15 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, _idx: usize, cte_name: &st
     format!("\"{}\" AS (\n{}\n)", cte_name, ins)
 }
 
-/// Emit the CTE clause for a junction table DELETE (remove).
-fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, _idx: usize, cte_name: &str) -> String {
+/// Emit the CTE clause for a junction table DELETE (remove). See
+/// emit_ml_append_cte re: `ids_name`.
+fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
     let vals_ref = emit_multilink_values_subquery(&mutation.values);
     let del = format!(
-        "DELETE FROM {}\nWHERE {} IN (SELECT \"id\" FROM \"_ids\")\n  AND {} IN (SELECT \"id\" FROM {})\nRETURNING {}, {}",
+        "DELETE FROM {}\nWHERE {} IN (SELECT \"id\" FROM \"{}\")\n  AND {} IN (SELECT \"id\" FROM {})\nRETURNING {}, {}",
         qn(&mutation.module, &mutation.junction_table),
         qi(&mutation.source_col),
+        ids_name,
         qi(&mutation.target_col),
         vals_ref,
         qi(&mutation.source_col),
@@ -948,9 +1050,7 @@ fn emit_for_insert(
         .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
         .collect();
 
-    let mut cte_parts: Vec<String> = user_ctes.iter().map(|cte| {
-        format!("{} AS (\n{}\n)", qi(&cte.name), emit_dml_as_cte_source(&cte.stmt))
-    }).collect();
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
     cte_parts.push(format!("{}(\"v\") AS (VALUES {})", qi(iter_alias), rows.join(", ")));
 
     let mut sql = format!(
@@ -1126,9 +1226,7 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         .chain(upd.rewrites.iter().map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
         .collect();
 
-    let mut cte_parts: Vec<String> = user_ctes.iter()
-        .map(|c| format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)))
-        .collect();
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
     let mut union_parts = vec![];
 
     for (i, imp) in upd.poly_implementors.iter().enumerate() {
@@ -1210,10 +1308,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\n    RETURNING \"id\"");
 
-        let mut cte_parts: Vec<String> = vec![];
-        for cte in user_ctes {
-            cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte.name, emit_dml_as_cte_source(&cte.stmt)));
-        }
+        let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
         cte_parts.push(format!("\"_w\" AS (\n{}\n)", upd_sql));
         cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_w"));
         cte_parts.extend(enqueue_search_ctes(&upd.enqueue_search, "_w", upd.enqueue_vector.len()));
@@ -1238,12 +1333,9 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     };
 
     let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
-    let mut cte_parts: Vec<String> = vec![];
 
     // User CTEs first.
-    for cte in user_ctes {
-        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte.name, emit_dml_as_cte_source(&cte.stmt)));
-    }
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
 
     // _ids: the target rows (updated or selected).
     if has_scalar_changes {
@@ -1280,17 +1372,17 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Junction appends (`+=`).
     for (i, app) in upd.multi_link_appends.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(app, i, &format!("_ml_add_{}", i)));
+        cte_parts.push(emit_ml_append_cte(app, "_ids", &format!("_ml_add_{}", i)));
     }
 
     // Junction removals (`-=`).
     for (i, rem) in upd.multi_link_removals.iter().enumerate() {
-        cte_parts.push(emit_ml_remove_cte(rem, i, &format!("_ml_rm_{}", i)));
+        cte_parts.push(emit_ml_remove_cte(rem, "_ids", &format!("_ml_rm_{}", i)));
     }
 
     // Junction inserts for replace (`:= expr` — insert after the clear).
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(rep, i, &format!("_ml_rep_{}", i)));
+        cte_parts.push(emit_ml_append_cte(rep, "_ids", &format!("_ml_rep_{}", i)));
     }
 
     // Enqueue CTEs (source is _ids which has all columns including id).
@@ -2688,6 +2780,68 @@ mod tests {
         assert!(out.sql.contains("UPDATE"));
         assert!(out.sql.contains("RETURNING *"));
         assert!(out.sql.contains("\"name\"::text"));
+    }
+
+    #[test]
+    fn test_select_over_update_multilink_only() {
+        // Regression test: an UPDATE bound to a single external name (here,
+        // the implicit "_dml" wrapper for `SELECT (UPDATE ...)`) whose SET
+        // clause is *only* a multi-link mutation, with no scalar/single-link
+        // assignment. This used to either emit an empty `SET` clause
+        // ("UPDATE ... SET  WHERE ..." — invalid SQL) or, in an earlier fix
+        // attempt, nest the junction INSERT inside "_dml"'s own CTE body —
+        // which Postgres rejects outright ("WITH clause containing a
+        // data-modifying statement must be at the top level"). The junction
+        // CTEs must instead be hoisted out as top-level siblings of "_dml".
+        let out = compile_and_emit(
+            "SELECT (UPDATE Person FILTER .id = $id SET { posts += (SELECT Post FILTER .title = $title) }) { id, name }",
+        );
+        assert!(out.sql.contains("\"_dml__ml_add_0\""), "missing junction-append CTE:\n{}", out.sql);
+        assert!(out.sql.contains("INSERT INTO"), "missing junction INSERT:\n{}", out.sql);
+        // No scalar changes -> the row-source CTE must be a SELECT, not an UPDATE
+        // with an empty SET clause.
+        assert!(out.sql.contains("\"_dml__ids\" AS (\nSELECT"), "expected SELECT-based _ids CTE:\n{}", out.sql);
+        assert!(!out.sql.contains("SET\n\nWHERE") && !out.sql.contains("SET \nWHERE"), "empty SET clause regression:\n{}", out.sql);
+        // The junction CTE must be a *sibling* at the top-level WITH, not
+        // nested inside another CTE's body — only one "WITH" keyword total.
+        assert_eq!(out.sql.matches("WITH\n").count(), 1, "junction CTE must not be nested in a second WITH:\n{}", out.sql);
+        // "_dml" itself must still resolve (as a passthrough) for the outer SELECT.
+        assert!(out.sql.contains("\"_dml\" AS (\n    SELECT * FROM \"_dml__ids\"\n)"), "missing _dml passthrough:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_select_over_update_scalar_and_multilink() {
+        // Mixed case: a scalar assignment alongside a multi-link mutation, both
+        // bound to the same external name — the scalar SET must survive *and*
+        // the junction mutation must still be emitted as its own top-level CTE.
+        let out = compile_and_emit(
+            "SELECT (UPDATE Person FILTER .id = $id SET { name := $name, posts += (SELECT Post FILTER .title = $title) }) { id, name }",
+        );
+        assert!(out.sql.contains("\"_dml__ml_add_0\""), "missing junction-append CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"_dml__ids\" AS (\nUPDATE"), "expected UPDATE-based _ids CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"name\" = "), "missing scalar SET assignment:\n{}", out.sql);
+        assert_eq!(out.sql.matches("WITH\n").count(), 1, "junction CTE must not be nested in a second WITH:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_bound_insert_and_multilink_update_forward_ref() {
+        // The actual shape pylon-ui's Data Explorer generates for its
+        // flagship "insert + link in one batch" scenario: a same-batch
+        // forward-reference (Person.posts += a not-yet-existing Post, bound
+        // to insert0) inside a multi-statement WITH. This is the exact query
+        // that failed live against a real Postgres before this fix ("WITH
+        // clause containing a data-modifying statement must be at the top
+        // level"), so it's the most important regression to pin down.
+        let out = compile_and_emit(
+            "with insert0 := (insert Post { title := $title }), update0 := (update Person filter .id = $id set { posts += (select insert0) }) select { insert0, update0 }",
+        );
+        assert!(out.sql.contains("\"insert0\" AS (\n    INSERT INTO"), "missing insert0 CTE:\n{}", out.sql);
+        assert!(out.sql.contains("\"update0__ml_add_0\""), "missing junction-append CTE for update0:\n{}", out.sql);
+        assert!(out.sql.contains("\"update0__ids\" AS (\nSELECT"), "expected SELECT-based update0 ids CTE (no scalar changes):\n{}", out.sql);
+        assert!(out.sql.contains("\"update0\" AS (\n    SELECT * FROM \"update0__ids\"\n)"), "missing update0 passthrough:\n{}", out.sql);
+        // Exactly one WITH keyword — every CTE (insert0, update0__ids,
+        // update0__ml_add_0, update0) must be a top-level sibling.
+        assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
     }
 
     #[test]
