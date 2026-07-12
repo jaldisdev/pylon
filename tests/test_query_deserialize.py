@@ -173,14 +173,16 @@ class TestDecodeJsonTuple:
         assert result == ("1", 3)
         assert isinstance(result, tuple)
 
-    def test_named_members_no_registered_class_build_dynamic_object(self):
-        from pylon.datatypes import Object
+    def test_named_members_no_registered_class_build_named_tuple_value(self):
+        from pylon.datatypes import NamedTupleValue
 
         node = _named_tuple("", 0, [_member("street"), _member("zip")])
         result = _decode({"street": "123 Main St", "zip": "94107"}, node, {})
-        assert isinstance(result, Object)
+        assert isinstance(result, NamedTupleValue)
+        assert isinstance(result, tuple)
         assert result.street == "123 Main St"
         assert result.zip == "94107"
+        assert result == ("123 Main St", "94107")
 
     def test_named_members_with_registered_class_hydrates_dataclass(self):
         @dataclass
@@ -207,10 +209,10 @@ class TestDecodeJsonTuple:
         )
         value = {"origin": {"x": 1.0, "y": 2.0}, "size": 3.0}
         result = _decode(value, node, {})
-        from pylon.datatypes import Object
+        from pylon.datatypes import NamedTupleValue
 
-        assert isinstance(result, Object)
-        assert result.origin == Object(x=1.0, y=2.0)
+        assert isinstance(result, NamedTupleValue)
+        assert result.origin == NamedTupleValue(x=1.0, y=2.0)
         assert result.size == 3.0
 
     def test_enum_member_hydrates_registered_enum(self):
@@ -254,9 +256,9 @@ class TestDecodeJsonTuple:
         node = _named_tuple("location", 2, [_member("x"), _member("y")])
         outer = ("default::Person", "Alice", {"x": 1.0, "y": 2.0})
         result = _decode(outer, node, {})
-        from pylon.datatypes import Object
+        from pylon.datatypes import NamedTupleValue
 
-        assert result == Object(x=1.0, y=2.0)
+        assert result == NamedTupleValue(x=1.0, y=2.0)
 
     def test_decode_json_tuple_helper_directly(self):
         node = _named_tuple("", 0, [_member(None), _member(None)])
