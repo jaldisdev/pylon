@@ -342,6 +342,10 @@ pub enum TypeExpr {
     /// Elements are either all-named or all-unnamed (checked at parse time) and may
     /// nest arbitrarily (an element's own `ty` can itself be `TypeExpr::Tuple`).
     Tuple { elements: Vec<TupleTypeElement> },
+    /// A one-dimensional array type: `array<str>`. The element type may be
+    /// anything except another array (checked at parse time) — Pylon arrays
+    /// are always one-dimensional, matching a plain Postgres `T[]` column.
+    Array { element: Box<TypeExpr> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,13 +361,14 @@ impl TypeExpr {
         TypeExpr::Named { module, name: name.into() }
     }
 
-    /// `(module, name)` for a `Named` type expr; `None` for `Tuple` — used by the
-    /// object-type-cast / `IS` / type-intersection contexts, which only ever mean
-    /// something for a named schema type (never a structural tuple).
+    /// `(module, name)` for a `Named` type expr; `None` for `Tuple`/`Array` —
+    /// used by the object-type-cast / `IS` / type-intersection contexts, which
+    /// only ever mean something for a named schema type (never a structural
+    /// tuple or array).
     pub fn as_named(&self) -> Option<(Option<&str>, &str)> {
         match self {
             TypeExpr::Named { module, name } => Some((module.as_deref(), name.as_str())),
-            TypeExpr::Tuple { .. } => None,
+            TypeExpr::Tuple { .. } | TypeExpr::Array { .. } => None,
         }
     }
 }

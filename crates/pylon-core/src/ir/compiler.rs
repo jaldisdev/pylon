@@ -704,6 +704,7 @@ impl<'a> Compiler<'a> {
                     .join(", ");
                 format!("tuple<{}>", inner)
             }
+            ast::TypeExpr::Array { element } => format!("array<{}>", self.type_expr_to_display_str(element)),
             ast::TypeExpr::Named { module, name } => match module {
                 Some(m) => format!("{}::{}", m, name),
                 None => type_expr_to_pg(ty)
@@ -770,13 +771,21 @@ impl<'a> Compiler<'a> {
 
     /// Resolve a cast's target `pg_type` string — shared by both `Expr::TypeCast`
     /// compile sites (`compile_free_expr`/`compile_expr`). A structural tuple
-    /// always resolves to jsonb; a named type checks enum, then registered named
-    /// tuple, then falls back to the built-in scalar/pgvector/cal type list.
+    /// always resolves to jsonb; an array resolves to its element's own pg_type
+    /// with a `[]` suffix — a real Postgres array, not jsonb, so it decodes
+    /// natively (asyncpg already returns a Python list) with no per-member
+    /// shape-tracking needed the way tuples require; a named type checks enum,
+    /// then registered named tuple, then falls back to the built-in
+    /// scalar/pgvector/cal type list.
     fn resolve_cast_pg_type(&self, ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         if matches!(ty, ast::TypeExpr::Tuple { .. }) {
             return Ok("jsonb".to_string());
         }
-        let (module, name) = ty.as_named().expect("checked above: not Tuple");
+        if let ast::TypeExpr::Array { element } = ty {
+            let element_pg = self.resolve_cast_pg_type(element)?;
+            return Ok(format!("{}[]", element_pg));
+        }
+        let (module, name) = ty.as_named().expect("checked above: not Tuple/Array");
         let qname = match module {
             Some(m) => format!("{}::{}", m, name),
             None => name.to_string(),
@@ -898,6 +907,47 @@ impl<'a> Compiler<'a> {
         } else {
             Ok(Some(IrExpr::Tuple(casted)))
         }
+    }
+
+    /// When casting an array *literal* to `array<T>`, apply the element
+    /// type's own cast to each element by position — e.g.
+    /// `<array<int64>>['1', '3']` must coerce each string element to int64,
+    /// not just emit a raw untyped `ARRAY[...]`. Reuses
+    /// `compile_tuple_element_cast_free` for the per-element cast since
+    /// casting "this value to this target type" is exactly the same
+    /// operation regardless of whether the target is a tuple element or an
+    /// array element (including decomposing a nested tuple-literal element).
+    /// Returns `None` when the source isn't a literal array (e.g. a
+    /// `$param` or a sub-select) — the caller's generic cast path handles
+    /// those instead.
+    fn try_compile_array_literal_cast_free(
+        &mut self,
+        element_ty: &ast::TypeExpr,
+        source: &Expr,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let Expr::Array(elems) = source else { return Ok(None) };
+        let casted = elems
+            .iter()
+            .map(|e| self.compile_tuple_element_cast_free(element_ty, e))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(IrExpr::Array(casted)))
+    }
+
+    /// Schema-bound counterpart of `try_compile_array_literal_cast_free` —
+    /// see its docs.
+    fn try_compile_array_literal_cast(
+        &mut self,
+        element_ty: &ast::TypeExpr,
+        source: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let Expr::Array(elems) = source else { return Ok(None) };
+        let casted = elems
+            .iter()
+            .map(|e| self.compile_tuple_element_cast(element_ty, e, td, alias))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(IrExpr::Array(casted)))
     }
 
     fn compile_enum_access(&self, type_ref: &str, variant: &str) -> Result<IrExpr, PyQLError> {
@@ -1140,7 +1190,7 @@ impl<'a> Compiler<'a> {
                                 {
                                     let src_qname = format!("{}::{}", src_td.module, src_td.name);
                                     let (ty_module, ty_name) = ty.as_named()
-                                        .ok_or_else(|| self.type_err("cannot use IS with a tuple type"))?;
+                                        .ok_or_else(|| self.type_err("cannot use IS with a tuple or array type"))?;
                                     let check_module = ty_module.unwrap_or(&src_td.module);
                                     let check_name = format!("{}::{}", check_module, ty_name);
                                     self.resolve_type(&check_name)?;
@@ -1247,7 +1297,7 @@ impl<'a> Compiler<'a> {
         // Callers only reach this function after confirming `tc.ty` is `Named`
         // (a structural tuple is never an object-type lookup).
         let (_, name) = tc.ty.as_named()
-            .ok_or_else(|| self.type_err("cannot use a tuple type as a schema object cast"))?;
+            .ok_or_else(|| self.type_err("cannot use a tuple or array type as a schema object cast"))?;
         let synthetic = ast::SelectStmt {
             result: Expr::Path(ast::Path::absolute(name)),
             filter: merged_filter,
@@ -2295,6 +2345,12 @@ impl<'a> Compiler<'a> {
                         let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
                         let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
                         return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
+                    }
+                }
+                if let ast::TypeExpr::Array { element } = &tc.ty {
+                    if let Some(ir) = self.try_compile_array_literal_cast_free(element, &tc.expr)? {
+                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape: None })));
                     }
                 }
                 let inner = self.compile_free_expr(&tc.expr)?;
@@ -4039,6 +4095,12 @@ impl<'a> Compiler<'a> {
                         return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
                     }
                 }
+                if let ast::TypeExpr::Array { element } = &tc.ty {
+                    if let Some(ir) = self.try_compile_array_literal_cast(element, &tc.expr, td, alias)? {
+                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape: None })));
+                    }
+                }
                 let inner = self.compile_expr(&tc.expr, td, alias)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
@@ -4211,7 +4273,7 @@ impl<'a> Compiler<'a> {
         };
 
         let (ty_module, ty_name) = ty.as_named()
-            .ok_or_else(|| self.type_err("cannot use IS with a tuple type"))?;
+            .ok_or_else(|| self.type_err("cannot use IS with a tuple or array type"))?;
         let check_module = ty_module.unwrap_or(td.module.as_str());
         let check_qname = format!("{}::{}", check_module, ty_name);
         self.resolve_type(&check_qname)?;
@@ -5967,11 +6029,11 @@ fn path_leaf(p: &ast::Path) -> Result<&str, PyQLError> {
 /// Map a PyQL type expression to a PostgreSQL type string.
 fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
     let Some((module, bare_name)) = ty.as_named() else {
-        // Callers resolve a structural tuple to "jsonb" directly before ever
+        // Callers resolve a structural tuple/array directly before ever
         // reaching this function (see `resolve_cast_pg_type`) — reaching here
         // with one would be an internal bug, not a user-facing scenario.
         return Err(PyQLError::Type(PyQLTypeError {
-            message: "internal error: structural tuple type reached type_expr_to_pg".into(),
+            message: "internal error: structural tuple/array type reached type_expr_to_pg".into(),
             position: Position { line: 0, col: 0 },
         }));
     };

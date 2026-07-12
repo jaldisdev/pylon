@@ -3847,6 +3847,60 @@ mod tests {
     }
 
     #[test]
+    fn test_array_literal_cast_resolves_to_native_pg_array_not_jsonb() {
+        // The exact query reported as failing — must compile now, and must
+        // resolve to a real Postgres array (text[]), never jsonb (arrays
+        // decode natively via asyncpg, unlike tuples).
+        let out = compile_and_emit("SELECT <array<str>>['foo', 'bar']");
+        assert!(out.sql.contains("::text[]") || out.sql.contains("ARRAY["), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("jsonb"), "arrays must not use jsonb, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_array_literal_cast_applies_per_element_cast() {
+        // Each element gets its own real cast, not a raw untyped ARRAY[...] —
+        // '1' and '2' must actually coerce to int8, matching real PyQL
+        // per-element cast semantics (mirrors the equivalent tuple test).
+        let out = compile_and_emit("SELECT <array<int64>>['1', '2']");
+        assert!(out.sql.contains("ARRAY[('1')::int8, ('2')::int8]"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_array_param_cast_uses_direct_suffix_cast() {
+        let out = compile_and_emit("SELECT <array<int64>>$p");
+        assert!(out.sql.contains("::int8[]"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_array_of_named_tuple_element_casts_to_jsonb_array() {
+        // An array's element type can be anything except another array —
+        // including a structural tuple, which still resolves that one
+        // element to jsonb while the array itself stays a native pg array.
+        let out = compile_and_emit("SELECT <array<tuple<x: float64, y: float64>>>$p");
+        assert!(out.sql.contains("::jsonb[]"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_nested_array_type_rejected_at_parse_time() {
+        match parse::parse("SELECT <array<array<str>>>$p") {
+            Ok(_) => panic!("expected parse error for nested array type"),
+            Err(e) => assert!(
+                e.to_string().contains("nested arrays are not supported"),
+                "got: {}",
+                e
+            ),
+        }
+    }
+
+    #[test]
+    fn test_array_cast_in_computed_shape_field_schema_bound_context() {
+        // Schema-bound counterpart (compile_expr, not compile_free_expr) — a
+        // computed shape field casting an array literal.
+        let out = compile_and_emit("SELECT Person { name, tags := <array<str>>['a', 'b'] }");
+        assert!(out.sql.contains("ARRAY[('a')::text, ('b')::text]"), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_nominal_named_tuple_cast_shape_carries_real_members() {
         use crate::schema::{TupleMemberDescriptor, TupleMemberKind};
         let mut schema = make_schema();
@@ -3983,7 +4037,23 @@ mod tests {
             Ok(_) => panic!("expected error for IS with a tuple type"),
             Err(e) => {
                 assert!(
-                    e.to_string().contains("cannot use IS with a tuple type"),
+                    e.to_string().contains("cannot use IS with a tuple or array type"),
+                    "got: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_with_array_type_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER Person is array<str>").unwrap();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected error for IS with an array type"),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("cannot use IS with a tuple or array type"),
                     "got: {}",
                     e
                 );
