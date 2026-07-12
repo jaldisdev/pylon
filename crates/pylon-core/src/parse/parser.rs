@@ -633,12 +633,13 @@ impl Parser {
         if i >= n { return false; }
         // must start with an identifier
         if !matches!(self.tokens[i].token, Token::Ident(_)) { return false; }
-        // `<tuple<...` — a structural tuple cast. The outer `<...>` isn't
-        // balance-checkable with this simple lookahead (nesting can go arbitrarily
-        // deep), but a bare identifier "tuple" immediately followed by `<` is never
-        // a legitimate comparison operand, so treat it unconditionally as a cast.
+        // `<tuple<...` / `<array<...` — a structural tuple or array cast. The
+        // outer `<...>` isn't balance-checkable with this simple lookahead
+        // (nesting can go arbitrarily deep), but a bare identifier "tuple"/
+        // "array" immediately followed by `<` is never a legitimate comparison
+        // operand, so treat it unconditionally as a cast.
         if let Token::Ident(name) = &self.tokens[i].token {
-            if name == "tuple" && i + 1 < n && matches!(self.tokens[i + 1].token, Token::Lt) {
+            if (name == "tuple" || name == "array") && i + 1 < n && matches!(self.tokens[i + 1].token, Token::Lt) {
                 return true;
             }
         }
@@ -666,6 +667,22 @@ impl Parser {
             let elements = self.parse_tuple_type_elements()?;
             self.eat(&Token::Gt)?;
             return Ok(TypeExpr::Tuple { elements });
+        }
+
+        // `array` is a contextual keyword the same way "tuple" is — a bare
+        // identifier "array" immediately followed by `<` starts a
+        // one-dimensional array type. Pylon arrays can't nest (any element
+        // type is allowed except another array), rejected here at parse time
+        // rather than left to a later compile pass.
+        if matches!(self.current(), Token::Ident(s) if s == "array") && matches!(self.peek_ahead(1), Token::Lt) {
+            self.advance(); // "array"
+            self.advance(); // "<"
+            let element = self.parse_type_expr()?;
+            if matches!(element, TypeExpr::Array { .. }) {
+                return Err(self.err("nested arrays are not supported; arrays must be one-dimensional"));
+            }
+            self.eat(&Token::Gt)?;
+            return Ok(TypeExpr::Array { element: Box::new(element) });
         }
 
         let first = self.eat_ident()?;
