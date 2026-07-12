@@ -6118,7 +6118,7 @@ fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
     match ty {
         // Wildcard params always match.
         PT::Any | PT::AnyOrderable | PT::AnyPoint => true,
-        PT::Array(_) => matches!(expr, IrExpr::Array(_)),
+        PT::Array(_) => is_array_expr(expr),
         PT::Json => infer_ir_type(expr) == Some("jsonb"),
         PT::Bytes => infer_ir_type(expr) == Some("bytea"),
         PT::Str => infer_ir_type(expr) == Some("text"),
