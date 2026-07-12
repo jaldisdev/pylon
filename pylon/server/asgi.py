@@ -50,16 +50,30 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[None]]:
     """Build the raw ASGI application for `pylon serve`."""
-    # Populated by the lifespan handler on startup; every http request reads
-    # the same connected Client back out of this closure.
-    connection: dict[str, Client] = {}
+    # Populated by the lifespan handler on startup, and lazily thereafter —
+    # one connected Client per named connection (config.connections' keys,
+    # "default" for the base [database] block), created on first use. Every
+    # http request looks up (or lazily builds) the Client for whichever
+    # connection its URL names.
+    clients: dict[str, Client] = {}
 
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
-            await _handle_lifespan(config, connection, receive, send)
+            await _handle_lifespan(config, clients, receive, send)
             return
 
         path, method = scope["path"], scope["method"]
+
+        # Routes that read/write actual database data are addressed as
+        # /api/<connection>/<rest>, mirroring the frontend's own /<branch>/...
+        # URL scheme (see ConnectionMenu.tsx) — "main" aliases the base
+        # [database] block's "default" key, matching /api/connections'
+        # convention. Schema/globals/connections/models are process-level
+        # (derived from pylon.finalize()'s schema-dir scan or the TOML config
+        # itself, never from a live DB round trip) and therefore identical
+        # regardless of which connection is selected, so they stay bare.
+        conn_rest = _split_connection_path(path)
+
         if path == "/api/schema" and method == "GET":
             await _handle_get_schema(send)
         elif path == "/api/globals" and method == "GET":
@@ -68,12 +82,24 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
             await _handle_get_connections(config, send)
         elif path == "/api/models" and method == "GET":
             await _handle_get_models(config, send)
-        elif path == "/api/stats" and method == "GET":
-            await _handle_get_stats(connection["client"], send)
-        elif path == "/api/query" and method == "POST":
-            await _handle_run_query(connection["client"], receive, send)
-        elif path == "/api/ai/chat" and method == "POST":
-            await _handle_ai_chat(config, connection["client"], receive, send)
+        elif conn_rest is not None and conn_rest[1] == "/stats" and method == "GET":
+            client = await _resolve_client(config, clients, conn_rest[0])
+            if client is None:
+                await _send_json(send, 404, {"error": f"No connection named {conn_rest[0]!r}"})
+            else:
+                await _handle_get_stats(client, send)
+        elif conn_rest is not None and conn_rest[1] == "/query" and method == "POST":
+            client = await _resolve_client(config, clients, conn_rest[0])
+            if client is None:
+                await _send_json(send, 404, {"error": f"No connection named {conn_rest[0]!r}"})
+            else:
+                await _handle_run_query(client, receive, send)
+        elif conn_rest is not None and conn_rest[1] == "/ai/chat" and method == "POST":
+            client = await _resolve_client(config, clients, conn_rest[0])
+            if client is None:
+                await _send_json(send, 404, {"error": f"No connection named {conn_rest[0]!r}"})
+            else:
+                await _handle_ai_chat(config, client, receive, send)
         elif config.ui.enabled:
             await _serve_static(path, send)
         else:
@@ -82,7 +108,43 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
     return app
 
 
-async def _handle_lifespan(config: Config, connection: dict[str, Client], receive: Receive, send: Send) -> None:
+# "main" is the frontend's fixed name for the base [database] block, which
+# config.connections stores under "default" (see _handle_get_connections).
+_MAIN_CONNECTION_ALIAS = "main"
+
+
+def _split_connection_path(path: str) -> tuple[str, str] | None:
+    """Split "/api/<connection>/<rest>" into (connection, "/<rest>").
+
+    Returns None for anything that isn't at least "/api/<segment>/<segment>"
+    — including the bare process-level routes (/api/schema, and so on),
+    which have no connection segment to split off in the first place.
+    """
+    parts = path.split("/")
+    if len(parts) < 4 or parts[0] != "" or parts[1] != "api" or not parts[2]:
+        return None
+    return parts[2], "/" + "/".join(parts[3:])
+
+
+async def _resolve_client(config: Config, clients: dict[str, Client], connection_name: str) -> Client | None:
+    """Look up (or lazily connect) the Client for a named connection.
+
+    None means the name isn't a configured connection at all — the caller
+    turns that into a 404, matching the frontend's own :branch validation
+    (Layout.tsx) rather than trying to connect to something nonexistent.
+    """
+    key = "default" if connection_name == _MAIN_CONNECTION_ALIAS else connection_name
+    if key not in config.connections:
+        return None
+    if key not in clients:
+        sub_config = dataclasses.replace(config, database=config.connections[key])
+        client = Client(sub_config)
+        await client.ensure_connected()
+        clients[key] = client
+    return clients[key]
+
+
+async def _handle_lifespan(config: Config, clients: dict[str, Client], receive: Receive, send: Send) -> None:
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
@@ -94,17 +156,21 @@ async def _handle_lifespan(config: Config, connection: dict[str, Client], receiv
 
                 pylon.finalize()
 
+                # Eagerly connect only the base ("default"/"main") connection
+                # at startup, matching the previous single-Client behavior —
+                # any other named connection connects lazily on first request
+                # (see _resolve_client), so a rarely-used branch doesn't cost
+                # a pool at every server start.
                 client = Client(config)
                 await client.ensure_connected()
-                connection["client"] = client
+                clients["default"] = client
                 await send({"type": "lifespan.startup.complete"})
             except Exception as exc:  # noqa: BLE001 — report to the ASGI server, don't hide it
                 await send({"type": "lifespan.startup.failed", "message": str(exc)})
                 return
         elif message["type"] == "lifespan.shutdown":
             try:
-                client = connection.get("client")
-                if client is not None:
+                for client in clients.values():
                     await client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
             except Exception as exc:  # noqa: BLE001
