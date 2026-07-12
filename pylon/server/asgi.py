@@ -19,7 +19,7 @@ import mimetypes
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, get_args, get_origin
 
 from pylon.client import Client
 from pylon.config import Config
@@ -27,6 +27,7 @@ from pylon.datatypes import NamedTupleValue
 from pylon.exceptions import PylonError
 from pylon.schema._decorators import _get_own_annotations, _infer_module, _unwrap_optional
 from pylon.schema._pointers import (
+    ArrayAnnotation,
     ComputedAnnotation,
     LinkAnnotation,
     MultiLinkAnnotation,
@@ -35,6 +36,7 @@ from pylon.schema._pointers import (
 )
 from pylon.schema._meta import PointerMeta
 from pylon.schema._registry import named_tuples_snapshot, snapshot as schema_snapshot
+from pylon.schema._scalars import SHORTHAND_MAP
 from pylon.schema._walker import _effective_pointers
 
 Scope = dict[str, Any]
@@ -233,8 +235,9 @@ def _classify_pointer(
     meta: PointerMeta | None,
     named_tuple_classes: set[type],
 ) -> dict[str, Any]:
-    """Returns the {kind, target?, typeName?, readonly?, required?, hasDefault?,
-    through?} fragment for one property/link/multiLink/computed pointer."""
+    """Returns the {kind, target?, typeName?, members?, element?, readonly?,
+    required?, hasDefault?, through?} fragment for one
+    property/link/multiLink/computed pointer."""
     _, inner = _unwrap_optional(annotation)
 
     if isinstance(inner, LinkAnnotation):
@@ -260,6 +263,23 @@ def _classify_pointer(
             result = {
                 "kind": "namedTuple",
                 "members": _classify_tuple_elements(scalar_type, enum_classes, named_tuple_classes),
+            }
+        elif isinstance(scalar_type, ArrayAnnotation):
+            result = {
+                "kind": "array",
+                "element": {
+                    "name": None,
+                    **_classify_member_type(scalar_type.element, enum_classes, named_tuple_classes),
+                },
+            }
+        elif get_origin(scalar_type) is list and get_args(scalar_type):
+            # Bare `list[T]` shorthand — equivalent to Array[T], the same way
+            # a bare `str` is equivalent to pylon.Str (see _decorators.py's
+            # _annotation_to_meta, which normalizes it the same way).
+            element = SHORTHAND_MAP.get(get_args(scalar_type)[0], get_args(scalar_type)[0])
+            result = {
+                "kind": "array",
+                "element": {"name": None, **_classify_member_type(element, enum_classes, named_tuple_classes)},
             }
         else:
             type_name = _scalar_type_name(scalar_type)

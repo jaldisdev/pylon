@@ -11,6 +11,7 @@ import pytest
 
 import pylon.schema as pylon
 from pylon.schema import (
+    Array,
     Computed,
     Default,
     Description,
@@ -31,7 +32,7 @@ from pylon.schema import (
     Tuple,
     through,
 )
-from pylon.schema._pointers import TupleAnnotation
+from pylon.schema._pointers import ArrayAnnotation, TupleAnnotation
 from pylon.schema._scalars import PG_TYPE_MAP, SHORTHAND_MAP
 from pylon.schema._walker import _to_pg_type
 
@@ -319,6 +320,82 @@ class TestTupleField:
         assert f.kind == "property"
         assert f.nullable is False
         assert [e.name for e in f.scalar_type.elements] == ["r", "g", "b"]
+
+
+# ---------------------------------------------------------------------------
+# One-dimensional array types (pylon.Array[T] and the bare list[T] shorthand)
+# ---------------------------------------------------------------------------
+
+
+class TestArrayField:
+    def test_array_of_scalar(self):
+        ann = Array[pylon.Str]
+        assert isinstance(ann, ArrayAnnotation)
+        assert ann.element is pylon.Str
+
+    def test_nested_array_rejected(self):
+        with pytest.raises(TypeError, match="one-dimensional"):
+            Array[Array[pylon.Str]]
+
+    def test_resolves_to_native_pg_array_not_jsonb(self):
+        assert _to_pg_type(Array[pylon.Str]) == "text[]"
+        assert _to_pg_type(Array[pylon.Int64]) == "int8[]"
+
+    def test_array_of_tuple_resolves_to_jsonb_array(self):
+        # An array's element may be anything except another array, including
+        # a structural tuple — the array itself still stays a native pg
+        # array (jsonb[]), it's just an array of jsonb-backed values.
+        assert _to_pg_type(Array[Tuple[pylon.Str, pylon.Bool]]) == "jsonb[]"
+
+    def test_optional_via_union(self):
+        @pylon.type
+        class HasArray:
+            tags: Array[pylon.Str] | None
+
+        f = HasArray.__pylon_config__.pointers["tags"]
+        assert f.kind == "property"
+        assert isinstance(f.scalar_type, ArrayAnnotation)
+        assert f.nullable is True
+
+    def test_property_meta_scalar_type_is_annotation(self):
+        @pylon.type
+        class HasRequiredArray:
+            tags: Array[pylon.Str]
+
+        f = HasRequiredArray.__pylon_config__.pointers["tags"]
+        assert f.kind == "property"
+        assert f.nullable is False
+        assert f.scalar_type.element is pylon.Str
+
+    # ── bare `list[T]` shorthand — equivalent to Array[T], the same way a
+    # bare `str` is equivalent to pylon.Str ──────────────────────────────────
+
+    def test_bare_list_shorthand_resolves_same_as_array(self):
+        @pylon.type
+        class HasListShorthand:
+            tags: list[str]
+
+        f = HasListShorthand.__pylon_config__.pointers["tags"]
+        assert f.kind == "property"
+        assert isinstance(f.scalar_type, ArrayAnnotation)
+        assert f.scalar_type.element is pylon.Str
+        assert _to_pg_type(f.scalar_type) == "text[]"
+
+    def test_bare_list_shorthand_optional(self):
+        @pylon.type
+        class HasOptionalListShorthand:
+            tags: list[str] | None
+
+        f = HasOptionalListShorthand.__pylon_config__.pointers["tags"]
+        assert f.nullable is True
+        assert isinstance(f.scalar_type, ArrayAnnotation)
+
+    def test_bare_nested_list_rejected(self):
+        with pytest.raises(TypeError, match="one-dimensional"):
+
+            @pylon.type
+            class HasNestedListShorthand:
+                tags: list[list[str]]
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ from ._named_tuples import named_tuple_decorator as named_tuple
 from ._registry import named_tuples_snapshot
 from ._pointers import (
     Allow,
+    Array,
     Computed,
     DeferredRestrict,
     DeleteSource,
@@ -103,6 +104,7 @@ __all__ = [
     "MultiLink",
     "Computed",
     "Tuple",
+    "Array",
     "through",
     # Deletion policies
     "OnDelete",
