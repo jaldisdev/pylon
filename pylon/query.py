@@ -54,10 +54,10 @@ def _decode_json_member(value: Any, node: dict, registry: dict[str, type]) -> An
 def _decode_json_tuple(value: Any, node: dict, registry: dict[str, type]) -> Any:
     """Decode a jsonb tuple/named-tuple value using its statically-known
     member shape (`node["members"]`) — a real Python tuple for positional
-    members, the registered dataclass for a nominal type, or a dynamically
-    built dataclass (mirroring pylon.datatypes.Object) for an unregistered
-    structural named tuple. Falls back to the raw jsonb value when no member
-    shape was available at compile time."""
+    members, the registered dataclass for a nominal type, or a
+    pylon.datatypes.NamedTupleValue (mirroring the upstream NamedTuple) for an
+    unregistered structural named tuple. Falls back to the raw jsonb value
+    when no member shape was available at compile time."""
     if value is None:
         return None
 
@@ -85,8 +85,8 @@ def _decode_json_tuple(value: Any, node: dict, registry: dict[str, type]) -> Any
         cls = registry.get(type_name)
         if cls is not None:
             return cls(**kwargs)
-    from pylon.datatypes import Object
-    return Object(**kwargs)
+    from pylon.datatypes import NamedTupleValue
+    return NamedTupleValue(**kwargs)
 
 
 def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:

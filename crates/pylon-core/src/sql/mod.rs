@@ -2041,13 +2041,23 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             // PostgreSQL doesn't support arbitrary_type::jsonb; to_jsonb() accepts any input.
             // String literals have type "unknown" in PG, so cast to text first.
             if c.pg_type == "jsonb" {
-                let inner = match &c.expr {
+                match &c.expr {
+                    // A bare `$N` parameter has no PG type at all until told
+                    // otherwise. to_jsonb($N) can't resolve it — it's a
+                    // polymorphic function, which needs a *concrete* input
+                    // type to dispatch on, and an unknown-typed placeholder
+                    // gives it nothing to work with ("could not determine
+                    // polymorphic type because input has type unknown").
+                    // A direct ($N)::jsonb cast works because PG specially
+                    // resolves an unknown-typed parameter against an
+                    // explicit cast — the same reason `$1::uuid` works fine
+                    // elsewhere in this file.
+                    IrExpr::Param { .. } => format!("({})::jsonb", emit_expr(&c.expr)),
                     IrExpr::Literal(IrLiteral::Str(_)) => {
-                        format!("{}::text", emit_expr(&c.expr))
+                        format!("to_jsonb({}::text)", emit_expr(&c.expr))
                     }
-                    _ => emit_expr(&c.expr),
-                };
-                format!("to_jsonb({})", inner)
+                    _ => format!("to_jsonb({})", emit_expr(&c.expr)),
+                }
             } else {
                 format!("({})::{}", emit_expr(&c.expr), c.pg_type)
             }
@@ -3129,6 +3139,19 @@ mod tests {
     }
 
     #[test]
+    fn test_update_set_tuple_param_cast_uses_direct_jsonb_cast_not_to_jsonb() {
+        // Regression: to_jsonb($N) on a bare, still-untyped parameter fails at
+        // execution time with "could not determine polymorphic type because
+        // input has type unknown" — Postgres can't dispatch a polymorphic
+        // function against an unknown-typed placeholder. A direct
+        // ($N)::jsonb cast resolves the parameter's type from the cast
+        // itself instead, matching how e.g. `$1::uuid` already works.
+        let out = compile_and_emit("UPDATE Person FILTER .id = $id SET { age := <tuple<x: float64>>$val }");
+        assert!(out.sql.contains(")::jsonb"), "expected a direct ::jsonb cast, got:\n{}", out.sql);
+        assert!(!out.sql.contains("to_jsonb($"), "must not pass a bare param straight into to_jsonb(): got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_delete_returning() {
         let out = compile_and_emit("DELETE Person FILTER .id = $id");
         assert!(out.sql.contains("DELETE FROM \"public\".\"Person\""));
@@ -3794,13 +3817,13 @@ mod tests {
     #[test]
     fn test_structural_tuple_cast_unnamed_resolves_to_jsonb() {
         let out = compile_and_emit("SELECT <tuple<str, bool>>$p");
-        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
     }
 
     #[test]
     fn test_structural_tuple_cast_named_resolves_to_jsonb() {
         let out = compile_and_emit("SELECT <tuple<x: float64, y: float64>>$p");
-        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -3808,7 +3831,7 @@ mod tests {
         let out = compile_and_emit(
             "SELECT <tuple<point: tuple<x: float64, y: float64>, label: str>>$p",
         );
-        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -3820,7 +3843,7 @@ mod tests {
             members: vec![],
         });
         let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
-        assert!(out.sql.contains("to_jsonb($1)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
     }
 
     #[test]

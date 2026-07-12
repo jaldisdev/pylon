@@ -2,6 +2,7 @@ import dataclasses
 from typing import Any
 
 _object_class_cache: dict[tuple[str, ...], type] = {}
+_named_tuple_value_cache: dict[tuple[str, ...], type] = {}
 
 
 class PylonSet(list):
@@ -36,3 +37,47 @@ class Object:
                 )
             return object.__new__(_object_class_cache[field_names])
         return object.__new__(cls)
+
+
+class NamedTupleValue(tuple):
+    """A named-tuple *value* — mirrors the upstream NamedTuple, not Object.
+
+    A named tuple is a tuple: its members are ordered and positionally
+    indexable/iterable/comparable like any tuple, and each member is also
+    reachable by name. That's a different shape than Object (a keyword-only
+    dataclass for free-form query results) and the distinction matters — a
+    tuple<x: ..., y: ...> value should behave like the tuple it is.
+
+    Usage::
+
+        p = NamedTupleValue(x=1, y=2)
+        p[0]                      # 1
+        p.x                       # 1
+        tuple(p)                  # (1, 2)
+        repr(p)                   # '(x := 1, y := 2)'
+    """
+
+    _fields: tuple[str, ...] = ()
+
+    def __new__(cls, **kwargs: Any) -> "NamedTupleValue":
+        if cls is NamedTupleValue:
+            field_names = tuple(kwargs.keys())
+            if field_names not in _named_tuple_value_cache:
+                _named_tuple_value_cache[field_names] = type(
+                    "NamedTupleValue",
+                    (NamedTupleValue,),
+                    {"_fields": field_names},
+                )
+            cls = _named_tuple_value_cache[field_names]
+            return tuple.__new__(cls, kwargs.values())
+        return tuple.__new__(cls, (kwargs[name] for name in cls._fields))
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[self._fields.index(name)]
+        except ValueError:
+            raise AttributeError(name) from None
+
+    def __repr__(self) -> str:
+        members = ", ".join(f"{name} := {value!r}" for name, value in zip(self._fields, self))
+        return f"({members})"

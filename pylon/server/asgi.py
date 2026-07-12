@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable
 
 from pylon.client import Client
 from pylon.config import Config
+from pylon.datatypes import NamedTupleValue
 from pylon.exceptions import PylonError
 from pylon.schema._decorators import _get_own_annotations, _infer_module, _unwrap_optional
 from pylon.schema._pointers import (
@@ -508,6 +509,11 @@ def _to_jsonable(value: Any) -> Any:
         # JsonTree does that same label-vs-fields split itself, since it also
         # needs __pylon_type__ to look up real field types from /api/schema.
         return {k: _to_jsonable(v) for k, v in attrs.items()}
+    if isinstance(value, NamedTupleValue):
+        # A real tuple underneath, but the frontend's shape-driven rendering
+        # expects named-tuple values keyed by field name (see shape_value_tags
+        # in query.py) — must check this before the generic tuple branch below.
+        return {name: _to_jsonable(v) for name, v in zip(value._fields, value)}
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(v) for v in value]
     if isinstance(value, dict):
