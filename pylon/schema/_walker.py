@@ -419,9 +419,16 @@ def _to_pg_type(scalar_type: Any) -> str:
         return f"__nt__:{mod}::{scalar_type.__name__}"
 
     # Structural tuple type (pylon.Tuple[...]) → plain jsonb, no registered type to decode into
-    from ._pointers import TupleAnnotation
+    from ._pointers import ArrayAnnotation, TupleAnnotation
     if isinstance(scalar_type, TupleAnnotation):
         return "jsonb"
+
+    # Structural array type (pylon.Array[T] or a bare list[T]) → a real
+    # Postgres array of the element's own pg_type, never jsonb — arrays
+    # decode natively via asyncpg, unlike tuples (see resolve_cast_pg_type
+    # on the Rust side, which follows the same rule for `<array<T>>` casts).
+    if isinstance(scalar_type, ArrayAnnotation):
+        return f"{_to_pg_type(scalar_type.element)}[]"
 
     # Enum type → schema-qualified PostgreSQL ENUM type reference
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonEnum):

@@ -336,6 +336,48 @@ class Tuple:
         return TupleAnnotation(elements=elements)
 
 
+class ArrayAnnotation:
+    """Structural array pointer annotation.
+
+    Usage::
+
+        tags: Array[Str]
+        scores: Array[Int64]
+    """
+
+    __slots__ = ("element",)
+
+    def __init__(self, element: Any) -> None:
+        self.element = element
+
+    def __or__(self, other: Any) -> Any:
+        if other is None:
+            return typing.Union[self, type(None)]
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"ArrayAnnotation({self.element!r})"
+
+
+class Array:
+    """One-dimensional array pointer annotation (Gel's inline `array<...>`
+    equivalent). The element type may be anything except another array —
+    Pylon arrays are always one-dimensional, matching a plain Postgres
+    `T[]` column (never jsonb, unlike Tuple).
+
+    Usage::
+
+        tags: Array[Str]
+        scores: Array[Int64]
+    """
+
+    @classmethod
+    def __class_getitem__(cls, element: Any) -> ArrayAnnotation:
+        if isinstance(element, ArrayAnnotation):
+            raise TypeError("Array[Array[...]] is not supported; arrays must be one-dimensional")
+        return ArrayAnnotation(element=element)
+
+
 class Computed:
     """Computed pointer — evaluated as a PyQL expression at query time.
 

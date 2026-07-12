@@ -140,3 +140,59 @@ class TestBuildTypeEntryWithStructuralTuple:
         assert "target" not in rgb
         assert [m["name"] for m in rgb["members"]] == ["r", "g", "b"]
         assert rgb["required"] is True
+
+
+class TestClassifyArrayPointer:
+    def test_scalar_element(self):
+        ann = pylon.Array[pylon.Str]
+        result = _classify_pointer(ann, object, set(), None, set())
+        assert result["kind"] == "array"
+        assert result["element"] == {"name": None, "kind": "scalar", "typeName": "std::str"}
+
+    def test_enum_element(self):
+        @pylon.enum("Active", "Inactive")
+        class Status(pylon.Enum):
+            pass
+
+        ann = pylon.Array[Status]
+        result = _classify_pointer(ann, object, {Status}, None, set())
+        assert result["element"] == {
+            "name": None,
+            "kind": "enum",
+            "target": "test_asgi_schema::Status",
+        }
+
+    def test_tuple_element(self):
+        ann = pylon.Array[pylon.Tuple[("x", pylon.Float64), ("y", pylon.Float64)]]
+        result = _classify_pointer(ann, object, set(), None, set())
+        assert result["element"]["kind"] == "namedTuple"
+        assert result["element"]["members"] == [
+            {"name": "x", "kind": "scalar", "typeName": "std::float64"},
+            {"name": "y", "kind": "scalar", "typeName": "std::float64"},
+        ]
+
+    def test_bare_list_shorthand_classifies_the_same_as_array(self):
+        ann = list[str]
+        result = _classify_pointer(ann, object, set(), None, set())
+        assert result["kind"] == "array"
+        assert result["element"] == {"name": None, "kind": "scalar", "typeName": "std::str"}
+
+    def test_optional_array_pointer_still_classifies_via_unwrap(self):
+        ann = pylon.Array[pylon.Str] | None
+        result = _classify_pointer(ann, object, set(), None, set())
+        assert result["kind"] == "array"
+        assert result["element"] == {"name": None, "kind": "scalar", "typeName": "std::str"}
+
+
+class TestBuildTypeEntryWithArray:
+    def test_pointer_shows_up_as_array_with_element(self):
+        @pylon.type(module="geo", name="Tagged")
+        class Tagged:
+            label: str
+            tags: pylon.Array[pylon.Str]
+
+        entry = _build_type_entry(Tagged, set(), set())
+        tags = next(p for p in entry["pointers"] if p["name"] == "tags")
+        assert tags["kind"] == "array"
+        assert tags["element"] == {"name": None, "kind": "scalar", "typeName": "std::str"}
+        assert tags["required"] is True

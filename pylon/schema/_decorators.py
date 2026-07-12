@@ -12,6 +12,7 @@ from typing import Any
 from . import _collector
 from ._constraints import Default, Description, Exclusive, Expression, Readonly
 from ._pointers import (
+    ArrayAnnotation,
     ComputedAnnotation,
     LinkAnnotation,
     MultiLinkAnnotation,
@@ -174,6 +175,43 @@ def _annotation_to_meta(
             name=name,
             kind="property",
             scalar_type=annotation,
+            nullable=nullable,
+            constraints=[],
+            default=default,
+            default_factory=factory,
+        )
+
+    if isinstance(annotation, ArrayAnnotation):
+        default, factory = _resolve_default(cls_default, [])
+        return PointerMeta(
+            name=name,
+            kind="property",
+            scalar_type=annotation,
+            nullable=nullable,
+            constraints=[],
+            default=default,
+            default_factory=factory,
+        )
+
+    # Python shorthand: a bare `list[T]` is equivalent to `Array[T]`, the same
+    # way a bare `str` is equivalent to `pylon.Str` — normalized to the same
+    # ArrayAnnotation the rest of the pipeline (walker/schema/decode) already
+    # knows how to handle, so there's only ever one array representation
+    # downstream of this function.
+    if typing.get_origin(annotation) is list:
+        args = typing.get_args(annotation)
+        if not args:
+            raise TypeError("list[...] property annotation requires an element type, e.g. list[str]")
+        element = SHORTHAND_MAP.get(args[0], args[0])
+        if typing.get_origin(element) is list or isinstance(element, ArrayAnnotation):
+            raise TypeError(
+                "nested arrays are not supported (list[list[...]]); arrays must be one-dimensional"
+            )
+        default, factory = _resolve_default(cls_default, [])
+        return PointerMeta(
+            name=name,
+            kind="property",
+            scalar_type=ArrayAnnotation(element=element),
             nullable=nullable,
             constraints=[],
             default=default,
