@@ -2340,6 +2340,17 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::TypeCast(tc) => {
+                // `<AnyType>{}` — an empty set cast to any type, e.g. clearing
+                // an optional link (`<Company>{}`) — is always just NULL,
+                // regardless of what pg_type the cast target would otherwise
+                // resolve to (a schema object type name isn't a scalar cast
+                // target at all, so resolve_cast_pg_type couldn't handle it
+                // below anyway). Generalizes the same bare-`{}`-in-assignment-
+                // position special case in compile_assignments_inner to any
+                // expression context, matching real EdgeQL semantics.
+                if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
+                    return Ok(IrExpr::Null);
+                }
                 if let ast::TypeExpr::Tuple { elements } = &tc.ty {
                     if let Some(ir) = self.try_compile_tuple_literal_cast_free(elements, &tc.expr)? {
                         let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
@@ -4088,6 +4099,11 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::TypeCast(tc) => {
+                // See the identical check in compile_free_expr's TypeCast
+                // handling — `<AnyType>{}` is always just NULL.
+                if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
+                    return Ok(IrExpr::Null);
+                }
                 if let ast::TypeExpr::Tuple { elements } = &tc.ty {
                     if let Some(ir) = self.try_compile_tuple_literal_cast(elements, &tc.expr, td, alias)? {
                         let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
