@@ -14,6 +14,7 @@ from .schema import (
     JSON,
     UUID,
     Allow,
+    Array,
     BaseObject,
     Bool,
     NamedTuple,
@@ -131,6 +132,7 @@ __all__ = [
     "MultiLink",
     "Property",
     "Tuple",
+    "Array",
     "through",
     # Schema — deletion policies
     "OnDelete",

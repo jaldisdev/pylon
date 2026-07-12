@@ -3881,6 +3881,18 @@ mod tests {
     }
 
     #[test]
+    fn test_contains_on_array_literal_cast_uses_array_overload_not_strpos() {
+        // Regression: contains()'s array<Any> overload only matched a bare
+        // IrExpr::Array node, never a TypeCast-wrapped one — which is what
+        // every `<array<T>>[...]` cast actually compiles to. Overload
+        // resolution silently fell back to the *first* registered `contains`
+        // overload (str, str), emitting a bogus `strpos(text[], text)` call.
+        let out = compile_and_emit("SELECT contains(<array<str>>[1, 2], '2')");
+        assert!(out.sql.contains("@> ARRAY["), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("strpos"), "must not fall back to the str/str overload, got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_nested_array_type_rejected_at_parse_time() {
         match parse::parse("SELECT <array<array<str>>>$p") {
             Ok(_) => panic!("expected parse error for nested array type"),
