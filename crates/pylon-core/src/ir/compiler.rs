@@ -688,6 +688,31 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Render a cast target `TypeExpr` for error messages, e.g.
+    /// `tuple<std::int64, std::str>` or `default::Point` — used by the
+    /// compile-time tuple-index bounds check to match Gel's own wording.
+    fn type_expr_to_display_str(&self, ty: &ast::TypeExpr) -> String {
+        match ty {
+            ast::TypeExpr::Tuple { elements } => {
+                let inner = elements
+                    .iter()
+                    .map(|e| match &e.name {
+                        Some(n) => format!("{}: {}", n, self.type_expr_to_display_str(&e.ty)),
+                        None => self.type_expr_to_display_str(&e.ty),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("tuple<{}>", inner)
+            }
+            ast::TypeExpr::Named { module, name } => match module {
+                Some(m) => format!("{}::{}", m, name),
+                None => type_expr_to_pg(ty)
+                    .map(|pg| pg_type_to_pyql(&pg).to_string())
+                    .unwrap_or_else(|_| name.clone()),
+            },
+        }
+    }
+
     /// Resolve a property's tuple-type shape for decode-time `ShapeNode`
     /// building — a nominal `__nt__:module::Name` `pg_type` marker resolves
     /// via the registered `NamedTupleDescriptor`'s own members; a structural
@@ -2374,7 +2399,20 @@ impl<'a> Compiler<'a> {
                     }
                     // Not a literal to constant-fold — emit a generic runtime
                     // jsonb positional access (`$param.1`, `(<tuple<...>>expr).1`, …).
+                    // When the source is a cast to a statically-known tuple type,
+                    // bounds-check the index against its arity at compile time
+                    // (matches Gel: `2 is not a member of tuple<std::int64, std::str>`).
                     _ => {
+                        if let Expr::TypeCast(tc) = inner.as_ref() {
+                            if let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty) {
+                                if *index >= shape.members.len() {
+                                    return Err(self.type_err(&format!(
+                                        "{index} is not a member of {}",
+                                        self.type_expr_to_display_str(&tc.ty)
+                                    )));
+                                }
+                            }
+                        }
                         let ir = self.compile_free_expr(inner)?;
                         Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
                     }
@@ -4078,8 +4116,21 @@ impl<'a> Compiler<'a> {
                         self.compile_expr(val, td, alias)
                     }
                     // Not a literal to constant-fold — emit a generic runtime
-                    // jsonb positional access.
+                    // jsonb positional access. When the source is a cast to a
+                    // statically-known tuple type, bounds-check the index
+                    // against its arity at compile time (matches Gel:
+                    // `2 is not a member of tuple<std::int64, std::str>`).
                     _ => {
+                        if let Expr::TypeCast(tc) = inner.as_ref() {
+                            if let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty) {
+                                if *index >= shape.members.len() {
+                                    return Err(self.type_err(&format!(
+                                        "{index} is not a member of {}",
+                                        self.type_expr_to_display_str(&tc.ty)
+                                    )));
+                                }
+                            }
+                        }
                         let ir = self.compile_expr(inner, td, alias)?;
                         Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
                     }

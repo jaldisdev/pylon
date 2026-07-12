@@ -4001,6 +4001,27 @@ mod tests {
     }
 
     #[test]
+    fn test_tuple_index_out_of_bounds_on_cast_target_errors_at_compile_time() {
+        // Regression: `.2` on a 2-element tuple cast silently fell back to a
+        // runtime jsonb index (returning null) instead of failing, because
+        // the source is a TypeCast, not a literal Tuple/NamedTuple. The cast's
+        // target type is statically known here, so this must bounds-check
+        // and error the same way Gel does.
+        let ast = parse::parse("SELECT (<tuple<int64, str>>('1', 3)).2").unwrap();
+        let schema = make_schema();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected out-of-bounds tuple index error"),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("2 is not a member of tuple<std::int64, std::str>"),
+                    "got: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_positional_tuple_literal_cast_to_tuple_type_compiles() {
         // Each element must be cast to its own declared type — '1' isn't
         // silently jsonb-wrapped unchanged as a string; it's coerced to
