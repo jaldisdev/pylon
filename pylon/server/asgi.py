@@ -522,6 +522,8 @@ def _to_jsonable(value: Any) -> Any:
 
 
 async def _handle_run_query(client: Client, receive: Receive, send: Send) -> None:
+    from pylon.query import compile as compile_query, shape_value_tags
+
     body = await _read_json_body(receive)
     pyql = body.get("pyql", "")
     params = body.get("params") or {}
@@ -539,7 +541,20 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
         return
     duration_ms = (time.perf_counter() - start) * 1000
 
-    await _send_json(send, 200, {"objects": [_to_jsonable(o) for o in objects], "duration_ms": duration_ms})
+    # Compiling again here (cheap — hits pylon-core's own query cache) gets at
+    # the shape descriptor without changing Client.query()'s public return
+    # type. Shape is a pure function of (query text, schema) — the same
+    # regardless of the bound param values already used above — so this is
+    # exactly the shape `target.query()` decoded the response with.
+    shape = None
+    try:
+        shape = shape_value_tags(compile_query(pyql).shape)
+    except PylonError:
+        pass
+
+    await _send_json(
+        send, 200, {"objects": [_to_jsonable(o) for o in objects], "duration_ms": duration_ms, "shape": shape}
+    )
 
 
 # ---------------------------------------------------------------------------

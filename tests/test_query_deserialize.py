@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pylon.query import _decode, _decode_json_tuple, deserialize
+from pylon.query import _decode, _decode_json_tuple, deserialize, shape_value_tags
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -293,3 +293,98 @@ class TestDeserialize:
         ]
         result = deserialize(records, query, REGISTRY)
         assert result == [Person(name="Alice"), Person(name="Bob")]
+
+
+# ── shape_value_tags ────────────────────────────────────────────────────────
+
+
+class TestShapeValueTags:
+    def test_scalar_and_raw_scalar_have_no_tag(self):
+        assert shape_value_tags(_scalar("name", 1)) is None
+        assert shape_value_tags({"kind": "raw_scalar"}) is None
+
+    def test_bare_positional_tuple_reports_positional_members(self):
+        node = {
+            "kind": "tuple",
+            "position": 0,
+            "elements": [_scalar("", 0), {"kind": "enum", "name": "", "position": 1, "enum_type": "default::Status"}],
+        }
+        tags = shape_value_tags(node)
+        assert tags == {
+            "kind": "namedTuple",
+            "typeName": None,
+            "members": [
+                {"key": None, "shape": None},
+                {"key": None, "shape": {"kind": "enum", "enumType": "default::Status"}},
+            ],
+        }
+
+    def test_named_tuple_with_members_reports_named_members(self):
+        node = _named_tuple(
+            "address",
+            2,
+            [_member("street"), _member("zip")],
+        )
+        tags = shape_value_tags(node)
+        assert tags == {
+            "kind": "namedTuple",
+            "typeName": None,
+            "members": [
+                {"key": "street", "shape": None},
+                {"key": "zip", "shape": None},
+            ],
+        }
+
+    def test_named_tuple_without_members_reports_none_members(self):
+        node = _named_tuple("location", 2, None, type_name="default::Point")
+        assert shape_value_tags(node) == {"kind": "namedTuple", "typeName": "default::Point", "members": None}
+
+    def test_nested_tuple_member_recurses(self):
+        node = _named_tuple(
+            "shape",
+            2,
+            [
+                _member("origin", kind="tuple", members=[_member("x"), _member("y")]),
+                _member("size"),
+            ],
+        )
+        tags = shape_value_tags(node)
+        assert tags["members"][0] == {
+            "key": "origin",
+            "shape": {
+                "kind": "namedTuple",
+                "typeName": None,
+                "members": [{"key": "x", "shape": None}, {"key": "y", "shape": None}],
+            },
+        }
+
+    def test_object_pointers_recurse_and_skip_type_discriminator(self):
+        shape = _object(
+            "",
+            "default::Person",
+            [
+                _scalar("name", 1),
+                {"kind": "enum", "name": "gender", "position": 2, "enum_type": "public::Gender"},
+                _named_tuple("address", 3, [_member("street"), _member("zip")]),
+            ],
+        )
+        tags = shape_value_tags(shape)
+        assert tags["kind"] == "object"
+        assert tags["typeName"] == "default::Person"
+        assert "__type__" not in tags["pointers"]
+        assert tags["pointers"]["name"] is None
+        # Un-translated from Postgres "public" back to the real Pylon module.
+        assert tags["pointers"]["gender"] == {"kind": "enum", "enumType": "default::Gender"}
+        assert tags["pointers"]["address"]["kind"] == "namedTuple"
+
+    def test_enum_type_default_module_unqualified_from_public_schema(self):
+        node = {"kind": "enum", "name": "gender", "position": 1, "enum_type": "public::Gender"}
+        assert shape_value_tags(node) == {"kind": "enum", "enumType": "default::Gender"}
+
+    def test_enum_type_non_default_module_passes_through(self):
+        node = {"kind": "enum", "name": "status", "position": 1, "enum_type": "shop::Status"}
+        assert shape_value_tags(node) == {"kind": "enum", "enumType": "shop::Status"}
+
+    def test_array_recurses_into_element(self):
+        node = _array("posts", 2, {"kind": "enum", "name": "", "position": 0, "enum_type": "public::Status"})
+        assert shape_value_tags(node) == {"kind": "array", "element": {"kind": "enum", "enumType": "default::Status"}}

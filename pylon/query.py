@@ -183,6 +183,86 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
     raise ValueError(f"unknown shape node kind: {kind!r}")
 
 
+def _pg_schema_to_pylon_module(pg_schema: str) -> str:
+    """Reverse of `_walker.py`'s `_pg_schema()` (module -> pg schema name):
+    only the "default" module is ever renamed (to Postgres "public"), so
+    that's the only translation to undo — every other schema name is
+    already a real Pylon module name."""
+    return "default" if pg_schema == "public" else pg_schema
+
+
+def _pylon_qualify_enum_type(enum_type: str) -> str:
+    """`ShapeNode::Enum.enum_type` carries the Postgres-schema-qualified form
+    (e.g. "public::Gender") for the decode registry lookup in `_decode()`,
+    which falls back to a short-name match — but the frontend's /api/schema-
+    driven enum lookup needs the real Pylon-qualified name ("default::Gender")."""
+    if "::" not in enum_type:
+        return enum_type
+    pg_schema, name = enum_type.split("::", 1)
+    return f"{_pg_schema_to_pylon_module(pg_schema)}::{name}"
+
+
+def _member_shape_tag(m: dict) -> Any:
+    """Value-tree tag for one JsonMember node (see `_decode_json_member`) —
+    the recursive counterpart of `shape_value_tags` for a tuple's own
+    members, which use a slightly different dict shape (`kind`/`enum_type`/
+    `members` directly, no `position`)."""
+    kind = m["kind"]
+    if kind == "enum":
+        return {"kind": "enum", "enumType": m["enum_type"]}
+    if kind == "tuple":
+        return {
+            "kind": "namedTuple",
+            "typeName": m.get("type_name"),
+            "members": [{"key": mm["key"], "shape": _member_shape_tag(mm)} for mm in m["members"]],
+        }
+    return None
+
+
+def shape_value_tags(node: dict) -> Any:
+    """Convert a compiled query's position-based shape descriptor into a
+    value-tree-aligned "tag tree" — mirrors the structure of the already-
+    decoded JSON value (`_to_jsonable`'s output), with no positions, so the
+    frontend can walk it alongside the response body to render type tags
+    (`<uuid>`, enum labels, Gel's `(x := 1, y := 2)` tuple literal syntax)
+    for values that aren't a known schema pointer — e.g. a bare top-level
+    cast, or a tuple nested inside a free object — the same way it already
+    does for object properties via /api/schema."""
+    kind = node["kind"]
+    if kind == "enum":
+        # Unlike JsonMember's own enum_type (already Pylon-module-qualified —
+        # see _member_shape_tag), ShapeNode::Enum's enum_type is built from
+        # the Postgres schema name, so "default" needs un-translating back
+        # from "public" for the frontend's /api/schema-driven enum lookup.
+        return {"kind": "enum", "enumType": _pylon_qualify_enum_type(node["enum_type"])}
+    if kind == "named_tuple":
+        members = node.get("members")
+        return {
+            "kind": "namedTuple",
+            "typeName": node.get("type_name"),
+            "members": None
+            if members is None
+            else [{"key": m["key"], "shape": _member_shape_tag(m)} for m in members],
+        }
+    if kind == "tuple":
+        return {
+            "kind": "namedTuple",
+            "typeName": None,
+            "members": [{"key": None, "shape": shape_value_tags(e)} for e in node["elements"]],
+        }
+    if kind == "object":
+        return {
+            "kind": "object",
+            "typeName": node.get("type_name"),
+            "pointers": {
+                p["name"]: shape_value_tags(p) for p in node["pointers"] if p["name"] != "__type__"
+            },
+        }
+    if kind == "array":
+        return {"kind": "array", "element": shape_value_tags(node["element"])}
+    return None
+
+
 def _get_schema() -> SchemaDescriptor:
     if _singleton is None:
         raise RuntimeError(
