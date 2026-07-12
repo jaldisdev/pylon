@@ -3152,6 +3152,20 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_set_cast_to_object_type_clears_optional_link() {
+        // Regression: unsetting an optional single-link generates
+        // `<TargetType>{}` (a cast of the empty set, not the bare `{}` the
+        // assignment-position special case in compile_assignments_inner
+        // already handled) — that TypeCast wraps the empty set, so it fell
+        // through to the generic Set/Shape rejection instead ("shapes and
+        // set literals are not valid in expression context"). Must compile
+        // to a plain NULL for the link's FK column, matching real PyQL:
+        // `<AnyType>{}` is always NULL regardless of context.
+        let out = compile_and_emit("UPDATE Person FILTER .id = $id SET { company := <default::Company>{} }");
+        assert!(out.sql.contains("\"company_id\" = NULL"), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_delete_returning() {
         let out = compile_and_emit("DELETE Person FILTER .id = $id");
         assert!(out.sql.contains("DELETE FROM \"public\".\"Person\""));
