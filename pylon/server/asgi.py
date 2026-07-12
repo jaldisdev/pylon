@@ -63,7 +63,7 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
         if path == "/api/schema" and method == "GET":
             await _handle_get_schema(send)
         elif path == "/api/globals" and method == "GET":
-            await _handle_get_globals(send)
+            await _handle_get_globals(config, send)
         elif path == "/api/connections" and method == "GET":
             await _handle_get_connections(config, send)
         elif path == "/api/models" and method == "GET":
@@ -408,19 +408,53 @@ async def _handle_get_schema(send: Send) -> None:
 # than the frontend having to know to skip them.
 
 
-async def _handle_get_globals(send: Send) -> None:
-    from pylon.query import _get_schema
+def _global_type_text(scalar_type: Any, enum_classes: set[type], named_tuple_classes: set[type]) -> str | None:
+    """Renders a global's raw scalar_type (a Pylon scalar class, an
+    Array/TupleAnnotation instance, or an enum/named-tuple class) back into
+    a PyQL-style type-name string — e.g. "std::str", "default::Gender",
+    "tuple<x: std::float64, y: std::float64>", "array<std::str>" — so the
+    frontend can classify/render it the same way it already does for a
+    Query Editor $param's cast-type text (see tupleTypeCast.ts). None when
+    the type can't be resolved at all (e.g. a custom scalar with no
+    _TYPE_NAME_BY_CLASS entry) — the frontend already treats a null typeName
+    as "generic scalar, no cast-specific rules", same as any other property."""
+    if isinstance(scalar_type, TupleAnnotation):
+        positional = all(e.name is None for e in scalar_type.elements)
+        parts: list[str] = []
+        for e in scalar_type.elements:
+            elem_text = _global_type_text(e.type_, enum_classes, named_tuple_classes)
+            if elem_text is None:
+                return None
+            parts.append(elem_text if positional else f"{e.name}: {elem_text}")
+        return f"tuple<{', '.join(parts)}>"
+    if isinstance(scalar_type, ArrayAnnotation):
+        elem_text = _global_type_text(scalar_type.element, enum_classes, named_tuple_classes)
+        return f"array<{elem_text}>" if elem_text is not None else None
+    if get_origin(scalar_type) is list and get_args(scalar_type):
+        element = SHORTHAND_MAP.get(get_args(scalar_type)[0], get_args(scalar_type)[0])
+        elem_text = _global_type_text(element, enum_classes, named_tuple_classes)
+        return f"array<{elem_text}>" if elem_text is not None else None
+    if isinstance(scalar_type, type) and (scalar_type in named_tuple_classes or scalar_type in enum_classes):
+        return _type_qualname(scalar_type)
+    return _scalar_type_name(scalar_type)
 
-    schema = _get_schema()
+
+async def _handle_get_globals(config: Config, send: Send) -> None:
+    from pylon.schema._globals import collect_all_globals
+
+    enum_classes = set(schema_snapshot()[1])
+    named_tuple_classes = set(named_tuples_snapshot())
+    schema_dir = config.project.schema_dir  # type: ignore[union-attr]
+
     globals_ = [
         {
-            "module": g["module"],
-            "name": g["name"],
-            "typeName": _TYPE_NAME_BY_CLASS.get(g["scalar_type"]),
-            "required": g["required"],
+            "module": g.module,
+            "name": g.name,
+            "typeName": _global_type_text(g.scalar_type, enum_classes, named_tuple_classes),
+            "required": g.required,
         }
-        for g in schema.globals()
-        if not g["computed"]
+        for g in collect_all_globals(schema_dir)
+        if g.computed_expr is None
     ]
     await _send_json(send, 200, {"globals": globals_})
 

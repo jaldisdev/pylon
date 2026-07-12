@@ -88,7 +88,7 @@ def finalize(
         link targets, required-link cycles, interface non-conformance.
     """
     from pylon.config import load_config
-    from pylon.schema._globals import collect_module_globals
+    from pylon.schema._globals import collect_all_globals
     from pylon.schema._aliases import collect_module_aliases
     from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot
     from pylon.schema._walker import walk
@@ -100,17 +100,16 @@ def finalize(
 
     types, enums, custom_scalars = snapshot()
 
-    # Collect globals from every non-private schema file that was imported.
-    globals_: list[Any] = []
+    globals_: list[Any] = collect_all_globals(schema_dir, modules)
+
+    # Collect aliases from every non-private schema file that was imported.
     aliases_: list[Any] = []
     for py_file in sorted(schema_dir.glob("*.py")):
         stem = py_file.stem
         if not stem.startswith("_") and stem in sys.modules:
-            globals_.extend(collect_module_globals(sys.modules[stem]))
             aliases_.extend(collect_module_aliases(sys.modules[stem]))
     if modules:
         for mod in modules:
-            globals_.extend(collect_module_globals(mod))
             aliases_.extend(collect_module_aliases(mod))
 
     functions = functions_snapshot()

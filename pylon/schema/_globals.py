@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+import sys
 import types
 import typing
+from pathlib import Path
 from typing import Any
 
 MISSING = dataclasses.MISSING
@@ -120,4 +122,25 @@ def collect_module_globals(module: Any) -> list[GlobalDescriptor]:
                 computed_expr=annotation.computed_expr,
             )
         )
+    return result
+
+
+def collect_all_globals(schema_dir: Path, modules: list[Any] | None = None) -> list[GlobalDescriptor]:
+    """Scan every already-imported schema-dir module (plus any extra `modules`)
+    for Global[T] annotations, preserving each one's real (un-stringified)
+    `scalar_type` — a Pylon scalar class, an ArrayAnnotation/TupleAnnotation
+    instance, or an enum/named-tuple class.
+
+    Shared by pylon._finalize.finalize() (which stringifies the result away
+    when handing it to the Rust walker) and pylon.server.asgi's /api/globals
+    handler (which needs the real, structured type to render a proper
+    typeName string for non-scalar globals — see _global_type_text)."""
+    result: list[GlobalDescriptor] = []
+    for py_file in sorted(schema_dir.glob("*.py")):
+        stem = py_file.stem
+        if not stem.startswith("_") and stem in sys.modules:
+            result.extend(collect_module_globals(sys.modules[stem]))
+    if modules:
+        for mod in modules:
+            result.extend(collect_module_globals(mod))
     return result
