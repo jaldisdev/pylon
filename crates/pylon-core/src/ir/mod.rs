@@ -108,7 +108,13 @@ pub enum IrPathJoin {
 #[derive(Debug, Clone)]
 pub enum IrPathResult {
     /// Final result is a scalar expression (column ref or computed expr like EXISTS).
-    Scalar(IrExpr),
+    /// The second field carries a tuple-typed property's real member shape
+    /// (nominal or structural — see `resolve_property_tuple_shape`) so a bare
+    /// `select Type.tuple_property` gets the same rich `ShapeNode::NamedTuple`
+    /// a `Type { tuple_property }` shape query already does, instead of
+    /// falling back to an opaque `ShapeNode::Scalar`. `None` for anything
+    /// that isn't a bare tuple-typed property reference.
+    Scalar(IrExpr, Option<TupleCastShape>),
     /// Final step is a link — return the linked objects with the given shape.
     Object { alias: String, type_name: String, shape: Vec<IrShapePointer> },
 }

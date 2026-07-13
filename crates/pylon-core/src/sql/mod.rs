@@ -25,7 +25,7 @@ fn emit_for_global_cte(stmt: &IrStmt) -> String {
         IrStmt::PathSelect(sel) => {
             let from_sql = emit_path_joins(&sel.root, &sel.joins);
             let scalar_expr = match &sel.result {
-                IrPathResult::Scalar(e) => emit_expr(e),
+                IrPathResult::Scalar(e, _) => emit_expr(e),
                 IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
             };
             let mut sql = format!("SELECT {} AS \"value\"\nFROM {}", scalar_expr, from_sql);
@@ -924,7 +924,7 @@ fn emit_array_source(src: &IrArraySource) -> String {
         }
         IrArraySource::PathSelect(ps) => {
             let scalar = match &ps.result {
-                IrPathResult::Scalar(e) => emit_expr(e),
+                IrPathResult::Scalar(e, _) => emit_expr(e),
                 IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
             };
             let from_sql = emit_path_joins(&ps.root, &ps.joins);
@@ -1066,17 +1066,30 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     };
 
     let (result_expr, shape_root) = match &sel.result {
-        IrPathResult::Scalar(ir_expr) => {
+        IrPathResult::Scalar(ir_expr, tuple_shape) => {
             // Named tuples / jsonb field accesses can't be decoded inside ROW() — emit raw.
             let is_nt = matches!(ir_expr, IrExpr::NamedTuple(_))
                 || matches!(ir_expr, IrExpr::Tuple(_))
                 || matches!(ir_expr, IrExpr::JsonbField { .. })
                 || matches!(ir_expr, IrExpr::JsonbIndex { .. })
-                || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"));
+                || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"))
+                || tuple_shape.is_some();
             if is_nt {
                 let expr_sql = format!("{} AS result", emit_expr(ir_expr));
                 let shape = if matches!(ir_expr, IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Tuple(_)) {
                     ShapeNode::RawScalar
+                } else if let Some(shape) = tuple_shape {
+                    // A bare tuple-typed property reference (nominal or
+                    // structural) — real member shape already resolved at
+                    // compile time (see resolve_property_tuple_shape), same
+                    // as a `Type { tuple_property }` shape query gets via
+                    // emit_scalar, instead of falling back to `members: None`.
+                    ShapeNode::NamedTuple {
+                        name: String::new(),
+                        position: 0,
+                        type_name: shape.type_name.clone(),
+                        members: Some(shape.members.clone()),
+                    }
                 } else {
                     let type_name = match ir_expr {
                         IrExpr::ColumnRef { pg_type, .. } =>
@@ -2173,7 +2186,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::PathSubquery(ps) => {
             let scalar = match &ps.result {
-                IrPathResult::Scalar(e) => emit_expr(e),
+                IrPathResult::Scalar(e, _) => emit_expr(e),
                 IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
             };
             let from_sql = emit_path_joins(&ps.root, &ps.joins);
@@ -4024,6 +4037,81 @@ mod tests {
                 }
             }
             other => panic!("expected ShapeNode::Object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bare_path_select_structural_tuple_property_shape_carries_real_members() {
+        // A bare `select Type.property` path traversal (no `{ }` shape) used
+        // to fall back to `ShapeNode::Scalar` for a *structural* tuple
+        // property — `emit_path_select`'s IrPathResult::Scalar branch only
+        // detected a *nominal* named tuple (via the "__nt__:" pg_type
+        // marker), never consulting the property's own `tuple_members`. This
+        // decoded every row as an opaque blob instead of a proper tuple
+        // literal (reported as `select default::Person.address` rendering
+        // wrong in both pylon-ui and the CLI REPL, while a `{ address }`
+        // shape query — the test above — already worked).
+        use crate::schema::{TupleMemberDescriptor, TupleMemberKind};
+        let schema = SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: "Person".into(),
+                module: "default".into(),
+                table: "Person".into(),
+                abstract_: false,
+                materialized: false,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
+                properties: vec![PropertyDescriptor {
+                    name: "address".into(),
+                    pg_type: "jsonb".into(),
+                    nullable: true,
+                    default_sql: None,
+                    default_pyql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: false,
+                    is_pk: false,
+                    is_readonly: false,
+                    rewrites: vec![],
+                    tuple_members: Some(vec![
+                        TupleMemberDescriptor {
+                            name: Some("street".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                        TupleMemberDescriptor {
+                            name: Some("zip".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                    ]),
+                }],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+            }],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+        };
+        let out = compile_and_emit_with("SELECT Person.address", &schema);
+        match &out.shape.root {
+            crate::query::ShapeNode::NamedTuple { type_name, members, .. } => {
+                assert_eq!(*type_name, None);
+                let members = members.as_ref().expect("expected resolved members");
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].key.as_deref(), Some("street"));
+                assert_eq!(members[1].key.as_deref(), Some("zip"));
+            }
+            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
         }
     }
 

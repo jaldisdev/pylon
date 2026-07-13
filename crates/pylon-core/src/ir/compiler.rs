@@ -1228,7 +1228,7 @@ impl<'a> Compiler<'a> {
                                             alias: src_alias,
                                         },
                                         joins: vec![],
-                                        result: IrPathResult::Scalar(bool_expr),
+                                        result: IrPathResult::Scalar(bool_expr, None),
                                         filter: s.filter.as_ref()
                                             .map(|_| Err(self.type_err("FILTER is not supported on type-is SELECT")))
                                             .transpose()?,
@@ -1481,7 +1481,7 @@ impl<'a> Compiler<'a> {
                         return Ok(IrPathSelect {
                             root,
                             joins,
-                            result: IrPathResult::Scalar(ir),
+                            result: IrPathResult::Scalar(ir, None),
                             filter,
                             order_by,
                             offset,
@@ -1494,11 +1494,12 @@ impl<'a> Compiler<'a> {
                         "'{step_name}' is a scalar property, not a link — cannot traverse further"
                     )));
                 }
+                let tuple_shape = self.resolve_property_tuple_shape(p);
                 let result = IrPathResult::Scalar(IrExpr::ColumnRef {
                     alias: current_alias.clone(),
                     column: p.name.clone(),
                     pg_type: p.pg_type.clone(),
-                });
+                }, tuple_shape);
                 let (filter, order_by, offset, limit) =
                     self.compile_path_modifiers(sel, current_td, &current_alias)?;
                 return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
@@ -1720,7 +1721,7 @@ impl<'a> Compiler<'a> {
             let val_ir = self.compile_expr(value_expr, root_td, &ps.root.alias)?;
             // Extract the scalar result from the path
             let scalar_col = match ps.result {
-                IrPathResult::Scalar(e) => e,
+                IrPathResult::Scalar(e, _) => e,
                 IrPathResult::Object { type_name, .. } => {
                     let val_type = infer_ir_type(&val_ir)
                         .map(pg_type_to_pyql)
@@ -1739,7 +1740,7 @@ impl<'a> Compiler<'a> {
             let (l, r) = if flip { (val_ir, scalar_col) } else { (scalar_col, val_ir) };
             ps.result = IrPathResult::Scalar(IrExpr::BinOp(Box::new(IrBinOp {
                 left: l, op: b.op.clone(), right: r,
-            })));
+            })), None);
             return Ok(ps);
         }
         self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct)
@@ -1766,7 +1767,7 @@ impl<'a> Compiler<'a> {
         Ok(IrPathSelect {
             root,
             joins: vec![],
-            result: IrPathResult::Scalar(expr),
+            result: IrPathResult::Scalar(expr, None),
             filter,
             order_by,
             offset,
