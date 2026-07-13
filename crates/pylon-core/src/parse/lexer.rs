@@ -144,6 +144,30 @@ impl<'a> Lexer<'a> {
         ch
     }
 
+    /// Reassemble a full UTF-8 scalar value starting from `lead` (a byte
+    /// already consumed via `advance()`), consuming any continuation bytes.
+    /// The lexer scans raw bytes so multi-byte UTF-8 sequences (accented
+    /// letters, emoji, …) must be decoded explicitly here — otherwise each
+    /// byte would be pushed into the token buffer as its own Latin-1-style
+    /// codepoint (`byte as char`), corrupting any non-ASCII text literal.
+    fn decode_utf8_char(&mut self, lead: u8) -> char {
+        let extra = match lead {
+            0xC0..=0xDF => 1,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF7 => 3,
+            _ => 0,
+        };
+        let mut buf = [0u8; 4];
+        buf[0] = lead;
+        for slot in buf.iter_mut().take(extra + 1).skip(1) {
+            *slot = self.advance();
+        }
+        std::str::from_utf8(&buf[..=extra])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or(lead as char)
+    }
+
     fn skip_whitespace_and_comments(&mut self) {
         while self.pos < self.input.len() {
             let ch = self.current();
@@ -364,7 +388,7 @@ impl<'a> Lexer<'a> {
             if ch == b'`' {
                 break;
             }
-            buf.push(ch as char);
+            buf.push(if ch < 0x80 { ch as char } else { self.decode_utf8_char(ch) });
         }
         if buf.is_empty() {
             return Err(self.err(pos, "backtick identifier must not be empty"));
@@ -383,7 +407,7 @@ impl<'a> Lexer<'a> {
             if ch == quote {
                 break;
             }
-            buf.push(ch as char);
+            buf.push(if ch < 0x80 { ch as char } else { self.decode_utf8_char(ch) });
         }
         Ok(Token::StrLit(buf))
     }
@@ -430,11 +454,11 @@ impl<'a> Lexer<'a> {
                     }
                     other => {
                         buf.push('\\');
-                        buf.push(other as char);
+                        buf.push(if other < 0x80 { other as char } else { self.decode_utf8_char(other) });
                     }
                 }
             } else {
-                buf.push(ch as char);
+                buf.push(if ch < 0x80 { ch as char } else { self.decode_utf8_char(ch) });
             }
         }
         Ok(Token::StrLit(buf))
