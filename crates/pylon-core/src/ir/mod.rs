@@ -1178,6 +1178,40 @@ mod tests {
     }
 
     #[test]
+    fn test_computed_global_field_access_compiles_as_path_select() {
+        // Regression: `global name.field` previously wrapped the global's
+        // opaque CTE reference in a jsonb `->` extraction (only valid for
+        // tuple-typed values), producing "operator does not exist: uuid ->
+        // unknown" for an object-typed computed global.
+        let mut schema = make_schema();
+        schema.globals.push(GlobalDescriptor {
+            name: "current_user".into(),
+            module: "default".into(),
+            scalar_type: "Person".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: Some("select default::Person filter .id = <uuid>$session_user_id".into()),
+        });
+        let ast = parse::parse("SELECT global current_user.id").unwrap();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::PathSelect(sel) = ir.stmt else { panic!("expected a path select, not a free select") };
+        assert_eq!(sel.root.type_name, "default::Person");
+    }
+
+    #[test]
+    fn test_subquery_field_access_compiles_as_path_select() {
+        // Regression: `(select Type filter ...).field` hit the generic free-
+        // expression fallback ("expression is not valid in free SELECT
+        // context") because bare subqueries aren't valid free expressions —
+        // it should splice `.field` onto the inner select as a path step.
+        let ast = parse::parse("SELECT (SELECT default::Person FILTER .age > 20).name").unwrap();
+        let schema = make_schema();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::PathSelect(sel) = ir.stmt else { panic!("expected a path select, not a free select") };
+        assert_eq!(sel.root.type_name, "default::Person");
+    }
+
+    #[test]
     fn test_string_index_compiles() {
         let ast = parse::parse("SELECT 'hello'[1]").unwrap();
         let schema = make_schema();
