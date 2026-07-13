@@ -78,6 +78,8 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
             await _handle_get_schema(send)
         elif path == "/api/globals" and method == "GET":
             await _handle_get_globals(config, send)
+        elif path == "/api/config-options" and method == "GET":
+            await _handle_get_config_options(send)
         elif path == "/api/connections" and method == "GET":
             await _handle_get_connections(config, send)
         elif path == "/api/models" and method == "GET":
@@ -526,6 +528,27 @@ async def _handle_get_globals(config: Config, send: Send) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /api/config-options
+# ---------------------------------------------------------------------------
+#
+# Powers the globals/config modal's "Config" scope — session config options
+# (Client.with_config(), applied per-query in _handle_run_query above) mirror
+# the upstream engine's `configure session set ...`. Unlike globals this is a small fixed
+# registry (pylon/config_options.py), not schema-derived, so it never touches
+# the schema-dir.
+
+
+async def _handle_get_config_options(send: Send) -> None:
+    from pylon.config_options import CONFIG_OPTIONS
+
+    options = [
+        {"name": o.name, "typeName": o.type_name, "default": o.default}
+        for o in CONFIG_OPTIONS
+    ]
+    await _send_json(send, 200, {"options": options})
+
+
+# ---------------------------------------------------------------------------
 # /api/connections
 # ---------------------------------------------------------------------------
 #
@@ -657,10 +680,17 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
     # "module::name", threaded through client.with_globals() for this query
     # only (the client itself stays global/stateless across requests).
     globals_ = body.get("globals") or {}
+    # Session config options (e.g. allow_user_specified_id) — same per-query
+    # scoping as globals, via client.with_config(). See pylon/config_options.py.
+    config_options = body.get("config") or {}
 
     start = time.perf_counter()
     try:
-        target = client.with_globals(globals_) if globals_ else client
+        target = client
+        if globals_:
+            target = target.with_globals(globals_)
+        if config_options:
+            target = target.with_config(config_options)
         objects = await target.query(pyql, **params)
     except PylonError as exc:
         await _send_json(send, 400, {"error": str(exc)})
@@ -669,12 +699,20 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
 
     # Compiling again here (cheap — hits pylon-core's own query cache) gets at
     # the shape descriptor without changing Client.query()'s public return
-    # type. Shape is a pure function of (query text, schema) — the same
-    # regardless of the bound param values already used above — so this is
-    # exactly the shape `target.query()` decoded the response with.
+    # type. Shape is a pure function of (query text, schema, config) — the
+    # same regardless of the bound param values already used above — so this
+    # is exactly the shape `target.query()` decoded the response with. Must
+    # pass the same config_options, or an INSERT that only compiles under
+    # allow_user_specified_id=true would succeed above but fail to re-compile
+    # here, silently losing its shape tags.
     shape = None
     try:
-        shape = shape_value_tags(compile_query(pyql).shape)
+        shape = shape_value_tags(
+            compile_query(
+                pyql,
+                allow_user_specified_id=bool(config_options.get("allow_user_specified_id", False)),
+            ).shape
+        )
     except PylonError:
         pass
 
