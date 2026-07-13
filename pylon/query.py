@@ -8,15 +8,28 @@ if TYPE_CHECKING:
 _singleton: SchemaDescriptor | None = None
 
 
-def compile(query: str, *, schema: SchemaDescriptor | None = None) -> CompiledQuery:
+def compile(
+    query: str,
+    *,
+    schema: SchemaDescriptor | None = None,
+    allow_user_specified_id: bool = False,
+) -> CompiledQuery:
     """Compile a PyQL string to SQL. Raises PyQLError (or a subclass) on failure.
 
     If schema is omitted, falls back to the process-level singleton SchemaDescriptor.
     Synchronous — compilation is CPU-bound; async lives at the DB execution layer.
+
+    ``allow_user_specified_id`` mirrors Gel's session config option of the same
+    name — see ``pylon.config_options`` for the full registry exposed to
+    clients (``Client.with_config()``) and the frontend.
     """
     from pylon._core import compile as _core_compile
 
-    return _core_compile(query, schema if schema is not None else _get_schema())
+    return _core_compile(
+        query,
+        schema if schema is not None else _get_schema(),
+        allow_user_specified_id=allow_user_specified_id,
+    )
 
 
 def deserialize(
