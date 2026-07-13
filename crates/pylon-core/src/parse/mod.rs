@@ -55,6 +55,16 @@ mod tests {
     }
 
     #[test]
+    fn test_string_literal_preserves_multibyte_utf8() {
+        // Regression: the lexer scans raw bytes; a naive `byte as char` cast
+        // on non-ASCII bytes previously corrupted multi-byte UTF-8 sequences
+        // (each byte became its own Latin-1-style codepoint instead of being
+        // reassembled into the real scalar value).
+        let expr = parse_expr("'I ❤️ Pylon!'").unwrap();
+        assert!(matches!(expr, Expr::Literal(Literal::Str(s)) if s == "I ❤️ Pylon!"));
+    }
+
+    #[test]
     fn test_positional_param_parsed() {
         let expr = parse_expr("$0").unwrap();
         assert!(matches!(expr, Expr::Parameter(n) if n == "0"));
