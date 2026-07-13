@@ -22,6 +22,59 @@ _SET_GLOBAL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+
+# --- parameter prompting -------------------------------------------------------
+
+
+def _find_cast_type(pyql: str, name: str) -> str | None:
+    """Best-effort: find the cast immediately preceding `$name` in the raw
+    query text, e.g. `<str>$var` -> "str". Only the first occurrence is
+    used — good enough for prompt display and coercion, not a full type
+    checker (mirrors pylon-ui's extractParams.ts fallback)."""
+    pattern = r"<\s*(?:optional\s+)?([\w:]+)\s*>\s*\$" + re.escape(name) + r"(?!\w)"
+    m = re.search(pattern, pyql)
+    return m.group(1) if m else None
+
+
+def _short_cast_type(cast_type: str | None) -> str | None:
+    return cast_type.rsplit("::", 1)[-1] if cast_type else None
+
+
+def _coerce_param_value(raw: str, cast_type: str | None) -> Any:
+    """Light coercion from typed-in REPL text to a bound value — covers the
+    common scalar cases, same scope as pylon-ui's coerceParamValue. str/uuid/
+    datetime/duration/bytes/anything unrecognized: passed through as-is."""
+    match _short_cast_type(cast_type):
+        case "int16" | "int32" | "int64":
+            return int(raw)
+        case "float32" | "float64" | "decimal":
+            return float(raw)
+        case "bool":
+            return raw.strip().lower() == "true"
+        case "json":
+            import json
+            return json.loads(raw)
+        case _:
+            return raw
+
+
+async def _prompt_for_params(pyql: str, names: list[str]) -> dict[str, Any]:
+    # A separate, plain single-line session — the REPL's own session is
+    # configured for multiline query entry (Enter only submits on a trailing
+    # `;`), which is wrong for a parameter value. prompt_async's per-call
+    # overrides (e.g. multiline=False) don't apply just to that call — they
+    # permanently mutate the session's stored settings — so reusing the REPL
+    # session here would corrupt its key bindings for later queries.
+    value_session: PromptSession[str] = PromptSession()
+    kwargs: dict[str, Any] = {}
+    for name in names:
+        cast_type = _find_cast_type(pyql, name)
+        label = f"<{cast_type}>${name}" if cast_type else f"${name}"
+        raw = await value_session.prompt_async(f"Parameter {label}: ")
+        kwargs[name] = _coerce_param_value(raw, cast_type)
+    return kwargs
+
+
 # --- colours ------------------------------------------------------------------
 
 _INFO_COLOR = "\x1b[38;2;136;120;168m"  # #8878A8
@@ -131,7 +184,7 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
                 await _handle_set_global(client, m.group(1), m.group(2).strip(), _session_globals)
                 continue
 
-            await _execute(client, pyql, as_json=as_json, globals_=_session_globals)
+            await _execute(client, pyql, as_json=as_json, globals_=_session_globals, session=session)
 
 
 async def _handle_set_global(
@@ -165,13 +218,29 @@ async def _handle_set_global(
     click.echo(f"{_INFO_COLOR}OK — {qualified} = {_value(value)}{_RESET}")
 
 
-async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globals_: dict[str, Any] | None = None) -> None:
+async def _execute(
+    client, pyql: str, *, as_json: bool, repl: bool = True,
+    globals_: dict[str, Any] | None = None,
+    session: "PromptSession[str] | None" = None,
+) -> None:
     """Transpile and execute a single PyQL statement, printing the result."""
     from pylon.client import _compile_and_resolve, _hydrate
+    from pylon.query import compile as _pyql_compile
+
+    kwargs: dict[str, Any] = {}
+    if session is not None:
+        try:
+            probe = _pyql_compile(pyql)
+            missing = [n for n in probe.param_names if not n.startswith("__")]
+            if missing:
+                kwargs = await _prompt_for_params(pyql, missing)
+        except Exception as e:
+            click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
+            return
 
     if as_json:
         try:
-            click.echo(await client.query_json(pyql))
+            click.echo(await client.query_json(pyql, **kwargs))
         except Exception as e:
             click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
         return
@@ -179,7 +248,7 @@ async def _execute(client, pyql: str, *, as_json: bool, repl: bool = True, globa
     try:
         import asyncpg as _asyncpg
         from pylon.client import _fmt_pg_error
-        compiled, sql, params = await _compile_and_resolve(pyql, {}, client._config, globals_)
+        compiled, sql, params = await _compile_and_resolve(pyql, kwargs, client._config, globals_)
         for w in compiled.warnings():
             click.echo(f"{_YELLOW}warning:{_RESET} {w}", err=True)
         try:
