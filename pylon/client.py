@@ -249,6 +249,7 @@ class Client:
         self._ref = _PoolRef()
         self._warnings = warnings
         self._globals: dict[str, Any] = {}
+        self._config_options: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -327,12 +328,39 @@ class Client:
         c._ref = self._ref
         c._warnings = self._warnings
         c._globals = {**self._globals, **globals_}
+        c._config_options = self._config_options
+        return c
+
+    def with_config(self, options: dict[str, Any]) -> "Client":
+        """Return a client view that applies session config *options* to every query.
+
+        The returned client shares the same connection pool. Mirrors the upstream engine's
+        session config (``configure session set ...``) — see
+        ``pylon.config_options`` for the registry of known option names/
+        defaults. An unrecognized option name is stored but has no effect
+        (only names ``pylon.query.compile()`` actually consumes change
+        compilation), matching ``with_globals()``'s own unvalidated-merge
+        behavior.
+
+        Usage::
+
+            unsafe = client.with_config({"allow_user_specified_id": True})
+            await unsafe.query("insert Person { id := <uuid>$id, name := $name }", id=..., name=...)
+        """
+        c = Client.__new__(Client)
+        c._config = self._config
+        c._ref = self._ref
+        c._warnings = self._warnings
+        c._globals = self._globals
+        c._config_options = {**self._config_options, **options}
         return c
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config, self._globals)
+        compiled, sql, params = await _compile_and_resolve(
+            pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
+        )
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -353,7 +381,9 @@ class Client:
         than one object matches.
         """
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(pyql, _merge_args(args, kwargs), self._config, self._globals)
+        compiled, sql, params = await _compile_and_resolve(
+            pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
+        )
         if self._warnings:
             _emit_warnings(compiled)
         try:
@@ -387,7 +417,7 @@ class Client:
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         async with pool.acquire() as conn:
             try:
                 await conn.execute(sql, *params)
@@ -404,7 +434,7 @@ class Client:
         Returns ``"[]"`` when the result set is empty.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         async with pool.acquire() as conn:
             return (
                 await conn.fetchval(
@@ -420,7 +450,7 @@ class Client:
         object matches.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals)
+        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -677,16 +707,21 @@ async def _compile_and_resolve(
     kwargs: dict[str, Any],
     config: "Config",
     globals_: dict[str, Any] | None = None,
+    config_options: dict[str, Any] | None = None,
 ) -> tuple["CompiledQuery", str, list[Any]]:
     """Compile PyQL and, for OpenSearch-backed queries, perform the HTTP phase first.
 
-    Returns ``(compiled, sql, params)`` ready for asyncpg.
+    Returns ``(compiled, sql, params)`` ready for asyncpg. ``config_options``
+    mirrors ``Client.with_config()`` — see ``pylon.config_options``.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
     from pylon.query import compile as _pyql_compile
     try:
-        compiled = _pyql_compile(pyql)
+        compiled = _pyql_compile(
+            pyql,
+            allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
+        )
     except BaseException as exc:
         raise InternalServerError(str(exc)) from exc
 
@@ -792,19 +827,24 @@ def _transpile(
     pyql: str,
     kwargs: dict[str, Any],
     globals_: dict[str, Any] | None = None,
+    config_options: dict[str, Any] | None = None,
 ) -> tuple[str, list[Any], "CompiledQuery"]:
     """Compile PyQL to SQL via the pylon-core Rust extension.
 
     Returns ``(sql, positional_params, compiled)`` ready for asyncpg.
     ``param_names`` entries prefixed with ``__global__`` are filled from
-    ``globals_``; all others from ``kwargs``.
+    ``globals_``; all others from ``kwargs``. ``config_options`` mirrors
+    ``Client.with_config()`` — see ``pylon.config_options``.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
     from pylon.query import compile as _pyql_compile
 
     try:
-        compiled = _pyql_compile(pyql)
+        compiled = _pyql_compile(
+            pyql,
+            allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
+        )
     except BaseException as exc:
         raise InternalServerError(str(exc)) from exc
     try:

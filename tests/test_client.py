@@ -123,6 +123,22 @@ class TestTranspile:
             with pytest.raises(InterfaceError, match="Missing query parameter"):
                 _transpile("select $name", {})
 
+    def test_config_options_thread_allow_user_specified_id(self):
+        from pylon.client import _transpile
+
+        compiled = self._make_compiled("INSERT ...")
+        with patch("pylon.query.compile", return_value=compiled) as mock_compile:
+            _transpile("insert ...", {}, config_options={"allow_user_specified_id": True})
+        assert mock_compile.call_args.kwargs["allow_user_specified_id"] is True
+
+    def test_missing_config_options_defaults_to_false(self):
+        from pylon.client import _transpile
+
+        compiled = self._make_compiled("INSERT ...")
+        with patch("pylon.query.compile", return_value=compiled) as mock_compile:
+            _transpile("insert ...", {})
+        assert mock_compile.call_args.kwargs["allow_user_specified_id"] is False
+
     def test_compile_failure_raises_internal_error(self):
         from pylon.client import _transpile
 
@@ -190,7 +206,7 @@ class TestClientQueryPositional:
 
             received_kwargs: dict = {}
 
-            async def fake_resolve(pyql, kwargs, config, globals_=None):
+            async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
                 received_kwargs.update(kwargs)
                 compiled = _fake_compiled()
                 compiled.param_names = []
@@ -262,6 +278,7 @@ def _client_with_pool(pool: MagicMock):
     client._ref = ref
     client._warnings = True
     client._globals = {}
+    client._config_options = {}
     return client
 
 
@@ -296,10 +313,10 @@ class TestClientQuery:
     def _patch_transpile(self, sql="SELECT 1"):
         compiled = _fake_compiled(sql)
 
-        async def fake_resolve(pyql, kwargs, config, globals_=None):
+        async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
             return compiled, sql, list(kwargs.values())
 
-        def fake_transpile(pyql, kwargs, globals_=None):
+        def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
             return sql, list(kwargs.values()), compiled
 
         p1 = patch("pylon.client._compile_and_resolve", side_effect=fake_resolve)
@@ -503,6 +520,40 @@ class TestWithGlobals:
         # Simulate connection on original
         client._ref.pool = pool
         assert view._require_pool() is pool
+
+
+class TestWithConfig:
+    def test_returns_client_instance(self):
+        from pylon.client import Client
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_config({"allow_user_specified_id": True})
+        assert isinstance(view, Client)
+
+    def test_shares_pool_ref(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_config({"allow_user_specified_id": True})
+        assert view._ref is client._ref
+
+    def test_options_merged(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        client._config_options = {"allow_user_specified_id": False}
+        view = client.with_config({"some_future_option": True})
+        assert view._config_options == {"allow_user_specified_id": False, "some_future_option": True}
+
+    def test_chained_with_config_merges(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_config({"a": 1}).with_config({"b": 2})
+        assert view._config_options == {"a": 1, "b": 2}
+
+    def test_with_config_preserves_globals(self):
+        pool, _ = _make_pool()
+        client = _client_with_pool(pool)
+        view = client.with_globals({"default::x": 1}).with_config({"allow_user_specified_id": True})
+        assert view._globals == {"default::x": 1}
 
 
 # ---------------------------------------------------------------------------
