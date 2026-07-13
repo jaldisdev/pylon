@@ -8,9 +8,14 @@ use crate::{ir, parse, sql};
 
 const CACHE_CAPACITY: usize = 1024;
 
-static QUERY_CACHE: OnceLock<RwLock<LruCache<String, CompiledQuery>>> = OnceLock::new();
+// Keyed by (query text, session config) — not query text alone. Compilation
+// success/shape/SQL can depend on the config (e.g. an INSERT assigning `id`
+// compiles under allow_user_specified_id=true and errors otherwise), so two
+// requests for the same query text under different configs must never share
+// a cache entry.
+static QUERY_CACHE: OnceLock<RwLock<LruCache<(String, ir::SessionConfig), CompiledQuery>>> = OnceLock::new();
 
-fn query_cache() -> &'static RwLock<LruCache<String, CompiledQuery>> {
+fn query_cache() -> &'static RwLock<LruCache<(String, ir::SessionConfig), CompiledQuery>> {
     QUERY_CACHE.get_or_init(|| {
         RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()))
     })
@@ -236,27 +241,40 @@ pub fn compile_fill_expr(
     Ok(sql::emit_expr(&ir_expr))
 }
 
-/// Compile a PyQL query string to SQL against `schema`.
+/// Compile a PyQL query string to SQL against `schema`, using default
+/// session config (see `ir::SessionConfig`) — for schema-time/test callers
+/// with no live client-supplied config. `compile_with_config` is the real
+/// entry a query request uses.
 ///
 /// Results are cached in a process-global LRU (capacity 1024). Call
 /// `clear_query_cache()` when the schema is reloaded to avoid stale entries.
 /// Synchronous — compilation is CPU-bound; async lives at the DB execution layer.
 /// Raises `PyQLError` on any grammar, type, or resolution failure.
 pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, PyQLError> {
+    compile_with_config(query, schema, &ir::SessionConfig::default())
+}
+
+/// Like `compile`, but honors a caller-supplied `SessionConfig` for this query.
+pub fn compile_with_config(
+    query: &str,
+    schema: &SchemaDescriptor,
+    config: &ir::SessionConfig,
+) -> Result<CompiledQuery, PyQLError> {
+    let key = (query.to_string(), config.clone());
     {
         let mut cache = query_cache().write().unwrap();
-        if let Some(cached) = cache.get(query) {
+        if let Some(cached) = cache.get(&key) {
             return Ok(cached.clone());
         }
     }
-    let compiled = compile_uncached(query, schema)?;
-    query_cache().write().unwrap().put(query.to_string(), compiled.clone());
+    let compiled = compile_uncached(query, schema, config)?;
+    query_cache().write().unwrap().put(key, compiled.clone());
     Ok(compiled)
 }
 
-fn compile_uncached(query: &str, schema: &SchemaDescriptor) -> Result<CompiledQuery, PyQLError> {
+fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::SessionConfig) -> Result<CompiledQuery, PyQLError> {
     let ast = parse::parse(query)?;
-    let ir_out = ir::compile(&ast, schema)?;
+    let ir_out = ir::compile_with_config(&ast, schema, config)?;
     let sql_out = sql::emit(&ir_out);
     Ok(CompiledQuery {
         sql: sql_out.sql,
