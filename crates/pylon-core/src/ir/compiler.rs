@@ -438,6 +438,106 @@ impl<'a> Compiler<'a> {
         Ok(Some(ir))
     }
 
+    /// Peel nested `Expr::FieldAccess` layers (`X.a.b` parses as
+    /// `FieldAccess{FieldAccess{X, "a"}, "b"}`) into the innermost root
+    /// expression plus the ordered chain of field names.
+    fn peel_field_access_chain(expr: &Expr) -> (&Expr, Vec<String>) {
+        let mut fields = Vec::new();
+        let mut current = expr;
+        while let Expr::FieldAccess { expr: inner, field } = current {
+            fields.push(field.clone());
+            current = inner;
+        }
+        fields.reverse();
+        (current, fields)
+    }
+
+    /// Resolve `expr` to the inner `select Type filter ...` statement it
+    /// stands for, if any — either a literal subquery (`(select Type filter
+    /// ...)`) or a computed global whose defining expression is such a
+    /// select. Only bare object-type results are recognized (`select Type
+    /// ...`, not `select Type { shape }` or a free expression) — that's the
+    /// only shape `.field` access after it can be spliced onto as an
+    /// additional path step.
+    fn resolve_field_owner_select(&self, expr: &Expr) -> Option<ast::SelectStmt> {
+        let sel = match expr {
+            Expr::SubQuery(stmt) => match stmt.as_ref() {
+                Stmt::Select(sel) => sel.clone(),
+                _ => return None,
+            },
+            Expr::Global(name) => {
+                let global = self.schema.globals.iter().find(|g| {
+                    g.name == *name || format!("{}::{}", g.module, g.name) == *name
+                })?;
+                let computed_expr = global.computed_expr.as_ref()?;
+                match crate::parse::parse(computed_expr).ok()? {
+                    Stmt::Select(sel) => sel,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        match &sel.result {
+            Expr::Path(p) if !p.partial => Some(sel),
+            _ => None,
+        }
+    }
+
+    /// `global name.field` or `(select Type filter ...).field` (and deeper
+    /// chains like `.link.field`) used as the top-level SELECT subject:
+    /// rather than treating `.field` as jsonb extraction on an opaque value
+    /// (which only makes sense for tuple-typed properties — see
+    /// `resolve_property_tuple_shape`), splice the field chain onto the
+    /// inner select as additional path steps and recompile as an ordinary
+    /// path-select. Mirrors `try_compile_global_select`'s filter/modifier
+    /// merge, generalized to a field-access result instead of a bare/shape
+    /// global reference.
+    fn try_compile_field_access_select(
+        &mut self,
+        outer: &ast::SelectStmt,
+        result: &Expr,
+    ) -> Result<Option<IrStmt>, PyQLError> {
+        let (root, fields) = Self::peel_field_access_chain(result);
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let inner_sel = match self.resolve_field_owner_select(root) {
+            Some(sel) => sel,
+            None => return Ok(None),
+        };
+        let Expr::Path(type_path) = &inner_sel.result else {
+            return Ok(None);
+        };
+        let mut steps = type_path.steps.clone();
+        steps.extend(fields.into_iter().map(ast::PathStep::Name));
+        let merged_result = Expr::Path(ast::Path { steps, partial: false });
+
+        let merged_filter = match (&inner_sel.filter, &outer.filter) {
+            (Some(a), Some(b)) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                left: a.clone(),
+                op: ast::BinOpKind::And,
+                right: b.clone(),
+            }))),
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b.clone(),
+        };
+
+        let merged = ast::SelectStmt {
+            result: merged_result,
+            filter: merged_filter,
+            order_by: if outer.order_by.is_empty() {
+                inner_sel.order_by.clone()
+            } else {
+                outer.order_by.clone()
+            },
+            offset: outer.offset.clone().or(inner_sel.offset.clone()),
+            limit: outer.limit.clone().or(inner_sel.limit.clone()),
+        };
+
+        let ir = self.compile_stmt(&Stmt::Select(merged))?;
+        Ok(Some(ir))
+    }
+
     fn try_compile_alias_select(
         &mut self,
         outer: &ast::SelectStmt,
@@ -1016,6 +1116,12 @@ impl<'a> Compiler<'a> {
 
                 // `select global name [{ shape }]` — inline the computed expression.
                 if let Some(ir) = self.try_compile_global_select(s, result, distinct)? {
+                    return Ok(ir);
+                }
+
+                // `global name.field` / `(select Type filter ...).field` — splice the
+                // field access onto the inner type-select as an additional path step.
+                if let Some(ir) = self.try_compile_field_access_select(s, result)? {
                     return Ok(ir);
                 }
 
