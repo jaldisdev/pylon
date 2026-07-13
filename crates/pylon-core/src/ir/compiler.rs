@@ -1456,8 +1456,10 @@ impl<'a> Compiler<'a> {
             // Check scalar property first.
             if let Some(p) = current_td.properties.iter().find(|p| p.name == step_name) {
                 if !is_last(0) {
-                    // Named tuple properties allow further field access via jsonb operators.
-                    if p.pg_type.starts_with("__nt__:") {
+                    // Named tuple properties (nominal `__nt__:` marker) and structural
+                    // tuple properties (`tuple_members`) both allow further field
+                    // access via jsonb operators.
+                    if p.pg_type.starts_with("__nt__:") || p.tuple_members.is_some() {
                         let base = IrExpr::ColumnRef {
                             alias: current_alias.clone(),
                             column: p.name.clone(),

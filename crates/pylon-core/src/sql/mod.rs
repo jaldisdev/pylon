@@ -4028,6 +4028,68 @@ mod tests {
     }
 
     #[test]
+    fn test_path_traversal_into_structural_tuple_property() {
+        use crate::schema::{TupleMemberDescriptor, TupleMemberKind};
+        let schema = SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: "Person".into(),
+                module: "default".into(),
+                table: "Person".into(),
+                abstract_: false,
+                materialized: false,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
+                properties: vec![PropertyDescriptor {
+                    name: "address".into(),
+                    pg_type: "jsonb".into(),
+                    nullable: true,
+                    default_sql: None,
+                    default_pyql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: false,
+                    is_pk: false,
+                    is_readonly: false,
+                    rewrites: vec![],
+                    tuple_members: Some(vec![
+                        TupleMemberDescriptor {
+                            name: Some("street".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                        TupleMemberDescriptor {
+                            name: Some("zip".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                    ]),
+                }],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+            }],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+        };
+        // Regression: a structural (unnamed) tuple property previously failed
+        // path traversal with "'address' is a scalar property, not a link —
+        // cannot traverse further" because compile_path_select only allowed
+        // further traversal for the nominal `__nt__:` named-tuple marker,
+        // ignoring `tuple_members` on plain jsonb-typed properties.
+        let out = compile_and_emit_with("SELECT default::Person.address.street", &schema);
+        assert!(out.sql.contains("\"address\"->'street'"), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_structural_tuple_cast_shape_carries_real_members() {
         let out = compile_and_emit("SELECT <tuple<street: str, zip: str>>$p");
         match &out.shape.root {
