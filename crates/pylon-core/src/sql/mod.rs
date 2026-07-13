@@ -3214,6 +3214,38 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_user_specified_id_denied_by_default() {
+        let schema = make_schema();
+        let ast = parse::parse("INSERT Person { id := <uuid>$id, name := $name, age := $age }").unwrap();
+        match ir::compile_with_config(&ast, &schema, &ir::SessionConfig::default()) {
+            Err(err) => assert!(err.to_string().contains("cannot assign to property 'id'"), "got: {err}"),
+            Ok(_) => panic!("expected id assignment to be denied by default"),
+        }
+    }
+
+    #[test]
+    fn test_insert_user_specified_id_allowed_when_configured() {
+        let schema = make_schema();
+        let ast = parse::parse("INSERT Person { id := <uuid>$id, name := $name, age := $age }").unwrap();
+        let config = ir::SessionConfig { allow_user_specified_id: true };
+        let ir_out = ir::compile_with_config(&ast, &schema, &config)
+            .expect("expected id assignment to be allowed with allow_user_specified_id");
+        let out = emit(&ir_out);
+        assert!(out.sql.contains("INSERT INTO"));
+    }
+
+    #[test]
+    fn test_update_user_specified_id_denied_even_when_configured() {
+        let schema = make_schema();
+        let ast = parse::parse("UPDATE Person FILTER .name = $name SET { id := <uuid>$id }").unwrap();
+        let config = ir::SessionConfig { allow_user_specified_id: true };
+        match ir::compile_with_config(&ast, &schema, &config) {
+            Err(err) => assert!(err.to_string().contains("cannot assign to property 'id'"), "got: {err}"),
+            Ok(_) => panic!("expected UPDATE to always deny reassigning id"),
+        }
+    }
+
+    #[test]
     fn test_select_over_update_multilink_only() {
         // Regression test: an UPDATE bound to a single external name (here,
         // the implicit "_dml" wrapper for `SELECT (UPDATE ...)`) whose SET

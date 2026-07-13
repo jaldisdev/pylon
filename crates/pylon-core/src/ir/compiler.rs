@@ -26,10 +26,24 @@ use super::{
 
 // ── Public entry point ──────────────────────────────────────────────────────────
 
-/// Compile a parsed PyQL statement against the schema.
+/// Compile a parsed PyQL statement against the schema, using default session
+/// config (see `crate::ir::SessionConfig`) — used throughout this crate's own
+/// tests and schema-time compilation, which never has a live client-supplied
+/// config to honor. `compile_with_config` is the real entry a live query
+/// request uses.
 /// Returns the IR plan and the ordered list of parameter names (matching $1, $2, …).
 pub fn compile(stmt: &Stmt, schema: &SchemaDescriptor) -> Result<IrOutput, PyQLError> {
-    let mut c = Compiler::new(schema);
+    compile_with_config(stmt, schema, &crate::ir::SessionConfig::default())
+}
+
+/// Like `compile`, but honors a caller-supplied `SessionConfig` (e.g.
+/// `allow_user_specified_id`) for this one statement.
+pub fn compile_with_config(
+    stmt: &Stmt,
+    schema: &SchemaDescriptor,
+    config: &crate::ir::SessionConfig,
+) -> Result<IrOutput, PyQLError> {
+    let mut c = Compiler::with_config(schema, config.clone());
 
     // Unwrap top-level WITH block: compile each CTE binding, then the main statement.
     let (ctes, ir) = if let Stmt::With(w) = stmt {
@@ -289,10 +303,17 @@ struct Compiler<'a> {
     global_ctes: Vec<IrGlobalCte>,
     /// Non-fatal warnings collected during compilation.
     warnings: Vec<String>,
+    /// User-configurable session options — see `SessionConfig`. Always
+    /// `default()` for every entry point except `compile_with_config`.
+    config: crate::ir::SessionConfig,
 }
 
 impl<'a> Compiler<'a> {
     fn new(schema: &'a SchemaDescriptor) -> Self {
+        Self::with_config(schema, crate::ir::SessionConfig::default())
+    }
+
+    fn with_config(schema: &'a SchemaDescriptor, config: crate::ir::SessionConfig) -> Self {
         Compiler {
             schema,
             params: vec![],
@@ -302,6 +323,7 @@ impl<'a> Compiler<'a> {
             fn_params: HashMap::new(),
             global_ctes: vec![],
             warnings: vec![],
+            config,
         }
     }
 
@@ -3073,6 +3095,17 @@ impl<'a> Compiler<'a> {
 
                 // Validate the pointer exists
                 let column = if let Some(p) = Self::resolve_property(td, pointer_name) {
+                    // A primary-key ("id") property: an UPDATE never allows
+                    // reassigning it (deny_readonly is true there, regardless
+                    // of the session config); an INSERT only allows an
+                    // explicit value when allow_user_specified_id is set —
+                    // matches the upstream engine's own `allow_user_specified_id` semantics.
+                    if p.is_pk && (deny_readonly || !self.config.allow_user_specified_id) {
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: "cannot assign to property 'id'".to_string(),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
                     if deny_readonly && p.is_readonly {
                         return Err(PyQLError::Type(PyQLTypeError {
                             message: format!("cannot update property '{pointer_name}': it is declared as read-only"),

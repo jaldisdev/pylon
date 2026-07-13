@@ -11,8 +11,28 @@ pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_fn_body;
 pub use compiler::compile_scalar_default;
+pub use compiler::compile_with_config;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
+
+// ── Session config ───────────────────────────────────────────────────────────────
+
+/// User-configurable session options affecting compile-time validation —
+/// mirrors the upstream engine's session config. Threaded from the client's `with_config()`
+/// (Python) via the ASGI `/api/query` "config" body field; see
+/// `pylon/config_options.py` for the full registry of known option names/
+/// defaults exposed to the frontend. `compile()` (the 2-arg convenience form,
+/// used throughout this crate's own tests and schema-time compilation, which
+/// never touches a live client-supplied config) always uses `default()`;
+/// `compile_with_config()` is the real entry point a live query request uses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct SessionConfig {
+    /// When false (the default), an INSERT that explicitly assigns a value
+    /// to a primary-key ("id") property is a compile error — matches the upstream engine's
+    /// `allow_user_specified_id`. An UPDATE never allows assigning `id`,
+    /// regardless of this flag.
+    pub allow_user_specified_id: bool,
+}
 
 // ── Top-level statement ─────────────────────────────────────────────────────────
 
