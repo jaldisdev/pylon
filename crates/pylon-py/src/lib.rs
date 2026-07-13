@@ -1407,8 +1407,10 @@ impl CompiledQuery {
 // ── Public functions ───────────────────────────────────────────────────────────
 
 #[pyfunction]
-fn compile(query: &str, schema: &SchemaDescriptor) -> PyResult<CompiledQuery> {
-    core::query::compile(query, &schema.inner)
+#[pyo3(signature = (query, schema, *, allow_user_specified_id = false))]
+fn compile(query: &str, schema: &SchemaDescriptor, allow_user_specified_id: bool) -> PyResult<CompiledQuery> {
+    let config = core::ir::SessionConfig { allow_user_specified_id };
+    core::query::compile_with_config(query, &schema.inner, &config)
         .map(|q| CompiledQuery { inner: q })
         .map_err(pyql_err)
 }
