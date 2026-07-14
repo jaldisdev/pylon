@@ -12,12 +12,12 @@ class TestGlobalTypeTextScalar:
         assert _global_type_text(pylon.Str, set(), set()) == "std::str"
         assert _global_type_text(pylon.UUID, set(), set()) == "std::uuid"
 
-    def test_unresolvable_custom_scalar_returns_none(self):
+    def test_custom_scalar_resolves_to_own_qualified_name(self):
         @pylon.scalar(pylon.Str)
         class Slug(pylon.Scalar):
             pass
 
-        assert _global_type_text(Slug, set(), set()) is None
+        assert _global_type_text(Slug, set(), set()) == "test_asgi_globals::Slug"
 
 
 class TestGlobalTypeTextEnum:
@@ -65,13 +65,13 @@ class TestGlobalTypeTextStructuralTuple:
         ann = pylon.Tuple[("status", Status2)]
         assert _global_type_text(ann, {Status2}, set()) == "tuple<status: test_asgi_globals::Status2>"
 
-    def test_element_unresolvable_bails_out_to_none(self):
+    def test_custom_scalar_element_resolves_to_own_qualified_name(self):
         @pylon.scalar(pylon.Str)
         class Slug2(pylon.Scalar):
             pass
 
         ann = pylon.Tuple[("s", Slug2)]
-        assert _global_type_text(ann, set(), set()) is None
+        assert _global_type_text(ann, set(), set()) == "tuple<s: test_asgi_globals::Slug2>"
 
 
 class TestGlobalTypeTextArray:
