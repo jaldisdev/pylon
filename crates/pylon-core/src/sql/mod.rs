@@ -88,10 +88,18 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
     };
 
     // Prepend global CTEs — merged into the existing WITH clause if present.
+    // Two conventions produce a top-level WITH prefix: `emit_cte_prefix`'s
+    // "WITH\n<parts>\n" (used whenever `ir.ctes` is non-empty) and the
+    // inline "WITH <parts>\n" (space, no newline) built directly by a few
+    // statement emitters (e.g. emit_update_stmt's enqueue branch). Both are
+    // exactly 5 bytes before the CTE parts start, so the same slice works
+    // for either — but checking only one (as this used to) means a query
+    // with both user-defined CTEs *and* a global CTE gets a second, stray
+    // `WITH` keyword prepended instead of being merged into the first.
     if !ir.global_ctes.is_empty() {
         let global_parts = emit_global_cte_parts(&ir.global_ctes);
         let global_str = global_parts.join(",\n     ");
-        if out.sql.starts_with("WITH ") {
+        if out.sql.starts_with("WITH\n") || out.sql.starts_with("WITH ") {
             out.sql = format!("WITH {},\n     {}", global_str, &out.sql[5..]);
         } else {
             out.sql = format!("WITH {}\n{}", global_str, out.sql);
@@ -2535,8 +2543,9 @@ mod tests {
     use crate::ir;
     use crate::parse;
     use crate::schema::{
-        FunctionDescriptor, FunctionParamDescriptor, LinkDescriptor, MultiLinkDescriptor,
-        NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor, LinkDescriptor,
+        MultiLinkDescriptor, NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor,
+        TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -3060,6 +3069,45 @@ mod tests {
         assert!(out.sql.contains("\"insert0__ml_add_0\" AS ("), "missing junction-append CTE:\n{}", out.sql);
         assert!(out.sql.contains("\"insert0\" AS (\n    SELECT * FROM \"insert0__ids\"\n)"), "missing insert0 passthrough:\n{}", out.sql);
         assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_block_cte_over_computed_global_merges_into_single_with_clause() {
+        // Regression: `with user := (select global current_user) select user;`
+        // produced two separate top-level `WITH` keywords ("syntax error at
+        // or near WITH" from Postgres) whenever the computed global's own
+        // expression referenced a session global (registering a global CTE
+        // in addition to the user-defined "user" CTE). The merge check in
+        // emit() only recognized the "WITH " (space) prefix convention, not
+        // emit_cte_prefix's "WITH\n" (newline) convention used here, so it
+        // prepended a second WITH block instead of merging into the first.
+        let mut schema = make_schema();
+        schema.globals.push(GlobalDescriptor {
+            name: "current_user_id".into(),
+            module: "default".into(),
+            scalar_type: "UUID".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        });
+        schema.globals.push(GlobalDescriptor {
+            name: "current_user".into(),
+            module: "default".into(),
+            scalar_type: "Person".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: Some(
+                "select default::Person filter .id = global current_user_id".into(),
+            ),
+        });
+        let out = compile_and_emit_with(
+            "with\n  user := (select global current_user)\nselect user;",
+            &schema,
+        );
+        assert_eq!(
+            out.sql.matches("WITH").count(), 1,
+            "must be a single WITH clause, got:\n{}", out.sql
+        );
     }
 
     #[test]
