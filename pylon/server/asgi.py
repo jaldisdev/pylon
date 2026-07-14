@@ -273,8 +273,21 @@ def _resolve_target(target: Any, owning_cls: type) -> str:
 
 
 def _scalar_type_name(scalar_type: Any) -> str | None:
-    name = scalar_type.__name__ if isinstance(scalar_type, type) else None
-    return _TYPE_NAME_BY_CLASS.get(name) if name else None
+    """A built-in scalar (pylon.Str, pylon.Sequence, ...) shows its canonical
+    std::/cal:: name; a user-defined custom scalar (`@pylon.scalar(...)`, e.g.
+    OrderNumber) has its own name in the schema and isn't in
+    _TYPE_NAME_BY_CLASS at all — shown as its own qualname instead of silently
+    falling back to nothing (confirmed empirically: /api/schema was omitting
+    typeName entirely for Order.number, whose annotation is OrderNumber, not
+    Sequence itself)."""
+    if not isinstance(scalar_type, type):
+        return None
+    builtin_name = _TYPE_NAME_BY_CLASS.get(scalar_type.__name__)
+    if builtin_name:
+        return builtin_name
+    if hasattr(scalar_type, "__pylon_base__"):
+        return _type_qualname(scalar_type)
+    return None
 
 
 def _pointer_editability(meta: PointerMeta) -> dict[str, Any]:
@@ -482,10 +495,10 @@ def _global_type_text(scalar_type: Any, enum_classes: set[type], named_tuple_cla
     a PyQL-style type-name string — e.g. "std::str", "default::Gender",
     "tuple<x: std::float64, y: std::float64>", "array<std::str>" — so the
     frontend can classify/render it the same way it already does for a
-    Query Editor $param's cast-type text (see tupleTypeCast.ts). None when
-    the type can't be resolved at all (e.g. a custom scalar with no
-    _TYPE_NAME_BY_CLASS entry) — the frontend already treats a null typeName
-    as "generic scalar, no cast-specific rules", same as any other property."""
+    Query Editor $param's cast-type text (see tupleTypeCast.ts). A custom
+    scalar (no _TYPE_NAME_BY_CLASS entry) resolves to its own qualname
+    (e.g. "default::Slug"), same as _scalar_type_name does for a schema
+    pointer's typeName."""
     if isinstance(scalar_type, TupleAnnotation):
         positional = all(e.name is None for e in scalar_type.elements)
         parts: list[str] = []
