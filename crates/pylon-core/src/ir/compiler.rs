@@ -2047,12 +2047,15 @@ impl<'a> Compiler<'a> {
     }
 
     /// `EXISTS(SELECT 1 FROM junction WHERE junction.source = alias.id)` for a multi-link.
-    fn compile_multilink_exists_check(
+    /// Build the `IrSelect` over the junction/FK-target rows for a multilink,
+    /// correlated to the current row (`alias.id`) — shared by `exists
+    /// .multilink` and `count(.multilink)`.
+    fn multilink_correlation_select(
         &mut self,
         ml_name: &str,
         td: &TypeDescriptor,
         alias: &str,
-    ) -> Result<IrExpr, PyQLError> {
+    ) -> Result<IrSelect, PyQLError> {
         let ml = Self::resolve_multilink(td, ml_name).unwrap();
         let ml_through = ml.through.clone();
         let td_module = td.module.clone();
@@ -2083,7 +2086,7 @@ impl<'a> Compiler<'a> {
             op: ast::BinOpKind::Eq,
             right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
         }));
-        let inner = IrExpr::Subquery(Box::new(IrSelect {
+        Ok(IrSelect {
             source: IrSource {
                 type_name: format!("{}::__jt__", jt_module),
                 table: jt_table,
@@ -2097,8 +2100,20 @@ impl<'a> Compiler<'a> {
             distinct: false,
             dml_source: None,
             polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-        }));
-        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
+        })
+    }
+
+    fn compile_multilink_exists_check(
+        &mut self,
+        ml_name: &str,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let inner = self.multilink_correlation_select(ml_name, td, alias)?;
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: ast::UnaryOpKind::Exists,
+            operand: IrExpr::Subquery(Box::new(inner)),
+        })))
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.
@@ -4226,6 +4241,28 @@ impl<'a> Compiler<'a> {
                                         self.try_multilink_exists(&synthetic, td, alias)?
                                     {
                                         return Ok(exists);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // count(.multilink) / other single-arg aggregates over a multilink —
+                // correlate via the junction/FK table (AggOverQuery) rather than
+                // treating `.multilink` as an ordinary scalar path (which it isn't).
+                if f.args.len() == 1 {
+                    if let Expr::Path(p) = &f.args[0] {
+                        if p.partial && p.steps.len() == 1 {
+                            if let ast::PathStep::Name(ml_name) = &p.steps[0] {
+                                if Self::resolve_multilink(td, ml_name).is_some() {
+                                    use crate::stdlib::{lookup, ImplStrategy};
+                                    let ns = f.module.as_deref().unwrap_or("std");
+                                    let overloads = lookup(ns, &f.name);
+                                    let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
+                                    if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy) {
+                                        let fn_name = sql_name.to_string();
+                                        let inner = self.multilink_correlation_select(ml_name, td, alias)?;
+                                        return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner) });
                                     }
                                 }
                             }

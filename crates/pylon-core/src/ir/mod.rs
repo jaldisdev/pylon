@@ -1166,6 +1166,21 @@ mod tests {
     }
 
     #[test]
+    fn test_count_over_multilink_in_computed_shape_element() {
+        // Regression: `count(.posts)` inside a computed shape element
+        // previously failed with "object type 'default::Person' has no link
+        // or property 'posts'" — compile_path only checked scalar
+        // properties/single-links, never multilinks.
+        let ir = compile("SELECT Person { post_count := count(.posts) }");
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        let computed = sel.shape.iter().find_map(|f| match f {
+            IrShapePointer::Computed(c) if c.alias == "post_count" => Some(c),
+            _ => None,
+        }).expect("expected post_count computed pointer");
+        assert!(matches!(computed.expr, IrExpr::AggOverQuery { .. }));
+    }
+
+    #[test]
     fn test_multi_sort_with_then() {
         let ir = compile("SELECT Person { name } ORDER BY .name THEN .age");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
