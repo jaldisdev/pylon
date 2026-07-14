@@ -3111,6 +3111,40 @@ mod tests {
     }
 
     #[test]
+    fn test_path_traversal_into_with_bound_cte_of_object_type() {
+        // Regression: `with user := (select global current_user) select
+        // user.name;` failed with "unknown type 'user'" — compile_path_select
+        // (used for multi-step absolute paths like `user.name`) only ever
+        // tried resolve_type(root_name), never checking whether the root
+        // name is a WITH-block CTE bound to an object type.
+        let mut schema = make_schema();
+        schema.globals.push(GlobalDescriptor {
+            name: "current_user_id".into(),
+            module: "default".into(),
+            scalar_type: "UUID".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        });
+        schema.globals.push(GlobalDescriptor {
+            name: "current_user".into(),
+            module: "default".into(),
+            scalar_type: "Person".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: Some(
+                "select default::Person filter .id = global current_user_id".into(),
+            ),
+        });
+        let out = compile_and_emit_with(
+            "with\n  user := (select global current_user)\nselect user.name;",
+            &schema,
+        );
+        assert!(out.sql.contains("FROM \"user\""), "expected path traversal from the CTE, got:\n{}", out.sql);
+        assert_eq!(out.sql.matches("WITH").count(), 1, "must be a single WITH clause, got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_insert_multilink_remove_rejected() {
         let schema = make_schema_with_through_and_prop();
         let ast = crate::parse::parse(

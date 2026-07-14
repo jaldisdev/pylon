@@ -1453,11 +1453,26 @@ impl<'a> Compiler<'a> {
             PathStep::Name(n) => n.as_str(),
             _ => return Err(self.type_err("path traversal must start with a type name")),
         };
-        let root_td = self.resolve_type(root_name)?;
+        // A WITH-block CTE bound to an object type (e.g. `with user :=
+        // (select global current_user) select user.gender`) can be
+        // traversed just like a real type name — resolve its underlying
+        // type and source from the `@cte:` sentinel table (the same
+        // mechanism `compile_select`'s bare-CTE-object-select case uses)
+        // instead of failing with "unknown type '{root_name}'".
+        let cte_object_type = self.cte_types.get(root_name)
+            .filter(|t| t.contains("::"))
+            .cloned();
+        let root_td = match &cte_object_type {
+            Some(t) => self.resolve_type(t)?,
+            None => self.resolve_type(root_name)?,
+        };
         let root_alias = self.fresh_alias();
         let root = IrSource {
             type_name: format!("{}::{}", root_td.module, root_td.name),
-            table: root_td.table.clone(),
+            table: match &cte_object_type {
+                Some(_) => format!("@cte:{}", root_name),
+                None => root_td.table.clone(),
+            },
             alias: root_alias.clone(),
         };
 
