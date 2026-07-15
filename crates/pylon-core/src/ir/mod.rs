@@ -534,6 +534,13 @@ pub enum IrExpr {
     /// `scalar = true`  → emits `(SELECT "result" FROM "cte_name")`
     /// `scalar = false` → emits `(SELECT "id"     FROM "cte_name")`
     CteRef { name: String, scalar: bool },
+    /// A single-field access on a WITH-bound free object: `with x := { a
+    /// := 1 } select x.a`. The CTE body exposes each free-object field as
+    /// its own named column (alongside the whole-object `result` column
+    /// `CtePassthrough`/`CteRef` use) so this can reference it directly
+    /// rather than reconstructing/decoding the opaque `result` composite.
+    /// Emits `(SELECT "field" FROM "name")`.
+    CteFieldRef { name: String, field: String },
     /// Reference to the current for-loop iterator variable.
     /// Emits `"_for_{name}"."v"`.
     ForVar { name: String },

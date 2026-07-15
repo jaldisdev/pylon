@@ -70,7 +70,7 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
         IrStmt::For(f) => emit_for_stmt(f, &ir.ctes),
         stmt => {
             let mut o = match stmt {
-                IrStmt::Select(sel) => emit_select_stmt(sel),
+                IrStmt::Select(sel) => emit_select_stmt(sel, &ir.ctes),
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
                 IrStmt::Insert(ins) => emit_insert_stmt(ins),
                 IrStmt::Delete(del) => emit_delete_stmt(del),
@@ -167,10 +167,10 @@ fn emit_poly_union(implementors: &[IrPolyImplementor], columns: &[String]) -> St
 
 // ── SELECT statement ────────────────────────────────────────────────────────
 
-fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
+fn emit_select_stmt(sel: &IrSelect, ctes: &[IrCteDef]) -> SqlOutput {
     match sel.rows.as_slice() {
         [IrRowSource::Bound { source, shape }] => emit_bound_select(sel, source, shape),
-        rows => emit_free_rows(sel, rows),
+        rows => emit_free_rows(sel, rows, ctes),
     }
 }
 
@@ -328,8 +328,11 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 sql
             }
             // Free rows: full UNION-ALL emission, same as before the merge
-            // (this arm used to be a separate IrStmt::FreeSelect match).
-            _ => emit_select_stmt(inner).sql,
+            // (this arm used to be a separate IrStmt::FreeSelect match). Only
+            // `.sql` is used here, and CtePassthrough's SQL text doesn't
+            // depend on the ctes list (only its *shape* resolution does), so
+            // an empty slice is fine.
+            _ => emit_select_stmt(inner, &[]).sql,
         },
         IrStmt::FunctionSelect(sel) => {
             // Expose raw columns so the outer SELECT can project its own shape,
@@ -851,7 +854,7 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
 /// already ruled out by `emit_select_stmt`'s dispatch (a schema object and a
 /// free literal can never appear in the same UNION — `check_union_type_compat`
 /// rejects that at compile time), so every entry here is `IrRowSource::Free`.
-fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
+fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> SqlOutput {
     use crate::query::ShapeNode;
 
     let items: Vec<&IrFreeExpr> = rows.iter().map(|r| match r {
@@ -892,7 +895,7 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
         }
     }
 
-    let shape_root = free_item_shape(items.first().unwrap());
+    let shape_root = free_item_shape(items.first().unwrap(), ctes);
 
     let branches: Vec<String> = items.iter().map(|item| match item {
         IrFreeExpr::Scalar(expr) => {
@@ -913,12 +916,26 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
             }
         }
         IrFreeExpr::FreeObject(fields) => {
-            if fields.len() == 1 {
-                format!("SELECT ROW({}) AS result", emit_free_field_expr(&fields[0].1))
-            } else {
-                let exprs: Vec<String> = fields.iter().map(|(_, e)| emit_free_field_expr(e)).collect();
-                format!("SELECT ({}) AS result", exprs.join(", "))
-            }
+            // Each field is computed once in an inner subquery (so a
+            // volatile expression like nextval() isn't evaluated twice) and
+            // exposed both packed into the `result` composite (for whole-
+            // object passthrough/decoding) and as its own named column (for
+            // `IrExpr::CteFieldRef` — `with x := {a := ...} select x.a`).
+            let inner_cols: Vec<String> = fields.iter().enumerate()
+                .map(|(i, (_, e))| format!("{} AS \"_f{}\"", emit_expr(e), i))
+                .collect();
+            let row_items: Vec<String> = fields.iter().enumerate()
+                .map(|(i, (_, e))| {
+                    if enum_type_of_expr(e).is_some() { format!("\"_f{}\"::text", i) } else { format!("\"_f{}\"", i) }
+                })
+                .collect();
+            let named_cols: Vec<String> = fields.iter().enumerate()
+                .map(|(i, (name, _))| format!("\"_f{}\" AS {}", i, qi(name)))
+                .collect();
+            format!(
+                "SELECT ROW({}) AS result, {} FROM (SELECT {}) AS _obj",
+                row_items.join(", "), named_cols.join(", "), inner_cols.join(", "),
+            )
         }
         IrFreeExpr::Tuple(exprs) => {
             if exprs.len() == 1 {
@@ -1016,7 +1033,7 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
     }
 }
 
-fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
+fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match item {
         IrFreeExpr::Scalar(e) => expr_shape_node("", 0, e),
@@ -1040,7 +1057,22 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
                 .collect(),
         },
         IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar { name: String::new(), position: 0 },
-        IrFreeExpr::CtePassthrough(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
+        // The referenced CTE's own `result` column carries whatever shape its
+        // defining free row has (a bare scalar, a multi-field free object, a
+        // tuple, or even another passthrough) — resolve it by looking the CTE
+        // up rather than assuming Scalar, otherwise a multi-field free object
+        // bound in a `WITH` clause decodes as just its first field's value.
+        IrFreeExpr::CtePassthrough(name) => ctes
+            .iter()
+            .find(|c| &c.name == name)
+            .and_then(|c| match &c.stmt {
+                IrStmt::Select(sel) => match sel.rows.first() {
+                    Some(IrRowSource::Free(inner)) => Some(free_item_shape(inner, ctes)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or(ShapeNode::Scalar { name: String::new(), position: 0 }),
     }
 }
 
@@ -1375,7 +1407,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
         IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &rows, user_ctes),
         body => {
             let body_out = match body {
-                IrStmt::Select(sel) => emit_select_stmt(sel),
+                IrStmt::Select(sel) => emit_select_stmt(sel, user_ctes),
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
                 other => panic!("unsupported for-loop body: {:?}", other),
             };
@@ -2316,7 +2348,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("(SELECT {}(v) FROM ({}) AS _set(v))", fn_name, union_all)
         }
         IrExpr::AggOverQuery { fn_name, inner } => {
-            let inner_sql = emit_select_stmt(inner).sql;
+            let inner_sql = emit_select_stmt(inner, &[]).sql;
             format!("(SELECT {}(*) FROM ({}) _agg)", fn_name, inner_sql)
         }
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
@@ -2326,6 +2358,10 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             // expression context so we get the plain scalar type, not record.
             let col = if *scalar { "v" } else { "id" };
             format!("(SELECT \"{}\" FROM \"{}\")", col, name)
+        }
+
+        IrExpr::CteFieldRef { name, field } => {
+            format!("(SELECT {} FROM {})", qi(field), qi(name))
         }
 
         IrExpr::ForVar { name } => format!("\"_for_{}\".\"v\"", name),
