@@ -256,6 +256,16 @@ def shape_value_tags(node: dict) -> Any:
         # from "public" for the frontend's /api/schema-driven enum lookup.
         return {"kind": "enum", "enumType": _pylon_qualify_enum_type(node["enum_type"])}
     if kind == "named_tuple":
+        # A nested free object (`test := { foo := 'bar' }`, e.g. inside a
+        # computed shape element) compiles to the exact same IR/shape node
+        # as a real named-tuple literal (`test := (foo := 'bar')`) — same
+        # jsonb encoding either way — but the two need different frontend
+        # display (Gel's expandable `Object {foo: 'bar'}` vs. a non-
+        # expandable `(foo := 'bar')` tuple literal). is_free_object (see
+        # ShapeNode::NamedTuple in query/mod.rs) carries that distinction
+        # through from the original curly-brace-vs-paren PyQL syntax.
+        if node.get("is_free_object"):
+            return {"kind": "object", "typeName": None, "pointers": {}}
         members = node.get("members")
         return {
             "kind": "namedTuple",
