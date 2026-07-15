@@ -398,6 +398,12 @@ pub struct IrUpdate {
     pub enqueue_search: Vec<SearchEnqueueInfo>,
     /// Populated when updating an interface type; one entry per concrete implementor.
     pub poly_implementors: Vec<IrPolyImplementor>,
+    /// The interface's own physical columns (properties + `{link}_id`) — the
+    /// only columns every implementor table is guaranteed to share, so a
+    /// per-implementor UNION ALL fan-out (see poly_implementors) can only
+    /// ever RETURNING this common subset, never `*`. Empty unless
+    /// poly_implementors is also non-empty.
+    pub poly_columns: Vec<String>,
     /// `friends := {}` — DELETE all junction rows for this object.
     pub multi_link_clears: Vec<IrMultiLinkClear>,
     /// `friends := expr` — clear + insert (both lists share the same index).
@@ -466,6 +472,8 @@ pub struct IrDelete {
     pub returning: Vec<IrShapePointer>,
     /// Populated when deleting from an interface type; one entry per concrete implementor.
     pub poly_implementors: Vec<IrPolyImplementor>,
+    /// The interface's own physical columns — see IrUpdate::poly_columns.
+    pub poly_columns: Vec<String>,
     /// OpenSearch-backed SearchIndexes that need delete outbox rows written.
     pub enqueue_search: Vec<SearchEnqueueInfo>,
 }

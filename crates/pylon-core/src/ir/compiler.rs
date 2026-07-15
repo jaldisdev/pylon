@@ -2757,11 +2757,7 @@ impl<'a> Compiler<'a> {
         let polymorphic = td.abstract_ && td.materialized;
         let (poly_implementors, poly_columns) = if polymorphic {
             let iface_qname = format!("{}::{}", td.module, td.name);
-            let implementors = self.find_poly_implementors(&iface_qname);
-            let columns: Vec<String> = td.properties.iter().map(|p| p.name.clone())
-                .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
-                .collect();
-            (implementors, columns)
+            (self.find_poly_implementors(&iface_qname), Self::poly_dml_columns(td))
         } else {
             (vec![], vec![])
         };
@@ -3276,10 +3272,10 @@ impl<'a> Compiler<'a> {
             .collect();
         let returning = Self::pk_returning(td);
 
-        let poly_implementors = if td.abstract_ && td.materialized {
-            self.find_poly_implementors(&format!("{}::{}", td.module, td.name))
+        let (poly_implementors, poly_columns) = if td.abstract_ && td.materialized {
+            (self.find_poly_implementors(&format!("{}::{}", td.module, td.name)), Self::poly_dml_columns(td))
         } else {
-            vec![]
+            (vec![], vec![])
         };
 
         // Only enqueue indexes whose source pointers are touched by this update.
@@ -3299,7 +3295,7 @@ impl<'a> Compiler<'a> {
             target, filter, assignments, rewrites, returning,
             multi_link_clears, multi_link_replaces,
             multi_link_appends, multi_link_removals,
-            poly_implementors,
+            poly_implementors, poly_columns,
             enqueue_vector,
             enqueue_search,
         })
@@ -3487,15 +3483,15 @@ impl<'a> Compiler<'a> {
 
         let returning = Self::pk_returning(td);
 
-        let poly_implementors = if td.abstract_ && td.materialized {
-            self.find_poly_implementors(&format!("{}::{}", td.module, td.name))
+        let (poly_implementors, poly_columns) = if td.abstract_ && td.materialized {
+            (self.find_poly_implementors(&format!("{}::{}", td.module, td.name)), Self::poly_dml_columns(td))
         } else {
-            vec![]
+            (vec![], vec![])
         };
         let qname = format!("{}::{}", td.module, td.name);
         let enqueue_search = collect_search_enqueue(td, &qname, "delete");
 
-        Ok(IrDelete { target, filter, returning, poly_implementors, enqueue_search })
+        Ok(IrDelete { target, filter, returning, poly_implementors, poly_columns, enqueue_search })
     }
 
     // ── Shape compilation ─────────────────────────────────────────────────────────
@@ -5702,6 +5698,18 @@ impl<'a> Compiler<'a> {
             limit,
             distinct,
         }))
+    }
+
+    /// The interface's own physical columns (properties + `{link}_id`) — the
+    /// subset every concrete implementor table is guaranteed to share, safe
+    /// to RETURNING/SELECT uniformly across a poly_implementors fan-out.
+    /// Shared by compile_select (read path) and the IrUpdate/IrDelete
+    /// builders (write path) so a DML-as-CTE fan-out (sql/mod.rs) can expose
+    /// the same columns a polymorphic select would.
+    fn poly_dml_columns(td: &TypeDescriptor) -> Vec<String> {
+        td.properties.iter().map(|p| p.name.clone())
+            .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
+            .collect()
     }
 
     /// Collect poly_implementors and poly_columns for a polymorphic return type.

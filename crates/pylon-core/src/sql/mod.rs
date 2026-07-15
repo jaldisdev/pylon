@@ -186,6 +186,8 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         let mut cte_parts = match dml.as_ref() {
             IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, "_dml"),
             IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, "_dml"),
+            IrStmt::Update(upd) if !upd.poly_implementors.is_empty() => emit_poly_update_dml_ctes(upd, "_dml"),
+            IrStmt::Delete(del) if !del.poly_implementors.is_empty() => emit_poly_delete_dml_ctes(del, "_dml"),
             _ => vec![format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml))],
         };
         let (enqueue_v, enqueue_s) = match dml.as_ref() {
@@ -333,6 +335,94 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
     }
 }
 
+// ── Polymorphic DML-as-CTE fan-out ──────────────────────────────────────────
+//
+// A DML statement targeting an interface/abstract type can't be a single
+// `UPDATE`/`DELETE ... RETURNING *` the way emit_dml_as_cte_source handles a
+// concrete-type target — Postgres has no single physical relation backing
+// the interface (each concrete implementor has its own table), and a bare
+// `RETURNING *` off whichever one table `source_ref` happened to resolve
+// would only ever see that one implementor's rows and never carry a
+// `__type__` discriminator column at all (confirmed live: querying such a
+// CTE from an outer polymorphic SELECT raised "column t1.__type__ does not
+// exist", since the outer SELECT — see emit_select_stmt and the "CTE-backed
+// polymorphic sources" comment there — assumes any CTE tied to a polymorphic
+// type already exposes one).
+//
+// Mirrors emit_poly_update_stmt/emit_poly_delete_stmt's per-implementor
+// UNION ALL fan-out (one CTE per concrete table, each RETURNING-ing rows,
+// unioned together with a compile-time-known type literal per branch — the
+// type is known per branch even though it can vary per row across the whole
+// statement, since each branch only ever touches one implementor's table).
+// The difference here: those two functions only need `id` back (a
+// standalone DML's own default RETURNING shape), while a DML-as-CTE source
+// must expose whatever columns the *outer* SELECT might project — so this
+// returns the interface's full common column set (poly_columns: every
+// property + link FK the type declares, guaranteed present on every
+// implementor table) instead of just id.
+//
+// Not handled: a multi-link mutation (+=/-=/:=) on the interface's own
+// pointer combined with poly_implementors on the same statement — that
+// would need per-implementor junction-table CTEs too, which
+// emit_update_multilink_ctes doesn't do either today. Callers check
+// update_has_any_multilink first and keep routing that (rarer) combination
+// through the existing (equally not-poly-aware) path rather than silently
+// mishandling it here.
+
+fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
+    let alias = &upd.target.alias;
+    let sets: Vec<String> = upd.assignments.iter()
+        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+        .chain(upd.rewrites.iter().map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
+        .collect();
+    let col_list = upd.poly_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+
+    let mut cte_parts = vec![];
+    let mut union_parts = vec![];
+    for (i, imp) in upd.poly_implementors.iter().enumerate() {
+        let cte_name = format!("{}__u{}", name, i);
+        let mut upd_sql = format!(
+            "UPDATE {} AS {}\nSET {}",
+            qn(&imp.module, &imp.table), qi(alias), sets.join(", "),
+        );
+        append_filter(&mut upd_sql, &upd.filter);
+        upd_sql.push_str(&format!("\nRETURNING {}", col_list));
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+
+        union_parts.push(format!(
+            "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
+            sql_str(&imp.type_name), col_list, cte_name,
+        ));
+    }
+    cte_parts.push(format!("\"{}\" AS (\n{}\n)", name, union_parts.join("\nUNION ALL\n")));
+    cte_parts
+}
+
+fn emit_poly_delete_dml_ctes(del: &IrDelete, name: &str) -> Vec<String> {
+    let alias = &del.target.alias;
+    let col_list = del.poly_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+
+    let mut cte_parts = vec![];
+    let mut union_parts = vec![];
+    for (i, imp) in del.poly_implementors.iter().enumerate() {
+        let cte_name = format!("{}__d{}", name, i);
+        let mut del_sql = format!(
+            "DELETE FROM {} AS {}",
+            qn(&imp.module, &imp.table), qi(alias),
+        );
+        append_filter(&mut del_sql, &del.filter);
+        del_sql.push_str(&format!("\nRETURNING {}", col_list));
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, del_sql));
+
+        union_parts.push(format!(
+            "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
+            sql_str(&imp.type_name), col_list, cte_name,
+        ));
+    }
+    cte_parts.push(format!("\"{}\" AS (\n{}\n)", name, union_parts.join("\nUNION ALL\n")));
+    cte_parts
+}
+
 // ── User CTE helpers ────────────────────────────────────────────────────────
 
 fn update_has_any_multilink(upd: &IrUpdate) -> bool {
@@ -449,8 +539,11 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
 /// Expands a list of user-bound WITH names into their top-level CTE parts —
 /// usually one part per name, except an UPDATE or INSERT with any multi-link
 /// mutation expands into several sibling parts (see
-/// emit_update_multilink_ctes / emit_insert_multilink_ctes) since those can't
-/// be nested inside a single name's own CTE body.
+/// emit_update_multilink_ctes / emit_insert_multilink_ctes), and an UPDATE or
+/// DELETE targeting an interface/abstract type similarly fans out into one
+/// part per concrete implementor (see emit_poly_update_dml_ctes /
+/// emit_poly_delete_dml_ctes) — neither can be nested inside a single name's
+/// own CTE body.
 fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
     let mut parts: Vec<String> = vec![];
     for c in ctes {
@@ -459,10 +552,20 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
                 parts.extend(emit_update_multilink_ctes(upd, &c.name));
                 continue;
             }
+            if !upd.poly_implementors.is_empty() {
+                parts.extend(emit_poly_update_dml_ctes(upd, &c.name));
+                continue;
+            }
         }
         if let IrStmt::Insert(ins) = &c.stmt {
             if insert_has_any_multilink(ins) {
                 parts.extend(emit_insert_multilink_ctes(ins, &c.name));
+                continue;
+            }
+        }
+        if let IrStmt::Delete(del) = &c.stmt {
+            if !del.poly_implementors.is_empty() {
+                parts.extend(emit_poly_delete_dml_ctes(del, &c.name));
                 continue;
             }
         }
