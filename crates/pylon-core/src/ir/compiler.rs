@@ -2223,6 +2223,19 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// True when `expr` is a bare 1-step name bound to a free (non-object)
+    /// WITH binding — the same "scalar CTE" check `is_free_result` uses for
+    /// its `Expr::Path` arm, factored out so `Expr::Shape`'s handling of
+    /// "shape applied to a non-object" can reuse it too.
+    fn is_free_cte_ref(&self, expr: &Expr) -> bool {
+        let Expr::Path(p) = expr else { return false };
+        if p.partial || p.steps.len() != 1 {
+            return false;
+        }
+        let ast::PathStep::Name(n) = &p.steps[0] else { return false };
+        self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false)
+    }
+
     // ── FREE SELECT ───────────────────────────────────────────────────────────────
 
     fn collect_union_items(
@@ -4234,6 +4247,36 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::NamedTuple { fields, is_free_object: true })
             }
 
+            // A shape applied to a WITH-bound free object (`test := test {
+            // test2 }` where `test` isn't a schema object, just a free
+            // binding) projects the named fields out of it — each element
+            // either reads the underlying field (by name, via the same
+            // per-field CTE column `.field` access uses) or, with a `:=`
+            // override, compiles a brand new value in the current context,
+            // exactly like a fresh free-object-literal field would.
+            Expr::Shape(s) if matches!(&s.expr, Some(inner) if self.is_free_cte_ref(inner)) => {
+                let Some(Expr::Path(root_path)) = &s.expr else { unreachable!() };
+                let ast::PathStep::Name(root) = &root_path.steps[0] else { unreachable!() };
+                let fields = s
+                    .elements
+                    .iter()
+                    .map(|el| -> Result<(String, IrExpr), PyQLError> {
+                        let name = path_leaf(&el.path)?.to_string();
+                        let expr = match &el.compexpr {
+                            Some(over) => self.compile_expr_ctx(over, ctx)?,
+                            None => match self.resolve_cte_field_chain(root, &[name.as_str()]) {
+                                Some(result) => result?,
+                                None => return Err(self.type_err(&format!(
+                                    "free object '{root}' has no field '{name}'"
+                                ))),
+                            },
+                        };
+                        Ok((name, expr))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(IrExpr::NamedTuple { fields, is_free_object: true })
+            }
+
             // A bare shape or set literal is never valid in expression
             // position, in either context — preserved exactly as the
             // schema-bound side always enforced (the free side's more
@@ -4424,6 +4467,19 @@ impl<'a> Compiler<'a> {
     fn resolve_name_ref(&self, name: &str, allow_fn_param: bool) -> Option<IrExpr> {
         if self.for_vars.contains_key(name) {
             return Some(IrExpr::ForVar { name: name.to_string() });
+        }
+        // A free-object-bound CTE (`with x := { a := 1 } select ... x ...`),
+        // referenced bare with no shape to project through, has nothing to
+        // expose — matching Gel (a free *object* needs an explicit shape to
+        // know what to return; unlike a tuple/named tuple, it has no
+        // "default" projection), this collapses to an empty free object,
+        // the same as `Expr::Shape`'s `is_free_cte_ref` case for `x { ... }`.
+        // It also sidesteps a real problem: this CTE has no "v" column
+        // (only `IrFreeExpr::Scalar` CTEs get one), so falling through to
+        // the generic `IrExpr::CteRef` below would reference a column that
+        // doesn't exist.
+        if let Some(IrFreeExpr::FreeObject(_)) = self.cte_free_items.get(name) {
+            return Some(IrExpr::NamedTuple { fields: vec![], is_free_object: true });
         }
         if let Some(t) = self.cte_types.get(name) {
             let scalar = !t.contains("::");

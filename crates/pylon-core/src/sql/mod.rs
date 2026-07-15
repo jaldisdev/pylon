@@ -3019,9 +3019,19 @@ mod tests {
             "select { gender := default::Gender.Male }",
             &schema,
         );
+        // The enum value is computed once (`'Male'::"public"."Gender" AS
+        // "_f0"`) and reused for both the `result` composite (cast to
+        // `::text` there, since asyncpg can't decode an enum OID inside an
+        // anonymous ROW()) and the plain per-field column exposed for
+        // `IrExpr::CteFieldRef` access — so the `::text` cast now applies
+        // to that computed column, not inline on the enum literal itself.
         assert!(
-            out.sql.contains("::\"public\".\"Gender\"::text"),
-            "expected enum field cast to text inside ROW(), got:\n{}", out.sql
+            out.sql.contains("'Male'::\"public\".\"Gender\""),
+            "expected the enum literal, got:\n{}", out.sql
+        );
+        assert!(
+            out.sql.contains("ROW(\"_f0\"::text) AS result"),
+            "expected the ROW composite to cast the enum field to text, got:\n{}", out.sql
         );
         let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root
             else { panic!("expected Object shape") };
@@ -3485,6 +3495,104 @@ mod tests {
         );
         assert!(out.sql.contains("FROM \"user\""), "expected path traversal from the CTE, got:\n{}", out.sql);
         assert_eq!(out.sql.matches("WITH").count(), 1, "must be a single WITH clause, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_bound_free_object_passthrough_preserves_all_fields() {
+        // Regression: `with test := { test2 := 1.0, test3 := 'str' } select
+        // test;` decoded as just `1.0` (the CTE's first field) — a bare
+        // reference to a free-object CTE (`IrFreeExpr::CtePassthrough`) had
+        // its shape hardcoded to `ShapeNode::Scalar` regardless of what the
+        // CTE actually held.
+        let out = compile_and_emit(
+            "with\n  test := { test2 := 1.0, test3 := 'str' }\nselect test;",
+        );
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape, got {:?}", out.shape.root)
+        };
+        assert_eq!(pointers.len(), 2);
+        assert!(matches!(&pointers[0], ShapeNode::Scalar { name, .. } if name == "test2"));
+        assert!(matches!(&pointers[1], ShapeNode::Scalar { name, .. } if name == "test3"));
+    }
+
+    #[test]
+    fn test_with_bound_free_object_field_access() {
+        // Regression: `with test := {...} select test.test2;` failed with
+        // "unknown type 'test'" — any absolute path with 2+ steps
+        // unconditionally routed to compile_path_select, which only knows
+        // how to resolve real schema types, never a free-value CTE.
+        let out = compile_and_emit(
+            "with\n  test := { test2 := 1.0, test3 := 'str' }\nselect test.test2;",
+        );
+        assert!(out.sql.contains("\"test2\" FROM \"test\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_bound_free_object_nested_field_access_chain() {
+        // A field-access chain through a *nested* free object literal
+        // (`test.test3.foo`) must resolve the first hop via the CTE's own
+        // materialized column, then extract `foo` as jsonb from that value
+        // — the fix must not be hardcoded to exactly 2 path steps.
+        let out = compile_and_emit(
+            "with\n  test := { test2 := 1.0, test3 := { foo := 'bar' } }\nselect test.test3.foo;",
+        );
+        assert!(out.sql.contains("\"test3\" FROM \"test\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("->'foo'"), "expected jsonb field extraction, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_bound_free_object_nested_field_access_wrong_field_errors() {
+        // A typo'd field name anywhere in the chain must still be a compile
+        // error, not silently emit SQL that returns NULL at runtime.
+        let schema = make_schema();
+        let ast = parse::parse(
+            "with\n  test := { test2 := 1.0, test3 := { foo := 'bar' } }\nselect test.test3.nope;",
+        ).unwrap();
+        assert!(ir::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
+    fn test_nested_free_object_literal_in_computed_shape_element() {
+        // Regression: a free object literal (`{ foo := 'bar' }`) nested
+        // inside a computed shape element — not the top-level SELECT
+        // result — hit "shapes and set literals are not valid in
+        // expression context"; free object literals were only ever handled
+        // at the statement level.
+        let out = compile_and_emit("select default::Person { id, test := { foo := 'bar' } };");
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape")
+        };
+        let test_node = pointers.iter()
+            .find(|p| matches!(p, ShapeNode::NamedTuple { name, .. } if name == "test"))
+            .unwrap_or_else(|| panic!("expected a NamedTuple shape node for 'test', got {:?}", pointers));
+        assert!(matches!(test_node, ShapeNode::NamedTuple { is_free_object: true, .. }));
+    }
+
+    #[test]
+    fn test_bare_free_cte_reference_in_computed_shape_collapses_to_empty() {
+        // A free-object CTE referenced bare (no shape) as a computed shape
+        // element's value has nothing to project — matches Gel, which
+        // needs an explicit shape to know what to expose from a free
+        // object (unlike a tuple, which is a plain value with no such
+        // requirement).
+        let out = compile_and_emit(
+            "with\n  test := { test2 := 1.0, test3 := 'str' }\n\
+             select default::Person { id, test := test };",
+        );
+        assert!(out.sql.contains("jsonb_build_object()"), "expected an empty free object, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_shaped_free_cte_reference_projects_fields() {
+        // `test := test { test2 }` must project just the named field out
+        // of the underlying free object — neither collapsing to empty nor
+        // returning every field.
+        let out = compile_and_emit(
+            "with\n  test := { test2 := 1.0, test3 := 'str' }\n\
+             select default::Person { id, test := test { test2 } };",
+        );
+        assert!(out.sql.contains("jsonb_build_object('test2'"), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("'test3'"), "test3 should not be projected, got:\n{}", out.sql);
     }
 
     #[test]
