@@ -870,23 +870,27 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
                 // `result` is a ROW() composite for top-level asyncpg decoding.
                 // `v` is the unwrapped scalar for use in CteRef expression context.
                 // Wrap in a subquery so volatile functions (nextval, etc.) are called once.
+                // Enum values also need a ::text cast inside the ROW() — same
+                // unregistered-OID problem as arrays/jsonb — but the bare `v`
+                // column stays natively typed for CteRef expression use.
                 let e = emit_expr(expr);
-                format!("SELECT ROW(v) AS result, v FROM (SELECT {e} AS v) AS _scalar")
+                let row_value = if enum_type_of_expr(expr).is_some() { "v::text" } else { "v" };
+                format!("SELECT ROW({row_value}) AS result, v FROM (SELECT {e} AS v) AS _scalar")
             }
         }
         IrFreeExpr::FreeObject(fields) => {
             if fields.len() == 1 {
-                format!("SELECT ROW({}) AS result", emit_expr(&fields[0].1))
+                format!("SELECT ROW({}) AS result", emit_free_field_expr(&fields[0].1))
             } else {
-                let exprs: Vec<String> = fields.iter().map(|(_, e)| emit_expr(e)).collect();
+                let exprs: Vec<String> = fields.iter().map(|(_, e)| emit_free_field_expr(e)).collect();
                 format!("SELECT ({}) AS result", exprs.join(", "))
             }
         }
         IrFreeExpr::Tuple(exprs) => {
             if exprs.len() == 1 {
-                format!("SELECT ROW({}) AS result", emit_expr(&exprs[0]))
+                format!("SELECT ROW({}) AS result", emit_free_field_expr(&exprs[0]))
             } else {
-                let parts: Vec<String> = exprs.iter().map(emit_expr).collect();
+                let parts: Vec<String> = exprs.iter().map(emit_free_field_expr).collect();
                 format!("SELECT ({}) AS result", parts.join(", "))
             }
         }
@@ -906,6 +910,44 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
     SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, inference_plan: None }
+}
+
+/// Determine whether `expr`'s runtime SQL type is a custom/enum type whose
+/// OID asyncpg can't decode inside an anonymous ROW()/tuple composite — and
+/// if so, the Postgres-schema-qualified enum type name for `ShapeNode::Enum`
+/// tagging (same convention `pg_quoted_to_pylon` expects). Covers both a
+/// column reference to an enum-typed property (quoted pg_type) and a bare
+/// enum literal (`default::Gender.Male`) — the two ways an enum value can
+/// appear as a free scalar/object/tuple field, which (unlike a schema
+/// object's `emit_scalar`) has no dedicated per-pointer descriptor to carry
+/// this, so it must be recovered from the expression itself.
+fn enum_type_of_expr(expr: &IrExpr) -> Option<String> {
+    match expr {
+        IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with('"') => Some(pg_quoted_to_pylon(pg_type)),
+        IrExpr::EnumLiteral { pg_type, .. } => Some(pg_quoted_to_pylon(pg_type)),
+        _ => None,
+    }
+}
+
+/// Emit `expr` for use as a free object/tuple field value — casts to
+/// `::text` when it's enum-typed (see `enum_type_of_expr`) so asyncpg's
+/// anonymous composite decoder doesn't choke on an unregistered type OID.
+fn emit_free_field_expr(expr: &IrExpr) -> String {
+    if enum_type_of_expr(expr).is_some() {
+        format!("{}::text", emit_expr(expr))
+    } else {
+        emit_expr(expr)
+    }
+}
+
+/// Shape node for one free scalar/object/tuple field — `Enum` when the
+/// value is enum-typed (see `enum_type_of_expr`), else a plain `Scalar`.
+fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
+    use crate::query::ShapeNode;
+    match enum_type_of_expr(expr) {
+        Some(enum_type) => ShapeNode::Enum { name: name.to_string(), position, enum_type },
+        None => ShapeNode::Scalar { name: name.to_string(), position },
+    }
 }
 
 fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
@@ -928,7 +970,7 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
             members: None,
         },
         IrFreeExpr::Scalar(e) if is_raw_scalar(e) => ShapeNode::RawScalar,
-        IrFreeExpr::Scalar(_) => ShapeNode::Scalar { name: String::new(), position: 0 },
+        IrFreeExpr::Scalar(e) => free_field_shape_node("", 0, e),
         IrFreeExpr::FreeObject(fields) => ShapeNode::Object {
             name: String::new(),
             type_name: None,
@@ -937,13 +979,15 @@ fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
             pointers: fields
                 .iter()
                 .enumerate()
-                .map(|(i, (name, _))| ShapeNode::Scalar { name: name.clone(), position: i })
+                .map(|(i, (name, e))| free_field_shape_node(name, i, e))
                 .collect(),
         },
         IrFreeExpr::Tuple(exprs) => ShapeNode::Tuple {
             position: 0,
-            elements: (0..exprs.len())
-                .map(|i| ShapeNode::Scalar { name: String::new(), position: i })
+            elements: exprs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| free_field_shape_node("", i, e))
                 .collect(),
         },
         IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar { name: String::new(), position: 0 },
@@ -2631,8 +2675,17 @@ fn emit_literal(lit: &IrLiteral) -> String {
         IrLiteral::Str(s) => sql_str(s),
         IrLiteral::Int(i) => i.to_string(),
         IrLiteral::Float(f) => {
+            // Explicit ::float8 cast — a bare untyped numeral like `1.0`
+            // defaults to Postgres `numeric`, but an un-cast PyQL float
+            // literal means `float64` (matches Gel/EdgeQL semantics; only
+            // an explicit `<decimal>`/`123n` literal should ever produce a
+            // real decimal). Without this, `numeric`'s different wire OID
+            // also broke decoding inside ROW() composites (see
+            // _pg_decode_numeric in pylon/client.py, still needed for
+            // genuine decimal casts).
             let s = f.to_string();
-            if s.contains('.') || s.contains('e') { s } else { format!("{}.0", s) }
+            let s = if s.contains('.') || s.contains('e') { s } else { format!("{}.0", s) };
+            format!("({}::float8)", s)
         }
         IrLiteral::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
     }
@@ -2850,6 +2903,61 @@ mod tests {
     }
 
     #[test]
+    fn test_free_select_object_with_enum_field_casts_to_text_and_tags_shape() {
+        // Regression: `select { gender := default::Gender.Male }` failed at
+        // runtime with "no decoder for composite type element ... " —
+        // asyncpg can't decode a custom enum OID inside an anonymous ROW()
+        // composite. free_item_shape/emit_free_select always treated every
+        // free-object field as a plain untyped Scalar, never casting an
+        // enum-valued field to ::text (unlike a schema object's emit_scalar,
+        // which already does this for a real enum-typed property column).
+        let mut schema = make_schema();
+        schema.enums.push(crate::schema::EnumDescriptor {
+            name: "Gender".into(),
+            module: "default".into(),
+            members: vec!["Male".into(), "Female".into()],
+        });
+        let out = compile_and_emit_with(
+            "select { gender := default::Gender.Male }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("::\"public\".\"Gender\"::text"),
+            "expected enum field cast to text inside ROW(), got:\n{}", out.sql
+        );
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root
+            else { panic!("expected Object shape") };
+        assert_eq!(pointers.len(), 1);
+        assert!(matches!(
+            &pointers[0],
+            crate::query::ShapeNode::Enum { name, position: 0, enum_type }
+                if name == "gender" && enum_type == "public::Gender"
+        ), "expected Enum-tagged shape, got: {:?}", pointers[0]);
+    }
+
+    #[test]
+    fn test_free_select_bare_enum_literal_casts_to_text_inside_row() {
+        // Same bug, bare scalar form: `select default::Gender.Male;` (no
+        // shape/object wrapper) also wraps the value in ROW() for top-level
+        // asyncpg decoding.
+        let mut schema = make_schema();
+        schema.enums.push(crate::schema::EnumDescriptor {
+            name: "Gender".into(),
+            module: "default".into(),
+            members: vec!["Male".into(), "Female".into()],
+        });
+        let out = compile_and_emit_with("select default::Gender.Male", &schema);
+        assert!(
+            out.sql.contains("ROW(v::text) AS result"),
+            "expected ROW(v::text), got:\n{}", out.sql
+        );
+        assert!(matches!(
+            &out.shape.root,
+            crate::query::ShapeNode::Enum { enum_type, .. } if enum_type == "public::Gender"
+        ), "expected Enum-tagged shape, got: {:?}", out.shape.root);
+    }
+
+    #[test]
     fn test_free_select_tuple() {
         let schema = make_schema();
         let ast = parse::parse("SELECT (1, 2)").unwrap();
@@ -2870,6 +2978,21 @@ mod tests {
         assert!(out.sql.contains("SELECT 'hello' AS v"));
         assert!(out.sql.contains("ROW(v) AS result"));
         assert!(matches!(out.shape.root, crate::query::ShapeNode::Scalar { .. }));
+    }
+
+    #[test]
+    fn test_float_literal_casts_to_float8() {
+        // Regression: an un-cast float literal like `1.0` is untyped in
+        // Postgres and defaults to `numeric`, not `float64` — silently
+        // changing PyQL's semantics (only an explicit `<decimal>`/`123n`
+        // literal should ever produce a real decimal) and breaking decode
+        // inside ROW() composites (numeric's wire format differs from
+        // float8's). An explicit ::float8 cast keeps it a real float.
+        let out = compile_and_emit("SELECT 1.0");
+        assert!(
+            out.sql.contains("(1.0::float8)"),
+            "expected explicit float8 cast, got:\n{}", out.sql
+        );
     }
 
     #[test]

@@ -858,26 +858,26 @@ impl<'a> Compiler<'a> {
     /// by the enum/named-tuple/structural-tuple cast cases in `compile_stmt`'s
     /// top-level `Expr::TypeCast` handling. For a structural tuple cast whose
     /// source is itself a tuple/named-tuple literal, applies each element's
-    /// own cast by position (see `try_compile_tuple_literal_cast_free`)
+    /// own cast by position (see `try_compile_tuple_literal_cast_ctx`)
     /// instead of jsonb-wrapping the raw uncast literal values.
     fn scalar_cast_free_select(&mut self, tc: &ast::TypeCast, pg_type: String, distinct: bool) -> Result<IrStmt, PyQLError> {
         let cast_expr = match &tc.ty {
             ast::TypeExpr::Tuple { elements } => {
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                match self.try_compile_tuple_literal_cast_free(elements, &tc.expr)? {
+                match self.try_compile_tuple_literal_cast_ctx(elements, &tc.expr, None)? {
                     // The literal-decompose path already applies each element's own
                     // cast — still wrap in TypeCast so `tuple_shape` reaches SQL
                     // emission for decode-time ShapeNode building (jsonb_build_*
                     // already produces jsonb, so the outer `::jsonb` is a no-op).
                     Some(ir) => IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })),
                     None => {
-                        let inner = self.compile_free_expr(&tc.expr)?;
+                        let inner = self.compile_expr_ctx(&tc.expr, None)?;
                         IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
                     }
                 }
             }
             _ => {
-                let inner = self.compile_free_expr(&tc.expr)?;
+                let inner = self.compile_expr_ctx(&tc.expr, None)?;
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
                 IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
             }
@@ -922,21 +922,22 @@ impl<'a> Compiler<'a> {
     }
 
     /// Cast one tuple-type element's source value to `target_ty` — recurses
-    /// via `try_compile_tuple_literal_cast_free` when both the element's own
+    /// via `try_compile_tuple_literal_cast_ctx` when both the element's own
     /// type and its source value are themselves a nested tuple/named-tuple
     /// literal, so nesting applies per-element casts all the way down;
     /// otherwise a plain scalar/enum/nominal-named-tuple cast.
-    fn compile_tuple_element_cast_free(
+    fn compile_tuple_element_cast_ctx(
         &mut self,
         target_ty: &ast::TypeExpr,
         value: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
         if let ast::TypeExpr::Tuple { elements } = target_ty {
-            if let Some(ir) = self.try_compile_tuple_literal_cast_free(elements, value)? {
+            if let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, value, ctx)? {
                 return Ok(ir);
             }
         }
-        let inner = self.compile_free_expr(value)?;
+        let inner = self.compile_expr_ctx(value, ctx)?;
         let pg_type = self.resolve_cast_pg_type(target_ty)?;
         Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape: None })))
     }
@@ -949,10 +950,11 @@ impl<'a> Compiler<'a> {
     /// tuple of matching arity (e.g. a `$param`) — the whole value already
     /// arrives pre-shaped in that case, so the caller's generic jsonb-cast
     /// path handles it instead.
-    fn try_compile_tuple_literal_cast_free(
+    fn try_compile_tuple_literal_cast_ctx(
         &mut self,
         target_elements: &[ast::TupleTypeElement],
         source: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<Option<IrExpr>, PyQLError> {
         let source_values: Vec<&Expr> = match source {
             Expr::Tuple(vals) if vals.len() == target_elements.len() => vals.iter().collect(),
@@ -964,60 +966,7 @@ impl<'a> Compiler<'a> {
         let named = target_elements.iter().all(|e| e.name.is_some());
         let mut casted = Vec::with_capacity(target_elements.len());
         for (elem, value) in target_elements.iter().zip(source_values) {
-            casted.push(self.compile_tuple_element_cast_free(&elem.ty, value)?);
-        }
-        if named {
-            let fields = target_elements
-                .iter()
-                .zip(casted)
-                .map(|(e, v)| (e.name.clone().unwrap(), v))
-                .collect();
-            Ok(Some(IrExpr::NamedTuple(fields)))
-        } else {
-            Ok(Some(IrExpr::Tuple(casted)))
-        }
-    }
-
-    /// Schema-bound counterpart of `compile_tuple_element_cast_free` — see
-    /// its docs. Needed alongside it because `compile_expr`'s recursive calls
-    /// thread `td`/`alias` that `compile_free_expr` doesn't have.
-    fn compile_tuple_element_cast(
-        &mut self,
-        target_ty: &ast::TypeExpr,
-        value: &Expr,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<IrExpr, PyQLError> {
-        if let ast::TypeExpr::Tuple { elements } = target_ty {
-            if let Some(ir) = self.try_compile_tuple_literal_cast(elements, value, td, alias)? {
-                return Ok(ir);
-            }
-        }
-        let inner = self.compile_expr(value, td, alias)?;
-        let pg_type = self.resolve_cast_pg_type(target_ty)?;
-        Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape: None })))
-    }
-
-    /// Schema-bound counterpart of `try_compile_tuple_literal_cast_free` —
-    /// see its docs.
-    fn try_compile_tuple_literal_cast(
-        &mut self,
-        target_elements: &[ast::TupleTypeElement],
-        source: &Expr,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<Option<IrExpr>, PyQLError> {
-        let source_values: Vec<&Expr> = match source {
-            Expr::Tuple(vals) if vals.len() == target_elements.len() => vals.iter().collect(),
-            Expr::NamedTuple(fields) if fields.len() == target_elements.len() => {
-                fields.iter().map(|(_, v)| v).collect()
-            }
-            _ => return Ok(None),
-        };
-        let named = target_elements.iter().all(|e| e.name.is_some());
-        let mut casted = Vec::with_capacity(target_elements.len());
-        for (elem, value) in target_elements.iter().zip(source_values) {
-            casted.push(self.compile_tuple_element_cast(&elem.ty, value, td, alias)?);
+            casted.push(self.compile_tuple_element_cast_ctx(&elem.ty, value, ctx)?);
         }
         if named {
             let fields = target_elements
@@ -1035,39 +984,23 @@ impl<'a> Compiler<'a> {
     /// type's own cast to each element by position — e.g.
     /// `<array<int64>>['1', '3']` must coerce each string element to int64,
     /// not just emit a raw untyped `ARRAY[...]`. Reuses
-    /// `compile_tuple_element_cast_free` for the per-element cast since
+    /// `compile_tuple_element_cast_ctx` for the per-element cast since
     /// casting "this value to this target type" is exactly the same
     /// operation regardless of whether the target is a tuple element or an
     /// array element (including decomposing a nested tuple-literal element).
     /// Returns `None` when the source isn't a literal array (e.g. a
     /// `$param` or a sub-select) — the caller's generic cast path handles
     /// those instead.
-    fn try_compile_array_literal_cast_free(
+    fn try_compile_array_literal_cast_ctx(
         &mut self,
         element_ty: &ast::TypeExpr,
         source: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<Option<IrExpr>, PyQLError> {
         let Expr::Array(elems) = source else { return Ok(None) };
         let casted = elems
             .iter()
-            .map(|e| self.compile_tuple_element_cast_free(element_ty, e))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(IrExpr::Array(casted)))
-    }
-
-    /// Schema-bound counterpart of `try_compile_array_literal_cast_free` —
-    /// see its docs.
-    fn try_compile_array_literal_cast(
-        &mut self,
-        element_ty: &ast::TypeExpr,
-        source: &Expr,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<Option<IrExpr>, PyQLError> {
-        let Expr::Array(elems) = source else { return Ok(None) };
-        let casted = elems
-            .iter()
-            .map(|e| self.compile_tuple_element_cast(element_ty, e, td, alias))
+            .map(|e| self.compile_tuple_element_cast_ctx(element_ty, e, ctx))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(IrExpr::Array(casted)))
     }
@@ -1932,12 +1865,17 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// `exists` in schema-bound expression context (FILTER, computed pointer, etc.).
-    fn compile_exists_operand(
+    /// `exists` in either schema-bound (FILTER, computed pointer, etc. —
+    /// `ctx = Some((td, alias))`) or free (`ctx = None`) expression context.
+    /// The `Path`-based arms (backlink / prop / link / multilink existence)
+    /// only apply schema-bound — guarded on `ctx.is_some()` — since none of
+    /// those concepts exist without a schema type in scope; everything else
+    /// (`Parameter`, `TypeCast`, `SubQuery`, and the scalar-expression
+    /// fallback) is identical either way and just threads `ctx` through.
+    fn compile_exists_ctx(
         &mut self,
         operand: &Expr,
-        td: &TypeDescriptor,
-        alias: &str,
+        ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
         match operand {
             // exists $param  /  exists <type>$param → $N IS NOT NULL
@@ -1947,21 +1885,26 @@ impl<'a> Compiler<'a> {
             }
             // exists <type>expr → expr IS NOT NULL (cast result is always a scalar)
             Expr::TypeCast(_) => {
-                let inner = self.compile_expr(operand, td, alias)?;
+                let inner = self.compile_expr_ctx(operand, ctx)?;
                 Ok(ir_is_not_null(inner))
             }
 
             // exists .<link[is Type] → EXISTS(SELECT 1 FROM type WHERE type.link_id = alias.id)
-            Expr::Path(p) if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) => {
+            Expr::Path(p) if ctx.is_some()
+                && p.partial
+                && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) =>
+            {
+                let (td, alias) = ctx.unwrap();
                 let current_qname = format!("{}::{}", td.module, td.name);
                 let exists = self.compile_backlink_as_exists(&p.steps, None, &current_qname, alias)?;
-                return Ok(exists);
+                Ok(exists)
             }
 
             // exists .prop → alias.col IS NOT NULL
             // exists .link → alias.link_id IS NOT NULL
             // exists .multilink → EXISTS(SELECT 1 FROM junction WHERE src = alias.id)
-            Expr::Path(p) if p.partial && p.steps.len() == 1 => {
+            Expr::Path(p) if ctx.is_some() && p.partial && p.steps.len() == 1 => {
+                let (td, alias) = ctx.unwrap();
                 let pointer_name = match &p.steps[0] {
                     ast::PathStep::Name(n) => n.as_str(),
                     _ => return Err(self.type_err("exists: invalid path step")),
@@ -1991,32 +1934,13 @@ impl<'a> Compiler<'a> {
                 self.compile_subquery_exists(stmt)
             }
 
-            // Fallback: any scalar expression → expr IS NOT NULL
+            // Fallback: any scalar expression → expr IS NOT NULL. When `ctx`
+            // is `None` and `operand` is a partial `Path` not caught above
+            // (guards failed since ctx.is_some() was false), this recurses
+            // into the free-context Path handling, which itself produces the
+            // "not valid in free SELECT" error — same as before the merge.
             other => {
-                let inner = self.compile_expr(other, td, alias)?;
-                Ok(ir_is_not_null(inner))
-            }
-        }
-    }
-
-    /// `exists` in free (no schema context) expressions — params and subqueries only.
-    fn compile_exists_free(&mut self, operand: &Expr) -> Result<IrExpr, PyQLError> {
-        match operand {
-            Expr::Parameter(name) => {
-                let idx = self.param_index(name);
-                Ok(ir_is_not_null(IrExpr::Param { index: idx }))
-            }
-            // exists <type>expr → expr IS NOT NULL (cast result is always scalar)
-            Expr::TypeCast(_) => {
-                let inner = self.compile_free_expr(operand)?;
-                Ok(ir_is_not_null(inner))
-            }
-            Expr::SubQuery(stmt) => {
-                self.compile_subquery_exists(stmt)
-            }
-            // Fallback: any scalar literal or expression → expr IS NOT NULL
-            other => {
-                let inner = self.compile_free_expr(other)?;
+                let inner = self.compile_expr_ctx(other, ctx)?;
                 Ok(ir_is_not_null(inner))
             }
         }
@@ -2351,354 +2275,6 @@ impl<'a> Compiler<'a> {
             .transpose()?;
 
         Ok(IrFreeSelect { items, order_by, offset, limit, distinct })
-    }
-
-    /// Compile an expression that has no schema type context (no .name references).
-    fn compile_free_expr(&mut self, expr: &Expr) -> Result<IrExpr, PyQLError> {
-        match expr {
-            Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
-                Literal::Str(s) => IrLiteral::Str(s.clone()),
-                Literal::Int(n) => IrLiteral::Int(*n),
-                Literal::Float(f) => IrLiteral::Float(*f),
-                Literal::Bool(b) => IrLiteral::Bool(*b),
-            })),
-
-            Expr::Parameter(name) => {
-                let index = self.param_index(name);
-                Ok(IrExpr::Param { index })
-            }
-
-            Expr::Global(name) => self.compile_global(name),
-
-            Expr::Index { expr: e, index: i } => {
-                let ir_expr = self.compile_free_expr(e)?;
-                let ir_index = self.compile_free_expr(i)?;
-                let is_array = is_array_expr(&ir_expr);
-                Ok(IrExpr::Subscript { expr: Box::new(ir_expr), index: Box::new(ir_index), is_array })
-            }
-
-            Expr::Slice { expr: e, lower: lo, upper: hi } => {
-                let ir_expr = self.compile_free_expr(e)?;
-                let is_array = is_array_expr(&ir_expr);
-                let ir_lower = lo.as_ref().map(|x| self.compile_free_expr(x)).transpose()?;
-                let ir_upper = hi.as_ref().map(|x| self.compile_free_expr(x)).transpose()?;
-                Ok(IrExpr::Slice {
-                    expr: Box::new(ir_expr),
-                    lower: ir_lower.map(Box::new),
-                    upper: ir_upper.map(Box::new),
-                    is_array,
-                })
-            }
-
-            Expr::FunctionCall(f) => {
-                // sequence_next / sequence_reset: type-ref arg → nextval/setval SQL
-                if (f.module.is_none() || f.module.as_deref() == Some("std"))
-                    && (f.name == "sequence_next" || f.name == "sequence_reset")
-                {
-                    return self.compile_sequence_fn(f);
-                }
-
-                // assert_single with SubQuery arg → _pylon.assert_single(ARRAY(subquery))
-                if (f.module.is_none() || f.module.as_deref() == Some("std"))
-                    && f.name == "assert_single"
-                    && f.args.len() >= 1
-                {
-                    if let Expr::SubQuery(inner_stmt) = &f.args[0] {
-                        let inner = self.compile_subquery_to_array_source(inner_stmt)?;
-                        return Ok(IrExpr::FunctionCall(IrFunctionCall {
-                            schema: Some("_pylon".to_string()),
-                            name: "assert_single".to_string(),
-                            args: vec![IrExpr::ArrayFromSelect(Box::new(inner))],
-                            sql_template: None,
-                        }));
-                    }
-                }
-                // count(TypeName) or count((select TypeName ...))
-                // Aggregate function with a single schema-type ref or subquery arg → AggOverQuery.
-                if f.args.len() == 1 {
-                    let arg = &f.args[0];
-                    let inner_sel: Option<ast::SelectStmt> = match arg {
-                        Expr::Path(p) if !p.partial => {
-                            // Resolve as a schema type if it matches a known type (not enum).
-                            let qname = p.steps.iter().filter_map(|s| {
-                                if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None }
-                            }).collect::<Vec<_>>().join("::");
-                            let is_schema_type = self.schema.types.iter().any(|t| {
-                                format!("{}::{}", t.module, t.name) == qname || t.name == qname
-                            });
-                            if is_schema_type {
-                                Some(ast::SelectStmt {
-                                    result: arg.clone(),
-                                    filter: None,
-                                    order_by: vec![],
-                                    offset: None,
-                                    limit: None,
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        Expr::SubQuery(stmt) => {
-                            if let ast::Stmt::Select(inner) = stmt.as_ref() {
-                                Some(inner.clone())
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some(sel) = inner_sel {
-                        use crate::stdlib::{lookup, ImplStrategy};
-                        let ns = f.module.as_deref().unwrap_or("std");
-                        let overloads = lookup(ns, &f.name);
-                        let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
-                        if let Some(d) = best {
-                            if let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy {
-                                let fn_name = sql_name.to_string();
-                                let inner_ir = self.compile_select(&sel, false)?;
-                                return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner_ir) });
-                            }
-                        }
-                    }
-                }
-
-                // If any argument is a set literal, this must be an aggregate.
-                // Compile as AggOverSet rather than a regular function call.
-                let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
-                if let Some(idx) = set_arg_idx {
-                    if let Expr::Set(set_elems) = &f.args[idx] {
-                        use crate::stdlib::{lookup, ImplStrategy};
-                        let ns = f.module.as_deref().unwrap_or("std");
-                        let overloads = lookup(ns, &f.name);
-                        let best = overloads
-                            .iter()
-                            .find(|d| d.params.len() == f.args.len())
-                            .or_else(|| overloads.first());
-                        let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
-                            Some(ImplStrategy::SqlBuiltin(sql_name)) =>
-                                (None, sql_name.to_string()),
-                            Some(_) => return Err(self.type_err(&format!(
-                                "function '{}::{}' cannot be called with a set literal in this context",
-                                ns, f.name
-                            ))),
-                            None => return Err(self.type_err(&format!(
-                                "function '{}::{}' does not exist", ns, f.name
-                            ))),
-                        };
-                        let elems = set_elems
-                            .iter()
-                            .map(|e| self.compile_free_expr(e))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
-                    }
-                }
-                let args = f
-                    .args
-                    .iter()
-                    .map(|a| self.compile_free_expr(a))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.resolve_fn_call(f.module.as_deref(), &f.name, args)
-            }
-
-            Expr::TypeCast(tc) => {
-                // `<AnyType>{}` — an empty set cast to any type, e.g. clearing
-                // an optional link (`<Company>{}`) — is always just NULL,
-                // regardless of what pg_type the cast target would otherwise
-                // resolve to (a schema object type name isn't a scalar cast
-                // target at all, so resolve_cast_pg_type couldn't handle it
-                // below anyway). Generalizes the same bare-`{}`-in-assignment-
-                // position special case in compile_assignments_inner to any
-                // expression context, matching real EdgeQL semantics.
-                if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
-                    return Ok(IrExpr::Null);
-                }
-                if let ast::TypeExpr::Tuple { elements } = &tc.ty {
-                    if let Some(ir) = self.try_compile_tuple_literal_cast_free(elements, &tc.expr)? {
-                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                        let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
-                    }
-                }
-                if let ast::TypeExpr::Array { element } = &tc.ty {
-                    if let Some(ir) = self.try_compile_array_literal_cast_free(element, &tc.expr)? {
-                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape: None })));
-                    }
-                }
-                let inner = self.compile_free_expr(&tc.expr)?;
-                let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
-            }
-
-            Expr::BinOp(b) => {
-                let left = self.compile_free_expr(&b.left)?;
-                let right = self.compile_free_expr(&b.right)?;
-                if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
-                    if !types_compatible(lt, rt) {
-                        return Err(PyQLError::Type(PyQLTypeError {
-                            message: format!(
-                                "operator '{op}' cannot be applied to operands of type \
-                                 '{lq}' and '{rq}'",
-                                op = b.op,
-                                lq = pg_type_to_pyql(lt),
-                                rq = pg_type_to_pyql(rt),
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        }));
-                    }
-                }
-                Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
-            }
-
-            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => {
-                self.compile_exists_free(&u.operand)
-            }
-
-            Expr::UnaryOp(u) => {
-                let operand = self.compile_free_expr(&u.operand)?;
-                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: u.op.clone(), operand })))
-            }
-
-            Expr::IfElse(ie) => {
-                let condition = self.compile_free_expr(&ie.condition)?;
-                let if_ = self.compile_free_expr(&ie.if_expr)?;
-                let else_ = self.compile_free_expr(&ie.else_expr)?;
-                Ok(IrExpr::IfElse(Box::new(IrIfElse { condition, if_, else_ })))
-            }
-
-            Expr::Array(elems) => {
-                let items = elems
-                    .iter()
-                    .map(|e| self.compile_free_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::Array(items))
-            }
-
-            Expr::NamedTuple(fields) => {
-                let ir = fields
-                    .iter()
-                    .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
-                    .collect::<Result<Vec<_>, PyQLError>>()?;
-                Ok(IrExpr::NamedTuple(ir))
-            }
-
-            Expr::Tuple(elems) => {
-                let ir = elems
-                    .iter()
-                    .map(|e| self.compile_free_expr(e))
-                    .collect::<Result<Vec<_>, PyQLError>>()?;
-                Ok(IrExpr::Tuple(ir))
-            }
-
-            Expr::FieldAccess { expr: inner, field } => {
-                if let Expr::NamedTuple(fields) = inner.as_ref() {
-                    let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
-                        self.type_err(&format!(
-                            "{field} is not a member of {}",
-                            named_tuple_type_str(fields)
-                        ))
-                    })?;
-                    return self.compile_free_expr(val);
-                }
-                let ir = self.compile_free_expr(inner)?;
-                Ok(IrExpr::JsonbField { expr: Box::new(ir), field: field.clone() })
-            }
-
-            Expr::TupleIndex { expr: inner, index } => {
-                match inner.as_ref() {
-                    Expr::Tuple(elems) => {
-                        let elem = elems.get(*index).ok_or_else(|| {
-                            self.type_err(&format!(
-                                "{index} is not a member of {}",
-                                positional_tuple_type_str(elems)
-                            ))
-                        })?;
-                        self.compile_free_expr(elem)
-                    }
-                    Expr::NamedTuple(fields) => {
-                        let (_, val) = fields.get(*index).ok_or_else(|| {
-                            self.type_err(&format!(
-                                "{index} is not a member of {}",
-                                named_tuple_type_str(fields)
-                            ))
-                        })?;
-                        self.compile_free_expr(val)
-                    }
-                    // Not a literal to constant-fold — emit a generic runtime
-                    // jsonb positional access (`$param.1`, `(<tuple<...>>expr).1`, …).
-                    // When the source is a cast to a statically-known tuple type,
-                    // bounds-check the index against its arity at compile time
-                    // (matches Gel: `2 is not a member of tuple<std::int64, std::str>`).
-                    _ => {
-                        if let Expr::TypeCast(tc) = inner.as_ref() {
-                            if let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty) {
-                                if *index >= shape.members.len() {
-                                    return Err(self.type_err(&format!(
-                                        "{index} is not a member of {}",
-                                        self.type_expr_to_display_str(&tc.ty)
-                                    )));
-                                }
-                            }
-                        }
-                        let ir = self.compile_free_expr(inner)?;
-                        Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
-                    }
-                }
-            }
-
-            Expr::Path(p) if p.partial => Err(self.type_err(
-                "property reference (.name) is not valid in free SELECT; \
-                 use a schema-bound SELECT instead",
-            )),
-
-            // Enum member access in free context: `default::Gender.Female`
-            Expr::Path(p) if !p.partial && p.steps.len() == 2 => {
-                if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
-                    if self.resolve_enum(type_ref).is_some() {
-                        return self.compile_enum_access(type_ref, variant);
-                    }
-                }
-                Err(self.type_err("expression is not valid in free SELECT context"))
-            }
-
-            // CTE name, for-loop variable, or function parameter used as a value in free context
-            Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if self.for_vars.contains_key(n.as_str()) {
-                        return Ok(IrExpr::ForVar { name: n.clone() });
-                    }
-                    if let Some(t) = self.cte_types.get(n.as_str()) {
-                        let scalar = !t.contains("::");
-                        return Ok(IrExpr::CteRef { name: n.clone(), scalar });
-                    }
-                    if let Some(pg_type) = self.fn_params.get(n.as_str()) {
-                        return Ok(IrExpr::FnParam { name: n.clone(), pg_type: pg_type.clone() });
-                    }
-                }
-                Err(self.type_err("expression is not valid in free SELECT context"))
-            }
-
-            Expr::Set(elems) if elems.is_empty() => Ok(IrExpr::Null),
-
-            Expr::Set(elems) => {
-                let compiled: Result<Vec<_>, _> =
-                    elems.iter().map(|e| self.compile_free_expr(e)).collect();
-                let mut compiled = compiled?;
-                if compiled.len() == 1 {
-                    Ok(compiled.remove(0))
-                } else {
-                    Err(self.type_err(
-                        "multi-element set literal is not supported in free SELECT context",
-                    ))
-                }
-            }
-
-            // detached has no effect in already-free context
-            Expr::Detached(inner) => self.compile_free_expr(inner),
-
-            _ => Err(self.type_err("expression is not valid in free SELECT context")),
-        }
     }
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
@@ -4135,14 +3711,38 @@ impl<'a> Compiler<'a> {
 
     // ── Expression compilation ────────────────────────────────────────────────────
 
-    fn compile_expr(
+    /// Single expression compiler for both free and schema-bound contexts.
+    /// `ctx = Some((td, alias))` when a schema type + SQL alias are in scope
+    /// (enables `.property`/`.link` resolution via `compile_path`); `ctx =
+    /// None` for free expressions (set literals, tuples, free objects,
+    /// scalar function calls not touching a table), via `compile_free_path`
+    /// for the `Path` variant. Most arms are identical either way and just
+    /// thread `ctx` through recursive calls; the handful that genuinely
+    /// diverge (`Path`, `BinOp`, `FunctionCall`, `Set`, `Detached`, `TypeIs`)
+    /// branch internally on `ctx` — see each arm's own comment.
+    fn compile_expr_ctx(
         &mut self,
         expr: &Expr,
-        td: &TypeDescriptor,
-        alias: &str,
+        ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
         match expr {
-            Expr::Path(p) => self.compile_path(p, td, alias),
+            // The main free/schema divergence — kept genuinely two-branched
+            // (`compile_path` needs a schema type + alias throughout:
+            // __type__, absolute-path rewrite, 2-step link/property
+            // traversal, computed-pointer recursion; `compile_free_path`
+            // only ever resolves for-vars/CTEs/fn-params/enum members).
+            // Both share the bare-name lookup via `resolve_name_ref`.
+            Expr::Path(p) => match ctx {
+                Some((td, alias)) => self.compile_path(p, td, alias),
+                None => self.compile_free_path(p),
+            },
+
+            Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
+                Literal::Str(s) => IrLiteral::Str(s.clone()),
+                Literal::Int(n) => IrLiteral::Int(*n),
+                Literal::Float(f) => IrLiteral::Float(*f),
+                Literal::Bool(b) => IrLiteral::Bool(*b),
+            })),
 
             Expr::Parameter(name) => {
                 let index = self.param_index(name);
@@ -4152,17 +3752,17 @@ impl<'a> Compiler<'a> {
             Expr::Global(name) => self.compile_global(name),
 
             Expr::Index { expr: e, index: i } => {
-                let ir_expr = self.compile_expr(e, td, alias)?;
-                let ir_index = self.compile_expr(i, td, alias)?;
+                let ir_expr = self.compile_expr_ctx(e, ctx)?;
+                let ir_index = self.compile_expr_ctx(i, ctx)?;
                 let is_array = is_array_expr(&ir_expr);
                 Ok(IrExpr::Subscript { expr: Box::new(ir_expr), index: Box::new(ir_index), is_array })
             }
 
             Expr::Slice { expr: e, lower: lo, upper: hi } => {
-                let ir_expr = self.compile_expr(e, td, alias)?;
+                let ir_expr = self.compile_expr_ctx(e, ctx)?;
                 let is_array = is_array_expr(&ir_expr);
-                let ir_lower = lo.as_ref().map(|x| self.compile_expr(x, td, alias)).transpose()?;
-                let ir_upper = hi.as_ref().map(|x| self.compile_expr(x, td, alias)).transpose()?;
+                let ir_lower = lo.as_ref().map(|x| self.compile_expr_ctx(x, ctx)).transpose()?;
+                let ir_upper = hi.as_ref().map(|x| self.compile_expr_ctx(x, ctx)).transpose()?;
                 Ok(IrExpr::Slice {
                     expr: Box::new(ir_expr),
                     lower: ir_lower.map(Box::new),
@@ -4171,22 +3771,48 @@ impl<'a> Compiler<'a> {
                 })
             }
 
-            Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
-                Literal::Str(s) => IrLiteral::Str(s.clone()),
-                Literal::Int(n) => IrLiteral::Int(*n),
-                Literal::Float(f) => IrLiteral::Float(*f),
-                Literal::Bool(b) => IrLiteral::Bool(*b),
-            })),
+            Expr::TypeCast(tc) => {
+                // `<AnyType>{}` — an empty set cast to any type, e.g. clearing
+                // an optional link (`<Company>{}`) — is always just NULL,
+                // regardless of what pg_type the cast target would otherwise
+                // resolve to (a schema object type name isn't a scalar cast
+                // target at all, so resolve_cast_pg_type couldn't handle it
+                // below anyway). Generalizes the same bare-`{}`-in-assignment-
+                // position special case in compile_assignments_inner to any
+                // expression context, matching real EdgeQL semantics.
+                if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
+                    return Ok(IrExpr::Null);
+                }
+                if let ast::TypeExpr::Tuple { elements } = &tc.ty {
+                    if let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, &tc.expr, ctx)? {
+                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                        let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
+                    }
+                }
+                if let ast::TypeExpr::Array { element } = &tc.ty {
+                    if let Some(ir) = self.try_compile_array_literal_cast_ctx(element, &tc.expr, ctx)? {
+                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape: None })));
+                    }
+                }
+                let inner = self.compile_expr_ctx(&tc.expr, ctx)?;
+                let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
+            }
 
             Expr::BinOp(b) => {
-                if let Some(exists) = self.try_backlink_exists(b, td, alias)? {
-                    return Ok(exists);
+                if let Some((td, alias)) = ctx {
+                    if let Some(exists) = self.try_backlink_exists(b, td, alias)? {
+                        return Ok(exists);
+                    }
+                    if let Some(exists) = self.try_multilink_exists(b, td, alias)? {
+                        return Ok(exists);
+                    }
                 }
-                if let Some(exists) = self.try_multilink_exists(b, td, alias)? {
-                    return Ok(exists);
-                }
-                let left = self.compile_expr(&b.left, td, alias)?;
-                let right = self.compile_expr(&b.right, td, alias)?;
+                let left = self.compile_expr_ctx(&b.left, ctx)?;
+                let right = self.compile_expr_ctx(&b.right, ctx)?;
                 if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
                     if !types_compatible(lt, rt) {
                         return Err(PyQLError::Type(PyQLTypeError {
@@ -4204,27 +3830,35 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
             }
 
-            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => {
-                self.compile_exists_operand(&u.operand, td, alias)
-            }
-
-            Expr::UnaryOp(u) => {
-                let operand = self.compile_expr(&u.operand, td, alias)?;
-                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: u.op.clone(), operand })))
-            }
-
             Expr::FunctionCall(f) => {
-                // assert_single/exists/distinct with SubQuery arg
+                // sequence_next / sequence_reset: type-ref arg → nextval/setval SQL
+                // (free-only: schema-bound context never special-cased this).
+                if ctx.is_none()
+                    && (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && (f.name == "sequence_next" || f.name == "sequence_reset")
+                {
+                    return self.compile_sequence_fn(f);
+                }
+
+                // assert_single(subquery) [free-only] / assert_single|assert_exists|
+                // assert_distinct(subquery) [schema-bound] → _pylon.<fn>(ARRAY(subquery)).
+                // Preserves the existing asymmetry: free context only ever recognized
+                // "assert_single" here, not the other two.
+                let assert_names: &[&str] = if ctx.is_some() {
+                    &["assert_single", "assert_exists", "assert_distinct"]
+                } else {
+                    &["assert_single"]
+                };
                 if (f.module.is_none() || f.module.as_deref() == Some("std"))
-                    && matches!(f.name.as_str(), "assert_single" | "assert_exists" | "assert_distinct")
-                    && f.args.len() >= 1
+                    && assert_names.contains(&f.name.as_str())
+                    && !f.args.is_empty()
                 {
                     if let Expr::SubQuery(inner_stmt) = &f.args[0] {
                         let inner = self.compile_subquery_to_array_source(inner_stmt)?;
                         let fn_pg = match f.name.as_str() {
                             "assert_single" => "assert_single",
-                            "assert_exists"  => "assert_exists",
-                            _               => "assert_distinct",
+                            "assert_exists" => "assert_exists",
+                            _ => "assert_distinct",
                         };
                         return Ok(IrExpr::FunctionCall(IrFunctionCall {
                             schema: Some("_pylon".to_string()),
@@ -4234,95 +3868,171 @@ impl<'a> Compiler<'a> {
                         }));
                     }
                 }
-                // contains(.multilink.scalar, value) → EXISTS (set-membership semantics)
-                if (f.module.is_none() || f.module.as_deref() == Some("std"))
-                    && f.name == "contains"
-                    && f.args.len() == 2
-                {
-                    if let Expr::Path(p) = &f.args[0] {
-                        if p.partial && p.steps.len() >= 2 {
-                            if let ast::PathStep::Name(ln) = &p.steps[0] {
-                                if Self::resolve_multilink(td, ln).is_some() {
-                                    let synthetic = ast::BinOp {
-                                        left: f.args[0].clone(),
-                                        op: ast::BinOpKind::Eq,
-                                        right: f.args[1].clone(),
-                                    };
-                                    if let Some(exists) =
-                                        self.try_multilink_exists(&synthetic, td, alias)?
-                                    {
-                                        return Ok(exists);
+
+                // contains(.multilink.scalar, value) → EXISTS (set-membership
+                // semantics; schema-bound only, needs td/alias to resolve the
+                // multilink).
+                if let Some((td, alias)) = ctx {
+                    if (f.module.is_none() || f.module.as_deref() == Some("std"))
+                        && f.name == "contains"
+                        && f.args.len() == 2
+                    {
+                        if let Expr::Path(p) = &f.args[0] {
+                            if p.partial && p.steps.len() >= 2 {
+                                if let ast::PathStep::Name(ln) = &p.steps[0] {
+                                    if Self::resolve_multilink(td, ln).is_some() {
+                                        let synthetic = ast::BinOp {
+                                            left: f.args[0].clone(),
+                                            op: ast::BinOpKind::Eq,
+                                            right: f.args[1].clone(),
+                                        };
+                                        if let Some(exists) =
+                                            self.try_multilink_exists(&synthetic, td, alias)?
+                                        {
+                                            return Ok(exists);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-                // count(.multilink) / other single-arg aggregates over a multilink —
-                // correlate via the junction/FK table (AggOverQuery) rather than
-                // treating `.multilink` as an ordinary scalar path (which it isn't).
+
+                // Single-arg aggregate over a schema-shaped source →
+                // AggOverQuery. Schema-bound: count(.multilink) correlates via
+                // the junction/FK table (`.multilink` isn't an ordinary scalar
+                // path). Free: count(TypeName) / count((select TypeName ...))
+                // resolves the arg as a schema type reference or subquery.
                 if f.args.len() == 1 {
-                    if let Expr::Path(p) = &f.args[0] {
-                        if p.partial && p.steps.len() == 1 {
-                            if let ast::PathStep::Name(ml_name) = &p.steps[0] {
-                                if Self::resolve_multilink(td, ml_name).is_some() {
-                                    use crate::stdlib::{lookup, ImplStrategy};
-                                    let ns = f.module.as_deref().unwrap_or("std");
-                                    let overloads = lookup(ns, &f.name);
-                                    let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
-                                    if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy) {
-                                        let fn_name = sql_name.to_string();
-                                        let inner = self.multilink_correlation_select(ml_name, td, alias)?;
-                                        return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner) });
+                    let arg = &f.args[0];
+                    if let Some((td, alias)) = ctx {
+                        if let Expr::Path(p) = arg {
+                            if p.partial && p.steps.len() == 1 {
+                                if let ast::PathStep::Name(ml_name) = &p.steps[0] {
+                                    if Self::resolve_multilink(td, ml_name).is_some() {
+                                        use crate::stdlib::{lookup, ImplStrategy};
+                                        let ns = f.module.as_deref().unwrap_or("std");
+                                        let overloads = lookup(ns, &f.name);
+                                        let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
+                                        if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy) {
+                                            let fn_name = sql_name.to_string();
+                                            let inner = self.multilink_correlation_select(ml_name, td, alias)?;
+                                            return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner) });
+                                        }
                                     }
+                                }
+                            }
+                        }
+                    } else {
+                        let inner_sel: Option<ast::SelectStmt> = match arg {
+                            Expr::Path(p) if !p.partial => {
+                                // Resolve as a schema type if it matches a known type (not enum).
+                                let qname = p.steps.iter().filter_map(|s| {
+                                    if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None }
+                                }).collect::<Vec<_>>().join("::");
+                                let is_schema_type = self.schema.types.iter().any(|t| {
+                                    format!("{}::{}", t.module, t.name) == qname || t.name == qname
+                                });
+                                if is_schema_type {
+                                    Some(ast::SelectStmt {
+                                        result: arg.clone(),
+                                        filter: None,
+                                        order_by: vec![],
+                                        offset: None,
+                                        limit: None,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            Expr::SubQuery(stmt) => {
+                                if let ast::Stmt::Select(inner) = stmt.as_ref() {
+                                    Some(inner.clone())
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(sel) = inner_sel {
+                            use crate::stdlib::{lookup, ImplStrategy};
+                            let ns = f.module.as_deref().unwrap_or("std");
+                            let overloads = lookup(ns, &f.name);
+                            let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
+                            if let Some(d) = best {
+                                if let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy {
+                                    let fn_name = sql_name.to_string();
+                                    let inner_ir = self.compile_select(&sel, false)?;
+                                    return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner_ir) });
                                 }
                             }
                         }
                     }
                 }
+
+                // Set-literal argument → AggOverSet (free-only; a schema-bound
+                // Set argument would already hard-error via the Set/Shape arm
+                // when compiled below, matching today's behavior — this
+                // special case never existed on the schema side).
+                if ctx.is_none() {
+                    let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
+                    if let Some(idx) = set_arg_idx {
+                        if let Expr::Set(set_elems) = &f.args[idx] {
+                            use crate::stdlib::{lookup, ImplStrategy};
+                            let ns = f.module.as_deref().unwrap_or("std");
+                            let overloads = lookup(ns, &f.name);
+                            let best = overloads
+                                .iter()
+                                .find(|d| d.params.len() == f.args.len())
+                                .or_else(|| overloads.first());
+                            let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
+                                Some(ImplStrategy::SqlBuiltin(sql_name)) =>
+                                    (None, sql_name.to_string()),
+                                Some(_) => return Err(self.type_err(&format!(
+                                    "function '{}::{}' cannot be called with a set literal in this context",
+                                    ns, f.name
+                                ))),
+                                None => return Err(self.type_err(&format!(
+                                    "function '{}::{}' does not exist", ns, f.name
+                                ))),
+                            };
+                            let elems = set_elems
+                                .iter()
+                                .map(|e| self.compile_expr_ctx(e, ctx))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
+                        }
+                    }
+                }
+
                 let args = f
                     .args
                     .iter()
-                    .map(|a| self.compile_expr(a, td, alias))
+                    .map(|a| self.compile_expr_ctx(a, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.resolve_fn_call(f.module.as_deref(), &f.name, args)
             }
 
-            Expr::TypeCast(tc) => {
-                // See the identical check in compile_free_expr's TypeCast
-                // handling — `<AnyType>{}` is always just NULL.
-                if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
-                    return Ok(IrExpr::Null);
-                }
-                if let ast::TypeExpr::Tuple { elements } = &tc.ty {
-                    if let Some(ir) = self.try_compile_tuple_literal_cast(elements, &tc.expr, td, alias)? {
-                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                        let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
-                    }
-                }
-                if let ast::TypeExpr::Array { element } = &tc.ty {
-                    if let Some(ir) = self.try_compile_array_literal_cast(element, &tc.expr, td, alias)? {
-                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape: None })));
-                    }
-                }
-                let inner = self.compile_expr(&tc.expr, td, alias)?;
-                let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => {
+                self.compile_exists_ctx(&u.operand, ctx)
+            }
+
+            Expr::UnaryOp(u) => {
+                let operand = self.compile_expr_ctx(&u.operand, ctx)?;
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: u.op.clone(), operand })))
             }
 
             Expr::IfElse(ie) => {
-                let condition = self.compile_expr(&ie.condition, td, alias)?;
-                let if_ = self.compile_expr(&ie.if_expr, td, alias)?;
-                let else_ = self.compile_expr(&ie.else_expr, td, alias)?;
+                let condition = self.compile_expr_ctx(&ie.condition, ctx)?;
+                let if_ = self.compile_expr_ctx(&ie.if_expr, ctx)?;
+                let else_ = self.compile_expr_ctx(&ie.else_expr, ctx)?;
                 Ok(IrExpr::IfElse(Box::new(IrIfElse { condition, if_, else_ })))
             }
 
             Expr::Array(elems) => {
-                let items = elems.iter()
-                    .map(|e| self.compile_expr(e, td, alias))
+                let items = elems
+                    .iter()
+                    .map(|e| self.compile_expr_ctx(e, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(IrExpr::Array(items))
             }
@@ -4330,7 +4040,7 @@ impl<'a> Compiler<'a> {
             Expr::NamedTuple(fields) => {
                 let ir = fields
                     .iter()
-                    .map(|(name, e)| Ok((name.clone(), self.compile_expr(e, td, alias)?)))
+                    .map(|(name, e)| Ok((name.clone(), self.compile_expr_ctx(e, ctx)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
                 Ok(IrExpr::NamedTuple(ir))
             }
@@ -4338,56 +4048,50 @@ impl<'a> Compiler<'a> {
             Expr::Tuple(elems) => {
                 let ir = elems
                     .iter()
-                    .map(|e| self.compile_expr(e, td, alias))
+                    .map(|e| self.compile_expr_ctx(e, ctx))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
                 Ok(IrExpr::Tuple(ir))
             }
 
             Expr::FieldAccess { expr: inner, field } => {
-                // Constant-fold on named tuple literals; otherwise emit jsonb field access.
                 if let Expr::NamedTuple(fields) = inner.as_ref() {
                     let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
-                        PyQLError::Type(PyQLTypeError {
-                            message: format!(
-                                "{field} is not a member of {}",
-                                named_tuple_type_str(fields)
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        })
+                        self.type_err(&format!(
+                            "{field} is not a member of {}",
+                            named_tuple_type_str(fields)
+                        ))
                     })?;
-                    return self.compile_expr(val, td, alias);
+                    return self.compile_expr_ctx(val, ctx);
                 }
-                let ir = self.compile_expr(inner, td, alias)?;
+                let ir = self.compile_expr_ctx(inner, ctx)?;
                 Ok(IrExpr::JsonbField { expr: Box::new(ir), field: field.clone() })
             }
 
             Expr::TupleIndex { expr: inner, index } => {
                 match inner.as_ref() {
                     Expr::Tuple(elems) => {
-                        let elem = elems.get(*index).ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!(
+                        let elem = elems.get(*index).ok_or_else(|| {
+                            self.type_err(&format!(
                                 "{index} is not a member of {}",
                                 positional_tuple_type_str(elems)
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        }))?;
-                        self.compile_expr(elem, td, alias)
+                            ))
+                        })?;
+                        self.compile_expr_ctx(elem, ctx)
                     }
                     Expr::NamedTuple(fields) => {
-                        let (_, val) = fields.get(*index).ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!(
+                        let (_, val) = fields.get(*index).ok_or_else(|| {
+                            self.type_err(&format!(
                                 "{index} is not a member of {}",
                                 named_tuple_type_str(fields)
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        }))?;
-                        self.compile_expr(val, td, alias)
+                            ))
+                        })?;
+                        self.compile_expr_ctx(val, ctx)
                     }
                     // Not a literal to constant-fold — emit a generic runtime
-                    // jsonb positional access. When the source is a cast to a
-                    // statically-known tuple type, bounds-check the index
-                    // against its arity at compile time (matches Gel:
-                    // `2 is not a member of tuple<std::int64, std::str>`).
+                    // jsonb positional access (`$param.1`, `(<tuple<...>>expr).1`, …).
+                    // When the source is a cast to a statically-known tuple type,
+                    // bounds-check the index against its arity at compile time
+                    // (matches Gel: `2 is not a member of tuple<std::int64, std::str>`).
                     _ => {
                         if let Expr::TypeCast(tc) = inner.as_ref() {
                             if let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty) {
@@ -4399,19 +4103,71 @@ impl<'a> Compiler<'a> {
                                 }
                             }
                         }
-                        let ir = self.compile_expr(inner, td, alias)?;
+                        let ir = self.compile_expr_ctx(inner, ctx)?;
                         Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
                     }
                 }
             }
 
-            Expr::Shape(_) | Expr::Set(_) => {
-                Err(PyQLError::Type(PyQLTypeError {
-                    message: "shapes and set literals are not valid in expression context".into(),
-                    position: Position { line: 0, col: 0 },
-                }))
+            // `detached` bypasses the implicit root-matches-td correlation
+            // rewrite. Schema-bound: if `inner` contains a type-rooted path,
+            // compile it as an independent PathSubquery; otherwise (or when
+            // already free) fall back to compiling `inner` with NO schema
+            // binding — note this fallback is deliberately `None`, not
+            // `ctx`, since `detached` means "evaluate independently of the
+            // enclosing scope" and free context has no rooted path to find
+            // in the first place (`find_path_root_in_expr` only ever matches
+            // against a resolvable schema type name).
+            Expr::Detached(inner) => {
+                if ctx.is_some() {
+                    if let Some(root) = self.find_path_root_in_expr(inner) {
+                        let synthetic = ast::SelectStmt {
+                            result: (**inner).clone(),
+                            filter: None, order_by: vec![], offset: None, limit: None,
+                        };
+                        let ps = self.compile_expr_as_path_select(&synthetic, inner, &root, false)?;
+                        return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                    }
+                }
+                self.compile_expr_ctx(inner, None)
             }
 
+            // Free context tolerates an empty set (-> Null) or a singleton
+            // set (-> its one element) as a convenience; a schema-bound
+            // expression position hard-errors on ANY set literal instead
+            // (see the generic Shape|Set arm below) — a plausibly
+            // intentional semantic difference, preserved exactly as-is.
+            Expr::Set(elems) if ctx.is_none() && elems.is_empty() => Ok(IrExpr::Null),
+
+            Expr::Set(elems) if ctx.is_none() => {
+                let compiled: Result<Vec<_>, _> =
+                    elems.iter().map(|e| self.compile_expr_ctx(e, ctx)).collect();
+                let mut compiled = compiled?;
+                if compiled.len() == 1 {
+                    Ok(compiled.remove(0))
+                } else {
+                    Err(self.type_err(
+                        "multi-element set literal is not supported in free SELECT context",
+                    ))
+                }
+            }
+
+            // A bare shape or set literal is never valid in expression
+            // position, in either context — preserved exactly as the
+            // schema-bound side always enforced (the free side's more
+            // permissive empty/singleton-set handling above is the one
+            // deliberate exception, handled before this arm).
+            Expr::Shape(_) | Expr::Set(_) => Err(PyQLError::Type(PyQLTypeError {
+                message: "shapes and set literals are not valid in expression context".into(),
+                position: Position { line: 0, col: 0 },
+            })),
+
+            // Strict improvement over the pre-merge free side: SubQuery/
+            // Union/Except previously fell through free's generic "not
+            // valid in free SELECT context" catch-all. These explicit,
+            // purpose-written messages (already used schema-bound) apply
+            // equally well with no schema in scope, so they're unconditional
+            // here rather than ctx-gated.
             Expr::SubQuery(_) => Err(PyQLError::Type(PyQLTypeError {
                 message: "sub-statement (SELECT/INSERT/UPDATE/DELETE) used as expression is \
                            only valid as the subject of a SELECT result"
@@ -4429,23 +4185,29 @@ impl<'a> Compiler<'a> {
                 position: Position { line: 0, col: 0 },
             })),
 
-            // detached in schema-bound context: compile inner as an independent subquery,
-            // bypassing the implicit root-matches-td correlation rewrite.
-            Expr::Detached(inner) => {
-                if let Some(root) = self.find_path_root_in_expr(inner) {
-                    let synthetic = ast::SelectStmt {
-                        result: *inner.clone(),
-                        filter: None, order_by: vec![], offset: None, limit: None,
-                    };
-                    let ps = self.compile_expr_as_path_select(&synthetic, inner, &root, false)?;
-                    return Ok(IrExpr::PathSubquery(Box::new(ps)));
-                }
-                // No type-rooted path — compile inner without schema binding
-                self.compile_free_expr(inner)
-            }
-
-            Expr::TypeIs { expr, ty } => self.compile_type_is(expr, ty, td, alias),
+            // TypeIs (`expr is Type`) is schema-exclusive — compile_type_is
+            // deeply needs td/alias throughout (interface checks, __type__
+            // column, alias-scoped bool expr). No free-context equivalent
+            // existed before the merge (fell to the generic catch-all); this
+            // is a new, clearer explicit error for that case.
+            Expr::TypeIs { expr, ty } => match ctx {
+                Some((td, alias)) => self.compile_type_is(expr, ty, td, alias),
+                None => Err(self.type_err("'is' type check is not valid in free SELECT context")),
+            },
         }
+    }
+
+    fn compile_expr(
+        &mut self,
+        expr: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        self.compile_expr_ctx(expr, Some((td, alias)))
+    }
+
+    fn compile_free_expr(&mut self, expr: &Expr) -> Result<IrExpr, PyQLError> {
+        self.compile_expr_ctx(expr, None)
     }
 
     fn compile_type_is(
@@ -4569,6 +4331,30 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Shared lookup for a bare 1-step name: for-loop variable, CTE binding,
+    /// or (free-context only, per existing behavior) a function parameter.
+    /// Used by both `compile_path`'s schema-bound prefix and
+    /// `compile_free_path`. `allow_fn_param` is `false` from `compile_path`
+    /// and `true` from `compile_free_path` — this preserves the existing
+    /// behavior gap where `fn_params` lookup only ever happened in free
+    /// context; `compile_path` never checked it (not fixed here, flagged as
+    /// a follow-up in the merge plan).
+    fn resolve_name_ref(&self, name: &str, allow_fn_param: bool) -> Option<IrExpr> {
+        if self.for_vars.contains_key(name) {
+            return Some(IrExpr::ForVar { name: name.to_string() });
+        }
+        if let Some(t) = self.cte_types.get(name) {
+            let scalar = !t.contains("::");
+            return Some(IrExpr::CteRef { name: name.to_string(), scalar });
+        }
+        if allow_fn_param {
+            if let Some(pg_type) = self.fn_params.get(name) {
+                return Some(IrExpr::FnParam { name: name.to_string(), pg_type: pg_type.clone() });
+            }
+        }
+        None
+    }
+
     fn compile_path(
         &mut self,
         p: &ast::Path,
@@ -4578,14 +4364,8 @@ impl<'a> Compiler<'a> {
         if !p.partial {
             if p.steps.len() == 1 {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
-                    // For-loop variable used in schema-bound context.
-                    if self.for_vars.contains_key(n.as_str()) {
-                        return Ok(IrExpr::ForVar { name: n.clone() });
-                    }
-                    // Allow CTE names as references in expression context.
-                    if let Some(t) = self.cte_types.get(n.as_str()) {
-                        let scalar = !t.contains("::");
-                        return Ok(IrExpr::CteRef { name: n.clone(), scalar });
+                    if let Some(ir) = self.resolve_name_ref(n, false) {
+                        return Ok(ir);
                     }
                     // __type__ without a leading dot still means the current object's type.
                     if n == "__type__" {
@@ -4692,6 +4472,36 @@ impl<'a> Compiler<'a> {
         }
 
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
+    }
+
+    /// Free-context counterpart of `compile_path` — no schema type/alias in
+    /// scope, so only for-loop variables, CTE bindings, function parameters,
+    /// and enum member access (`default::Gender.Female`) are resolvable;
+    /// anything property/link-shaped is a hard error.
+    fn compile_free_path(&mut self, p: &ast::Path) -> Result<IrExpr, PyQLError> {
+        if p.partial {
+            return Err(self.type_err(
+                "property reference (.name) is not valid in free SELECT; \
+                 use a schema-bound SELECT instead",
+            ));
+        }
+        if p.steps.len() == 2 {
+            if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
+                if self.resolve_enum(type_ref).is_some() {
+                    return self.compile_enum_access(type_ref, variant);
+                }
+            }
+            return Err(self.type_err("expression is not valid in free SELECT context"));
+        }
+        if p.steps.len() == 1 {
+            if let ast::PathStep::Name(n) = &p.steps[0] {
+                if let Some(ir) = self.resolve_name_ref(n, true) {
+                    return Ok(ir);
+                }
+            }
+            return Err(self.type_err("expression is not valid in free SELECT context"));
+        }
+        Err(self.type_err("expression is not valid in free SELECT context"))
     }
 
     fn compile_path_2step(
