@@ -112,6 +112,24 @@ class TestDecodeObject:
         outer = ("default::Person", "Alice", None)
         assert _decode(outer, company_shape, REGISTRY) is None
 
+    def test_free_object_int_field_does_not_crash(self):
+        # Regression: a free object literal (`select { test := 1 }`) has no
+        # schema type at all — type_name is None and there's no injected
+        # __type__ discriminator, so obj_tuple[0] is just the first field's
+        # raw value, not a type name. This used to be blindly treated as one,
+        # crashing with "'int' object has no attribute 'split'" whenever that
+        # first field held a non-zero int.
+        shape = {
+            "kind": "object",
+            "name": "",
+            "type_name": None,
+            "position": 0,
+            "cardinality": "many",
+            "pointers": [_scalar("test", 0)],
+        }
+        value = (1,)
+        assert _decode(value, shape, {}) == {"test": 1}
+
 
 # ── _decode array ─────────────────────────────────────────────────────────────
 

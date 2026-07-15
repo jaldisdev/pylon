@@ -125,12 +125,19 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
             for p in pointers
             if not (p["name"] == "__type__" and p["position"] == 0)
         }
-        # Use the actual per-row __type__ value (obj_tuple[0]) for class lookup.
-        # For concrete types it equals the static type_name; for polymorphic (interface)
-        # queries it gives the real concrete type.
-        actual_type = obj_tuple[0] if obj_tuple else None
-        type_name = actual_type or node.get("type_name")
-        if type_name:
+        # A free object literal (`select { a := 1 }`) has no schema type at
+        # all — node["type_name"] is None and obj_tuple has no injected
+        # __type__ discriminator, so obj_tuple[0] there is just the first
+        # user field's raw value, not a type name. Only schema-backed
+        # objects (type_name is always set for those) carry that
+        # discriminator, so only look for it in that case.
+        static_type_name = node.get("type_name")
+        if static_type_name:
+            # Use the actual per-row __type__ value (obj_tuple[0]) for class
+            # lookup. For concrete types it equals the static type_name; for
+            # polymorphic (interface) queries it gives the real concrete type.
+            actual_type = obj_tuple[0] if obj_tuple else None
+            type_name = actual_type or static_type_name
             short = type_name.split("::")[-1]
             cls = registry.get(short)
             if cls is not None:

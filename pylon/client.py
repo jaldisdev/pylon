@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import decimal
 import json
 import struct
 import uuid as _uuid_mod
@@ -587,12 +588,31 @@ def _pg_decode_value(type_oid: int, data: bytes) -> Any:
             return struct.unpack_from(">f", data)[0]
         case 3802:  # jsonb: 1-byte version prefix + json text
             return json.loads(data[1:].decode("utf-8"))
+        case 1700:  # numeric — untyped decimal literals default to this
+            return _pg_decode_numeric(data)
         case 2249:  # record (nested composite)
             return _pg_decode_record(data)
         case 2287:  # _record (record[])
             return _pg_decode_record_array(data)
         case _:  # enums, domains, and other text-compatible custom types
             return data.decode("utf-8")
+
+
+def _pg_decode_numeric(data: bytes) -> decimal.Decimal:
+    """Decode PostgreSQL's binary `numeric` wire format (base-10000 digit
+    groups) into a `Decimal` — needed because our custom composite decoder
+    bypasses asyncpg's own (correct) built-in numeric codec entirely."""
+    ndigits, weight, sign, dscale = struct.unpack_from(">hhHh", data, 0)
+    if sign == 0xC000:  # NUMERIC_NAN
+        return decimal.Decimal("NaN")
+    digits = struct.unpack_from(f">{ndigits}h", data, 8) if ndigits else ()
+    result = decimal.Decimal(0)
+    for i, digit in enumerate(digits):
+        result += decimal.Decimal(digit) * (decimal.Decimal(10) ** ((weight - i) * 4))
+    if sign == 0x4000:  # NUMERIC_NEG
+        result = -result
+    quant = decimal.Decimal(1).scaleb(-dscale) if dscale > 0 else decimal.Decimal(1)
+    return result.quantize(quant)
 
 
 def _pg_decode_record(data: bytes) -> tuple:

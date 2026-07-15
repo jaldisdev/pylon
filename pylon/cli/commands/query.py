@@ -264,8 +264,12 @@ async def _execute(
     shape = compiled.shape
     shape_kind = shape.get("kind", "object")
 
-    # Free scalar: plain values like int, str, bool, and array literals
-    if shape_kind in ("scalar", "raw_scalar"):
+    # Free scalar: plain values like int, str, bool, and array literals.
+    # "enum" is a bare enum-typed scalar (e.g. `select Person.gender;`) —
+    # _value() already formats an Enum member correctly (just its name);
+    # without this it fell through to the generic object/tuple tail below,
+    # which used str(obj) and printed Python's default "ClassName.member".
+    if shape_kind in ("scalar", "raw_scalar", "enum"):
         items = [_value(obj) for obj in results]
         click.echo(_format_set(items) if repl else "\n".join(items))
         return
@@ -415,7 +419,15 @@ def _value(v: object) -> str:
     import decimal as _decimal_mod
     import enum as _enum_mod
     if isinstance(v, _enum_mod.Enum):
-        return f"{_RED}{v.name}{_RESET}"
+        # `default::Gender.Male` — module resolved the same way schema
+        # build time does (_walker._build_enum_descriptor): an explicit
+        # __pylon_module__ class attribute, else the last segment of the
+        # class's own __module__.
+        cls = type(v)
+        module = getattr(cls, "__pylon_module__", None) or (
+            (cls.__module__ or "default").rpartition(".")[-1] or "default"
+        )
+        return f"{_RED}{module}::{cls.__name__}.{v.name}{_RESET}"
     if isinstance(v, _decimal_mod.Decimal):
         return format(v.normalize(), 'f')
     if isinstance(v, str):
