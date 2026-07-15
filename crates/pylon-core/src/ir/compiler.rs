@@ -61,8 +61,7 @@ pub fn compile_with_config(
         let mut cte_defs = vec![];
         for alias in &w.aliases {
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
-            let type_name = cte_stmt_type(&ir_stmt);
-            c.cte_types.insert(alias.name.clone(), type_name.clone());
+            let type_name = c.register_cte(&alias.name, &ir_stmt);
             cte_defs.push(IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name });
         }
         let main = c.compile_stmt(&w.stmt)?;
@@ -295,6 +294,11 @@ struct Compiler<'a> {
     alias_counter: usize,
     /// CTE names registered in the enclosing WITH block → qualified type name.
     cte_types: HashMap<String, String>,
+    /// CTE names bound to a single free row (free object/scalar/tuple, not
+    /// a schema object) → that row's `IrFreeExpr` — lets `root.field`
+    /// resolve to `IrExpr::CteFieldRef` when `root` is such a binding,
+    /// instead of failing as an unresolvable schema-path root.
+    cte_free_items: HashMap<String, IrFreeExpr>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
     /// User-defined function parameters in scope (only set during body compilation).
@@ -319,12 +323,80 @@ impl<'a> Compiler<'a> {
             params: vec![],
             alias_counter: 0,
             cte_types: HashMap::new(),
+            cte_free_items: HashMap::new(),
             for_vars: HashMap::new(),
             fn_params: HashMap::new(),
             global_ctes: vec![],
             warnings: vec![],
             config,
         }
+    }
+
+    /// Register a compiled WITH binding under `name`: records its type (or
+    /// empty string for a free binding) in `cte_types`, and — when it's a
+    /// single free row — its `IrFreeExpr` in `cte_free_items` so a later
+    /// `name.field` reference can resolve to `IrExpr::CteFieldRef`.
+    fn register_cte(&mut self, name: &str, ir_stmt: &IrStmt) -> String {
+        let type_name = cte_stmt_type(ir_stmt);
+        self.cte_types.insert(name.to_string(), type_name.clone());
+        if let IrStmt::Select(sel) = ir_stmt {
+            if let [IrRowSource::Free(item)] = sel.rows.as_slice() {
+                self.cte_free_items.insert(name.to_string(), item.clone());
+            }
+        }
+        type_name
+    }
+
+    /// Resolve `root.field1.field2. ... fieldN` where `root` is a WITH-bound
+    /// free object (e.g. `with x := { a := { b := 1 } } select x.a.b`) —
+    /// `None` when `root` isn't such a binding, so callers fall back to
+    /// their normal path resolution. The first step reads the CTE's own
+    /// per-field column (`IrExpr::CteFieldRef`, materialized once); any
+    /// further steps index into that value as jsonb (`IrExpr::JsonbField`),
+    /// since a nested free-object *field* is jsonb the moment it's not the
+    /// top-level row itself — validated statically wherever the nesting is
+    /// itself a free-object literal (so a typo like `x.a.typo` still gets a
+    /// compile error instead of silently returning SQL NULL).
+    fn resolve_cte_field_chain(&self, root: &str, steps: &[&str]) -> Option<Result<IrExpr, PyQLError>> {
+        let (first, rest) = steps.split_first()?;
+        let fields = match self.cte_free_items.get(root)? {
+            IrFreeExpr::FreeObject(fields) => fields,
+            _ => return None,
+        };
+        let mut current: &IrExpr = match fields.iter().find(|(n, _)| n == first) {
+            Some((_, e)) => e,
+            None => return Some(Err(self.type_err(&format!("free object '{root}' has no field '{first}'")))),
+        };
+        let mut expr = IrExpr::CteFieldRef { name: root.to_string(), field: first.to_string() };
+        for step in rest {
+            if let IrExpr::NamedTuple { fields: nested, is_free_object: true } = current {
+                match nested.iter().find(|(n, _)| n == step) {
+                    Some((_, next)) => current = next,
+                    None => return Some(Err(self.type_err(&format!("{step} is not a member of the nested free object")))),
+                }
+            }
+            expr = IrExpr::JsonbField { expr: Box::new(expr), field: step.to_string() };
+        }
+        Some(Ok(expr))
+    }
+
+    /// `resolve_cte_field_chain`, but taking the whole `root.f1.f2...` path
+    /// directly — `None` when the path isn't an absolute multi-step name
+    /// chain (so, in particular, whenever a step is anything other than a
+    /// plain name, e.g. a type intersection or backlink).
+    fn resolve_cte_path(&self, p: &ast::Path) -> Option<Result<IrExpr, PyQLError>> {
+        if p.partial || p.steps.len() < 2 {
+            return None;
+        }
+        let ast::PathStep::Name(root) = &p.steps[0] else { return None };
+        let mut steps = Vec::with_capacity(p.steps.len() - 1);
+        for step in &p.steps[1..] {
+            match step {
+                ast::PathStep::Name(n) => steps.push(n.as_str()),
+                _ => return None,
+            }
+        }
+        self.resolve_cte_field_chain(root, &steps)
     }
 
     /// Return the CTE name if `expr` is a bare identifier that matches a registered CTE.
@@ -1208,6 +1280,26 @@ impl<'a> Compiler<'a> {
                             }
                         }
                     }
+                    // `root.field1.field2...` where `root` is a WITH-bound
+                    // free object (not a real/CTE-bound schema type) —
+                    // resolve to a field reference (possibly chained through
+                    // nested free objects) instead of falling into
+                    // compile_path_select, which only knows schema paths.
+                    if let Some(resolved) = self.resolve_cte_path(p) {
+                        let expr = resolved?;
+                        return Ok(IrStmt::Select(IrSelect {
+                            rows: vec![IrRowSource::Free(IrFreeExpr::Scalar(expr))],
+                            filter: None,
+                            order_by: vec![],
+                            offset: None,
+                            limit: None,
+                            distinct,
+                            dml_source: None,
+                            polymorphic: false,
+                            poly_implementors: vec![],
+                            poly_columns: vec![],
+                        }));
+                    }
                     if !p.partial && p.steps.len() > 1 {
                         return self.compile_path_select(s, p, &[], distinct).map(IrStmt::PathSelect);
                     }
@@ -1340,8 +1432,7 @@ impl<'a> Compiler<'a> {
             Stmt::With(w) => {
                 for alias in &w.aliases {
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
-                    let type_name = cte_stmt_type(&ir_inner);
-                    self.cte_types.insert(alias.name.clone(), type_name);
+                    self.register_cte(&alias.name, &ir_inner);
                 }
                 self.compile_stmt(&w.stmt)
             }
@@ -4380,6 +4471,10 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
+            // `root.field1.field2...` where `root` is a WITH-bound free object.
+            if let Some(resolved) = self.resolve_cte_path(p) {
+                return resolved;
+            }
             // Absolute path rooted at the current td: `TypeName.prop` inside a schema-bound
             // expression (e.g. the value side of a BinOp in compile_expr_as_path_select).
             // Rewrite to a relative path and compile normally.
@@ -4482,7 +4577,11 @@ impl<'a> Compiler<'a> {
                     return self.compile_enum_access(type_ref, variant);
                 }
             }
-            return Err(self.type_err("expression is not valid in free SELECT context"));
+        }
+        // `root.field1.field2...` where `root` is a WITH-bound free object
+        // (any length >= 2, including chains through nested free objects).
+        if let Some(resolved) = self.resolve_cte_path(p) {
+            return resolved;
         }
         if p.steps.len() == 1 {
             if let ast::PathStep::Name(n) = &p.steps[0] {
@@ -4490,7 +4589,6 @@ impl<'a> Compiler<'a> {
                     return Ok(ir);
                 }
             }
-            return Err(self.type_err("expression is not valid in free SELECT context"));
         }
         Err(self.type_err("expression is not valid in free SELECT context"))
     }
