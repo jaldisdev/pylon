@@ -1,8 +1,8 @@
 use crate::ir::{
-    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFreeSelect,
+    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr,
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkPointer,
     IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrMultiLinkValueSource, IrNulls,
-    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrScalarPointer,
+    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRowSource, IrScalarPointer,
     IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
     IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
@@ -18,9 +18,22 @@ pub struct SqlOutput {
 /// Emit the SQL body for a computed global CTE — a plain scalar query with a `value` column.
 fn emit_for_global_cte(stmt: &IrStmt) -> String {
     match stmt {
-        IrStmt::FreeSelect(sel) => match sel.items.first() {
-            Some(IrFreeExpr::Scalar(e)) => format!("SELECT {} AS \"value\"", emit_expr(e)),
-            _ => "SELECT NULL AS \"value\"".to_string(),
+        IrStmt::Select(sel) => match sel.rows.as_slice() {
+            [IrRowSource::Bound { source, .. }] => {
+                let alias = &source.alias;
+                let mut sql = format!(
+                    "SELECT {}.\"id\" AS \"value\"\nFROM {} AS {}",
+                    qi(alias),
+                    source_ref(source),
+                    qi(alias)
+                );
+                append_filter(&mut sql, &sel.filter);
+                sql
+            }
+            rows => match rows.first() {
+                Some(IrRowSource::Free(IrFreeExpr::Scalar(e))) => format!("SELECT {} AS \"value\"", emit_expr(e)),
+                _ => "SELECT NULL AS \"value\"".to_string(),
+            },
         },
         IrStmt::PathSelect(sel) => {
             let from_sql = emit_path_joins(&sel.root, &sel.joins);
@@ -32,17 +45,6 @@ fn emit_for_global_cte(stmt: &IrStmt) -> String {
             append_filter(&mut sql, &sel.filter);
             append_order_by(&mut sql, &sel.order_by);
             append_offset_limit(&mut sql, &sel.offset, &sel.limit);
-            sql
-        }
-        IrStmt::Select(sel) => {
-            let alias = &sel.source.alias;
-            let mut sql = format!(
-                "SELECT {}.\"id\" AS \"value\"\nFROM {} AS {}",
-                qi(alias),
-                source_ref(&sel.source),
-                qi(alias)
-            );
-            append_filter(&mut sql, &sel.filter);
             sql
         }
         _ => "SELECT NULL AS \"value\"".to_string(),
@@ -69,7 +71,6 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
         stmt => {
             let mut o = match stmt {
                 IrStmt::Select(sel) => emit_select_stmt(sel),
-                IrStmt::FreeSelect(sel) => emit_free_select(sel),
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
                 IrStmt::Insert(ins) => emit_insert_stmt(ins),
                 IrStmt::Delete(del) => emit_delete_stmt(del),
@@ -167,13 +168,25 @@ fn emit_poly_union(implementors: &[IrPolyImplementor], columns: &[String]) -> St
 // ── SELECT statement ────────────────────────────────────────────────────────
 
 fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
-    let alias = &sel.source.alias;
-    let (pointer_exprs, shape_pointers) = build_shape(&sel.shape, alias);
+    match sel.rows.as_slice() {
+        [IrRowSource::Bound { source, shape }] => emit_bound_select(sel, source, shape),
+        rows => emit_free_rows(sel, rows),
+    }
+}
+
+/// Schema-bound SELECT — has a FROM clause, projected column shape, and
+/// (optionally) a DML source / polymorphic fan-out. `source`/`shape` are the
+/// single `IrRowSource::Bound` entry destructured by `emit_select_stmt`;
+/// everything else (filter/order_by/offset/limit/distinct/dml_source/
+/// polymorphic/poly_*) stays on the outer `IrSelect`.
+fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]) -> SqlOutput {
+    let alias = &source.alias;
+    let (pointer_exprs, shape_pointers) = build_shape(shape, alias);
 
     let type_expr = if sel.polymorphic {
         format!("{}.\"__type__\"", qi(alias))
     } else {
-        type_disc(&sel.source.type_name)
+        type_disc(&source.type_name)
     };
     let mut parts = vec![type_expr];
     parts.extend(pointer_exprs);
@@ -199,7 +212,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         cte_parts.extend(enqueue_search_ctes(enqueue_s, "_dml", enqueue_v.len()));
         format!("WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
             cte_parts.join(",\n"), distinct, tuple, qi(alias))
-    } else if sel.polymorphic && !sel.source.table.starts_with("@cte:") {
+    } else if sel.polymorphic && !source.table.starts_with("@cte:") {
         // Polymorphic interface with no CTE indirection: fan out to implementor tables.
         let union_sql = emit_poly_union(&sel.poly_implementors, &sel.poly_columns);
         format!("SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
@@ -208,7 +221,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         // Concrete table or CTE (pre-filtered): query directly.
         // For CTE-backed polymorphic sources, __type__ is already present in the CTE result.
         format!("SELECT {}(\n    {}\n) AS result\nFROM {} AS {}",
-            distinct, tuple, source_ref(&sel.source), qi(alias))
+            distinct, tuple, source_ref(source), qi(alias))
     };
 
     let mut sql = from_clause;
@@ -222,7 +235,7 @@ fn emit_select_stmt(sel: &IrSelect) -> SqlOutput {
         shape: ShapeDescriptor {
             root: ShapeNode::Object {
                 name: String::new(),
-                type_name: Some(sel.source.type_name.clone()),
+                type_name: Some(source.type_name.clone()),
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: root_pointers,
@@ -295,25 +308,29 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             sql.push_str("\n    RETURNING *");
             sql
         }
-        IrStmt::Select(inner) => {
-            // SELECT-over-SELECT: expose raw columns so the outer SELECT can
-            // project its own shape from them, mirroring DML's RETURNING *.
-            let from = if inner.polymorphic && !inner.source.table.starts_with("@cte:") {
-                format!(
-                    "(\n{}\n    ) AS {}",
-                    emit_poly_union(&inner.poly_implementors, &inner.poly_columns),
-                    qi(&inner.source.alias),
-                )
-            } else {
-                format!("{} AS {}", source_ref(&inner.source), qi(&inner.source.alias))
-            };
-            let mut sql = format!("    SELECT * FROM {}", from);
-            append_filter(&mut sql, &inner.filter);
-            append_order_by(&mut sql, &inner.order_by);
-            append_offset_limit(&mut sql, &inner.offset, &inner.limit);
-            sql
-        }
-        IrStmt::FreeSelect(sel) => emit_free_select(sel).sql,
+        IrStmt::Select(inner) => match inner.rows.as_slice() {
+            [IrRowSource::Bound { source, .. }] => {
+                // SELECT-over-SELECT: expose raw columns so the outer SELECT can
+                // project its own shape from them, mirroring DML's RETURNING *.
+                let from = if inner.polymorphic && !source.table.starts_with("@cte:") {
+                    format!(
+                        "(\n{}\n    ) AS {}",
+                        emit_poly_union(&inner.poly_implementors, &inner.poly_columns),
+                        qi(&source.alias),
+                    )
+                } else {
+                    format!("{} AS {}", source_ref(source), qi(&source.alias))
+                };
+                let mut sql = format!("    SELECT * FROM {}", from);
+                append_filter(&mut sql, &inner.filter);
+                append_order_by(&mut sql, &inner.order_by);
+                append_offset_limit(&mut sql, &inner.offset, &inner.limit);
+                sql
+            }
+            // Free rows: full UNION-ALL emission, same as before the merge
+            // (this arm used to be a separate IrStmt::FreeSelect match).
+            _ => emit_select_stmt(inner).sql,
+        },
         IrStmt::FunctionSelect(sel) => {
             // Expose raw columns so the outer SELECT can project its own shape,
             // mirroring how IrStmt::Select works as a CTE source.
@@ -635,10 +652,17 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
             }
         }
         IrMultiLinkValueSource::Select(s) => {
-            let alias = &s.source.alias;
+            // Compiler only ever constructs this variant for a single
+            // schema-bound row (compile_subquery_exists's callers reject
+            // free rows before wrapping) — see compiler.rs's multilink-
+            // value-source sites.
+            let [IrRowSource::Bound { source, .. }] = s.rows.as_slice() else {
+                unreachable!("IrMultiLinkValueSource::Select is always schema-bound")
+            };
+            let alias = &source.alias;
             let mut sql = format!(
                 "(SELECT {}.\"id\"{} FROM {} AS {}",
-                qi(alias), prop_cols, source_ref(&s.source), qi(alias)
+                qi(alias), prop_cols, source_ref(source), qi(alias)
             );
             append_filter(&mut sql, &s.filter);
             sql.push(')');
@@ -822,10 +846,20 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
         || matches!(expr, IrExpr::JsonbIndex { .. })
 }
 
-fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
+/// Free (non-schema-bound) SELECT rows — one or more UNION ALL branches with
+/// a ROW(…) wrapper. `rows` is `sel.rows` with any leading `Bound` entries
+/// already ruled out by `emit_select_stmt`'s dispatch (a schema object and a
+/// free literal can never appear in the same UNION — `check_union_type_compat`
+/// rejects that at compile time), so every entry here is `IrRowSource::Free`.
+fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
     use crate::query::ShapeNode;
 
-    if sel.items.is_empty() {
+    let items: Vec<&IrFreeExpr> = rows.iter().map(|r| match r {
+        IrRowSource::Free(item) => item,
+        IrRowSource::Bound { .. } => unreachable!("mixed Bound/Free rows rejected at compile time"),
+    }).collect();
+
+    if items.is_empty() {
         return SqlOutput {
             sql: "SELECT NULL AS result WHERE FALSE".to_string(),
             shape: ShapeDescriptor {
@@ -836,8 +870,8 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
     }
 
     // assert_exists / assert_distinct: set-returning — emit as unnest, not UNION ALL
-    if sel.items.len() == 1 {
-        if let IrFreeExpr::AssertSet { fn_name, inner } = &sel.items[0] {
+    if items.len() == 1 {
+        if let IrFreeExpr::AssertSet { fn_name, inner } = items[0] {
             let array_sql = emit_array_source(inner);
             let mut sql = format!(
                 "SELECT ROW(v) AS result FROM unnest(\"_pylon\".{}({})) AS _assert(v)",
@@ -858,9 +892,9 @@ fn emit_free_select(sel: &IrFreeSelect) -> SqlOutput {
         }
     }
 
-    let shape_root = free_item_shape(sel.items.first().unwrap());
+    let shape_root = free_item_shape(items.first().unwrap());
 
-    let branches: Vec<String> = sel.items.iter().map(|item| match item {
+    let branches: Vec<String> = items.iter().map(|item| match item {
         IrFreeExpr::Scalar(expr) => {
             // Arrays (OID 1007) and jsonb (OID 3802) can't be decoded inside anonymous
             // ROW() composites by asyncpg. Return them as plain top-level columns instead.
@@ -1067,13 +1101,18 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
 fn emit_array_source(src: &IrArraySource) -> String {
     match src {
         IrArraySource::Select(s) => {
-            let scalar = match s.shape.first() {
+            // compile_subquery_to_array_source only ever constructs this
+            // variant for a single schema-bound row.
+            let [IrRowSource::Bound { source, shape }] = s.rows.as_slice() else {
+                unreachable!("IrArraySource::Select is always schema-bound")
+            };
+            let scalar = match shape.first() {
                 Some(IrShapePointer::Scalar(sf)) =>
-                    format!("{}.{}", qi(&s.source.alias), qi(&sf.column)),
-                _ => format!("{}.\"id\"", qi(&s.source.alias)),
+                    format!("{}.{}", qi(&source.alias), qi(&sf.column)),
+                _ => format!("{}.\"id\"", qi(&source.alias)),
             };
             let mut sql = format!("SELECT {} FROM {} AS {}",
-                scalar, source_ref(&s.source), qi(&s.source.alias));
+                scalar, source_ref(source), qi(&source.alias));
             append_filter(&mut sql, &s.filter);
             format!("ARRAY({})", sql)
         }
@@ -1321,7 +1360,6 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
         body => {
             let body_out = match body {
                 IrStmt::Select(sel) => emit_select_stmt(sel),
-                IrStmt::FreeSelect(sel) => emit_free_select(sel),
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
                 other => panic!("unsupported for-loop body: {:?}", other),
             };
@@ -1960,10 +1998,13 @@ fn emit_single_link(
     pos: usize,
 ) -> (String, ShapeNode) {
     let sub = &f.subquery;
-    let sub_alias = &sub.source.alias;
+    let [IrRowSource::Bound { source, shape }] = sub.rows.as_slice() else {
+        unreachable!("single-link subquery is always schema-bound")
+    };
+    let sub_alias = &source.alias;
 
-    let (sub_exprs, sub_nodes) = build_shape(&sub.shape, sub_alias);
-    let mut parts = vec![type_disc(&sub.source.type_name)];
+    let (sub_exprs, sub_nodes) = build_shape(shape, sub_alias);
+    let mut parts = vec![type_disc(&source.type_name)];
     parts.extend(sub_exprs);
     let tuple = parts.join(",\n        ");
 
@@ -1982,7 +2023,7 @@ fn emit_single_link(
     let mut sql = format!(
         "(SELECT (\n        {}\n    )\n    FROM {} AS {}\n    WHERE {}",
         tuple,
-        source_ref(&sub.source),
+        source_ref(source),
         qi(sub_alias),
         where_parts.join(" AND "),
     );
@@ -1994,7 +2035,7 @@ fn emit_single_link(
 
     let node = ShapeNode::Object {
         name: f.alias.clone(),
-        type_name: Some(sub.source.type_name.clone()),
+        type_name: Some(source.type_name.clone()),
         position: pos,
         cardinality: Cardinality::Optional,
         pointers: prepend_type(sub_nodes),
@@ -2008,10 +2049,13 @@ fn emit_multi_link(
     pos: usize,
 ) -> (String, ShapeNode) {
     let sub = &f.subquery;
-    let sub_alias = &sub.source.alias;
+    let [IrRowSource::Bound { source, shape }] = sub.rows.as_slice() else {
+        unreachable!("multi-link subquery is always schema-bound")
+    };
+    let sub_alias = &source.alias;
 
-    let (sub_exprs, mut sub_nodes) = build_shape(&sub.shape, sub_alias);
-    let mut row_parts = vec![type_disc(&sub.source.type_name)];
+    let (sub_exprs, mut sub_nodes) = build_shape(shape, sub_alias);
+    let mut row_parts = vec![type_disc(&source.type_name)];
     row_parts.extend(sub_exprs);
 
     // Link properties: read from the junction table alias "jt".
@@ -2040,7 +2084,7 @@ fn emit_multi_link(
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".target",
                 qn(module, junction_table),
-                source_ref(&sub.source),
+                source_ref(source),
                 qi(sub_alias),
                 qi(sub_alias),
             );
@@ -2051,7 +2095,7 @@ fn emit_multi_link(
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
                 qn(module, junction_table),
-                source_ref(&sub.source),
+                source_ref(source),
                 qi(sub_alias),
                 qi(sub_alias),
                 qi(target_col),
@@ -2079,7 +2123,7 @@ fn emit_multi_link(
         position: pos,
         element: Box::new(ShapeNode::Object {
             name: String::new(),
-            type_name: Some(sub.source.type_name.clone()),
+            type_name: Some(source.type_name.clone()),
             position: 0,
             cardinality: Cardinality::Required,
             pointers: prepend_type(sub_nodes),
@@ -2352,20 +2396,22 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
 
         IrExpr::Subquery(sel) => {
-            let alias = &sel.source.alias;
-            let mut sql = if sel.shape.is_empty() {
+            let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
+                unreachable!("scalar/exists subquery is always schema-bound")
+            };
+            let alias = &source.alias;
+            let mut sql = if shape.is_empty() {
                 // EXISTS inner: SELECT 1 FROM …
-                format!("(SELECT 1\nFROM {} AS {}", source_ref(&sel.source), qi(alias))
+                format!("(SELECT 1\nFROM {} AS {}", source_ref(source), qi(alias))
             } else {
                 // Scalar subquery: SELECT alias.col FROM …
-                let pk_col = sel
-                    .shape
+                let pk_col = shape
                     .iter()
                     .find_map(|f| if let IrShapePointer::Scalar(s) = f { Some(s.column.as_str()) } else { None })
                     .unwrap_or("id");
                 format!(
                     "(SELECT {}.{}\nFROM {} AS {}",
-                    qi(alias), qi(pk_col), source_ref(&sel.source), qi(alias),
+                    qi(alias), qi(pk_col), source_ref(source), qi(alias),
                 )
             };
             append_filter(&mut sql, &sel.filter);
@@ -2649,16 +2695,14 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
 
 /// Emit the SQL body expression for a user-defined function DDL.
 ///
-/// For scalar functions (`FreeSelect`) emits just the expression — e.g. `"a" + "b"`.
-/// For object functions (`Select`, `FunctionSelect`) emits a full `SELECT … FROM …`.
+/// For a bare scalar free select emits just the expression — e.g. `"a" + "b"`.
+/// For everything else (object functions, non-scalar free selects) emits a
+/// full `SELECT … FROM …` via `emit_dml_as_cte_source`.
 pub fn emit_fn_body(ir: &crate::ir::IrOutput) -> String {
     let body = match &ir.stmt {
-        IrStmt::FreeSelect(sel) => {
-            if let Some(IrFreeExpr::Scalar(e)) = sel.items.first() {
-                format!("SELECT {}", emit_expr(e))
-            } else {
-                emit_free_select(sel).sql
-            }
+        IrStmt::Select(sel) if matches!(sel.rows.as_slice(), [IrRowSource::Free(IrFreeExpr::Scalar(_))]) => {
+            let IrRowSource::Free(IrFreeExpr::Scalar(e)) = &sel.rows[0] else { unreachable!() };
+            format!("SELECT {}", emit_expr(e))
         }
         other => emit_dml_as_cte_source(other),
     };

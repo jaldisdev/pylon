@@ -14,11 +14,12 @@ use std::collections::HashMap;
 
 use super::{
     IrArraySource, IrBinOp, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrForIterator, IrFreeExpr, IrFreeSelect, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrComputedGlobalCte,
+    IrForIterator, IrFreeExpr, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrComputedGlobalCte,
     IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
     IrMultiLinkClear, IrMultiLinkPointer, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
     IrMultiLinkValueSource,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
+    IrRowSource,
     IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
     IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
     VectorEnqueueInfo, SearchEnqueueInfo, TupleCastShape,
@@ -162,18 +163,17 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         IrStmt::Insert(ins) => ins.target.type_name.clone(),
         IrStmt::Update(upd) => upd.target.type_name.clone(),
         IrStmt::Delete(del) => del.target.type_name.clone(),
-        IrStmt::Select(sel) => sel.source.type_name.clone(),
-        IrStmt::PathSelect(ps) => ps.root.type_name.clone(),
-        IrStmt::FreeSelect(fs) => {
-            // Infer the scalar pg_type from the first item so the type is available
-            // for UNION mismatch error messages. Returns empty string if unknown.
-            if let Some(IrFreeExpr::Scalar(expr)) = fs.items.first() {
-                if let Some(t) = infer_ir_type(expr) {
-                    return t.to_string();
-                }
+        IrStmt::Select(sel) => match sel.rows.first() {
+            Some(IrRowSource::Bound { source, .. }) => source.type_name.clone(),
+            // Infer the scalar pg_type from the first free item so the type
+            // is available for UNION mismatch error messages. Returns empty
+            // string if unknown.
+            Some(IrRowSource::Free(IrFreeExpr::Scalar(expr))) => {
+                infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
             }
-            String::new()
-        }
+            _ => String::new(),
+        },
+        IrStmt::PathSelect(ps) => ps.root.type_name.clone(),
         IrStmt::For(f) => cte_stmt_type(&f.body),
         IrStmt::Group(g) => g.source.type_name.clone(),
         IrStmt::FunctionSelect(fs) => fs.type_name.clone(),
@@ -882,12 +882,17 @@ impl<'a> Compiler<'a> {
                 IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
             }
         };
-        Ok(IrStmt::FreeSelect(IrFreeSelect {
-            items: vec![IrFreeExpr::Scalar(cast_expr)],
+        Ok(IrStmt::Select(IrSelect {
+            rows: vec![IrRowSource::Free(IrFreeExpr::Scalar(cast_expr))],
+            filter: None,
             order_by: vec![],
             offset: None,
             limit: None,
             distinct,
+            dml_source: None,
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
         }))
     }
 
@@ -1188,12 +1193,17 @@ impl<'a> Compiler<'a> {
                         if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
                             if self.resolve_enum(type_ref).is_some() {
                                 let expr = self.compile_enum_access(type_ref, variant)?;
-                                return Ok(IrStmt::FreeSelect(IrFreeSelect {
-                                    items: vec![IrFreeExpr::Scalar(expr)],
+                                return Ok(IrStmt::Select(IrSelect {
+                                    rows: vec![IrRowSource::Free(IrFreeExpr::Scalar(expr))],
+                                    filter: None,
                                     order_by: vec![],
                                     offset: None,
                                     limit: None,
                                     distinct,
+                                    dml_source: None,
+                                    polymorphic: false,
+                                    poly_implementors: vec![],
+                                    poly_columns: vec![],
                                 }));
                             }
                         }
@@ -1224,15 +1234,20 @@ impl<'a> Compiler<'a> {
                             let limit = s.limit.as_ref()
                                 .map(|e| self.compile_free_expr(e))
                                 .transpose()?;
-                            return Ok(IrStmt::FreeSelect(IrFreeSelect {
-                                items: vec![IrFreeExpr::AssertSet {
+                            return Ok(IrStmt::Select(IrSelect {
+                                rows: vec![IrRowSource::Free(IrFreeExpr::AssertSet {
                                     fn_name: f.name.clone(),
                                     inner: Box::new(inner),
-                                }],
+                                })],
+                                filter: None,
                                 order_by: vec![],
                                 offset,
                                 limit,
                                 distinct,
+                                dml_source: None,
+                                polymorphic: false,
+                                poly_implementors: vec![],
+                                poly_columns: vec![],
                             }));
                         }
                     }
@@ -1310,7 +1325,7 @@ impl<'a> Compiler<'a> {
                     return Err(e);
                 }
                 if self.is_free_result(result) {
-                    self.compile_free_select(s, result, distinct).map(IrStmt::FreeSelect)
+                    self.compile_free_select(s, result, distinct).map(IrStmt::Select)
                 } else {
                     self.compile_select(s, result, distinct).map(IrStmt::Select)
                 }
@@ -1857,7 +1872,9 @@ impl<'a> Compiler<'a> {
     /// The result is `ARRAY(SELECT scalar FROM compiled_inner)`.
     fn compile_subquery_to_array_source(&mut self, stmt: &Stmt) -> Result<IrArraySource, PyQLError> {
         match self.compile_stmt(stmt)? {
-            IrStmt::Select(s) => Ok(IrArraySource::Select(s)),
+            IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
+                Ok(IrArraySource::Select(s))
+            }
             IrStmt::PathSelect(ps) => Ok(IrArraySource::PathSelect(ps)),
             _ => Err(self.type_err(
                 "assert functions require a schema-bound SELECT as argument",
@@ -1950,17 +1967,14 @@ impl<'a> Compiler<'a> {
     fn compile_subquery_exists(&mut self, stmt: &Stmt) -> Result<IrExpr, PyQLError> {
         match self.compile_stmt(stmt)? {
             IrStmt::Select(s) => {
-                let inner = IrExpr::Subquery(Box::new(IrSelect {
-                    source: s.source,
-                    shape: vec![],
-                    filter: s.filter,
-                    order_by: vec![],
-                    offset: None,
-                    limit: None,
-                    distinct: false,
-                    dml_source: None,
-                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                }));
+                let mut rows = s.rows;
+                if rows.len() != 1 {
+                    return Err(self.type_err("exists requires a schema-bound SELECT expression"));
+                }
+                let IrRowSource::Bound { source, .. } = rows.remove(0) else {
+                    return Err(self.type_err("exists requires a schema-bound SELECT expression"));
+                };
+                let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(source, vec![], s.filter)));
                 Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
             }
             IrStmt::PathSelect(ps) => {
@@ -1968,17 +1982,7 @@ impl<'a> Compiler<'a> {
                 // Reuse the path select but signal "exists" via a dedicated IR node
                 Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
                     op: ast::UnaryOpKind::Exists,
-                    operand: IrExpr::Subquery(Box::new(IrSelect {
-                        source: ps.root,
-                        shape: vec![],
-                        filter: ps.filter,
-                        order_by: vec![],
-                        offset: None,
-                        limit: None,
-                        distinct: false,
-                        dml_source: None,
-                        polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                    })),
+                    operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(ps.root, vec![], ps.filter))),
                 })))
             }
             _ => Err(self.type_err("exists requires a SELECT expression")),
@@ -2025,21 +2029,15 @@ impl<'a> Compiler<'a> {
             op: ast::BinOpKind::Eq,
             right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
         }));
-        Ok(IrSelect {
-            source: IrSource {
+        Ok(IrSelect::schema_bound(
+            IrSource {
                 type_name: format!("{}::__jt__", jt_module),
                 table: jt_table,
                 alias: jt_alias,
             },
-            shape: vec![],
-            filter: Some(filter),
-            order_by: vec![],
-            offset: None,
-            limit: None,
-            distinct: false,
-            dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-        })
+            vec![],
+            Some(filter),
+        ))
     }
 
     fn compile_multilink_exists_check(
@@ -2163,7 +2161,7 @@ impl<'a> Compiler<'a> {
         sel: &ast::SelectStmt,
         result_expr: &Expr,
         distinct: bool,
-    ) -> Result<IrFreeSelect, PyQLError> {
+    ) -> Result<IrSelect, PyQLError> {
         if sel.filter.is_some() {
             return Err(self.type_err("FILTER is not supported on free SELECT expressions"));
         }
@@ -2258,7 +2256,18 @@ impl<'a> Compiler<'a> {
             .map(|e| self.compile_free_expr(e))
             .transpose()?;
 
-        Ok(IrFreeSelect { items, order_by, offset, limit, distinct })
+        Ok(IrSelect {
+            rows: items.into_iter().map(IrRowSource::Free).collect(),
+            filter: None,
+            order_by,
+            offset,
+            limit,
+            distinct,
+            dml_source: None,
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
+        })
     }
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
@@ -2317,7 +2326,10 @@ impl<'a> Compiler<'a> {
             (vec![], vec![])
         };
 
-        Ok(IrSelect { source, shape, filter, order_by, offset, limit, distinct, dml_source, polymorphic, poly_implementors, poly_columns })
+        Ok(IrSelect {
+            rows: vec![IrRowSource::Bound { source, shape }],
+            filter, order_by, offset, limit, distinct, dml_source, polymorphic, poly_implementors, poly_columns,
+        })
     }
 
     /// Unwrap `Shape(expr, elements)` or bare `Path` from a SELECT result.
@@ -2975,10 +2987,12 @@ impl<'a> Compiler<'a> {
         // Parenthesised subquery
         if let Expr::SubQuery(inner) = expr {
             return match self.compile_stmt(inner)? {
-                IrStmt::Select(s) => Ok(IrMultiLinkValues {
-                    source: IrMultiLinkValueSource::Select(Box::new(s)),
-                    link_props: vec![],
-                }),
+                IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
+                    Ok(IrMultiLinkValues {
+                        source: IrMultiLinkValueSource::Select(Box::new(s)),
+                        link_props: vec![],
+                    })
+                }
                 IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues {
                     source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
                     link_props: vec![],
@@ -3004,10 +3018,12 @@ impl<'a> Compiler<'a> {
                         source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
                         link_props: vec![],
                     }),
-                    IrStmt::Select(s) => Ok(IrMultiLinkValues {
-                        source: IrMultiLinkValueSource::Select(Box::new(s)),
-                        link_props: vec![],
-                    }),
+                    IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
+                        Ok(IrMultiLinkValues {
+                            source: IrMultiLinkValueSource::Select(Box::new(s)),
+                            link_props: vec![],
+                        })
+                    }
                     _ => Err(self.type_err("expected a path expression for multilink value")),
                 };
             }
@@ -3114,21 +3130,15 @@ impl<'a> Compiler<'a> {
                 let target_td = self.resolve_type(&l.target)?;
                 let sub_alias = self.fresh_alias();
                 let sub_shape = Self::pk_returning(target_td);
-                let subquery = IrSelect {
-                    source: IrSource {
+                let subquery = IrSelect::schema_bound(
+                    IrSource {
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: sub_alias.clone(),
                     },
-                    shape: sub_shape,
-                    filter: None,
-                    order_by: vec![],
-                    offset: None,
-                    limit: None,
-                    distinct: false,
-                    dml_source: None,
-                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                };
+                    sub_shape,
+                    None,
+                );
                 pointers.push(IrShapePointer::SingleLink(IrSingleLinkPointer {
                     alias: l.name.clone(),
                     fk_column: format!("{}_id", l.name),
@@ -3191,21 +3201,15 @@ impl<'a> Compiler<'a> {
                     }
                 };
 
-                let subquery = IrSelect {
-                    source: IrSource {
+                let subquery = IrSelect::schema_bound(
+                    IrSource {
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: sub_alias.clone(),
                     },
-                    shape: sub_shape,
-                    filter: None,
-                    order_by: vec![],
-                    offset: None,
-                    limit: None,
-                    distinct: false,
-                    dml_source: None,
-                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                };
+                    sub_shape,
+                    None,
+                );
 
                 pointers.push(IrShapePointer::MultiLink(IrMultiLinkPointer {
                     alias: ml.name.clone(),
@@ -3271,26 +3275,20 @@ impl<'a> Compiler<'a> {
                     pg_type: "uuid".to_string(),
                 },
             }));
-            let subquery = IrSelect {
-                source: IrSource {
+            let subquery = IrSelect::schema_bound(
+                IrSource {
                     type_name: concrete_qname.clone(),
                     table: concrete_table.clone(),
                     alias: sub_alias,
                 },
-                shape: vec![IrShapePointer::Scalar(IrScalarPointer {
+                vec![IrShapePointer::Scalar(IrScalarPointer {
                     alias: prop.name.clone(),
                     column: prop.name.clone(),
                     pg_type: prop.pg_type.clone(),
                     tuple_shape: self.resolve_property_tuple_shape(&prop),
                 })],
-                filter: Some(filter),
-                order_by: vec![],
-                offset: None,
-                limit: None,
-                distinct: false,
-                dml_source: None,
-                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-            };
+                Some(filter),
+            );
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 alias: prop.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
@@ -3315,21 +3313,15 @@ impl<'a> Compiler<'a> {
                 },
             }));
             let sub_shape = Self::pk_returning(target_td);
-            let subquery = IrSelect {
-                source: IrSource {
+            let subquery = IrSelect::schema_bound(
+                IrSource {
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: sub_alias,
                 },
-                shape: sub_shape,
-                filter: Some(filter),
-                order_by: vec![],
-                offset: None,
-                limit: None,
-                distinct: false,
-                dml_source: None,
-                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-            };
+                sub_shape,
+                Some(filter),
+            );
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 alias: link.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
@@ -3413,26 +3405,20 @@ impl<'a> Compiler<'a> {
             },
         }));
 
-        Ok(IrExpr::Subquery(Box::new(IrSelect {
-            source: IrSource {
+        Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+            IrSource {
                 type_name: concrete_qname,
                 table: concrete_table,
                 alias: sub_alias,
             },
-            shape: vec![IrShapePointer::Scalar(IrScalarPointer {
+            vec![IrShapePointer::Scalar(IrScalarPointer {
                 alias: prop_name.clone(),
                 column: prop_name,
                 pg_type: prop_type,
                 tuple_shape: self.resolve_property_tuple_shape(prop),
             })],
-            filter: Some(filter),
-            order_by: vec![],
-            offset: None,
-            limit: None,
-            distinct: false,
-            dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-        })))
+            Some(filter),
+        ))))
     }
 
     fn compile_shape_element(
@@ -3526,21 +3512,15 @@ impl<'a> Compiler<'a> {
             let nested_elements = el.nested.as_deref().unwrap_or(&[]);
             let sub_shape =
                 self.compile_shape(nested_elements, target_td, &sub_alias, &target_td.module.clone())?;
-            let subquery = IrSelect {
-                source: IrSource {
+            let subquery = IrSelect::schema_bound(
+                IrSource {
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: sub_alias,
                 },
-                shape: sub_shape,
-                filter: None,
-                order_by: vec![],
-                offset: None,
-                limit: None,
-                distinct: false,
-                dml_source: None,
-                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-            };
+                sub_shape,
+                None,
+            );
             return Ok(IrShapePointer::SingleLink(IrSingleLinkPointer {
                 alias: pointer_name.to_string(),
                 fk_column: format!("{}_id", l.name),
@@ -3649,12 +3629,14 @@ impl<'a> Compiler<'a> {
         };
 
         let subquery = IrSelect {
-            source: IrSource {
-                type_name: format!("{}::{}", target_td.module, target_td.name),
-                table: target_td.table.clone(),
-                alias: sub_alias.clone(),
-            },
-            shape: sub_shape,
+            rows: vec![IrRowSource::Bound {
+                source: IrSource {
+                    type_name: format!("{}::{}", target_td.module, target_td.name),
+                    table: target_td.table.clone(),
+                    alias: sub_alias.clone(),
+                },
+                shape: sub_shape,
+            }],
             filter: el
                 .filter
                 .as_ref()
@@ -4516,19 +4498,19 @@ impl<'a> Compiler<'a> {
             let target_td = self.resolve_type(&link.target)?;
             if let Some(prop) = Self::resolve_property(target_td, pointer_name) {
                 let ft_alias = self.fresh_alias();
-                return Ok(IrExpr::Subquery(Box::new(IrSelect {
-                    source: IrSource {
+                return Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                    IrSource {
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: ft_alias.clone(),
                     },
-                    shape: vec![IrShapePointer::Scalar(IrScalarPointer {
+                    vec![IrShapePointer::Scalar(IrScalarPointer {
                         alias: prop.name.clone(),
                         column: prop.name.clone(),
                         pg_type: prop.pg_type.clone(),
                         tuple_shape: self.resolve_property_tuple_shape(prop),
                     })],
-                    filter: Some(IrExpr::BinOp(Box::new(IrBinOp {
+                    Some(IrExpr::BinOp(Box::new(IrBinOp {
                         left: IrExpr::ColumnRef {
                             alias: ft_alias.clone(),
                             column: "id".to_string(),
@@ -4541,13 +4523,7 @@ impl<'a> Compiler<'a> {
                             pg_type: "uuid".to_string(),
                         },
                     }))),
-                    order_by: vec![],
-                    offset: None,
-                    limit: None,
-                    distinct: false,
-                    dml_source: None,
-                    polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                })));
+                ))));
             }
             let target_name = link.target.clone();
             return Err(self.field_err(pointer_name, &target_name));
@@ -4673,17 +4649,11 @@ impl<'a> Compiler<'a> {
 
         Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
             op: ast::UnaryOpKind::Exists,
-            operand: IrExpr::Subquery(Box::new(IrSelect {
-                source: IrSource { type_name: target_qname, table: target_table, alias: t_alias },
-                shape: vec![],
-                filter: Some(filter),
-                order_by: vec![],
-                offset: None,
-                limit: None,
-                distinct: false,
-                dml_source: None,
-                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-            })),
+            operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                IrSource { type_name: target_qname, table: target_table, alias: t_alias },
+                vec![],
+                Some(filter),
+            ))),
         })))
     }
 
@@ -4766,21 +4736,15 @@ impl<'a> Compiler<'a> {
                     }));
                     return Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
                         op: ast::UnaryOpKind::Exists,
-                        operand: IrExpr::Subquery(Box::new(IrSelect {
-                            source: IrSource {
+                        operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                            IrSource {
                                 type_name: link_target_qname,
                                 table: link_target_table,
                                 alias: l_alias,
                             },
-                            shape: vec![],
-                            filter: Some(full),
-                            order_by: vec![],
-                            offset: None,
-                            limit: None,
-                            distinct: false,
-                            dml_source: None,
-                            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                        })),
+                            vec![],
+                            Some(full),
+                        ))),
                     }))));
                 }
             }
@@ -4948,17 +4912,7 @@ impl<'a> Compiler<'a> {
             table: jt_table,
             alias: jt_alias,
         };
-        let inner = IrExpr::Subquery(Box::new(IrSelect {
-            source: jt_source,
-            shape: vec![],
-            filter: Some(full_filter),
-            order_by: vec![],
-            offset: None,
-            limit: None,
-            distinct: false,
-            dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-        }));
+        let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(jt_source, vec![], Some(full_filter))));
 
         Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
             op: ast::UnaryOpKind::Exists,
@@ -5037,21 +4991,15 @@ impl<'a> Compiler<'a> {
                 op: ast::BinOpKind::And,
                 right: prop_filter,
             }));
-            let inner = IrExpr::Subquery(Box::new(IrSelect {
-                source: IrSource {
+            let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                IrSource {
                     type_name: target_type.to_string(),
                     table: target_table,
                     alias: tgt_alias,
                 },
-                shape: vec![],
-                filter: Some(full),
-                order_by: vec![],
-                offset: None,
-                limit: None,
-                distinct: false,
-                dml_source: None,
-                polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-            }));
+                vec![],
+                Some(full),
+            )));
             return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
         }
 
@@ -5088,21 +5036,15 @@ impl<'a> Compiler<'a> {
                         op: ast::BinOpKind::And,
                         right: fk_filter,
                     }));
-                    let inner = IrExpr::Subquery(Box::new(IrSelect {
-                        source: IrSource {
+                    let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                        IrSource {
                             type_name: target_type.to_string(),
                             table: target_table,
                             alias: tgt_alias,
                         },
-                        shape: vec![],
-                        filter: Some(full),
-                        order_by: vec![],
-                        offset: None,
-                        limit: None,
-                        distinct: false,
-                        dml_source: None,
-                        polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-                    }));
+                        vec![],
+                        Some(full),
+                    )));
                     return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
                 }
             }
@@ -5129,21 +5071,15 @@ impl<'a> Compiler<'a> {
             op: ast::BinOpKind::And,
             right: nested_filter,
         }));
-        let inner = IrExpr::Subquery(Box::new(IrSelect {
-            source: IrSource {
+        let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+            IrSource {
                 type_name: target_type.to_string(),
                 table: target_table,
                 alias: tgt_alias,
             },
-            shape: vec![],
-            filter: Some(full),
-            order_by: vec![],
-            offset: None,
-            limit: None,
-            distinct: false,
-            dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-        }));
+            vec![],
+            Some(full),
+        )));
         Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
     }
 
@@ -5211,21 +5147,15 @@ impl<'a> Compiler<'a> {
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
 
-        Ok(IrExpr::Subquery(Box::new(IrSelect {
-            source: IrSource {
+        Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+            IrSource {
                 type_name: format!("{}::{}", td.module, td.name),
                 table: td.table.clone(),
                 alias,
             },
-            shape: Self::pk_returning(td),
+            Self::pk_returning(td),
             filter,
-            order_by: vec![],
-            offset: None,
-            limit: None,
-            distinct: false,
-            dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
-        })))
+        ))))
     }
 
     /// Shared `IrSort` builder for both schema-bound (`compile_sort`) and
