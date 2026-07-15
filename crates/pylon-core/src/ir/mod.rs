@@ -38,9 +38,10 @@ pub struct SessionConfig {
 
 #[derive(Debug, Clone)]
 pub enum IrStmt {
+    /// A SELECT — schema-bound (`select Type { .. }`), free (`select {1,2,3}`,
+    /// a set/tuple/free-object literal), or a mix via UNION — no distinction
+    /// at this level; see `IrSelect::rows`/`IrRowSource`.
     Select(IrSelect),
-    /// A SELECT over a free expression: set literal, tuple, free object, or scalar function.
-    FreeSelect(IrFreeSelect),
     /// A flat SELECT produced by absolute path traversal: `select TypeName.link.prop`.
     PathSelect(IrPathSelect),
     Insert(IrInsert),
@@ -139,19 +140,7 @@ pub enum IrPathResult {
     Object { alias: String, type_name: String, shape: Vec<IrShapePointer> },
 }
 
-// ── FREE SELECT (expressions, set literals, tuples, free objects) ───────────────
-
-/// A SELECT that does not reference a schema type.
-/// Emitted as one or more UNION ALL branches with a ROW(…) wrapper.
-#[derive(Debug, Clone)]
-pub struct IrFreeSelect {
-    /// One item per UNION ALL branch (set literals expand to multiple items).
-    pub items: Vec<IrFreeExpr>,
-    pub order_by: Vec<IrSort>,
-    pub offset: Option<IrExpr>,
-    pub limit: Option<IrExpr>,
-    pub distinct: bool,
-}
+// ── FREE ROW EXPRESSIONS (set literals, tuples, free objects) ───────────────────
 
 #[derive(Debug, Clone)]
 pub enum IrFreeExpr {
@@ -189,8 +178,12 @@ pub enum IrArraySource {
 
 #[derive(Debug, Clone)]
 pub struct IrSelect {
-    pub source: IrSource,
-    pub shape: Vec<IrShapePointer>,
+    /// What each output row comes from. Almost always exactly one `Bound`
+    /// (a schema object) — more than one entry, or a `Free` entry, only
+    /// happens for a literal set/union (`select {1,2,3}`).
+    pub rows: Vec<IrRowSource>,
+    /// Only ever `Some` when `rows` is a single `Bound` — a free select can
+    /// never have a FILTER (enforced at compile time).
     pub filter: Option<IrExpr>,
     pub order_by: Vec<IrSort>,
     pub offset: Option<IrExpr>,
@@ -198,15 +191,48 @@ pub struct IrSelect {
     pub distinct: bool,
     /// When this SELECT wraps a DML statement (`SELECT (INSERT …) { … }`),
     /// the inner DML is stored here and emitted as a CTE.
-    /// `None` for plain `SELECT Type { … }`.
+    /// `None` for plain `SELECT Type { … }` and for any free select.
+    /// Only ever `Some` when `rows` is a single `Bound`.
     pub dml_source: Option<Box<IrStmt>>,
     /// True when this SELECT targets an interface type.
     /// The SQL emitter builds a UNION ALL inline instead of hitting the view.
+    /// Only meaningful when `rows` is a single `Bound`.
     pub polymorphic: bool,
     /// Concrete implementors of the interface (populated when `polymorphic = true`).
     pub poly_implementors: Vec<IrPolyImplementor>,
     /// Interface column names used in the UNION ALL branches (e.g. `["id", "email"]`).
     pub poly_columns: Vec<String>,
+}
+
+/// One SELECT output row's source — either a real schema object (with a
+/// FROM clause and projected column shape) or a free literal expression
+/// (set/tuple/free-object/scalar). Replaces the former `IrSelect`/
+/// `IrFreeSelect` type-level split: Gel/EdgeQL has no such distinction, and
+/// Pylon's version of it caused real bugs (the same logic reimplemented
+/// twice, independently, and drifting) before this merge.
+#[derive(Debug, Clone)]
+pub enum IrRowSource {
+    Bound { source: IrSource, shape: Vec<IrShapePointer> },
+    Free(IrFreeExpr),
+}
+
+impl IrSelect {
+    /// The overwhelming-majority shape: one schema-bound row, no DML, no
+    /// polymorphism — what most correlated-subquery/EXISTS builders want.
+    pub fn schema_bound(source: IrSource, shape: Vec<IrShapePointer>, filter: Option<IrExpr>) -> Self {
+        IrSelect {
+            rows: vec![IrRowSource::Bound { source, shape }],
+            filter,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct: false,
+            dml_source: None,
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
+        }
+    }
 }
 
 /// One concrete type that implements a polymorphic interface.
@@ -969,14 +995,34 @@ mod tests {
         super::compile(&ast, &schema).expect("IR compile failed")
     }
 
+    /// Extract the single schema-bound row's `(source, shape)` from a
+    /// `SELECT` — panics if the select isn't schema-bound (i.e. is a free
+    /// select), which is what most tests expect.
+    fn bound(sel: &IrSelect) -> (&IrSource, &[IrShapePointer]) {
+        match sel.rows.as_slice() {
+            [IrRowSource::Bound { source, shape }] => (source, shape),
+            _ => panic!("expected a single schema-bound row"),
+        }
+    }
+
+    /// Extract the free-row items from a `SELECT` — panics if any row is
+    /// schema-bound, which is what free-select tests expect.
+    fn free_items(sel: &IrSelect) -> Vec<&IrFreeExpr> {
+        sel.rows.iter().map(|r| match r {
+            IrRowSource::Free(item) => item,
+            IrRowSource::Bound { .. } => panic!("expected a free row"),
+        }).collect()
+    }
+
     #[test]
     fn test_select_resolves_source() {
         let ir = compile("SELECT Person { name, age }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        assert_eq!(sel.source.table, "person");
-        assert_eq!(sel.source.type_name, "default::Person");
-        assert_eq!(sel.shape.len(), 2);
-        assert!(matches!(sel.shape[0], IrShapePointer::Scalar(_)));
+        let (source, shape) = bound(&sel);
+        assert_eq!(source.table, "person");
+        assert_eq!(source.type_name, "default::Person");
+        assert_eq!(shape.len(), 2);
+        assert!(matches!(shape[0], IrShapePointer::Scalar(_)));
     }
 
     #[test]
@@ -991,20 +1037,22 @@ mod tests {
     fn test_select_single_link() {
         let ir = compile("SELECT Person { name, company { name } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        assert_eq!(sel.shape.len(), 2);
-        let IrShapePointer::SingleLink(link) = &sel.shape[1] else { panic!("expected SingleLink") };
+        let (_, shape) = bound(&sel);
+        assert_eq!(shape.len(), 2);
+        let IrShapePointer::SingleLink(link) = &shape[1] else { panic!("expected SingleLink") };
         assert_eq!(link.alias, "company");
         assert_eq!(link.fk_column, "company_id");
-        assert_eq!(link.subquery.source.table, "company");
+        assert_eq!(bound(&link.subquery).0.table, "company");
     }
 
     #[test]
     fn test_select_multi_link() {
         let ir = compile("SELECT Person { name, posts { title } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        let IrShapePointer::MultiLink(ml) = &sel.shape[1] else { panic!("expected MultiLink") };
+        let (_, shape) = bound(&sel);
+        let IrShapePointer::MultiLink(ml) = &shape[1] else { panic!("expected MultiLink") };
         assert_eq!(ml.alias, "posts");
-        assert_eq!(ml.subquery.source.table, "post");
+        assert_eq!(bound(&ml.subquery).0.table, "post");
         let IrMultiLinkJoin::Standard { junction_table, .. } = &ml.join else { panic!() };
         assert_eq!(junction_table, "person.posts");
     }
@@ -1014,8 +1062,9 @@ mod tests {
         let ir = compile("SELECT Person");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         // Bare SELECT Type returns only { id }, matching Gel semantics.
-        assert_eq!(sel.shape.len(), 1);
-        let IrShapePointer::Scalar(f) = &sel.shape[0] else { panic!() };
+        let (_, shape) = bound(&sel);
+        assert_eq!(shape.len(), 1);
+        let IrShapePointer::Scalar(f) = &shape[0] else { panic!() };
         assert_eq!(f.alias, "id");
     }
 
@@ -1024,9 +1073,10 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT {1, 2, 3}").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
-        assert_eq!(sel.items.len(), 3);
-        assert!(matches!(sel.items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(1)))));
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(1)))));
     }
 
     #[test]
@@ -1034,9 +1084,10 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT { foo := 'bar', n := 42 }").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
-        assert_eq!(sel.items.len(), 1);
-        let IrFreeExpr::FreeObject(fields) = &sel.items[0] else { panic!("expected FreeObject") };
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        assert_eq!(items.len(), 1);
+        let IrFreeExpr::FreeObject(fields) = &items[0] else { panic!("expected FreeObject") };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].0, "foo");
         assert_eq!(fields[1].0, "n");
@@ -1047,9 +1098,10 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT (1, 'hello')").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
-        assert_eq!(sel.items.len(), 1);
-        assert!(matches!(sel.items[0], IrFreeExpr::Tuple(_)));
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], IrFreeExpr::Tuple(_)));
     }
 
     #[test]
@@ -1057,9 +1109,10 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT 42").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
-        assert_eq!(sel.items.len(), 1);
-        assert!(matches!(sel.items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(42)))));
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(42)))));
     }
 
     #[test]
@@ -1067,8 +1120,9 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT str_lower('HELLO')").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::FreeSelect(sel) = ir.stmt else { panic!("expected FreeSelect") };
-        assert!(matches!(sel.items[0], IrFreeExpr::Scalar(IrExpr::FunctionCall(_))));
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        assert!(matches!(items[0], IrFreeExpr::Scalar(IrExpr::FunctionCall(_))));
     }
 
     #[test]
@@ -1161,7 +1215,8 @@ mod tests {
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         // upper_name should compile to a Computed shape pointer
-        assert!(sel.shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "upper_name")));
+        let (_, shape) = bound(&sel);
+        assert!(shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "upper_name")));
     }
 
     #[test]
@@ -1170,7 +1225,8 @@ mod tests {
         let ast = parse::parse("SELECT Person { x := str_lower(.upper_name) }").unwrap();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        assert!(sel.shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "x")));
+        let (_, shape) = bound(&sel);
+        assert!(shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "x")));
     }
 
     #[test]
@@ -1181,7 +1237,8 @@ mod tests {
         // properties/single-links, never multilinks.
         let ir = compile("SELECT Person { post_count := count(.posts) }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        let computed = sel.shape.iter().find_map(|f| match f {
+        let (_, shape) = bound(&sel);
+        let computed = shape.iter().find_map(|f| match f {
             IrShapePointer::Computed(c) if c.alias == "post_count" => Some(c),
             _ => None,
         }).expect("expected post_count computed pointer");
@@ -1259,9 +1316,10 @@ mod tests {
         let ast = parse::parse("SELECT 'hello'[1]").unwrap();
         let schema = make_schema();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        let items = free_items(&sel);
         assert!(matches!(
-            &fs.items[0],
+            items[0],
             IrFreeExpr::Scalar(IrExpr::Subscript { is_array: false, .. })
         ));
     }
@@ -1271,9 +1329,10 @@ mod tests {
         let ast = parse::parse("SELECT [1, 2, 3][0]").unwrap();
         let schema = make_schema();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        let items = free_items(&sel);
         assert!(matches!(
-            &fs.items[0],
+            items[0],
             IrFreeExpr::Scalar(IrExpr::Subscript { is_array: true, .. })
         ));
     }
@@ -1283,9 +1342,10 @@ mod tests {
         let ast = parse::parse("SELECT 'hello'[1:3]").unwrap();
         let schema = make_schema();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        let items = free_items(&sel);
         assert!(matches!(
-            &fs.items[0],
+            items[0],
             IrFreeExpr::Scalar(IrExpr::Slice { is_array: false, .. })
         ));
     }
@@ -1295,9 +1355,10 @@ mod tests {
         let ast = parse::parse("SELECT [1, 2, 3][0:2]").unwrap();
         let schema = make_schema();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!() };
+        let IrStmt::Select(sel) = ir.stmt else { panic!() };
+        let items = free_items(&sel);
         assert!(matches!(
-            &fs.items[0],
+            items[0],
             IrFreeExpr::Scalar(IrExpr::Slice { is_array: true, .. })
         ));
     }
@@ -1331,8 +1392,9 @@ mod tests {
         let schema = make_schema_with_sequence();
         let ast = parse::parse(query).expect("parse failed");
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::FreeSelect(fs) = ir.stmt else { panic!("expected FreeSelect") };
-        let IrFreeExpr::Scalar(expr) = &fs.items[0] else { panic!("expected scalar") };
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
         crate::sql::emit_expr(expr)
     }
 
