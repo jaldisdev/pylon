@@ -37,4 +37,4 @@ def serve(ctx: click.Context, host: str | None, port: int | None, ui_enabled: bo
 
     config = dataclasses.replace(config, webserver=webserver, ui=ui)
 
-    uvicorn.run(create_app(config), host=webserver.host, port=webserver.port)
+    uvicorn.run(create_app(config), host=webserver.host, port=webserver.port, server_header=False)
