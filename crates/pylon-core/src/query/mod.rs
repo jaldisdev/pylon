@@ -79,6 +79,15 @@ pub enum ShapeNode {
         position: usize,
         type_name: Option<String>,
         members: Option<Vec<JsonMember>>,
+        /// True when this value came from `{ x := 1.0 }` (curly-brace free-
+        /// object syntax) rather than `(x := 1.0)` (paren tuple syntax) —
+        /// decoded identically either way (both are jsonb), but the
+        /// frontend's own value-shape-tag tree (pylon/query.py's
+        /// shape_value_tags) uses this to tell the Python API layer to
+        /// describe it as an "object" rather than a "namedTuple", so
+        /// JsonTree renders the upstream engine's `Object {x: 1.0}` instead of a
+        /// non-expandable `(x := 1.0)` tuple literal.
+        is_free_object: bool,
     },
     /// Enum value arrived as text; hydrated to the Python enum class keyed by `enum_type`.
     Enum {

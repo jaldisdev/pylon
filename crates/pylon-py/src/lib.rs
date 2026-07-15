@@ -1856,11 +1856,12 @@ fn shape_node_to_py<'py>(
         ShapeNode::JsonScalar => {
             d.set_item("kind", "json_scalar")?;
         }
-        ShapeNode::NamedTuple { name, position, type_name, members } => {
+        ShapeNode::NamedTuple { name, position, type_name, members, is_free_object } => {
             d.set_item("kind", "named_tuple")?;
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
             d.set_item("type_name", type_name.as_deref())?;
+            d.set_item("is_free_object", *is_free_object)?;
             match members {
                 Some(ms) => {
                     let py_members = PyList::new(

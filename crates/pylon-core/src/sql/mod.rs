@@ -840,7 +840,7 @@ fn is_integer_expr(expr: &IrExpr) -> bool {
 fn is_raw_scalar(expr: &IrExpr) -> bool {
     matches!(expr, IrExpr::Array(_))
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
-        || matches!(expr, IrExpr::NamedTuple(_))
+        || matches!(expr, IrExpr::NamedTuple { .. })
         || matches!(expr, IrExpr::Tuple(_))
         || matches!(expr, IrExpr::JsonbField { .. })
         || matches!(expr, IrExpr::JsonbIndex { .. })
@@ -1000,14 +1000,16 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                 position,
                 type_name: shape.type_name.clone(),
                 members: Some(shape.members.clone()),
+                is_free_object: false,
             }
         }
         IrExpr::TypeCast(c) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
-        IrExpr::NamedTuple(_) => ShapeNode::NamedTuple {
+        IrExpr::NamedTuple { is_free_object, .. } => ShapeNode::NamedTuple {
             name: name.to_string(),
             position,
             type_name: None,
             members: None,
+            is_free_object: *is_free_object,
         },
         e if is_raw_scalar(e) => ShapeNode::RawScalar,
         e => free_field_shape_node(name, position, e),
@@ -1275,7 +1277,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     let (result_expr, shape_root) = match &sel.result {
         IrPathResult::Scalar(ir_expr, tuple_shape) => {
             // Named tuples / jsonb field accesses can't be decoded inside ROW() — emit raw.
-            let is_nt = matches!(ir_expr, IrExpr::NamedTuple(_))
+            let is_nt = matches!(ir_expr, IrExpr::NamedTuple { .. })
                 || matches!(ir_expr, IrExpr::Tuple(_))
                 || matches!(ir_expr, IrExpr::JsonbField { .. })
                 || matches!(ir_expr, IrExpr::JsonbIndex { .. })
@@ -1296,6 +1298,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                         position: 0,
                         type_name: shape.type_name.clone(),
                         members: Some(shape.members.clone()),
+                        is_free_object: false,
                     }
                 } else {
                     let type_name = match ir_expr {
@@ -1303,7 +1306,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                             pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
                         _ => None,
                     };
-                    ShapeNode::NamedTuple { name: String::new(), position: 0, type_name, members: None }
+                    ShapeNode::NamedTuple { name: String::new(), position: 0, type_name, members: None, is_free_object: false }
                 };
                 (expr_sql, shape)
             } else {
@@ -1968,6 +1971,7 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
             position: pos,
             type_name: Some(nt_name.to_string()),
             members: f.tuple_shape.as_ref().map(|s| s.members.clone()),
+            is_free_object: false,
         });
     }
     // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to asyncpg's
@@ -1995,6 +1999,7 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
             position: pos,
             type_name: shape.type_name.clone(),
             members: Some(shape.members.clone()),
+            is_free_object: false,
         });
     }
     let sql = if table_alias.is_empty() {
@@ -2337,7 +2342,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("(SELECT \"value\" FROM \"{}\")", cte_name)
         }
 
-        IrExpr::NamedTuple(fields) => {
+        IrExpr::NamedTuple { fields, .. } => {
             let pairs: Vec<String> = fields.iter()
                 .flat_map(|(k, v)| [format!("'{}'", k.replace('\'', "''")), emit_expr(v)])
                 .collect();

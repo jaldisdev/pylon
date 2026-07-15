@@ -543,7 +543,13 @@ pub enum IrExpr {
     /// An enum member access: `default::Gender.Female` → `'Female'::"default"."Gender"`.
     EnumLiteral { pg_type: String, variant: String },
     /// Named tuple construction: `(x := 1.0, y := 2.0)` → `jsonb_build_object('x', 1.0, 'y', 2.0)`.
-    NamedTuple(Vec<(String, IrExpr)>),
+    /// `is_free_object` is true when this actually came from `{ x := 1.0 }`
+    /// (curly-brace shape syntax, no subject) rather than `(x := 1.0)`
+    /// (paren tuple syntax) — same jsonb encoding/decoding either way, but
+    /// the frontend needs to know which one it was to render the upstream engine's
+    /// `Object {x: 1.0}` vs `(x := 1.0)` literal display correctly (see
+    /// ShapeNode::NamedTuple's own is_free_object).
+    NamedTuple { fields: Vec<(String, IrExpr)>, is_free_object: bool },
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
     Tuple(Vec<IrExpr>),
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.

@@ -979,7 +979,7 @@ impl<'a> Compiler<'a> {
                 .zip(casted)
                 .map(|(e, v)| (e.name.clone().unwrap(), v))
                 .collect();
-            Ok(Some(IrExpr::NamedTuple(fields)))
+            Ok(Some(IrExpr::NamedTuple { fields, is_free_object: false }))
         } else {
             Ok(Some(IrExpr::Tuple(casted)))
         }
@@ -2234,7 +2234,7 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                vec![IrFreeExpr::Scalar(IrExpr::NamedTuple(ir))]
+                vec![IrFreeExpr::Scalar(IrExpr::NamedTuple { fields: ir, is_free_object: false })]
             }
             other => vec![IrFreeExpr::Scalar(self.compile_free_expr(other)?)],
         };
@@ -4003,7 +4003,7 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|(name, e)| Ok((name.clone(), self.compile_expr_ctx(e, ctx)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                Ok(IrExpr::NamedTuple(ir))
+                Ok(IrExpr::NamedTuple { fields: ir, is_free_object: false })
             }
 
             Expr::Tuple(elems) => {
@@ -4121,6 +4121,11 @@ impl<'a> Compiler<'a> {
             // schema-bound nested free object can still reference `.name`
             // etc.), just wrapped as `IrExpr::NamedTuple` (jsonb) instead of
             // a whole result row, since here it's a value, not a row source.
+            // is_free_object: true — this came from curly-brace shape syntax,
+            // not a paren tuple literal, so the value-shape-tag tree
+            // (pylon/query.py's shape_value_tags) can tell the frontend to
+            // render it as an expandable "Object {...}", not a `(...)`
+            // tuple literal (see ShapeNode::NamedTuple's own doc comment).
             Expr::Shape(s) if s.expr.is_none() => {
                 let fields = s
                     .elements
@@ -4135,7 +4140,7 @@ impl<'a> Compiler<'a> {
                         Ok((name, self.compile_expr_ctx(expr, ctx)?))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::NamedTuple(fields))
+                Ok(IrExpr::NamedTuple { fields, is_free_object: true })
             }
 
             // A bare shape or set literal is never valid in expression
@@ -6160,7 +6165,7 @@ fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             IrLiteral::Bool(_) => "boolean",
         }),
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
-        IrExpr::NamedTuple(_) => Some("jsonb"),
+        IrExpr::NamedTuple { .. } => Some("jsonb"),
         IrExpr::GlobalParam { pg_type, .. } => Some(pg_type.as_str()),
         _ => None,
     }
@@ -6263,8 +6268,11 @@ pub(super) fn substitute_col_refs(
         IrExpr::Array(elems) => {
             IrExpr::Array(elems.into_iter().map(|e| substitute_col_refs(e, bindings)).collect())
         }
-        IrExpr::NamedTuple(fields) => {
-            IrExpr::NamedTuple(fields.into_iter().map(|(k, v)| (k, substitute_col_refs(v, bindings))).collect())
+        IrExpr::NamedTuple { fields, is_free_object } => {
+            IrExpr::NamedTuple {
+                fields: fields.into_iter().map(|(k, v)| (k, substitute_col_refs(v, bindings))).collect(),
+                is_free_object,
+            }
         }
         // Literals, Params, Subqueries — no column refs to substitute
         other => other,
