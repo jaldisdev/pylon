@@ -1148,7 +1148,7 @@ impl<'a> Compiler<'a> {
                                     offset: s.offset.clone(),
                                     limit: s.limit.clone(),
                                 };
-                                return self.compile_select(&synthetic, distinct).map(IrStmt::Select);
+                                return self.compile_select(&synthetic, &synthetic.result, distinct).map(IrStmt::Select);
                             }
                         }
                     }
@@ -1310,9 +1310,9 @@ impl<'a> Compiler<'a> {
                     return Err(e);
                 }
                 if self.is_free_result(result) {
-                    self.compile_free_select(s, distinct).map(IrStmt::FreeSelect)
+                    self.compile_free_select(s, result, distinct).map(IrStmt::FreeSelect)
                 } else {
-                    self.compile_select(s, distinct).map(IrStmt::Select)
+                    self.compile_select(s, result, distinct).map(IrStmt::Select)
                 }
             }
             Stmt::Insert(s) => self.compile_insert(s).map(IrStmt::Insert),
@@ -1366,7 +1366,7 @@ impl<'a> Compiler<'a> {
             offset: sel.offset.clone(),
             limit: sel.limit.clone(),
         };
-        self.compile_select(&synthetic, false)
+        self.compile_select(&synthetic, &synthetic.result, false)
     }
 
     // ── PATH SELECT ───────────────────────────────────────────────────────────────
@@ -2161,16 +2161,12 @@ impl<'a> Compiler<'a> {
     fn compile_free_select(
         &mut self,
         sel: &ast::SelectStmt,
+        result_expr: &Expr,
         distinct: bool,
     ) -> Result<IrFreeSelect, PyQLError> {
         if sel.filter.is_some() {
             return Err(self.type_err("FILTER is not supported on free SELECT expressions"));
         }
-
-        let result_expr = match &sel.result {
-            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
-            other => other,
-        };
 
         let items: Vec<IrFreeExpr> = match result_expr {
             Expr::Union(_, _) | Expr::Set(_) => {
@@ -2248,19 +2244,7 @@ impl<'a> Compiler<'a> {
         let order_by = sel
             .order_by
             .iter()
-            .map(|s| -> Result<IrSort, PyQLError> {
-                Ok(IrSort {
-                    expr: self.compile_free_expr(&s.expr)?,
-                    direction: match s.direction {
-                        SortDirection::Asc => IrSortDir::Asc,
-                        SortDirection::Desc => IrSortDir::Desc,
-                    },
-                    nulls: match s.nones {
-                        NonesOrder::First => IrNulls::First,
-                        NonesOrder::Last => IrNulls::Last,
-                    },
-                })
-            })
+            .map(|s| self.compile_sort_ctx(s, None))
             .collect::<Result<Vec<_>, _>>()?;
 
         let offset = sel
@@ -2279,12 +2263,7 @@ impl<'a> Compiler<'a> {
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
 
-    fn compile_select(&mut self, sel: &ast::SelectStmt, distinct: bool) -> Result<IrSelect, PyQLError> {
-        let result_expr = match &sel.result {
-            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => &u.operand,
-            Expr::Detached(inner) => inner.as_ref(),
-            other => other,
-        };
+    fn compile_select(&mut self, sel: &ast::SelectStmt, result_expr: &Expr, distinct: bool) -> Result<IrSelect, PyQLError> {
         let (type_name, shape_elements, inner_stmt, cte_name) =
             self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
@@ -3962,7 +3941,7 @@ impl<'a> Compiler<'a> {
                             if let Some(d) = best {
                                 if let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy {
                                     let fn_name = sql_name.to_string();
-                                    let inner_ir = self.compile_select(&sel, false)?;
+                                    let inner_ir = self.compile_select(&sel, &sel.result, false)?;
                                     return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner_ir) });
                                 }
                             }
@@ -5249,14 +5228,16 @@ impl<'a> Compiler<'a> {
         })))
     }
 
-    fn compile_sort(
+    /// Shared `IrSort` builder for both schema-bound (`compile_sort`) and
+    /// free (`compile_free_select`'s order-by) contexts — direction/nulls
+    /// translation is identical either way, only the expr compiler ctx differs.
+    fn compile_sort_ctx(
         &mut self,
         s: &ast::SortExpr,
-        td: &TypeDescriptor,
-        alias: &str,
+        ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrSort, PyQLError> {
         Ok(IrSort {
-            expr: self.compile_expr(&s.expr, td, alias)?,
+            expr: self.compile_expr_ctx(&s.expr, ctx)?,
             direction: match s.direction {
                 SortDirection::Asc => IrSortDir::Asc,
                 SortDirection::Desc => IrSortDir::Desc,
@@ -5266,6 +5247,15 @@ impl<'a> Compiler<'a> {
                 NonesOrder::Last => IrNulls::Last,
             },
         })
+    }
+
+    fn compile_sort(
+        &mut self,
+        s: &ast::SortExpr,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrSort, PyQLError> {
+        self.compile_sort_ctx(s, Some((td, alias)))
     }
 
     // ── Stdlib function resolution ────────────────────────────────────────────────
