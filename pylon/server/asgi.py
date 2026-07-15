@@ -443,6 +443,13 @@ def _build_type_entry(cls: type, enum_classes: set[type], named_tuple_classes: s
         # concrete subtypes) — lets the Data Explorer offer a subtype
         # picker when inserting into an abstract/interface type.
         "abstract": cls.__pylon_config__.abstract,
+        # A junction type (@pylon.junction) backs a through-typed multi-link's
+        # link-property storage — entirely compiler-managed (never inserted/
+        # queried directly by a user), so the Data Explorer's own type picker
+        # filters these out, even though schema.types itself still needs to
+        # list them (e.g. link-property editing looks up a through-type's own
+        # pointers by name).
+        "junction": cls.__pylon_config__.junction,
         "bases": [_type_qualname(base) for base in cls.__bases__ if hasattr(base, "__pylon_config__")],
         "pointers": [
             {
