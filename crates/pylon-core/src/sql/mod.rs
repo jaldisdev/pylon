@@ -984,27 +984,40 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
     }
 }
 
-fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
-    use crate::query::{Cardinality, ShapeNode};
-    match item {
-        IrFreeExpr::Scalar(IrExpr::TypeCast(c)) if c.tuple_shape.is_some() => {
+/// Shape node for an arbitrary compiled expression appearing at a shape
+/// position (a computed pointer, or a free scalar/tuple/object field) —
+/// `NamedTuple`/`JsonScalar` when the expression produces jsonb (tuple
+/// literals, nested free objects, tuple-typed casts), `RawScalar` when
+/// asyncpg can't decode it inside an anonymous ROW() composite, `Enum` when
+/// enum-typed, else a plain `Scalar`.
+fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
+    use crate::query::ShapeNode;
+    match expr {
+        IrExpr::TypeCast(c) if c.tuple_shape.is_some() => {
             let shape = c.tuple_shape.as_ref().unwrap();
             ShapeNode::NamedTuple {
-                name: String::new(),
-                position: 0,
+                name: name.to_string(),
+                position,
                 type_name: shape.type_name.clone(),
                 members: Some(shape.members.clone()),
             }
         }
-        IrFreeExpr::Scalar(IrExpr::TypeCast(c)) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
-        IrFreeExpr::Scalar(IrExpr::NamedTuple(_)) => ShapeNode::NamedTuple {
-            name: String::new(),
-            position: 0,
+        IrExpr::TypeCast(c) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
+        IrExpr::NamedTuple(_) => ShapeNode::NamedTuple {
+            name: name.to_string(),
+            position,
             type_name: None,
             members: None,
         },
-        IrFreeExpr::Scalar(e) if is_raw_scalar(e) => ShapeNode::RawScalar,
-        IrFreeExpr::Scalar(e) => free_field_shape_node("", 0, e),
+        e if is_raw_scalar(e) => ShapeNode::RawScalar,
+        e => free_field_shape_node(name, position, e),
+    }
+}
+
+fn free_item_shape(item: &IrFreeExpr) -> crate::query::ShapeNode {
+    use crate::query::{Cardinality, ShapeNode};
+    match item {
+        IrFreeExpr::Scalar(e) => expr_shape_node("", 0, e),
         IrFreeExpr::FreeObject(fields) => ShapeNode::Object {
             name: String::new(),
             type_name: None,
@@ -1917,7 +1930,7 @@ fn build_shape(
             }
             IrShapePointer::Computed(f) => {
                 exprs.push(emit_expr(&f.expr));
-                nodes.push(ShapeNode::Scalar { name: f.alias.clone(), position: pos });
+                nodes.push(expr_shape_node(&f.alias, pos, &f.expr));
             }
             IrShapePointer::ScalarSet(f) => {
                 let (sql, node) = emit_scalar_set(f, pos);

@@ -4113,6 +4113,31 @@ impl<'a> Compiler<'a> {
                 }
             }
 
+            // A free object literal (`{ foo := 'bar' }`, no subject type) is
+            // valid anywhere an expression is, not just as a whole SELECT's
+            // result — e.g. nested inside a computed shape element. Compiled
+            // the same way `compile_free_select` treats it at the top level
+            // (each field compiled independently, ctx propagated so a
+            // schema-bound nested free object can still reference `.name`
+            // etc.), just wrapped as `IrExpr::NamedTuple` (jsonb) instead of
+            // a whole result row, since here it's a value, not a row source.
+            Expr::Shape(s) if s.expr.is_none() => {
+                let fields = s
+                    .elements
+                    .iter()
+                    .map(|el| -> Result<(String, IrExpr), PyQLError> {
+                        let name = path_leaf(&el.path)?.to_string();
+                        let expr = el.compexpr.as_ref().ok_or_else(|| {
+                            self.type_err(
+                                "free object field must have a value expression (':= expr')",
+                            )
+                        })?;
+                        Ok((name, self.compile_expr_ctx(expr, ctx)?))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(IrExpr::NamedTuple(fields))
+            }
+
             // A bare shape or set literal is never valid in expression
             // position, in either context — preserved exactly as the
             // schema-bound side always enforced (the free side's more
