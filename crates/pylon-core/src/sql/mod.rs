@@ -2958,6 +2958,25 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_select_distinct_emits_distinct_keyword() {
+        // Regression: compile_stmt's Distinct/Detached unwrap and
+        // compile_select's own re-derivation of the same unwrap were merged
+        // into a single pass-through (Phase 2 of the compile_expr merge) —
+        // confirm `select distinct` still compiles and emits DISTINCT.
+        let out = compile_and_emit("SELECT DISTINCT Person { name }");
+        assert!(out.sql.contains("DISTINCT"), "expected DISTINCT in SQL:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_schema_select_detached_compiles_as_ordinary_select() {
+        // Same merge — `detached` at the top level of a schema select is a
+        // no-op (already independent); confirm it still compiles cleanly
+        // instead of erroring or double-unwrapping.
+        let out = compile_and_emit("SELECT DETACHED Person { name }");
+        assert!(out.sql.contains("\"name\""), "expected name column in SQL:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_free_select_tuple() {
         let schema = make_schema();
         let ast = parse::parse("SELECT (1, 2)").unwrap();
