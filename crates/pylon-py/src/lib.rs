@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 use pyo3::PyTypeInfo;
 use pylon_core as core;
 
+mod cache;
+
 // ── Exception hierarchy ────────────────────────────────────────────────────────
 
 pyo3::create_exception!(
@@ -88,6 +90,12 @@ pyo3::create_exception!(
     PylonInvalidValueError,
     PylonExecutionError,
     "Invalid value for a type (e.g. out-of-range, bad format)."
+);
+pyo3::create_exception!(
+    pylon._core,
+    PylonCacheError,
+    pyo3::exceptions::PyException,
+    "Raised on a cache storage failure (LMDB, serialization, or value encoding)."
 );
 
 // ── Deletion policy ────────────────────────────────────────────────────────────
@@ -1372,6 +1380,14 @@ impl CompiledQuery {
         pyo3::types::PyList::new(py, &self.inner.warnings).unwrap()
     }
 
+    /// Schema-qualified tables (`"schema.table"`) this statement reads from or
+    /// writes to. For a SELECT, the tags to cache the result under; for an
+    /// INSERT/UPDATE/DELETE, the tags a cache layer must invalidate on commit.
+    #[getter]
+    fn tags<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
+        pyo3::types::PyList::new(py, &self.inner.tags).unwrap()
+    }
+
     /// Returns an `InferencePlan` dict if this query requires a pre-execution model call,
     /// or `None` for pure-SQL queries. The dict always has a `"kind"` key: `"search"` or `"embedding"`.
     #[getter]
@@ -1951,6 +1967,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PylonCardinalityViolationError", PylonCardinalityViolationError::type_object(py))?;
     m.add("PylonMissingRequiredError", PylonMissingRequiredError::type_object(py))?;
     m.add("PylonInvalidValueError", PylonInvalidValueError::type_object(py))?;
+    m.add("PylonCacheError", PylonCacheError::type_object(py))?;
 
     // Deletion policy
     m.add_class::<OnDeletePolicy>()?;
@@ -2017,6 +2034,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
     m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;
+
+    // Cache
+    cache::register(m)?;
 
     Ok(())
 }
