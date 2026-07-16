@@ -22,6 +22,10 @@ fn pg_type(ty: &PylonType) -> String {
         LocalDate => "date".into(),
         LocalTime => "time".into(),
         Vector => "vector".into(),
+        Geometry => "geometry".into(),
+        Geography => "geography".into(),
+        Box2D => "box2d".into(),
+        Box3D => "box3d".into(),
         Any | AnyOrderable | AnyPoint => "anyelement".into(),
         Array(inner) => match inner.as_ref() {
             Any | AnyOrderable | AnyPoint => "anyarray".into(),

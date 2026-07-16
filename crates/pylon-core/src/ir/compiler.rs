@@ -1201,7 +1201,7 @@ impl<'a> Compiler<'a> {
                 if let Expr::Shape(sh) = result {
                     if let Some(Expr::TypeCast(tc)) = sh.expr.as_ref() {
                         if let Some((module, name)) = tc.ty.as_named() {
-                            if module.map(|m| !["std","cal","math","sys","pgvector","crypto"].contains(&m)).unwrap_or(false) {
+                            if module.map(|m| !["std","cal","math","sys","pgvector","crypto","postgis"].contains(&m)).unwrap_or(false) {
                                 let id_filter = Expr::BinOp(Box::new(ast::BinOp {
                                     left: Expr::Path(ast::Path::relative("id")),
                                     op: ast::BinOpKind::Eq,
@@ -1234,7 +1234,7 @@ impl<'a> Compiler<'a> {
                 // (enum, registered named tuple, or a bare structural `tuple<...>`).
                 // Stdlib modules are handled by compile_free_expr; only user schema
                 // modules (or a structural tuple, which has no module at all) route here.
-                const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector", "crypto"];
+                const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector", "crypto", "postgis"];
                 if let Expr::TypeCast(tc) = result {
                     // A structural tuple cast is always a plain scalar (jsonb) cast —
                     // never an object-type lookup — so it's handled directly, before
@@ -6176,6 +6176,22 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
             "vector" => Ok("vector".to_string()),
             other => Err(PyQLError::Type(PyQLTypeError {
                 message: format!("unknown pgvector type '{other}'; valid types are: vector"),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+    }
+
+    // postgis:: types map directly to PostgreSQL types.
+    if module == Some("postgis") {
+        return match bare_name {
+            "geometry" => Ok("geometry".to_string()),
+            "geography" => Ok("geography".to_string()),
+            "box2d" => Ok("box2d".to_string()),
+            "box3d" => Ok("box3d".to_string()),
+            other => Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "unknown postgis type '{other}'; valid types are: geometry, geography, box2d, box3d"
+                ),
                 position: Position { line: 0, col: 0 },
             })),
         };
