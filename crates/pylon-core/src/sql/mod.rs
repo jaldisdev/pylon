@@ -4215,6 +4215,78 @@ mod tests {
         assert!(out.sql.contains("crypt("), "expected pgcrypto's crypt(), got:\n{}", out.sql);
     }
 
+    #[test]
+    fn test_postgis_cast_emits_geometry_type() {
+        let out = compile_and_emit("SELECT <postgis::geometry>'POINT(1 2)'");
+        assert!(out.sql.contains("::geometry"), "expected ::geometry cast, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_postgis_x_uses_st_x_builtin() {
+        let out = compile_and_emit("SELECT postgis::x(<postgis::geometry>'POINT(1 2)')");
+        assert!(out.sql.contains("st_x("), "expected st_x() call, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_postgis_area_geometry_and_geography_overloads() {
+        let out = compile_and_emit("SELECT postgis::area(<postgis::geometry>'POINT(1 2)')");
+        assert!(out.sql.contains("st_area("), "expected st_area() call, got:\n{}", out.sql);
+
+        let out = compile_and_emit(
+            "SELECT postgis::area(<postgis::geography>'POINT(1 2)', true)",
+        );
+        assert!(out.sql.contains("st_area("), "expected st_area() call, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_postgis_setsrid_casts_int64_arg_to_int4() {
+        let out = compile_and_emit("SELECT postgis::setsrid(<postgis::geometry>'POINT(1 2)', 4326)");
+        assert!(out.sql.contains("st_setsrid("), "expected st_setsrid() call, got:\n{}", out.sql);
+        assert!(out.sql.contains("::int4"), "expected int8 -> int4 narrowing cast, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_postgis_quantizecoordinates_default_arity_variants_compile() {
+        // The upstream engine documents this with 3 trailing optional params; Pylon has no
+        // notion of default args, so each arity is its own registered
+        // overload — confirm both the 2-arg and 4-arg forms resolve.
+        let out = compile_and_emit(
+            "SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5)",
+        );
+        assert!(out.sql.contains("st_quantizecoordinates("), "got:\n{}", out.sql);
+
+        let out = compile_and_emit(
+            "SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5, 5, 5)",
+        );
+        assert!(out.sql.contains("st_quantizecoordinates("), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_postgis_op_contains_emits_infix_operator_not_function_call() {
+        // Regression: ImplStrategy::SqlOperator was never actually consulted
+        // by resolve_fn_call — it fell through to the generic "schema.name(args)"
+        // FunctionCall path, which would have emitted a nonexistent
+        // `"postgis".op_contains(...)` call instead of the `~` operator.
+        let out = compile_and_emit(
+            "SELECT postgis::op_contains(<postgis::geometry>'POINT(1 2)', <postgis::geometry>'POINT(3 4)')",
+        );
+        assert!(out.sql.contains(" ~ "), "expected infix ~ operator, got:\n{}", out.sql);
+        assert!(!out.sql.contains("op_contains("), "must not call a literal op_contains function, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_postgis_op_overlaps_geometry_and_geography_overloads() {
+        let out = compile_and_emit(
+            "SELECT postgis::op_overlaps(<postgis::geometry>'POINT(1 2)', <postgis::geometry>'POINT(3 4)')",
+        );
+        assert!(out.sql.contains(" && "), "expected infix && operator, got:\n{}", out.sql);
+
+        let out = compile_and_emit(
+            "SELECT postgis::op_overlaps(<postgis::geography>'POINT(1 2)', <postgis::geography>'POINT(3 4)')",
+        );
+        assert!(out.sql.contains(" && "), "expected infix && operator, got:\n{}", out.sql);
+    }
+
     // ── User-defined function tests ───────────────────────────────────────────
 
     fn make_schema_with_fns() -> SchemaDescriptor {

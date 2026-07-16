@@ -5406,7 +5406,15 @@ impl<'a> Compiler<'a> {
                     (None, name.to_string(), Some(tmpl.to_string())),
                 ImplStrategy::PylonFunction(def) =>
                     (Some("_pylon".to_string()), def.name.to_string(), None),
-                // SqlOperator / TranspilerIntrinsic: pass through; handled elsewhere
+                // Binary infix operator: emit as a template so sql/mod.rs's
+                // generic FunctionCall path (which only ever calls
+                // `schema.name(args)`) doesn't swallow the operator symbol —
+                // previously unreachable in practice (only `std::overlaps`
+                // used this strategy, untested, and would have silently
+                // resolved to a nonexistent `"std".overlaps(...)` call).
+                ImplStrategy::SqlOperator(op) if args.len() == 2 =>
+                    (None, name.to_string(), Some(format!("($1 {op} $2)"))),
+                // TranspilerIntrinsic: pass through; handled elsewhere
                 _ => (module.map(str::to_string), name.to_string(), None),
             }
         } else {
