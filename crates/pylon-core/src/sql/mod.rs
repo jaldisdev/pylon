@@ -4171,6 +4171,50 @@ mod tests {
         assert!(out.sql.contains("0.0"), "expected negation of <#>, got:\n{}", out.sql);
     }
 
+    #[test]
+    fn test_crypto_digest_str_and_bytes_overloads_both_use_pgcrypto_digest() {
+        let out = compile_and_emit("SELECT crypto::digest('hello', 'sha256')");
+        assert!(out.sql.contains("digest("), "expected pgcrypto's digest(), got:\n{}", out.sql);
+
+        let out = compile_and_emit("SELECT crypto::digest(std::from_hex('68656c6c6f'), 'sha256')");
+        assert!(out.sql.contains("digest("), "expected pgcrypto's digest(), got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_crypto_hmac_str_and_bytes_overloads_both_use_pgcrypto_hmac() {
+        let out = compile_and_emit("SELECT crypto::hmac('hello', 'key', 'sha256')");
+        assert!(out.sql.contains("hmac("), "expected pgcrypto's hmac(), got:\n{}", out.sql);
+
+        let out = compile_and_emit(
+            "SELECT crypto::hmac(std::from_hex('68656c6c6f'), std::from_hex('6b6579'), 'sha256')",
+        );
+        assert!(out.sql.contains("hmac("), "expected pgcrypto's hmac(), got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_crypto_gen_salt_zero_arg_defaults_to_blowfish() {
+        let out = compile_and_emit("SELECT crypto::gen_salt()");
+        assert!(out.sql.contains("gen_salt('bf')"), "expected default 'bf' salt type, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_crypto_gen_salt_one_arg_passes_type_through() {
+        let out = compile_and_emit("SELECT crypto::gen_salt('xdes')");
+        assert!(out.sql.contains("gen_salt("), "expected gen_salt() call, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_crypto_gen_salt_iter_count_casts_to_int4() {
+        let out = compile_and_emit("SELECT crypto::gen_salt('xdes', 5)");
+        assert!(out.sql.contains("::int4"), "expected int8 -> int4 narrowing cast, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_crypto_crypt_uses_pgcrypto_crypt() {
+        let out = compile_and_emit("SELECT crypto::crypt('hunter2', crypto::gen_salt())");
+        assert!(out.sql.contains("crypt("), "expected pgcrypto's crypt(), got:\n{}", out.sql);
+    }
+
     // ── User-defined function tests ───────────────────────────────────────────
 
     fn make_schema_with_fns() -> SchemaDescriptor {
