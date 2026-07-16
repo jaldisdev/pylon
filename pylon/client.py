@@ -282,6 +282,8 @@ class Client:
                 raise ConnectionTimeoutError(
                     "Timed out while connecting to PostgreSQL."
                 ) from exc
+            from pylon import cache as _cache
+            _cache.init(self._config.cache)
 
     async def aclose(self) -> None:
         """Close the connection pool and release all resources."""
@@ -364,6 +366,12 @@ class Client:
         )
         if self._warnings:
             _emit_warnings(compiled)
+
+        from pylon import cache as _cache
+        cached = _cache.get(compiled, params, self._config.cache)
+        if cached is not None:
+            return _hydrate(cached, compiled)
+
         try:
             async with pool.acquire() as conn:
                 records = list(await conn.fetch(sql, *params))
@@ -373,6 +381,7 @@ class Client:
             raise TransactionDeadlockError(str(exc)) from exc
         except asyncpg.PostgresError as exc:
             raise _fmt_pg_error(exc) from exc
+        _cache.put(compiled, params, records, self._config.cache)
         return _hydrate(records, compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
@@ -387,6 +396,18 @@ class Client:
         )
         if self._warnings:
             _emit_warnings(compiled)
+
+        from pylon import cache as _cache
+        cached = _cache.get(compiled, params, self._config.cache)
+        if cached is not None:
+            if len(cached) > 1:
+                raise ResultCardinalityError(
+                    f"query_single expected at most one result, got {len(cached)}."
+                )
+            if not cached:
+                return None
+            return _hydrate(cached, compiled)[0]
+
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(sql, *params)
@@ -400,9 +421,11 @@ class Client:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
             )
-        if not rows:
+        records = list(rows)
+        _cache.put(compiled, params, records, self._config.cache)
+        if not records:
             return None
-        return _hydrate(list(rows), compiled)[0]
+        return _hydrate(records, compiled)[0]
 
     async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Execute *pyql* and return exactly one result.
@@ -435,14 +458,22 @@ class Client:
         Returns ``"[]"`` when the result set is empty.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+
+        from pylon import cache as _cache
+        hit, cached = _cache.get_json(compiled, params, self._config.cache, kind="json_all")
+        if hit:
+            return cached if cached is not None else "[]"
+
         async with pool.acquire() as conn:
-            return (
+            value = (
                 await conn.fetchval(
                     f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
                 )
                 or "[]"
             )
+        _cache.put_json(compiled, params, value, self._config.cache, kind="json_all")
+        return value
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Execute *pyql* and return at most one result as a JSON string, or ``None``.
@@ -451,7 +482,13 @@ class Client:
         object matches.
         """
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+
+        from pylon import cache as _cache
+        hit, cached = _cache.get_json(compiled, params, self._config.cache, kind="json_single")
+        if hit:
+            return cached
+
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         if len(rows) > 1:
@@ -459,11 +496,14 @@ class Client:
                 f"query_single_json expected at most one result, got {len(rows)}."
             )
         if not rows:
+            _cache.put_json(compiled, params, None, self._config.cache, kind="json_single")
             return None
         async with pool.acquire() as conn:
-            return await conn.fetchval(
+            value = await conn.fetchval(
                 f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
             )
+        _cache.put_json(compiled, params, value, self._config.cache, kind="json_single")
+        return value
 
     async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return exactly one result as a JSON string.

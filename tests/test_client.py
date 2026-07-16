@@ -257,20 +257,29 @@ class TestHydrate:
 # ---------------------------------------------------------------------------
 
 
-def _fake_compiled(sql: str = "SELECT 1"):
+def _fake_compiled(sql: str = "SELECT 1", tags: list[str] | None = None):
     c = MagicMock()
     c.sql = sql
     c.inference_plan = None
+    c.tags = tags if tags is not None else []
     return c
 
 
-def _client_with_pool(pool: MagicMock):
-    """Return a Client whose internal pool is already set to *pool*."""
+def _client_with_pool(pool: MagicMock, cache_config=None):
+    """Return a Client whose internal pool is already set to *pool*.
+
+    *cache_config* defaults to a `MagicMock` (matching every pre-existing
+    caller — its truthy `.enabled` is never actually consulted, since
+    `pylon.cache`'s global `_enabled` flag short-circuits first while the
+    cache is untouched by these tests). Pass a real `CacheConfig` to
+    exercise the read-through cache wiring itself.
+    """
     from pylon.client import Client, _PoolRef
 
     cfg_db = DatabaseConfig(host="h", port=5432, name="db", user="u")
     cfg = MagicMock()
     cfg.database = cfg_db
+    cfg.cache = cache_config if cache_config is not None else MagicMock()
     client = Client.__new__(Client)
     client._config = cfg
     ref = _PoolRef()
@@ -479,6 +488,155 @@ class TestClientQuery:
 
 
 # ---------------------------------------------------------------------------
+# Client caching — real CacheConfig, proving a second call skips the DB
+# ---------------------------------------------------------------------------
+
+
+class TestClientCaching:
+    def _patch_transpile(self, sql="SELECT 1", tags=None):
+        compiled = _fake_compiled(sql, tags=tags)
+
+        async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
+            return compiled, sql, list(kwargs.values())
+
+        def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
+            return sql, list(kwargs.values()), compiled
+
+        p1 = patch("pylon.client._compile_and_resolve", side_effect=fake_resolve)
+        p2 = patch("pylon.client._transpile", side_effect=fake_transpile)
+
+        class _Both:
+            def __enter__(self):
+                p1.__enter__()
+                p2.__enter__()
+                return self
+
+            def __exit__(self, *a):
+                p2.__exit__(*a)
+                p1.__exit__(*a)
+
+        return _Both(), compiled
+
+    def _cache_config(self, tmp_path):
+        from pylon.config import CacheConfig
+
+        return CacheConfig(enabled=True, path=tmp_path / "cache")
+
+    def test_query_cache_hit_skips_db_fetch(self, tmp_path):
+        async def _run():
+            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
+            from pylon import cache as _cache
+            _cache.init(client._config.cache)
+
+            transpile_patch, _ = self._patch_transpile(tags=["public.person"])
+            with transpile_patch, patch(
+                "pylon.client._hydrate", side_effect=lambda records, compiled: [r["result"] for r in records]
+            ):
+                first = await client.query("select Person")
+                second = await client.query("select Person")
+
+            assert first == ["row1"]
+            assert second == ["row1"]
+            conn.fetch.assert_awaited_once()
+
+        run(_run())
+
+    def test_query_single_cache_hit_skips_db_fetch(self, tmp_path):
+        async def _run():
+            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
+            from pylon import cache as _cache
+            _cache.init(client._config.cache)
+
+            transpile_patch, _ = self._patch_transpile(tags=["public.person"])
+            with transpile_patch, patch(
+                "pylon.client._hydrate", side_effect=lambda records, compiled: [r["result"] for r in records]
+            ):
+                first = await client.query_single("select Person")
+                second = await client.query_single("select Person")
+
+            assert first == "row1"
+            assert second == "row1"
+            conn.fetch.assert_awaited_once()
+
+        run(_run())
+
+    def test_query_json_cache_hit_skips_db_fetchval(self, tmp_path):
+        async def _run():
+            pool, conn = _make_pool(fetchval_result='[{"id": 1}]')
+            client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
+            from pylon import cache as _cache
+            _cache.init(client._config.cache)
+
+            transpile_patch, _ = self._patch_transpile(tags=["public.person"])
+            with transpile_patch:
+                first = await client.query_json("select Person")
+                second = await client.query_json("select Person")
+
+            assert first == '[{"id": 1}]'
+            assert second == '[{"id": 1}]'
+            conn.fetchval.assert_awaited_once()
+
+        run(_run())
+
+    def test_query_single_json_cache_hit_skips_db_round_trip(self, tmp_path):
+        async def _run():
+            pool, conn = _make_pool(fetch_result=[{"result": "row1"}], fetchval_result='{"id": 1}')
+            client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
+            from pylon import cache as _cache
+            _cache.init(client._config.cache)
+
+            transpile_patch, _ = self._patch_transpile(tags=["public.person"])
+            with transpile_patch:
+                first = await client.query_single_json("select Person")
+                second = await client.query_single_json("select Person")
+
+            assert first == '{"id": 1}'
+            assert second == '{"id": 1}'
+            conn.fetch.assert_awaited_once()
+            conn.fetchval.assert_awaited_once()
+
+        run(_run())
+
+    def test_query_with_no_tags_is_never_cached(self, tmp_path):
+        async def _run():
+            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
+            from pylon import cache as _cache
+            _cache.init(client._config.cache)
+
+            transpile_patch, _ = self._patch_transpile(tags=[])
+            with transpile_patch, patch(
+                "pylon.client._hydrate", side_effect=lambda records, compiled: [r["result"] for r in records]
+            ):
+                await client.query("select 1")
+                await client.query("select 1")
+
+            assert conn.fetch.await_count == 2
+
+        run(_run())
+
+    def test_cache_disabled_never_short_circuits_db(self, tmp_path):
+        async def _run():
+            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            from pylon.config import CacheConfig
+            disabled = CacheConfig(enabled=False, path=tmp_path / "cache")
+            client = _client_with_pool(pool, cache_config=disabled)
+
+            transpile_patch, _ = self._patch_transpile(tags=["public.person"])
+            with transpile_patch, patch(
+                "pylon.client._hydrate", side_effect=lambda records, compiled: [r["result"] for r in records]
+            ):
+                await client.query("select Person")
+                await client.query("select Person")
+
+            assert conn.fetch.await_count == 2
+
+        run(_run())
+
+
+# ---------------------------------------------------------------------------
 # with_globals — returns a Client sharing the same pool
 # ---------------------------------------------------------------------------
 
@@ -566,12 +724,15 @@ class TestEnsureConnected:
         async def _run():
             from pylon.client import Client
 
+            from pylon.config import CacheConfig
+
             db_cfg = DatabaseConfig(
                 host="localhost", port=5432, name="db", user="u",
                 pool_min_size=3, pool_max_size=15,
             )
             cfg = MagicMock()
             cfg.database = db_cfg
+            cfg.cache = CacheConfig(enabled=False)
 
             mock_pool = MagicMock()
             with patch("asyncpg.create_pool", new=AsyncMock(return_value=mock_pool)) as mock_create:
@@ -589,9 +750,12 @@ class TestEnsureConnected:
         async def _run():
             from pylon.client import Client
 
+            from pylon.config import CacheConfig
+
             db_cfg = DatabaseConfig(host="h", port=5432, name="db", user="u")
             cfg = MagicMock()
             cfg.database = db_cfg
+            cfg.cache = CacheConfig(enabled=False)
 
             mock_pool = MagicMock()
             with patch("asyncpg.create_pool", new=AsyncMock(return_value=mock_pool)) as mock_create:

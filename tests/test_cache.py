@@ -95,6 +95,75 @@ class TestGetPutRoundTrip:
         assert cache.get(q, [1], config) is None
 
 
+class TestJsonCache:
+    def test_miss_then_put_then_hit(self, tmp_path):
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=["public.person"])
+
+        hit, value = cache.get_json(q, [1], config, kind="json_all")
+        assert hit is False
+        assert value is None
+
+        cache.put_json(q, [1], '[{"name": "alice"}]', config, kind="json_all")
+
+        hit, value = cache.get_json(q, [1], config, kind="json_all")
+        assert hit is True
+        assert value == '[{"name": "alice"}]'
+
+    def test_caches_a_genuine_none_distinct_from_a_miss(self, tmp_path):
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=["public.person"])
+
+        cache.put_json(q, [1], None, config, kind="json_single")
+
+        hit, value = cache.get_json(q, [1], config, kind="json_single")
+        assert hit is True
+        assert value is None
+
+    def test_different_kinds_do_not_collide(self, tmp_path):
+        """Same compiled.sql/params, different `kind` (json_all vs json_single)
+        must not share a cache entry — they cache different value shapes for
+        the same underlying query."""
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=["public.person"])
+
+        cache.put_json(q, [1], '[{"name": "alice"}]', config, kind="json_all")
+        cache.put_json(q, [1], '{"name": "alice"}', config, kind="json_single")
+
+        _, all_value = cache.get_json(q, [1], config, kind="json_all")
+        _, single_value = cache.get_json(q, [1], config, kind="json_single")
+        assert all_value == '[{"name": "alice"}]'
+        assert single_value == '{"name": "alice"}'
+
+    def test_rows_cache_and_json_cache_do_not_collide(self, tmp_path):
+        """`get`/`put` (kind="rows") and `get_json`/`put_json` must not share
+        a key even for the identical compiled.sql/params — one caches a row
+        list for `deserialize()`, the other a raw JSON string."""
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=["public.person"])
+
+        cache.put(q, [1], [{"result": "row-value"}], config)
+        cache.put_json(q, [1], '"json-value"', config, kind="json_all")
+
+        assert cache.get(q, [1], config) == [{"result": "row-value"}]
+        hit, value = cache.get_json(q, [1], config, kind="json_all")
+        assert hit is True
+        assert value == '"json-value"'
+
+    def test_put_json_with_no_tags_is_a_noop(self, tmp_path):
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=[])
+
+        cache.put_json(q, [1], '"x"', config, kind="json_all")
+        hit, _ = cache.get_json(q, [1], config, kind="json_all")
+        assert hit is False
+
+
 class TestSetOverrides:
     def _install_fake_schema(self, monkeypatch):
         fake_type = SimpleNamespace(name="Order", module="default", table="Order")
