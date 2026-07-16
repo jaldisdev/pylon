@@ -14,7 +14,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
-use pylon_cache::{Cache, CachedValue};
+use pylon_cache::{cache_key as cache_key_impl, Cache, CachedValue};
 
 use crate::PylonCacheError;
 
@@ -71,11 +71,21 @@ fn cache_invalidate(tags: Vec<String>) -> PyResult<()> {
     cache.invalidate(&tags).map_err(cache_err)
 }
 
+/// `sha256(sql) + bound parameter values`, hex-encoded — the single source
+/// of truth for cache-key derivation (see `pylon_cache::store::cache_key`),
+/// so Python never re-implements the hashing scheme independently.
+#[pyfunction]
+fn cache_key(sql: &str, params: Vec<Bound<'_, PyAny>>) -> PyResult<String> {
+    let params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+    cache_key_impl(sql, &params).map_err(cache_err)
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cache_init, m)?)?;
     m.add_function(wrap_pyfunction!(cache_get, m)?)?;
     m.add_function(wrap_pyfunction!(cache_put, m)?)?;
     m.add_function(wrap_pyfunction!(cache_invalidate, m)?)?;
+    m.add_function(wrap_pyfunction!(cache_key, m)?)?;
     Ok(())
 }
 
