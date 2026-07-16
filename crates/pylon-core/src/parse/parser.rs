@@ -689,6 +689,15 @@ impl Parser {
         if matches!(self.current(), Token::ColonColon) {
             self.advance();
             let name = self.eat_ident()?;
+            // See the matching check in parse_primary: PyQL module names
+            // are a single segment, so a further `::` here is an error
+            // worth naming rather than a confusing dangling token later.
+            if matches!(self.current(), Token::ColonColon) {
+                return Err(self.err(&format!(
+                    "'{first}::{name}::...' has too many '::' segments; \
+                     PyQL module names are a single segment"
+                )));
+            }
             Ok(TypeExpr::named(Some(first), name))
         } else {
             Ok(TypeExpr::named(None, first))
@@ -960,6 +969,18 @@ impl Parser {
                 if matches!(self.current(), Token::ColonColon) {
                     self.advance();
                     let member = self.eat_ident()?;
+                    // A third `::` here means the module path has more than
+                    // one segment, which PyQL doesn't support — say so
+                    // clearly instead of leaving the trailing `::` to
+                    // surface as a confusing "unexpected token ColonColon"
+                    // once this (wrongly 2-segment-terminated) path/call
+                    // returns.
+                    if matches!(self.current(), Token::ColonColon) {
+                        return Err(self.err(&format!(
+                            "'{name}::{member}::...' has too many '::' segments; \
+                             PyQL module names are a single segment"
+                        )));
+                    }
                     // Function call with module prefix
                     if matches!(self.current(), Token::LParen) {
                         return self.parse_func_call_args(Some(name), member);
