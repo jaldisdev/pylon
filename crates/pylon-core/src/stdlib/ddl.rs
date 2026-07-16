@@ -171,6 +171,23 @@ pub const INDEX_OUTBOX_DDL: &str = concat!(
     "    FOR EACH ROW EXECUTE FUNCTION _pylon.notify_index_queue();\n",
 );
 
+/// DDL for the cache-invalidation notify function.
+///
+/// One statement-level trigger per user table (attached in the diff/export
+/// DDL generators, alongside `CREATE TABLE`) calls this on every write,
+/// notifying with the schema-qualified table name — matching exactly the
+/// tag format `ir::tags::collect_tags` produces, so the Python-side listener
+/// can evict cache entries by tag with no further lookup.
+pub const CACHE_INVALIDATE_DDL: &str = concat!(
+    "CREATE OR REPLACE FUNCTION _pylon.notify_cache_invalidate()\n",
+    "    RETURNS trigger LANGUAGE plpgsql AS $$\n",
+    "BEGIN\n",
+    "    PERFORM pg_notify('pylon_cache_invalidate', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME);\n",
+    "    RETURN NULL;\n",
+    "END\n",
+    "$$;\n",
+);
+
 /// DDL for the `_pylon."Migrations"` and `_pylon."Progress"` tracking tables (§7).
 ///
 /// Emitted alongside `INDEX_OUTBOX_DDL` at schema-bootstrap time.
@@ -201,6 +218,8 @@ pub fn export_stdlib() -> String {
     out.push_str(INDEX_OUTBOX_DDL);
     out.push('\n');
     out.push_str(MIGRATION_TRACKING_DDL);
+    out.push('\n');
+    out.push_str(CACHE_INVALIDATE_DDL);
     out.push('\n');
 
     // Internal runtime helpers (not user-callable from PyQL).
@@ -287,5 +306,12 @@ mod tests {
     fn ddl_json_get_uses_variadic() {
         let ddl = export_stdlib();
         assert!(ddl.contains("VARIADIC path text[]"), "json_get must use VARIADIC");
+    }
+
+    #[test]
+    fn ddl_installs_cache_invalidate_notify_function() {
+        let ddl = export_stdlib();
+        assert!(ddl.contains("CREATE OR REPLACE FUNCTION _pylon.notify_cache_invalidate()"));
+        assert!(ddl.contains("pg_notify('pylon_cache_invalidate', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME)"));
     }
 }

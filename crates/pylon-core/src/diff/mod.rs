@@ -1267,6 +1267,35 @@ fn diff_inner(
             }
         }
 
+        // Cache-invalidation trigger — every concrete table and every
+        // multi-link junction table, unconditionally (not gated by
+        // `[cache].enabled`; see the cache layer plan's design decision).
+        // Only the per-table attachment is migration content — the trigger
+        // *function* itself ships via bootstrap DDL
+        // (`stdlib::ddl::CACHE_INVALIDATE_DDL`), applied once by
+        // `pylon database initialize`, not per-migration.
+        let mut cache_trigger_tables: Vec<(String, String)> = Vec::new();
+        for td in &target.types {
+            if td.abstract_ { continue; }
+            cache_trigger_tables.push((td.module.clone(), td.table.clone()));
+            if !td.junction {
+                for ml in &td.multilinks {
+                    cache_trigger_tables.push((td.module.clone(), format!("{}.{}", td.table, ml.name)));
+                }
+            }
+        }
+        for (module, table) in &cache_trigger_tables {
+            expected_trigger_map.entry((module.clone(), table.clone())).or_default()
+                .insert("pylon_cache_invalidate".to_string());
+            let already_present = cur_trigger_map
+                .get(&(module.as_str(), table.as_str()))
+                .map(|t| t.contains("pylon_cache_invalidate"))
+                .unwrap_or(false);
+            if !already_present {
+                push_tx(&mut ops, cache_invalidate_trigger_sql(&qn(module, table)));
+            }
+        }
+
         // Drop triggers that no longer exist in the target schema.
         for cur_table in &current.tables {
             let key = (cur_table.schema.clone(), cur_table.name.clone());
@@ -1407,6 +1436,17 @@ fn emit_create_table(td: &TypeDescriptor, schema: &SchemaDescriptor, ops: &mut V
         qn(&td.module, &td.table),
         lines.join(",\n")
     ));
+}
+
+/// `CREATE OR REPLACE TRIGGER` statement wiring `qualified_table` into the
+/// cache-invalidation notify function (see `stdlib::ddl::CACHE_INVALIDATE_DDL`).
+/// Statement-level, not row-level — tier 1 invalidation only needs one notify
+/// per write statement.
+fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
+    format!(
+        "CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON {}\n    FOR EACH STATEMENT EXECUTE FUNCTION _pylon.notify_cache_invalidate();",
+        qualified_table
+    )
 }
 
 // ── Column diff for an existing table ─────────────────────────────────────────
@@ -1896,6 +1936,63 @@ mod tests {
         let joined = ops.join("\n");
         assert!(joined.contains("CREATE SCHEMA IF NOT EXISTS \"catalog\""), "got:\n{joined}");
         assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""), "got:\n{joined}");
+        assert!(
+            joined.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"catalog\".\"Product\""),
+            "new table must get the cache-invalidation trigger; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_cache_invalidate_trigger_backfilled_on_pre_existing_table() {
+        let schema = SchemaDescriptor {
+            types: vec![simple_type("default", "Person", "Person")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                triggers: vec![], // pre-existing table, created before this feature shipped
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        let joined = ops.join("\n");
+        assert!(
+            joined.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""),
+            "pre-existing table missing the trigger must get it backfilled; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_cache_invalidate_trigger_not_dropped_when_already_present() {
+        let schema = SchemaDescriptor {
+            types: vec![simple_type("default", "Person", "Person")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                triggers: vec!["pylon_cache_invalidate".into()],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        assert!(ops.iter().all(|op| !op.contains("DROP TRIGGER") && !op.contains("pylon_cache_invalidate")),
+            "already-present trigger must not be re-created or dropped; got: {:?}", ops);
     }
 
     #[test]
@@ -1912,7 +2009,8 @@ mod tests {
                     DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
                     DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                triggers: vec!["pylon_cache_invalidate".into()],
             }],
             enums: vec![], domains: vec![],
             ..DbState::default()

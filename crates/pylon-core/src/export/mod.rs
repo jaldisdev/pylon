@@ -210,6 +210,20 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
 
     out.push_str(&lines.join(",\n"));
     out.push_str("\n);\n\n");
+    out.push_str(&cache_invalidate_trigger_sql(&qn(&t.module, &t.table)));
+    out.push_str("\n\n");
+}
+
+/// `CREATE OR REPLACE TRIGGER` statement wiring `qualified_table` into the
+/// cache-invalidation notify function (see `stdlib::ddl::CACHE_INVALIDATE_DDL`).
+/// Statement-level, not row-level — tier 1 invalidation only needs one notify
+/// per write statement. Attached unconditionally to every concrete table and
+/// junction table so the cache plumbing exists regardless of `[cache].enabled`.
+fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
+    format!(
+        "CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON {}\n    FOR EACH STATEMENT EXECUTE FUNCTION _pylon.notify_cache_invalidate();",
+        qualified_table
+    )
 }
 
 // ── Deletion policy helpers ────────────────────────────────────────────────────
@@ -390,6 +404,8 @@ fn emit_junction_tables(
             }
 
             out.push_str("    PRIMARY KEY (source, target)\n);\n\n");
+            out.push_str(&cache_invalidate_trigger_sql(&qn(&t.module, &jt_name)));
+            out.push_str("\n\n");
         }
     }
 }
@@ -1231,6 +1247,16 @@ mod tests {
             functions: fns,
             aliases: vec![],
         }
+    }
+
+    #[test]
+    fn test_emit_one_table_includes_cache_invalidate_trigger() {
+        let mut out = String::new();
+        emit_one_table(&person_type(), &mut out);
+        assert!(
+            out.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""),
+            "got:\n{out}"
+        );
     }
 
     #[test]
