@@ -9,6 +9,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pylon.config import (
+    CacheConfig,
+    CacheSetConfig,
     Config,
     DatabaseConfig,
     ModelConfig,
@@ -442,3 +444,97 @@ class TestLoadConfig:
         assert cfg.search_registry["staging"].host == "opensearch.staging.internal"
         assert cfg.models_registry["default"].secret == "sk-oai"
         assert cfg.models_registry["mistral_eu"].secret == "sk-mis"
+
+
+# ---------------------------------------------------------------------------
+# CacheConfig
+# ---------------------------------------------------------------------------
+
+
+class TestCacheConfig:
+    def test_defaults(self):
+        c = CacheConfig()
+        assert c.enabled is False
+        assert c.backend == "lmdb"
+        assert c.max_size_mb == 1024
+        assert c.sets == {}
+
+    def test_set_override_defaults_enabled(self):
+        assert CacheSetConfig().enabled is True
+
+
+class TestLoadConfigCache:
+    def _base(self) -> str:
+        return """
+            [project]
+            schema-dir = "dbschema"
+
+            [database]
+            host = "localhost"
+            port = 5432
+            name = "mydb"
+            user = "myuser"
+        """
+
+    def test_cache_absent_defaults_disabled(self, toml_dir):
+        d = toml_dir(self._base())
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.cache.enabled is False
+        assert cfg.cache.path == (d / ".pylon" / "cache").resolve()
+
+    def test_cache_section_parsed(self, toml_dir):
+        d = toml_dir(self._base() + """
+            [cache]
+            enabled = true
+            max_size_mb = 2048
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.cache.enabled is True
+        assert cfg.cache.max_size_mb == 2048
+        assert cfg.cache.backend == "lmdb"
+
+    def test_cache_invalid_backend_raises(self, toml_dir):
+        d = toml_dir(self._base() + """
+            [cache]
+            backend = "memcached"
+        """)
+        with pytest.raises(ValueError, match="lmdb"):
+            load_config(d / "pylon.toml")
+
+    def test_cache_path_relative_resolved_against_toml_dir(self, toml_dir):
+        d = toml_dir(self._base() + """
+            [cache]
+            path = "my-cache"
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.cache.path == (d / "my-cache").resolve()
+
+    def test_cache_path_tilde_expanded(self, toml_dir, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        d = toml_dir(self._base() + """
+            [cache]
+            path = "~/pylon-cache"
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.cache.path == Path("/home/testuser/pylon-cache")
+
+    def test_cache_sets_override(self, toml_dir):
+        d = toml_dir(self._base() + """
+            [cache]
+            enabled = true
+
+            [cache.sets.Order]
+            enabled = false
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.cache.sets["Order"].enabled is False
+
+    def test_cache_set_defaults_to_enabled(self, toml_dir):
+        d = toml_dir(self._base() + """
+            [cache]
+            enabled = true
+
+            [cache.sets.Order]
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.cache.sets["Order"].enabled is True

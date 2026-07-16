@@ -95,11 +95,12 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
         for si in td.search_indexes
     )
 
-    if not providers and not want_opensearch and not want_meilisearch:
+    if not providers and not want_opensearch and not want_meilisearch and not config.cache.enabled:
         _print_error(
             "no index workers to start",
             "Add VectorIndex or SearchIndex(backend=...) to your schema, "
-            "and configure [models.*] / [search] in pylon.toml.",
+            "and configure [models.*] / [search] in pylon.toml — or set "
+            "[cache].enabled = true to start the cache-invalidation worker.",
         )
         ctx.exit(1)
         return
@@ -165,6 +166,21 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
                 "MeilisearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs",
                 base_url, batch_size, poll_interval,
             )
+            tasks.append(w.run())
+
+        if config.cache.enabled:
+            from pylon import cache as pylon_cache
+            from pylon.cache import CacheInvalidationWorker, NOTIFY_CHANNEL
+            # This process's own LMDB handle onto the shared, file-backed
+            # cache at config.cache.path — LMDB supports safe concurrent
+            # multi-process access to one file, so this worker process
+            # evicting entries is immediately visible to every serving
+            # process (e.g. `pylon serve`) mapping the same path.
+            pylon_cache.init(config.cache)
+            conn = await asyncpg.connect(dsn)
+            conns.append(conn)
+            w = CacheInvalidationWorker(conn)
+            log.info("CacheInvalidationWorker started  channel=%s", NOTIFY_CHANNEL)
             tasks.append(w.run())
 
         try:

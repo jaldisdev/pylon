@@ -138,6 +138,43 @@ class UiConfig:
 
 
 # ---------------------------------------------------------------------------
+# CacheConfig
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class CacheSetConfig:
+    """``[cache.sets.<Name>]`` — per-set override, keyed by short Pylon type name.
+
+    Exists so a set whose invalidation write-throughput turns out to be a
+    bottleneck can be opted out of caching individually, without disabling
+    the cache globally (see the cache layer spec's "fallback" note).
+    """
+
+    enabled: bool = True
+
+
+type CacheSetRegistry = dict[str, CacheSetConfig]
+
+
+@dataclass(slots=True, frozen=True)
+class CacheConfig:
+    """``[cache]`` — optional read-through LMDB cache in front of Postgres.
+
+    Off by default. *path* is resolved to an absolute directory the same way
+    *schema_dir* is (relative to ``pylon.toml`` if not already absolute; ``~``
+    is expanded). *sets* maps a short Pylon type name (e.g. ``"Order"``) to a
+    per-set override under ``[cache.sets.<Name>]``.
+    """
+
+    enabled: bool = False
+    backend: Literal["lmdb"] = "lmdb"
+    max_size_mb: int = 1024
+    path: Path = field(default_factory=lambda: Path(".pylon/cache"))
+    sets: CacheSetRegistry = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -166,6 +203,7 @@ class Config:
     connections: dict[str, DatabaseConfig] = field(default_factory=dict)
     webserver: WebserverConfig = field(default_factory=WebserverConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
 
     # ------------------------------------------------------------------
     # Normalised accessors
@@ -257,6 +295,25 @@ def _build_search(raw: dict[str, object]) -> SearchConfig:
     )
 
 
+def _build_cache_set(raw: dict[str, object]) -> CacheSetConfig:
+    kwargs: dict[str, object] = {}
+    if "enabled" in raw:
+        kwargs["enabled"] = bool(raw["enabled"])
+    return CacheSetConfig(**kwargs)
+
+
+def _resolve_cache_path(raw_path: str | None, toml_path: Path) -> Path:
+    """Resolve ``[cache].path`` the same way *schema_dir* is resolved: ``~``
+    expanded, then made absolute relative to the directory containing
+    ``pylon.toml`` if not already absolute. Defaults to ``.pylon/cache``
+    next to ``pylon.toml`` when unset.
+    """
+    expanded = Path(raw_path).expanduser() if raw_path else Path(".pylon/cache")
+    if expanded.is_absolute():
+        return expanded
+    return (toml_path.parent / expanded).resolve()
+
+
 def _build_model(raw: dict[str, object]) -> ModelConfig:
     api_style = raw["api_style"]
     if api_style not in ("openai", "anthropic"):
@@ -291,6 +348,7 @@ _SEARCH_SCALAR_KEYS = frozenset({"host", "port", "user", "password", "password_e
 _MODELS_SCALAR_KEYS = frozenset(
     {"api_style", "api_url", "model", "client_id", "secret", "secret_env", "purpose"}
 )
+_CACHE_SCALAR_KEYS = frozenset({"enabled", "backend", "max_size_mb", "path"})
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -436,6 +494,35 @@ def load_config(path: str | Path | None = None) -> Config:
         ui_kwargs["enabled"] = bool(raw_ui["enabled"])
     ui = UiConfig(**ui_kwargs)
 
+    # ------------------------------------------------------------------
+    # [cache]
+    # ------------------------------------------------------------------
+    cache_kwargs: dict[str, object] = {}
+    raw_cache = raw.get("cache")
+    raw_cache_path = None
+    if isinstance(raw_cache, dict):
+        if "enabled" in raw_cache:
+            cache_kwargs["enabled"] = bool(raw_cache["enabled"])
+        if "backend" in raw_cache:
+            backend_val = raw_cache["backend"]
+            if backend_val != "lmdb":
+                raise ValueError(f"CacheConfig: backend must be 'lmdb', got {backend_val!r}")
+            cache_kwargs["backend"] = backend_val
+        if "max_size_mb" in raw_cache:
+            cache_kwargs["max_size_mb"] = int(raw_cache["max_size_mb"])  # type: ignore[arg-type]
+        if "path" in raw_cache:
+            raw_cache_path = str(raw_cache["path"])
+
+        raw_sets = raw_cache.get("sets")
+        if isinstance(raw_sets, dict):
+            cache_kwargs["sets"] = {
+                name: _build_cache_set(value)
+                for name, value in raw_sets.items()
+                if isinstance(value, dict)
+            }
+    cache_kwargs["path"] = _resolve_cache_path(raw_cache_path, toml_path)
+    cache = CacheConfig(**cache_kwargs)
+
     return Config(
         database=database,
         project=project,
@@ -444,6 +531,7 @@ def load_config(path: str | Path | None = None) -> Config:
         connections=connections,
         webserver=webserver,
         ui=ui,
+        cache=cache,
     )
 
 
@@ -455,5 +543,7 @@ __all__ = [
     "ModelConfig",
     "WebserverConfig",
     "UiConfig",
+    "CacheConfig",
+    "CacheSetConfig",
     "load_config",
 ]
