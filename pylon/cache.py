@@ -57,10 +57,14 @@ def _is_disabled_for_sets(compiled: CompiledQuery, config: CacheConfig) -> bool:
     return False
 
 
-def _cache_key(compiled: CompiledQuery, params: list[Any]) -> str:
+def _cache_key(compiled: CompiledQuery, params: list[Any], *, kind: str) -> str:
+    """*kind* namespaces the hash so different callers compiling the exact
+    same PyQL text/params to different cached *value shapes* (a decoded row
+    list for `query`/`query_single` vs. a raw JSON string for the
+    `*_json` methods) never collide on the same key."""
     from pylon._core import cache_key
 
-    return cache_key(compiled.sql, list(params))
+    return cache_key(f"{kind}\x00{compiled.sql}", list(params))
 
 
 def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list[Any] | None:
@@ -74,7 +78,7 @@ def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list
         return None
     from pylon._core import cache_get
 
-    key = _cache_key(compiled, params)
+    key = _cache_key(compiled, params, kind="rows")
     rows = cache_get(key)
     if rows is None:
         return None
@@ -92,9 +96,48 @@ def put(compiled: CompiledQuery, params: list[Any], records: list[Any], config: 
         return
     from pylon._core import cache_put
 
-    key = _cache_key(compiled, params)
+    key = _cache_key(compiled, params, kind="rows")
     rows = [record["result"] for record in records]
     cache_put(key, list(compiled.tags), rows)
+
+
+def get_json(
+    compiled: CompiledQuery, params: list[Any], config: CacheConfig, *, kind: str
+) -> tuple[bool, str | None]:
+    """Returns ``(hit, value)`` for the JSON-string-returning query methods
+    (`query_json`/`query_single_json`). ``hit`` distinguishes a genuine
+    cache hit from a miss independently of ``value``, since
+    `query_single_json` legitimately caches ``None`` for an empty result.
+    *kind* must differ between `query_json` (``"json_all"``) and
+    `query_single_json` (``"json_single"``) — same underlying SQL, but a
+    JSON array vs. at most one JSON object are different cached values."""
+    if not _enabled or not config.enabled:
+        return False, None
+    if _is_disabled_for_sets(compiled, config):
+        return False, None
+    from pylon._core import cache_get
+
+    key = _cache_key(compiled, params, kind=kind)
+    rows = cache_get(key)
+    if rows is None:
+        return False, None
+    return True, (rows[0] if rows else None)
+
+
+def put_json(
+    compiled: CompiledQuery, params: list[Any], value: str | None, config: CacheConfig, *, kind: str
+) -> None:
+    """Counterpart to `get_json` — stores *value* (or nothing, for a
+    legitimately-empty `query_single_json` result) under a key namespaced
+    by *kind*. No-op if caching is disabled or the query has no tags."""
+    if not _enabled or not config.enabled or not compiled.tags:
+        return
+    if _is_disabled_for_sets(compiled, config):
+        return
+    from pylon._core import cache_put
+
+    key = _cache_key(compiled, params, kind=kind)
+    cache_put(key, list(compiled.tags), [value] if value is not None else [])
 
 
 class CacheInvalidationWorker:
@@ -143,4 +186,4 @@ class CacheInvalidationWorker:
         cache_invalidate(tags)
 
 
-__all__ = ["NOTIFY_CHANNEL", "init", "get", "put", "CacheInvalidationWorker"]
+__all__ = ["NOTIFY_CHANNEL", "init", "get", "put", "get_json", "put_json", "CacheInvalidationWorker"]
