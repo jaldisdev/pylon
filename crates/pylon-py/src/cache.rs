@@ -80,12 +80,35 @@ fn cache_key(sql: &str, params: Vec<Bound<'_, PyAny>>) -> PyResult<String> {
     cache_key_impl(sql, &params).map_err(cache_err)
 }
 
+/// Current cache size — `{"entry_count": int, "used_bytes": int}` — for the
+/// `pylon cache status` CLI command.
+#[pyfunction]
+fn cache_stat<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let guard = cache_slot().read().unwrap();
+    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    let stats = cache.stat().map_err(cache_err)?;
+    let d = PyDict::new(py);
+    d.set_item("entry_count", stats.entry_count)?;
+    d.set_item("used_bytes", stats.used_bytes)?;
+    Ok(d)
+}
+
+/// Evicts every cache entry — for the `pylon cache purge` CLI command.
+#[pyfunction]
+fn cache_clear() -> PyResult<()> {
+    let guard = cache_slot().read().unwrap();
+    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    cache.clear().map_err(cache_err)
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cache_init, m)?)?;
     m.add_function(wrap_pyfunction!(cache_get, m)?)?;
     m.add_function(wrap_pyfunction!(cache_put, m)?)?;
     m.add_function(wrap_pyfunction!(cache_invalidate, m)?)?;
     m.add_function(wrap_pyfunction!(cache_key, m)?)?;
+    m.add_function(wrap_pyfunction!(cache_stat, m)?)?;
+    m.add_function(wrap_pyfunction!(cache_clear, m)?)?;
     Ok(())
 }
 

@@ -140,6 +140,27 @@ def put_json(
     cache_put(key, list(compiled.tags), [value] if value is not None else [])
 
 
+def stat() -> dict[str, int] | None:
+    """Returns ``{"entry_count": int, "used_bytes": int}`` for the `pylon
+    cache status` CLI command, or ``None`` if the cache isn't open (either
+    ``[cache].enabled = false`` or `init` hasn't been called)."""
+    if not _enabled:
+        return None
+    from pylon._core import cache_stat
+
+    return cache_stat()
+
+
+def clear() -> None:
+    """Evicts every cache entry — for the `pylon cache purge` CLI command.
+    No-op if the cache isn't open."""
+    if not _enabled:
+        return
+    from pylon._core import cache_clear
+
+    cache_clear()
+
+
 class CacheInvalidationWorker:
     """Listens on `NOTIFY_CHANNEL` and evicts matching cache entries.
 
@@ -186,4 +207,7 @@ class CacheInvalidationWorker:
         cache_invalidate(tags)
 
 
-__all__ = ["NOTIFY_CHANNEL", "init", "get", "put", "get_json", "put_json", "CacheInvalidationWorker"]
+__all__ = [
+    "NOTIFY_CHANNEL", "init", "get", "put", "get_json", "put_json", "stat", "clear",
+    "CacheInvalidationWorker",
+]

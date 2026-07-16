@@ -6,6 +6,7 @@ import click
 from pylon.config import load_config
 
 from .banner import _BOLD_RED, _RESET
+from .commands.cache import cache
 from .commands.database import database
 from .commands.info import info_cmd
 from .commands.migrations import migration
@@ -74,6 +75,7 @@ def cli(ctx: click.Context, db_name: str | None) -> None:
 
 # --- groups -------------------------------------------------------------------
 
+cli.add_command(cache)
 cli.add_command(database)
 cli.add_command(migration)
 cli.add_command(worker)

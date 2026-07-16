@@ -1274,13 +1274,19 @@ fn diff_inner(
         // *function* itself ships via bootstrap DDL
         // (`stdlib::ddl::CACHE_INVALIDATE_DDL`), applied once by
         // `pylon database initialize`, not per-migration.
-        let mut cache_trigger_tables: Vec<(String, String)> = Vec::new();
+        // A HashSet, not a Vec — a junction ("through") type's own `td.table`
+        // is the physical join table itself, identical to what the owning
+        // type's multilink enumeration below also derives (e.g. `ProductTag`
+        // and `Product`'s "tags" multilink both resolve to
+        // `"Product.tags"`), so without deduping this would emit the same
+        // `CREATE TRIGGER` statement twice for that table.
+        let mut cache_trigger_tables: HashSet<(String, String)> = HashSet::new();
         for td in &target.types {
             if td.abstract_ { continue; }
-            cache_trigger_tables.push((td.module.clone(), td.table.clone()));
+            cache_trigger_tables.insert((td.module.clone(), td.table.clone()));
             if !td.junction {
                 for ml in &td.multilinks {
-                    cache_trigger_tables.push((td.module.clone(), format!("{}.{}", td.table, ml.name)));
+                    cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
                 }
             }
         }
@@ -1939,6 +1945,38 @@ mod tests {
         assert!(
             joined.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"catalog\".\"Product\""),
             "new table must get the cache-invalidation trigger; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_cache_invalidate_trigger_not_duplicated_for_junction_through_type() {
+        use crate::schema::MultiLinkDescriptor;
+
+        let mut product = simple_type("default", "Product", "Product");
+        product.multilinks.push(MultiLinkDescriptor {
+            name: "tags".into(),
+            target: "default::Tag".into(),
+            through: Some("default::ProductTag".into()),
+            nullable: false,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![],
+        });
+        let mut junction = simple_type("default", "ProductTag", "Product.tags");
+        junction.junction = true;
+
+        let schema = SchemaDescriptor {
+            types: vec![product, junction, simple_type("default", "Tag", "Tag")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
+        let trigger_count = ops.iter()
+            .filter(|op| op.contains("AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Product.tags\""))
+            .count();
+        assert_eq!(
+            trigger_count, 1,
+            "junction table's own td.table and the owning type's multilink both resolve to \
+             the same physical table — must be deduped to one trigger, got {trigger_count} in: {ops:?}"
         );
     }
 
