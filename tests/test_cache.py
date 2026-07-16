@@ -164,6 +164,40 @@ class TestJsonCache:
         assert hit is False
 
 
+class TestStatAndClear:
+    def test_stat_returns_none_when_not_initialized(self, monkeypatch):
+        monkeypatch.setattr(cache, "_enabled", False)
+        assert cache.stat() is None
+
+    def test_clear_is_a_noop_when_not_initialized(self, monkeypatch):
+        monkeypatch.setattr(cache, "_enabled", False)
+        cache.clear()  # must not raise
+
+    def test_stat_reports_entry_count(self, tmp_path):
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=["public.person"])
+
+        assert cache.stat()["entry_count"] == 0
+
+        cache.put(q, [1], [{"result": "x"}], config)
+        cache.put(q, [2], [{"result": "y"}], config)
+        assert cache.stat()["entry_count"] == 2
+
+    def test_clear_evicts_everything(self, tmp_path):
+        config = CacheConfig(enabled=True, path=tmp_path / "cache")
+        cache.init(config)
+        q = compiled(tags=["public.person"])
+        cache.put(q, [1], [{"result": "x"}], config)
+        cache.put(q, [2], [{"result": "y"}], config)
+
+        cache.clear()
+
+        assert cache.stat()["entry_count"] == 0
+        assert cache.get(q, [1], config) is None
+        assert cache.get(q, [2], config) is None
+
+
 class TestSetOverrides:
     def _install_fake_schema(self, monkeypatch):
         fake_type = SimpleNamespace(name="Order", module="default", table="Order")

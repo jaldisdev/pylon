@@ -33,6 +33,17 @@ pub fn cache_key(sql: &str, params: &[CachedValue]) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Snapshot of a cache's current size — see `Cache::stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Number of cached entries (one per distinct query+params key).
+    pub entry_count: u64,
+    /// Bytes actually used by the environment's databases, excluding
+    /// LMDB's free (reclaimable) pages — i.e. real usage, not the
+    /// fixed virtual `map_size` reservation the environment was opened with.
+    pub used_bytes: u64,
+}
+
 pub struct Cache {
     env: Env,
     entries: Database<Str, Bytes>,
@@ -123,6 +134,26 @@ impl Cache {
         wtxn.commit()?;
         Ok(())
     }
+
+    /// Current size of the cache — see `CacheStats`.
+    pub fn stat(&self) -> Result<CacheStats> {
+        let rtxn = self.env.read_txn()?;
+        let entry_count = self.entries.len(&rtxn)?;
+        drop(rtxn);
+        let used_bytes = self.env.non_free_pages_size()?;
+        Ok(CacheStats { entry_count, used_bytes })
+    }
+
+    /// Evicts every cache entry, unconditionally — used by the `pylon cache
+    /// purge` CLI command. Unlike `invalidate`, this doesn't require
+    /// knowing any tags up front.
+    pub fn clear(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.entries.clear(&mut wtxn)?;
+        self.tags.clear(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +212,47 @@ mod tests {
         let k3 = cache_key("select 1", &[CachedValue::I64(2)]).unwrap();
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn stat_on_empty_cache_reports_zero_entries() {
+        let (_dir, cache) = open_temp();
+        let stats = cache.stat().unwrap();
+        assert_eq!(stats.entry_count, 0);
+    }
+
+    #[test]
+    fn stat_reports_entry_count_and_nonzero_used_bytes_after_put() {
+        let (_dir, cache) = open_temp();
+        cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache.put("key2", vec![CachedValue::I64(2)], vec!["public.pet".into()]).unwrap();
+
+        let stats = cache.stat().unwrap();
+        assert_eq!(stats.entry_count, 2);
+        assert!(stats.used_bytes > 0);
+    }
+
+    #[test]
+    fn clear_removes_all_entries_and_tags() {
+        let (_dir, cache) = open_temp();
+        cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache.put("key2", vec![CachedValue::I64(2)], vec!["public.pet".into()]).unwrap();
+
+        cache.clear().unwrap();
+
+        assert!(cache.get("key1").unwrap().is_none());
+        assert!(cache.get("key2").unwrap().is_none());
+        assert_eq!(cache.stat().unwrap().entry_count, 0);
+
+        // Tags were cleared too — re-invalidating a formerly-present tag
+        // must be a no-op, not find stale reverse-index entries.
+        cache.invalidate(&["public.person".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn clear_on_empty_cache_is_a_no_op() {
+        let (_dir, cache) = open_temp();
+        cache.clear().unwrap();
+        assert_eq!(cache.stat().unwrap().entry_count, 0);
     }
 }
