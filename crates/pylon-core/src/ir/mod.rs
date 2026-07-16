@@ -5,6 +5,7 @@
 // deduplication. Every node is already resolved to a concrete table/column.
 
 mod compiler;
+pub mod tags;
 
 pub use compiler::compile;
 pub use compiler::compile_expr_in_type;
