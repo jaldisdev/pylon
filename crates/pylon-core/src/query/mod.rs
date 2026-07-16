@@ -226,6 +226,11 @@ pub struct CompiledQuery {
     pub warnings: Vec<String>,
     /// Set when the query requires a pre-execution model call.
     pub inference_plan: Option<InferencePlan>,
+    /// Every schema-qualified table (`"schema.table"`) this statement reads
+    /// from or writes to — see `ir::tags::collect_tags`. For a SELECT, the
+    /// set of tags to cache this result under; for an INSERT/UPDATE/DELETE,
+    /// the set of tags a cache layer must invalidate after the write commits.
+    pub tags: Vec<String>,
 }
 
 /// Compile a PyQL expression string in the context of a named type to a bare SQL
@@ -284,6 +289,7 @@ pub fn compile_with_config(
 fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::SessionConfig) -> Result<CompiledQuery, PyQLError> {
     let ast = parse::parse(query)?;
     let ir_out = ir::compile_with_config(&ast, schema, config)?;
+    let tags = ir::tags::collect_tags(&ir_out);
     let sql_out = sql::emit(&ir_out);
     Ok(CompiledQuery {
         sql: sql_out.sql,
@@ -292,5 +298,6 @@ fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::Session
         shape: sql_out.shape,
         warnings: ir_out.warnings,
         inference_plan: sql_out.inference_plan,
+        tags,
     })
 }
