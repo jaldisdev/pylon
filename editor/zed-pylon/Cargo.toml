@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "zed-pylon"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Pylon PyQL diagnostics for embedded query strings in Python files"
+repository = "https://github.com/jaldisdev/pylon"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"

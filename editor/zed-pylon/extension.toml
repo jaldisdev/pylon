@@ -1,0 +1,11 @@
+id = "pylon"
+name = "Pylon"
+version = "0.0.1"
+schema_version = 1
+authors = []
+description = "Diagnostics for PyQL queries embedded as Python string literals"
+repository = "https://github.com/jaldisdev/pylon"
+
+[language_servers.pylon-lsp]
+name = "Pylon LSP"
+languages = ["Python"]
