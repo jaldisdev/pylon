@@ -1,0 +1,31 @@
+use super::{set_of, f, p, B, E};
+use super::{Decimal, Float64, FnDescriptor};
+
+pub(super) fn build() -> Vec<FnDescriptor> {
+    vec![
+        f("math", "pi",         vec![],                                     Float64, E("pi()")),
+        f("math", "e",          vec![],                                     Float64, E("exp(1.0)")),
+        f("math", "exp",        vec![p("n", Float64)],                      Float64, B("exp")),
+        f("math", "ln",         vec![p("n", Float64)],                      Float64, B("ln")),
+        f("math", "log",        vec![p("n", Float64)],                      Float64, B("log")),
+        // Two-arg form: PyQL log(n, base) → PG log(base, n) — arguments are swapped.
+        f("math", "log",        vec![p("n", Float64), p("base", Float64)],  Float64, E("log($2, $1)")),
+        f("math", "log2",       vec![p("n", Float64)],                      Float64, E("log(2.0, $1)")),
+        f("math", "log10",      vec![p("n", Float64)],                      Float64, B("log")),
+        f("math", "sin",        vec![p("n", Float64)],                      Float64, B("sin")),
+        f("math", "cos",        vec![p("n", Float64)],                      Float64, B("cos")),
+        f("math", "tan",        vec![p("n", Float64)],                      Float64, B("tan")),
+        f("math", "asin",       vec![p("n", Float64)],                      Float64, B("asin")),
+        f("math", "acos",       vec![p("n", Float64)],                      Float64, B("acos")),
+        f("math", "atan",       vec![p("n", Float64)],                      Float64, B("atan")),
+        f("math", "atan2",      vec![p("y", Float64), p("x", Float64)],     Float64, B("atan2")),
+        f("math", "stddev",     vec![p("s", set_of(Float64))],              Float64, B("stddev_samp")),
+        f("math", "stddev",     vec![p("s", set_of(Decimal))],              Decimal, B("stddev_samp")),
+        f("math", "stddev_pop", vec![p("s", set_of(Float64))],              Float64, B("stddev_pop")),
+        f("math", "stddev_pop", vec![p("s", set_of(Decimal))],              Decimal, B("stddev_pop")),
+        f("math", "var",        vec![p("s", set_of(Float64))],              Float64, B("var_samp")),
+        f("math", "var",        vec![p("s", set_of(Decimal))],              Decimal, B("var_samp")),
+        f("math", "var_pop",    vec![p("s", set_of(Float64))],              Float64, B("var_pop")),
+        f("math", "var_pop",    vec![p("s", set_of(Decimal))],              Decimal, B("var_pop")),
+    ]
+}

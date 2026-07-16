@@ -31,6 +31,11 @@ pub enum PylonType {
     RelativeDuration,
     // pgvector:: types
     Vector,
+    // postgis:: types
+    Geometry,
+    Geography,
+    Box2D,
+    Box3D,
     // Polymorphic
     Any,
     AnyOrderable,
