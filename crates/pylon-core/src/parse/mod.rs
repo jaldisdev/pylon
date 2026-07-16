@@ -245,4 +245,27 @@ mod tests {
         let Expr::IfElse(outer) = sel.result else { panic!("expected IfElse") };
         assert!(matches!(outer.else_expr, Expr::IfElse(_)));
     }
+
+    #[test]
+    fn test_nested_module_path_in_function_call_is_a_clear_error() {
+        // Regression: `ext::pgcrypto::digest(...)` (a 3-segment module path
+        // — PyQL module names are a single segment, e.g. `crypto::digest`)
+        // used to silently stop consuming after the first `::`, leaving the
+        // second `::` dangling to surface as a confusing "unexpected token
+        // ColonColon" once the (wrongly 2-segment-terminated) call returned.
+        let err = parse("select ext::pgcrypto::digest('encrypt this', 'sha1')").unwrap_err();
+        assert!(
+            err.to_string().contains("too many '::' segments"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_nested_module_path_in_type_expr_is_a_clear_error() {
+        let err = parse_expr("x is ext::pgcrypto::SomeType").unwrap_err();
+        assert!(
+            err.to_string().contains("too many '::' segments"),
+            "got: {err}"
+        );
+    }
 }
