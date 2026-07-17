@@ -253,7 +253,7 @@ class TestHydrate:
 
 
 # ---------------------------------------------------------------------------
-# Client query methods — mock asyncpg pool
+# Client query methods — mock pgcon pool
 # ---------------------------------------------------------------------------
 
 
