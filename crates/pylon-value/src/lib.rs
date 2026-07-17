@@ -1,4 +1,4 @@
-//! A purpose-built, self-describing value tree for cached query rows.
+//! A purpose-built, self-describing value tree for decoded Postgres rows.
 //!
 //! Not `serde_json::Value` (would blur int64 vs float64 vs decimal vs uuid —
 //! real distinctions PyQL's own type system preserves) and not raw
@@ -7,10 +7,14 @@
 //! Instead, this sits at the same layer `pylon.query.deserialize()`'s
 //! `_decode()` consumes today: already decoded from Postgres wire format
 //! (never raw bytes), but still generic/positional, not yet hydrated into a
-//! user class. The shape-driven walk that converts a raw asyncpg row tuple
-//! to/from `CachedValue` (using `ShapeNode` as the position→name map) lives
-//! at the pyo3 boundary in `pylon-py`, not here — this crate only needs to
-//! know how to serialize/store/retrieve an already-built `CachedValue`.
+//! user class.
+//!
+//! This is the shared decode target for both `pylon-cache` (stores it,
+//! serialized via `rkyv`) and `pylon-pgcon` (the Postgres driver — decodes
+//! wire bytes straight into this same representation) — the whole point
+//! being one decode path regardless of whether a result came fresh from
+//! Postgres or from the LMDB cache. Deliberately has no dependency on
+//! `pylon-core`, pyo3, or any I/O crate: it's just the value shape.
 //!
 //! Serialized with `rkyv` (zero-copy) rather than `bincode` — `bincode` is
 //! effectively unmaintained upstream (its 3.0.0 release is a deliberate

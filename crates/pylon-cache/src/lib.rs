@@ -1,5 +1,4 @@
 pub mod store;
-pub mod value;
 
+pub use pylon_value::{CachedEntry, CachedValue};
 pub use store::{cache_key, Cache, CacheStats};
-pub use value::{CachedEntry, CachedValue};
