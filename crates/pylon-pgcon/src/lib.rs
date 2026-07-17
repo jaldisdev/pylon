@@ -8,9 +8,11 @@
 //! (the shared decode target `pylon-cache` also stores).
 
 pub mod error;
+pub mod listener;
 pub mod wire;
 
 pub use error::{Error, Result};
+pub use listener::PgListener;
 pub use wire::{decode_value, ExtensionOids};
 
 use pylon_value::CachedValue;
@@ -151,7 +153,7 @@ impl PgPool {
     }
 }
 
-async fn query_typed_on(
+pub(crate) async fn query_typed_on(
     client: &tokio_postgres::Client,
     sql: &str,
     params: &[CachedValue],
@@ -165,7 +167,7 @@ async fn query_typed_on(
     rows.iter().map(|row| decode_result_column(row, ext)).collect()
 }
 
-async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str, params: &[CachedValue]) -> Result<u64> {
+pub(crate) async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str, params: &[CachedValue]) -> Result<u64> {
     let stmt = client.prepare(sql).await?;
     let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
     let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
