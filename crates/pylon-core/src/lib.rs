@@ -2,6 +2,7 @@ pub mod cast;
 pub mod diff;
 pub mod error;
 pub mod export;
+pub mod introspect;
 pub mod ir;
 pub mod migrate;
 pub mod migration;
