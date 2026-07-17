@@ -5,7 +5,7 @@ Covers:
   - Walker pointer resolution (_resolve_vector_pointer, _make_vector_index_desc)
   - OpenAIProvider and AnthropicProvider (mocked httpx)
   - IndexWorker drain lock
-  - VectorIndexWorker.process_batch (mocked asyncpg + compile_index_fetch)
+  - VectorIndexWorker.process_batch (mocked pgcon connection + compile_index_fetch)
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
