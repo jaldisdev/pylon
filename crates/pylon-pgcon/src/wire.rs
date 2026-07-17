@@ -270,7 +270,20 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
                 out.put_f64(*f);
             }
         }
-        CachedValue::Str(s) => out.put_slice(s.as_bytes()),
+        CachedValue::Str(s) => {
+            if *ty == Type::UUID {
+                // A JSON API request body necessarily carries a UUID query
+                // parameter as plain text (there's no JSON "uuid" type), so
+                // it arrives here as a `CachedValue::Str`, not `::Uuid` —
+                // asyncpg's own `uuid` codec accepted a plain string the
+                // same way. Without this, the raw UTF-8 text bytes get sent
+                // for a binary-format `uuid` parameter, which Postgres
+                // rejects with "incorrect binary data format".
+                out.put_slice(&parse_uuid_str(s)?);
+            } else {
+                out.put_slice(s.as_bytes());
+            }
+        }
         CachedValue::Bytes(b) => out.put_slice(b),
         CachedValue::Uuid(bytes) => out.put_slice(bytes),
         CachedValue::Decimal(s) => {
@@ -330,6 +343,17 @@ fn cached_to_json(value: &CachedValue) -> serde_json::Value {
 fn format_uuid(bytes: &[u8; 16]) -> String {
     let hex = hex::encode(bytes);
     format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+/// Parses a hyphenated UUID string into its 16 raw bytes — the inverse of
+/// `format_uuid`. Tolerates the hyphens being anywhere/absent (just strips
+/// every `-` and hex-decodes what's left) rather than validating the exact
+/// `8-4-4-4-12` grouping, since the only thing that matters here is
+/// recovering the right 16 bytes, not rejecting non-canonical formatting.
+fn parse_uuid_str(s: &str) -> Result<[u8; 16]> {
+    let hex_only: String = s.chars().filter(|c| *c != '-').collect();
+    let bytes = hex::decode(&hex_only).map_err(|_| Error::message(format!("invalid UUID string: {s:?}")))?;
+    bytes.try_into().map_err(|_: Vec<u8>| Error::message(format!("invalid UUID string: {s:?}")))
 }
 
 /// 1-dimensional Postgres array binary format (see the module doc comment
@@ -628,5 +652,37 @@ mod tests {
             decode_value(50_000, "some-domain-value".as_bytes(), &no_ext()).unwrap(),
             CachedValue::Str("some-domain-value".to_string())
         );
+    }
+
+    #[test]
+    fn encodes_a_str_value_as_uuid_binary_when_the_target_type_is_uuid() {
+        // Regression test: a JSON API request body carries a UUID query
+        // parameter as plain text (there's no JSON "uuid" type), so it
+        // arrives as `CachedValue::Str` — binding it directly against a
+        // `uuid`-typed parameter must produce the 16-byte binary form, not
+        // the raw 36-character text bytes (which Postgres rejects with
+        // "incorrect binary data format").
+        let value = CachedValue::Str("11111111-2222-3333-4444-555555555555".to_string());
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::UUID, &mut out).unwrap();
+        assert_eq!(
+            out.as_ref(),
+            &[0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]
+        );
+    }
+
+    #[test]
+    fn a_str_value_still_encodes_as_plain_text_for_a_text_target() {
+        let value = CachedValue::Str("11111111-2222-3333-4444-555555555555".to_string());
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::TEXT, &mut out).unwrap();
+        assert_eq!(out.as_ref(), "11111111-2222-3333-4444-555555555555".as_bytes());
+    }
+
+    #[test]
+    fn rejects_a_malformed_uuid_string_instead_of_sending_garbage_bytes() {
+        let value = CachedValue::Str("not-a-uuid".to_string());
+        let mut out = bytes::BytesMut::new();
+        assert!(encode_value(&value, &postgres_types::Type::UUID, &mut out).is_err());
     }
 }
