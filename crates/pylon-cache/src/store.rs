@@ -15,7 +15,7 @@ use heed::{Database, DatabaseFlags, Env, EnvOpenOptions};
 use rkyv::rancor::Error as RkyvError;
 use sha2::{Digest, Sha256};
 
-use crate::value::{ArchivedCachedEntry, CachedEntry, CachedValue};
+use pylon_value::{ArchivedCachedEntry, CachedEntry, CachedValue};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
