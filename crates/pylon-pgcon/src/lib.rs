@@ -504,6 +504,21 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn binds_a_plain_string_as_a_uuid_param() {
+        // A JSON API request body (see pylon.server.asgi's /api/<connection>/query
+        // handler) necessarily carries a UUID query parameter as plain text —
+        // there's no JSON "uuid" type — so it arrives as `CachedValue::Str`,
+        // not `::Uuid`. Regression test for a real bug: binding that Str
+        // directly against a `uuid`-typed parameter used to send raw UTF-8
+        // text bytes for a binary-format column, which Postgres rejected
+        // with "incorrect binary data format in bind parameter 1".
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let as_string = CachedValue::Str("11111111-1111-1111-1111-111111111111".to_string());
+        assert_eq!(round_trip(&pool, "uuid", as_string).await, CachedValue::Uuid([0x11; 16]));
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn round_trips_numeric_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
