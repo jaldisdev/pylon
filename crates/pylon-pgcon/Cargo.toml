@@ -6,8 +6,11 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7"
+postgres-types = "0.2"
 deadpool-postgres = "0.14"
 pylon-value = { path = "../pylon-value" }
+serde_json = "1"
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
