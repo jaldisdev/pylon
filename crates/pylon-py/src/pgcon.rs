@@ -7,12 +7,13 @@
 //! re-acquired the GIL — so no Python object ever needs to cross the
 //! `.await` inside these futures.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 
 use pyo3::prelude::*;
 use tokio::sync::Mutex as AsyncMutex;
 
-use pylon_pgcon::{ExtensionOids, PgPool, PgTransaction};
+use pylon_pgcon::{ExtensionOids, PgListener, PgPool, PgTransaction};
 use pylon_value::CachedValue;
 
 use crate::pgvalue::{cached_to_py, py_to_cached};
@@ -192,11 +193,103 @@ fn pgcon_transaction(py: Python<'_>, isolation: String) -> PyResult<Bound<'_, Py
     })
 }
 
+/// One callback per channel — every real call site in `pylon.worker`/
+/// `pylon.cache` registers exactly one listener per channel on its own
+/// dedicated connection, so this doesn't need to support asyncpg's more
+/// general multi-callback-per-channel case.
+type CallbackRegistry = Arc<StdMutex<HashMap<String, Py<PyAny>>>>;
+
+/// A dedicated LISTEN/NOTIFY connection, exposed close enough to
+/// asyncpg's `Connection.add_listener`/`remove_listener`/`execute`/`fetch`
+/// that `pylon.worker.IndexWorker` and `pylon.cache.CacheInvalidationWorker`
+/// need minimal changes to run on it (a later phase's job — this phase
+/// only builds and verifies the primitive).
+#[pyclass(module = "pylon._core")]
+struct PgconListener {
+    inner: Arc<PgListener>,
+    callbacks: CallbackRegistry,
+}
+
+#[pymethods]
+impl PgconListener {
+    /// Matches `asyncpg.Connection.add_listener(channel, callback)`:
+    /// `callback` is invoked as `callback(None, pid, channel, payload)` —
+    /// `None` stands in for asyncpg's leading `connection` argument, which
+    /// every existing callback in this codebase already ignores (both are
+    /// named `_conn`).
+    fn add_listener<'py>(&self, py: Python<'py>, channel: String, callback: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let callbacks = self.callbacks.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.listen(&channel).await.map_err(pgcon_err)?;
+            callbacks.lock().unwrap().insert(channel, callback);
+            Ok(())
+        })
+    }
+
+    /// Matches `asyncpg.Connection.remove_listener(channel, callback)`'s
+    /// signature; `callback` is accepted but not consulted since this
+    /// registry only ever holds one callback per channel.
+    fn remove_listener<'py>(&self, py: Python<'py>, channel: String, _callback: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let callbacks = self.callbacks.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.unlisten(&channel).await.map_err(pgcon_err)?;
+            callbacks.lock().unwrap().remove(&channel);
+            Ok(())
+        })
+    }
+
+    fn query<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = inner.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
+    fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+}
+
+/// Opens a new, non-pooled connection dedicated to LISTEN/NOTIFY (plus
+/// ordinary queries on the same connection, mirroring how
+/// `IndexWorker`/`CacheInvalidationWorker` use their one connection for
+/// both today).
+#[pyfunction]
+fn pgcon_listen(py: Python<'_>, dsn: String) -> PyResult<Bound<'_, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let callbacks: CallbackRegistry = Arc::new(StdMutex::new(HashMap::new()));
+        let dispatch_callbacks = callbacks.clone();
+        let listener = PgListener::connect(&dsn, move |n| {
+            Python::attach(|py| {
+                let callback = dispatch_callbacks.lock().unwrap().get(n.channel()).map(|cb| cb.clone_ref(py));
+                let Some(callback) = callback else { return };
+                let args = (py.None(), n.process_id(), n.channel().to_string(), n.payload().to_string());
+                if let Err(e) = callback.call1(py, args) {
+                    e.print(py);
+                }
+            });
+        })
+        .await
+        .map_err(pgcon_err)?;
+        Ok(PgconListener { inner: Arc::new(listener), callbacks })
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pgcon_connect, m)?)?;
     m.add_function(wrap_pyfunction!(pgcon_query, m)?)?;
     m.add_function(wrap_pyfunction!(pgcon_execute, m)?)?;
     m.add_function(wrap_pyfunction!(pgcon_transaction, m)?)?;
     m.add_class::<PgconTransaction>()?;
+    m.add_function(wrap_pyfunction!(pgcon_listen, m)?)?;
+    m.add_class::<PgconListener>()?;
     Ok(())
 }
