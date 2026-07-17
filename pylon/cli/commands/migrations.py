@@ -270,8 +270,9 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
         await _ensure_tracking_tables(conn)
         tracking = await _read_tracking(conn)
         if dev_mode:
-            from pylon.schema._introspect import introspect_db_state
-            db_state = await introspect_db_state(conn)
+            from pylon._core import pgcon_connect, introspect_db_state
+            pool = await pgcon_connect(_pg_dsn(config), 2)
+            db_state = await introspect_db_state(pool)
         else:
             db_state = None
     finally:
@@ -423,14 +424,15 @@ async def _watch(ctx: click.Context) -> None:
 async def _sync_once(config) -> None:
     """Recompile schema, introspect DB, diff, apply."""
     import asyncpg
-    from pylon._core import diff_schema as _diff_schema
-    from pylon.schema._introspect import introspect_db_state
+    from pylon._core import diff_schema as _diff_schema, pgcon_connect, introspect_db_state
 
     schema = _reload_schema(config)
 
+    pool = await pgcon_connect(_pg_dsn(config), 2)
+    db_state = await introspect_db_state(pool)
+
     conn = await asyncpg.connect(_pg_dsn(config))
     try:
-        db_state = await introspect_db_state(conn)
         ops = _diff_schema(schema, db_state)
 
         if not ops:
@@ -765,8 +767,9 @@ async def _create_from_diff(
         render_migration_file,
         compute_migration_short_id,
         db_state_from_json,
+        pgcon_connect,
+        introspect_db_state,
     )
-    from pylon.schema._introspect import introspect_db_state
 
     config = ctx.obj["config"]
     d = _migrations_dir(config)
@@ -815,7 +818,8 @@ async def _create_from_diff(
         if db_state_json is not None:
             db_state = db_state_from_json(db_state_json)
         else:
-            db_state = await introspect_db_state(conn)
+            pool = await pgcon_connect(_pg_dsn(config), 2)
+            db_state = await introspect_db_state(pool)
     finally:
         await conn.close()
 
@@ -1019,8 +1023,8 @@ async def _squash(
         compute_migration_short_id,
         pgcon_connect,
         migration_ensure_tracking_tables,
+        introspect_db_state,
     )
-    from pylon.schema._introspect import introspect_db_state
 
     config = ctx.obj["config"]
     d = _migrations_dir(config)
@@ -1087,10 +1091,9 @@ async def _squash(
     try:
         shadow_dsn = _shadow_dsn(dsn, shadow_name)
         shadow_conn = await asyncpg.connect(shadow_dsn)
-        # A small dedicated pool for `_apply_one` on the same ephemeral
-        # shadow database — `introspect_db_state` below still needs its own
-        # asyncpg connection (Phase 12 hasn't moved introspection to pgcon
-        # yet), but `_apply_one`'s DDL execution already runs through Rust.
+        # A small dedicated pool for `_apply_one`/`introspect_db_state` on
+        # the same ephemeral shadow database — `shadow_conn` (asyncpg) is
+        # only still needed for `CREATE SCHEMA` (Phase 13 territory).
         shadow_pool = await pgcon_connect(shadow_dsn, 2)
         try:
             await shadow_conn.execute("CREATE SCHEMA IF NOT EXISTS _pylon")
@@ -1101,13 +1104,13 @@ async def _squash(
             for m in pre_range:
                 await _apply_one(shadow_pool, m, False)
 
-            before_state = await introspect_db_state(shadow_conn)
+            before_state = await introspect_db_state(shadow_pool)
 
             # Apply the squash range to reach the "after" state.
             for m in squash_range:
                 await _apply_one(shadow_pool, m, False)
 
-            after_state = await introspect_db_state(shadow_conn)
+            after_state = await introspect_db_state(shadow_pool)
         finally:
             await shadow_conn.close()
     finally:

@@ -3,6 +3,7 @@ use pyo3::PyTypeInfo;
 use pylon_core as core;
 
 mod cache;
+mod introspect;
 mod migrate;
 mod pgcon;
 mod pgvalue;
@@ -1548,7 +1549,7 @@ fn blank_migration_body() -> &'static str {
 /// Pass to `diff_schema()` to compute the DDL needed to reach the target schema.
 #[pyclass(module = "pylon._core")]
 pub struct DbState {
-    inner: core::diff::DbState,
+    pub(crate) inner: core::diff::DbState,
 }
 
 #[pymethods]
@@ -1790,6 +1791,13 @@ fn db_state_from_json(json: &str) -> PyResult<DbState> {
     core::diff::db_state_from_json(json)
         .map(|inner| DbState { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+}
+
+/// Serialize an existing `DbState` (e.g. from `introspect_db_state`) to JSON
+/// — the inverse of `db_state_from_json`.
+#[pyfunction]
+fn db_state_to_json(state: &DbState) -> String {
+    core::diff::db_state_to_json(&state.inner)
 }
 
 /// Discard all cached compiled queries. Must be called after a schema reload
@@ -2046,6 +2054,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
+    m.add_function(wrap_pyfunction!(db_state_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;
 
     // Cache
@@ -2058,6 +2067,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_async_runtimes::tokio::init(builder);
     pgcon::register(m)?;
     migrate::register(m)?;
+    introspect::register(m)?;
 
     Ok(())
 }
