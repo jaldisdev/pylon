@@ -95,16 +95,6 @@ impl PgPool {
         Ok(rows)
     }
 
-    /// Column 0 of every row as `i64` — a temporary, narrowly-scoped
-    /// convenience for validating the pyo3 async boundary (phase 3 of the
-    /// driver migration) before the real composite/record decoder exists.
-    /// Callers outside that validation path should prefer `query_raw` (or,
-    /// once it lands, the `CachedValue`-decoding path).
-    pub async fn query_scalar_i64(&self, sql: &str) -> Result<Vec<i64>> {
-        let rows = self.query_raw(sql).await?;
-        Ok(rows.iter().map(|row| row.get::<_, i64>(0)).collect())
-    }
-
     /// Runs `sql` (expected to produce exactly one column, matching
     /// pylon-core's `SELECT (...) AS result` emission) and decodes that
     /// column of every row via `wire::decode_value`, using its actual
@@ -135,6 +125,19 @@ impl PgPool {
             bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
         let rows = client.query(&stmt, &param_refs).await?;
         rows.iter().map(|row| decode_result_column(row, ext)).collect()
+    }
+
+    /// Runs `sql` with bound `params` (same convention as `query_typed`)
+    /// and discards the result, returning the number of rows affected —
+    /// for `INSERT`/`UPDATE`/`DELETE` where the caller has no `RETURNING`
+    /// clause to decode.
+    pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
+        let client = self.pool.get().await?;
+        let stmt = client.prepare(sql).await?;
+        let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+        let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+            bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+        Ok(client.execute(&stmt, &param_refs).await?)
     }
 }
 
@@ -175,14 +178,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let value: i32 = rows[0].get(0);
         assert_eq!(value, 2);
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn query_scalar_i64_casts_to_the_right_width() {
-        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        let values = pool.query_scalar_i64("SELECT 42::int8").await.unwrap();
-        assert_eq!(values, vec![42]);
     }
 
     #[tokio::test]
@@ -237,7 +232,7 @@ mod tests {
         let rows = pool.query_composite(sql, &ExtensionOids::default()).await.unwrap();
         assert_eq!(
             rows,
-            vec![CachedValue::Array(vec![
+            vec![CachedValue::Composite(vec![
                 CachedValue::Str("Person".into()),
                 CachedValue::Str("Alice".into()),
                 CachedValue::I64(30),
@@ -258,12 +253,12 @@ mod tests {
         let rows = pool.query_composite(sql, &ExtensionOids::default()).await.unwrap();
         assert_eq!(
             rows,
-            vec![CachedValue::Array(vec![
+            vec![CachedValue::Composite(vec![
                 CachedValue::Str("Product".into()),
-                CachedValue::Array(vec![CachedValue::Str("Tag".into()), CachedValue::Str("sale".into())]),
+                CachedValue::Composite(vec![CachedValue::Str("Tag".into()), CachedValue::Str("sale".into())]),
                 CachedValue::Array(vec![
-                    CachedValue::Array(vec![CachedValue::I64(1)]),
-                    CachedValue::Array(vec![CachedValue::I64(2)]),
+                    CachedValue::Composite(vec![CachedValue::I64(1)]),
+                    CachedValue::Composite(vec![CachedValue::I64(2)]),
                 ]),
             ])]
         );
@@ -295,7 +290,7 @@ mod tests {
             '11111111-1111-1111-1111-111111111111'::uuid\
         ) AS result";
         let rows = pool.query_composite(sql, &ExtensionOids::default()).await.unwrap();
-        let CachedValue::Array(fields) = &rows[0] else { panic!("expected Array") };
+        let CachedValue::Composite(fields) = &rows[0] else { panic!("expected Composite") };
         assert_eq!(fields[0], CachedValue::Decimal("12.50".to_string()));
         assert_eq!(
             fields[1],
@@ -467,7 +462,7 @@ mod tests {
         let rows = pool.query_typed(sql, &params, &ExtensionOids::default()).await.unwrap();
         assert_eq!(
             rows,
-            vec![CachedValue::Array(vec![
+            vec![CachedValue::Composite(vec![
                 CachedValue::Str("Alice".into()),
                 CachedValue::I64(30),
                 CachedValue::Bool(true),
@@ -481,5 +476,33 @@ mod tests {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let result = pool.query_typed("SELECT $1::int8, $2::int8", &[CachedValue::I64(1)], &ExtensionOids::default()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn execute_typed_runs_a_mutation_and_reports_affected_rows() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE IF NOT EXISTS pgcon_execute_test (id int8, name text)").await.unwrap();
+
+        let inserted = pool
+            .execute_typed(
+                "INSERT INTO pgcon_execute_test (id, name) VALUES ($1::int8, $2::text)",
+                &[CachedValue::I64(1), CachedValue::Str("alice".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let updated = pool
+            .execute_typed(
+                "UPDATE pgcon_execute_test SET name = $1::text WHERE id = $2::int8",
+                &[CachedValue::Str("bob".into()), CachedValue::I64(1)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let rows = pool.query_composite("SELECT (name) AS result FROM pgcon_execute_test", &ExtensionOids::default()).await.unwrap();
+        assert_eq!(rows, vec![CachedValue::Str("bob".to_string())]);
     }
 }

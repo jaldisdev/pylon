@@ -4,6 +4,7 @@ use pylon_core as core;
 
 mod cache;
 mod pgcon;
+mod pgvalue;
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
 

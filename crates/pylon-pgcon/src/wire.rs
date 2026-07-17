@@ -185,7 +185,7 @@ fn decode_record(data: &[u8], ext: &ExtensionOids) -> Result<CachedValue> {
             offset += len;
         }
     }
-    Ok(CachedValue::Array(fields))
+    Ok(CachedValue::Composite(fields))
 }
 
 /// Decodes any 1-dimensional array: `i32 ndim`, `i32 has_null_flag`, `u32
@@ -287,6 +287,15 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
             };
             encode_array(items, &element_ty, out)?;
         }
+        CachedValue::Composite(_) => {
+            // Composites only ever arise from *decoding* a query result
+            // (see `decode_record`) — PyQL never binds a raw composite as
+            // a query parameter, and encoding one correctly would need a
+            // per-field Postgres type that isn't available here (only the
+            // original compiled query's shape carries that). Erroring is
+            // safer than guessing wrong field types.
+            return Err("cannot bind a composite value as a query parameter".into());
+        }
         CachedValue::Object(fields) => {
             let json = cached_object_to_json(fields);
             out.put_u8(1); // jsonb binary format version prefix
@@ -310,7 +319,9 @@ fn cached_to_json(value: &CachedValue) -> serde_json::Value {
         CachedValue::Bytes(b) => serde_json::Value::String(hex::encode(b)),
         CachedValue::Uuid(bytes) => serde_json::Value::String(format_uuid(bytes)),
         CachedValue::Decimal(s) => serde_json::Value::String(s.clone()),
-        CachedValue::Array(items) => serde_json::Value::Array(items.iter().map(cached_to_json).collect()),
+        CachedValue::Array(items) | CachedValue::Composite(items) => {
+            serde_json::Value::Array(items.iter().map(cached_to_json).collect())
+        }
         CachedValue::Object(fields) => cached_object_to_json(fields),
     }
 }
@@ -518,7 +529,7 @@ mod tests {
         let decoded = decode_value(OID_RECORD, &data, &no_ext()).unwrap();
         assert_eq!(
             decoded,
-            CachedValue::Array(vec![CachedValue::I64(42), CachedValue::Str("alice".into()), CachedValue::Null])
+            CachedValue::Composite(vec![CachedValue::I64(42), CachedValue::Str("alice".into()), CachedValue::Null])
         );
     }
 
@@ -529,8 +540,8 @@ mod tests {
         let decoded = decode_value(OID_RECORD, &outer, &no_ext()).unwrap();
         assert_eq!(
             decoded,
-            CachedValue::Array(vec![
-                CachedValue::Array(vec![CachedValue::I64(1)]),
+            CachedValue::Composite(vec![
+                CachedValue::Composite(vec![CachedValue::I64(1)]),
                 CachedValue::Str("outer".into()),
             ])
         );
@@ -590,8 +601,8 @@ mod tests {
         assert_eq!(
             decoded,
             CachedValue::Array(vec![
-                CachedValue::Array(vec![CachedValue::I64(1)]),
-                CachedValue::Array(vec![CachedValue::I64(2)]),
+                CachedValue::Composite(vec![CachedValue::I64(1)]),
+                CachedValue::Composite(vec![CachedValue::I64(2)]),
             ])
         );
     }

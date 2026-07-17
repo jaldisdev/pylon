@@ -50,7 +50,22 @@ pub enum CachedValue {
     // (`CachedValue: Archive` requires `Vec<CachedValue>: Archive` requires
     // `CachedValue: Archive`, forever) — see rkyv's own docs on recursive
     // types.
+    /// A genuine Postgres array (`text[]`, `int8[]`, ...) — reconstructed
+    /// Python-side as a `list`, matching what asyncpg has always decoded a
+    /// Postgres array into. Do not use this for a composite/record's
+    /// positional fields; see `Composite`.
     Array(#[rkyv(omit_bounds)] Vec<CachedValue>),
+    /// A positional composite (`record` — a schema object's own field
+    /// tuple, or a nested `ROW(...)`), reconstructed Python-side as a
+    /// `tuple`, matching `asyncpg.Record`'s own behavior — critically,
+    /// `isinstance(a_tuple, (dict, list))` is `False`, the same as a real
+    /// `asyncpg.Record`, which `pylon.query._decode()`'s `"named_tuple"`
+    /// case relies on to tell "this position holds a raw jsonb value"
+    /// apart from "this position holds a composite that needs `value[pos]`
+    /// indexing first." Using `Array` (→ `list`) here instead silently
+    /// breaks that check — a real bug caught by comparing decoded output
+    /// against the live asyncpg path on real queries.
+    Composite(#[rkyv(omit_bounds)] Vec<CachedValue>),
     /// Field name + value pairs, in shape order (not a map — field order is
     /// part of what `ShapeNode` positions describe, and duplicate names
     /// can't happen for a single object's own pointers).
@@ -83,6 +98,7 @@ mod tests {
             ("balance".into(), CachedValue::Decimal("12.50".into())),
             ("tags".into(), CachedValue::Array(vec![CachedValue::Str("a".into()), CachedValue::Null])),
             ("avatar".into(), CachedValue::Bytes(vec![1, 2, 3])),
+            ("point".into(), CachedValue::Composite(vec![CachedValue::F64(1.0), CachedValue::F64(2.0)])),
         ]);
         let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
         // SAFETY: bytes were produced moments ago by `to_bytes` on this same
