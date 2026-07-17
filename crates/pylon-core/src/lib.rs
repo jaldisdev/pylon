@@ -3,6 +3,7 @@ pub mod diff;
 pub mod error;
 pub mod export;
 pub mod ir;
+pub mod migrate;
 pub mod migration;
 pub mod parse;
 pub mod query;

@@ -246,6 +246,36 @@ pub fn render_file(onto: &str, body: &str, squashed: &[String]) -> String {
     out
 }
 
+// ── Step splitting ────────────────────────────────────────────────────────────
+
+/// Split a migration body on `-- pylon:step` markers into `(transactional,
+/// sql)` pairs, in order. A step is transactional unless its *preceding*
+/// marker was `-- pylon:step non-transactional` (that marker applies to the
+/// step it introduces, not the one it ends — matching the Python
+/// implementation this replaces exactly, including the leading segment
+/// before any marker always being transactional).
+pub fn parse_steps(body: &str) -> Vec<(bool, String)> {
+    let mut steps = Vec::new();
+    let mut current_transactional = true;
+    let mut current = String::new();
+
+    for line in body.split_inclusive('\n') {
+        match line.trim() {
+            "-- pylon:step" => {
+                steps.push((current_transactional, std::mem::take(&mut current)));
+                current_transactional = true;
+            }
+            "-- pylon:step non-transactional" => {
+                steps.push((current_transactional, std::mem::take(&mut current)));
+                current_transactional = false;
+            }
+            _ => current.push_str(line),
+        }
+    }
+    steps.push((current_transactional, current));
+    steps
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -352,5 +382,54 @@ mod tests {
     fn test_blank_body_stable() {
         // Blank body must be stable so its hash is consistent.
         assert_eq!(blank_body(), "\n-- TODO: write this migration's SQL by hand\n");
+    }
+
+    #[test]
+    fn test_parse_steps_no_markers_is_one_transactional_step() {
+        let steps = parse_steps("CREATE TABLE foo ();\n");
+        assert_eq!(steps, vec![(true, "CREATE TABLE foo ();\n".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_steps_splits_on_transactional_marker() {
+        let steps = parse_steps("CREATE TABLE a ();\n-- pylon:step\nCREATE TABLE b ();\n");
+        assert_eq!(
+            steps,
+            vec![
+                (true, "CREATE TABLE a ();\n".to_string()),
+                (true, "CREATE TABLE b ();\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_steps_non_transactional_marker_applies_to_the_next_step() {
+        let steps = parse_steps(
+            "CREATE TABLE a ();\n-- pylon:step non-transactional\nCREATE INDEX CONCURRENTLY idx ON a (x);\n",
+        );
+        assert_eq!(
+            steps,
+            vec![
+                (true, "CREATE TABLE a ();\n".to_string()),
+                (false, "CREATE INDEX CONCURRENTLY idx ON a (x);\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_steps_reverts_to_transactional_after_a_plain_marker() {
+        let steps = parse_steps(
+            "-- pylon:step non-transactional\nCREATE INDEX CONCURRENTLY idx ON a (x);\n\
+             -- pylon:step\nCREATE TABLE b ();\n",
+        );
+        assert_eq!(steps.len(), 3);
+        assert!(steps[0].0); // leading empty segment, transactional
+        assert!(!steps[1].0);
+        assert!(steps[2].0);
+    }
+
+    #[test]
+    fn test_parse_steps_empty_body() {
+        assert_eq!(parse_steps(""), vec![(true, String::new())]);
     }
 }

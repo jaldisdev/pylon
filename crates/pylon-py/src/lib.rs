@@ -3,6 +3,7 @@ use pyo3::PyTypeInfo;
 use pylon_core as core;
 
 mod cache;
+mod migrate;
 mod pgcon;
 mod pgvalue;
 
@@ -1477,7 +1478,7 @@ fn compile_search_index_fetch(
 /// Parsed migration file exposed to Python.
 #[pyclass]
 struct MigrationFile {
-    inner: core::migration::MigrationFile,
+    pub(crate) inner: core::migration::MigrationFile,
 }
 
 #[pymethods]
@@ -2056,6 +2057,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     builder.enable_all();
     pyo3_async_runtimes::tokio::init(builder);
     pgcon::register(m)?;
+    migrate::register(m)?;
 
     Ok(())
 }

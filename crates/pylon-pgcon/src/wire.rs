@@ -280,6 +280,17 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
                 // for a binary-format `uuid` parameter, which Postgres
                 // rejects with "incorrect binary data format".
                 out.put_slice(&parse_uuid_str(s)?);
+            } else if *ty == Type::JSONB {
+                // A caller that already has serialized JSON text (e.g.
+                // `schema_to_db_state_json`'s output, bound as `$1::jsonb`
+                // in `migration apply`'s db_state snapshot update) arrives
+                // here as `CachedValue::Str`, not `::Object` — treat it as
+                // already-valid JSON text and just add jsonb's binary
+                // version-byte prefix (see `decode_jsonb`/the `Object` arm
+                // below), rather than writing raw text bytes with no
+                // framing, which Postgres would reject.
+                out.put_u8(1);
+                out.put_slice(s.as_bytes());
             } else {
                 out.put_slice(s.as_bytes());
             }
@@ -684,5 +695,20 @@ mod tests {
         let value = CachedValue::Str("not-a-uuid".to_string());
         let mut out = bytes::BytesMut::new();
         assert!(encode_value(&value, &postgres_types::Type::UUID, &mut out).is_err());
+    }
+
+    #[test]
+    fn encodes_a_str_value_as_jsonb_binary_when_the_target_type_is_jsonb() {
+        // Regression test for the same class of bug as the UUID case above:
+        // a caller with already-serialized JSON text (e.g.
+        // `schema_to_db_state_json`'s output) arrives as `CachedValue::Str`,
+        // not `::Object` — binding it against a `jsonb` parameter must add
+        // the binary version-byte prefix, not send raw unframed text.
+        let value = CachedValue::Str(r#"{"a":1}"#.to_string());
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::JSONB, &mut out).unwrap();
+        assert_eq!(out.as_ref(), [&[1u8][..], br#"{"a":1}"#].concat());
+        // And decodes back correctly through the normal jsonb decode path.
+        assert_eq!(decode_value(OID_JSONB, &out, &no_ext()).unwrap(), CachedValue::Object(vec![("a".into(), CachedValue::I64(1))]));
     }
 }

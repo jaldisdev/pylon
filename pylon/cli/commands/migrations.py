@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from pathlib import Path
 
 import click
@@ -11,8 +10,6 @@ import click
 from ..config import _print_error, requires_config
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-_ADVISORY_LOCK_KEY = 7_461_999  # fixed session-level advisory-lock key for apply
 
 
 def _migrations_dir(config) -> Path:
@@ -62,42 +59,30 @@ def _ordered_chain(migrations: list) -> list:
 
 
 def _applied_tip(tracking: list[dict]) -> str | None:
-    """Compute the tip ID from applied _pylon."Migrations" rows (the one with no descendant)."""
+    """Compute the tip ID from applied _pylon."Migrations" rows (the one with no descendant).
+
+    A healthy chain has exactly one such row, but a tracking table can end
+    up with several orphaned single-node "tips" (e.g. leftover rows from
+    migration files that were since deleted/regenerated without cleaning up
+    the tracking table). When that happens, deterministically return the
+    lexicographically smallest ID among them — `next(iter(tips))` on a
+    `set()` difference used to pick one at random (Python's string hash
+    randomization means iteration order varies per *process*, so `status`
+    and `apply` — each a separate CLI invocation — could disagree on which
+    tip is current). Mirrors `pylon_core::migrate::applied_tip`'s tie-break.
+    """
     applied = [r for r in tracking if r.get("applied_at") is not None]
     if not applied:
         return None
     applied_ids = {r["id"] for r in applied}
     onto_targets = {r["onto"] for r in applied}
     tips = applied_ids - onto_targets
-    return next(iter(tips)) if tips else None
+    return min(tips) if tips else None
 
 
 def _next_seq(d: Path) -> int:
     existing = sorted(d.glob("[0-9][0-9][0-9][0-9][0-9]_*.sql"))
     return int(existing[-1].name[:5]) + 1 if existing else 1
-
-
-def _parse_steps(body: str) -> list[tuple[bool, str]]:
-    """Split a migration body on -- pylon:step markers into (transactional, sql) pairs."""
-    steps: list[tuple[bool, str]] = []
-    current_transactional = True
-    current_parts: list[str] = []
-
-    for line in body.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped == "-- pylon:step":
-            steps.append((current_transactional, "".join(current_parts)))
-            current_transactional = True
-            current_parts = []
-        elif stripped == "-- pylon:step non-transactional":
-            steps.append((current_transactional, "".join(current_parts)))
-            current_transactional = False
-            current_parts = []
-        else:
-            current_parts.append(line)
-
-    steps.append((current_transactional, "".join(current_parts)))
-    return steps
 
 
 async def _ensure_tracking_tables(conn) -> None:
@@ -153,8 +138,16 @@ async def _apply(
     dev_mode: bool,
     no_wait: bool,
 ) -> None:
-    import asyncpg
-    from pylon._core import verify_migration, schema_to_db_state_json
+    from pylon._core import (
+        schema_to_db_state_json,
+        pgcon_connect,
+        migration_ensure_tracking_tables,
+        migration_read_tracking,
+        migration_applied_tip,
+        migration_advisory_lock,
+        migration_try_advisory_lock,
+        migration_record_applied,
+    )
 
     config = ctx.obj["config"]
     d = _migrations_dir(config)
@@ -163,187 +156,91 @@ async def _apply(
     migrations = _load_migrations(d)
     chain = _ordered_chain(migrations)
 
-    conn = await asyncpg.connect(_pg_dsn(config))
-    try:
-        await _ensure_tracking_tables(conn)
+    pool = await pgcon_connect(_pg_dsn(config), config.database.pool_max_size)
+    await migration_ensure_tracking_tables(pool)
 
-        # Session-level advisory lock (§9.3)
-        if no_wait:
-            acquired = await conn.fetchval(
-                "SELECT pg_try_advisory_lock($1)", _ADVISORY_LOCK_KEY
+    # Session-level advisory lock (§9.3)
+    if no_wait:
+        lock = await migration_try_advisory_lock(pool)
+        if lock is None:
+            raise click.ClickException(
+                "Another 'pylon migration apply' is already running (--no-wait)."
             )
-            if not acquired:
-                raise click.ClickException(
-                    "Another 'pylon migration apply' is already running (--no-wait)."
-                )
+    else:
+        lock = await migration_advisory_lock(pool)
+
+    try:
+        tracking = await migration_read_tracking(pool)  # [(id, onto, applied), ...]
+        applied_tip = migration_applied_tip(tracking)
+
+        if not chain:
+            click.echo("No migrations found.")
+            return
+
+        chain_ids = [m.id for m in chain]
+
+        if applied_tip is None:
+            pending_start = 0
+        elif applied_tip in chain_ids:
+            pending_start = chain_ids.index(applied_tip) + 1
         else:
-            await conn.execute("SELECT pg_advisory_lock($1)", _ADVISORY_LOCK_KEY)
+            raise click.ClickException(
+                f"Database tip {applied_tip!r} not found in on-disk chain — "
+                "history has diverged. Resolve manually."
+            )
 
-        try:
-            tracking = await _read_tracking(conn)
-            applied_tip = _applied_tip(tracking)
+        pending = chain[pending_start:]
+        if to_id is not None:
+            if to_id not in chain_ids:
+                raise click.ClickException(f"--to target {to_id!r} not in chain.")
+            stop_idx = chain_ids.index(to_id)
+            if stop_idx < pending_start:
+                raise click.ClickException(f"--to target {to_id!r} is already applied.")
+            pending = chain[pending_start : stop_idx + 1]
 
-            if not chain:
-                click.echo("No migrations found.")
-                return
+        if not pending:
+            click.echo("Already up to date.")
+            return
 
-            chain_ids = [m.id for m in chain]
-
-            if applied_tip is None:
-                pending_start = 0
-            elif applied_tip in chain_ids:
-                pending_start = chain_ids.index(applied_tip) + 1
-            else:
-                raise click.ClickException(
-                    f"Database tip {applied_tip!r} not found in on-disk chain — "
-                    "history has diverged. Resolve manually."
-                )
-
-            pending = chain[pending_start:]
-            if to_id is not None:
-                if to_id not in chain_ids:
-                    raise click.ClickException(f"--to target {to_id!r} not in chain.")
-                stop_idx = chain_ids.index(to_id)
-                if stop_idx < pending_start:
-                    raise click.ClickException(f"--to target {to_id!r} is already applied.")
-                pending = chain[pending_start : stop_idx + 1]
-
-            if not pending:
-                click.echo("Already up to date.")
-                return
-
-            applied_ids = {r["id"] for r in tracking}
-            for m in pending:
-                # §12 squash compatibility: if any of this migration's squashed
-                # constituent IDs are already in the tracking table, the DB was
-                # updated via the old (pre-squash) chain — backfill and skip DDL.
-                if m.squashed and any(sid in applied_ids for sid in m.squashed):
-                    await _record_applied(conn, m)
-                    click.echo(f"  Backfilled {m.filename} (squash of already-applied migrations)")
-                    applied_ids.add(m.id)
-                    continue
-                await _apply_one(conn, m, dev_mode, verify_migration)
+        applied_ids = {id_ for id_, _onto, _applied in tracking}
+        for m in pending:
+            # §12 squash compatibility: if any of this migration's squashed
+            # constituent IDs are already in the tracking table, the DB was
+            # updated via the old (pre-squash) chain — backfill and skip DDL.
+            if m.squashed and any(sid in applied_ids for sid in m.squashed):
+                await migration_record_applied(pool, m.id, m.onto, m.filename)
+                click.echo(f"  Backfilled {m.filename} (squash of already-applied migrations)")
                 applied_ids.add(m.id)
+                continue
+            await _apply_one(pool, m, dev_mode)
+            applied_ids.add(m.id)
 
-            # Store a db_state snapshot on the tip row so the next `migration create`
-            # has a correct baseline without needing to apply pending migrations first.
-            tip = pending[-1]
-            schema = _reload_schema(config)
-            db_state_snapshot = schema_to_db_state_json(schema)
-            await conn.execute(
-                'UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2',
-                db_state_snapshot, tip.id,
-            )
+        # Store a db_state snapshot on the tip row so the next `migration create`
+        # has a correct baseline without needing to apply pending migrations first.
+        tip = pending[-1]
+        schema = _reload_schema(config)
+        db_state_snapshot = schema_to_db_state_json(schema)
+        await pool.execute(
+            'UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2',
+            [db_state_snapshot, tip.id],
+        )
 
-        finally:
-            await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
     finally:
-        await conn.close()
+        await lock.unlock()
 
 
-async def _apply_one(conn, m, dev_mode: bool, verify_migration) -> None:
+async def _apply_one(pool, m, dev_mode: bool) -> None:
+    """Apply one migration via `pylon_core::migrate::apply_one` (advisory
+    lock, per-step transactions, resumable progress, and dev-mode savepoint
+    retry all run in Rust — see `crates/pylon-core/src/migrate.rs`)."""
+    from pylon._core import migration_apply_one
+
     try:
-        verify_migration(m)
+        await migration_apply_one(pool, m, dev_mode)
     except ValueError as exc:
-        raise click.ClickException(str(exc))
-
-    steps = _parse_steps(m.body)
-
-    # Resume from recorded progress if a prior run failed mid-migration (§9.1)
-    progress_row = await conn.fetchrow(
-        'SELECT step_index FROM _pylon."Progress" WHERE id = $1', m.id
-    )
-    resume_from = (progress_row["step_index"] + 1) if progress_row else 0
-    multi_step = len(steps) > 1
-
-    for step_idx, (transactional, sql) in enumerate(steps):
-        if step_idx < resume_from:
-            continue
-        sql = sql.strip()
-        if not sql:
-            continue
-
-        if multi_step:
-            await conn.execute(
-                'INSERT INTO _pylon."Progress" (id, step_index) VALUES ($1, $2) '
-                "ON CONFLICT (id) DO UPDATE SET step_index = $2, updated_at = now()",
-                m.id, step_idx,
-            )
-
-        is_last = step_idx == len(steps) - 1
-
-        if transactional:
-            async with conn.transaction():
-                if dev_mode:
-                    # §9 dev-mode rebase: run DDL inside a savepoint so that "already
-                    # exists" errors (from watch having applied this earlier) roll back
-                    # only the step, not the outer transaction. Generated DDL uses
-                    # IF NOT EXISTS so this is usually a no-op.
-                    try:
-                        async with conn.transaction():  # nested → savepoint in asyncpg
-                            await conn.execute(sql)
-                    except Exception as exc:
-                        import asyncpg
-                        _dup = (
-                            asyncpg.DuplicateTableError,
-                            asyncpg.DuplicateColumnError,
-                            asyncpg.DuplicateSchemaError,
-                            asyncpg.DuplicateObjectError,
-                            asyncpg.DuplicateDatabaseError,
-                        )
-                        if not isinstance(exc, _dup):
-                            raise
-                        # Silently swallow: structure was already applied by watch.
-                else:
-                    await conn.execute(sql)
-                if is_last:
-                    await _record_applied(conn, m)
-                    if multi_step:
-                        await conn.execute(
-                            'DELETE FROM _pylon."Progress" WHERE id = $1', m.id
-                        )
-        else:
-            # Non-transactional (CONCURRENTLY): IF NOT EXISTS prevents errors when
-            # the index already exists from a prior watch or failed attempt.
-            await _drop_invalid_concurrent_index(conn, sql)
-            await conn.execute(sql)
-            if is_last:
-                await _record_applied(conn, m)
-                if multi_step:
-                    await conn.execute(
-                        'DELETE FROM _pylon."Progress" WHERE id = $1', m.id
-                    )
+        raise click.ClickException(str(exc)) from exc
 
     click.echo(f"  Applied {m.filename}")
-
-
-async def _record_applied(conn, m) -> None:
-    await conn.execute(
-        """
-        INSERT INTO _pylon."Migrations" (id, onto, filename, applied_at)
-        VALUES ($1, $2, $3, now())
-        ON CONFLICT (id) DO UPDATE SET applied_at = now()
-        """,
-        m.id, m.onto, m.filename,
-    )
-
-
-async def _drop_invalid_concurrent_index(conn, sql: str) -> None:
-    """Before retrying a CONCURRENTLY step, drop any invalid index it left behind (§9.1)."""
-    match = re.search(
-        r'CREATE\s+INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?',
-        sql, re.IGNORECASE,
-    )
-    if not match:
-        return
-    index_name = match.group(1)
-    invalid = await conn.fetchval(
-        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-        "WHERE c.relname = $1 AND NOT i.indisvalid",
-        index_name,
-    )
-    if invalid:
-        await conn.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{index_name}"')
 
 
 # ── status ────────────────────────────────────────────────────────────────────
@@ -867,7 +764,6 @@ async def _create_from_diff(
         diff_schema_ops_with_renames_and_fills as _core_diff_schema_ops_with_renames_and_fills,
         render_migration_file,
         compute_migration_short_id,
-        verify_migration,  # noqa: F401 — used by _apply_one
         db_state_from_json,
     )
     from pylon.schema._introspect import introspect_db_state
@@ -1121,7 +1017,8 @@ async def _squash(
         diff_states as _core_diff_states,
         render_migration_file,
         compute_migration_short_id,
-        verify_migration,
+        pgcon_connect,
+        migration_ensure_tracking_tables,
     )
     from pylon.schema._introspect import introspect_db_state
 
@@ -1190,20 +1087,25 @@ async def _squash(
     try:
         shadow_dsn = _shadow_dsn(dsn, shadow_name)
         shadow_conn = await asyncpg.connect(shadow_dsn)
+        # A small dedicated pool for `_apply_one` on the same ephemeral
+        # shadow database — `introspect_db_state` below still needs its own
+        # asyncpg connection (Phase 12 hasn't moved introspection to pgcon
+        # yet), but `_apply_one`'s DDL execution already runs through Rust.
+        shadow_pool = await pgcon_connect(shadow_dsn, 2)
         try:
             await shadow_conn.execute("CREATE SCHEMA IF NOT EXISTS _pylon")
-            await _ensure_tracking_tables(shadow_conn)
+            await migration_ensure_tracking_tables(shadow_pool)
 
             # Apply migrations before the squash range to reach the "before" state.
             pre_range = chain[:range_start]
             for m in pre_range:
-                await _apply_one(shadow_conn, m, False, verify_migration)
+                await _apply_one(shadow_pool, m, False)
 
             before_state = await introspect_db_state(shadow_conn)
 
             # Apply the squash range to reach the "after" state.
             for m in squash_range:
-                await _apply_one(shadow_conn, m, False, verify_migration)
+                await _apply_one(shadow_pool, m, False)
 
             after_state = await introspect_db_state(shadow_conn)
         finally:
