@@ -26,6 +26,7 @@
 use pylon_value::CachedValue;
 use rust_decimal::Decimal;
 
+pub use crate::error::Error;
 pub type Result<T> = crate::Result<T>;
 
 // Fixed, well-known OIDs (see `pg_type.h` / `SELECT oid, typname FROM
@@ -294,7 +295,7 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
             // per-field Postgres type that isn't available here (only the
             // original compiled query's shape carries that). Erroring is
             // safer than guessing wrong field types.
-            return Err("cannot bind a composite value as a query parameter".into());
+            return Err(Error::message("cannot bind a composite value as a query parameter"));
         }
         CachedValue::Object(fields) => {
             let json = cached_object_to_json(fields);
