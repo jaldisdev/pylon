@@ -6,10 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import asyncpg
 import click
 
 from ..config import _print_error, requires_config
+from pylon.exceptions import PylonError
 
 
 @click.group()
@@ -39,17 +39,17 @@ def _pg_env(db) -> dict[str, str]:
 _SYSTEM_SCHEMAS = frozenset({"information_schema", "public", "_pylon"})
 
 
-async def _user_schemas(conn) -> list[str]:
-    rows = await conn.fetch(
+async def _user_schemas(pool) -> list[str]:
+    return await pool.query(
         """
-        SELECT schema_name
+        SELECT (schema_name) AS result
         FROM information_schema.schemata
         WHERE schema_name NOT IN ('information_schema', 'public', '_pylon')
           AND schema_name NOT LIKE 'pg_%'
         ORDER BY schema_name
-        """
+        """,
+        [],
     )
-    return [r["schema_name"] for r in rows]
 
 
 # ── initialize ─────────────────────────────────────────────────────────────────
@@ -78,17 +78,18 @@ def initialize(ctx: click.Context, dry_run: bool) -> None:
     config = ctx.obj["config"]
 
     async def apply() -> None:
-        conn = await asyncpg.connect(_pg_dsn(config.database))
-        try:
-            async with conn.transaction():
-                await conn.execute(sql)
-        finally:
-            await conn.close()
+        from pylon._core import pgcon_connect
+
+        pool = await pgcon_connect(_pg_dsn(config.database), 2)
+        # `batch_execute` runs the whole multi-statement blob via the simple
+        # query protocol, which Postgres itself wraps in an implicit
+        # transaction (atomic all-or-nothing) — no explicit BEGIN needed.
+        await pool.batch_execute(sql)
 
     try:
         asyncio.run(apply())
         click.echo("_pylon schema initialized.")
-    except asyncpg.PostgresError as exc:
+    except PylonError as exc:
         _print_error("database error", str(exc))
         ctx.exit(1)
 
@@ -181,24 +182,28 @@ def wipe(ctx: click.Context, force: bool) -> None:
         )
 
     async def do_wipe() -> None:
-        conn = await asyncpg.connect(_pg_dsn(db))
-        try:
-            schemas = await _user_schemas(conn)
-            has_tracking = await conn.fetchval(
-                "SELECT to_regclass('_pylon.\"Migrations\"')"
-            )
-            async with conn.transaction():
-                for schema in schemas:
-                    await conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
-                if has_tracking:
-                    await conn.execute('DELETE FROM _pylon."Migrations"')
-                    await conn.execute('DELETE FROM _pylon."Progress"')
-        finally:
-            await conn.close()
+        from pylon._core import pgcon_connect
+
+        pool = await pgcon_connect(_pg_dsn(db), 2)
+        schemas = await _user_schemas(pool)
+        tracking_rows = await pool.query(
+            "SELECT (to_regclass('_pylon.\"Migrations\"')) AS result", []
+        )
+        has_tracking = tracking_rows[0] if tracking_rows else None
+
+        # One `batch_execute` call — Postgres's simple query protocol wraps
+        # the whole multi-statement blob in an implicit transaction, same
+        # atomicity as the old explicit `async with conn.transaction():`.
+        statements = [f'DROP SCHEMA "{schema}" CASCADE;' for schema in schemas]
+        if has_tracking:
+            statements.append('DELETE FROM _pylon."Migrations";')
+            statements.append('DELETE FROM _pylon."Progress";')
+        if statements:
+            await pool.batch_execute("\n".join(statements))
 
     try:
         asyncio.run(do_wipe())
-    except asyncpg.PostgresError as exc:
+    except PylonError as exc:
         _print_error("database error", str(exc))
         ctx.exit(1)
         return

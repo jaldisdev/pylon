@@ -33,6 +33,7 @@ use crate::PylonPgconError;
 pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
     use tokio_postgres::error::SqlState;
 
+    let sqlstate = err.sqlstate().map(|code| code.code().to_string());
     let class_name = match err.sqlstate() {
         Some(code) if *code == SqlState::T_R_SERIALIZATION_FAILURE => "TransactionSerializationError",
         Some(code) if *code == SqlState::T_R_DEADLOCK_DETECTED => "TransactionDeadlockError",
@@ -53,7 +54,16 @@ pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
             .and_then(|m| m.getattr(class_name))
             .expect("pylon.exceptions must define the core exception hierarchy");
         match cls.call1((message,)) {
-            Ok(instance) => PyErr::from_value(instance),
+            Ok(instance) => {
+                // Mirrors asyncpg's own `.sqlstate` attribute (present on
+                // every `PostgresError`) — lets callers branch on a precise
+                // error code (e.g. `42501` insufficient privilege) without
+                // a dedicated exception class per SQLSTATE.
+                if let Some(code) = &sqlstate {
+                    let _ = instance.setattr("sqlstate", code);
+                }
+                PyErr::from_value(instance)
+            }
             Err(construct_err) => construct_err,
         }
     })
@@ -225,6 +235,19 @@ impl PgconPool {
         })
     }
 
+    /// Like `query`, but decodes every column of every row by name (a
+    /// Python dict per row) instead of assuming a single `(...) AS result`
+    /// column — for hand-written admin SQL that reads named columns
+    /// directly, mirroring `PgconListener::query_named`.
+    fn query_named<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = pool.query_typed_named(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
     /// Runs `sql` with positional `params` and discards the result,
     /// returning the number of rows affected — for `INSERT`/`UPDATE`/
     /// `DELETE` with no `RETURNING` clause to decode.
@@ -246,6 +269,19 @@ impl PgconPool {
             let tx = pool.begin(&isolation).await.map_err(pgcon_err)?;
             Ok(PgconTransaction { inner: Arc::new(AsyncMutex::new(Some(tx))) })
         })
+    }
+
+    /// Runs `sql` via the simple query protocol, with no bind parameters —
+    /// unlike `query`/`execute` (which prepare via the extended protocol
+    /// and so accept exactly one statement), this can run several
+    /// `;`-separated statements — including `DO $$ ... $$` blocks — in one
+    /// call, matching asyncpg's `Connection.execute(sql)` called with no
+    /// arguments. For admin DDL blobs like `export_stdlib()`'s output
+    /// (`database initialize`) or a `watch`-computed diff op list, not
+    /// something meant to be split and bound.
+    fn batch_execute<'py>(&self, py: Python<'py>, sql: String) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { pool.batch_execute(&sql).await.map_err(pgcon_err) })
     }
 }
 
@@ -296,6 +332,18 @@ impl PgconTransaction {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
             tx.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    /// See `PgconPool::batch_execute` — same simple-protocol,
+    /// multi-statement capability, run inside this transaction instead of
+    /// on a fresh connection.
+    fn batch_execute<'py>(&self, py: Python<'py>, sql: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            tx.batch_execute(&sql).await.map_err(pgcon_err)
         })
     }
 
@@ -377,6 +425,20 @@ impl PgconListener {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             inner.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    /// Like `query`, but decodes every column of every row by name into a
+    /// dict — matching `asyncpg.Record`'s `row["col"]` access, unlike
+    /// `query` (which only ever decodes column 0, the convention PyQL-
+    /// compiled SQL uses). For hand-written admin/worker queries with
+    /// several named columns.
+    fn query_named<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = inner.query_typed_named(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
         })
     }
 }

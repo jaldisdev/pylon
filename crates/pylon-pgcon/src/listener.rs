@@ -12,7 +12,7 @@
 
 use crate::error::Result;
 use crate::wire::ExtensionOids;
-use crate::{execute_typed_on, query_typed_on};
+use crate::{execute_typed_on, query_typed_named_on, query_typed_on};
 use pylon_value::CachedValue;
 use tokio_postgres::AsyncMessage;
 
@@ -65,6 +65,14 @@ impl PgListener {
 
     pub async fn query_typed(&self, sql: &str, params: &[CachedValue], ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
         query_typed_on(&self.client, sql, params, ext).await
+    }
+
+    /// Like `query_typed`, but decodes every column of every row by name
+    /// (`CachedValue::Object`) instead of assuming column 0 is the whole
+    /// result — for hand-written queries with several named columns a
+    /// caller accesses by name, matching `asyncpg.Record`'s behavior.
+    pub async fn query_typed_named(&self, sql: &str, params: &[CachedValue], ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
+        query_typed_named_on(&self.client, sql, params, ext).await
     }
 
     pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
@@ -188,5 +196,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, vec![CachedValue::I64(7)]);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn query_typed_named_decodes_every_column_by_name() {
+        // Matches `asyncpg.Record`'s named-column access, which
+        // pylon.worker/pylon.vector/pylon.search rely on — unlike
+        // `query_typed`, which only ever decodes column 0.
+        let listener = PgListener::connect(&test_dsn(), |_n| {}).await.unwrap();
+        let rows = listener
+            .query_typed_named(
+                "SELECT $1::int8 AS id, $2::text AS type_name, $3::text AS index_name",
+                &[CachedValue::I64(42), CachedValue::Str("default::Product".to_string()), CachedValue::Null],
+                &ExtensionOids::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![CachedValue::Object(vec![
+                ("id".to_string(), CachedValue::I64(42)),
+                ("type_name".to_string(), CachedValue::Str("default::Product".to_string())),
+                ("index_name".to_string(), CachedValue::Null),
+            ])]
+        );
     }
 }
