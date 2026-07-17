@@ -23,8 +23,35 @@ fn pgcon_slot() -> &'static RwLock<Option<PgPool>> {
     PYLON_PGCON.get_or_init(|| RwLock::new(None))
 }
 
-fn pgcon_err<E: std::fmt::Display>(e: E) -> PyErr {
-    PylonPgconError::new_err(e.to_string())
+/// Maps a `pylon-pgcon` error to the real `pylon.exceptions.*` class the
+/// old asyncpg-based `client.py` already raised for the same situation —
+/// so once `Client` is wired onto this driver (a later phase), no further
+/// exception translation is needed in Python, and user code catching
+/// `except pylon.exceptions.TransactionSerializationError` (etc.) keeps
+/// working unchanged. Classifies by SQLSTATE exactly like asyncpg's own
+/// typed exceptions do (`asyncpg.SerializationError.sqlstate == "40001"`,
+/// `asyncpg.DeadlockDetectedError.sqlstate == "40P01"`); anything else —
+/// including every other constraint violation — becomes the same generic
+/// `QueryError` `_fmt_pg_error` already produces for those today (the
+/// hierarchy is preserved as-is in this pass, not redesigned).
+fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
+    use tokio_postgres::error::SqlState;
+
+    let class_name = match err.sqlstate() {
+        Some(code) if *code == SqlState::T_R_SERIALIZATION_FAILURE => "TransactionSerializationError",
+        Some(code) if *code == SqlState::T_R_DEADLOCK_DETECTED => "TransactionDeadlockError",
+        _ => "QueryError",
+    };
+    Python::attach(|py| {
+        let cls = py
+            .import("pylon.exceptions")
+            .and_then(|m| m.getattr(class_name))
+            .expect("pylon.exceptions must define the core exception hierarchy");
+        match cls.call1((err.to_string(),)) {
+            Ok(instance) => PyErr::from_value(instance),
+            Err(construct_err) => construct_err,
+        }
+    })
 }
 
 /// Clones the process-global pool out from under its lock. A

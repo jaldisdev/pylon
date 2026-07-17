@@ -5,16 +5,15 @@
 //!
 //! `query_raw` returns raw `tokio_postgres::Row`s; `wire` decodes the
 //! composite `result` column those rows carry into `pylon_value::CachedValue`
-//! (the shared decode target `pylon-cache` also stores). Typed parameter
-//! binding lands in a later phase.
+//! (the shared decode target `pylon-cache` also stores).
 
+pub mod error;
 pub mod wire;
 
+pub use error::{Error, Result};
 pub use wire::{decode_value, ExtensionOids};
 
 use pylon_value::CachedValue;
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Captures a column's raw wire bytes regardless of its declared Postgres
 /// type. `tokio_postgres`'s own `&[u8]` `FromSql` impl only accepts
@@ -50,7 +49,7 @@ impl postgres_types::ToSql for BoundParam<'_> {
         ty: &postgres_types::Type,
         out: &mut bytes::BytesMut,
     ) -> std::result::Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        wire::encode_value(self.0, ty, out)
+        Ok(wire::encode_value(self.0, ty, out)?)
     }
 
     fn accepts(_ty: &postgres_types::Type) -> bool {
@@ -65,7 +64,7 @@ impl postgres_types::ToSql for BoundParam<'_> {
 // pyo3 boundary, where a lock guard over the process-global pool slot
 // can't be held across an `.await` (it isn't `Send`), so callers clone the
 // pool out from under the lock first.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PgPool {
     pool: deadpool_postgres::Pool,
 }
@@ -504,5 +503,75 @@ mod tests {
 
         let rows = pool.query_composite("SELECT (name) AS result FROM pgcon_execute_test", &ExtensionOids::default()).await.unwrap();
         assert_eq!(rows, vec![CachedValue::Str("bob".to_string())]);
+    }
+
+    // ── Error::sqlstate() against real Postgres constraint violations ──
+    //
+    // Error mapping to Pylon's Python exception hierarchy (a later phase)
+    // classifies on these codes, exactly like asyncpg's own typed
+    // exceptions (`asyncpg.UniqueViolationError.sqlstate == "23505"`, etc.)
+    // already do today — verified against a real server response, not
+    // assumed from the SQLSTATE spec alone.
+
+    #[tokio::test]
+    #[ignore]
+    async fn unique_violation_reports_23505() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_unique_test (id int8 PRIMARY KEY)").await.unwrap();
+        pool.execute_typed("INSERT INTO pgcon_unique_test (id) VALUES ($1::int8)", &[CachedValue::I64(1)])
+            .await
+            .unwrap();
+
+        let err = pool
+            .execute_typed("INSERT INTO pgcon_unique_test (id) VALUES ($1::int8)", &[CachedValue::I64(1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION));
+        assert_eq!(err.sqlstate().unwrap().code(), "23505");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn foreign_key_violation_reports_23503() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_fk_parent (id int8 PRIMARY KEY)").await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_fk_child (parent_id int8 REFERENCES pgcon_fk_parent(id))").await.unwrap();
+
+        let err = pool
+            .execute_typed("INSERT INTO pgcon_fk_child (parent_id) VALUES ($1::int8)", &[CachedValue::I64(999)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn check_violation_reports_23514() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_check_test (age int8 CHECK (age >= 0))").await.unwrap();
+
+        let err = pool
+            .execute_typed("INSERT INTO pgcon_check_test (age) VALUES ($1::int8)", &[CachedValue::I64(-1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn syntax_error_has_no_sqlstate_matching_constraint_codes() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let err = pool.query_raw("SELECT this is not valid sql").await.unwrap_err();
+        assert_ne!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn connection_pool_error_has_no_sqlstate() {
+        // A bad DSN never reaches Postgres at all — no SQLSTATE to report,
+        // unlike a real server-side rejection.
+        let result = PgPool::connect("not-a-valid-dsn", 5).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.sqlstate(), None);
     }
 }
