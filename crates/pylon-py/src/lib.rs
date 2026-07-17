@@ -103,9 +103,10 @@ pyo3::create_exception!(
     pylon._core,
     PylonPgconError,
     pyo3::exceptions::PyException,
-    "Raised on a Postgres connection/query failure via the Rust driver. \
-     Placeholder pending proper SQLSTATE-aware error mapping (driver \
-     migration phase 7) — not yet part of the stable exception hierarchy."
+    "Raised for pgcon usage errors that aren't a Postgres response at all \
+     (e.g. calling a method on an already committed/rolled-back \
+     transaction) — real Postgres errors are mapped to pylon.exceptions.* \
+     instead (see pgcon_err in pgcon.rs)."
 );
 
 // ── Deletion policy ────────────────────────────────────────────────────────────

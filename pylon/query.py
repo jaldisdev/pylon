@@ -37,7 +37,7 @@ def deserialize(
     query: CompiledQuery,
     registry: dict[str, type],
 ) -> list:
-    """Decode asyncpg Records into Python objects using the shape embedded in query.
+    """Decode rows into Python objects using the shape embedded in query.
 
     Each record must have a ``result`` column containing the anonymous PostgreSQL
     record tuple produced by the compiled SQL.  The shape descriptor in ``query``

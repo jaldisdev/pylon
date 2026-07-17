@@ -201,7 +201,7 @@ class TestTranspilePositional:
 class TestClientQueryPositional:
     def test_positional_args_forwarded_to_transpile(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[])
+            pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
             received_kwargs: dict = {}
@@ -291,31 +291,20 @@ def _client_with_pool(pool: MagicMock, cache_config=None):
     return client
 
 
-def _make_pool(fetch_result=None, fetchval_result=None):
-    row = MagicMock()
-    row.__class__ = object  # asyncpg.Record-ish
+def _make_pool(query_result=None, execute_result=None):
+    """Return a MagicMock standing in for a `pylon._core.PgconPool` handle.
 
-    conn = AsyncMock()
-    conn.fetch = AsyncMock(return_value=fetch_result or [])
-    conn.fetchval = AsyncMock(return_value=fetchval_result)
-    conn.execute = AsyncMock(return_value=None)
-
+    `query`/`execute` take positional `(sql, params)`, matching the real
+    `PgconPool` — no more separate `pool.acquire()`-yielded connection;
+    `pgcon`'s pool methods are called directly on the pool handle itself.
+    `query_result` defaults to `[]`; pass a list to stand in for the
+    (already-decoded, unwrapped) rows a real `pool.query()` would return —
+    `Client.query()` itself does the `{"result": row}` wrapping now.
+    """
     pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_async_cm(conn))
-    return pool, conn
-
-
-class _async_cm:
-    """Minimal async context manager returning a fixed value."""
-
-    def __init__(self, value):
-        self._value = value
-
-    async def __aenter__(self):
-        return self._value
-
-    async def __aexit__(self, *_):
-        pass
+    pool.query = AsyncMock(return_value=query_result if query_result is not None else [])
+    pool.execute = AsyncMock(return_value=execute_result)
+    return pool
 
 
 class TestClientQuery:
@@ -348,7 +337,7 @@ class TestClientQuery:
 
     def test_query_returns_hydrated_list(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=["r1", "r2"])
+            pool = _make_pool(query_result=["r1", "r2"])
             client = _client_with_pool(pool)
             hydrated = [object(), object()]
 
@@ -362,7 +351,7 @@ class TestClientQuery:
 
     def test_query_single_empty_returns_none(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[])
+            pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -376,7 +365,7 @@ class TestClientQuery:
     def test_query_single_one_row_returns_first(self):
         async def _run():
             row = object()
-            pool, conn = _make_pool(fetch_result=[row])
+            pool = _make_pool(query_result=[row])
             client = _client_with_pool(pool)
 
             hydrated_row = object()
@@ -390,7 +379,7 @@ class TestClientQuery:
 
     def test_query_single_multiple_rows_raises(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=["r1", "r2"])
+            pool = _make_pool(query_result=["r1", "r2"])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -401,7 +390,7 @@ class TestClientQuery:
 
     def test_query_required_single_empty_raises(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[])
+            pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -413,7 +402,7 @@ class TestClientQuery:
 
     def test_execute_discards_result(self):
         async def _run():
-            pool, conn = _make_pool()
+            pool = _make_pool()
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -421,13 +410,13 @@ class TestClientQuery:
                 result = await client.execute("insert User { name := 'x' }")
 
             assert result is None
-            conn.execute.assert_awaited_once()
+            pool.execute.assert_awaited_once()
 
         run(_run())
 
     def test_query_json_returns_string(self):
         async def _run():
-            pool, conn = _make_pool(fetchval_result='[{"id": 1}]')
+            pool = _make_pool(query_result=['[{"id": 1}]'])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -440,7 +429,7 @@ class TestClientQuery:
 
     def test_query_json_empty_returns_empty_array(self):
         async def _run():
-            pool, conn = _make_pool(fetchval_result=None)
+            pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -453,7 +442,7 @@ class TestClientQuery:
 
     def test_query_single_json_empty_returns_none(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[])
+            pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -466,7 +455,7 @@ class TestClientQuery:
 
     def test_query_single_json_multiple_rows_raises(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=["r1", "r2"])
+            pool = _make_pool(query_result=["r1", "r2"])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -477,7 +466,7 @@ class TestClientQuery:
 
     def test_query_required_single_json_empty_raises(self):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[])
+            pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
             transpile_patch, _ = self._patch_transpile()
@@ -524,7 +513,7 @@ class TestClientCaching:
 
     def test_query_cache_hit_skips_db_fetch(self, tmp_path):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            pool = _make_pool(query_result=["row1"])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
             _cache.init(client._config.cache)
@@ -538,13 +527,13 @@ class TestClientCaching:
 
             assert first == ["row1"]
             assert second == ["row1"]
-            conn.fetch.assert_awaited_once()
+            pool.query.assert_awaited_once()
 
         run(_run())
 
     def test_query_single_cache_hit_skips_db_fetch(self, tmp_path):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            pool = _make_pool(query_result=["row1"])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
             _cache.init(client._config.cache)
@@ -558,13 +547,13 @@ class TestClientCaching:
 
             assert first == "row1"
             assert second == "row1"
-            conn.fetch.assert_awaited_once()
+            pool.query.assert_awaited_once()
 
         run(_run())
 
     def test_query_json_cache_hit_skips_db_fetchval(self, tmp_path):
         async def _run():
-            pool, conn = _make_pool(fetchval_result='[{"id": 1}]')
+            pool = _make_pool(query_result=['[{"id": 1}]'])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
             _cache.init(client._config.cache)
@@ -576,13 +565,18 @@ class TestClientCaching:
 
             assert first == '[{"id": 1}]'
             assert second == '[{"id": 1}]'
-            conn.fetchval.assert_awaited_once()
+            pool.query.assert_awaited_once()
 
         run(_run())
 
     def test_query_single_json_cache_hit_skips_db_round_trip(self, tmp_path):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[{"result": "row1"}], fetchval_result='{"id": 1}')
+            pool = _make_pool()
+            # query_single_json issues two `pool.query` calls on a cache
+            # miss: first the raw compiled SQL (to check emptiness/
+            # cardinality), then a `row_to_json`-wrapped variant for the
+            # actual JSON text — each needs its own distinct return value.
+            pool.query = AsyncMock(side_effect=[["row1"], ['{"id": 1}']])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
             _cache.init(client._config.cache)
@@ -594,14 +588,13 @@ class TestClientCaching:
 
             assert first == '{"id": 1}'
             assert second == '{"id": 1}'
-            conn.fetch.assert_awaited_once()
-            conn.fetchval.assert_awaited_once()
+            assert pool.query.await_count == 2
 
         run(_run())
 
     def test_query_with_no_tags_is_never_cached(self, tmp_path):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            pool = _make_pool(query_result=["row1"])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
             _cache.init(client._config.cache)
@@ -613,13 +606,13 @@ class TestClientCaching:
                 await client.query("select 1")
                 await client.query("select 1")
 
-            assert conn.fetch.await_count == 2
+            assert pool.query.await_count == 2
 
         run(_run())
 
     def test_cache_disabled_never_short_circuits_db(self, tmp_path):
         async def _run():
-            pool, conn = _make_pool(fetch_result=[{"result": "row1"}])
+            pool = _make_pool(query_result=["row1"])
             from pylon.config import CacheConfig
             disabled = CacheConfig(enabled=False, path=tmp_path / "cache")
             client = _client_with_pool(pool, cache_config=disabled)
@@ -631,7 +624,7 @@ class TestClientCaching:
                 await client.query("select Person")
                 await client.query("select Person")
 
-            assert conn.fetch.await_count == 2
+            assert pool.query.await_count == 2
 
         run(_run())
 
@@ -644,26 +637,26 @@ class TestClientCaching:
 class TestWithGlobals:
     def test_returns_client_instance(self):
         from pylon.client import Client
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_globals({"default::x": 1})
         assert isinstance(view, Client)
 
     def test_shares_pool_ref(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_globals({"default::x": 1})
         assert view._ref is client._ref
 
     def test_globals_merged(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         client._globals = {"default::a": 1}
         view = client.with_globals({"default::b": 2})
         assert view._globals == {"default::a": 1, "default::b": 2}
 
     def test_chained_with_globals_merges(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_globals({"default::a": 1}).with_globals({"default::b": 2})
         assert view._globals == {"default::a": 1, "default::b": 2}
@@ -671,7 +664,7 @@ class TestWithGlobals:
     def test_later_connection_visible_to_view(self):
         """Pool connected after with_globals() must be visible via the shared ref."""
         from pylon.client import _PoolRef
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(None)  # not yet connected
         client._ref.pool = None
         view = client.with_globals({"default::x": 1})
@@ -683,32 +676,32 @@ class TestWithGlobals:
 class TestWithConfig:
     def test_returns_client_instance(self):
         from pylon.client import Client
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_config({"allow_user_specified_id": True})
         assert isinstance(view, Client)
 
     def test_shares_pool_ref(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_config({"allow_user_specified_id": True})
         assert view._ref is client._ref
 
     def test_options_merged(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         client._config_options = {"allow_user_specified_id": False}
         view = client.with_config({"some_future_option": True})
         assert view._config_options == {"allow_user_specified_id": False, "some_future_option": True}
 
     def test_chained_with_config_merges(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_config({"a": 1}).with_config({"b": 2})
         assert view._config_options == {"a": 1, "b": 2}
 
     def test_with_config_preserves_globals(self):
-        pool, _ = _make_pool()
+        pool = _make_pool()
         client = _client_with_pool(pool)
         view = client.with_globals({"default::x": 1}).with_config({"allow_user_specified_id": True})
         assert view._globals == {"default::x": 1}
@@ -720,7 +713,7 @@ class TestWithConfig:
 
 
 class TestEnsureConnected:
-    def test_passes_pool_sizes_to_asyncpg(self):
+    def test_passes_max_pool_size_to_pgcon_connect(self):
         async def _run():
             from pylon.client import Client
 
@@ -735,14 +728,13 @@ class TestEnsureConnected:
             cfg.cache = CacheConfig(enabled=False)
 
             mock_pool = MagicMock()
-            with patch("asyncpg.create_pool", new=AsyncMock(return_value=mock_pool)) as mock_create:
+            with patch("pylon._core.pgcon_connect", new=AsyncMock(return_value=mock_pool)) as mock_connect:
                 client = Client(cfg)
                 await client.ensure_connected()
 
-            mock_create.assert_awaited_once()
-            _, call_kwargs = mock_create.call_args
-            assert call_kwargs["min_size"] == 3
-            assert call_kwargs["max_size"] == 15
+            mock_connect.assert_awaited_once()
+            call_args, _ = mock_connect.call_args
+            assert call_args[1] == 15
 
         run(_run())
 
@@ -758,12 +750,12 @@ class TestEnsureConnected:
             cfg.cache = CacheConfig(enabled=False)
 
             mock_pool = MagicMock()
-            with patch("asyncpg.create_pool", new=AsyncMock(return_value=mock_pool)) as mock_create:
+            with patch("pylon._core.pgcon_connect", new=AsyncMock(return_value=mock_pool)) as mock_connect:
                 client = Client(cfg)
                 await client.ensure_connected()
                 await client.ensure_connected()
 
-            assert mock_create.await_count == 1
+            assert mock_connect.await_count == 1
 
         run(_run())
 
@@ -783,9 +775,8 @@ class TestRetryingTransaction:
             tx_obj.__aexit__ = AsyncMock(return_value=False)
             tx_obj._retry_exc = None  # committed cleanly
 
-            pool = AsyncMock()
-            pool.acquire = AsyncMock(return_value=MagicMock())
-            pool.release = AsyncMock()
+            pool = MagicMock()
+            pool.transaction = AsyncMock(return_value=MagicMock())
 
             with patch("pylon.client.AsyncTransaction", return_value=tx_obj):
                 iterator = RetryingTransaction(pool, attempts=3, isolation="serializable")
@@ -795,6 +786,7 @@ class TestRetryingTransaction:
                         iterations += 1
 
             assert iterations == 1
+            pool.transaction.assert_awaited_once_with("serializable")
 
         run(_run())
 
@@ -808,8 +800,8 @@ class TestRetryingTransaction:
             call_count = 0
 
             class FakeTx:
-                def __init__(self, conn, isolation):
-                    self._conn = conn
+                def __init__(self, pgcon_tx):
+                    self._tx = pgcon_tx
 
                 async def __aenter__(self):
                     return self
@@ -822,9 +814,8 @@ class TestRetryingTransaction:
 
                 _retry_exc = exc
 
-            pool = AsyncMock()
-            pool.acquire = AsyncMock(return_value=MagicMock())
-            pool.release = AsyncMock()
+            pool = MagicMock()
+            pool.transaction = AsyncMock(return_value=MagicMock())
 
             with patch("pylon.client.AsyncTransaction", FakeTx):
                 iterator = RetryingTransaction(pool, attempts=2, isolation="serializable")
