@@ -30,7 +30,7 @@ use crate::PylonPgconError;
 /// including every other constraint violation — becomes the same generic
 /// `QueryError` `_fmt_pg_error` already produces for those today (the
 /// hierarchy is preserved as-is in this pass, not redesigned).
-fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
+pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
     use tokio_postgres::error::SqlState;
 
     let class_name = match err.sqlstate() {
@@ -206,7 +206,7 @@ impl<'py> IntoPyObject<'py> for PyCachedValue {
 /// it) can't represent that.
 #[pyclass(module = "pylon._core", frozen)]
 pub struct PgconPool {
-    inner: PgPool,
+    pub(crate) inner: PgPool,
 }
 
 #[pymethods]

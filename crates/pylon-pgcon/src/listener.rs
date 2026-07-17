@@ -72,12 +72,12 @@ impl PgListener {
     }
 }
 
-/// Quotes a channel name as a Postgres identifier (`"..."`, doubling any
-/// embedded `"`). Every call site in this codebase passes a fixed literal
-/// channel name (`pylon_index_queue`, `pylon_cache_invalidate`), never
-/// user input, but `LISTEN`/`UNLISTEN` take an identifier, not a string
-/// literal, so it still needs identifier quoting to be well-formed SQL.
-fn quote_ident(ident: &str) -> String {
+/// Quotes a channel/savepoint name as a Postgres identifier (`"..."`,
+/// doubling any embedded `"`). Every call site in this crate passes a fixed
+/// literal name (`pylon_index_queue`, `pylon_cache_invalidate`, `pylon_dev`),
+/// never user input, but the SQL these go into takes an identifier, not a
+/// string literal, so it still needs identifier quoting to be well-formed.
+pub(crate) fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 

@@ -163,6 +163,66 @@ impl PgPool {
         client.batch_execute(&format!("BEGIN ISOLATION LEVEL {level}")).await?;
         Ok(PgTransaction { client })
     }
+
+    /// Starts a transaction with no explicit isolation level — whatever
+    /// Postgres's own session/database default is applies. Used by
+    /// migration execution, which (unlike `begin`) never needs a specific
+    /// isolation level — this matches asyncpg's plain `conn.transaction()`
+    /// (no `isolation=` kwarg) that the old Python migration executor used.
+    pub async fn begin_default(&self) -> Result<PgTransaction> {
+        let client = self.pool.get().await?;
+        client.batch_execute("BEGIN").await?;
+        Ok(PgTransaction { client })
+    }
+
+    /// Runs `sql` via the simple query protocol — no bind parameters, but
+    /// (unlike `query_typed`/`execute_typed`, which prepare via the extended
+    /// protocol and so accept exactly one statement) able to run several
+    /// `;`-separated statements in one call. Matches asyncpg's
+    /// `Connection.execute(sql)` called with no arguments, which migration
+    /// DDL steps rely on (a step's body is whatever raw SQL text sits
+    /// between `-- pylon:step` markers, often more than one statement).
+    pub async fn batch_execute(&self, sql: &str) -> Result<()> {
+        let client = self.pool.get().await?;
+        client.batch_execute(sql).await?;
+        Ok(())
+    }
+
+    /// Checks out one pooled connection and hands back a handle the caller
+    /// holds across several calls, with no transaction started — for
+    /// state that's scoped to a single session rather than a single
+    /// statement or transaction, the way Postgres advisory locks
+    /// (`pg_advisory_lock`/`pg_advisory_unlock`) are: they're released by
+    /// an explicit unlock (or the session ending), not by a transaction
+    /// boundary, so acquiring and releasing one has to happen on the same
+    /// held connection — calling `PgPool::batch_execute` twice wouldn't
+    /// work, since each call may checkout a different pooled connection.
+    pub async fn connection(&self) -> Result<PgConnection> {
+        let client = self.pool.get().await?;
+        Ok(PgConnection { client })
+    }
+}
+
+/// One connection checked out of the pool and held by the caller, with no
+/// transaction open — see `PgPool::connection`.
+#[derive(Debug)]
+pub struct PgConnection {
+    client: deadpool_postgres::Object,
+}
+
+impl PgConnection {
+    pub async fn query_typed(&self, sql: &str, params: &[CachedValue], ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
+        query_typed_on(&self.client, sql, params, ext).await
+    }
+
+    pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
+        execute_typed_on(&self.client, sql, params).await
+    }
+
+    pub async fn batch_execute(&self, sql: &str) -> Result<()> {
+        self.client.batch_execute(sql).await?;
+        Ok(())
+    }
 }
 
 pub(crate) async fn query_typed_on(
@@ -210,6 +270,33 @@ impl PgTransaction {
 
     pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
         execute_typed_on(&self.client, sql, params).await
+    }
+
+    /// Runs `sql` via the simple query protocol — see `PgPool::batch_execute`
+    /// for why migration DDL steps need this instead of `execute_typed`.
+    pub async fn batch_execute(&self, sql: &str) -> Result<()> {
+        self.client.batch_execute(sql).await?;
+        Ok(())
+    }
+
+    /// Establishes a named savepoint inside this transaction. Used by
+    /// migration execution's dev-mode rebase: a step runs inside a
+    /// savepoint so an "already exists" error (from `watch` having applied
+    /// the same DDL earlier) can be rolled back to just that step instead
+    /// of aborting the whole outer transaction.
+    pub async fn savepoint(&self, name: &str) -> Result<()> {
+        self.client.batch_execute(&format!("SAVEPOINT {}", listener::quote_ident(name))).await?;
+        Ok(())
+    }
+
+    pub async fn release_savepoint(&self, name: &str) -> Result<()> {
+        self.client.batch_execute(&format!("RELEASE SAVEPOINT {}", listener::quote_ident(name))).await?;
+        Ok(())
+    }
+
+    pub async fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
+        self.client.batch_execute(&format!("ROLLBACK TO SAVEPOINT {}", listener::quote_ident(name))).await?;
+        Ok(())
     }
 
     /// Commits the transaction. On failure (e.g. a serialization failure or
@@ -515,6 +602,25 @@ mod tests {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let as_string = CachedValue::Str("11111111-1111-1111-1111-111111111111".to_string());
         assert_eq!(round_trip(&pool, "uuid", as_string).await, CachedValue::Uuid([0x11; 16]));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn binds_a_plain_string_as_a_jsonb_param() {
+        // Regression test for a real bug: `migration apply`'s db_state
+        // snapshot update binds already-serialized JSON text (a plain Rust
+        // `String`, not a `CachedValue::Object`) as `$1::jsonb` — the same
+        // class of bug as the UUID case above (a Str value bound against a
+        // non-text binary-format target type).
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let as_string = CachedValue::Str(r#"{"a":1,"b":[1,2]}"#.to_string());
+        assert_eq!(
+            round_trip(&pool, "jsonb", as_string).await,
+            CachedValue::Object(vec![
+                ("a".into(), CachedValue::I64(1)),
+                ("b".into(), CachedValue::Array(vec![CachedValue::I64(1), CachedValue::I64(2)])),
+            ])
+        );
     }
 
     #[tokio::test]
