@@ -3,6 +3,7 @@ use pyo3::PyTypeInfo;
 use pylon_core as core;
 
 mod cache;
+mod pgcon;
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
 
@@ -96,6 +97,14 @@ pyo3::create_exception!(
     PylonCacheError,
     pyo3::exceptions::PyException,
     "Raised on a cache storage failure (LMDB, serialization, or value encoding)."
+);
+pyo3::create_exception!(
+    pylon._core,
+    PylonPgconError,
+    pyo3::exceptions::PyException,
+    "Raised on a Postgres connection/query failure via the Rust driver. \
+     Placeholder pending proper SQLSTATE-aware error mapping (driver \
+     migration phase 7) — not yet part of the stable exception hierarchy."
 );
 
 // ── Deletion policy ────────────────────────────────────────────────────────────
@@ -1968,6 +1977,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PylonMissingRequiredError", PylonMissingRequiredError::type_object(py))?;
     m.add("PylonInvalidValueError", PylonInvalidValueError::type_object(py))?;
     m.add("PylonCacheError", PylonCacheError::type_object(py))?;
+    m.add("PylonPgconError", PylonPgconError::type_object(py))?;
 
     // Deletion policy
     m.add_class::<OnDeletePolicy>()?;
@@ -2037,6 +2047,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Cache
     cache::register(m)?;
+
+    // Postgres driver (async) — one persistent multi-threaded tokio
+    // runtime for the whole process, built once here rather than per call.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    pyo3_async_runtimes::tokio::init(builder);
+    pgcon::register(m)?;
 
     Ok(())
 }

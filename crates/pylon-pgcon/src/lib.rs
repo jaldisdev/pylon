@@ -10,6 +10,12 @@
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+// `deadpool_postgres::Pool` is `Arc`-backed internally, so cloning a
+// `PgPool` is cheap and shares the same underlying pool — needed at the
+// pyo3 boundary, where a lock guard over the process-global pool slot
+// can't be held across an `.await` (it isn't `Send`), so callers clone the
+// pool out from under the lock first.
+#[derive(Clone)]
 pub struct PgPool {
     pool: deadpool_postgres::Pool,
 }
@@ -38,6 +44,16 @@ impl PgPool {
         let rows = client.query(sql, &[]).await?;
         Ok(rows)
     }
+
+    /// Column 0 of every row as `i64` — a temporary, narrowly-scoped
+    /// convenience for validating the pyo3 async boundary (phase 3 of the
+    /// driver migration) before the real composite/record decoder exists.
+    /// Callers outside that validation path should prefer `query_raw` (or,
+    /// once it lands, the `CachedValue`-decoding path).
+    pub async fn query_scalar_i64(&self, sql: &str) -> Result<Vec<i64>> {
+        let rows = self.query_raw(sql).await?;
+        Ok(rows.iter().map(|row| row.get::<_, i64>(0)).collect())
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +77,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let value: i32 = rows[0].get(0);
         assert_eq!(value, 2);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn query_scalar_i64_casts_to_the_right_width() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let values = pool.query_scalar_i64("SELECT 42::int8").await.unwrap();
+        assert_eq!(values, vec![42]);
     }
 
     #[tokio::test]
