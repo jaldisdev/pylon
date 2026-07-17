@@ -66,4 +66,23 @@ impl Error {
     pub(crate) fn message(msg: impl Into<String>) -> Self {
         Error::Other(msg.into().into())
     }
+
+    /// The message a caller should actually show. `tokio_postgres::Error`'s
+    /// own `Display` only renders a generic category string for a
+    /// server-side error (`"db error"` for every `DbError`-backed failure,
+    /// regardless of what the server actually said) — the real detail
+    /// (e.g. `duplicate key value violates unique constraint "..."`) lives
+    /// one level deeper, in the `DbError` its `source()` wraps, so this
+    /// prefers that when present and falls back to `Display` otherwise.
+    pub fn pg_message(&self) -> String {
+        let db_message = match self {
+            Error::Postgres(e) => e.as_db_error(),
+            Error::Pool(deadpool_postgres::PoolError::Backend(e)) => e.as_db_error(),
+            _ => None,
+        };
+        match db_message {
+            Some(db) => db.message().to_string(),
+            None => self.to_string(),
+        }
+    }
 }

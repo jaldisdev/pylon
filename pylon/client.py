@@ -1,32 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-import decimal
-import json
-import struct
-import uuid as _uuid_mod
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-import asyncpg
-
 from pylon.config import Config
 from pylon.exceptions import (
     ClientConnectionClosedError,
-    ConnectionFailedError,
-    ConnectionTimeoutError,
     InterfaceError,
     InternalServerError,
     NoDataError,
-    QueryError,
     ResultCardinalityError,
     TransactionDeadlockError,
     TransactionSerializationError,
 )
 
 if TYPE_CHECKING:
-    from pylon._core import CompiledQuery
+    from pylon._core import CompiledQuery, PgconPool, PgconTransaction
 
 
 # ---------------------------------------------------------------------------
@@ -35,62 +26,42 @@ if TYPE_CHECKING:
 
 
 class AsyncTransaction:
-    """Wraps an asyncpg connection inside an explicit transaction.
+    """Wraps a `pgcon` transaction handle.
 
     Obtain one via :meth:`Client.transaction`, never construct directly.
+    The underlying connection is already `BEGIN`-ed by the time this wraps
+    it (`PgconPool.transaction()` does both in one call), so `__aenter__`
+    has nothing left to start.
 
     ``_retry_exc`` is set by ``__aexit__`` when the failure is retriable
     (serialisation failure or deadlock).  :class:`RetryingTransaction`
     inspects this flag in ``__anext__`` to decide whether to loop again.
     """
 
-    def __init__(
-        self, conn: asyncpg.Connection, isolation: str = "serializable"
-    ) -> None:
-        self._conn = conn
-        self._isolation = isolation
-        self._tx: asyncpg.transaction.Transaction | None = None
+    def __init__(self, tx: "PgconTransaction") -> None:
+        self._tx = tx
         self._retry_exc: Exception | None = None
 
     async def __aenter__(self) -> "AsyncTransaction":
-        self._tx = self._conn.transaction(isolation=self._isolation)
-        await self._tx.start()
         return self
 
     async def __aexit__(
         self, exc_type: type | None, exc: BaseException | None, tb: object
     ) -> bool:
-        if self._tx is None:
-            return False
-
         if exc_type is None:
-            # Happy path — attempt commit.
+            # Happy path — attempt commit. `self._tx.commit()` already
+            # raises the correctly-mapped `pylon.exceptions.*` instance
+            # (see `pgcon_err` in `pgcon.rs`) — no further translation
+            # needed here, unlike the old asyncpg-native exception mapping.
             try:
                 await self._tx.commit()
-            except asyncpg.SerializationError as e:
-                mapped = TransactionSerializationError(str(e))
-                self._retry_exc = mapped
-                raise mapped from e
-            except asyncpg.DeadlockDetectedError as e:
-                mapped = TransactionDeadlockError(str(e))
-                self._retry_exc = mapped
-                raise mapped from e
+            except (TransactionSerializationError, TransactionDeadlockError) as e:
+                self._retry_exc = e
+                raise
         else:
             # Always roll back on any error.
             await self._tx.rollback()
-            # Re-map asyncpg-native retriable errors to Pylon exceptions.
-            if isinstance(exc, asyncpg.SerializationError):
-                mapped = TransactionSerializationError(str(exc))
-                self._retry_exc = mapped
-                raise mapped from exc
-            if isinstance(exc, asyncpg.DeadlockDetectedError):
-                mapped = TransactionDeadlockError(str(exc))
-                self._retry_exc = mapped
-                raise mapped from exc
-            # Already a Pylon retriable exception — record it for the iterator.
-            if isinstance(
-                exc, (TransactionSerializationError, TransactionDeadlockError)
-            ):
+            if isinstance(exc, (TransactionSerializationError, TransactionDeadlockError)):
                 self._retry_exc = exc  # type: ignore[assignment]
 
         return False
@@ -102,20 +73,20 @@ class AsyncTransaction:
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
         sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs))
-        records = list(await self._conn.fetch(sql, *params))
-        return _hydrate(records, compiled)
+        rows = await self._tx.query(sql, params)
+        return _hydrate([{"result": row} for row in rows], compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
         sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs))
-        rows = await self._conn.fetch(sql, *params)
+        rows = await self._tx.query(sql, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
             )
         if not rows:
             return None
-        return _hydrate(list(rows), compiled)[0]
+        return _hydrate([{"result": row} for row in rows], compiled)[0]
 
     async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Return exactly one result; raise if the set is empty or has >1 row."""
@@ -127,7 +98,7 @@ class AsyncTransaction:
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
-        await self._conn.execute(sql, *params)
+        await self._tx.execute(sql, params)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -135,26 +106,21 @@ class AsyncTransaction:
         Returns ``"[]"`` when the result set is empty.
         """
         sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
-        return (
-            await self._conn.fetchval(
-                f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
-            )
-            or "[]"
-        )
+        rows = await self._tx.query(f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", params)
+        return rows[0] if rows else "[]"
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
         sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
-        rows = await self._conn.fetch(sql, *params)
+        rows = await self._tx.query(sql, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single_json expected at most one result, got {len(rows)}."
             )
         if not rows:
             return None
-        return await self._conn.fetchval(
-            f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
-        )
+        json_rows = await self._tx.query(f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", params)
+        return json_rows[0] if json_rows else None
 
     async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Return exactly one result as a JSON string; raise if the set is empty."""
@@ -185,7 +151,7 @@ class RetryingTransaction:
     Do not construct directly — use ``client.transaction()``.
     """
 
-    def __init__(self, pool: asyncpg.Pool, *, attempts: int, isolation: str) -> None:
+    def __init__(self, pool: "PgconPool", *, attempts: int, isolation: str) -> None:
         self._pool = pool
         self._attempts = attempts
         self._isolation = isolation
@@ -196,15 +162,13 @@ class RetryingTransaction:
         return self
 
     async def __anext__(self) -> AsyncTransaction:
-        # Inspect the outcome of the previous attempt.
+        # Inspect the outcome of the previous attempt. Unlike the old
+        # asyncpg-based pool, there's no separate release step: `commit`/
+        # `rollback` on the pgcon transaction handle already consume the
+        # underlying connection and return it to the pool themselves.
         if self._prev_tx is not None:
             if self._prev_tx._retry_exc is None:
-                # Committed cleanly — release the connection and stop.
-                await self._pool.release(self._prev_tx._conn)
                 raise StopAsyncIteration
-
-            # Retriable failure — release the connection before deciding.
-            await self._pool.release(self._prev_tx._conn)
 
             if self._attempt >= self._attempts:
                 raise self._prev_tx._retry_exc
@@ -212,8 +176,8 @@ class RetryingTransaction:
             # Exponential back-off: attempt 1 → 0 ms, 2 → 100 ms, 3 → 200 ms, …
             await asyncio.sleep((self._attempt - 1) * 0.1)
 
-        conn: asyncpg.Connection = await self._pool.acquire()
-        tx = AsyncTransaction(conn, isolation=self._isolation)
+        pgcon_tx = await self._pool.transaction(self._isolation)
+        tx = AsyncTransaction(pgcon_tx)
         self._prev_tx = tx
         self._attempt += 1
         return tx
@@ -229,12 +193,12 @@ class _PoolRef:
     __slots__ = ("pool", "lock")
 
     def __init__(self) -> None:
-        self.pool: asyncpg.Pool | None = None
+        self.pool: "PgconPool | None" = None
         self.lock = asyncio.Lock()
 
 
 class Client:
-    """Async Pylon client — asyncpg pool wrapper with PyQL transpilation.
+    """Async Pylon client — pgcon (Rust driver) pool wrapper with PyQL transpilation.
 
     Args:
         config: A :class:`~pylon.config.Config` instance.  When omitted the
@@ -267,21 +231,17 @@ class Client:
             dsn = self._config.database.dsn or _build_dsn(self._config.database)
             # Swap the pylon:// scheme for postgresql:// if present.
             dsn = dsn.replace("pylon://", "postgresql://", 1)
-            try:
-                self._ref.pool = await asyncpg.create_pool(
-                    dsn,
-                    min_size=self._config.database.pool_min_size,
-                    max_size=self._config.database.pool_max_size,
-                    init=_setup_codecs,
-                )
-            except asyncpg.InvalidCatalogNameError as exc:
-                raise ConnectionFailedError(str(exc)) from exc
-            except (OSError, asyncpg.CannotConnectNowError) as exc:
-                raise ConnectionFailedError(str(exc)) from exc
-            except asyncio.TimeoutError as exc:
-                raise ConnectionTimeoutError(
-                    "Timed out while connecting to PostgreSQL."
-                ) from exc
+            # `pgcon_connect` already raises the correctly-mapped
+            # `ConnectionFailedError`/`ConnectionTimeoutError` itself (see
+            # `pgcon_connect_err` in `pgcon.rs`) — no try/except needed here
+            # anymore. Note: `pool_min_size` isn't passed through — deadpool
+            # (the pgcon pool implementation) has no eager pre-warm concept
+            # the way asyncpg's pool did; connections are created lazily on
+            # demand up to `pool_max_size` instead. The field is still
+            # accepted/validated on `DatabaseConfig` for config-surface
+            # compatibility, just not enforced at the connection layer.
+            from pylon._core import pgcon_connect
+            self._ref.pool = await pgcon_connect(dsn, self._config.database.pool_max_size)
             from pylon import cache as _cache
             _cache.init(self._config.cache)
 
@@ -289,7 +249,6 @@ class Client:
         """Close the connection pool and release all resources."""
         async with self._ref.lock:
             if self._ref.pool is not None:
-                await self._ref.pool.close()
                 self._ref.pool = None
 
     # Support ``async with Client(config) as client:``
@@ -304,7 +263,7 @@ class Client:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _require_pool(self) -> asyncpg.Pool:
+    def _require_pool(self) -> "PgconPool":
         if self._ref.pool is None:
             raise ClientConnectionClosedError(
                 "Client is not connected. Call await client.ensure_connected() first."
@@ -372,15 +331,11 @@ class Client:
         if cached is not None:
             return _hydrate(cached, compiled)
 
-        try:
-            async with pool.acquire() as conn:
-                records = list(await conn.fetch(sql, *params))
-        except asyncpg.SerializationError as exc:
-            raise TransactionSerializationError(str(exc)) from exc
-        except asyncpg.DeadlockDetectedError as exc:
-            raise TransactionDeadlockError(str(exc)) from exc
-        except asyncpg.PostgresError as exc:
-            raise _fmt_pg_error(exc) from exc
+        # `pool.query` already raises the correctly-mapped
+        # `pylon.exceptions.*` instance on failure (see `pgcon_err` in
+        # `pgcon.rs`) — no exception translation needed here.
+        rows = await pool.query(sql, params)
+        records = [{"result": row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
         return _hydrate(records, compiled)
 
@@ -408,20 +363,12 @@ class Client:
                 return None
             return _hydrate(cached, compiled)[0]
 
-        try:
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(sql, *params)
-        except asyncpg.SerializationError as exc:
-            raise TransactionSerializationError(str(exc)) from exc
-        except asyncpg.DeadlockDetectedError as exc:
-            raise TransactionDeadlockError(str(exc)) from exc
-        except asyncpg.PostgresError as exc:
-            raise _fmt_pg_error(exc) from exc
+        rows = await pool.query(sql, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
             )
-        records = list(rows)
+        records = [{"result": row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
         if not records:
             return None
@@ -442,15 +389,7 @@ class Client:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = self._require_pool()
         sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
-        async with pool.acquire() as conn:
-            try:
-                await conn.execute(sql, *params)
-            except asyncpg.SerializationError as exc:
-                raise TransactionSerializationError(str(exc)) from exc
-            except asyncpg.DeadlockDetectedError as exc:
-                raise TransactionDeadlockError(str(exc)) from exc
-            except asyncpg.PostgresError as exc:
-                raise _fmt_pg_error(exc) from exc
+        await pool.execute(sql, params)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -465,13 +404,8 @@ class Client:
         if hit:
             return cached if cached is not None else "[]"
 
-        async with pool.acquire() as conn:
-            value = (
-                await conn.fetchval(
-                    f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", *params
-                )
-                or "[]"
-            )
+        rows = await pool.query(f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", params)
+        value = rows[0] if rows else "[]"
         _cache.put_json(compiled, params, value, self._config.cache, kind="json_all")
         return value
 
@@ -489,8 +423,7 @@ class Client:
         if hit:
             return cached
 
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
+        rows = await pool.query(sql, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single_json expected at most one result, got {len(rows)}."
@@ -498,10 +431,8 @@ class Client:
         if not rows:
             _cache.put_json(compiled, params, None, self._config.cache, kind="json_single")
             return None
-        async with pool.acquire() as conn:
-            value = await conn.fetchval(
-                f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", *params
-            )
+        json_rows = await pool.query(f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", params)
+        value = json_rows[0] if json_rows else None
         _cache.put_json(compiled, params, value, self._config.cache, kind="json_single")
         return value
 
@@ -564,14 +495,18 @@ class Client:
     # ------------------------------------------------------------------
 
     @asynccontextmanager
-    async def raw_connection(self) -> AsyncGenerator[asyncpg.Connection, None]:
-        """Yield a raw asyncpg connection for queries outside PyQL.
+    async def raw_connection(self) -> AsyncGenerator["PgconPool", None]:
+        """Yield the underlying pgcon pool handle for queries outside PyQL.
 
-        Use sparingly — this bypasses the transpiler entirely.
+        Use sparingly — this bypasses the transpiler entirely. Exposes
+        ``query(sql, params)``/``execute(sql, params)`` (positional ``$1,
+        $2, ...`` params) — ``query`` decodes column 0 of every row
+        regardless of its name, so a bare scalar expression (e.g.
+        ``SELECT count(*) AS n``) works the same as PyQL's own ``result``
+        column convention.
         """
         pool = self._require_pool()
-        async with pool.acquire() as conn:
-            yield conn  # type: ignore[misc]
+        yield pool
 
     # ------------------------------------------------------------------
     # Repr
@@ -608,154 +543,6 @@ def create_async_client(config: Config | None = None) -> Client:
 # ---------------------------------------------------------------------------
 
 
-def _pg_decode_value(type_oid: int, data: bytes) -> Any:
-    match type_oid:
-        case 25 | 1043 | 1042:  # text, varchar, bpchar
-            return data.decode("utf-8")
-        case 2950:  # uuid
-            return str(_uuid_mod.UUID(bytes=data))
-        case 20:  # int8
-            return struct.unpack_from(">q", data)[0]
-        case 23:  # int4
-            return struct.unpack_from(">i", data)[0]
-        case 21:  # int2
-            return struct.unpack_from(">h", data)[0]
-        case 16:  # bool
-            return data[0] != 0
-        case 701:  # float8
-            return struct.unpack_from(">d", data)[0]
-        case 700:  # float4
-            return struct.unpack_from(">f", data)[0]
-        case 3802:  # jsonb: 1-byte version prefix + json text
-            return json.loads(data[1:].decode("utf-8"))
-        case 1700:  # numeric — untyped decimal literals default to this
-            return _pg_decode_numeric(data)
-        case 2249:  # record (nested composite)
-            return _pg_decode_record(data)
-        case 2287:  # _record (record[])
-            return _pg_decode_record_array(data)
-        case _:  # enums, domains, and other text-compatible custom types
-            return data.decode("utf-8")
-
-
-def _pg_decode_numeric(data: bytes) -> decimal.Decimal:
-    """Decode PostgreSQL's binary `numeric` wire format (base-10000 digit
-    groups) into a `Decimal` — needed because our custom composite decoder
-    bypasses asyncpg's own (correct) built-in numeric codec entirely."""
-    ndigits, weight, sign, dscale = struct.unpack_from(">hhHh", data, 0)
-    if sign == 0xC000:  # NUMERIC_NAN
-        return decimal.Decimal("NaN")
-    digits = struct.unpack_from(f">{ndigits}h", data, 8) if ndigits else ()
-    result = decimal.Decimal(0)
-    for i, digit in enumerate(digits):
-        result += decimal.Decimal(digit) * (decimal.Decimal(10) ** ((weight - i) * 4))
-    if sign == 0x4000:  # NUMERIC_NEG
-        result = -result
-    quant = decimal.Decimal(1).scaleb(-dscale) if dscale > 0 else decimal.Decimal(1)
-    return result.quantize(quant)
-
-
-def _pg_decode_record(data: bytes) -> tuple:
-    offset = 0
-    (nfields,) = struct.unpack_from(">i", data, offset)
-    offset += 4
-    fields: list[Any] = []
-    for _ in range(nfields):
-        (type_oid,) = struct.unpack_from(">I", data, offset)
-        offset += 4
-        (field_len,) = struct.unpack_from(">i", data, offset)
-        offset += 4
-        if field_len == -1:
-            fields.append(None)
-        else:
-            fields.append(_pg_decode_value(type_oid, data[offset : offset + field_len]))
-            offset += field_len
-    return tuple(fields)
-
-
-def _pg_decode_record_array(data: bytes) -> list:
-    offset = 0
-    (ndims,) = struct.unpack_from(">i", data, offset)
-    offset += 4
-    offset += 4  # flags (has-nulls)
-    offset += 4  # element OID (always 2249 for record[])
-    if ndims == 0:
-        return []
-    (dim,) = struct.unpack_from(">i", data, offset)
-    offset += 4
-    offset += 4  # lbound (usually 1)
-    result: list[Any] = []
-    for _ in range(dim):
-        (elem_len,) = struct.unpack_from(">i", data, offset)
-        offset += 4
-        if elem_len == -1:
-            result.append(None)
-        else:
-            result.append(_pg_decode_record(data[offset : offset + elem_len]))
-            offset += elem_len
-    return result
-
-
-def _decode_vector_binary(data: bytes) -> list:
-    ndim = struct.unpack_from(">H", data, 0)[0]
-    return list(struct.unpack_from(f">{ndim}f", data, 4))
-
-
-def _encode_vector_binary(v: list) -> bytes:
-    floats = [float(x) for x in v]
-    return struct.pack(f">HH{len(floats)}f", len(floats), 0, *floats)
-
-
-async def _setup_codecs(conn: asyncpg.Connection) -> None:
-    row = await conn.fetchrow(
-        "SELECT t.oid, n.nspname "
-        "FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
-        "WHERE t.typname = 'vector'"
-    )
-    if row is not None:
-        conn._protocol.get_settings().add_python_codec(
-            row["oid"], "vector", row["nspname"], [], "scalar",
-            _encode_vector_binary,
-            _decode_vector_binary,
-            "binary",
-        )
-
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-        format="text",
-    )
-    # Override jsonb with a binary-format codec so it decodes correctly inside
-    # anonymous record composites (asyncpg passes binary data there, not text).
-    conn._protocol.get_settings().add_python_codec(
-        3802, "jsonb", "pg_catalog", [], "scalar",
-        lambda v: b"\x01" + json.dumps(v).encode(),
-        lambda data: json.loads(data[1:].decode("utf-8")),
-        "binary",
-    )
-    # Monkey-patch: register a binary decoder for record[] (OID 2287) directly,
-    # bypassing asyncpg's scalar/composite validation in set_type_codec.
-    conn._protocol.get_settings().add_python_codec(
-        2287, "_record", "pg_catalog", [], "scalar",
-        lambda v: v,
-        _pg_decode_record_array,
-        "binary",
-    )
-
-
-import re as _re
-
-_PG_QUOTED_IDENT_RE = _re.compile(r'"([^"]+)"\."([^"]+)"')
-
-
-def _fmt_pg_error(exc: asyncpg.PostgresError) -> QueryError:
-    """Re-raise a PostgresError with Pylon-style type names in the message."""
-    msg = _PG_QUOTED_IDENT_RE.sub(lambda m: f"'{m.group(1)}::{m.group(2)}'", exc.args[0])
-    return QueryError(msg)
-
-
 def _emit_warnings(compiled: "CompiledQuery") -> None:
     import warnings as _warnings
     for msg in compiled.warnings():
@@ -771,8 +558,8 @@ async def _compile_and_resolve(
 ) -> tuple["CompiledQuery", str, list[Any]]:
     """Compile PyQL and, for OpenSearch-backed queries, perform the HTTP phase first.
 
-    Returns ``(compiled, sql, params)`` ready for asyncpg. ``config_options``
-    mirrors ``Client.with_config()`` — see ``pylon.config_options``.
+    Returns ``(compiled, sql, params)`` ready for ``pool.query``/``pool.execute``.
+    ``config_options`` mirrors ``Client.with_config()`` — see ``pylon.config_options``.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
@@ -891,8 +678,8 @@ def _transpile(
 ) -> tuple[str, list[Any], "CompiledQuery"]:
     """Compile PyQL to SQL via the pylon-core Rust extension.
 
-    Returns ``(sql, positional_params, compiled)`` ready for asyncpg.
-    ``param_names`` entries prefixed with ``__global__`` are filled from
+    Returns ``(sql, positional_params, compiled)`` ready for ``pool.query``/
+    ``pool.execute``. ``param_names`` entries prefixed with ``__global__`` are filled from
     ``globals_``; all others from ``kwargs``. ``config_options`` mirrors
     ``Client.with_config()`` — see ``pylon.config_options``.
     """
@@ -921,7 +708,7 @@ def _transpile(
 
 
 def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
-    """Decode asyncpg Records into Python dataclass instances."""
+    """Decode ``{"result": ...}``-wrapped rows into Python dataclass instances."""
     from pylon.query import _get_schema, deserialize
     from pylon.schema import schema_snapshot
     from pylon.schema._registry import named_tuples_snapshot

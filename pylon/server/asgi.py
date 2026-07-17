@@ -631,14 +631,16 @@ async def _handle_get_models(config: Config, send: Send) -> None:
 async def _handle_get_stats(client: Client, send: Send) -> None:
     registered_types, _, registered_scalars = schema_snapshot()
 
-    async with client.raw_connection() as conn:
-        estimated_objects = await conn.fetchval(
+    async with client.raw_connection() as pool:
+        rows = await pool.query(
             """
-            SELECT SUM(n_live_tup)::bigint AS estimated_total_objects
+            SELECT (SUM(n_live_tup)::bigint) AS result
             FROM pg_stat_user_tables
             WHERE schemaname NOT IN ('pg_catalog', 'information_schema', '_pylon')
-            """
+            """,
+            [],
         )
+        estimated_objects = rows[0] if rows else None
 
     await _send_json(
         send,

@@ -8,7 +8,7 @@
 //! `.await` inside these futures.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use pyo3::prelude::*;
 use tokio::sync::Mutex as AsyncMutex;
@@ -18,12 +18,6 @@ use pylon_value::CachedValue;
 
 use crate::pgvalue::{cached_to_py, py_to_cached};
 use crate::PylonPgconError;
-
-static PYLON_PGCON: OnceLock<RwLock<Option<PgPool>>> = OnceLock::new();
-
-fn pgcon_slot() -> &'static RwLock<Option<PgPool>> {
-    PYLON_PGCON.get_or_init(|| RwLock::new(None))
-}
 
 /// Maps a `pylon-pgcon` error to the real `pylon.exceptions.*` class the
 /// old asyncpg-based `client.py` already raised for the same situation —
@@ -44,28 +38,146 @@ fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
         Some(code) if *code == SqlState::T_R_DEADLOCK_DETECTED => "TransactionDeadlockError",
         _ => "QueryError",
     };
+    // The old `_fmt_pg_error` (`client.py`) only ever rewrote the message
+    // on the generic `QueryError` path — `SerializationError`/
+    // `DeadlockDetectedError` were always raised with the raw message —
+    // so this matches that exactly rather than applying it uniformly.
+    let message = if class_name == "QueryError" {
+        pylonize_pg_message(&err.pg_message())
+    } else {
+        err.pg_message()
+    };
     Python::attach(|py| {
         let cls = py
             .import("pylon.exceptions")
             .and_then(|m| m.getattr(class_name))
             .expect("pylon.exceptions must define the core exception hierarchy");
-        match cls.call1((err.to_string(),)) {
+        match cls.call1((message,)) {
             Ok(instance) => PyErr::from_value(instance),
             Err(construct_err) => construct_err,
         }
     })
 }
 
-/// Clones the process-global pool out from under its lock. A
-/// `RwLockReadGuard` isn't `Send`, so it can't be held across the `.await`
-/// inside `future_into_py`'s future — `PgPool` itself is cheaply cloneable
-/// (an `Arc`-backed handle), so callers take an owned copy instead.
-fn cloned_pool() -> PyResult<PgPool> {
-    pgcon_slot()
-        .read()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| PylonPgconError::new_err("pgcon not connected; call pgcon_connect() first"))
+/// Rewrites Postgres's `"schema"."table"` quoted-identifier notation to
+/// Pylon's own `'schema::table'` convention — mirrors the old
+/// `_fmt_pg_error`'s regex substitution in `client.py` (`r'"([^"]+)"\."([^"]+)"'`
+/// -> `"'{a}::{b}'"`), reimplemented by hand here rather than pulling in
+/// the `regex` crate for one narrow, fixed substitution.
+fn pylonize_pg_message(msg: &str) -> String {
+    let chars: Vec<char> = msg.chars().collect();
+    let mut out = String::with_capacity(msg.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some((a, b, next_i)) = match_quoted_pair(&chars, i) {
+            out.push('\'');
+            out.push_str(&a);
+            out.push_str("::");
+            out.push_str(&b);
+            out.push('\'');
+            i = next_i;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// If `chars[start..]` begins with `"<a>"."<b>"` (both `<a>`/`<b>`
+/// non-empty and quote-free), returns `(a, b, index just past the match)`.
+fn match_quoted_pair(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    let mut i = start;
+    if *chars.get(i)? != '"' {
+        return None;
+    }
+    i += 1;
+    let a_start = i;
+    while *chars.get(i)? != '"' {
+        i += 1;
+    }
+    let a: String = chars[a_start..i].iter().collect();
+    if a.is_empty() {
+        return None;
+    }
+    i += 1; // past closing quote of a
+    if *chars.get(i)? != '.' {
+        return None;
+    }
+    i += 1;
+    if *chars.get(i)? != '"' {
+        return None;
+    }
+    i += 1;
+    let b_start = i;
+    while *chars.get(i)? != '"' {
+        i += 1;
+    }
+    let b: String = chars[b_start..i].iter().collect();
+    if b.is_empty() {
+        return None;
+    }
+    i += 1; // past closing quote of b
+    Some((a, b, i))
+}
+
+#[cfg(test)]
+mod message_format_tests {
+    use super::pylonize_pg_message;
+
+    #[test]
+    fn rewrites_a_single_quoted_pair() {
+        assert_eq!(
+            pylonize_pg_message(r#"duplicate key value violates unique constraint "person_pkey" on "public"."person""#),
+            "duplicate key value violates unique constraint \"person_pkey\" on 'public::person'",
+        );
+    }
+
+    #[test]
+    fn rewrites_multiple_quoted_pairs() {
+        assert_eq!(
+            pylonize_pg_message(r#""a"."b" and "c"."d""#),
+            "'a::b' and 'c::d'",
+        );
+    }
+
+    #[test]
+    fn leaves_a_lone_quoted_identifier_untouched() {
+        assert_eq!(pylonize_pg_message(r#"column "name" does not exist"#), r#"column "name" does not exist"#);
+    }
+
+    #[test]
+    fn leaves_plain_text_untouched() {
+        assert_eq!(pylonize_pg_message("no quotes here at all"), "no quotes here at all");
+    }
+}
+
+/// Maps a `pylon-pgcon` error from `pgcon_connect` specifically — distinct
+/// from `pgcon_err` above, which is for errors during query/execute/
+/// transaction use on an *already-established* pool. `Client.ensure_connected()`
+/// depends on connect failures raising `ConnectionFailedError` (or
+/// `ConnectionTimeoutError` for the timeout case), not `QueryError` —
+/// mirroring the old `except asyncpg.InvalidCatalogNameError` / `except
+/// (OSError, asyncpg.CannotConnectNowError)` / `except asyncio.TimeoutError`
+/// triage in `client.py`, which never mapped any connect-time failure to
+/// `QueryError`.
+fn pgcon_connect_err(err: pylon_pgcon::Error) -> PyErr {
+    let class_name = if matches!(err, pylon_pgcon::Error::Pool(deadpool_postgres::PoolError::Timeout(_))) {
+        "ConnectionTimeoutError"
+    } else {
+        "ConnectionFailedError"
+    };
+    let message = err.pg_message();
+    Python::attach(|py| {
+        let cls = py
+            .import("pylon.exceptions")
+            .and_then(|m| m.getattr(class_name))
+            .expect("pylon.exceptions must define the core exception hierarchy");
+        match cls.call1((message,)) {
+            Ok(instance) => PyErr::from_value(instance),
+            Err(construct_err) => construct_err,
+        }
+    })
 }
 
 /// Wraps a `CachedValue` so it can be returned from an async future body
@@ -85,40 +197,64 @@ impl<'py> IntoPyObject<'py> for PyCachedValue {
     }
 }
 
-/// Connects (or reconnects) the process-global connection pool.
+/// A connected pool — the Rust-driver equivalent of an `asyncpg.Pool`.
+/// One per `Client` instance, not a process-wide global: `pylon.server.asgi`
+/// genuinely holds several independently-configured `Client`s at once (one
+/// per named multi-tenant connection in `pylon.toml`'s `[connections]`),
+/// each against a potentially different database, so a single global pool
+/// slot (this module's earlier design, before any Python code depended on
+/// it) can't represent that.
+#[pyclass(module = "pylon._core", frozen)]
+pub struct PgconPool {
+    inner: PgPool,
+}
+
+#[pymethods]
+impl PgconPool {
+    /// Runs `sql` with positional `params` (`$1, $2, ...`, matching
+    /// `CompiledQuery.param_names`'s own convention) and returns the
+    /// decoded `result` column of every row, each ready to feed into
+    /// `pylon.query.deserialize()` unmodified — structurally identical to
+    /// what a cache hit already reconstructs today.
+    fn query<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
+    /// Runs `sql` with positional `params` and discards the result,
+    /// returning the number of rows affected — for `INSERT`/`UPDATE`/
+    /// `DELETE` with no `RETURNING` clause to decode.
+    fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            pool.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    /// Starts an explicit transaction on a fresh pooled connection.
+    /// `isolation` is one of `"read_uncommitted"`, `"read_committed"`,
+    /// `"repeatable_read"`, `"serializable"` — the same values
+    /// `AsyncTransaction`/`client.transaction()` already accept today.
+    fn transaction<'py>(&self, py: Python<'py>, isolation: String) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tx = pool.begin(&isolation).await.map_err(pgcon_err)?;
+            Ok(PgconTransaction { inner: Arc::new(AsyncMutex::new(Some(tx))) })
+        })
+    }
+}
+
+/// Opens a new pool against `dsn`, returning a `PgconPool` handle.
 #[pyfunction]
 fn pgcon_connect(py: Python<'_>, dsn: String, max_size: usize) -> PyResult<Bound<'_, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let pool = PgPool::connect(&dsn, max_size).await.map_err(pgcon_err)?;
-        *pgcon_slot().write().unwrap() = Some(pool);
-        Ok(())
-    })
-}
-
-/// Runs `sql` with positional `params` (`$1, $2, ...`, matching
-/// `CompiledQuery.param_names`'s own convention) and returns the decoded
-/// `result` column of every row, each ready to feed into
-/// `pylon.query.deserialize()` unmodified — structurally identical to
-/// what a cache hit already reconstructs today.
-#[pyfunction]
-fn pgcon_query<'py>(py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
-    let pool = cloned_pool()?;
-    let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
-        Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
-    })
-}
-
-/// Runs `sql` with positional `params` and discards the result, returning
-/// the number of rows affected — for `INSERT`/`UPDATE`/`DELETE` with no
-/// `RETURNING` clause to decode.
-#[pyfunction]
-fn pgcon_execute<'py>(py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
-    let pool = cloned_pool()?;
-    let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        pool.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        let pool = PgPool::connect(&dsn, max_size).await.map_err(pgcon_connect_err)?;
+        Ok(PgconPool { inner: pool })
     })
 }
 
@@ -178,19 +314,6 @@ impl PgconTransaction {
             tx.rollback().await.map_err(pgcon_err)
         })
     }
-}
-
-/// Starts an explicit transaction on a fresh pooled connection. `isolation`
-/// is one of `"read_uncommitted"`, `"read_committed"`, `"repeatable_read"`,
-/// `"serializable"` — the same values `AsyncTransaction`/`client.transaction()`
-/// already accept today.
-#[pyfunction]
-fn pgcon_transaction(py: Python<'_>, isolation: String) -> PyResult<Bound<'_, PyAny>> {
-    let pool = cloned_pool()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let tx = pool.begin(&isolation).await.map_err(pgcon_err)?;
-        Ok(PgconTransaction { inner: Arc::new(AsyncMutex::new(Some(tx))) })
-    })
 }
 
 /// One callback per channel — every real call site in `pylon.worker`/
@@ -285,9 +408,7 @@ fn pgcon_listen(py: Python<'_>, dsn: String) -> PyResult<Bound<'_, PyAny>> {
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pgcon_connect, m)?)?;
-    m.add_function(wrap_pyfunction!(pgcon_query, m)?)?;
-    m.add_function(wrap_pyfunction!(pgcon_execute, m)?)?;
-    m.add_function(wrap_pyfunction!(pgcon_transaction, m)?)?;
+    m.add_class::<PgconPool>()?;
     m.add_class::<PgconTransaction>()?;
     m.add_function(wrap_pyfunction!(pgcon_listen, m)?)?;
     m.add_class::<PgconListener>()?;

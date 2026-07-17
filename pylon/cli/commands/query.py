@@ -246,16 +246,13 @@ async def _execute(
         return
 
     try:
-        import asyncpg as _asyncpg
-        from pylon.client import _fmt_pg_error
         compiled, sql, params = await _compile_and_resolve(pyql, kwargs, client._config, globals_)
         for w in compiled.warnings():
             click.echo(f"{_YELLOW}warning:{_RESET} {w}", err=True)
-        try:
-            async with client._require_pool().acquire() as conn:
-                records = list(await conn.fetch(sql, *params))
-        except _asyncpg.PostgresError as exc:
-            raise _fmt_pg_error(exc) from exc
+        # `pool.query` already raises the correctly-mapped
+        # `pylon.exceptions.*` instance on failure — no translation needed.
+        rows = await client._require_pool().query(sql, params)
+        records = [{"result": row} for row in rows]
         results = _hydrate(records, compiled)
     except Exception as e:
         click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")

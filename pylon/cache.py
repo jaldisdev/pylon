@@ -70,7 +70,7 @@ def _cache_key(compiled: CompiledQuery, params: list[Any], *, kind: str) -> str:
 def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list[Any] | None:
     """Returns cached rows, each already wrapped as ``{"result": row}`` so
     the list can be passed straight to `pylon.query.deserialize` exactly
-    like a live asyncpg result — or ``None`` on a cache miss or when caching
+    like a live query result — or ``None`` on a cache miss or when caching
     is disabled (globally or for the sets this query touches)."""
     if not _enabled or not config.enabled:
         return None
@@ -86,8 +86,8 @@ def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list
 
 
 def put(compiled: CompiledQuery, params: list[Any], records: list[Any], config: CacheConfig) -> None:
-    """Caches *records* (each an asyncpg Record with a ``result`` column)
-    under a key derived from *compiled* + *params*, tagged with
+    """Caches *records* (each a ``{"result": row}`` dict) under a key
+    derived from *compiled* + *params*, tagged with
     ``compiled.tags`` for later invalidation. No-op if caching is disabled
     or the query has no tags to key eviction on."""
     if not _enabled or not config.enabled or not compiled.tags:

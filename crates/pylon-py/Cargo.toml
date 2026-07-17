@@ -16,3 +16,4 @@ pylon-value = { path = "../pylon-value" }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tokio-postgres = "0.7"
+deadpool-postgres = "0.14"

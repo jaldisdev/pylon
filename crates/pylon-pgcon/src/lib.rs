@@ -77,13 +77,25 @@ impl PgPool {
     /// yet — no SSL/TLS surface exists anywhere in the project currently
     /// (confirmed by a full-repo grep during planning), so this isn't a
     /// regression; it's simply not needed until it is.
+    ///
+    /// Unlike `deadpool_postgres::Pool::builder(..).build()` on its own —
+    /// which only validates the DSN and is otherwise lazy, deferring the
+    /// first real connection attempt to whenever a caller first acquires
+    /// one — this eagerly acquires and immediately releases one connection
+    /// before returning, so a bad host/port/database/credentials fails
+    /// right here. That matches `asyncpg.create_pool`'s own eager-connect
+    /// behavior, which the caller (`Client.ensure_connected`) depends on to
+    /// raise `ConnectionFailedError`/`ConnectionTimeoutError` immediately
+    /// rather than silently deferring the failure to the first query.
     pub async fn connect(dsn: &str, max_size: usize) -> Result<Self> {
         let pg_config: tokio_postgres::Config = dsn.parse()?;
         let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
         let pool = deadpool_postgres::Pool::builder(manager)
             .max_size(max_size)
+            .create_timeout(Some(std::time::Duration::from_secs(10)))
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .build()?;
+        let _ = pool.get().await?;
         Ok(Self { pool })
     }
 
@@ -274,6 +286,20 @@ mod tests {
     #[ignore]
     async fn invalid_dsn_fails_to_connect() {
         let result = PgPool::connect("not-a-valid-dsn", 5).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn connect_fails_eagerly_against_a_nonexistent_database() {
+        // A well-formed DSN pointing at a database that doesn't exist must
+        // fail right here, not lazily on the first query — matching
+        // `asyncpg.create_pool`'s eager-connect behavior, which
+        // `Client.ensure_connected()` depends on to map this straight to
+        // `ConnectionFailedError` instead of silently deferring the
+        // failure past `ensure_connected()` returning successfully.
+        let bad_dsn = test_dsn().replace("/app", "/pgcon_definitely_does_not_exist");
+        let result = PgPool::connect(&bad_dsn, 5).await;
         assert!(result.is_err());
     }
 
