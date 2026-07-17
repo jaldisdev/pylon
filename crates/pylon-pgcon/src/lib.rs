@@ -118,12 +118,7 @@ impl PgPool {
         ext: &ExtensionOids,
     ) -> Result<Vec<CachedValue>> {
         let client = self.pool.get().await?;
-        let stmt = client.prepare(sql).await?;
-        let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
-        let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-            bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
-        let rows = client.query(&stmt, &param_refs).await?;
-        rows.iter().map(|row| decode_result_column(row, ext)).collect()
+        query_typed_on(&client, sql, params, ext).await
     }
 
     /// Runs `sql` with bound `params` (same convention as `query_typed`)
@@ -132,11 +127,94 @@ impl PgPool {
     /// clause to decode.
     pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
         let client = self.pool.get().await?;
-        let stmt = client.prepare(sql).await?;
-        let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
-        let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-            bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
-        Ok(client.execute(&stmt, &param_refs).await?)
+        execute_typed_on(&client, sql, params).await
+    }
+
+    /// Acquires one pooled connection and starts an explicit transaction at
+    /// the given isolation level (`"read_uncommitted"`, `"read_committed"`,
+    /// `"repeatable_read"`, or `"serializable"` — matching
+    /// `AsyncTransaction`'s existing accepted values in `client.py`, itself
+    /// a mirror of `asyncpg.transaction.ISOLATION_LEVELS`). The returned
+    /// `PgTransaction` owns the connection until `commit`/`rollback`
+    /// consumes it.
+    pub async fn begin(&self, isolation: &str) -> Result<PgTransaction> {
+        let client = self.pool.get().await?;
+        let level = match isolation {
+            "read_uncommitted" => "READ UNCOMMITTED",
+            "read_committed" => "READ COMMITTED",
+            "repeatable_read" => "REPEATABLE READ",
+            "serializable" => "SERIALIZABLE",
+            other => return Err(Error::message(format!("unknown isolation level: {other:?}"))),
+        };
+        client.batch_execute(&format!("BEGIN ISOLATION LEVEL {level}")).await?;
+        Ok(PgTransaction { client })
+    }
+}
+
+async fn query_typed_on(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[CachedValue],
+    ext: &ExtensionOids,
+) -> Result<Vec<CachedValue>> {
+    let stmt = client.prepare(sql).await?;
+    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+    let rows = client.query(&stmt, &param_refs).await?;
+    rows.iter().map(|row| decode_result_column(row, ext)).collect()
+}
+
+async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str, params: &[CachedValue]) -> Result<u64> {
+    let stmt = client.prepare(sql).await?;
+    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+    Ok(client.execute(&stmt, &param_refs).await?)
+}
+
+/// An explicit transaction on a single connection checked out of the pool.
+/// `deadpool-postgres`'s default recycling method (`Fast`) does *not* run
+/// any reset query when a connection is returned to the pool — unlike
+/// `asyncpg.Pool.release()`, which always issues `ROLLBACK` itself if the
+/// released connection still has an open transaction. That safety net has
+/// to be reproduced here explicitly, or a connection released mid- or
+/// aborted-transaction would silently corrupt the next borrower's session.
+/// Hence `commit` rolls back on its own failure before returning the error,
+/// and both `commit`/`rollback` consume `self` so the connection is only
+/// ever returned to the pool (via `Drop`) once it is guaranteed to be back
+/// in a clean, non-transactional state.
+#[derive(Debug)]
+pub struct PgTransaction {
+    client: deadpool_postgres::Object,
+}
+
+impl PgTransaction {
+    pub async fn query_typed(&self, sql: &str, params: &[CachedValue], ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
+        query_typed_on(&self.client, sql, params, ext).await
+    }
+
+    pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
+        execute_typed_on(&self.client, sql, params).await
+    }
+
+    /// Commits the transaction. On failure (e.g. a serialization failure or
+    /// deadlock detected at COMMIT time), best-effort rolls back first so
+    /// the connection isn't returned to the pool still aborted — the
+    /// original commit error is what's returned either way.
+    pub async fn commit(self) -> Result<()> {
+        match self.client.batch_execute("COMMIT").await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.client.batch_execute("ROLLBACK").await;
+                Err(e.into())
+            }
+        }
+    }
+
+    pub async fn rollback(self) -> Result<()> {
+        self.client.batch_execute("ROLLBACK").await?;
+        Ok(())
     }
 }
 
@@ -573,5 +651,235 @@ mod tests {
         let result = PgPool::connect("not-a-valid-dsn", 5).await;
         let err = result.unwrap_err();
         assert_eq!(err.sqlstate(), None);
+    }
+
+    // ── PgTransaction: begin/commit/rollback on real Postgres ───────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn committed_transaction_persists_its_writes() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_tx_commit_test (id int8 PRIMARY KEY)").await.unwrap();
+
+        let tx = pool.begin("serializable").await.unwrap();
+        tx.execute_typed("INSERT INTO pgcon_tx_commit_test (id) VALUES ($1::int8)", &[CachedValue::I64(1)])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let rows = pool
+            .query_composite("SELECT (id) AS result FROM pgcon_tx_commit_test", &ExtensionOids::default())
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![CachedValue::I64(1)]);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn rolled_back_transaction_discards_its_writes() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_tx_rollback_test (id int8 PRIMARY KEY)").await.unwrap();
+
+        let tx = pool.begin("serializable").await.unwrap();
+        tx.execute_typed("INSERT INTO pgcon_tx_rollback_test (id) VALUES ($1::int8)", &[CachedValue::I64(1)])
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+
+        let rows = pool
+            .query_composite("SELECT (id) AS result FROM pgcon_tx_rollback_test", &ExtensionOids::default())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn begin_actually_sets_the_requested_isolation_level() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        for (level, expected) in [
+            ("read_committed", "read committed"),
+            ("repeatable_read", "repeatable read"),
+            ("serializable", "serializable"),
+        ] {
+            let tx = pool.begin(level).await.unwrap();
+            let rows = tx.query_typed("SELECT (current_setting('transaction_isolation')) AS result", &[], &ExtensionOids::default())
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![CachedValue::Str(expected.to_string())]);
+            tx.rollback().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn begin_rejects_an_unknown_isolation_level() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let result = pool.begin("not_a_real_level").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_pooled_connection_is_reusable_after_commit_and_after_rollback() {
+        // Guards the exact hazard begin()/PgTransaction's doc comment
+        // describes: deadpool's default Fast recycling does nothing to a
+        // connection returned mid-transaction, so if commit/rollback ever
+        // failed to leave the session clean, this small pool (max_size 1)
+        // would hang forever on the second `begin()` waiting for a
+        // connection that never becomes usable again.
+        let pool = PgPool::connect(&test_dsn(), 1).await.unwrap();
+
+        let tx = pool.begin("serializable").await.unwrap();
+        tx.commit().await.unwrap();
+
+        let tx = pool.begin("serializable").await.unwrap();
+        tx.rollback().await.unwrap();
+
+        let rows = pool.query_raw("SELECT 1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn failed_commit_leaves_the_connection_reusable() {
+        // Forces a real 40001 serialization failure at COMMIT time (the
+        // same interleaving as `serializable_transactions_conflict_with_40001`
+        // below), on a pool sized to exactly the two connections both
+        // transactions occupy, then drains the pool with fresh queries to
+        // prove every connection — including the one that failed COMMIT —
+        // comes back healthy. Without `commit`'s best-effort
+        // ROLLBACK-on-failure, the failed connection would still be
+        // aborted server-side and the next query to land on it would
+        // immediately fail with "current transaction is aborted".
+        let pool = PgPool::connect(&test_dsn(), 2).await.unwrap();
+        pool.query_raw("DROP TABLE IF EXISTS pgcon_tx_failed_commit_test").await.unwrap();
+        pool.query_raw("CREATE TABLE pgcon_tx_failed_commit_test (class int8, value int8)").await.unwrap();
+        pool.execute_typed(
+            "INSERT INTO pgcon_tx_failed_commit_test (class, value) VALUES ($1::int8, $2::int8), ($3::int8, $4::int8)",
+            &[CachedValue::I64(1), CachedValue::I64(10), CachedValue::I64(2), CachedValue::I64(20)],
+        )
+        .await
+        .unwrap();
+
+        let tx1 = pool.begin("serializable").await.unwrap();
+        let tx2 = pool.begin("serializable").await.unwrap();
+
+        tx1.query_typed("SELECT (sum(value)) AS result FROM pgcon_tx_failed_commit_test WHERE class = 1::int8", &[], &ExtensionOids::default())
+            .await
+            .unwrap();
+        tx2.query_typed("SELECT (sum(value)) AS result FROM pgcon_tx_failed_commit_test WHERE class = 2::int8", &[], &ExtensionOids::default())
+            .await
+            .unwrap();
+        tx1.execute_typed(
+            "INSERT INTO pgcon_tx_failed_commit_test (class, value) VALUES (2::int8, $1::int8)",
+            &[CachedValue::I64(10)],
+        )
+        .await
+        .unwrap();
+        tx2.execute_typed(
+            "INSERT INTO pgcon_tx_failed_commit_test (class, value) VALUES (1::int8, $1::int8)",
+            &[CachedValue::I64(20)],
+        )
+        .await
+        .unwrap();
+
+        tx1.commit().await.unwrap();
+        let commit_result = tx2.commit().await;
+        assert!(commit_result.is_err());
+
+        // Both pooled connections are back now (tx1 released on success,
+        // tx2 released on Drop after the failed commit) — round-trip each.
+        for _ in 0..2 {
+            let rows = pool.query_raw("SELECT 1").await.unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn serializable_transactions_conflict_with_40001() {
+        // The canonical serialization-anomaly example from the Postgres
+        // docs (13.2.3): two SERIALIZABLE transactions each read one
+        // class's total, then insert a row into the *other* class based on
+        // what they read. Run concurrently with each SELECT completing
+        // before either INSERT, this is guaranteed to leave one commit
+        // rejected with 40001 — this is the exact SQLSTATE `pgcon_err`
+        // (pylon-py/src/pgcon.rs) maps to `TransactionSerializationError`.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("DROP TABLE IF EXISTS pgcon_serialization_test").await.unwrap();
+        pool.query_raw("CREATE TABLE pgcon_serialization_test (class int8, value int8)").await.unwrap();
+        pool.execute_typed(
+            "INSERT INTO pgcon_serialization_test (class, value) VALUES ($1::int8, $2::int8), ($3::int8, $4::int8)",
+            &[CachedValue::I64(1), CachedValue::I64(10), CachedValue::I64(2), CachedValue::I64(20)],
+        )
+        .await
+        .unwrap();
+
+        let tx1 = pool.begin("serializable").await.unwrap();
+        let tx2 = pool.begin("serializable").await.unwrap();
+
+        tx1.query_typed("SELECT (sum(value)) AS result FROM pgcon_serialization_test WHERE class = 1::int8", &[], &ExtensionOids::default())
+            .await
+            .unwrap();
+        tx2.query_typed("SELECT (sum(value)) AS result FROM pgcon_serialization_test WHERE class = 2::int8", &[], &ExtensionOids::default())
+            .await
+            .unwrap();
+
+        tx1.execute_typed(
+            "INSERT INTO pgcon_serialization_test (class, value) VALUES (2::int8, $1::int8)",
+            &[CachedValue::I64(10)],
+        )
+        .await
+        .unwrap();
+        tx2.execute_typed(
+            "INSERT INTO pgcon_serialization_test (class, value) VALUES (1::int8, $1::int8)",
+            &[CachedValue::I64(20)],
+        )
+        .await
+        .unwrap();
+
+        tx1.commit().await.unwrap();
+        let err = tx2.commit().await.unwrap_err();
+        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn concurrent_transactions_deadlock_with_40p01() {
+        // Classic reproducible deadlock: two transactions lock two rows in
+        // opposite order. tx1 locks row 1 then blocks on row 2; tx2 locks
+        // row 2 then blocks on row 1 — Postgres's deadlock detector aborts
+        // one of them with 40P01, `pgcon_err`'s other mapped SQLSTATE
+        // (-> `TransactionDeadlockError`).
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw("DROP TABLE IF EXISTS pgcon_deadlock_test").await.unwrap();
+        pool.query_raw("CREATE TABLE pgcon_deadlock_test (id int8 PRIMARY KEY, value int8)").await.unwrap();
+        pool.execute_typed(
+            "INSERT INTO pgcon_deadlock_test (id, value) VALUES ($1::int8, $2::int8), ($3::int8, $4::int8)",
+            &[CachedValue::I64(1), CachedValue::I64(0), CachedValue::I64(2), CachedValue::I64(0)],
+        )
+        .await
+        .unwrap();
+
+        let tx1 = pool.begin("read_committed").await.unwrap();
+        let tx2 = pool.begin("read_committed").await.unwrap();
+
+        tx1.execute_typed("UPDATE pgcon_deadlock_test SET value = 1::int8 WHERE id = 1::int8", &[]).await.unwrap();
+        tx2.execute_typed("UPDATE pgcon_deadlock_test SET value = 2::int8 WHERE id = 2::int8", &[]).await.unwrap();
+
+        // Now each blocks on the row the other is holding — issue both
+        // concurrently and let Postgres's deadlock detector break the tie.
+        let (r1, r2) = tokio::join!(
+            tx1.execute_typed("UPDATE pgcon_deadlock_test SET value = 3::int8 WHERE id = 2::int8", &[]),
+            tx2.execute_typed("UPDATE pgcon_deadlock_test SET value = 4::int8 WHERE id = 1::int8", &[]),
+        );
+
+        let results = [r1, r2];
+        let deadlock_errors: Vec<_> = results
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.sqlstate() == Some(&tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED)))
+            .collect();
+        assert_eq!(deadlock_errors.len(), 1, "expected exactly one side to be aborted with 40P01, got {results:?}");
     }
 }

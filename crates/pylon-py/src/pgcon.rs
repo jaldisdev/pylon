@@ -7,11 +7,12 @@
 //! re-acquired the GIL — so no Python object ever needs to cross the
 //! `.await` inside these futures.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use pyo3::prelude::*;
+use tokio::sync::Mutex as AsyncMutex;
 
-use pylon_pgcon::{ExtensionOids, PgPool};
+use pylon_pgcon::{ExtensionOids, PgPool, PgTransaction};
 use pylon_value::CachedValue;
 
 use crate::pgvalue::{cached_to_py, py_to_cached};
@@ -120,9 +121,82 @@ fn pgcon_execute<'py>(py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny
     })
 }
 
+/// One explicit transaction on a connection checked out of the pool.
+/// Wraps its `PgTransaction` in an `Arc<tokio::sync::Mutex<..>>` (not a
+/// `std::sync::Mutex` — the guard needs to be held across `.await` inside
+/// each async method's future, which a std guard can't do since it isn't
+/// `Send`) so `query`/`execute`/`commit`/`rollback` can each be called as
+/// independent async methods from Python while still serializing access to
+/// the single underlying connection. `commit`/`rollback` `.take()` the
+/// `Option`, so a second call on an already-closed transaction fails
+/// cleanly instead of reusing a consumed connection.
+#[pyclass(module = "pylon._core")]
+struct PgconTransaction {
+    inner: Arc<AsyncMutex<Option<PgTransaction>>>,
+}
+
+fn closed_tx_err() -> PyErr {
+    PylonPgconError::new_err("transaction already committed or rolled back")
+}
+
+#[pymethods]
+impl PgconTransaction {
+    fn query<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let rows = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
+    fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            tx.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tx = inner.lock().await.take().ok_or_else(closed_tx_err)?;
+            tx.commit().await.map_err(pgcon_err)
+        })
+    }
+
+    fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tx = inner.lock().await.take().ok_or_else(closed_tx_err)?;
+            tx.rollback().await.map_err(pgcon_err)
+        })
+    }
+}
+
+/// Starts an explicit transaction on a fresh pooled connection. `isolation`
+/// is one of `"read_uncommitted"`, `"read_committed"`, `"repeatable_read"`,
+/// `"serializable"` — the same values `AsyncTransaction`/`client.transaction()`
+/// already accept today.
+#[pyfunction]
+fn pgcon_transaction(py: Python<'_>, isolation: String) -> PyResult<Bound<'_, PyAny>> {
+    let pool = cloned_pool()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let tx = pool.begin(&isolation).await.map_err(pgcon_err)?;
+        Ok(PgconTransaction { inner: Arc::new(AsyncMutex::new(Some(tx))) })
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pgcon_connect, m)?)?;
     m.add_function(wrap_pyfunction!(pgcon_query, m)?)?;
     m.add_function(wrap_pyfunction!(pgcon_execute, m)?)?;
+    m.add_function(wrap_pyfunction!(pgcon_transaction, m)?)?;
+    m.add_class::<PgconTransaction>()?;
     Ok(())
 }
