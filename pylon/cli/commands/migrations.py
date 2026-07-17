@@ -58,55 +58,9 @@ def _ordered_chain(migrations: list) -> list:
     return [by_id[mid] for mid in ordered_ids]
 
 
-def _applied_tip(tracking: list[dict]) -> str | None:
-    """Compute the tip ID from applied _pylon."Migrations" rows (the one with no descendant).
-
-    A healthy chain has exactly one such row, but a tracking table can end
-    up with several orphaned single-node "tips" (e.g. leftover rows from
-    migration files that were since deleted/regenerated without cleaning up
-    the tracking table). When that happens, deterministically return the
-    lexicographically smallest ID among them — `next(iter(tips))` on a
-    `set()` difference used to pick one at random (Python's string hash
-    randomization means iteration order varies per *process*, so `status`
-    and `apply` — each a separate CLI invocation — could disagree on which
-    tip is current). Mirrors `pylon_core::migrate::applied_tip`'s tie-break.
-    """
-    applied = [r for r in tracking if r.get("applied_at") is not None]
-    if not applied:
-        return None
-    applied_ids = {r["id"] for r in applied}
-    onto_targets = {r["onto"] for r in applied}
-    tips = applied_ids - onto_targets
-    return min(tips) if tips else None
-
-
 def _next_seq(d: Path) -> int:
     existing = sorted(d.glob("[0-9][0-9][0-9][0-9][0-9]_*.sql"))
     return int(existing[-1].name[:5]) + 1 if existing else 1
-
-
-async def _ensure_tracking_tables(conn) -> None:
-    await conn.execute(
-        'CREATE TABLE IF NOT EXISTS _pylon."Migrations" ('
-        "    id          text        PRIMARY KEY,"
-        "    onto        text        NOT NULL,"
-        "    filename    text        NOT NULL,"
-        "    db_state    jsonb       NULL,"
-        "    applied_at  timestamptz NULL"
-        ");"
-    )
-    await conn.execute(
-        'CREATE TABLE IF NOT EXISTS _pylon."Progress" ('
-        "    id          text        PRIMARY KEY,"
-        "    step_index  integer     NOT NULL,"
-        "    updated_at  timestamptz NOT NULL DEFAULT now()"
-        ");"
-    )
-
-
-async def _read_tracking(conn) -> list[dict]:
-    rows = await conn.fetch('SELECT id, onto, filename, db_state, applied_at FROM _pylon."Migrations"')
-    return [dict(r) for r in rows]
 
 
 # ── CLI group ─────────────────────────────────────────────────────────────────
@@ -170,7 +124,7 @@ async def _apply(
         lock = await migration_advisory_lock(pool)
 
     try:
-        tracking = await migration_read_tracking(pool)  # [(id, onto, applied), ...]
+        tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, applied), ...]
         applied_tip = migration_applied_tip(tracking)
 
         if not chain:
@@ -202,7 +156,7 @@ async def _apply(
             click.echo("Already up to date.")
             return
 
-        applied_ids = {id_ for id_, _onto, _applied in tracking}
+        applied_ids = {id_ for id_, _onto, _db_state, _applied in tracking}
         for m in pending:
             # §12 squash compatibility: if any of this migration's squashed
             # constituent IDs are already in the tracking table, the DB was
@@ -256,7 +210,13 @@ def status(ctx: click.Context, dev_mode: bool) -> None:
 
 
 async def _status(ctx: click.Context, dev_mode: bool) -> None:
-    import asyncpg
+    from pylon._core import (
+        pgcon_connect,
+        migration_ensure_tracking_tables,
+        migration_read_tracking,
+        migration_applied_tip,
+        introspect_db_state,
+    )
 
     config = ctx.obj["config"]
     d = _migrations_dir(config)
@@ -265,20 +225,12 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
     migrations = _load_migrations(d)
     chain = _ordered_chain(migrations)
 
-    conn = await asyncpg.connect(_pg_dsn(config))
-    try:
-        await _ensure_tracking_tables(conn)
-        tracking = await _read_tracking(conn)
-        if dev_mode:
-            from pylon._core import pgcon_connect, introspect_db_state
-            pool = await pgcon_connect(_pg_dsn(config), 2)
-            db_state = await introspect_db_state(pool)
-        else:
-            db_state = None
-    finally:
-        await conn.close()
+    pool = await pgcon_connect(_pg_dsn(config), 2)
+    await migration_ensure_tracking_tables(pool)
+    tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, applied), ...]
+    db_state = await introspect_db_state(pool) if dev_mode else None
 
-    applied_tip = _applied_tip(tracking)
+    applied_tip = migration_applied_tip(tracking)
 
     if not chain:
         click.echo("No migrations on disk.")
@@ -348,8 +300,6 @@ async def _log(
     newest_first: bool,
     limit: int | None,
 ) -> None:
-    import asyncpg
-
     config = ctx.obj["config"]
     d = _migrations_dir(config)
 
@@ -358,20 +308,19 @@ async def _log(
         chain = _ordered_chain(_load_migrations(d))
         entries = [{"id": m.id, "onto": m.onto, "ref": m.filename} for m in chain]
     else:
-        conn = await asyncpg.connect(_pg_dsn(config))
-        try:
-            await _ensure_tracking_tables(conn)
-            rows = await conn.fetch(
-                'SELECT id, onto, filename, applied_at '
-                'FROM _pylon."Migrations" ORDER BY applied_at'
-            )
-        finally:
-            await conn.close()
-        entries = [
-            {"id": r["id"], "onto": r["onto"],
-             "ref": r["applied_at"].strftime("%Y-%m-%d %H:%M:%S UTC")}
-            for r in rows
-        ]
+        from pylon._core import pgcon_connect, migration_ensure_tracking_tables
+
+        pool = await pgcon_connect(_pg_dsn(config), 2)
+        await migration_ensure_tracking_tables(pool)
+        rows = await pool.query_named(
+            """
+            SELECT id, onto,
+                   (to_char(applied_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') || ' UTC') AS applied_at
+            FROM _pylon."Migrations" ORDER BY applied_at
+            """,
+            [],
+        )
+        entries = [{"id": r["id"], "onto": r["onto"], "ref": r["applied_at"]} for r in rows]
 
     if newest_first:
         entries = list(reversed(entries))
@@ -403,7 +352,6 @@ def watch(ctx: click.Context) -> None:
 
 
 async def _watch(ctx: click.Context) -> None:
-    import asyncpg
     from watchfiles import awatch
 
     config = ctx.obj["config"]
@@ -423,7 +371,6 @@ async def _watch(ctx: click.Context) -> None:
 
 async def _sync_once(config) -> None:
     """Recompile schema, introspect DB, diff, apply."""
-    import asyncpg
     from pylon._core import diff_schema as _diff_schema, pgcon_connect, introspect_db_state
 
     schema = _reload_schema(config)
@@ -431,25 +378,22 @@ async def _sync_once(config) -> None:
     pool = await pgcon_connect(_pg_dsn(config), 2)
     db_state = await introspect_db_state(pool)
 
-    conn = await asyncpg.connect(_pg_dsn(config))
-    try:
-        ops = _diff_schema(schema, db_state)
+    ops = _diff_schema(schema, db_state)
 
-        if not ops:
-            click.echo("Schema up to date.")
-            return
+    if not ops:
+        click.echo("Schema up to date.")
+        return
 
-        async with conn.transaction():
-            for sql in ops:
-                await conn.execute(sql)
+    # One `batch_execute` call — Postgres's simple query protocol wraps the
+    # whole multi-statement blob in an implicit transaction, same atomicity
+    # as the old explicit `async with conn.transaction():`.
+    await pool.batch_execute("\n".join(ops))
 
-        click.echo(f"Applied {len(ops)} DDL statement(s):")
-        for sql in ops:
-            # Print first line of each statement as a brief summary
-            first_line = sql.splitlines()[0]
-            click.echo(f"  {first_line}")
-    finally:
-        await conn.close()
+    click.echo(f"Applied {len(ops)} DDL statement(s):")
+    for sql in ops:
+        # Print first line of each statement as a brief summary
+        first_line = sql.splitlines()[0]
+        click.echo(f"  {first_line}")
 
 
 def _reload_schema(config):
@@ -757,7 +701,6 @@ async def _create_from_diff(
     non_interactive: bool,
 ) -> None:
     import sys
-    import asyncpg
     from pylon._core import (
         diff_schema_ops as _core_diff_schema_ops,
         detect_type_renames as _core_detect_type_renames,
@@ -769,6 +712,9 @@ async def _create_from_diff(
         db_state_from_json,
         pgcon_connect,
         introspect_db_state,
+        migration_ensure_tracking_tables,
+        migration_read_tracking,
+        migration_applied_tip,
     )
 
     config = ctx.obj["config"]
@@ -783,45 +729,41 @@ async def _create_from_diff(
     chain = _ordered_chain(migrations)
     chain_tip = chain[-1].id if chain else "initial"
 
-    conn = await asyncpg.connect(_pg_dsn(config))
-    try:
-        await _ensure_tracking_tables(conn)
-        tracking = await _read_tracking(conn)
-        applied_tip = _applied_tip(tracking)
-        chain_ids = [m.id for m in chain]
+    pool = await pgcon_connect(_pg_dsn(config), 2)
+    await migration_ensure_tracking_tables(pool)
+    tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, applied), ...]
+    applied_tip = migration_applied_tip(tracking)
+    chain_ids = [m.id for m in chain]
 
-        # Diverged history → abort.
-        if applied_tip is not None and applied_tip not in chain_ids:
+    # Diverged history → abort.
+    if applied_tip is not None and applied_tip not in chain_ids:
+        raise click.ClickException(
+            f"Database tip {applied_tip!r} not found in on-disk chain — "
+            "history has diverged. Resolve manually."
+        )
+
+    # Pending migrations → abort. All migrations must be applied before
+    # creating a new one so the live database is the correct diff baseline.
+    if applied_tip != chain_tip:
+        pending_start = 0 if applied_tip is None else (chain_ids.index(applied_tip) + 1)
+        pending = chain[pending_start:]
+        if pending:
+            names = ", ".join(m.filename for m in pending)
             raise click.ClickException(
-                f"Database tip {applied_tip!r} not found in on-disk chain — "
-                "history has diverged. Resolve manually."
+                f"{len(pending)} unapplied migration(s): {names}\n"
+                "Run 'pylon migration apply' first."
             )
 
-        # Pending migrations → abort. All migrations must be applied before
-        # creating a new one so the live database is the correct diff baseline.
-        if applied_tip != chain_tip:
-            pending_start = 0 if applied_tip is None else (chain_ids.index(applied_tip) + 1)
-            pending = chain[pending_start:]
-            if pending:
-                names = ", ".join(m.filename for m in pending)
-                raise click.ClickException(
-                    f"{len(pending)} unapplied migration(s): {names}\n"
-                    "Run 'pylon migration apply' first."
-                )
-
-        # Use the db_state snapshot from the tip row as the baseline — this is
-        # what the schema looked like after the last migration was applied, which
-        # is the correct baseline even when watch has run since then.
-        # Fall back to live DB introspection only when no snapshot exists yet.
-        tip_row = next((r for r in tracking if r["id"] == chain_tip), None)
-        db_state_json = tip_row["db_state"] if tip_row else None
-        if db_state_json is not None:
-            db_state = db_state_from_json(db_state_json)
-        else:
-            pool = await pgcon_connect(_pg_dsn(config), 2)
-            db_state = await introspect_db_state(pool)
-    finally:
-        await conn.close()
+    # Use the db_state snapshot from the tip row as the baseline — this is
+    # what the schema looked like after the last migration was applied, which
+    # is the correct baseline even when watch has run since then.
+    # Fall back to live DB introspection only when no snapshot exists yet.
+    tip_row = next((r for r in tracking if r[0] == chain_tip), None)
+    db_state_json = tip_row[2] if tip_row else None
+    if db_state_json is not None:
+        db_state = db_state_from_json(db_state_json)
+    else:
+        db_state = await introspect_db_state(pool)
 
     # ── Rename detection (interactive) ────────────────────────────────────────
     confirmed_type_renames: list[tuple[str, str, str, str]] = []
@@ -1016,7 +958,6 @@ async def _squash(
     dry_run: bool,
 ) -> None:
     import secrets
-    import asyncpg
     from pylon._core import (
         diff_states as _core_diff_states,
         render_migration_file,
@@ -1025,6 +966,7 @@ async def _squash(
         migration_ensure_tracking_tables,
         introspect_db_state,
     )
+    from pylon.exceptions import QueryError
 
     config = ctx.obj["config"]
     d = _migrations_dir(config)
@@ -1076,49 +1018,37 @@ async def _squash(
     shadow_name = f"_pylon_shadow_{secrets.token_hex(8)}"
     click.echo(f"Creating shadow database {shadow_name!r}…")
 
-    conn = await asyncpg.connect(dsn)
+    admin_pool = await pgcon_connect(dsn, 2)
     try:
-        await conn.execute(f'CREATE DATABASE "{shadow_name}" TEMPLATE template0')
-    except asyncpg.InsufficientPrivilegeError:
-        await conn.close()
-        raise click.ClickException(
-            "Squash requires CREATEDB privilege on the PostgreSQL server."
-        )
-    finally:
-        await conn.close()
+        await admin_pool.execute(f'CREATE DATABASE "{shadow_name}" TEMPLATE template0', [])
+    except QueryError as exc:
+        if getattr(exc, "sqlstate", None) == "42501":  # insufficient_privilege
+            raise click.ClickException(
+                "Squash requires CREATEDB privilege on the PostgreSQL server."
+            ) from exc
+        raise
 
     before_state = after_state = None
     try:
         shadow_dsn = _shadow_dsn(dsn, shadow_name)
-        shadow_conn = await asyncpg.connect(shadow_dsn)
-        # A small dedicated pool for `_apply_one`/`introspect_db_state` on
-        # the same ephemeral shadow database — `shadow_conn` (asyncpg) is
-        # only still needed for `CREATE SCHEMA` (Phase 13 territory).
         shadow_pool = await pgcon_connect(shadow_dsn, 2)
-        try:
-            await shadow_conn.execute("CREATE SCHEMA IF NOT EXISTS _pylon")
-            await migration_ensure_tracking_tables(shadow_pool)
+        await shadow_pool.execute("CREATE SCHEMA IF NOT EXISTS _pylon", [])
+        await migration_ensure_tracking_tables(shadow_pool)
 
-            # Apply migrations before the squash range to reach the "before" state.
-            pre_range = chain[:range_start]
-            for m in pre_range:
-                await _apply_one(shadow_pool, m, False)
+        # Apply migrations before the squash range to reach the "before" state.
+        pre_range = chain[:range_start]
+        for m in pre_range:
+            await _apply_one(shadow_pool, m, False)
 
-            before_state = await introspect_db_state(shadow_pool)
+        before_state = await introspect_db_state(shadow_pool)
 
-            # Apply the squash range to reach the "after" state.
-            for m in squash_range:
-                await _apply_one(shadow_pool, m, False)
+        # Apply the squash range to reach the "after" state.
+        for m in squash_range:
+            await _apply_one(shadow_pool, m, False)
 
-            after_state = await introspect_db_state(shadow_pool)
-        finally:
-            await shadow_conn.close()
+        after_state = await introspect_db_state(shadow_pool)
     finally:
-        drop_conn = await asyncpg.connect(dsn)
-        try:
-            await drop_conn.execute(f'DROP DATABASE IF EXISTS "{shadow_name}"')
-        finally:
-            await drop_conn.close()
+        await admin_pool.execute(f'DROP DATABASE IF EXISTS "{shadow_name}"', [])
         click.echo(f"Dropped shadow database {shadow_name!r}.")
 
     # ── Compute the net DDL ────────────────────────────────────────────────────

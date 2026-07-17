@@ -135,6 +135,20 @@ impl PgPool {
         query_typed_on(&client, sql, params, ext).await
     }
 
+    /// Like `query_typed`, but decodes every column of every row by name
+    /// instead of assuming a single `(...) AS result` column — for
+    /// hand-written admin SQL (CLI commands, not `pylon-core`-emitted
+    /// query bodies) that reads named columns directly.
+    pub async fn query_typed_named(
+        &self,
+        sql: &str,
+        params: &[CachedValue],
+        ext: &ExtensionOids,
+    ) -> Result<Vec<CachedValue>> {
+        let client = self.pool.get().await?;
+        query_typed_named_on(&client, sql, params, ext).await
+    }
+
     /// Runs `sql` with bound `params` (same convention as `query_typed`)
     /// and discards the result, returning the number of rows affected —
     /// for `INSERT`/`UPDATE`/`DELETE` where the caller has no `RETURNING`
@@ -239,6 +253,23 @@ pub(crate) async fn query_typed_on(
     rows.iter().map(|row| decode_result_column(row, ext)).collect()
 }
 
+/// Like `query_typed_on`, but decodes every column of every row by name
+/// (`decode_row_named`) instead of assuming column 0 is the whole result —
+/// see `decode_row_named`'s doc comment.
+pub(crate) async fn query_typed_named_on(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[CachedValue],
+    ext: &ExtensionOids,
+) -> Result<Vec<CachedValue>> {
+    let stmt = client.prepare(sql).await?;
+    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+    let rows = client.query(&stmt, &param_refs).await?;
+    rows.iter().map(|row| decode_row_named(row, ext)).collect()
+}
+
 pub(crate) async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str, params: &[CachedValue]) -> Result<u64> {
     let stmt = client.prepare(sql).await?;
     let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
@@ -333,6 +364,26 @@ fn decode_result_column(row: &tokio_postgres::Row, ext: &ExtensionOids) -> Resul
         None => Ok(CachedValue::Null),
         Some(RawBytes(bytes)) => wire::decode_value(oid, bytes, ext),
     }
+}
+
+/// Decodes *every* column of `row`, keyed by name, as a `CachedValue::Object`
+/// — the general `asyncpg.Record`-equivalent decode path, unlike
+/// `decode_result_column` (which only ever decodes column 0, matching
+/// pylon-core's own single-composite-column SQL emission convention). For
+/// hand-written queries with several named columns a caller accesses by
+/// name (`row["col"]`) — `pylon.worker`/`pylon.vector`/`pylon.search`'s
+/// index-outbox queries, not PyQL-compiled SQL.
+fn decode_row_named(row: &tokio_postgres::Row, ext: &ExtensionOids) -> Result<CachedValue> {
+    let mut fields = Vec::with_capacity(row.columns().len());
+    for (i, col) in row.columns().iter().enumerate() {
+        let oid = col.type_().oid();
+        let value = match row.try_get::<_, Option<RawBytes>>(i)? {
+            None => CachedValue::Null,
+            Some(RawBytes(bytes)) => wire::decode_value(oid, bytes, ext)?,
+        };
+        fields.push((col.name().to_string(), value));
+    }
+    Ok(CachedValue::Object(fields))
 }
 
 #[cfg(test)]

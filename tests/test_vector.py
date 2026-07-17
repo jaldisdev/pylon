@@ -311,7 +311,7 @@ class TestVectorIndexWorker:
         provider = AsyncMock()
         provider.embed_batch.return_value = [[0.1, 0.2, 0.3]]
         conn = AsyncMock()
-        conn.fetch.return_value = [{"id": "uuid-1", "source_text": "Wireless Headphones"}]
+        conn.query_named.return_value = [{"id": "uuid-1", "source_text": "Wireless Headphones"}]
         with patch("pylon.vector.sync.compile_index_fetch", return_value="SELECT ..."):
             worker = VectorIndexWorker(
                 conn,
@@ -325,20 +325,20 @@ class TestVectorIndexWorker:
         rows = [{"type_name": "default::Product", "index_name": None, "object_id": "uuid-1"}]
         run(worker.process_batch(rows))
         provider.embed_batch.assert_awaited_once_with(["Wireless Headphones"])
-        conn.executemany.assert_awaited_once()
-        _, batch = conn.executemany.call_args[0]
-        assert batch[0][0] == "uuid-1"
-        assert batch[0][1] == "[0.1,0.2,0.3]"
+        conn.execute.assert_awaited_once()
+        _, params = conn.execute.call_args[0]
+        assert params[0] == "uuid-1"
+        assert params[1] == "[0.1,0.2,0.3]"
 
     def test_missing_provider_skips_fetch(self):
         worker, conn, _ = self._make_worker()
         rows = [{"type_name": "default::Other", "index_name": None, "object_id": "uuid-1"}]
         run(worker.process_batch(rows))
-        conn.fetch.assert_not_awaited()
+        conn.query_named.assert_not_awaited()
 
     def test_empty_fetch_result_skips_embed(self):
         worker, conn, provider = self._make_worker()
-        conn.fetch.return_value = []
+        conn.query_named.return_value = []
         rows = [{"type_name": "default::Product", "index_name": None, "object_id": "uuid-1"}]
         run(worker.process_batch(rows))
         provider.embed_batch.assert_not_awaited()

@@ -99,7 +99,7 @@ class VectorIndexWorker(IndexWorker):
                 continue
 
             ids = [r["object_id"] for r in group_rows]
-            records = await self._conn.fetch(fetch_sql, ids)
+            records = await self._conn.query_named(fetch_sql, [ids])
             if not records:
                 continue
 
@@ -108,8 +108,6 @@ class VectorIndexWorker(IndexWorker):
 
             table, col = self._table_and_col(type_name, index_name)
             write_sql = f'UPDATE {table} SET {col} = $2::vector WHERE "id" = $1'
-            await self._conn.executemany(
-                write_sql,
-                [(r["id"], f"[{','.join(str(x) for x in vec)}]")
-                 for r, vec in zip(records, vectors)],
-            )
+            for r, vec in zip(records, vectors):
+                vec_str = f"[{','.join(str(x) for x in vec)}]"
+                await self._conn.execute(write_sql, [r["id"], vec_str])

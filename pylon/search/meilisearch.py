@@ -179,7 +179,7 @@ class MeilisearchWorker(IndexWorker):
                 continue
 
             ids = [r["object_id"] for r in group_rows]
-            records = await self._conn.fetch(fetch_sql, ids)
+            records = await self._conn.query_named(fetch_sql, [ids])
             if not records:
                 continue
 

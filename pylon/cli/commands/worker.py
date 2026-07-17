@@ -4,7 +4,6 @@ import asyncio
 import logging
 import sys
 
-import asyncpg
 import click
 
 from ..config import _print_error, requires_config
@@ -117,13 +116,13 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     dsn = db.dsn or f"postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}"
 
     async def run() -> None:
+        from pylon._core import pgcon_listen
+
         tasks = []
-        conns = []
         clients = []
 
         if providers:
-            conn = await asyncpg.connect(dsn)
-            conns.append(conn)
+            conn = await pgcon_listen(dsn)
             w = VectorIndexWorker(conn, schema=schema, providers=providers)
             w.batch_size = batch_size
             w.poll_interval = poll_interval
@@ -140,8 +139,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             client = OpenSearchClient(base_url, auth=auth)
             await client.__aenter__()
             clients.append(client)
-            conn = await asyncpg.connect(dsn)
-            conns.append(conn)
+            conn = await pgcon_listen(dsn)
             w = OpenSearchWorker(conn, schema=schema, client=client)
             w.batch_size = batch_size
             w.poll_interval = poll_interval
@@ -157,8 +155,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             client = MeilisearchClient(base_url, api_key=search_cfg.api_key)
             await client.__aenter__()
             clients.append(client)
-            conn = await asyncpg.connect(dsn)
-            conns.append(conn)
+            conn = await pgcon_listen(dsn)
             w = MeilisearchWorker(conn, schema=schema, client=client)
             w.batch_size = batch_size
             w.poll_interval = poll_interval
@@ -177,17 +174,18 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             # evicting entries is immediately visible to every serving
             # process (e.g. `pylon serve`) mapping the same path.
             pylon_cache.init(config.cache)
-            conn = await asyncpg.connect(dsn)
-            conns.append(conn)
+            conn = await pgcon_listen(dsn)
             w = CacheInvalidationWorker(conn)
             log.info("CacheInvalidationWorker started  channel=%s", NOTIFY_CHANNEL)
             tasks.append(w.run())
 
+        # Each `pgcon_listen` connection above has no explicit close — it's
+        # dropped (and its socket closed) along with the process, matching
+        # `worker start`'s own lifecycle (runs until interrupted). Only the
+        # HTTP search clients need an explicit, ordered shutdown.
         try:
             await asyncio.gather(*tasks)
         finally:
-            for conn in conns:
-                await conn.close()
             for client in clients:
                 await client.__aexit__(None, None, None)
 

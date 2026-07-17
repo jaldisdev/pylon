@@ -89,14 +89,14 @@ class IndexWorker:
         try:
             await self.process_batch(rows)
             ids = [r["id"] for r in rows]
-            await self._conn.execute(MARK_DONE_SQL, ids)
+            await self._conn.execute(MARK_DONE_SQL, [ids])
         except Exception:
             log.exception("IndexWorker: batch failed, scheduling retry")
             ids = [r["id"] for r in rows]
-            await self._conn.execute(MARK_FAILED_SQL, ids)
+            await self._conn.execute(MARK_FAILED_SQL, [ids])
 
     async def claim_batch(self, limit: int) -> list[Any]:
-        return await self._conn.fetch(CLAIM_BATCH_SQL, self.index_kind.value, limit)
+        return await self._conn.query_named(CLAIM_BATCH_SQL, [self.index_kind.value, limit])
 
     async def process_batch(self, rows: list[Any]) -> None:
         raise NotImplementedError
