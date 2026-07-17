@@ -37,6 +37,29 @@ impl<'a> postgres_types::FromSql<'a> for RawBytes<'a> {
     }
 }
 
+/// Wraps a `CachedValue` for binding as a query parameter. `accepts` is
+/// unconditionally `true` (mirroring `RawBytes` above) because the target
+/// `Type` isn't known until `Statement::params()` reports it — see
+/// `wire::encode_value`, which does the actual type-directed encoding.
+#[derive(Debug)]
+struct BoundParam<'a>(&'a CachedValue);
+
+impl postgres_types::ToSql for BoundParam<'_> {
+    fn to_sql(
+        &self,
+        ty: &postgres_types::Type,
+        out: &mut bytes::BytesMut,
+    ) -> std::result::Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        wire::encode_value(self.0, ty, out)
+    }
+
+    fn accepts(_ty: &postgres_types::Type) -> bool {
+        true
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
 // `deadpool_postgres::Pool` is `Arc`-backed internally, so cloning a
 // `PgPool` is cheap and shares the same underlying pool — needed at the
 // pyo3 boundary, where a lock guard over the process-global pool slot
@@ -89,13 +112,45 @@ impl PgPool {
     /// `result` column decodes just as well through the same path).
     pub async fn query_composite(&self, sql: &str, ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
         let rows = self.query_raw(sql).await?;
-        rows.iter()
-            .map(|row| {
-                let oid = row.columns()[0].type_().oid();
-                let RawBytes(bytes) = row.try_get(0)?;
-                wire::decode_value(oid, bytes, ext)
-            })
-            .collect()
+        rows.iter().map(|row| decode_result_column(row, ext)).collect()
+    }
+
+    /// Runs `sql` with bound `params`, matched positionally to `$1, $2, ...`
+    /// — the same convention `pylon-core`'s `param_names` already assumes.
+    /// No caller-supplied parameter types: `prepare` asks Postgres itself
+    /// to analyze the SQL and report each placeholder's expected `Type`
+    /// (`Statement::params()`), which drives `wire::encode_value`'s
+    /// encoding directly. Decodes the single result column exactly like
+    /// `query_composite`.
+    pub async fn query_typed(
+        &self,
+        sql: &str,
+        params: &[CachedValue],
+        ext: &ExtensionOids,
+    ) -> Result<Vec<CachedValue>> {
+        let client = self.pool.get().await?;
+        let stmt = client.prepare(sql).await?;
+        let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+        let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+            bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+        let rows = client.query(&stmt, &param_refs).await?;
+        rows.iter().map(|row| decode_result_column(row, ext)).collect()
+    }
+}
+
+/// Decodes a row's column 0 (the `result` column pylon-core's SQL always
+/// projects) into a `CachedValue`, using its actual declared Postgres type.
+/// Column 0 itself can be SQL NULL at the top level (not just a NULL
+/// *field within* a composite, which `decode_record`/`decode_array`
+/// already handle) — `RawBytes` has no `from_sql_null` override, so a
+/// direct `row.try_get::<_, RawBytes>(0)` errors on a null column; going
+/// through `Option<RawBytes>` (which `postgres_types` implements generically
+/// for any `T: FromSql`, yielding `None` for SQL NULL) avoids that.
+fn decode_result_column(row: &tokio_postgres::Row, ext: &ExtensionOids) -> Result<CachedValue> {
+    let oid = row.columns()[0].type_().oid();
+    match row.try_get::<_, Option<RawBytes>>(0)? {
+        None => Ok(CachedValue::Null),
+        Some(RawBytes(bytes)) => wire::decode_value(oid, bytes, ext),
     }
 }
 
@@ -275,5 +330,156 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, vec![CachedValue::Str("a".to_string())]);
+    }
+
+    // ── query_typed: bound-parameter round trips against real Postgres ──
+    //
+    // Each test binds a CachedValue as $1, has Postgres echo it straight
+    // back out (so both encode_value AND decode_value are exercised in one
+    // pass — a mismatch in either direction fails the assertion), matching
+    // exactly how a real PyQL query binds a param and gets a result back.
+
+    async fn round_trip(pool: &PgPool, pg_type: &str, param: CachedValue) -> CachedValue {
+        let sql = format!("SELECT ($1::{pg_type}) AS result");
+        let rows = pool.query_typed(&sql, &[param], &ExtensionOids::default()).await.unwrap();
+        rows.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_bool_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(round_trip(&pool, "bool", CachedValue::Bool(true)).await, CachedValue::Bool(true));
+        assert_eq!(round_trip(&pool, "bool", CachedValue::Bool(false)).await, CachedValue::Bool(false));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_integer_params_at_every_width() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(round_trip(&pool, "int2", CachedValue::I64(30)).await, CachedValue::I64(30));
+        assert_eq!(round_trip(&pool, "int4", CachedValue::I64(70_000)).await, CachedValue::I64(70_000));
+        assert_eq!(
+            round_trip(&pool, "int8", CachedValue::I64(9_223_372_036_854_775_807)).await,
+            CachedValue::I64(9_223_372_036_854_775_807)
+        );
+        assert_eq!(round_trip(&pool, "int8", CachedValue::I64(-1)).await, CachedValue::I64(-1));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_float_params() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(round_trip(&pool, "float4", CachedValue::F64(1.5)).await, CachedValue::F64(1.5));
+        assert_eq!(round_trip(&pool, "float8", CachedValue::F64(2.25)).await, CachedValue::F64(2.25));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_text_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(
+            round_trip(&pool, "text", CachedValue::Str("héllo 🎉".to_string())).await,
+            CachedValue::Str("héllo 🎉".to_string())
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_bytea_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(
+            round_trip(&pool, "bytea", CachedValue::Bytes(vec![1, 2, 3, 255])).await,
+            CachedValue::Bytes(vec![1, 2, 3, 255])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_uuid_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let bytes = [0x11u8; 16];
+        assert_eq!(round_trip(&pool, "uuid", CachedValue::Uuid(bytes)).await, CachedValue::Uuid(bytes));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_numeric_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(
+            round_trip(&pool, "numeric", CachedValue::Decimal("12.50".to_string())).await,
+            CachedValue::Decimal("12.50".to_string())
+        );
+        assert_eq!(
+            round_trip(&pool, "numeric", CachedValue::Decimal("-9999.001".to_string())).await,
+            CachedValue::Decimal("-9999.001".to_string())
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_null_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        assert_eq!(round_trip(&pool, "int8", CachedValue::Null).await, CachedValue::Null);
+        assert_eq!(round_trip(&pool, "text", CachedValue::Null).await, CachedValue::Null);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_array_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let param = CachedValue::Array(vec![
+            CachedValue::Str("a".into()),
+            CachedValue::Str("b".into()),
+            CachedValue::Null,
+        ]);
+        assert_eq!(round_trip(&pool, "text[]", param.clone()).await, param);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_int_array_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let param = CachedValue::Array(vec![CachedValue::I64(1), CachedValue::I64(2), CachedValue::I64(3)]);
+        assert_eq!(round_trip(&pool, "int8[]", param.clone()).await, param);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn round_trips_jsonb_object_param() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let param = CachedValue::Object(vec![
+            ("a".into(), CachedValue::I64(1)),
+            ("b".into(), CachedValue::Str("two".into())),
+            ("c".into(), CachedValue::Array(vec![CachedValue::I64(1), CachedValue::I64(2)])),
+        ]);
+        assert_eq!(round_trip(&pool, "jsonb", param.clone()).await, param);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn query_typed_matches_pylon_cores_own_param_binding_convention() {
+        // $1, $2, ... positional, matching multiple params in one query —
+        // the same shape a real PyQL query with several kwargs produces.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let sql = "SELECT ($1::text, $2::int8, $3::bool) AS result";
+        let params = vec![CachedValue::Str("Alice".into()), CachedValue::I64(30), CachedValue::Bool(true)];
+        let rows = pool.query_typed(sql, &params, &ExtensionOids::default()).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![CachedValue::Array(vec![
+                CachedValue::Str("Alice".into()),
+                CachedValue::I64(30),
+                CachedValue::Bool(true),
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn wrong_param_count_returns_an_error_not_a_panic() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let result = pool.query_typed("SELECT $1::int8, $2::int8", &[CachedValue::I64(1)], &ExtensionOids::default()).await;
+        assert!(result.is_err());
     }
 }

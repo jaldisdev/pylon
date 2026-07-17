@@ -221,6 +221,136 @@ fn decode_array(data: &[u8], ext: &ExtensionOids) -> Result<CachedValue> {
     Ok(CachedValue::Array(items))
 }
 
+// ── Parameter encoding (the inverse direction: CachedValue -> wire bytes) ──
+//
+// Bound query parameters don't need pylon-core to supply explicit
+// per-parameter Postgres types up front: `Client::prepare` already asks
+// Postgres itself to analyze the SQL and report each `$1, $2, ...`'s
+// expected `Type` back (`Statement::params()`) — exactly what asyncpg's
+// own extended-query-protocol binding already relies on today, just
+// surfaced explicitly here instead of hidden inside asyncpg's codec
+// registry. So encoding is *type-directed*: given a `CachedValue` and the
+// `Type` Postgres reported for that position, write the matching binary
+// representation. See `BoundParam` (in `lib.rs`) for the `ToSql` glue that
+// makes this pluggable into `tokio_postgres::Client::query`.
+
+use bytes::BufMut;
+use postgres_types::{IsNull, Kind, ToSql, Type};
+
+/// Encodes `value` as `ty`'s binary wire format into `out`. `ty` comes from
+/// `Statement::params()[i]` — Postgres's own analysis of the prepared SQL,
+/// not a guess — so this only needs to pick the right byte width/shape for
+/// whatever `CachedValue` variant is actually being sent, not infer the
+/// target type itself.
+pub fn encode_value(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) -> Result<IsNull> {
+    let CachedValue::Null = value else {
+        return encode_non_null(value, ty, out);
+    };
+    Ok(IsNull::Yes)
+}
+
+fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) -> Result<IsNull> {
+    match value {
+        CachedValue::Null => unreachable!("caller already handled NULL"),
+        CachedValue::Bool(b) => out.put_u8(*b as u8),
+        CachedValue::I64(i) => {
+            if *ty == Type::INT2 {
+                out.put_i16(*i as i16);
+            } else if *ty == Type::INT4 {
+                out.put_i32(*i as i32);
+            } else {
+                out.put_i64(*i);
+            }
+        }
+        CachedValue::F64(f) => {
+            if *ty == Type::FLOAT4 {
+                out.put_f32(*f as f32);
+            } else {
+                out.put_f64(*f);
+            }
+        }
+        CachedValue::Str(s) => out.put_slice(s.as_bytes()),
+        CachedValue::Bytes(b) => out.put_slice(b),
+        CachedValue::Uuid(bytes) => out.put_slice(bytes),
+        CachedValue::Decimal(s) => {
+            let decimal: Decimal = s.parse()?;
+            decimal.to_sql(&Type::NUMERIC, out)?;
+        }
+        CachedValue::Array(items) => {
+            let element_ty = match ty.kind() {
+                Kind::Array(inner) => inner.clone(),
+                // Not actually an array type per Postgres's own analysis —
+                // fall back to TEXT so encoding still proceeds deterministically
+                // rather than panicking; a real mismatch surfaces as a
+                // Postgres-side type error on execute, same as today.
+                _ => Type::TEXT,
+            };
+            encode_array(items, &element_ty, out)?;
+        }
+        CachedValue::Object(fields) => {
+            let json = cached_object_to_json(fields);
+            out.put_u8(1); // jsonb binary format version prefix
+            out.put_slice(json.to_string().as_bytes());
+        }
+    }
+    Ok(IsNull::No)
+}
+
+fn cached_object_to_json(fields: &[(String, CachedValue)]) -> serde_json::Value {
+    serde_json::Value::Object(fields.iter().map(|(k, v)| (k.clone(), cached_to_json(v))).collect())
+}
+
+fn cached_to_json(value: &CachedValue) -> serde_json::Value {
+    match value {
+        CachedValue::Null => serde_json::Value::Null,
+        CachedValue::Bool(b) => serde_json::Value::Bool(*b),
+        CachedValue::I64(i) => serde_json::Value::Number((*i).into()),
+        CachedValue::F64(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+        CachedValue::Str(s) => serde_json::Value::String(s.clone()),
+        CachedValue::Bytes(b) => serde_json::Value::String(hex::encode(b)),
+        CachedValue::Uuid(bytes) => serde_json::Value::String(format_uuid(bytes)),
+        CachedValue::Decimal(s) => serde_json::Value::String(s.clone()),
+        CachedValue::Array(items) => serde_json::Value::Array(items.iter().map(cached_to_json).collect()),
+        CachedValue::Object(fields) => cached_object_to_json(fields),
+    }
+}
+
+fn format_uuid(bytes: &[u8; 16]) -> String {
+    let hex = hex::encode(bytes);
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+/// 1-dimensional Postgres array binary format (see the module doc comment
+/// for the layout) — the encode-side mirror of `decode_array`.
+fn encode_array(items: &[CachedValue], element_ty: &Type, out: &mut bytes::BytesMut) -> Result<()> {
+    if items.is_empty() {
+        out.put_i32(0); // ndim
+        out.put_i32(0); // has-null flag
+        out.put_u32(element_ty.oid());
+        return Ok(());
+    }
+    let has_null = items.iter().any(|v| matches!(v, CachedValue::Null));
+    out.put_i32(1); // ndim — Pylon arrays are always 1-D
+    out.put_i32(has_null as i32);
+    out.put_u32(element_ty.oid());
+    out.put_i32(items.len() as i32); // dim size
+    out.put_i32(1); // lower bound
+
+    for item in items {
+        if matches!(item, CachedValue::Null) {
+            out.put_i32(-1);
+            continue;
+        }
+        let start = out.len();
+        out.put_i32(0); // placeholder length, patched below
+        let is_null = encode_value(item, element_ty, out)?;
+        let len = (out.len() - start - 4) as i32;
+        let len = if matches!(is_null, IsNull::Yes) { -1 } else { len };
+        out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
