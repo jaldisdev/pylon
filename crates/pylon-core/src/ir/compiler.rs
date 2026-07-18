@@ -3863,6 +3863,34 @@ impl<'a> Compiler<'a> {
                 }
                 let inner = self.compile_expr_ctx(&tc.expr, ctx)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+
+                // PostgreSQL has no native jsonb -> {uuid, date/time family,
+                // interval, array<T>} cast (only jsonb -> {bool, numeric
+                // family, text} are native as of PG17+) — there's nothing
+                // generic to defer to the way `to_jsonb(x)` covers every
+                // scalar in the opposite direction, so extract via `#>>'{}'`
+                // (the value's raw text form) and cast that, matching what
+                // `to_json`'s own emitted text already round-trips (ISO 8601
+                // for datetimes, PG's native interval text, a bare UUID
+                // string — see `to_jsonb`'s emission for `<json>x`).
+                if infer_ir_type(&inner) == Some("jsonb") {
+                    if let ast::TypeExpr::Array { element } = &tc.ty {
+                        let elem_pg = self.resolve_cast_pg_type(element)?;
+                        let sql_template = format!(
+                            "ARRAY(SELECT (elem #>> '{{}}')::{elem_pg} FROM jsonb_array_elements($1) AS elem)"
+                        );
+                        return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                            schema: None, name: "jsonb_array_cast".to_string(), args: vec![inner], sql_template: Some(sql_template),
+                        }));
+                    }
+                    if matches!(pg_type.as_str(), "uuid" | "timestamptz" | "timestamp" | "date" | "time" | "interval") {
+                        let sql_template = format!("(($1 #>> '{{}}'))::{pg_type}");
+                        return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                            schema: None, name: "jsonb_scalar_cast".to_string(), args: vec![inner], sql_template: Some(sql_template),
+                        }));
+                    }
+                }
+
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
             }
