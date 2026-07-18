@@ -27,7 +27,39 @@ from pylon.exceptions import InterfaceError
 
 
 class _Node:
+    """Base for every expression-tree node. Comparison operators live here
+    (not just on `_FieldPath`) so comparing *any* sub-expression works —
+    e.g. `std.foo(u.name) == 'x'` compares a `_FuncCall` result, not a bare
+    field path. Only `_FieldPath` additionally supports attribute access."""
+
     __slots__ = ()
+
+    def _cmp(self, op: str, other: Any) -> "_Compare":
+        return _Compare(self, op, _as_node(other))
+
+    def __eq__(self, other: Any) -> "_Compare":  # type: ignore[override]
+        return self._cmp("=", other)
+
+    def __ne__(self, other: Any) -> "_Compare":  # type: ignore[override]
+        return self._cmp("!=", other)
+
+    def __lt__(self, other: Any) -> "_Compare":
+        return self._cmp("<", other)
+
+    def __le__(self, other: Any) -> "_Compare":
+        return self._cmp("<=", other)
+
+    def __gt__(self, other: Any) -> "_Compare":
+        return self._cmp(">", other)
+
+    def __ge__(self, other: Any) -> "_Compare":
+        return self._cmp(">=", other)
+
+    def __hash__(self) -> int:
+        # __eq__ is overloaded to build an expression rather than compare,
+        # so the default hash (disabled by defining __eq__) needs restoring
+        # explicitly — identity hashing is fine, these are throwaway proxies.
+        return object.__hash__(self)
 
     def __and__(self, other: Any) -> "_BoolOp":
         if not isinstance(other, _Node):
@@ -69,33 +101,6 @@ class _FieldPath(_Node):
         if name.startswith("_"):
             raise AttributeError(name)
         return _FieldPath([*self.segments, name])
-
-    def _cmp(self, op: str, other: Any) -> "_Compare":
-        return _Compare(self, op, _as_node(other))
-
-    def __eq__(self, other: Any) -> "_Compare":  # type: ignore[override]
-        return self._cmp("=", other)
-
-    def __ne__(self, other: Any) -> "_Compare":  # type: ignore[override]
-        return self._cmp("!=", other)
-
-    def __lt__(self, other: Any) -> "_Compare":
-        return self._cmp("<", other)
-
-    def __le__(self, other: Any) -> "_Compare":
-        return self._cmp("<=", other)
-
-    def __gt__(self, other: Any) -> "_Compare":
-        return self._cmp(">", other)
-
-    def __ge__(self, other: Any) -> "_Compare":
-        return self._cmp(">=", other)
-
-    def __hash__(self) -> int:
-        # __eq__ is overloaded to build an expression rather than compare,
-        # so the default hash (disabled by defining __eq__) needs restoring
-        # explicitly — identity hashing is fine, these are throwaway proxies.
-        return object.__hash__(self)
 
 
 class _Compare(_Node):

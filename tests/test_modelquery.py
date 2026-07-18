@@ -154,8 +154,7 @@ class TestRenderExpr:
         with pytest.raises(TypeError, match="boolean context"):
             bool(node)
         with pytest.raises(TypeError, match="boolean context"):
-            if node:  # noqa: SIM108
-                pass
+            _ = node and True
 
     def test_bare_root_path_cannot_be_rendered(self):
         with pytest.raises(InterfaceError, match="whole object"):

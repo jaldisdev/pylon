@@ -272,6 +272,20 @@ def _inject_repr(cls: type) -> None:
     cls.__repr__ = __repr__  # type: ignore[method-assign]
 
 
+def _inject_query_methods(cls: type, *, abstract: bool, junction: bool) -> None:
+    """Attach `.filter()` for model-based querying (`client.query(Model)` /
+    `Model.filter(...)`, see `pylon.modelquery`) — only for regular,
+    fully-materialized types. Abstract, interface, and junction classes
+    simply never get the method, so calling `.filter()` on one raises a
+    plain `AttributeError` rather than a query that silently does the
+    wrong thing.
+    """
+    if abstract or junction:
+        return
+    from pylon import modelquery
+    cls.filter = classmethod(modelquery.filter_classmethod)
+
+
 def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None:
     """Inject dataclasses.field() specs into the class dict before @dataclass runs.
 
@@ -451,6 +465,7 @@ def _build_type(
     _prepare_dataclass(cls, pointer_metas)
     dataclasses.dataclass(cls, kw_only=True)
     _inject_repr(cls)
+    _inject_query_methods(cls, abstract=abstract, junction=junction)
 
     resolved_module = module or _infer_module(cls)
     resolved_name = name or cls.__name__
