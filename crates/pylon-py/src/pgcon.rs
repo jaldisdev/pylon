@@ -195,7 +195,7 @@ fn pgcon_connect_err(err: pylon_pgcon::Error) -> PyErr {
 /// reacquired — the same job `cached_to_py` does, just reachable through
 /// `IntoPyObject` instead of called directly (orphan rules mean we can't
 /// impl `IntoPyObject` for `pylon_value::CachedValue` itself here).
-struct PyCachedValue(CachedValue);
+pub(crate) struct PyCachedValue(pub(crate) CachedValue);
 
 impl<'py> IntoPyObject<'py> for PyCachedValue {
     type Target = PyAny;

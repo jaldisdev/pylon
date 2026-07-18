@@ -7,6 +7,7 @@ mod introspect;
 mod migrate;
 mod pgcon;
 mod pgvalue;
+mod providers;
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
 
@@ -2068,6 +2069,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pgcon::register(m)?;
     migrate::register(m)?;
     introspect::register(m)?;
+    providers::register(m)?;
 
     Ok(())
 }

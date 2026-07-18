@@ -614,10 +614,14 @@ async def _compile_and_resolve(
         extra = {"__deferred_ids__": ids, "__deferred_scores__": scores}
 
     else:
-        # vector::search text overload — embed the query text, inject as __deferred_vec__.
+        # vector::search text overload — embed the query text (via Rust's
+        # pylon-providers HTTP client), inject as __deferred_vec__.
         model_cfg = _resolve_model_config(plan["model_name"], config)
-        provider = _make_provider(model_cfg)
-        vector = await provider.embed(query_text or "")
+        from pylon._core import embed_text
+        vector = await embed_text(
+            model_cfg.api_style, model_cfg.api_url, model_cfg.model, query_text or "",
+            api_key=model_cfg.secret,
+        )
         extra = {"__deferred_vec__": vector}
 
     params = [extra[name] for name in compiled.param_names]
@@ -649,21 +653,6 @@ def _resolve_model_config(model_name: str, config: "Config"):
             f"vector::search: no model config found for '{model_name}' in pylon.toml"
         )
     return cfg
-
-
-def _make_provider(model_cfg):
-    from pylon.vector.models import OpenAIProvider, AnthropicProvider
-    if model_cfg.api_style == "anthropic":
-        return AnthropicProvider(
-            api_url=model_cfg.api_url,
-            model=model_cfg.model,
-            api_key=model_cfg.secret,
-        )
-    return OpenAIProvider(
-        api_url=model_cfg.api_url,
-        model=model_cfg.model,
-        api_key=model_cfg.secret,
-    )
 
 
 def _merge_args(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
