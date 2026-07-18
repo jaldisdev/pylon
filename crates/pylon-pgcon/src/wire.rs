@@ -166,6 +166,23 @@ fn decode_vector(data: &[u8]) -> Result<Vec<CachedValue>> {
     Ok(values)
 }
 
+/// Encodes `items` (each expected to be `CachedValue::F64`/`I64`) as
+/// pgvector's binary format — the inverse of `decode_vector`.
+fn encode_vector(items: &[CachedValue], out: &mut bytes::BytesMut) -> Result<()> {
+    let ndim: u16 = items.len().try_into().map_err(|_| Error::message("vector has too many dimensions to encode"))?;
+    out.put_u16(ndim);
+    out.put_u16(0); // reserved
+    for item in items {
+        let f = match item {
+            CachedValue::F64(f) => *f as f32,
+            CachedValue::I64(i) => *i as f32,
+            other => return Err(Error::message(format!("cannot encode {other:?} as a vector element"))),
+        };
+        out.put_f32(f);
+    }
+    Ok(())
+}
+
 /// Decodes a `record`-typed field: `i32 nfields`, then per field `u32
 /// type_oid` + `i32 field_len` (`-1` = NULL) + `field_len` bytes.
 fn decode_record(data: &[u8], ext: &ExtensionOids) -> Result<CachedValue> {
@@ -300,6 +317,15 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
         CachedValue::Decimal(s) => {
             let decimal: Decimal = s.parse()?;
             decimal.to_sql(&Type::NUMERIC, out)?;
+        }
+        CachedValue::Array(items) if ty.name() == "vector" => {
+            // `$n::vector` casts the parameter directly (unlike
+            // `vector::search`'s `$n::float8[]::vector`, where the *inner*
+            // cast is what Postgres's prepare step reports as the param's
+            // type) — Postgres reports `$n` itself as `vector`, a scalar
+            // extension type, not `Kind::Array`. Bypass the generic array
+            // path entirely and write pgvector's own binary format.
+            encode_vector(items, out)?;
         }
         CachedValue::Array(items) => {
             let element_ty = match ty.kind() {
@@ -695,6 +721,51 @@ mod tests {
         let value = CachedValue::Str("not-a-uuid".to_string());
         let mut out = bytes::BytesMut::new();
         assert!(encode_value(&value, &postgres_types::Type::UUID, &mut out).is_err());
+    }
+
+    fn vector_type() -> Type {
+        // `vector` is a pgvector extension type, not a `postgres_types`
+        // builtin — construct it the way `Statement::params()` would
+        // report it back (any OID works here; encoding only inspects the
+        // name via `ty.name()`, matching `$n::vector`'s cast-reported type).
+        Type::new("vector".to_string(), 50_000, postgres_types::Kind::Simple, "public".to_string())
+    }
+
+    #[test]
+    fn encodes_an_array_value_as_pgvector_binary_when_the_target_type_is_vector() {
+        // Regression test: `$n::vector` reports the parameter's type as
+        // the scalar `vector` type itself (unlike `$n::float8[]::vector`,
+        // where the *inner* cast makes Postgres report `float8[]`) — an
+        // `Array` value bound against it must produce pgvector's own
+        // binary format (`u16 ndim`, `u16 reserved`, then big-endian
+        // `f32`s), not the generic Postgres array wire format.
+        let value = CachedValue::Array(vec![CachedValue::F64(1.5), CachedValue::F64(-2.25), CachedValue::F64(0.0)]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &vector_type(), &mut out).unwrap();
+        let mut expected = vec![0u8, 3, 0, 0];
+        expected.extend_from_slice(&1.5f32.to_be_bytes());
+        expected.extend_from_slice(&(-2.25f32).to_be_bytes());
+        expected.extend_from_slice(&0.0f32.to_be_bytes());
+        assert_eq!(out.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn a_vector_encoded_value_round_trips_through_decode_vector() {
+        let value = CachedValue::Array(vec![CachedValue::F64(1.0), CachedValue::F64(2.0), CachedValue::F64(3.0)]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &vector_type(), &mut out).unwrap();
+        let decoded = decode_vector(out.as_ref()).unwrap();
+        assert_eq!(decoded, vec![CachedValue::F64(1.0), CachedValue::F64(2.0), CachedValue::F64(3.0)]);
+    }
+
+    #[test]
+    fn an_array_value_still_encodes_as_a_plain_postgres_array_for_a_non_vector_target() {
+        let value = CachedValue::Array(vec![CachedValue::F64(1.0), CachedValue::F64(2.0)]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::FLOAT8_ARRAY, &mut out).unwrap();
+        // Generic array format starts with ndim=1 (i32), not pgvector's
+        // ndim=2 (u16) — first four bytes distinguish the two encodings.
+        assert_eq!(&out.as_ref()[0..4], &1i32.to_be_bytes());
     }
 
     #[test]
