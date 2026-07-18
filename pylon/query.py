@@ -144,6 +144,10 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
                 obj = object.__new__(cls)
                 obj.__dict__.update(kwargs)
                 obj.__dict__["__pylon_type__"] = type_name
+                # Shadow copy of the hydrated field values — lets
+                # Client.save() diff current vs. persisted state instead of
+                # intercepting every __setattr__ (see pylon.modelquery).
+                obj.__dict__["__pylon_saved__"] = dict(kwargs)
                 return obj
         return kwargs
 

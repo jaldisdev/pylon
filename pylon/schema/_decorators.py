@@ -265,7 +265,7 @@ def _inject_repr(cls: type) -> None:
         pairs = ", ".join(
             f"{k}={{}}" if v is None else f"{k}={v!r}"
             for k, v in vars(self).items()
-            if k != "__pylon_type__"
+            if k not in ("__pylon_type__", "__pylon_saved__")
         )
         return f"{qname} {{{pairs}}}"
 

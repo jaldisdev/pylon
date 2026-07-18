@@ -318,3 +318,65 @@ def render(obj: Any) -> tuple[str, dict[str, Any]] | None:
     if isinstance(obj, ModelSet):
         return render_delete(obj) if obj._delete else render_select(obj)
     return None
+
+
+# ── save(): INSERT/UPDATE PyQL generation for a single instance ─────────────
+#
+# New-vs-existing is decided by the presence of `__pylon_saved__` in
+# `obj.__dict__` — stashed by `pylon.query._decode()` on every hydrated
+# instance, absent on a freshly `__init__`'d one (even if the caller
+# pre-assigned `id` under `allow_user_specified_id`).
+
+_UNSET = object()
+
+
+def prepare_save(obj: Any) -> tuple[str, dict[str, Any]] | None:
+    """Renders one INSERT (new instance) or UPDATE (hydrated instance,
+    diffed against its `__pylon_saved__` shadow) for `obj`, or returns
+    `None` if a hydrated instance has no changed fields (a no-op save)."""
+    cfg = type(obj).__pylon_config__
+    type_name = f"{cfg.module}::{cfg.name}"
+    saved = obj.__dict__.get("__pylon_saved__")
+    params: dict[str, Any] = {}
+    counter = [0]
+
+    def _param(value: Any) -> str:
+        name = f"__mq_s{counter[0]}"
+        counter[0] += 1
+        params[name] = value
+        return f"${name}"
+
+    if saved is None:
+        assignments = []
+        for name, meta in cfg.pointers.items():
+            if meta.kind != "property" or name not in obj.__dict__:
+                continue
+            value = obj.__dict__[name]
+            # A field left at its Python-side default (None) is
+            # indistinguishable from "never touched" — omit it so any
+            # server-side default (id generation, Default(...), sequences)
+            # still applies. An explicitly-set None on a genuinely nullable
+            # field is unrepresentable here, but has the same net effect:
+            # the column is simply omitted and stays NULL either way.
+            if value is None:
+                continue
+            assignments.append(f"{name} := {_param(value)}")
+        if not assignments:
+            raise InterfaceError(f"cannot save a new {type_name} instance with no fields set")
+        return f"insert {type_name} {{ {', '.join(assignments)} }}", params
+
+    assignments = []
+    for name, meta in cfg.pointers.items():
+        if meta.kind != "property" or meta.is_readonly or name not in obj.__dict__:
+            continue
+        current = obj.__dict__[name]
+        if current == saved.get(name, _UNSET):
+            continue
+        assignments.append(f"{name} := {_param(current)}")
+    if not assignments:
+        return None
+    pid = obj.__dict__.get("id")
+    if pid is None:
+        raise InterfaceError(f"cannot update {type_name}: instance has no id")
+    id_param = _param(pid)
+    return f"update {type_name} filter .id = {id_param} set {{ {', '.join(assignments)} }}", params
