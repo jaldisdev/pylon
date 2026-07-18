@@ -105,21 +105,21 @@ class AsyncTransaction:
 
         Returns ``"[]"`` when the result set is empty.
         """
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query(f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
+        rows = await self._tx.query_compiled_json_agg(compiled, params)
         return rows[0] if rows else "[]"
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query(sql, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
+        rows = await self._tx.query_compiled(compiled, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single_json expected at most one result, got {len(rows)}."
             )
         if not rows:
             return None
-        json_rows = await self._tx.query(f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", params)
+        json_rows = await self._tx.query_compiled_row_to_json(compiled, params)
         return json_rows[0] if json_rows else None
 
     async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
@@ -397,14 +397,14 @@ class Client:
         Returns ``"[]"`` when the result set is empty.
         """
         pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
         from pylon import cache as _cache
         hit, cached = _cache.get_json(compiled, params, self._config.cache, kind="json_all")
         if hit:
             return cached if cached is not None else "[]"
 
-        rows = await pool.query(f"SELECT COALESCE(json_agg(q), '[]') FROM ({sql}) q", params)
+        rows = await pool.query_compiled_json_agg(compiled, params)
         value = rows[0] if rows else "[]"
         _cache.put_json(compiled, params, value, self._config.cache, kind="json_all")
         return value
@@ -416,14 +416,14 @@ class Client:
         object matches.
         """
         pool = self._require_pool()
-        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
         from pylon import cache as _cache
         hit, cached = _cache.get_json(compiled, params, self._config.cache, kind="json_single")
         if hit:
             return cached
 
-        rows = await pool.query(sql, params)
+        rows = await pool.query_compiled(compiled, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single_json expected at most one result, got {len(rows)}."
@@ -431,7 +431,7 @@ class Client:
         if not rows:
             _cache.put_json(compiled, params, None, self._config.cache, kind="json_single")
             return None
-        json_rows = await pool.query(f"SELECT row_to_json(q) FROM ({sql} LIMIT 1) q", params)
+        json_rows = await pool.query_compiled_row_to_json(compiled, params)
         value = json_rows[0] if json_rows else None
         _cache.put_json(compiled, params, value, self._config.cache, kind="json_single")
         return value
