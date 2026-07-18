@@ -44,6 +44,13 @@ pub enum CachedValue {
     /// (matches how `_pg_decode_numeric` round-trips today) rather than a
     /// lossy f64 or a bespoke bignum encoding.
     Decimal(String),
+    /// A PostgreSQL `interval` — backs both Pylon's `std::duration` (months
+    /// always 0 by convention) and `cal::relative_duration` (months may be
+    /// nonzero). Kept as the three raw wire components rather than folded
+    /// into a single duration, since `months` (a calendar-relative unit —
+    /// "1 month" isn't a fixed number of days) can't be losslessly combined
+    /// with `days`/`microseconds` without a reference date.
+    Interval { months: i32, days: i32, microseconds: i64 },
     // `omit_bounds` is required on self-referential fields: rkyv's derive
     // otherwise adds a naive `FieldType: Archive` bound per field, which
     // for a directly-recursive type like this overflows trait resolution
@@ -99,6 +106,7 @@ mod tests {
             ("tags".into(), CachedValue::Array(vec![CachedValue::Str("a".into()), CachedValue::Null])),
             ("avatar".into(), CachedValue::Bytes(vec![1, 2, 3])),
             ("point".into(), CachedValue::Composite(vec![CachedValue::F64(1.0), CachedValue::F64(2.0)])),
+            ("span".into(), CachedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }),
         ]);
         let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
         // SAFETY: bytes were produced moments ago by `to_bytes` on this same

@@ -47,6 +47,16 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<CachedValue> {
     if value.is_instance(&py.import("decimal")?.getattr("Decimal")?)? {
         return Ok(CachedValue::Decimal(value.str()?.extract()?));
     }
+    if value.is_instance(&py.import("datetime")?.getattr("timedelta")?)? {
+        // `timedelta` only ever carries days/seconds/microseconds (Python
+        // normalizes seconds into days+microseconds internally too) — never
+        // months, so this always round-trips through `Interval` with
+        // months == 0, matching `std::duration`'s own convention.
+        let days: i32 = value.getattr("days")?.extract()?;
+        let seconds: i64 = value.getattr("seconds")?.extract()?;
+        let microseconds: i64 = value.getattr("microseconds")?.extract()?;
+        return Ok(CachedValue::Interval { months: 0, days, microseconds: seconds * 1_000_000 + microseconds });
+    }
     if let Ok(d) = value.cast::<PyDict>() {
         let entries = d
             .iter()
@@ -119,6 +129,22 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &CachedValue) -> PyResul
                 d.set_item(k, cached_to_py(py, v)?)?;
             }
             d.into_any()
+        }
+        CachedValue::Interval { months, days, microseconds } => {
+            if *months != 0 {
+                // `datetime.timedelta` has no month/year component (a
+                // "month" isn't a fixed span without a reference date) —
+                // only `std::duration` (months always 0) and the common
+                // `cal::relative_duration` calls that don't set years/months
+                // decode today; a genuinely month-bearing relative_duration
+                // needs a richer Python type this crate doesn't have yet.
+                return Err(PyValueError::new_err(
+                    "decoding a cal::relative_duration with nonzero years/months \
+                     is not yet supported"
+                ));
+            }
+            // Positional form: timedelta(days, seconds, microseconds, ...).
+            py.import("datetime")?.getattr("timedelta")?.call1((*days, 0, *microseconds))?
         }
     })
 }
