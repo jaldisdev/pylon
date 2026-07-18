@@ -47,6 +47,7 @@ const OID_FLOAT8: u32 = 701;
 const OID_BPCHAR: u32 = 1042;
 const OID_VARCHAR: u32 = 1043;
 const OID_NUMERIC: u32 = 1700;
+const OID_INTERVAL: u32 = 1186;
 const OID_UUID: u32 = 2950;
 const OID_RECORD: u32 = 2249;
 const OID_RECORD_ARRAY: u32 = 2287;
@@ -102,6 +103,7 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Cached
         }
         OID_BYTEA => Ok(CachedValue::Bytes(data.to_vec())),
         OID_NUMERIC => decode_numeric(data),
+        OID_INTERVAL => decode_interval(data),
         OID_JSONB => decode_jsonb(data),
         OID_RECORD => decode_record(data, ext),
         OID_RECORD_ARRAY => decode_array(data, ext),
@@ -122,6 +124,23 @@ fn decode_numeric(data: &[u8]) -> Result<CachedValue> {
     use postgres_types::{FromSql, Type};
     let decimal = Decimal::from_sql(&Type::NUMERIC, data)?;
     Ok(CachedValue::Decimal(decimal.to_string()))
+}
+
+/// PostgreSQL's binary `interval` wire format: `i64 microseconds, i32 days,
+/// i32 months`, in that order — see `interval_send` in Postgres's own
+/// `timestamp.c`. Backs both `std::duration` and `cal::relative_duration`
+/// (see `CachedValue::Interval`'s own doc comment for why `months` isn't
+/// folded into `days`).
+fn decode_interval(data: &[u8]) -> Result<CachedValue> {
+    if data.len() != 16 {
+        return Err(Error::message(format!(
+            "malformed interval: expected 16 bytes, got {}", data.len()
+        )));
+    }
+    let microseconds = i64::from_be_bytes(data[0..8].try_into()?);
+    let days = i32::from_be_bytes(data[8..12].try_into()?);
+    let months = i32::from_be_bytes(data[12..16].try_into()?);
+    Ok(CachedValue::Interval { months, days, microseconds })
 }
 
 /// Binary jsonb: a 1-byte format-version prefix (always `1` today) followed
@@ -352,6 +371,12 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
             out.put_u8(1); // jsonb binary format version prefix
             out.put_slice(json.to_string().as_bytes());
         }
+        CachedValue::Interval { months, days, microseconds } => {
+            // Same field order as `decode_interval`'s read.
+            out.put_i64(*microseconds);
+            out.put_i32(*days);
+            out.put_i32(*months);
+        }
     }
     Ok(IsNull::No)
 }
@@ -374,6 +399,13 @@ fn cached_to_json(value: &CachedValue) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(cached_to_json).collect())
         }
         CachedValue::Object(fields) => cached_object_to_json(fields),
+        // No natural JSON scalar for an interval; only reachable if an
+        // Interval value ends up nested inside an Object being sent as a
+        // jsonb parameter — represented as its raw components so it's at
+        // least round-trippable, not silently dropped.
+        CachedValue::Interval { months, days, microseconds } => serde_json::json!({
+            "months": months, "days": days, "microseconds": microseconds,
+        }),
     }
 }
 
@@ -484,6 +516,29 @@ mod tests {
             decode_value(OID_BYTEA, &[1, 2, 3, 255], &no_ext()).unwrap(),
             CachedValue::Bytes(vec![1, 2, 3, 255])
         );
+    }
+
+    #[test]
+    fn decodes_interval() {
+        // Regression: interval has no dedicated binary decoder — it used to
+        // fall through to the UTF-8-text fallback, which panics/errors on
+        // interval's actual binary payload (microseconds/days/months, not text).
+        let mut data = Vec::new();
+        data.extend_from_slice(&3_600_000_000i64.to_be_bytes()); // 1 hour, in microseconds
+        data.extend_from_slice(&2i32.to_be_bytes()); // 2 days
+        data.extend_from_slice(&1i32.to_be_bytes()); // 1 month
+        assert_eq!(
+            decode_value(OID_INTERVAL, &data, &no_ext()).unwrap(),
+            CachedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }
+        );
+    }
+
+    #[test]
+    fn encodes_interval() {
+        let value = CachedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 };
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::INTERVAL, &mut out).unwrap();
+        assert_eq!(decode_value(OID_INTERVAL, &out, &no_ext()).unwrap(), value);
     }
 
     #[test]
