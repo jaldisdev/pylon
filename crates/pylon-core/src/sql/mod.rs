@@ -1499,7 +1499,20 @@ fn enqueue_ctes(enqueue: &[VectorEnqueueInfo], source_cte: &str) -> Vec<String> 
         .collect()
 }
 
-/// Build one OpenSearch outbox CTE string.
+/// The `_pylon."IndexOutbox".index_kind` enum label for a search backend —
+/// `Postgres`-backed indexes never reach this (see `collect_search_enqueue`),
+/// so there's no corresponding `IndexKind` value for that variant.
+fn search_backend_index_kind(backend: &crate::schema::SearchBackend) -> &'static str {
+    match backend {
+        crate::schema::SearchBackend::OpenSearch => "OpenSearch",
+        crate::schema::SearchBackend::Meilisearch => "Meilisearch",
+        crate::schema::SearchBackend::Postgres => {
+            unreachable!("Postgres-backed search indexes are never collected into SearchEnqueueInfo")
+        }
+    }
+}
+
+/// Build one OpenSearch/Meilisearch outbox CTE string.
 fn enqueue_search_cte_sql(eq: &SearchEnqueueInfo, source_cte: &str, cte_name: &str) -> String {
     let index_name_sql = match &eq.index_name {
         None => "NULL".to_string(),
@@ -1510,7 +1523,7 @@ fn enqueue_search_cte_sql(eq: &SearchEnqueueInfo, source_cte: &str, cte_name: &s
             "\"{}\" AS (\n",
             "    INSERT INTO _pylon.\"IndexOutbox\"\n",
             "        (object_id, type_name, index_kind, index_name, operation)\n",
-            "    SELECT \"id\", {}, 'OpenSearch'::_pylon.\"IndexKind\", {}, {}\n",
+            "    SELECT \"id\", {}, '{}'::_pylon.\"IndexKind\", {}, {}\n",
             "    FROM \"{}\"\n",
             "    ON CONFLICT (object_id, index_kind, index_name)\n",
             "    DO UPDATE SET status = 'Pending', operation = EXCLUDED.operation, enqueued_at = now()\n",
@@ -1518,13 +1531,14 @@ fn enqueue_search_cte_sql(eq: &SearchEnqueueInfo, source_cte: &str, cte_name: &s
         ),
         cte_name,
         sql_str(&eq.type_name),
+        search_backend_index_kind(&eq.backend),
         index_name_sql,
         sql_str(eq.operation),
         source_cte,
     )
 }
 
-/// Build the full list of OpenSearch enqueue CTE strings.
+/// Build the full list of OpenSearch/Meilisearch enqueue CTE strings.
 fn enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], source_cte: &str, offset: usize) -> Vec<String> {
     enqueue.iter().enumerate()
         .map(|(i, eq)| enqueue_search_cte_sql(eq, source_cte, &format!("_es{}", offset + i)))
@@ -4991,5 +5005,81 @@ mod tests {
     fn test_positional_tuple_literal_in_schema_bound_shape_field_compiles() {
         let out = compile_and_emit("SELECT Person { name, pair := (1, 2) }");
         assert!(out.sql.contains("jsonb_build_array(1, 2)"), "got:\n{}", out.sql);
+    }
+
+    // ── search index outbox enqueue tests ─────────────────────────────────────
+    //
+    // Regression coverage for a real bug: `collect_search_enqueue` used to
+    // filter for `SearchBackend::OpenSearch` only, so a Meilisearch-backed
+    // SearchIndex never got an outbox row on insert/update/delete — the
+    // Meilisearch worker (Rust or the old Python one) never received real
+    // traffic from normal DML, only from a manually-inserted outbox row.
+
+    fn make_schema_with_search_index(backend: crate::schema::SearchBackend) -> SchemaDescriptor {
+        use crate::schema::{SearchIndexDescriptor, SearchPointerDescriptor, SearchWeight};
+        let mut s = make_schema();
+        if let Some(td) = s.types.iter_mut().find(|t| t.name == "Person") {
+            td.search_indexes.push(SearchIndexDescriptor {
+                index_name: None,
+                backend,
+                pointers: vec![SearchPointerDescriptor { name: "name".into(), weight: SearchWeight::A }],
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn test_insert_enqueues_a_meilisearch_outbox_row() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with("INSERT Person { name := 'Alice', age := 30 }", &schema);
+        assert!(
+            out.sql.contains("'Meilisearch'::_pylon.\"IndexKind\""),
+            "expected a Meilisearch outbox enqueue CTE, got:\n{}",
+            out.sql,
+        );
+        assert!(out.sql.contains("INSERT INTO _pylon.\"IndexOutbox\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_insert_enqueues_an_opensearch_outbox_row() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::OpenSearch);
+        let out = compile_and_emit_with("INSERT Person { name := 'Alice', age := 30 }", &schema);
+        assert!(
+            out.sql.contains("'OpenSearch'::_pylon.\"IndexKind\""),
+            "expected an OpenSearch outbox enqueue CTE, got:\n{}",
+            out.sql,
+        );
+    }
+
+    #[test]
+    fn test_insert_does_not_enqueue_an_outbox_row_for_a_postgres_backed_search_index() {
+        // Postgres-backed search indexes are maintained synchronously by a
+        // trigger-updated tsvector column — no async worker involved.
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Postgres);
+        let out = compile_and_emit_with("INSERT Person { name := 'Alice', age := 30 }", &schema);
+        assert!(!out.sql.contains("_pylon.\"IndexOutbox\""), "did not expect an outbox enqueue, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_enqueues_a_meilisearch_outbox_row() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with("UPDATE Person FILTER .name = 'Alice' SET { age := 31 }", &schema);
+        assert!(
+            out.sql.contains("'Meilisearch'::_pylon.\"IndexKind\""),
+            "expected a Meilisearch outbox enqueue CTE, got:\n{}",
+            out.sql,
+        );
+    }
+
+    #[test]
+    fn test_delete_enqueues_a_meilisearch_outbox_delete_job() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with("DELETE Person FILTER .name = 'Alice'", &schema);
+        assert!(
+            out.sql.contains("'Meilisearch'::_pylon.\"IndexKind\""),
+            "expected a Meilisearch outbox enqueue CTE, got:\n{}",
+            out.sql,
+        );
+        assert!(out.sql.contains("'delete'"), "expected the delete operation literal, got:\n{}", out.sql);
     }
 }
