@@ -4582,6 +4582,65 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_plus_duration_type_checks() {
+        // Regression: types_compatible's bucket-matching (same type, or
+        // both-int, or both-float) rejected this outright, even though
+        // Postgres supports `timestamptz + interval` natively and the upstream engine
+        // declares it as a real operator overload.
+        let out = compile_and_emit("SELECT <datetime>$p + <duration>$d");
+        assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_duration_plus_datetime_type_checks_either_order() {
+        let out = compile_and_emit("SELECT <duration>$d + <datetime>$p");
+        assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_local_date_plus_duration_type_checks() {
+        let out = compile_and_emit("SELECT <cal::local_date>$p + <duration>$d");
+        assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_datetime_minus_duration_type_checks() {
+        let out = compile_and_emit("SELECT <datetime>$p - <duration>$d");
+        assert!(out.sql.contains(" - "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_local_time_plus_duration_type_checks() {
+        let out = compile_and_emit("SELECT <cal::local_time>$p + <duration>$d");
+        assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_datetime_plus_duration_only_allowed_for_add_and_sub() {
+        // Comparing (or otherwise combining) a datetime and a duration with
+        // anything other than +/- still isn't meaningful and must still error.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT <datetime>$p = <duration>$d").unwrap();
+        match ir::compile(&ast, &schema) {
+            Err(err) => assert!(format!("{err}").contains("cannot be applied"), "got: {err}"),
+            Ok(_) => panic!("expected a compile error"),
+        }
+    }
+
+    #[test]
+    fn test_unrelated_numeric_mismatch_still_rejected() {
+        // Loosening the datetime/duration case must not accidentally loosen
+        // unrelated type mismatches (e.g. decimal + int64 still needs an
+        // explicit cast, matching the upstream engine's own exact-type-only arithmetic).
+        let schema = make_schema();
+        let ast = parse::parse("SELECT <decimal>$p + <int64>$n").unwrap();
+        match ir::compile(&ast, &schema) {
+            Err(err) => assert!(format!("{err}").contains("cannot be applied"), "got: {err}"),
+            Ok(_) => panic!("expected a compile error"),
+        }
+    }
+
+    #[test]
     fn test_structural_tuple_cast_named_resolves_to_jsonb() {
         let out = compile_and_emit("SELECT <tuple<x: float64, y: float64>>$p");
         assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
