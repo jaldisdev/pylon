@@ -265,6 +265,35 @@ impl PgconPool {
         })
     }
 
+    /// Like `query_compiled`, but wraps the compiled SQL in `SELECT
+    /// COALESCE(json_agg(q), '[]') FROM (...) q` before executing — the
+    /// Rust-side equivalent of `Client.query_json`'s old Python
+    /// string-wrapping (`f"SELECT COALESCE(json_agg(q), '[]') FROM
+    /// ({sql}) q"`). Still just plain string formatting, but it happens
+    /// here instead of in Python, so no Python code ever touches `.sql`.
+    fn query_compiled_json_agg<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
+    /// Like `query_compiled`, but wraps the compiled SQL in `SELECT
+    /// row_to_json(q) FROM (... LIMIT 1) q` — the Rust-side equivalent of
+    /// `Client.query_single_json`'s second (JSON-materializing) query.
+    fn query_compiled_row_to_json<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
     /// Runs `sql` with positional `params` and discards the result,
     /// returning the number of rows affected — for `INSERT`/`UPDATE`/
     /// `DELETE` with no `RETURNING` clause to decode.
@@ -386,6 +415,32 @@ impl PgconTransaction {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
             tx.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    /// See `PgconPool::query_compiled_json_agg`.
+    fn query_compiled_json_agg<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let rows = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
+    /// See `PgconPool::query_compiled_row_to_json`.
+    fn query_compiled_row_to_json<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let rows = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
         })
     }
 

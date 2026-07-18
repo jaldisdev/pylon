@@ -312,6 +312,8 @@ def _make_pool(query_result=None, execute_result=None):
     pool.execute = AsyncMock(return_value=execute_result)
     pool.query_compiled = AsyncMock(return_value=query_result if query_result is not None else [])
     pool.execute_compiled = AsyncMock(return_value=execute_result)
+    pool.query_compiled_json_agg = AsyncMock(return_value=query_result if query_result is not None else [])
+    pool.query_compiled_row_to_json = AsyncMock(return_value=query_result if query_result is not None else [])
     return pool
 
 
@@ -505,16 +507,22 @@ class TestClientCaching:
         def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
             return sql, list(kwargs.values()), compiled
 
+        def fake_bind(pyql, kwargs, globals_=None, config_options=None):
+            return compiled, list(kwargs.values())
+
         p1 = patch("pylon.client._compile_and_resolve", side_effect=fake_resolve)
         p2 = patch("pylon.client._transpile", side_effect=fake_transpile)
+        p3 = patch("pylon.client._compile_and_bind", side_effect=fake_bind)
 
         class _Both:
             def __enter__(self):
                 p1.__enter__()
                 p2.__enter__()
+                p3.__enter__()
                 return self
 
             def __exit__(self, *a):
+                p3.__exit__(*a)
                 p2.__exit__(*a)
                 p1.__exit__(*a)
 
@@ -579,18 +587,18 @@ class TestClientCaching:
 
             assert first == '[{"id": 1}]'
             assert second == '[{"id": 1}]'
-            pool.query.assert_awaited_once()
+            pool.query_compiled_json_agg.assert_awaited_once()
 
         run(_run())
 
     def test_query_single_json_cache_hit_skips_db_round_trip(self, tmp_path):
         async def _run():
             pool = _make_pool()
-            # query_single_json issues two `pool.query` calls on a cache
-            # miss: first the raw compiled SQL (to check emptiness/
-            # cardinality), then a `row_to_json`-wrapped variant for the
-            # actual JSON text — each needs its own distinct return value.
-            pool.query = AsyncMock(side_effect=[["row1"], ['{"id": 1}']])
+            # query_single_json issues two fused calls on a cache miss:
+            # `query_compiled` first (to check emptiness/cardinality), then
+            # `query_compiled_row_to_json` for the actual JSON text.
+            pool.query_compiled = AsyncMock(return_value=["row1"])
+            pool.query_compiled_row_to_json = AsyncMock(return_value=['{"id": 1}'])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
             _cache.init(client._config.cache)
@@ -602,7 +610,8 @@ class TestClientCaching:
 
             assert first == '{"id": 1}'
             assert second == '{"id": 1}'
-            assert pool.query.await_count == 2
+            pool.query_compiled.assert_awaited_once()
+            pool.query_compiled_row_to_json.assert_awaited_once()
 
         run(_run())
 
