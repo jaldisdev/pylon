@@ -22,6 +22,24 @@ class NamedTuple:
     """
 
 
+def _inject_named_tuple_repr(cls: type, pylon_module: str) -> None:
+    """Replace the dataclass-generated `__repr__` with the same
+    `(field := value, ...)` format `pylon.datatypes.NamedTupleValue` uses
+    for anonymous named tuples, prefixed with the qualified type name —
+    e.g. `default::Point (x := 1.0, y := 2.0)` — rather than the
+    dataclass-default `Point(x=1.0, y=2.0)`, which reads more like a
+    regular object than the tuple value it actually is.
+    """
+    def __repr__(self) -> str:
+        pairs = ", ".join(
+            f"{k} := {{}}" if v is None else f"{k} := {v!r}"
+            for k, v in vars(self).items()
+        )
+        return f"{pylon_module}::{cls.__name__} ({pairs})"
+
+    cls.__repr__ = __repr__  # type: ignore[method-assign]
+
+
 def named_tuple_decorator(cls: type) -> type:
     """Class decorator that registers a NamedTuple subclass as a Pylon named tuple type."""
     dc = dataclasses.dataclass(cls)
@@ -38,6 +56,7 @@ def named_tuple_decorator(cls: type) -> type:
         pylon_module = (cls.__module__ or "default").rpartition(".")[-1] or "default"
 
     dc.__pylon_module__ = pylon_module  # type: ignore[attr-defined]
+    _inject_named_tuple_repr(dc, pylon_module)
 
     from . import _registry
     _registry.register_named_tuple(dc)
