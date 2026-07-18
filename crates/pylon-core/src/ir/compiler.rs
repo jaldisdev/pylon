@@ -3907,7 +3907,7 @@ impl<'a> Compiler<'a> {
                 let left = self.compile_expr_ctx(&b.left, ctx)?;
                 let right = self.compile_expr_ctx(&b.right, ctx)?;
                 if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
-                    if !types_compatible(lt, rt) {
+                    if !types_compatible(lt, rt) && !datetime_arithmetic_compatible(&b.op, lt, rt) {
                         return Err(PyQLError::Type(PyQLTypeError {
                             message: format!(
                                 "operator '{op}' cannot be applied to operands of type \
@@ -6492,6 +6492,32 @@ fn types_compatible(a: &str, b: &str) -> bool {
     let a_float = FLOAT_TYPES.contains(&a);
     let b_float = FLOAT_TYPES.contains(&b);
     a_float && b_float
+}
+
+/// Datetime/duration `+`/`-` pairs PostgreSQL supports natively (e.g.
+/// `timestamptz + interval`) that `types_compatible`'s bucket-matching
+/// (same type, or both-int, or both-float) doesn't cover — Gel declares an
+/// extensive set of these as real `CREATE INFIX OPERATOR` overloads (see
+/// `std/30-datetimefuncs.edgeql`/`cal.edgeql`). Deliberately a separate,
+/// narrower check from `types_compatible` (also used for UNION-branch
+/// compatibility, where "a datetime and a duration are interchangeable"
+/// would be nonsensical) rather than folded into it, so this can't leak
+/// into a context where "arithmetic-compatible" isn't the same relation as
+/// "interchangeable." Postgres's own operator resolution is the final
+/// authority on any (op, operand-order) combination that doesn't actually
+/// exist (e.g. `interval - timestamptz`) — this only needs to widen the
+/// compile-time gate far enough to let the legitimate combinations through.
+fn datetime_arithmetic_compatible(op: &ast::BinOpKind, a: &str, b: &str) -> bool {
+    if !matches!(op, ast::BinOpKind::Add | ast::BinOpKind::Sub) {
+        return false;
+    }
+    matches!(
+        (a, b),
+        ("timestamptz", "interval") | ("interval", "timestamptz")
+            | ("timestamp", "interval") | ("interval", "timestamp")
+            | ("date", "interval") | ("interval", "date")
+            | ("time", "interval") | ("interval", "time")
+    )
 }
 
 /// Collect `SearchEnqueueInfo` for every OpenSearch- or Meilisearch-backed
