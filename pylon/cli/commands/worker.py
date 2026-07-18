@@ -9,19 +9,13 @@ import click
 from ..config import _print_error, requires_config
 
 
-def _build_provider(api_style: str, api_url: str, model: str, secret: str | None):
-    if api_style == "openai":
-        from pylon.vector.models.openai import OpenAIProvider
-        return OpenAIProvider(api_url=api_url, model=model, api_key=secret)
-    if api_style == "anthropic":
-        from pylon.vector.models.anthropic import AnthropicProvider
-        return AnthropicProvider(api_url=api_url, model=model, api_key=secret)
-    raise click.ClickException(
-        f"Unknown api_style {api_style!r} in [models] — expected 'openai' or 'anthropic'."
-    )
-
-
 def _build_providers(schema, config) -> dict:
+    """Resolve the `[models.<name>]` config each schema `VectorIndex` declares.
+
+    Returns ``{(type_name, index_name): ModelConfig}`` — the embedding HTTP
+    call itself happens in Rust now (`run_vector_worker`), so this only does
+    the schema × `pylon.toml` lookup, not provider construction.
+    """
     log = logging.getLogger(__name__)
     models = config.models_registry
     providers: dict = {}
@@ -36,9 +30,7 @@ def _build_providers(schema, config) -> dict:
                     vi.model, type_name, index_name or "<default>",
                 )
                 continue
-            providers[(type_name, index_name)] = _build_provider(
-                model_cfg.api_style, model_cfg.api_url, model_cfg.model, model_cfg.secret,
-            )
+            providers[(type_name, index_name)] = model_cfg
             log.info(
                 "Provider registered: %s  index=%s  →  %s  (%s)",
                 type_name, index_name or "<default>", vi.model, model_cfg.api_style,
@@ -74,7 +66,6 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     log = logging.getLogger(__name__)
 
     import pylon
-    from pylon.vector.sync import VectorIndexWorker
     from pylon.search import OpenSearchClient, OpenSearchWorker, MeilisearchClient, MeilisearchWorker
     import pylon.query as _q
 
@@ -122,15 +113,19 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
         clients = []
 
         if providers:
-            conn = await pgcon_listen(dsn)
-            w = VectorIndexWorker(conn, schema=schema, providers=providers)
-            w.batch_size = batch_size
-            w.poll_interval = poll_interval
+            from pylon._core import run_vector_worker
+            # Runs entirely in Rust now (`pylon_workers::VectorIndexWorker`)
+            # — claim/embed/write all happen natively; only the resolved
+            # `[models.*]` config crosses into Rust as plain data.
+            provider_list = [
+                (type_name, index_name, model_cfg.api_style, model_cfg.api_url, model_cfg.model, model_cfg.secret)
+                for (type_name, index_name), model_cfg in providers.items()
+            ]
             log.info(
                 "VectorIndexWorker started  batch_size=%d  poll_interval=%.0fs",
                 batch_size, poll_interval,
             )
-            tasks.append(w.run())
+            tasks.append(run_vector_worker(dsn, schema, provider_list, batch_size, poll_interval))
 
         if want_opensearch:
             search_cfg = config.search_registry["default"]

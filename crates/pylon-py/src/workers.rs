@@ -5,15 +5,25 @@
 //! `asyncio.gather` in `pylon worker start`), so the CLI wiring doesn't
 //! need to change until the dedicated re-architecture phase.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+use pylon_workers::ProviderConfig;
+
 use crate::pgcon::pgcon_err;
-use crate::PylonCacheError;
+use crate::{PylonCacheError, SchemaDescriptor};
 
 fn workers_err(err: pylon_workers::Error) -> PyErr {
     match err {
         pylon_workers::Error::Pgcon(e) => pgcon_err(e),
         pylon_workers::Error::Cache(msg) => PylonCacheError::new_err(msg),
+        pylon_workers::Error::Providers(e) => PyRuntimeError::new_err(format!("model provider request failed: {e}")),
+        pylon_workers::Error::Decode(msg) => PyRuntimeError::new_err(msg),
+        pylon_workers::Error::Schema(msg) => PyValueError::new_err(msg),
+        pylon_workers::Error::Unsupported(msg) => PyNotImplementedError::new_err(msg),
     }
 }
 
@@ -32,7 +42,40 @@ fn run_cache_invalidation_worker(py: Python<'_>, dsn: String, cache_path: String
     })
 }
 
+/// Runs the native `VectorIndexWorker` claim/embed/write loop until the
+/// returned coroutine is cancelled — the Rust-native replacement for
+/// `VectorIndexWorker(conn, schema=schema, providers=providers).run()`.
+/// `providers` is `[(type_name, index_name, api_style, api_url, model,
+/// api_key), ...]` — the already-resolved `[models.*]` entry for each
+/// `(type_name, index_name)` pair `_build_providers` would have looked up;
+/// `pylon.toml` parsing itself stays in Python.
+#[pyfunction]
+#[pyo3(signature = (dsn, schema, providers, batch_size=50, poll_interval_secs=30.0))]
+fn run_vector_worker<'py>(
+    py: Python<'py>,
+    dsn: String,
+    schema: &SchemaDescriptor,
+    providers: Vec<(String, Option<String>, String, String, String, Option<String>)>,
+    batch_size: i64,
+    poll_interval_secs: f64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let schema = schema.inner.clone();
+    let provider_map: HashMap<(String, Option<String>), ProviderConfig> = providers
+        .into_iter()
+        .map(|(type_name, index_name, api_style, api_url, model, api_key)| {
+            ((type_name, index_name), ProviderConfig { api_style, api_url, model, api_key })
+        })
+        .collect();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let worker = pylon_workers::VectorIndexWorker::new(schema, provider_map).map_err(workers_err)?;
+        pylon_workers::index_worker::run(&dsn, batch_size, Duration::from_secs_f64(poll_interval_secs), worker)
+            .await
+            .map_err(workers_err)
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_cache_invalidation_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(run_vector_worker, m)?)?;
     Ok(())
 }
