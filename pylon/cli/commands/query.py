@@ -210,7 +210,7 @@ async def _handle_set_global(
     try:
         results = await client.query(f"select {expression}")
     except Exception as e:
-        click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
+        click.echo(_format_exception(e))
         return
 
     value = results[0] if results else None
@@ -235,14 +235,14 @@ async def _execute(
             if missing:
                 kwargs = await _prompt_for_params(pyql, missing)
         except Exception as e:
-            click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
+            click.echo(_format_exception(e))
             return
 
     if as_json:
         try:
             click.echo(await client.query_json(pyql, **kwargs))
         except Exception as e:
-            click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
+            click.echo(_format_exception(e))
         return
 
     try:
@@ -255,7 +255,7 @@ async def _execute(
         records = [{"result": row} for row in rows]
         results = _hydrate(records, compiled)
     except Exception as e:
-        click.echo(f"{_BOLD_RED}error:{_RESET} {_translate_pg_types(str(e))}")
+        click.echo(_format_exception(e))
         return
 
     shape = compiled.shape
@@ -398,6 +398,16 @@ _PG_TYPE_RE = re.compile(
 
 def _translate_pg_types(msg: str) -> str:
     return _PG_TYPE_RE.sub(lambda m: _PG_TO_PYQL[m.group()], msg)
+
+
+def _format_exception(e: BaseException) -> str:
+    """`ClassName: message` — `str(e)` already includes the conventional
+    caret-snippet rendering for a `pylon.exceptions.PylonError` that
+    carries a source position (see `PylonError.__str__`); this just
+    prefixes the actual exception class (`InvalidQueryError`,
+    `UnknownLinkError`, ...) instead of the previous generic literal
+    "error:" text, which discarded which kind of error it was."""
+    return f"{_BOLD_RED}{type(e).__name__}:{_RESET} {_translate_pg_types(str(e))}"
 
 
 def _type(s: str) -> str:

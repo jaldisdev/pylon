@@ -40,7 +40,7 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(self.err(&format!("expected {expected:?}, got {:?}", self.current())))
+            Err(self.err(&format!("expected {expected}, found {}", self.current())))
         }
     }
 
@@ -52,7 +52,7 @@ impl Parser {
         }
         match self.current().clone() {
             Token::Ident(s) => { self.advance(); Ok(s) }
-            other => Err(self.err(&format!("expected identifier, got {other:?}"))),
+            other => Err(self.err(&format!("expected an identifier, found {other}"))),
         }
     }
 
@@ -125,7 +125,7 @@ impl Parser {
             Token::Delete => self.parse_delete(),
             Token::Group => self.parse_group(),
             _ => Err(self.err(&format!(
-                "expected WITH, FOR, SELECT, INSERT, UPDATE, DELETE, or GROUP, got {:?}",
+                "expected the start of a statement (with, for, select, insert, update, delete, or group), found {}",
                 self.current()
             ))),
         }?;
@@ -134,7 +134,7 @@ impl Parser {
             self.advance();
         }
         if !self.at_end() {
-            return Err(self.err(&format!("unexpected token {:?}", self.current())));
+            return Err(self.err(&format!("unexpected {} after the end of the query", self.current())));
         }
         Ok(stmt)
     }
@@ -314,7 +314,7 @@ impl Parser {
             Token::Delete => self.parse_delete(),
             Token::Group => self.parse_group(),
             _ => Err(self.err(&format!(
-                "expected WITH, FOR, SELECT, INSERT, UPDATE, DELETE, or GROUP, got {:?}",
+                "expected the start of a statement (with, for, select, insert, update, delete, or group), found {}",
                 self.current()
             ))),
         }
@@ -822,11 +822,13 @@ impl Parser {
                 p.steps.push(step);
                 Ok(Expr::Path(p))
             }
-            other => {
+            _other => {
                 // For non-path expressions (e.g. `(SELECT ...).field`), we'd need
                 // a Path with an Expr head — not supported in Phase 1.
                 Err(PyQLSyntaxError {
-                    message: format!("path traversal on non-path expression: {other:?}"),
+                    message: "field access with '.' is only supported on paths (e.g. `.field`), \
+                              not on a parenthesized sub-expression"
+                        .to_string(),
                     position: self.current_pos(),
                 })
             }
@@ -1008,7 +1010,7 @@ impl Parser {
                 Ok(Expr::Detached(Box::new(inner)))
             }
 
-            other => Err(self.err(&format!("unexpected token {other:?}"))),
+            other => Err(self.err(&format!("expected an expression, found {other}"))),
         }
     }
 

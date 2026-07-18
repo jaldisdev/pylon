@@ -1788,10 +1788,7 @@ impl<'a> Compiler<'a> {
                 continue;
             }
 
-            return Err(self.type_err(&format!(
-                "type '{}' has no property or link named '{step_name}'",
-                current_td.name
-            )));
+            return Err(self.field_err(step_name, &format!("{}::{}", current_td.module, current_td.name)));
         }
 
         // Should be unreachable: steps is non-empty (we checked len > 1 before dispatch).
@@ -6185,10 +6182,39 @@ impl<'a> Compiler<'a> {
     }
 
     fn field_err(&self, field: &str, type_name: &str) -> PyQLError {
+        let suggestion = self.schema.types.iter()
+            .find(|t| format!("{}::{}", t.module, t.name) == type_name)
+            .and_then(|td| Self::suggest_pointer_name(td, field));
+        let message = match suggestion {
+            Some(s) => format!("object type '{type_name}' has no link or property '{field}'. Did you mean '{s}'?"),
+            None => format!("object type '{type_name}' has no link or property '{field}'"),
+        };
         PyQLError::Resolution(PyQLResolutionError::UnknownField(PyQLUnknownFieldError {
-            message: format!("object type '{type_name}' has no link or property '{field}'"),
+            message,
             position: Position { line: 0, col: 0 },
         }))
+    }
+
+    /// Fuzzy-matches `name` against every pointer (property/link/multilink/
+    /// computed — Pylon's term for a type's own attributes; "field" is a
+    /// Postgres-level term that doesn't apply here) on `td`, returning the
+    /// closest candidate when it's plausibly a typo — mirrors the upstream engine's own
+    /// "Did you mean X?" suggestion for an unknown property/link.
+    /// Jaro-Winkler (favors a shared prefix, which is where most real typos
+    /// preserve the most characters, e.g. `nam` -> `name`) with a
+    /// conservative similarity floor, so an unrelated pointer never gets
+    /// suggested just because it happens to be the "closest" among an
+    /// otherwise-dissimilar set of candidates.
+    fn suggest_pointer_name(td: &TypeDescriptor, name: &str) -> Option<String> {
+        const MIN_SIMILARITY: f64 = 0.7;
+        td.properties.iter().map(|p| p.name.as_str())
+            .chain(td.links.iter().map(|l| l.name.as_str()))
+            .chain(td.multilinks.iter().map(|m| m.name.as_str()))
+            .chain(td.computed.iter().map(|c| c.name.as_str()))
+            .map(|candidate| (candidate, strsim::jaro_winkler(name, candidate)))
+            .filter(|(_, score)| *score >= MIN_SIMILARITY)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(name, _)| name.to_string())
     }
 
     // ── Default returning (pk only, matching the upstream engine's bare DML behaviour) ────────────

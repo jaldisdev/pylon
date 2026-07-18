@@ -11,6 +11,7 @@ from pylon.exceptions import (
     InterfaceError,
     InternalServerError,
     NoDataError,
+    PylonError,
     ResultCardinalityError,
     TransactionDeadlockError,
     TransactionSerializationError,
@@ -610,6 +611,12 @@ async def _compile_and_resolve(
             pyql,
             allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
         )
+    except PylonError:
+        # Already a real pylon.exceptions.* class (InvalidQueryError,
+        # UnknownLinkError, ...) with position/query attached by
+        # pyql_err/_from_transpiler on the Rust side — let it propagate
+        # as-is instead of relabeling every compile error InternalServerError.
+        raise
     except BaseException as exc:
         raise InternalServerError(str(exc)) from exc
 
@@ -741,6 +748,9 @@ def _compile_and_bind(
             pyql,
             allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
         )
+    except PylonError:
+        # See the matching comment in _compile_and_resolve above.
+        raise
     except BaseException as exc:
         raise InternalServerError(str(exc)) from exc
     try:

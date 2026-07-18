@@ -91,6 +91,103 @@ pub enum Token {
     Eof,
 }
 
+impl std::fmt::Display for Token {
+    /// Human-readable surface form for error messages — `RParen` -> `')'`,
+    /// `Eof` -> `end of input`, `Ident("foo")` -> `identifier 'foo'`, rather
+    /// than a raw `{:?}` dump of the enum variant name. Used by the
+    /// parser's `eat`/`eat_ident`/`err` call sites so "expected X, found Y"
+    /// messages read the way a user actually wrote the query, not the way
+    /// the lexer named its own token type.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s: &str = match self {
+            // Keywords — surface form, lowercase (matches how they're
+            // actually typed; PyQL keywords are case-insensitive but this
+            // is just for display).
+            Token::Select => "'select'",
+            Token::Insert => "'insert'",
+            Token::Update => "'update'",
+            Token::Delete => "'delete'",
+            Token::Filter => "'filter'",
+            Token::Order => "'order'",
+            Token::By => "'by'",
+            Token::Asc => "'asc'",
+            Token::Desc => "'desc'",
+            Token::First => "'first'",
+            Token::Last => "'last'",
+            Token::Limit => "'limit'",
+            Token::Offset => "'offset'",
+            Token::With => "'with'",
+            Token::For => "'for'",
+            Token::In => "'in'",
+            Token::Union => "'union'",
+            Token::Except => "'except'",
+            Token::Intersect => "'intersect'",
+            Token::Not => "'not'",
+            Token::And => "'and'",
+            Token::Or => "'or'",
+            Token::Exists => "'exists'",
+            Token::Distinct => "'distinct'",
+            Token::If => "'if'",
+            Token::Then => "'then'",
+            Token::Else => "'else'",
+            Token::Like => "'like'",
+            Token::Ilike => "'ilike'",
+            Token::Set => "'set'",
+            Token::True => "'true'",
+            Token::False => "'false'",
+            Token::Is => "'is'",
+            Token::Optional => "'optional'",
+            Token::Required => "'required'",
+            Token::Unless => "'unless'",
+            Token::Conflict => "'conflict'",
+            Token::Detached => "'detached'",
+            Token::Group => "'group'",
+            Token::Using => "'using'",
+            // Identifiers/literals carry their own value.
+            Token::Ident(name) => return write!(f, "identifier '{name}'"),
+            Token::IntLit(n) => return write!(f, "integer literal '{n}'"),
+            Token::FloatLit(n) => return write!(f, "float literal '{n}'"),
+            Token::DecimalLit(s) => return write!(f, "decimal literal '{s}'"),
+            Token::StrLit(s) => return write!(f, "string literal {s:?}"),
+            // Punctuation — the literal character(s), quoted.
+            Token::LBrace => "'{'",
+            Token::RBrace => "'}'",
+            Token::LParen => "'('",
+            Token::RParen => "')'",
+            Token::LBracket => "'['",
+            Token::RBracket => "']'",
+            Token::Dot => "'.'",
+            Token::Comma => "','",
+            Token::Semicolon => "';'",
+            Token::Colon => "':'",
+            Token::At => "'@'",
+            // Operators.
+            Token::ColonEq => "':='",
+            Token::ColonColon => "'::'",
+            Token::Eq => "'='",
+            Token::Ne => "'!='",
+            Token::Lt => "'<'",
+            Token::Le => "'<='",
+            Token::Gt => "'>'",
+            Token::Ge => "'>='",
+            Token::Plus => "'+'",
+            Token::Minus => "'-'",
+            Token::Star => "'*'",
+            Token::Slash => "'/'",
+            Token::SlashSlash => "'//'",
+            Token::Percent => "'%'",
+            Token::StarStar => "'**'",
+            Token::QQ => "'??'",
+            Token::PlusPlus => "'++'",
+            Token::PlusEq => "'+='",
+            Token::MinusEq => "'-='",
+            Token::Dollar => "'$'",
+            Token::Eof => "end of input",
+        };
+        write!(f, "{s}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SpannedToken {
     pub token: Token,

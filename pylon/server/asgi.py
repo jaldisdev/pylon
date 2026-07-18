@@ -692,6 +692,34 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
+def _pylon_error_payload(exc: PylonError) -> dict[str, Any]:
+    """Structured error info for JSON API responses — the plain message,
+    the real exception class name, and (when the Rust transpiler attached
+    one via `_from_transpiler`) hint/details/source-position, so a frontend
+    can render its own diagnostic UI (e.g. underline the offending token in
+    a code editor) instead of scraping `PylonError.__str__`'s
+    terminal-oriented ASCII-art snippet out of a JSON string. `"error"`
+    stays a plain string for backward compatibility with existing callers
+    that only read that key.
+    """
+    payload: dict[str, Any] = {
+        "error": exc.args[0] if exc.args else str(exc),
+        "errorType": type(exc).__name__,
+    }
+    if exc._hint:
+        payload["hint"] = exc._hint
+    if exc._details:
+        payload["details"] = exc._details
+    if exc._position_start >= 0:
+        payload["position"] = {
+            "start": exc._position_start,
+            "end": exc._position_end,
+            "line": exc._line,
+            "col": exc._col,
+        }
+    return payload
+
+
 async def _handle_run_query(client: Client, receive: Receive, send: Send) -> None:
     from pylon.query import compile as compile_query, shape_value_tags
 
@@ -715,7 +743,7 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
             target = target.with_config(config_options)
         objects = await target.query(pyql, **params)
     except PylonError as exc:
-        await _send_json(send, 400, {"error": str(exc)})
+        await _send_json(send, 400, _pylon_error_payload(exc))
         return
     duration_ms = (time.perf_counter() - start) * 1000
 
@@ -833,7 +861,7 @@ async def _handle_ai_chat(config: Config, client: Client, receive: Receive, send
     try:
         objects = await client.query(pyql, **params)
     except PylonError as exc:
-        await _send_json(send, 400, {"error": str(exc)})
+        await _send_json(send, 400, _pylon_error_payload(exc))
         return
 
     results = [_to_jsonable(o) for o in objects]
