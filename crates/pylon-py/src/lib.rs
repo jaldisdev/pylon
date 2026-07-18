@@ -1364,7 +1364,7 @@ impl SchemaDescriptor {
 
 #[pyclass(module = "pylon._core", frozen)]
 pub struct CompiledQuery {
-    inner: core::query::CompiledQuery,
+    pub(crate) inner: core::query::CompiledQuery,
 }
 
 #[pymethods]

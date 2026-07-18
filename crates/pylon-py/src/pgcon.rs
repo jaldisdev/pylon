@@ -17,7 +17,7 @@ use pylon_pgcon::{ExtensionOids, PgListener, PgPool, PgTransaction};
 use pylon_value::CachedValue;
 
 use crate::pgvalue::{cached_to_py, py_to_cached};
-use crate::PylonPgconError;
+use crate::{CompiledQuery, PylonPgconError};
 
 /// Maps a `pylon-pgcon` error to the real `pylon.exceptions.*` class the
 /// old asyncpg-based `client.py` already raised for the same situation —
@@ -248,11 +248,39 @@ impl PgconPool {
         })
     }
 
+    /// Like `query`, but reads the SQL text directly out of an already-
+    /// compiled `CompiledQuery` instead of taking it as a Python `str`.
+    /// Closes the round trip `Client.query` used to do: compile in Rust →
+    /// hand `.sql` to Python as a string → hand that string right back
+    /// into `query()`. Here the SQL never leaves Rust-owned memory as a
+    /// Python object; only `compiled` (an opaque handle) and the
+    /// already-resolved `params` cross the boundary.
+    fn query_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let sql = compiled.inner.sql.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
     /// Runs `sql` with positional `params` and discards the result,
     /// returning the number of rows affected — for `INSERT`/`UPDATE`/
     /// `DELETE` with no `RETURNING` clause to decode.
     fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            pool.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    /// Like `execute`, but reads the SQL text directly out of an
+    /// already-compiled `CompiledQuery` — see `query_compiled`.
+    fn execute_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             pool.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
@@ -327,6 +355,32 @@ impl PgconTransaction {
 
     fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            tx.execute_typed(&sql, &cached_params).await.map_err(pgcon_err)
+        })
+    }
+
+    /// See `PgconPool::query_compiled` — same "read SQL straight out of an
+    /// already-compiled `CompiledQuery`" fusion, on a transaction handle.
+    fn query_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let sql = compiled.inner.sql.clone();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let rows = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+        })
+    }
+
+    /// See `PgconPool::execute_compiled`.
+    fn execute_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
