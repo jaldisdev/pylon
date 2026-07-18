@@ -563,8 +563,7 @@ async def _compile_and_resolve(
     themselves; the fused pgcon methods read it directly out of ``compiled``.
     ``config_options`` mirrors ``Client.with_config()`` — see ``pylon.config_options``.
     """
-    if not isinstance(pyql, str):
-        raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
+    pyql, kwargs = _normalize_pyql_source(pyql, kwargs)
     from pylon.query import compile as _pyql_compile
     try:
         compiled = _pyql_compile(
@@ -661,6 +660,24 @@ def _merge_args(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {str(i): v for i, v in enumerate(args)} | kwargs
 
 
+def _normalize_pyql_source(pyql: Any, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Accepts a raw PyQL string unchanged, or a `@pylon.type` class /
+    `pylon.modelquery.ModelSet` (from `client.query(Model)`,
+    `Model.filter(...)`, `Model.filter(...).delete()`) — rendered to PyQL
+    text via `pylon.modelquery.render()`, with its generated `$__mq_pN`
+    params merged into the caller's own kwargs. Raises the same
+    `InterfaceError` as before for anything else.
+    """
+    if isinstance(pyql, str):
+        return pyql, kwargs
+    from pylon import modelquery
+    rendered = modelquery.render(pyql)
+    if rendered is None:
+        raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
+    text, extra_params = rendered
+    return text, {**kwargs, **extra_params}
+
+
 def _compile_and_bind(
     pyql: str,
     kwargs: dict[str, Any],
@@ -676,8 +693,7 @@ def _compile_and_bind(
     ``pylon.config_options``. Doesn't handle inference-plan queries — those
     still go through ``_compile_and_resolve``.
     """
-    if not isinstance(pyql, str):
-        raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
+    pyql, kwargs = _normalize_pyql_source(pyql, kwargs)
     from pylon.query import compile as _pyql_compile
 
     try:
