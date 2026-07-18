@@ -4641,6 +4641,38 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_pointer_suggests_a_close_match() {
+        // `Person` has a `name` property (see make_schema) — `nam` is close
+        // enough (missing one trailing character) that a "Did you mean"
+        // suggestion should fire, matching Gel's own UX for this mistake.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person { nam }").unwrap();
+        match ir::compile(&ast, &schema) {
+            Err(err) => assert_eq!(
+                format!("{err}"),
+                "object type 'default::Person' has no link or property 'nam'. Did you mean 'name'?"
+            ),
+            Ok(_) => panic!("expected a compile error"),
+        }
+    }
+
+    #[test]
+    fn test_unrelated_unknown_pointer_gets_no_suggestion() {
+        // A typo with no plausible match on the type shouldn't force a
+        // confusing, unrelated suggestion onto the user.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person { xyzxyzxyz }").unwrap();
+        match ir::compile(&ast, &schema) {
+            Err(err) => {
+                let msg = format!("{err}");
+                assert!(msg.contains("has no link or property 'xyzxyzxyz'"), "got: {msg}");
+                assert!(!msg.contains("Did you mean"), "got: {msg}");
+            }
+            Ok(_) => panic!("expected a compile error"),
+        }
+    }
+
+    #[test]
     fn test_structural_tuple_cast_named_resolves_to_jsonb() {
         let out = compile_and_emit("SELECT <tuple<x: float64, y: float64>>$p");
         assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);

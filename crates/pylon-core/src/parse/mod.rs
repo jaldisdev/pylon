@@ -268,4 +268,45 @@ mod tests {
             "got: {err}"
         );
     }
+
+    // ── Error message wording ───────────────────────────────────────────────
+    //
+    // Regression: `eat`/`eat_ident` used to Debug-format the `Token` enum
+    // directly (`"expected RParen, got Eof"`, `"unexpected token LBrace"`),
+    // leaking internal lexer variant names instead of the surface syntax a
+    // user actually typed.
+
+    #[test]
+    fn test_unclosed_paren_names_the_missing_character_not_the_token_variant() {
+        let err = parse("select (1 + 2").unwrap_err();
+        assert_eq!(err.message, "expected ')', found end of input");
+    }
+
+    #[test]
+    fn test_unclosed_brace_names_the_missing_character_not_the_token_variant() {
+        let err = parse("select { 1").unwrap_err();
+        assert_eq!(err.message, "expected '}', found end of input");
+    }
+
+    #[test]
+    fn test_trailing_garbage_after_a_complete_statement_is_a_clear_error() {
+        let err = parse("select 1 select 2").unwrap_err();
+        assert_eq!(err.message, "unexpected 'select' after the end of the query");
+    }
+
+    #[test]
+    fn test_missing_expression_names_the_offending_token_not_its_debug_form() {
+        let err = parse_expr("1 +").unwrap_err();
+        assert_eq!(err.message, "expected an expression, found end of input");
+    }
+
+    #[test]
+    fn test_bad_statement_start_lists_keywords_in_surface_form() {
+        let err = parse("123").unwrap_err();
+        assert_eq!(
+            err.message,
+            "expected the start of a statement (with, for, select, insert, update, delete, or group), \
+             found integer literal '123'"
+        );
+    }
 }

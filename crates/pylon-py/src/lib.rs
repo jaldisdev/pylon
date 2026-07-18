@@ -1448,12 +1448,12 @@ fn compile(query: &str, schema: &SchemaDescriptor, allow_user_specified_id: bool
     let config = core::ir::SessionConfig { allow_user_specified_id };
     core::query::compile_with_config(query, &schema.inner, &config)
         .map(|q| CompiledQuery { inner: q })
-        .map_err(pyql_err)
+        .map_err(|e| pyql_err(e, Some(query)))
 }
 
 #[pyfunction]
 fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
-    core::export::export_schema(&schema.inner).map_err(pyql_err)
+    core::export::export_schema(&schema.inner).map_err(|e| pyql_err(e, None))
 }
 
 #[pyfunction]
@@ -1468,7 +1468,7 @@ fn compile_index_fetch(
     schema: &SchemaDescriptor,
     index_name: Option<&str>,
 ) -> PyResult<String> {
-    core::export::compile_index_fetch(type_name, index_name, &schema.inner).map_err(pyql_err)
+    core::export::compile_index_fetch(type_name, index_name, &schema.inner).map_err(|e| pyql_err(e, None))
 }
 
 #[pyfunction]
@@ -1478,7 +1478,7 @@ fn compile_search_index_fetch(
     schema: &SchemaDescriptor,
     index_name: Option<&str>,
 ) -> PyResult<String> {
-    core::export::compile_search_index_fetch(type_name, index_name, &schema.inner).map_err(pyql_err)
+    core::export::compile_search_index_fetch(type_name, index_name, &schema.inner).map_err(|e| pyql_err(e, None))
 }
 
 // ── Migration ─────────────────────────────────────────────────────────────────
@@ -1745,7 +1745,7 @@ fn compile_fill_expr(
     expr_str: &str,
     schema: &SchemaDescriptor,
 ) -> PyResult<String> {
-    core::query::compile_fill_expr(type_name, expr_str, &schema.inner).map_err(pyql_err)
+    core::query::compile_fill_expr(type_name, expr_str, &schema.inner).map_err(|e| pyql_err(e, Some(expr_str)))
 }
 
 /// Detect columns that are being made NOT NULL and will need a fill expression.
@@ -1951,24 +1951,92 @@ fn shape_node_to_py<'py>(
 
 // ── Error conversion ───────────────────────────────────────────────────────────
 
-fn pyql_err(err: core::error::PyQLError) -> PyErr {
-    match err {
-        core::error::PyQLError::Syntax(e) => PyQLSyntaxError::new_err(e.message),
-        core::error::PyQLError::Type(e) => PyQLTypeError::new_err(e.message),
-        core::error::PyQLError::Resolution(e) => match e {
-            core::error::PyQLResolutionError::UnknownType(e) => {
-                PyQLUnknownTypeError::new_err(e.message)
-            }
-            core::error::PyQLResolutionError::UnknownField(e) => {
-                PyQLUnknownFieldError::new_err(e.message)
-            }
-            core::error::PyQLResolutionError::UnknownParameter(e) => {
-                PyQLUnknownParameterError::new_err(e.message)
-            }
-        },
-        core::error::PyQLError::Cardinality(e) => PyQLCardinalityError::new_err(e.message),
-        core::error::PyQLError::Fragment(e) => PyQLFragmentError::new_err(e.message),
+/// Converts a 1-based `(line, col)` position (as `error::Position` reports
+/// it — `col` counts *bytes* within the line, since the lexer operates on
+/// raw bytes) into a 0-based *character* offset into `text`, matching the
+/// Gel wire-protocol convention `pylon.exceptions.PylonError`'s
+/// caret-snippet renderer expects (`_FIELD_CHARACTER_START`). Returns
+/// `None` for a dead/unset position (`line == 0` — used by compile-time
+/// type/resolution errors, which don't track a real position yet) rather
+/// than rendering a nonsensical snippet.
+///
+/// Clamped to the last valid character index: an EOF error's position is
+/// one column *past* the last character (there's nothing there to point
+/// at), and `pylon.exceptions._format_error`'s line-walker skips a line
+/// entirely once its running offset reaches-or-exceeds that line's length
+/// — for a single-line, no-trailing-newline query, an unclamped offset
+/// exactly equal to the query's length falls into that "past the end,
+/// keep looking" branch with no further line to find, silently dropping
+/// the source excerpt from the rendered error.
+fn char_offset(text: &str, line: u32, col: u32) -> Option<usize> {
+    if line == 0 {
+        return None;
     }
+    let total_chars = text.chars().count();
+    if total_chars == 0 {
+        return None;
+    }
+    let mut offset = 0usize;
+    for (i, l) in text.split_inclusive('\n').enumerate() {
+        if i as u32 + 1 == line {
+            let byte_col = col.saturating_sub(1) as usize;
+            let char_col = l.char_indices().take_while(|(b, _)| *b < byte_col).count();
+            return Some((offset + char_col).min(total_chars - 1));
+        }
+        offset += l.chars().count();
+    }
+    None
+}
+
+/// Maps a Rust-side `PyQLError` straight to the real `pylon.exceptions.*`
+/// class (not the separate, unrelated `pylon._core.PyQL*Error` hierarchy
+/// registered below, which is kept importable for anyone referencing it by
+/// name but is no longer what actually gets raised) — mirrors the existing
+/// `pgcon_err` pattern in `pgcon.rs` for Postgres errors. Callers get the
+/// right exception class *and*, when a real position is available (syntax
+/// and type errors always carry one; resolution/cardinality/fragment
+/// errors don't track one yet), the Gel-style annotated-source-snippet
+/// rendering `PylonError.__str__` already implements via
+/// `_from_transpiler` — previously unreachable because nothing ever called
+/// it, and because `pylon.client`'s blanket `except BaseException` used to
+/// collapse every compile error into `InternalServerError` regardless.
+fn pyql_err(err: core::error::PyQLError, query: Option<&str>) -> PyErr {
+    use core::error::{PyQLError as E, PyQLResolutionError as R};
+    let (class_name, message, position) = match err {
+        E::Syntax(e) => ("InvalidQueryError", e.message, e.position),
+        E::Type(e) => ("InvalidQueryError", e.message, e.position),
+        E::Resolution(R::UnknownType(e)) => ("UnknownTypeError", e.message, e.position),
+        E::Resolution(R::UnknownField(e)) => ("UnknownLinkError", e.message, e.position),
+        E::Resolution(R::UnknownParameter(e)) => ("UnknownParameterError", e.message, e.position),
+        E::Cardinality(e) => ("InvalidQueryError", e.message, e.position),
+        E::Fragment(e) => ("SchemaError", e.message, e.position),
+    };
+    construct_pylon_error(class_name, &message, query, &position)
+}
+
+fn construct_pylon_error(class_name: &str, message: &str, query: Option<&str>, position: &core::error::Position) -> PyErr {
+    Python::attach(|py| {
+        let result: PyResult<PyErr> = (|| {
+            let module = py.import("pylon.exceptions")?;
+            let cls = module.getattr(class_name)?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            if let Some(q) = query {
+                if let Some(offset) = char_offset(q, position.line, position.col) {
+                    kwargs.set_item("query", q)?;
+                    kwargs.set_item("position_start", offset)?;
+                    kwargs.set_item("position_end", offset + 1)?;
+                    kwargs.set_item("line", position.line)?;
+                    kwargs.set_item("col", position.col)?;
+                }
+            }
+            let instance = cls.call_method("_from_transpiler", (message,), Some(&kwargs))?;
+            Ok(PyErr::from_value(instance))
+        })();
+        match result {
+            Ok(err) => err,
+            Err(construct_err) => construct_err,
+        }
+    })
 }
 
 // ── Module ─────────────────────────────────────────────────────────────────────
