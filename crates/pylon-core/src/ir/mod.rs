@@ -369,13 +369,18 @@ pub struct VectorEnqueueInfo {
     pub index_name: Option<String>,
 }
 
-/// Identifies one OpenSearch-backed SearchIndex that needs an outbox row written.
+/// Identifies one OpenSearch- or Meilisearch-backed SearchIndex that needs
+/// an outbox row written (`Postgres`-backed indexes use a synchronously
+/// trigger-maintained tsvector column instead — never enqueued here).
 #[derive(Debug, Clone)]
 pub struct SearchEnqueueInfo {
     pub type_name: String,
     pub index_name: Option<String>,
     /// `"index"` for insert/update, `"delete"` for delete.
     pub operation: &'static str,
+    /// `OpenSearch` or `Meilisearch` — determines the outbox row's
+    /// `_pylon."IndexKind"` value.
+    pub backend: crate::schema::SearchBackend,
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────────

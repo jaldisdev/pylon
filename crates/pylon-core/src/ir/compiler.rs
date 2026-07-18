@@ -6366,18 +6366,22 @@ fn types_compatible(a: &str, b: &str) -> bool {
     a_float && b_float
 }
 
-/// Collect `SearchEnqueueInfo` for all OpenSearch-backed search indexes on a type.
+/// Collect `SearchEnqueueInfo` for every OpenSearch- or Meilisearch-backed
+/// search index on a type — `Postgres`-backed indexes are excluded since
+/// they're maintained synchronously by a trigger-updated tsvector column,
+/// not an async outbox worker.
 fn collect_search_enqueue(
     td: &TypeDescriptor,
     type_name: &str,
     operation: &'static str,
 ) -> Vec<SearchEnqueueInfo> {
     td.search_indexes.iter()
-        .filter(|si| si.backend == SearchBackend::OpenSearch)
+        .filter(|si| si.backend == SearchBackend::OpenSearch || si.backend == SearchBackend::Meilisearch)
         .map(|si| SearchEnqueueInfo {
             type_name: type_name.to_string(),
             index_name: si.index_name.clone(),
             operation,
+            backend: si.backend.clone(),
         })
         .collect()
 }
