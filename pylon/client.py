@@ -449,6 +449,46 @@ class Client:
             )
         return result
 
+    async def save(self, *objs: Any) -> None:
+        """Insert or update each of *objs* — instances of `@pylon.type`
+        classes — in a single transaction.
+
+        A "new" instance (never hydrated from a query result, i.e. no
+        `__pylon_saved__` shadow — see `pylon.query._decode`) is INSERTed
+        and has its generated ``id`` assigned back. A hydrated instance is
+        diffed against the values it was loaded with and UPDATEd only if
+        something actually changed (a no-op is skipped entirely). See
+        `pylon.modelquery.prepare_save` for the diffing/rendering logic.
+        """
+        from pylon import modelquery
+        # The `__pylon_saved__` shadow is only refreshed once the whole
+        # transaction has actually committed (after the retry loop below
+        # exits normally) — refreshing it per-statement, inside the loop,
+        # would make a *retried* attempt (serialization failure/deadlock —
+        # a rolled-back attempt that reruns this same body) see a diff of
+        # zero for objects it already "saved" on the failed attempt, and
+        # silently skip re-issuing their INSERT/UPDATE.
+        async for tx in self.transaction():
+            async with tx:
+                for obj in objs:
+                    prepared = modelquery.prepare_save(obj)
+                    if prepared is None:
+                        continue
+                    pyql, params = prepared
+                    is_new = "__pylon_saved__" not in obj.__dict__
+                    if is_new:
+                        result = await tx.query_single(pyql, **params)
+                        obj.id = result.id
+                    else:
+                        await tx.execute(pyql, **params)
+        for obj in objs:
+            cfg = type(obj).__pylon_config__
+            obj.__dict__["__pylon_saved__"] = {
+                name: obj.__dict__[name]
+                for name, meta in cfg.pointers.items()
+                if meta.kind == "property" and name in obj.__dict__
+            }
+
     # ------------------------------------------------------------------
     # Transaction
     # ------------------------------------------------------------------

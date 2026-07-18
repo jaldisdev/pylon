@@ -16,8 +16,8 @@ from pylon.modelquery import ModelSet, cal, math, render, render_expr, std
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
-def _pointer(kind: str):
-    return SimpleNamespace(kind=kind)
+def _pointer(kind: str, is_readonly: bool = False):
+    return SimpleNamespace(kind=kind, is_readonly=is_readonly)
 
 
 class Person:
@@ -37,11 +37,34 @@ class Person:
     )
 
 
+class PersonWithReadonlyAge:
+    """A stand-in with a readonly property, for prepare_save's readonly-diff
+    exclusion behavior."""
+
+    __pylon_config__ = SimpleNamespace(
+        module="default",
+        name="PersonWithReadonlyAge",
+        pointers={
+            "id": _pointer("property"),
+            "name": _pointer("property"),
+            "age": _pointer("property", is_readonly=True),
+        },
+    )
+
+
 class Account:
     """A stand-in for an interface type — no .filter attached in real usage,
     but the renderer itself doesn't care; the gating lives in _decorators."""
 
     __pylon_config__ = SimpleNamespace(module="default", name="Account", pointers={})
+
+
+def _make(cls, **kwargs):
+    """Builds a bare instance of a stand-in class (bypassing __init__, like
+    real query-result hydration does) with the given attributes set."""
+    obj = object.__new__(cls)
+    obj.__dict__.update(kwargs)
+    return obj
 
 
 # ── Expression tree / render_expr ───────────────────────────────────────────
@@ -240,3 +263,63 @@ class TestModelSet:
         assert isinstance(ms, ModelSet)
         text, _ = render(ms)
         assert "filter .name" in text
+
+
+# ── prepare_save (INSERT/UPDATE rendering) ──────────────────────────────────
+
+
+class TestPrepareSave:
+    def test_insert_renders_all_set_property_fields(self):
+        obj = _make(Person, name="Bob", age=30)
+        pyql, params = modelquery.prepare_save(obj)
+        assert pyql.startswith("insert default::Person { ")
+        assert "name :=" in pyql
+        assert "age :=" in pyql
+        assert set(params.values()) == {"Bob", 30}
+
+    def test_insert_omits_none_fields(self):
+        obj = _make(Person, name="Bob", age=None)
+        pyql, params = modelquery.prepare_save(obj)
+        assert "age" not in pyql
+        assert params == {"__mq_s0": "Bob"}
+
+    def test_insert_with_no_fields_set_raises(self):
+        obj = _make(Person)
+        with pytest.raises(InterfaceError, match="no fields set"):
+            modelquery.prepare_save(obj)
+
+    def test_insert_includes_readonly_fields_if_explicitly_set(self):
+        obj = _make(PersonWithReadonlyAge, name="Bob", age=10)
+        pyql, params = modelquery.prepare_save(obj)
+        assert "age :=" in pyql
+        assert 10 in params.values()
+
+    def test_update_renders_only_changed_fields(self):
+        pid = uuid.uuid4()
+        obj = _make(Person, id=pid, name="Bob", age=30)
+        obj.__dict__["__pylon_saved__"] = {"id": pid, "name": "Bob", "age": 30}
+        obj.name = "Robert"
+        pyql, params = modelquery.prepare_save(obj)
+        assert pyql.startswith("update default::Person filter .id = $")
+        assert "name :=" in pyql
+        assert "age :=" not in pyql
+        assert set(params.values()) == {"Robert", pid}
+
+    def test_update_with_no_changes_returns_none(self):
+        pid = uuid.uuid4()
+        obj = _make(Person, id=pid, name="Bob", age=30)
+        obj.__dict__["__pylon_saved__"] = {"id": pid, "name": "Bob", "age": 30}
+        assert modelquery.prepare_save(obj) is None
+
+    def test_update_excludes_readonly_fields_from_diff(self):
+        pid = uuid.uuid4()
+        obj = _make(PersonWithReadonlyAge, id=pid, name="Bob", age=30)
+        obj.__dict__["__pylon_saved__"] = {"id": pid, "name": "Bob", "age": 30}
+        obj.age = 99
+        assert modelquery.prepare_save(obj) is None
+
+    def test_update_without_id_raises(self):
+        obj = _make(Person, name="Bob")
+        obj.__dict__["__pylon_saved__"] = {"name": "Old"}
+        with pytest.raises(InterfaceError, match="no id"):
+            modelquery.prepare_save(obj)
