@@ -211,7 +211,7 @@ class TestClientQueryPositional:
                 compiled = _fake_compiled()
                 compiled.param_names = []
                 compiled.inference_plan = None
-                return compiled, "SELECT 1", []
+                return compiled, []
 
             with patch("pylon.client._compile_and_resolve", side_effect=fake_resolve), \
                  patch("pylon.client._hydrate", return_value=[]):
@@ -300,10 +300,18 @@ def _make_pool(query_result=None, execute_result=None):
     `query_result` defaults to `[]`; pass a list to stand in for the
     (already-decoded, unwrapped) rows a real `pool.query()` would return —
     `Client.query()` itself does the `{"result": row}` wrapping now.
+    `query_compiled`/`execute_compiled` are the fused entrypoints
+    (`compiled` object + params, no SQL string) used by the non-JSON,
+    non-inference-plan `Client`/`AsyncTransaction` methods — mirror the
+    same return values as `query`/`execute` since they're the same
+    operation, just reading SQL out of `compiled` on the Rust side instead
+    of taking it as a Python string.
     """
     pool = MagicMock()
     pool.query = AsyncMock(return_value=query_result if query_result is not None else [])
     pool.execute = AsyncMock(return_value=execute_result)
+    pool.query_compiled = AsyncMock(return_value=query_result if query_result is not None else [])
+    pool.execute_compiled = AsyncMock(return_value=execute_result)
     return pool
 
 
@@ -312,20 +320,26 @@ class TestClientQuery:
         compiled = _fake_compiled(sql)
 
         async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
-            return compiled, sql, list(kwargs.values())
+            return compiled, list(kwargs.values())
 
         def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
             return sql, list(kwargs.values()), compiled
 
+        def fake_bind(pyql, kwargs, globals_=None, config_options=None):
+            return compiled, list(kwargs.values())
+
         p1 = patch("pylon.client._compile_and_resolve", side_effect=fake_resolve)
         p2 = patch("pylon.client._transpile", side_effect=fake_transpile)
+        p3 = patch("pylon.client._compile_and_bind", side_effect=fake_bind)
 
         class _Both:
             def __enter__(self):
                 p1.__enter__()
                 p2.__enter__()
+                p3.__enter__()
                 return self
             def __exit__(self, *a):
+                p3.__exit__(*a)
                 p2.__exit__(*a)
                 p1.__exit__(*a)
 
@@ -410,7 +424,7 @@ class TestClientQuery:
                 result = await client.execute("insert User { name := 'x' }")
 
             assert result is None
-            pool.execute.assert_awaited_once()
+            pool.execute_compiled.assert_awaited_once()
 
         run(_run())
 
@@ -486,7 +500,7 @@ class TestClientCaching:
         compiled = _fake_compiled(sql, tags=tags)
 
         async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
-            return compiled, sql, list(kwargs.values())
+            return compiled, list(kwargs.values())
 
         def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
             return sql, list(kwargs.values()), compiled
@@ -527,7 +541,7 @@ class TestClientCaching:
 
             assert first == ["row1"]
             assert second == ["row1"]
-            pool.query.assert_awaited_once()
+            pool.query_compiled.assert_awaited_once()
 
         run(_run())
 
@@ -547,7 +561,7 @@ class TestClientCaching:
 
             assert first == "row1"
             assert second == "row1"
-            pool.query.assert_awaited_once()
+            pool.query_compiled.assert_awaited_once()
 
         run(_run())
 
@@ -606,7 +620,7 @@ class TestClientCaching:
                 await client.query("select 1")
                 await client.query("select 1")
 
-            assert pool.query.await_count == 2
+            assert pool.query_compiled.await_count == 2
 
         run(_run())
 
@@ -624,7 +638,7 @@ class TestClientCaching:
                 await client.query("select Person")
                 await client.query("select Person")
 
-            assert pool.query.await_count == 2
+            assert pool.query_compiled.await_count == 2
 
         run(_run())
 

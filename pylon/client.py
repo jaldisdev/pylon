@@ -72,14 +72,14 @@ class AsyncTransaction:
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
-        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query(sql, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
+        rows = await self._tx.query_compiled(compiled, params)
         return _hydrate([{"result": row} for row in rows], compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
-        sql, params, compiled = _transpile(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query(sql, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
+        rows = await self._tx.query_compiled(compiled, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
@@ -97,8 +97,8 @@ class AsyncTransaction:
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs))
-        await self._tx.execute(sql, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
+        await self._tx.execute_compiled(compiled, params)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -320,7 +320,7 @@ class Client:
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(
+        compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
         )
         if self._warnings:
@@ -331,10 +331,10 @@ class Client:
         if cached is not None:
             return _hydrate(cached, compiled)
 
-        # `pool.query` already raises the correctly-mapped
+        # `pool.query_compiled` already raises the correctly-mapped
         # `pylon.exceptions.*` instance on failure (see `pgcon_err` in
         # `pgcon.rs`) — no exception translation needed here.
-        rows = await pool.query(sql, params)
+        rows = await pool.query_compiled(compiled, params)
         records = [{"result": row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
         return _hydrate(records, compiled)
@@ -346,7 +346,7 @@ class Client:
         than one object matches.
         """
         pool = self._require_pool()
-        compiled, sql, params = await _compile_and_resolve(
+        compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
         )
         if self._warnings:
@@ -363,7 +363,7 @@ class Client:
                 return None
             return _hydrate(cached, compiled)[0]
 
-        rows = await pool.query(sql, params)
+        rows = await pool.query_compiled(compiled, params)
         if len(rows) > 1:
             raise ResultCardinalityError(
                 f"query_single expected at most one result, got {len(rows)}."
@@ -388,8 +388,8 @@ class Client:
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = self._require_pool()
-        sql, params, _ = _transpile(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
-        await pool.execute(sql, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        await pool.execute_compiled(compiled, params)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -555,10 +555,12 @@ async def _compile_and_resolve(
     config: "Config",
     globals_: dict[str, Any] | None = None,
     config_options: dict[str, Any] | None = None,
-) -> tuple["CompiledQuery", str, list[Any]]:
+) -> tuple["CompiledQuery", list[Any]]:
     """Compile PyQL and, for OpenSearch-backed queries, perform the HTTP phase first.
 
-    Returns ``(compiled, sql, params)`` ready for ``pool.query``/``pool.execute``.
+    Returns ``(compiled, params)`` ready for ``pool.query_compiled``/
+    ``pool.execute_compiled`` — callers never need to read ``compiled.sql``
+    themselves; the fused pgcon methods read it directly out of ``compiled``.
     ``config_options`` mirrors ``Client.with_config()`` — see ``pylon.config_options``.
     """
     if not isinstance(pyql, str):
@@ -585,7 +587,7 @@ async def _compile_and_resolve(
                     params.append(kwargs[name])
         except KeyError as exc:
             raise InterfaceError(f"Missing query parameter: {exc}") from exc
-        return compiled, compiled.sql, params
+        return compiled, params
 
     query_text = _resolve_query_text(plan, kwargs)
 
@@ -619,7 +621,7 @@ async def _compile_and_resolve(
         extra = {"__deferred_vec__": vector}
 
     params = [extra[name] for name in compiled.param_names]
-    return compiled, compiled.sql, params
+    return compiled, params
 
 
 def _resolve_query_text(plan: dict, kwargs: dict) -> str | None:
@@ -670,18 +672,20 @@ def _merge_args(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {str(i): v for i, v in enumerate(args)} | kwargs
 
 
-def _transpile(
+def _compile_and_bind(
     pyql: str,
     kwargs: dict[str, Any],
     globals_: dict[str, Any] | None = None,
     config_options: dict[str, Any] | None = None,
-) -> tuple[str, list[Any], "CompiledQuery"]:
-    """Compile PyQL to SQL via the pylon-core Rust extension.
+) -> tuple["CompiledQuery", list[Any]]:
+    """Compile PyQL and resolve positional params — never reads ``compiled.sql``.
 
-    Returns ``(sql, positional_params, compiled)`` ready for ``pool.query``/
-    ``pool.execute``. ``param_names`` entries prefixed with ``__global__`` are filled from
-    ``globals_``; all others from ``kwargs``. ``config_options`` mirrors
-    ``Client.with_config()`` — see ``pylon.config_options``.
+    Returns ``(compiled, params)`` ready for ``pool.query_compiled``/
+    ``execute_compiled``. ``param_names`` entries prefixed with ``__global__``
+    are filled from ``globals_``; all others from ``kwargs``.
+    ``config_options`` mirrors ``Client.with_config()`` — see
+    ``pylon.config_options``. Doesn't handle inference-plan queries — those
+    still go through ``_compile_and_resolve``.
     """
     if not isinstance(pyql, str):
         raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
@@ -704,6 +708,23 @@ def _transpile(
                 params.append(kwargs[name])
     except KeyError as exc:
         raise InterfaceError(f"Missing query parameter: {exc}") from exc
+    return compiled, params
+
+
+def _transpile(
+    pyql: str,
+    kwargs: dict[str, Any],
+    globals_: dict[str, Any] | None = None,
+    config_options: dict[str, Any] | None = None,
+) -> tuple[str, list[Any], "CompiledQuery"]:
+    """Compile PyQL to SQL text — only for the JSON-wrapping paths
+    (``query_json``/``query_single_json``), which still string-wrap raw SQL
+    in Python until a later phase moves that wrapping into Rust too.
+
+    Returns ``(sql, positional_params, compiled)`` ready for ``pool.query``/
+    ``pool.execute``.
+    """
+    compiled, params = _compile_and_bind(pyql, kwargs, globals_, config_options)
     return compiled.sql, params, compiled
 
 
