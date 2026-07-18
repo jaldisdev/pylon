@@ -4543,6 +4543,45 @@ mod tests {
     }
 
     #[test]
+    fn test_jsonb_to_uuid_cast_extracts_via_text() {
+        // PostgreSQL has no native jsonb -> uuid cast; extract raw text then cast.
+        let out = compile_and_emit("SELECT <uuid>(<json>$p)");
+        assert!(out.sql.contains("#>> '{}'"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("::uuid"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_jsonb_to_datetime_cast_extracts_via_text() {
+        let out = compile_and_emit("SELECT <datetime>(<json>$p)");
+        assert!(out.sql.contains("#>> '{}'"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("::timestamptz"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_jsonb_to_duration_cast_extracts_via_text() {
+        let out = compile_and_emit("SELECT <duration>(<json>$p)");
+        assert!(out.sql.contains("#>> '{}'"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("::interval"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_jsonb_to_array_cast_unpacks_each_element() {
+        let out = compile_and_emit("SELECT <array<int64>>(<json>$p)");
+        assert!(out.sql.contains("jsonb_array_elements("), "got:\n{}", out.sql);
+        assert!(out.sql.contains("#>> '{}'"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("::int8"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_non_jsonb_cast_is_unaffected_by_jsonb_extraction() {
+        // A plain str -> uuid cast (source isn't jsonb) must still use the
+        // ordinary `::pg_type` path, not the jsonb-extraction template.
+        let out = compile_and_emit("SELECT <uuid>$p");
+        assert!(!out.sql.contains("#>>"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("::uuid"), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_structural_tuple_cast_named_resolves_to_jsonb() {
         let out = compile_and_emit("SELECT <tuple<x: float64, y: float64>>$p");
         assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
