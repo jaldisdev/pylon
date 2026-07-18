@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -240,37 +239,3 @@ class TestSetOverrides:
         assert cache.get(q, [1], config) is None
 
 
-class TestCacheInvalidationWorker:
-    def test_notify_triggers_invalidation(self, monkeypatch):
-        invalidated: list[list[str]] = []
-
-        async def fake_invalidate(self, tags):
-            invalidated.append(tags)
-
-        monkeypatch.setattr(cache.CacheInvalidationWorker, "_invalidate", fake_invalidate)
-
-        class FakeConn:
-            def __init__(self):
-                self.listeners = {}
-
-            async def add_listener(self, channel, callback):
-                self.listeners[channel] = callback
-
-            async def remove_listener(self, channel, callback):
-                del self.listeners[channel]
-
-        async def scenario():
-            conn = FakeConn()
-            worker = cache.CacheInvalidationWorker(conn)
-            run_task = asyncio.ensure_future(worker.run())
-            await asyncio.sleep(0)  # let run() reach add_listener
-
-            worker._on_notify(conn, 1, cache.NOTIFY_CHANNEL, "public.person")
-            await asyncio.sleep(0.01)  # let the scheduled _drain() run
-
-            run_task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await run_task
-
-        asyncio.run(scenario())
-        assert invalidated == [["public.person"]]

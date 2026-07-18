@@ -1,0 +1,17 @@
+[package]
+name = "pylon-workers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pylon-core = { path = "../pylon-core" }
+pylon-pgcon = { path = "../pylon-pgcon" }
+pylon-cache = { path = "../pylon-cache" }
+pylon-providers = { path = "../pylon-providers" }
+pylon-value = { path = "../pylon-value" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"
