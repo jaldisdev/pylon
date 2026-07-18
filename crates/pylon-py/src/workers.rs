@@ -24,6 +24,7 @@ fn workers_err(err: pylon_workers::Error) -> PyErr {
         pylon_workers::Error::Decode(msg) => PyRuntimeError::new_err(msg),
         pylon_workers::Error::Schema(msg) => PyValueError::new_err(msg),
         pylon_workers::Error::Unsupported(msg) => PyNotImplementedError::new_err(msg),
+        pylon_workers::Error::Http(e) => PyRuntimeError::new_err(format!("search backend request failed: {e}")),
     }
 }
 
@@ -74,8 +75,65 @@ fn run_vector_worker<'py>(
     })
 }
 
+/// Runs the native `MeilisearchIndexWorker` (`SearchIndexWorker<MeilisearchClient>`)
+/// claim/fetch/index loop until the returned coroutine is cancelled — the
+/// Rust-native replacement for `MeilisearchWorker(conn, schema=schema,
+/// client=client).run()`.
+#[pyfunction]
+#[pyo3(signature = (dsn, schema, base_url, api_key=None, batch_size=50, poll_interval_secs=30.0, timeout_secs=10.0))]
+fn run_meilisearch_worker<'py>(
+    py: Python<'py>,
+    dsn: String,
+    schema: &SchemaDescriptor,
+    base_url: String,
+    api_key: Option<String>,
+    batch_size: i64,
+    poll_interval_secs: f64,
+    timeout_secs: f64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let schema = schema.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let client = pylon_workers::MeilisearchClient::new(&base_url, api_key.as_deref(), Duration::from_secs_f64(timeout_secs))
+            .map_err(workers_err)?;
+        let worker = pylon_workers::SearchIndexWorker::new(schema, client, "Meilisearch");
+        pylon_workers::index_worker::run(&dsn, batch_size, Duration::from_secs_f64(poll_interval_secs), worker)
+            .await
+            .map_err(workers_err)
+    })
+}
+
+/// Runs the native `OpenSearchIndexWorker` (`SearchIndexWorker<OpenSearchClient>`)
+/// claim/fetch/index loop until the returned coroutine is cancelled — the
+/// Rust-native replacement for `OpenSearchWorker(conn, schema=schema,
+/// client=client).run()`.
+#[pyfunction]
+#[pyo3(signature = (dsn, schema, base_url, user=None, password=None, batch_size=50, poll_interval_secs=30.0, timeout_secs=10.0))]
+fn run_opensearch_worker<'py>(
+    py: Python<'py>,
+    dsn: String,
+    schema: &SchemaDescriptor,
+    base_url: String,
+    user: Option<String>,
+    password: Option<String>,
+    batch_size: i64,
+    poll_interval_secs: f64,
+    timeout_secs: f64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let schema = schema.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let auth = user.as_deref().zip(password.as_deref());
+        let client = pylon_workers::OpenSearchClient::new(&base_url, auth, Duration::from_secs_f64(timeout_secs)).map_err(workers_err)?;
+        let worker = pylon_workers::SearchIndexWorker::new(schema, client, "OpenSearch");
+        pylon_workers::index_worker::run(&dsn, batch_size, Duration::from_secs_f64(poll_interval_secs), worker)
+            .await
+            .map_err(workers_err)
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_cache_invalidation_worker, m)?)?;
     m.add_function(wrap_pyfunction!(run_vector_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(run_meilisearch_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(run_opensearch_worker, m)?)?;
     Ok(())
 }

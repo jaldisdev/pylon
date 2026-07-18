@@ -9,8 +9,12 @@
 mod cache_worker;
 mod error;
 pub mod index_worker;
+pub mod search_clients;
+mod search_worker;
 mod vector_worker;
 
 pub use cache_worker::{CacheInvalidationWorker, NOTIFY_CHANNEL as CACHE_NOTIFY_CHANNEL};
 pub use error::{Error, Result};
+pub use search_clients::{MeilisearchClient, OpenSearchClient};
+pub use search_worker::SearchIndexWorker;
 pub use vector_worker::{ProviderConfig, VectorIndexWorker};

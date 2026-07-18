@@ -66,7 +66,6 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     log = logging.getLogger(__name__)
 
     import pylon
-    from pylon.search import OpenSearchClient, OpenSearchWorker, MeilisearchClient, MeilisearchWorker
     import pylon.query as _q
 
     pylon.finalize()
@@ -107,10 +106,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     dsn = db.dsn or f"postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}"
 
     async def run() -> None:
-        from pylon._core import pgcon_listen
-
         tasks = []
-        clients = []
 
         if providers:
             from pylon._core import run_vector_worker
@@ -128,37 +124,28 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             tasks.append(run_vector_worker(dsn, schema, provider_list, batch_size, poll_interval))
 
         if want_opensearch:
+            from pylon._core import run_opensearch_worker
             search_cfg = config.search_registry["default"]
             base_url = f"http://{search_cfg.host}:{search_cfg.port}"
-            auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
-            client = OpenSearchClient(base_url, auth=auth)
-            await client.__aenter__()
-            clients.append(client)
-            conn = await pgcon_listen(dsn)
-            w = OpenSearchWorker(conn, schema=schema, client=client)
-            w.batch_size = batch_size
-            w.poll_interval = poll_interval
             log.info(
                 "OpenSearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs",
                 base_url, batch_size, poll_interval,
             )
-            tasks.append(w.run())
+            tasks.append(run_opensearch_worker(
+                dsn, schema, base_url, search_cfg.user, search_cfg.password, batch_size, poll_interval,
+            ))
 
         if want_meilisearch:
+            from pylon._core import run_meilisearch_worker
             search_cfg = config.search_registry["default"]
             base_url = f"http://{search_cfg.host}:{search_cfg.port}"
-            client = MeilisearchClient(base_url, api_key=search_cfg.api_key)
-            await client.__aenter__()
-            clients.append(client)
-            conn = await pgcon_listen(dsn)
-            w = MeilisearchWorker(conn, schema=schema, client=client)
-            w.batch_size = batch_size
-            w.poll_interval = poll_interval
             log.info(
                 "MeilisearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs",
                 base_url, batch_size, poll_interval,
             )
-            tasks.append(w.run())
+            tasks.append(run_meilisearch_worker(
+                dsn, schema, base_url, search_cfg.api_key, batch_size, poll_interval,
+            ))
 
         if config.cache.enabled:
             from pylon._core import run_cache_invalidation_worker
@@ -173,15 +160,11 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             log.info("CacheInvalidationWorker started  channel=%s", NOTIFY_CHANNEL)
             tasks.append(run_cache_invalidation_worker(dsn, str(config.cache.path), config.cache.max_size_mb))
 
-        # Each `pgcon_listen` connection above has no explicit close — it's
-        # dropped (and its socket closed) along with the process, matching
-        # `worker start`'s own lifecycle (runs until interrupted). Only the
-        # HTTP search clients need an explicit, ordered shutdown.
-        try:
-            await asyncio.gather(*tasks)
-        finally:
-            for client in clients:
-                await client.__aexit__(None, None, None)
+        # Every worker now runs entirely in Rust — its connection and any
+        # HTTP client it owns are dropped along with the process, matching
+        # `worker start`'s own lifecycle (runs until interrupted). No
+        # Python-side cleanup needed.
+        await asyncio.gather(*tasks)
 
     try:
         asyncio.run(run())
