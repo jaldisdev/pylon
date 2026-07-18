@@ -3,9 +3,9 @@
 Covers:
   - VectorPointer / VectorIndex construction
   - Walker pointer resolution (_resolve_vector_pointer, _make_vector_index_desc)
-  - OpenAIProvider and AnthropicProvider (mocked httpx)
-  - IndexWorker drain lock
-  - VectorIndexWorker.process_batch (mocked pgcon connection + compile_index_fetch)
+  - OpenAIProvider and AnthropicProvider (mocked httpx) — still used by
+    pylon.server.asgi's /api/ai/chat endpoint; embedding itself runs in
+    Rust now (pylon._core.embed_text), but .chat() hasn't been ported.
 """
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -250,95 +250,3 @@ class TestAnthropicProvider:
             assert "Authorization" not in headers
 
 
-# ── IndexWorker drain lock ────────────────────────────────────────────────────
-
-
-class TestIndexWorkerDrainLock:
-    def _make_worker(self):
-        from pylon.worker import IndexKind, IndexWorker
-
-        class CountingWorker(IndexWorker):
-            index_kind = IndexKind.VECTOR
-            claim_calls = 0
-
-            async def claim_batch(self, limit):
-                self.claim_calls += 1
-                return []
-
-            async def process_batch(self, rows):
-                pass
-
-        return CountingWorker(AsyncMock())
-
-    def test_skips_when_lock_held(self):
-        worker = self._make_worker()
-
-        async def go():
-            async with worker._drain_lock:
-                await worker._drain()
-            return worker.claim_calls
-
-        assert run(go()) == 0
-
-    def test_runs_when_unlocked(self):
-        worker = self._make_worker()
-        run(worker._drain())
-        assert worker.claim_calls == 1
-
-
-# ── VectorIndexWorker ─────────────────────────────────────────────────────────
-
-
-def _make_schema_mock(type_name: str, index_name, col_name: str, table: str):
-    module, name = type_name.split("::")
-    vi = MagicMock()
-    vi.index_name = index_name
-    vi.column_name = col_name
-    td = MagicMock()
-    td.module = module
-    td.name = name
-    td.table = table
-    td.vector_indexes = [vi]
-    schema = MagicMock()
-    schema.types = [td]
-    return schema
-
-
-class TestVectorIndexWorker:
-    def _make_worker(self, type_name="default::Product", index_name=None):
-        from pylon.vector.sync import VectorIndexWorker
-        schema = _make_schema_mock(type_name, index_name, "__vector__", "Product")
-        provider = AsyncMock()
-        provider.embed_batch.return_value = [[0.1, 0.2, 0.3]]
-        conn = AsyncMock()
-        conn.query_named.return_value = [{"id": "uuid-1", "source_text": "Wireless Headphones"}]
-        with patch("pylon.vector.sync.compile_index_fetch", return_value="SELECT ..."):
-            worker = VectorIndexWorker(
-                conn,
-                schema=schema,
-                providers={(type_name, index_name): provider},
-            )
-        return worker, conn, provider
-
-    def test_process_batch_embeds_and_writes(self):
-        worker, conn, provider = self._make_worker()
-        rows = [{"type_name": "default::Product", "index_name": None, "object_id": "uuid-1"}]
-        run(worker.process_batch(rows))
-        provider.embed_batch.assert_awaited_once_with(["Wireless Headphones"])
-        conn.execute.assert_awaited_once()
-        _, params = conn.execute.call_args[0]
-        assert params[0] == "uuid-1"
-        assert params[1] == "[0.1,0.2,0.3]"
-
-    def test_missing_provider_skips_fetch(self):
-        worker, conn, _ = self._make_worker()
-        rows = [{"type_name": "default::Other", "index_name": None, "object_id": "uuid-1"}]
-        run(worker.process_batch(rows))
-        conn.query_named.assert_not_awaited()
-
-    def test_empty_fetch_result_skips_embed(self):
-        worker, conn, provider = self._make_worker()
-        conn.query_named.return_value = []
-        rows = [{"type_name": "default::Product", "index_name": None, "object_id": "uuid-1"}]
-        run(worker.process_batch(rows))
-        provider.embed_batch.assert_not_awaited()
