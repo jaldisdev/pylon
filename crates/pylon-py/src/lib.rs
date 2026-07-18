@@ -1371,6 +1371,11 @@ pub struct CompiledQuery {
 
 #[pymethods]
 impl CompiledQuery {
+    /// Debug-only escape hatch (the REPL, tests). The normal query path
+    /// never reads this: `PgconPool`/`PgconTransaction`'s `*_compiled`
+    /// methods (`pgcon.rs`) take a `&CompiledQuery` directly and read
+    /// `.sql` out of the Rust-owned struct themselves, so the SQL text
+    /// never needs to cross into Python as a string at all.
     #[getter]
     fn sql(&self) -> &str {
         &self.inner.sql

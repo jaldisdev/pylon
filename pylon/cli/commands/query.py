@@ -246,12 +246,12 @@ async def _execute(
         return
 
     try:
-        compiled, sql, params = await _compile_and_resolve(pyql, kwargs, client._config, globals_)
+        compiled, params = await _compile_and_resolve(pyql, kwargs, client._config, globals_)
         for w in compiled.warnings():
             click.echo(f"{_YELLOW}warning:{_RESET} {w}", err=True)
         # `pool.query` already raises the correctly-mapped
         # `pylon.exceptions.*` instance on failure — no translation needed.
-        rows = await client._require_pool().query(sql, params)
+        rows = await client._require_pool().query_compiled(compiled, params)
         records = [{"result": row} for row in rows]
         results = _hydrate(records, compiled)
     except Exception as e:
