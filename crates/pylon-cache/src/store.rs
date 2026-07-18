@@ -19,6 +19,25 @@ use pylon_value::{ArchivedCachedEntry, CachedEntry, CachedValue};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Bump this whenever `CachedValue`'s rkyv binary layout changes in a way
+/// that isn't safely re-readable under the new layout — adding, removing,
+/// or reordering an enum variant (rkyv discriminants are positional by
+/// default), changing a field's type, etc. `Cache::open` wipes the whole
+/// environment on a version mismatch rather than risk silently misdecoding
+/// bytes written under an older layout.
+///
+/// This constant exists because of a real incident: `CachedValue::Interval`/
+/// `Date`/`Time`/`Timestamp`/`Timestamptz` were inserted *between*
+/// `Decimal` and `Array` (rather than appended at the end), which shifted
+/// every later variant's discriminant — an `Array` entry written by an
+/// older build got silently misread as the new `Interval` variant by a
+/// rebuilt binary, surfacing as a `ValueError` about decoding a
+/// `cal::relative_duration` on a completely unrelated query. Reordering
+/// mid-enum should be avoided going forward (append new variants at the
+/// end instead) — but bumping this version is the safety net for whenever
+/// that isn't possible or gets missed.
+const CACHE_FORMAT_VERSION: &[u8] = b"2";
+
 /// `sha256(sql) + bound parameter values`, hex-encoded — see the cache
 /// layer plan's key-simplification note: `compiled.sql` is already a
 /// canonical, whitespace-insensitive form, so hashing it directly (rather
@@ -59,7 +78,7 @@ impl Cache {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(max_size_mb * 1024 * 1024)
-                .max_dbs(2)
+                .max_dbs(3)
                 .open(path)?
         };
 
@@ -71,6 +90,17 @@ impl Cache {
             .flags(DatabaseFlags::DUP_SORT)
             .name("tags")
             .create(&mut wtxn)?;
+        let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta"))?;
+
+        // Self-healing format check — see `CACHE_FORMAT_VERSION`'s doc
+        // comment. A missing/mismatched version (including a cache
+        // directory from before this check existed at all) wipes
+        // everything rather than risk misdecoding stale bytes.
+        if meta.get(&wtxn, "format_version")?.map(<[u8]>::to_vec) != Some(CACHE_FORMAT_VERSION.to_vec()) {
+            entries.clear(&mut wtxn)?;
+            tags.clear(&mut wtxn)?;
+            meta.put(&mut wtxn, "format_version", CACHE_FORMAT_VERSION)?;
+        }
         wtxn.commit()?;
 
         Ok(Self { env, entries, tags })
@@ -164,6 +194,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path(), 10).unwrap();
         (dir, cache)
+    }
+
+    #[test]
+    fn reopening_with_a_different_format_version_wipes_stale_entries() {
+        // Regression: CachedValue variants inserted mid-enum shift every
+        // later variant's rkyv discriminant, so a stale cache directory
+        // written under an older layout must never be trusted as-is — it
+        // needs to be wiped, not silently misdecoded.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cache = Cache::open(dir.path(), 10).unwrap();
+            cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+            assert!(cache.get("key1").unwrap().is_some());
+        }
+        // Simulate a cache directory written under a different format
+        // version by overwriting the version marker directly.
+        {
+            let env = unsafe {
+                EnvOpenOptions::new().map_size(10 * 1024 * 1024).max_dbs(3).open(dir.path()).unwrap()
+            };
+            let mut wtxn = env.write_txn().unwrap();
+            let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta")).unwrap();
+            meta.put(&mut wtxn, "format_version", b"a-different-version").unwrap();
+            wtxn.commit().unwrap();
+        }
+        let cache = Cache::open(dir.path(), 10).unwrap();
+        assert!(cache.get("key1").unwrap().is_none());
+    }
+
+    #[test]
+    fn reopening_with_the_same_format_version_preserves_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cache = Cache::open(dir.path(), 10).unwrap();
+            cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        }
+        let cache = Cache::open(dir.path(), 10).unwrap();
+        assert!(cache.get("key1").unwrap().is_some());
     }
 
     #[test]
