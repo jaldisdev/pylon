@@ -81,6 +81,18 @@ END"#)),
             sql("to_relative_duration",
                 "SELECT make_interval(days => $1::int, hours => $2::int, mins => $3::int, secs => $4)")),
 
+        // Fuller positional form matching the upstream engine's cal::to_relative_duration
+        // (whose params are all NAMED ONLY there — Pylon has no named-only
+        // parameter support, so this is positional instead).
+        f("cal", "to_duration",
+            vec![p("years", Int64), p("months", Int64), p("days", Int64), p("hours", Int64),
+                 p("minutes", Int64), p("seconds", Float64), p("microseconds", Int64)],
+            RelativeDuration,
+            sql("to_relative_duration_full",
+                "SELECT make_interval(years => $1::int, months => $2::int, days => $3::int, \
+                 hours => $4::int, mins => $5::int, secs => $6) \
+                 + ($7::text || ' microseconds')::interval")),
+
         f("cal", "duration_normalize_hours",
             vec![p("d", RelativeDuration)],
             RelativeDuration,

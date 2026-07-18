@@ -1,5 +1,5 @@
 use super::{set_of, f, p, B, E};
-use super::{Decimal, Float64, FnDescriptor};
+use super::{Decimal, Float64, Int64, FnDescriptor};
 
 pub(super) fn build() -> Vec<FnDescriptor> {
     vec![
@@ -12,9 +12,16 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("math", "log",        vec![p("n", Float64), p("base", Float64)],  Float64, E("log($2, $1)")),
         f("math", "log2",       vec![p("n", Float64)],                      Float64, E("log(2.0, $1)")),
         f("math", "log10",      vec![p("n", Float64)],                      Float64, B("log")),
+        // the upstream engine's math::lg is exactly a base-10 log; kept as a thin alias alongside
+        // the clearer std::log10 name (which Pylon deliberately favors — see
+        // stdlib-intentional-divergences memory).
+        f("math", "lg",         vec![p("n", Int64)],                        Float64, E("log($1::float8)")),
+        f("math", "lg",         vec![p("n", Float64)],                      Float64, B("log")),
+        f("math", "lg",         vec![p("n", Decimal)],                      Decimal, B("log")),
         f("math", "sin",        vec![p("n", Float64)],                      Float64, B("sin")),
         f("math", "cos",        vec![p("n", Float64)],                      Float64, B("cos")),
         f("math", "tan",        vec![p("n", Float64)],                      Float64, B("tan")),
+        f("math", "cot",        vec![p("n", Float64)],                      Float64, B("cot")),
         f("math", "asin",       vec![p("n", Float64)],                      Float64, B("asin")),
         f("math", "acos",       vec![p("n", Float64)],                      Float64, B("acos")),
         f("math", "atan",       vec![p("n", Float64)],                      Float64, B("atan")),

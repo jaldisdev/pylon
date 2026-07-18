@@ -5414,6 +5414,8 @@ impl<'a> Compiler<'a> {
                 // resolved to a nonexistent `"std".overlaps(...)` call).
                 ImplStrategy::SqlOperator(op) if args.len() == 2 =>
                     (None, name.to_string(), Some(format!("($1 {op} $2)"))),
+                ImplStrategy::TranspilerIntrinsic(intrinsic) =>
+                    return self.compile_range_intrinsic(intrinsic, name, args),
                 // TranspilerIntrinsic: pass through; handled elsewhere
                 _ => (module.map(str::to_string), name.to_string(), None),
             }
@@ -5456,6 +5458,71 @@ impl<'a> Compiler<'a> {
             args,
             sql_template,
         }))
+    }
+
+    /// Resolve `std::range(...)`/`std::multirange(...)` — `TranspilerIntrinsic`
+    /// entries with no real backing function anywhere (no `_pylon` function,
+    /// no bare PostgreSQL builtin of that literal name). PostgreSQL has no
+    /// single polymorphic range constructor — the concrete constructor
+    /// (`int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange`, and
+    /// their multirange counterparts) is chosen here from the resolved
+    /// element type of the arguments, since there's nothing generic to defer
+    /// to at the SQL level the way `to_jsonb(x)` covers "cast to json".
+    fn compile_range_intrinsic(&self, intrinsic: &str, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
+        match intrinsic {
+            "range" => {
+                let point_ty = args.first().and_then(infer_ir_type).ok_or_else(|| self.type_err(
+                    "range(): cannot infer the element type of the first argument — \
+                     use an explicit cast, e.g. range(<int64>$lower, <int64>$upper)"
+                ))?;
+                let ctor = range_ctor_for_pg_type(point_ty).ok_or_else(|| self.type_err(&format!(
+                    "range(): unsupported element type '{point_ty}' — PostgreSQL only has native \
+                     ranges over int64, decimal, datetime, cal::local_datetime, and cal::local_date"
+                )))?;
+                let sql_template = match args.len() {
+                    1 => return Err(self.type_err(
+                        "range(empty) has no inferable element type in this context — not \
+                         currently supported; use range(lower, upper) instead"
+                    )),
+                    2 => format!("{ctor}($1, $2)"),
+                    4 => format!(
+                        "{ctor}($1, $2, \
+                         (CASE WHEN $3 THEN '[' ELSE '(' END) || (CASE WHEN $4 THEN ']' ELSE ')' END))"
+                    ),
+                    n => return Err(self.type_err(&format!("range(): unexpected argument count {n}"))),
+                };
+                // `.name` carries the *resolved* constructor (not the
+                // original `range`) so a wrapping `multirange([range(...)])`
+                // call can identify the element family — emission always
+                // goes through `sql_template` above, so this doesn't change
+                // the SQL text.
+                Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    schema: None, name: ctor.to_string(), args, sql_template: Some(sql_template),
+                }))
+            }
+            "multirange" => {
+                let Some(IrExpr::Array(elems)) = args.first() else {
+                    return Err(self.type_err("multirange(): argument must be an array literal of ranges"));
+                };
+                let first_ctor = elems.first().and_then(|e| match e {
+                    IrExpr::FunctionCall(fc) => Some(fc.name.as_str()),
+                    _ => None,
+                }).ok_or_else(|| self.type_err(
+                    "multirange(): cannot infer the element range type from an empty or non-range \
+                     array — pass at least one range(...) call, e.g. multirange([range(1, 3)])"
+                ))?;
+                let ctor = multirange_ctor_for_range_ctor(first_ctor).ok_or_else(|| self.type_err(&format!(
+                    "multirange(): unrecognized range constructor '{first_ctor}'"
+                )))?;
+                // PostgreSQL's multirange constructors (int8multirange, etc.)
+                // are VARIADIC — they don't accept a plain array argument
+                // without the VARIADIC keyword.
+                Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    schema: None, name: name.to_string(), args, sql_template: Some(format!("{ctor}(VARIADIC $1)")),
+                }))
+            }
+            other => Err(self.type_err(&format!("internal error: unhandled TranspilerIntrinsic '{other}'"))),
+        }
     }
 
     // ── Sequence function helpers ──────────────────────────────────────────────────
@@ -6245,6 +6312,9 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         "bytes" => "bytea",
         "json" => "jsonb",
         "decimal" => "numeric",
+        // bigint and decimal are both PostgreSQL `numeric` — the distinction
+        // is a Pylon-level scale/precision convention, not a separate PG type.
+        "bigint" => "numeric",
         "datetime" => "timestamptz",
         "date" => "date",
         "time" => "time",
@@ -6345,6 +6415,36 @@ fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::NamedTuple { .. } => Some("jsonb"),
         IrExpr::GlobalParam { pg_type, .. } => Some(pg_type.as_str()),
+        _ => None,
+    }
+}
+
+/// Maps a resolved element `pg_type` (as `infer_ir_type` reports it) to the
+/// PostgreSQL native range constructor over that type. PG has no float4/
+/// float8/int2/int4-native range type — only int8range, numrange, tsrange,
+/// tstzrange, and daterange exist — so untyped int/float literals default
+/// to the widest native family (int8/numeric) rather than erroring, matching
+/// how those literals already default elsewhere in Pylon.
+fn range_ctor_for_pg_type(pg_type: &str) -> Option<&'static str> {
+    match pg_type {
+        "int2" | "int4" | "int8" | "__int_literal" => Some("int8range"),
+        "numeric" | "__float_literal" => Some("numrange"),
+        "timestamp" => Some("tsrange"),
+        "timestamptz" => Some("tstzrange"),
+        "date" => Some("daterange"),
+        _ => None,
+    }
+}
+
+/// The multirange counterpart of a range constructor name resolved by
+/// `range_ctor_for_pg_type`.
+fn multirange_ctor_for_range_ctor(range_ctor: &str) -> Option<&'static str> {
+    match range_ctor {
+        "int8range" => Some("int8multirange"),
+        "numrange" => Some("nummultirange"),
+        "tsrange" => Some("tsmultirange"),
+        "tstzrange" => Some("tstzmultirange"),
+        "daterange" => Some("datemultirange"),
         _ => None,
     }
 }

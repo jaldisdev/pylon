@@ -22,6 +22,8 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("std", "max",       vec![p("s", set_of(AnyOrderable))], opt(AnyOrderable), B("max")),
         f("std", "mean",      vec![p("s", set_of(Float64))],      Float64, B("avg")),
         f("std", "mean",      vec![p("s", set_of(Decimal))],      Decimal, B("avg")),
+        // PG's avg(bigint) returns numeric; cast down to match the upstream engine's float64 return type.
+        f("std", "mean",      vec![p("s", set_of(Int64))],        Float64, E("avg($1)::float8")),
         f("std", "all",       vec![p("vals", set_of(Bool))],      Bool,    B("bool_and")),
         f("std", "any",       vec![p("vals", set_of(Bool))],      Bool,    B("bool_or")),
         f("std", "array_agg", vec![p("s", set_of(Any))],          arr(Any), B("array_agg")),
@@ -203,6 +205,7 @@ END"#)),
         f("std", "sign",  vec![p("n", Decimal)], Decimal, B("sign")),
         f("std", "sqrt",  vec![p("n", Float64)], Float64, B("sqrt")),
         f("std", "sqrt",  vec![p("n", Decimal)], Decimal, B("sqrt")),
+        f("std", "random", vec![], Float64, B("random")),
 
         // ── std:: generic / polymorphic ──────────────────────────────────────
         f("std", "len",      vec![p("s", Str)],                              Int64, B("length")),
@@ -226,6 +229,15 @@ END"#)),
         f("std", "uuid_generate_v7",       vec![],          Uuid,     B("uuidv7")),
         f("std", "uuid_extract_timestamp", vec![p("u", Uuid)], Datetime, B("uuid_extract_timestamp")),
         f("std", "uuid_extract_version",   vec![p("u", Uuid)], Int64,    B("uuid_extract_version")),
+        f("std", "to_uuid",
+            vec![p("val", Bytes)],
+            Uuid,
+            plpgsql("to_uuid", r#"BEGIN
+    IF length($1) != 16 THEN
+        RAISE EXCEPTION 'to_uuid(): the argument must be exactly 16 bytes long';
+    END IF;
+    RETURN encode($1, 'hex')::uuid;
+END"#)),
 
         // ── std:: json ───────────────────────────────────────────────────────
         fc("std", "to_json",            vec![p("s", Str)],                            Json,         E("$1::jsonb")),
@@ -245,6 +257,21 @@ END"#)),
         f( "std", "json_array_length",  vec![p("j", Json)],                           opt(Int64),    B("jsonb_array_length")),
 
         // ── std:: bitwise ────────────────────────────────────────────────────
+        f("std", "bit_and", vec![p("l", Int16), p("r", Int16)], Int16, E("($1 & $2)")),
+        f("std", "bit_and", vec![p("l", Int32), p("r", Int32)], Int32, E("($1 & $2)")),
+        f("std", "bit_and", vec![p("l", Int64), p("r", Int64)], Int64, E("($1 & $2)")),
+        f("std", "bit_or",  vec![p("l", Int16), p("r", Int16)], Int16, E("($1 | $2)")),
+        f("std", "bit_or",  vec![p("l", Int32), p("r", Int32)], Int32, E("($1 | $2)")),
+        f("std", "bit_or",  vec![p("l", Int64), p("r", Int64)], Int64, E("($1 | $2)")),
+        f("std", "bit_xor", vec![p("l", Int16), p("r", Int16)], Int16, E("($1 # $2)")),
+        f("std", "bit_xor", vec![p("l", Int32), p("r", Int32)], Int32, E("($1 # $2)")),
+        f("std", "bit_xor", vec![p("l", Int64), p("r", Int64)], Int64, E("($1 # $2)")),
+        f("std", "bit_not", vec![p("r", Int16)], Int16, E("(~$1)")),
+        f("std", "bit_not", vec![p("r", Int32)], Int32, E("(~$1)")),
+        f("std", "bit_not", vec![p("r", Int64)], Int64, E("(~$1)")),
+        f("std", "bit_count", vec![p("val", Int16)], Int64, E("bit_count($1::int4::bit(16))")),
+        f("std", "bit_count", vec![p("val", Int32)], Int64, E("bit_count($1::bit(32))")),
+        f("std", "bit_count", vec![p("val", Int64)], Int64, E("bit_count($1::bit(64))")),
         f("std", "bit_lshift", vec![p("val", Int16), p("n", Int64)], Int16, E("(($1::int8 << $2)::int2)")),
         f("std", "bit_lshift", vec![p("val", Int32), p("n", Int64)], Int32, E("(($1::int8 << $2)::int4)")),
         f("std", "bit_lshift", vec![p("val", Int64), p("n", Int64)], Int64, E("($1 << $2)")),
@@ -254,7 +281,6 @@ END"#)),
         f("std", "to_hex",     vec![p("n", Int16)],                   Str,  E("to_hex($1::int8)")),
         f("std", "to_hex",     vec![p("n", Int32)],                   Str,  E("to_hex($1::int8)")),
         f("std", "to_hex",     vec![p("n", Int64)],                   Str,  B("to_hex")),
-        f("std", "to_hex",     vec![p("n", Int32)],                   Str,  E("to_hex($1::int8)")),
 
         // ── std:: bytes ──────────────────────────────────────────────────────
         f("std", "bytes_get_bit", vec![p("b", Bytes), p("n", Int64)], Int64, B("get_bit")),
@@ -285,6 +311,15 @@ END"#)),
         f("std", "array_fill",     vec![p("el", Any), p("n", Int64)],                  arr(Any),   E("array_fill($1, ARRAY[$2::int])")),
         f("std", "array_replace",  vec![p("a", arr(Any)), p("old", Any), p("new", Any)], arr(Any), B("array_replace")),
         f("std", "array_reverse",  vec![p("a", arr(Any))],                             arr(Any),   B("array_reverse")),
+        // 0-based indexing at PyQL level, matching array_get/array_slice's convention above.
+        f("std", "array_set",
+            vec![p("a", arr(Any)), p("idx", Int64), p("val", Any)],
+            arr(Any),
+            E("(($1)[1:$2] || ARRAY[$3] || ($1)[$2 + 2:])")),
+        f("std", "array_insert",
+            vec![p("a", arr(Any)), p("idx", Int64), p("val", Any)],
+            arr(Any),
+            E("(($1)[1:$2] || ARRAY[$3] || ($1)[$2 + 1:])")),
         f("std", "array_rotate",
             vec![p("a", arr(Any)), p("n", Int64)],
             arr(Any),
@@ -311,6 +346,17 @@ END"#)),
         f("std", "range_is_inclusive_upper", vec![p("r", ro(AnyPoint))], Bool, B("upper_inc")),
         f("std", "overlaps",     vec![p("a", ro(AnyPoint)), p("b", ro(AnyPoint))], Bool, O("&&")),
         f("std", "multirange",   vec![p("ranges", arr(ro(AnyPoint)))], mr(AnyPoint), I("multirange")),
+        f("std", "strictly_below", vec![p("l", ro(AnyPoint)), p("r", ro(AnyPoint))], Bool, O("<<")),
+        f("std", "strictly_below", vec![p("l", mr(AnyPoint)), p("r", mr(AnyPoint))], Bool, O("<<")),
+        f("std", "strictly_above", vec![p("l", ro(AnyPoint)), p("r", ro(AnyPoint))], Bool, O(">>")),
+        f("std", "strictly_above", vec![p("l", mr(AnyPoint)), p("r", mr(AnyPoint))], Bool, O(">>")),
+        f("std", "bounded_above",  vec![p("l", ro(AnyPoint)), p("r", ro(AnyPoint))], Bool, O("&<")),
+        f("std", "bounded_above",  vec![p("l", mr(AnyPoint)), p("r", mr(AnyPoint))], Bool, O("&<")),
+        f("std", "bounded_below",  vec![p("l", ro(AnyPoint)), p("r", ro(AnyPoint))], Bool, O("&>")),
+        f("std", "bounded_below",  vec![p("l", mr(AnyPoint)), p("r", mr(AnyPoint))], Bool, O("&>")),
+        f("std", "adjacent",       vec![p("l", ro(AnyPoint)), p("r", ro(AnyPoint))], Bool, O("-|-")),
+        f("std", "adjacent",       vec![p("l", mr(AnyPoint)), p("r", mr(AnyPoint))], Bool, O("-|-")),
+        f("std", "multirange_unpack", vec![p("val", mr(AnyPoint))], set_of(ro(AnyPoint)), B("unnest")),
 
         // ── std:: datetime ───────────────────────────────────────────────────
         f("std", "datetime_current",        vec![], Datetime, E("clock_timestamp()")),
@@ -365,6 +411,16 @@ BEGIN
 END"#)),
 
         f("std", "duration_to_seconds", vec![p("d", Duration)], Decimal, E("extract(epoch from $1)")),
+
+        f("std", "duration_truncate",
+            vec![p("dt", Duration), p("unit", Str)],
+            Duration,
+            plpgsql("duration_truncate", r#"BEGIN
+    IF $2 NOT IN ('microseconds', 'milliseconds', 'seconds', 'minutes', 'hours') THEN
+        RAISE EXCEPTION 'invalid unit for std::duration_truncate: %', $2;
+    END IF;
+    RETURN date_trunc($2, $1);
+END"#)),
 
         f("std", "to_datetime", vec![p("s", Str), p("fmt", Str)], Datetime, E("to_timestamp($1, $2)")),
         f("std", "to_datetime",
