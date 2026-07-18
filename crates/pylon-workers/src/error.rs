@@ -12,6 +12,8 @@ pub enum Error {
     Schema(String),
     #[error("{0}")]
     Unsupported(String),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
