@@ -5082,4 +5082,40 @@ mod tests {
         );
         assert!(out.sql.contains("'delete'"), "expected the delete operation literal, got:\n{}", out.sql);
     }
+
+    #[test]
+    fn test_range_intrinsic_resolves_int_literals_to_int8range() {
+        // Regression: std::range's ImplStrategy::TranspilerIntrinsic had no
+        // actual substitution anywhere — it fell through resolve_fn_call's
+        // catch-all, which emitted a literal (nonexistent) `"std"."range"(...)`
+        // call instead of a real PostgreSQL range constructor.
+        let out = compile_and_emit("SELECT std::overlaps(std::range(1, 3), std::range(2, 5))");
+        assert!(out.sql.contains("int8range(1, 3)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("int8range(2, 5)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains(" && "), "expected infix && for overlaps, got:\n{}", out.sql);
+        assert!(!out.sql.contains("\"std\""), "must not emit a literal std schema call, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_range_intrinsic_resolves_datetime_to_tstzrange() {
+        let out = compile_and_emit(
+            "SELECT std::range(<datetime>'2024-01-01T00:00:00Z', <datetime>'2024-06-01T00:00:00Z')",
+        );
+        assert!(out.sql.contains("tstzrange("), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_range_intrinsic_four_arg_form_computes_bounds_string() {
+        let out = compile_and_emit("SELECT std::range(1, 3, true, false)");
+        assert!(out.sql.contains("int8range(1, 3,"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("CASE WHEN"), "expected a dynamic bounds-string CASE, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_multirange_intrinsic_resolves_from_range_element() {
+        let out = compile_and_emit("SELECT std::multirange([std::range(1, 3), std::range(5, 7)])");
+        assert!(out.sql.contains("int8multirange(VARIADIC "), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("\"std\""), "must not emit a literal std schema call, got:\n{}", out.sql);
+    }
 }
+
