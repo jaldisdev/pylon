@@ -51,6 +51,24 @@ pub enum CachedValue {
     /// "1 month" isn't a fixed number of days) can't be losslessly combined
     /// with `days`/`microseconds` without a reference date.
     Interval { months: i32, days: i32, microseconds: i64 },
+    /// PostgreSQL `date` — whole days since the PG epoch (2000-01-01),
+    /// exactly as the wire encodes it. Backs `cal::local_date`.
+    Date(i32),
+    /// PostgreSQL `time` (no timezone) — microseconds since midnight,
+    /// exactly as the wire encodes it. Backs `cal::local_time`.
+    Time(i64),
+    /// PostgreSQL `timestamp` (no timezone) — microseconds since the PG
+    /// epoch (2000-01-01T00:00:00), exactly as the wire encodes it. Backs
+    /// `cal::local_datetime`; decodes to a naive `datetime.datetime`.
+    Timestamp(i64),
+    /// PostgreSQL `timestamptz` — microseconds since the PG epoch
+    /// (2000-01-01T00:00:00 UTC; PostgreSQL always normalizes `timestamptz`
+    /// to UTC on the wire, regardless of session timezone), exactly as the
+    /// wire encodes it. Backs `std::datetime`; decodes to a UTC-aware
+    /// `datetime.datetime`. A distinct variant from `Timestamp` (not a
+    /// shared representation with a tag) so decode/encode can't mix up
+    /// naive vs. aware at the type level.
+    Timestamptz(i64),
     // `omit_bounds` is required on self-referential fields: rkyv's derive
     // otherwise adds a naive `FieldType: Archive` bound per field, which
     // for a directly-recursive type like this overflows trait resolution
@@ -77,6 +95,22 @@ pub enum CachedValue {
     /// part of what `ShapeNode` positions describe, and duplicate names
     /// can't happen for a single object's own pointers).
     Object(#[rkyv(omit_bounds)] Vec<(String, CachedValue)>),
+    /// A PostgreSQL range value (`int8range`, `numrange`, `tsrange`,
+    /// `tstzrange`, `daterange`, ...). `lower`/`upper` are `None` for an
+    /// unbounded side; `empty == true` means the whole range is empty
+    /// (`lower`/`upper` are meaningless in that case, not "both unbounded" —
+    /// PostgreSQL's own binary encoding distinguishes the two). A
+    /// `multirange<T>` decodes to a plain `Array` of these, not a separate
+    /// variant — it's just an ordered collection of ranges.
+    Range {
+        #[rkyv(omit_bounds)]
+        lower: Option<Box<CachedValue>>,
+        #[rkyv(omit_bounds)]
+        upper: Option<Box<CachedValue>>,
+        inc_lower: bool,
+        inc_upper: bool,
+        empty: bool,
+    },
 }
 
 /// One cache entry: the cached rows plus the tags a write to any of which
@@ -107,6 +141,17 @@ mod tests {
             ("avatar".into(), CachedValue::Bytes(vec![1, 2, 3])),
             ("point".into(), CachedValue::Composite(vec![CachedValue::F64(1.0), CachedValue::F64(2.0)])),
             ("span".into(), CachedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }),
+            ("day".into(), CachedValue::Date(9525)),
+            ("clock".into(), CachedValue::Time(3_600_000_000)),
+            ("naive_ts".into(), CachedValue::Timestamp(1_000_000_000)),
+            ("aware_ts".into(), CachedValue::Timestamptz(1_000_000_000)),
+            ("span_range".into(), CachedValue::Range {
+                lower: Some(Box::new(CachedValue::I64(1))),
+                upper: Some(Box::new(CachedValue::I64(10))),
+                inc_lower: true,
+                inc_upper: false,
+                empty: false,
+            }),
         ]);
         let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
         // SAFETY: bytes were produced moments ago by `to_bytes` on this same

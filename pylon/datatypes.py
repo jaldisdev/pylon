@@ -12,6 +12,33 @@ class PylonSet(list):
     """
 
 
+@dataclasses.dataclass(frozen=True)
+class Range:
+    """A PostgreSQL range value (`range<T>`) — `lower`/`upper` are `None`
+    for an unbounded side, not for an empty range (see `empty`).
+
+    Usage::
+
+        r = Range(lower=1, upper=10, inc_lower=True, inc_upper=False)
+        r.lower, r.upper          # 1, 10
+    """
+
+    lower: Any = None
+    upper: Any = None
+    inc_lower: bool = True
+    inc_upper: bool = False
+    empty: bool = False
+
+    def __repr__(self) -> str:
+        if self.empty:
+            return "Range(empty=True)"
+        lo = "" if self.lower is None else repr(self.lower)
+        hi = "" if self.upper is None else repr(self.upper)
+        open_b = "[" if self.inc_lower else "("
+        close_b = "]" if self.inc_upper else ")"
+        return f"Range({open_b}{lo}, {hi}{close_b})"
+
+
 class Object:
     """Result container for free-form PyQL queries.
 
