@@ -166,18 +166,17 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             tasks.append(w.run())
 
         if config.cache.enabled:
-            from pylon import cache as pylon_cache
-            from pylon.cache import CacheInvalidationWorker, NOTIFY_CHANNEL
-            # This process's own LMDB handle onto the shared, file-backed
-            # cache at config.cache.path — LMDB supports safe concurrent
+            from pylon._core import run_cache_invalidation_worker
+            from pylon.cache import NOTIFY_CHANNEL
+            # Runs entirely in Rust now (`pylon_workers::CacheInvalidationWorker`)
+            # — it opens its own LMDB handle onto the shared, file-backed
+            # cache at config.cache.path directly, no `pylon.cache.init()`
+            # needed in this process. LMDB supports safe concurrent
             # multi-process access to one file, so this worker process
             # evicting entries is immediately visible to every serving
             # process (e.g. `pylon serve`) mapping the same path.
-            pylon_cache.init(config.cache)
-            conn = await pgcon_listen(dsn)
-            w = CacheInvalidationWorker(conn)
             log.info("CacheInvalidationWorker started  channel=%s", NOTIFY_CHANNEL)
-            tasks.append(w.run())
+            tasks.append(run_cache_invalidation_worker(dsn, str(config.cache.path), config.cache.max_size_mb))
 
         # Each `pgcon_listen` connection above has no explicit close — it's
         # dropped (and its socket closed) along with the process, matching

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -161,53 +160,6 @@ def clear() -> None:
     cache_clear()
 
 
-class CacheInvalidationWorker:
-    """Listens on `NOTIFY_CHANNEL` and evicts matching cache entries.
-
-    Unlike `pylon.worker.IndexWorker` there's no outbox table to drain from
-    — the NOTIFY payload *is* the tag to invalidate (a schema-qualified
-    table name, written by the `_pylon.notify_cache_invalidate()` trigger),
-    so eviction happens directly from the listener callback. Best-effort:
-    if a NOTIFY is ever dropped, the affected cache entries persist until
-    naturally evicted or overwritten — there is no durable outbox to
-    reconcile against, unlike the index queue.
-    """
-
-    def __init__(self, conn: Any) -> None:
-        self._conn = conn
-        self._pending: set[str] = set()
-        self._drain_lock = asyncio.Lock()
-
-    async def run(self) -> None:
-        await self._conn.add_listener(NOTIFY_CHANNEL, self._on_notify)
-        try:
-            await asyncio.Event().wait()
-        finally:
-            await self._conn.remove_listener(NOTIFY_CHANNEL, self._on_notify)
-
-    def _on_notify(self, _conn: Any, _pid: int, _channel: str, payload: str) -> None:
-        self._pending.add(payload)
-        asyncio.ensure_future(self._drain())
-
-    async def _drain(self) -> None:
-        if self._drain_lock.locked():
-            return
-        async with self._drain_lock:
-            while self._pending:
-                tags = list(self._pending)
-                self._pending.clear()
-                try:
-                    await self._invalidate(tags)
-                except Exception:
-                    log.exception("CacheInvalidationWorker: eviction failed for tags %r", tags)
-
-    async def _invalidate(self, tags: list[str]) -> None:
-        from pylon._core import cache_invalidate
-
-        cache_invalidate(tags)
-
-
 __all__ = [
     "NOTIFY_CHANNEL", "init", "get", "put", "get_json", "put_json", "stat", "clear",
-    "CacheInvalidationWorker",
 ]
