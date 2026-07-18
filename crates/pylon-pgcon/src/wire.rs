@@ -47,6 +47,10 @@ const OID_FLOAT8: u32 = 701;
 const OID_BPCHAR: u32 = 1042;
 const OID_VARCHAR: u32 = 1043;
 const OID_NUMERIC: u32 = 1700;
+const OID_DATE: u32 = 1082;
+const OID_TIME: u32 = 1083;
+const OID_TIMESTAMP: u32 = 1114;
+const OID_TIMESTAMPTZ: u32 = 1184;
 const OID_INTERVAL: u32 = 1186;
 const OID_UUID: u32 = 2950;
 const OID_RECORD: u32 = 2249;
@@ -65,6 +69,39 @@ const OID_FLOAT8_ARRAY: u32 = 1022;
 const OID_NUMERIC_ARRAY: u32 = 1231;
 const OID_UUID_ARRAY: u32 = 2951;
 const OID_JSONB_ARRAY: u32 = 3807;
+
+// Native PostgreSQL range/multirange type OIDs, paired with the element
+// type OID their bound values decode with (int4range's bounds are int4,
+// etc.) — mirrors `range_ctor_for_pg_type`/`multirange_ctor_for_range_ctor`
+// in `pylon-core`'s `ir/compiler.rs`, the other side of this same "which 5
+// PG range families does Pylon support" decision.
+const OID_INT4RANGE: u32 = 3904;
+const OID_INT8RANGE: u32 = 3926;
+const OID_NUMRANGE: u32 = 3906;
+const OID_TSRANGE: u32 = 3908;
+const OID_TSTZRANGE: u32 = 3910;
+const OID_DATERANGE: u32 = 3912;
+const OID_INT4MULTIRANGE: u32 = 4451;
+const OID_INT8MULTIRANGE: u32 = 4536;
+const OID_NUMMULTIRANGE: u32 = 4532;
+const OID_TSMULTIRANGE: u32 = 4533;
+const OID_TSTZMULTIRANGE: u32 = 4534;
+const OID_DATEMULTIRANGE: u32 = 4535;
+
+/// The element OID a range/multirange type's bound values decode with —
+/// `None` for anything that isn't one of the 6 native range/multirange
+/// families this module knows about.
+fn range_element_oid(oid: u32) -> Option<u32> {
+    match oid {
+        OID_INT4RANGE | OID_INT4MULTIRANGE => Some(OID_INT4),
+        OID_INT8RANGE | OID_INT8MULTIRANGE => Some(OID_INT8),
+        OID_NUMRANGE | OID_NUMMULTIRANGE => Some(OID_NUMERIC),
+        OID_TSRANGE | OID_TSMULTIRANGE => Some(OID_TIMESTAMP),
+        OID_TSTZRANGE | OID_TSTZMULTIRANGE => Some(OID_TIMESTAMPTZ),
+        OID_DATERANGE | OID_DATEMULTIRANGE => Some(OID_DATE),
+        _ => None,
+    }
+}
 
 /// Extension type OIDs, assigned per-database at `CREATE EXTENSION` time —
 /// discovered once at connect time (mirroring `_setup_codecs`'s runtime
@@ -104,6 +141,10 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Cached
         OID_BYTEA => Ok(CachedValue::Bytes(data.to_vec())),
         OID_NUMERIC => decode_numeric(data),
         OID_INTERVAL => decode_interval(data),
+        OID_DATE => Ok(CachedValue::Date(i32::from_be_bytes(data.try_into()?))),
+        OID_TIME => Ok(CachedValue::Time(i64::from_be_bytes(data.try_into()?))),
+        OID_TIMESTAMP => Ok(CachedValue::Timestamp(i64::from_be_bytes(data.try_into()?))),
+        OID_TIMESTAMPTZ => Ok(CachedValue::Timestamptz(i64::from_be_bytes(data.try_into()?))),
         OID_JSONB => decode_jsonb(data),
         OID_RECORD => decode_record(data, ext),
         OID_RECORD_ARRAY => decode_array(data, ext),
@@ -111,6 +152,13 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Cached
         | OID_TEXT_ARRAY | OID_BPCHAR_ARRAY | OID_VARCHAR_ARRAY | OID_FLOAT4_ARRAY
         | OID_FLOAT8_ARRAY | OID_NUMERIC_ARRAY | OID_UUID_ARRAY | OID_JSONB_ARRAY => {
             decode_array(data, ext)
+        }
+        OID_INT4RANGE | OID_INT8RANGE | OID_NUMRANGE | OID_TSRANGE | OID_TSTZRANGE | OID_DATERANGE => {
+            decode_range(data, range_element_oid(oid).expect("range OID"), ext)
+        }
+        OID_INT4MULTIRANGE | OID_INT8MULTIRANGE | OID_NUMMULTIRANGE | OID_TSMULTIRANGE
+        | OID_TSTZMULTIRANGE | OID_DATEMULTIRANGE => {
+            decode_multirange(data, range_element_oid(oid).expect("multirange OID"), ext)
         }
         // Enums, domains, and other extension/text-compatible custom types
         // (schema-qualified enums are always emitted `::text`-cast by
@@ -141,6 +189,68 @@ fn decode_interval(data: &[u8]) -> Result<CachedValue> {
     let days = i32::from_be_bytes(data[8..12].try_into()?);
     let months = i32::from_be_bytes(data[12..16].try_into()?);
     Ok(CachedValue::Interval { months, days, microseconds })
+}
+
+// PostgreSQL's range binary-format flag bits (`rangetypes.h`).
+const RANGE_EMPTY: u8 = 0x01;
+const RANGE_LB_INC: u8 = 0x02;
+const RANGE_UB_INC: u8 = 0x04;
+const RANGE_LB_INF: u8 = 0x08;
+const RANGE_UB_INF: u8 = 0x10;
+
+/// Binary range: `u8 flags`, then — only when not empty — a length-prefixed
+/// lower bound (skipped if `RANGE_LB_INF`) and a length-prefixed upper bound
+/// (skipped if `RANGE_UB_INF`), each bound decoded with `element_oid`'s own
+/// decoder (see `range_element_oid` for which element type backs which
+/// range OID).
+fn decode_range(data: &[u8], element_oid: u32, ext: &ExtensionOids) -> Result<CachedValue> {
+    let flags = data[0];
+    let mut offset = 1usize;
+    if flags & RANGE_EMPTY != 0 {
+        return Ok(CachedValue::Range { lower: None, upper: None, inc_lower: false, inc_upper: false, empty: true });
+    }
+    let lower = if flags & RANGE_LB_INF != 0 {
+        None
+    } else {
+        let len = i32::from_be_bytes(data[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+        let value = decode_value(element_oid, &data[offset..offset + len], ext)?;
+        offset += len;
+        Some(Box::new(value))
+    };
+    let upper = if flags & RANGE_UB_INF != 0 {
+        None
+    } else {
+        let len = i32::from_be_bytes(data[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+        Some(Box::new(decode_value(element_oid, &data[offset..offset + len], ext)?))
+    };
+    Ok(CachedValue::Range {
+        lower,
+        upper,
+        inc_lower: flags & RANGE_LB_INC != 0,
+        inc_upper: flags & RANGE_UB_INC != 0,
+        empty: false,
+    })
+}
+
+/// Binary multirange: `i32 range_count`, then per range an `i32 len` +
+/// `len` bytes of that range's own binary encoding (the same format
+/// `decode_range` reads). Decodes to a plain `Array` of `Range` values —
+/// see `CachedValue::Range`'s own doc comment for why there's no separate
+/// multirange variant.
+fn decode_multirange(data: &[u8], element_oid: u32, ext: &ExtensionOids) -> Result<CachedValue> {
+    let mut offset = 0usize;
+    let count = i32::from_be_bytes(data[offset..offset + 4].try_into()?) as usize;
+    offset += 4;
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = i32::from_be_bytes(data[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+        ranges.push(decode_range(&data[offset..offset + len], element_oid, ext)?);
+        offset += len;
+    }
+    Ok(CachedValue::Array(ranges))
 }
 
 /// Binary jsonb: a 1-byte format-version prefix (always `1` today) followed
@@ -377,6 +487,36 @@ fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) ->
             out.put_i32(*days);
             out.put_i32(*months);
         }
+        CachedValue::Date(days) => out.put_i32(*days),
+        CachedValue::Time(us) => out.put_i64(*us),
+        CachedValue::Timestamp(us) => out.put_i64(*us),
+        CachedValue::Timestamptz(us) => out.put_i64(*us),
+        CachedValue::Range { lower, upper, inc_lower, inc_upper, empty } => {
+            if *empty {
+                out.put_u8(RANGE_EMPTY);
+                return Ok(IsNull::No);
+            }
+            let element_ty = match ty.kind() {
+                Kind::Range(inner) => inner.clone(),
+                // Not actually a range type per Postgres's own analysis —
+                // fall back to TEXT so encoding proceeds deterministically;
+                // a real mismatch surfaces as a Postgres-side error, same
+                // as the analogous fallback in the `Array` arm above.
+                _ => Type::TEXT,
+            };
+            let mut flags = 0u8;
+            if *inc_lower { flags |= RANGE_LB_INC; }
+            if *inc_upper { flags |= RANGE_UB_INC; }
+            if lower.is_none() { flags |= RANGE_LB_INF; }
+            if upper.is_none() { flags |= RANGE_UB_INF; }
+            out.put_u8(flags);
+            for bound in [lower, upper].into_iter().flatten() {
+                let mut buf = bytes::BytesMut::new();
+                encode_value(bound, &element_ty, &mut buf)?;
+                out.put_i32(buf.len() as i32);
+                out.put_slice(&buf);
+            }
+        }
     }
     Ok(IsNull::No)
 }
@@ -405,6 +545,21 @@ fn cached_to_json(value: &CachedValue) -> serde_json::Value {
         // least round-trippable, not silently dropped.
         CachedValue::Interval { months, days, microseconds } => serde_json::json!({
             "months": months, "days": days, "microseconds": microseconds,
+        }),
+        // Same rationale as Interval above — raw PG wire units, not a
+        // formatted calendar string (calendar math is deliberately left to
+        // Python's own `datetime` module at the `pgvalue.rs` boundary, not
+        // reimplemented here).
+        CachedValue::Date(days) => serde_json::json!({ "days_since_2000_01_01": days }),
+        CachedValue::Time(us) => serde_json::json!({ "microseconds_since_midnight": us }),
+        CachedValue::Timestamp(us) => serde_json::json!({ "microseconds_since_2000_01_01": us }),
+        CachedValue::Timestamptz(us) => serde_json::json!({ "microseconds_since_2000_01_01_utc": us }),
+        CachedValue::Range { lower, upper, inc_lower, inc_upper, empty } => serde_json::json!({
+            "lower": lower.as_deref().map(cached_to_json),
+            "upper": upper.as_deref().map(cached_to_json),
+            "inc_lower": inc_lower,
+            "inc_upper": inc_upper,
+            "empty": empty,
         }),
     }
 }
@@ -539,6 +694,134 @@ mod tests {
         let mut out = bytes::BytesMut::new();
         encode_value(&value, &postgres_types::Type::INTERVAL, &mut out).unwrap();
         assert_eq!(decode_value(OID_INTERVAL, &out, &no_ext()).unwrap(), value);
+    }
+
+    #[test]
+    fn decodes_date_time_timestamp_timestamptz() {
+        // Regression: these had no binary decoder either — date silently
+        // returned garbage bytes (never even errored), the others panicked
+        // on the same UTF-8-text-fallback assumption interval did.
+        assert_eq!(decode_value(OID_DATE, &9525i32.to_be_bytes(), &no_ext()).unwrap(), CachedValue::Date(9525));
+        assert_eq!(decode_value(OID_TIME, &3_600_000_000i64.to_be_bytes(), &no_ext()).unwrap(), CachedValue::Time(3_600_000_000));
+        assert_eq!(
+            decode_value(OID_TIMESTAMP, &1_000_000_000i64.to_be_bytes(), &no_ext()).unwrap(),
+            CachedValue::Timestamp(1_000_000_000)
+        );
+        assert_eq!(
+            decode_value(OID_TIMESTAMPTZ, &1_000_000_000i64.to_be_bytes(), &no_ext()).unwrap(),
+            CachedValue::Timestamptz(1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn encodes_date_time_timestamp_timestamptz() {
+        for (value, ty) in [
+            (CachedValue::Date(9525), postgres_types::Type::DATE),
+            (CachedValue::Time(3_600_000_000), postgres_types::Type::TIME),
+            (CachedValue::Timestamp(1_000_000_000), postgres_types::Type::TIMESTAMP),
+            (CachedValue::Timestamptz(1_000_000_000), postgres_types::Type::TIMESTAMPTZ),
+        ] {
+            let mut out = bytes::BytesMut::new();
+            encode_value(&value, &ty, &mut out).unwrap();
+            let oid = match &value {
+                CachedValue::Date(_) => OID_DATE,
+                CachedValue::Time(_) => OID_TIME,
+                CachedValue::Timestamp(_) => OID_TIMESTAMP,
+                CachedValue::Timestamptz(_) => OID_TIMESTAMPTZ,
+                _ => unreachable!(),
+            };
+            assert_eq!(decode_value(oid, &out, &no_ext()).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn decodes_a_bounded_int8range() {
+        // flags = LB_INC | UB_INC-off = 0x02 (inclusive lower, exclusive upper)
+        let mut data = vec![RANGE_LB_INC];
+        data.extend_from_slice(&8i32.to_be_bytes());
+        data.extend_from_slice(&1i64.to_be_bytes());
+        data.extend_from_slice(&8i32.to_be_bytes());
+        data.extend_from_slice(&10i64.to_be_bytes());
+        assert_eq!(
+            decode_value(OID_INT8RANGE, &data, &no_ext()).unwrap(),
+            CachedValue::Range {
+                lower: Some(Box::new(CachedValue::I64(1))),
+                upper: Some(Box::new(CachedValue::I64(10))),
+                inc_lower: true,
+                inc_upper: false,
+                empty: false,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_an_empty_range() {
+        assert_eq!(
+            decode_value(OID_INT8RANGE, &[RANGE_EMPTY], &no_ext()).unwrap(),
+            CachedValue::Range { lower: None, upper: None, inc_lower: false, inc_upper: false, empty: true }
+        );
+    }
+
+    #[test]
+    fn decodes_an_unbounded_range() {
+        // Both bounds infinite: flags = LB_INF | UB_INF, no bound payloads follow.
+        let data = [RANGE_LB_INF | RANGE_UB_INF];
+        assert_eq!(
+            decode_value(OID_INT8RANGE, &data, &no_ext()).unwrap(),
+            CachedValue::Range { lower: None, upper: None, inc_lower: false, inc_upper: false, empty: false }
+        );
+    }
+
+    #[test]
+    fn encodes_and_round_trips_an_int8range() {
+        let value = CachedValue::Range {
+            lower: Some(Box::new(CachedValue::I64(1))),
+            upper: Some(Box::new(CachedValue::I64(10))),
+            inc_lower: true,
+            inc_upper: false,
+            empty: false,
+        };
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::INT8_RANGE, &mut out).unwrap();
+        assert_eq!(decode_value(OID_INT8RANGE, &out, &no_ext()).unwrap(), value);
+    }
+
+    #[test]
+    fn decodes_a_multirange_of_int8ranges() {
+        let mut range1 = vec![RANGE_LB_INC];
+        range1.extend_from_slice(&8i32.to_be_bytes());
+        range1.extend_from_slice(&1i64.to_be_bytes());
+        range1.extend_from_slice(&8i32.to_be_bytes());
+        range1.extend_from_slice(&3i64.to_be_bytes());
+
+        let mut range2 = vec![RANGE_LB_INC];
+        range2.extend_from_slice(&8i32.to_be_bytes());
+        range2.extend_from_slice(&5i64.to_be_bytes());
+        range2.extend_from_slice(&8i32.to_be_bytes());
+        range2.extend_from_slice(&7i64.to_be_bytes());
+
+        let mut data = 2i32.to_be_bytes().to_vec();
+        data.extend_from_slice(&(range1.len() as i32).to_be_bytes());
+        data.extend_from_slice(&range1);
+        data.extend_from_slice(&(range2.len() as i32).to_be_bytes());
+        data.extend_from_slice(&range2);
+
+        let decoded = decode_value(OID_INT8MULTIRANGE, &data, &no_ext()).unwrap();
+        assert_eq!(
+            decoded,
+            CachedValue::Array(vec![
+                CachedValue::Range {
+                    lower: Some(Box::new(CachedValue::I64(1))),
+                    upper: Some(Box::new(CachedValue::I64(3))),
+                    inc_lower: true, inc_upper: false, empty: false,
+                },
+                CachedValue::Range {
+                    lower: Some(Box::new(CachedValue::I64(5))),
+                    upper: Some(Box::new(CachedValue::I64(7))),
+                    inc_lower: true, inc_upper: false, empty: false,
+                },
+            ])
+        );
     }
 
     #[test]

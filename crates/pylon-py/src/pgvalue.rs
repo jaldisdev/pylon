@@ -57,6 +57,65 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<CachedValue> {
         let microseconds: i64 = value.getattr("microseconds")?.extract()?;
         return Ok(CachedValue::Interval { months: 0, days, microseconds: seconds * 1_000_000 + microseconds });
     }
+    // `datetime.datetime` is a subclass of `datetime.date` — must be checked
+    // first, or every datetime would also match the plain-date branch below.
+    // Epoch math is delegated to Python's own `datetime` subtraction rather
+    // than reimplemented in Rust (proleptic Gregorian calendar arithmetic is
+    // exactly what the stdlib already gets right).
+    if value.is_instance(&py.import("datetime")?.getattr("datetime")?)? {
+        let datetime_cls = py.import("datetime")?.getattr("datetime")?;
+        let tzinfo = value.getattr("tzinfo")?;
+        let (epoch, target) = if tzinfo.is_none() {
+            (datetime_cls.call1((2000, 1, 1))?, value.clone())
+        } else {
+            // Normalize to UTC first — PostgreSQL's `timestamptz` wire
+            // format is always UTC microseconds since the PG epoch,
+            // regardless of the value's original tzinfo.
+            let utc = py.import("datetime")?.getattr("timezone")?.getattr("utc")?;
+            (datetime_cls.call1((2000, 1, 1, 0, 0, 0, 0, &utc))?, value.call_method1("astimezone", (&utc,))?)
+        };
+        let delta = target.call_method1("__sub__", (epoch,))?;
+        let days: i64 = delta.getattr("days")?.extract()?;
+        let seconds: i64 = delta.getattr("seconds")?.extract()?;
+        let microseconds: i64 = delta.getattr("microseconds")?.extract()?;
+        let total_us = days * 86_400_000_000 + seconds * 1_000_000 + microseconds;
+        return Ok(if tzinfo.is_none() {
+            CachedValue::Timestamp(total_us)
+        } else {
+            CachedValue::Timestamptz(total_us)
+        });
+    }
+    if value.is_instance(&py.import("datetime")?.getattr("date")?)? {
+        let epoch = py.import("datetime")?.getattr("date")?.call1((2000, 1, 1))?;
+        let delta = value.call_method1("__sub__", (epoch,))?;
+        let days: i32 = delta.getattr("days")?.extract()?;
+        return Ok(CachedValue::Date(days));
+    }
+    if value.is_instance(&py.import("datetime")?.getattr("time")?)? {
+        if !value.getattr("tzinfo")?.is_none() {
+            return Err(PyValueError::new_err(
+                "cannot bind a timezone-aware datetime.time — PostgreSQL `time` (cal::local_time) has no timezone"
+            ));
+        }
+        let hour: i64 = value.getattr("hour")?.extract()?;
+        let minute: i64 = value.getattr("minute")?.extract()?;
+        let second: i64 = value.getattr("second")?.extract()?;
+        let microsecond: i64 = value.getattr("microsecond")?.extract()?;
+        let total_us = ((hour * 60 + minute) * 60 + second) * 1_000_000 + microsecond;
+        return Ok(CachedValue::Time(total_us));
+    }
+    if value.is_instance(&py.import("pylon.datatypes")?.getattr("Range")?)? {
+        let empty: bool = value.getattr("empty")?.extract()?;
+        let lower = value.getattr("lower")?;
+        let upper = value.getattr("upper")?;
+        return Ok(CachedValue::Range {
+            lower: if lower.is_none() { None } else { Some(Box::new(py_to_cached(&lower)?)) },
+            upper: if upper.is_none() { None } else { Some(Box::new(py_to_cached(&upper)?)) },
+            inc_lower: value.getattr("inc_lower")?.extract()?,
+            inc_upper: value.getattr("inc_upper")?.extract()?,
+            empty,
+        });
+    }
     if let Ok(d) = value.cast::<PyDict>() {
         let entries = d
             .iter()
@@ -145,6 +204,44 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &CachedValue) -> PyResul
             }
             // Positional form: timedelta(days, seconds, microseconds, ...).
             py.import("datetime")?.getattr("timedelta")?.call1((*days, 0, *microseconds))?
+        }
+        CachedValue::Date(days) => {
+            let epoch = py.import("datetime")?.getattr("date")?.call1((2000, 1, 1))?;
+            let delta = py.import("datetime")?.getattr("timedelta")?.call1((*days,))?;
+            epoch.call_method1("__add__", (delta,))?
+        }
+        CachedValue::Time(us) => {
+            // PG `time` is always in [0, 86_400_000_000) microseconds —
+            // non-negative, so plain euclidean division/remainder suffices.
+            let microsecond = us.rem_euclid(1_000_000);
+            let total_s = us.div_euclid(1_000_000);
+            let second = total_s.rem_euclid(60);
+            let total_m = total_s.div_euclid(60);
+            let minute = total_m.rem_euclid(60);
+            let hour = total_m.div_euclid(60);
+            py.import("datetime")?.getattr("time")?.call1((hour, minute, second, microsecond))?
+        }
+        CachedValue::Timestamp(us) => {
+            let epoch = py.import("datetime")?.getattr("datetime")?.call1((2000, 1, 1))?;
+            let delta = py.import("datetime")?.getattr("timedelta")?.call1((0, 0, *us))?;
+            epoch.call_method1("__add__", (delta,))?
+        }
+        CachedValue::Timestamptz(us) => {
+            let utc = py.import("datetime")?.getattr("timezone")?.getattr("utc")?;
+            let epoch = py.import("datetime")?.getattr("datetime")?.call1((2000, 1, 1, 0, 0, 0, 0, utc))?;
+            let delta = py.import("datetime")?.getattr("timedelta")?.call1((0, 0, *us))?;
+            epoch.call_method1("__add__", (delta,))?
+        }
+        CachedValue::Range { lower, upper, inc_lower, inc_upper, empty } => {
+            let lower_py = match lower {
+                Some(v) => cached_to_py(py, v)?,
+                None => py.None().into_bound(py),
+            };
+            let upper_py = match upper {
+                Some(v) => cached_to_py(py, v)?,
+                None => py.None().into_bound(py),
+            };
+            py.import("pylon.datatypes")?.getattr("Range")?.call1((lower_py, upper_py, *inc_lower, *inc_upper, *empty))?
         }
     })
 }
