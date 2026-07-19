@@ -1352,6 +1352,7 @@ mod tests {
             search_indexes: vec![],
             triggers: vec![],
             junction: false,
+            signals: vec![],
         }
     }
 
@@ -1517,6 +1518,7 @@ mod tests {
             links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
             indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
             triggers: vec![], junction: false,
+            signals: vec![],
         }
     }
 

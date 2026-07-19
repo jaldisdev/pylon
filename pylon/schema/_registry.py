@@ -1,13 +1,33 @@
-"""Global thread-safe registry of all schema-decorated types, enums, and scalars.
+"""Global thread-safe registry of all schema-decorated types, enums, scalars,
+and signal handlers.
 
 Populated automatically at import time as each @pylon.type / @pylon.abstract /
-@pylon.interface / @pylon.enum / @pylon.scalar decorator runs. Consumed once by
-pylon.finalize() to build the SchemaDescriptor.
+@pylon.interface / @pylon.enum / @pylon.scalar / @pylon.signal decorator runs.
+Consumed once by pylon.finalize() to build the SchemaDescriptor — except
+signal registrations, whose live handler callables never cross into the
+schema; only their `target`/`on` bitmask does (see `SignalRegistration`).
 """
 
 from __future__ import annotations
 
 import threading
+from typing import Any, Callable, NamedTuple
+
+
+class SignalRegistration(NamedTuple):
+    """One `@pylon.signal(target, on=...)` registration.
+
+    `handler` is the live decorated callable itself — it never crosses into
+    the Rust-side schema (only `target`/`on` do, as a bitmask on the
+    matching `TypeDescriptor.signals`); it's consulted directly by the
+    dispatch loop that drains the outbox a mutation's capture trigger
+    writes to.
+    """
+
+    target: type
+    on: int
+    handler: Callable[..., Any]
+
 
 _lock = threading.Lock()
 _types: list[type] = []
@@ -15,6 +35,7 @@ _enums: list[type] = []
 _custom_scalars: list[type] = []
 _named_tuples: list[type] = []
 _functions: list = []
+_signals: list[SignalRegistration] = []
 
 
 def register_type(cls: type) -> None:
@@ -42,9 +63,19 @@ def register_function(func: object) -> None:
         _functions.append(func)
 
 
+def register_signal(registration: SignalRegistration) -> None:
+    with _lock:
+        _signals.append(registration)
+
+
 def functions_snapshot() -> list:
     with _lock:
         return list(_functions)
+
+
+def signals_snapshot() -> list[SignalRegistration]:
+    with _lock:
+        return list(_signals)
 
 
 def snapshot() -> tuple[list[type], list[type], list[type]]:
@@ -67,3 +98,4 @@ def clear() -> None:
         _custom_scalars.clear()
         _named_tuples.clear()
         _functions.clear()
+        _signals.clear()

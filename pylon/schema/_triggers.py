@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import enum
+from typing import Any, Callable, TypeVar
 
 from . import _collector
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 class On(enum.IntFlag):
@@ -71,3 +74,36 @@ class Rewrite:
 
     def __repr__(self) -> str:
         return f"Rewrite({self.on!r}, {self.handler!r})"
+
+
+def signal(
+    target: type, *, on: On = On.Insert | On.Update | On.Delete
+) -> Callable[[_F], _F]:
+    """Register an async handler that fires after a mutation on `target` commits.
+
+    Usage::
+
+        @pylon.signal(Person, on=On.Insert | On.Delete)
+        async def sync_to_crm(old: Person | None, new: Person | None) -> None:
+            ...
+
+    `old` is always `None` for `On.Insert`, `new` is always `None` for
+    `On.Delete`. Both are populated from the type's own stored properties
+    and single-link foreign-key columns only (exposed as plain `<name>_id`
+    values, not resolved link objects) — the same data a database-level
+    trigger's own `OLD`/`NEW` would see, since neither a computed pointer
+    nor a multilink has a backing column to capture in the first place.
+    Handlers run asynchronously, after the transaction that triggered them
+    has already committed, not inline with the mutation.
+    """
+    if not hasattr(target, "__pylon_config__"):
+        raise TypeError(
+            f"pylon.signal target must be a @pylon.type-decorated class, got {target!r}"
+        )
+
+    def decorator(func: _F) -> _F:
+        from ._registry import SignalRegistration, register_signal
+        register_signal(SignalRegistration(target=target, on=int(on), handler=func))
+        return func
+
+    return decorator

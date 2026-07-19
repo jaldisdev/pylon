@@ -72,6 +72,7 @@ from .schema import (
     Restrict,
     Scalar,
     Sequence,
+    On,
     SequenceNext,
     Source,
     Str,
@@ -87,6 +88,7 @@ from .schema import (
     lazy,
     named_tuple,
     scalar,
+    signal_decorator as signal,
     through,
     type,  # shadows builtins.type intentionally  # noqa: A001
 )
@@ -113,10 +115,13 @@ __all__ = [
     "junction",
     "named_tuple",
     "scalar",
+    "signal",
     "type",
     # Schema — functions
     "Language",
     "Volatility",
+    # Schema — signals
+    "On",
     # Schema — base types & introspection
     "BaseObject",
     "Enum",

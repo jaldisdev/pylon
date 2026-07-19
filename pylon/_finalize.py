@@ -90,8 +90,9 @@ def finalize(
     from pylon.config import load_config
     from pylon.schema._globals import collect_all_globals
     from pylon.schema._aliases import collect_module_aliases
-    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot
+    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot, signals_snapshot
     from pylon.schema._walker import walk
+    from pylon.schema._signal_registry import build_index as build_signal_index, _set_index as _set_signal_index
     from pylon.query import _set_schema
 
     cfg = load_config(config)
@@ -114,6 +115,7 @@ def finalize(
 
     functions = functions_snapshot()
     named_tuples = named_tuples_snapshot()
+    signals = signals_snapshot()
     schema = walk(
         types,
         enums,
@@ -122,8 +124,10 @@ def finalize(
         functions=functions,
         aliases=aliases_,
         named_tuples=named_tuples,
+        signals=signals,
     )
     _set_schema(schema)
+    _set_signal_index(build_signal_index(signals))
     _export_schema_json(cfg, schema)
     return schema
 

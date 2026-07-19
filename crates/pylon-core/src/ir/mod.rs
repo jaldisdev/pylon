@@ -955,6 +955,7 @@ mod tests {
                     search_indexes: vec![],
                     triggers: vec![],
                     junction: false,
+                    signals: vec![],
                 },
                 TypeDescriptor {
                     name: "Company".into(),
@@ -987,6 +988,7 @@ mod tests {
                     search_indexes: vec![],
                     triggers: vec![],
                     junction: false,
+                    signals: vec![],
                 },
                 TypeDescriptor {
                     name: "Post".into(),
@@ -1019,6 +1021,7 @@ mod tests {
                     search_indexes: vec![],
                     triggers: vec![],
                     junction: false,
+                    signals: vec![],
                 },
             ],
             scalars: vec![],

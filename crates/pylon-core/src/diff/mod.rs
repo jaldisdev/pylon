@@ -1961,6 +1961,7 @@ mod tests {
             constraints: vec![], indexes: vec![],
             vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
             junction: false,
+            signals: vec![],
         }
     }
 
