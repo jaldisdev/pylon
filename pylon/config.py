@@ -204,6 +204,7 @@ class Config:
     webserver: WebserverConfig = field(default_factory=WebserverConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    toml_path: Path | None = None
 
     # ------------------------------------------------------------------
     # Normalised accessors
@@ -532,6 +533,7 @@ def load_config(path: str | Path | None = None) -> Config:
         webserver=webserver,
         ui=ui,
         cache=cache,
+        toml_path=toml_path,
     )
 
 

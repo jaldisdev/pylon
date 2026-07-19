@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     pub line: u32,
     pub col: u32,
@@ -20,6 +20,28 @@ pub enum PyQLError {
     Cardinality(#[from] PyQLCardinalityError),
     #[error(transparent)]
     Fragment(#[from] PyQLFragmentError),
+}
+
+impl PyQLError {
+    /// Maps this error to the `pylon.exceptions.*` class name it corresponds to,
+    /// plus its message and position — the single source of truth shared by the
+    /// Python binding (`pylon-py`'s `pyql_err`) and the language server's
+    /// diagnostics, so both surfaces stay in sync with exactly one match arm set.
+    pub fn class_name_message_position(&self) -> (&'static str, &str, &Position) {
+        use PyQLError as E;
+        use PyQLResolutionError as R;
+        match self {
+            E::Syntax(e) => ("InvalidQueryError", &e.message, &e.position),
+            E::Type(e) => ("InvalidQueryError", &e.message, &e.position),
+            E::Resolution(R::UnknownType(e)) => ("UnknownTypeError", &e.message, &e.position),
+            E::Resolution(R::UnknownField(e)) => ("UnknownLinkError", &e.message, &e.position),
+            E::Resolution(R::UnknownParameter(e)) => {
+                ("UnknownParameterError", &e.message, &e.position)
+            }
+            E::Cardinality(e) => ("InvalidQueryError", &e.message, &e.position),
+            E::Fragment(e) => ("SchemaError", &e.message, &e.position),
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone)]
