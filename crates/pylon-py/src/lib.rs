@@ -1360,6 +1360,14 @@ impl SchemaDescriptor {
         }).collect::<PyResult<_>>()?;
         Ok(PyList::new(py, items)?)
     }
+
+    /// Serialize the full schema to JSON — consumed by `pylon-lsp` (a pure-Rust
+    /// binary with no embedded Python interpreter) so it can run the full
+    /// compiler and surface semantic diagnostics, not just parser errors.
+    fn to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
 }
 
 // ── Query types ────────────────────────────────────────────────────────────────
@@ -2001,17 +2009,8 @@ fn char_offset(text: &str, line: u32, col: u32) -> Option<usize> {
 /// it, and because `pylon.client`'s blanket `except BaseException` used to
 /// collapse every compile error into `InternalServerError` regardless.
 fn pyql_err(err: core::error::PyQLError, query: Option<&str>) -> PyErr {
-    use core::error::{PyQLError as E, PyQLResolutionError as R};
-    let (class_name, message, position) = match err {
-        E::Syntax(e) => ("InvalidQueryError", e.message, e.position),
-        E::Type(e) => ("InvalidQueryError", e.message, e.position),
-        E::Resolution(R::UnknownType(e)) => ("UnknownTypeError", e.message, e.position),
-        E::Resolution(R::UnknownField(e)) => ("UnknownLinkError", e.message, e.position),
-        E::Resolution(R::UnknownParameter(e)) => ("UnknownParameterError", e.message, e.position),
-        E::Cardinality(e) => ("InvalidQueryError", e.message, e.position),
-        E::Fragment(e) => ("SchemaError", e.message, e.position),
-    };
-    construct_pylon_error(class_name, &message, query, &position)
+    let (class_name, message, position) = err.class_name_message_position();
+    construct_pylon_error(class_name, message, query, position)
 }
 
 fn construct_pylon_error(class_name: &str, message: &str, query: Option<&str>, position: &core::error::Position) -> PyErr {

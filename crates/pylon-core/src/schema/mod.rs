@@ -1,12 +1,12 @@
 // ── Deletion policies ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeleteSide {
     Target,
     Source,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeleteAction {
     Allow,
     Restrict,
@@ -16,7 +16,7 @@ pub enum DeleteAction {
     DeleteTargetIfOrphan,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnDeletePolicy {
     pub side: DeleteSide,
     pub action: DeleteAction,
@@ -24,7 +24,7 @@ pub struct OnDeletePolicy {
 
 // ── Mutation rewrites ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RewriteEntry {
     /// Bitmask: 1=Insert, 2=Update, 4=Delete (mirrors Python On IntFlag).
     pub on: u8,
@@ -34,7 +34,7 @@ pub struct RewriteEntry {
 
 // ── Pointer descriptors ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropertyDescriptor {
     pub name: String,
     /// PostgreSQL column type, e.g. `text`, `int8`, `uuid`.
@@ -62,7 +62,7 @@ pub struct PropertyDescriptor {
     pub tuple_members: Option<Vec<TupleMemberDescriptor>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LinkDescriptor {
     pub name: String,
     /// Qualified name of the target type, e.g. `catalog::Category`.
@@ -78,7 +78,7 @@ pub struct LinkDescriptor {
     pub on_delete: Vec<OnDeletePolicy>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MultiLinkDescriptor {
     pub name: String,
     /// Qualified name of the target type.
@@ -91,7 +91,7 @@ pub struct MultiLinkDescriptor {
     pub on_delete: Vec<OnDeletePolicy>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ComputedDescriptor {
     pub name: String,
     /// PyQL expression evaluated at query time.
@@ -104,14 +104,14 @@ pub struct ComputedDescriptor {
 
 // ── Search index ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SearchBackend {
     Postgres,
     OpenSearch,
     Meilisearch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SearchWeight {
     A,
     B,
@@ -130,13 +130,13 @@ impl SearchWeight {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchPointerDescriptor {
     pub name: String,
     pub weight: SearchWeight,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchIndexDescriptor {
     pub index_name: Option<String>,
     pub backend: SearchBackend,
@@ -161,7 +161,7 @@ impl SearchIndexDescriptor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VectorIndexDescriptor {
     /// `None` = default (bare) index; `Some(name)` = named index.
     pub index_name: Option<String>,
@@ -194,7 +194,7 @@ impl VectorIndexDescriptor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexDescriptor {
     /// Pointer names for a simple or composite index; empty when is_expression=true.
     pub pointers: Vec<String>,
@@ -205,7 +205,7 @@ pub struct IndexDescriptor {
     pub unless: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TriggerDescriptor {
     /// Bitmask: 1=Insert, 2=Update, 4=Delete.
     pub on: u8,
@@ -214,7 +214,7 @@ pub struct TriggerDescriptor {
     pub handler: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypeConstraint {
     /// Composite UNIQUE INDEX across multiple pointers.
     Exclusive {
@@ -227,7 +227,7 @@ pub enum TypeConstraint {
 
 // ── Type descriptor ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeDescriptor {
     /// Unqualified name, e.g. `Product`.
     pub name: String,
@@ -268,7 +268,7 @@ pub struct TypeDescriptor {
 
 // ── Scalar / enum / global descriptors ────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScalarDescriptor {
     /// Qualified scalar name, e.g. `default::Email`.
     pub name: String,
@@ -283,7 +283,7 @@ pub struct ScalarDescriptor {
     pub is_sequence: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnumDescriptor {
     pub name: String,
     pub module: String,
@@ -294,7 +294,7 @@ pub struct EnumDescriptor {
 /// member can itself be a nested tuple. Drives decode-time shape building
 /// (`ShapeNode`) so a jsonb-backed tuple value decodes with real per-member
 /// types instead of an opaque dict/list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TupleMemberKind {
     Scalar { pg_type: String },
     Enum { module: String, name: String },
@@ -304,7 +304,7 @@ pub enum TupleMemberKind {
     Tuple { members: Vec<TupleMemberDescriptor> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TupleMemberDescriptor {
     /// `None` for an unnamed/positional element of a structural tuple.
     pub name: Option<String>,
@@ -315,14 +315,14 @@ pub struct TupleMemberDescriptor {
 /// resolution (`<module::Name>expr` → jsonb) and, via `members`, for decoding a
 /// value read back from a column/cast of this type with real per-member types
 /// instead of an opaque dict.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NamedTupleDescriptor {
     pub name: String,
     pub module: String,
     pub members: Vec<TupleMemberDescriptor>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GlobalDescriptor {
     pub name: String,
     pub module: String,
@@ -336,14 +336,14 @@ pub struct GlobalDescriptor {
 
 // ── Function descriptors ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionParamDescriptor {
     pub name: String,
     /// PostgreSQL type string, e.g. `int8`, `text`, `uuid`.
     pub pg_type: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDescriptor {
     pub name: String,
     pub module: String,
@@ -364,7 +364,7 @@ pub struct FunctionDescriptor {
 
 // ── Alias descriptor ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AliasDescriptor {
     pub name: String,
     pub module: String,
@@ -374,7 +374,7 @@ pub struct AliasDescriptor {
 
 // ── Top-level schema ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchemaDescriptor {
     pub types: Vec<TypeDescriptor>,
     pub scalars: Vec<ScalarDescriptor>,

@@ -3,7 +3,7 @@
 //! in the original `.py` file, using the byte-for-byte source map built by
 //! `scan::PyqlMatch`.
 
-use lsp_types::{Diagnostic, DiagnosticSeverity, Position as LspPosition, Range};
+use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position as LspPosition, Range};
 use pylon_core::error::Position as PyqlPosition;
 
 use crate::scan::PyqlMatch;
@@ -59,13 +59,19 @@ pub fn error_range(m: &PyqlMatch, position: &PyqlPosition) -> Range {
     }
 }
 
-/// Builds the LSP `Diagnostic` for one failed-to-parse PyQL match.
-pub fn diagnostic_for(m: &PyqlMatch, err: &pylon_core::error::PyQLSyntaxError) -> Diagnostic {
+/// Builds the LSP `Diagnostic` for one PyQL match that failed to parse or
+/// compile. Covers every `PyQLError` variant (syntax, type, unknown
+/// property/link/parameter, cardinality, fragment) uniformly, tagging the
+/// diagnostic's `code` with the `pylon.exceptions.*` class name so an editor
+/// can group/filter by error kind the same way the CLI and web API do.
+pub fn diagnostic_for(m: &PyqlMatch, err: &pylon_core::error::PyQLError) -> Diagnostic {
+    let (class_name, message, position) = err.class_name_message_position();
     Diagnostic {
-        range: error_range(m, &err.position),
+        range: error_range(m, position),
         severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(class_name.to_string())),
         source: Some("pylon".to_string()),
-        message: err.message.clone(),
+        message: message.to_string(),
         ..Default::default()
     }
 }
