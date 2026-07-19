@@ -232,10 +232,29 @@ fn policy_for<'a>(policies: &'a [OnDeletePolicy], side: &DeleteSide) -> Option<&
     policies.iter().find(|p| &p.side == side).map(|p| &p.action)
 }
 
+/// True when the Source-side policy is `DeleteTarget`/`DeleteTargetIfOrphan`
+/// — a `BEFORE DELETE` trigger on the owner row (`emit_link_source_triggers`/
+/// `emit_multilink_deletion_triggers`) that deletes the target *while the
+/// owner row that references it still exists* (triggers fire before the
+/// row is actually removed). An immediate (non-deferred) `RESTRICT`/default
+/// Target-side FK would see that still-present owner row and reject the
+/// trigger's own delete — confirmed live (`live_execution_on_delete.rs`):
+/// every `DeleteTarget`/`DeleteTargetIfOrphan` delete failed with
+/// "violates RESTRICT setting" until the corresponding Target-side FK was
+/// forced deferrable. A permissive Target-side policy (`Allow`/`DeleteSource`)
+/// has no such conflict — only the RESTRICT-family default needs forcing.
+pub(crate) fn needs_deferred_target_fk(policies: &[OnDeletePolicy]) -> bool {
+    policies.iter().any(|p| {
+        p.side == DeleteSide::Source
+            && matches!(p.action, DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan)
+    })
+}
+
 /// Returns the `ON DELETE …` / `DEFERRABLE …` suffix for a FK constraint
 /// based on the Target-side policy. `is_deferred` is set for DeferredRestrict.
 fn target_fk_suffix(policies: &[OnDeletePolicy]) -> String {
     match policy_for(policies, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict) {
+        DeleteAction::Restrict if needs_deferred_target_fk(policies) => " DEFERRABLE INITIALLY DEFERRED".into(),
         DeleteAction::Restrict => " ON DELETE RESTRICT".into(),
         DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED".into(),
         DeleteAction::DeleteSource => " ON DELETE CASCADE".into(),
@@ -255,6 +274,7 @@ fn source_jt_fk_suffix(_policies: &[OnDeletePolicy]) -> &'static str {
 /// Returns the `ON DELETE …` suffix for the target FK in a junction table.
 fn target_jt_fk_suffix(policies: &[OnDeletePolicy]) -> String {
     match policy_for(policies, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict) {
+        DeleteAction::Restrict if needs_deferred_target_fk(policies) => " DEFERRABLE INITIALLY DEFERRED".into(),
         DeleteAction::Restrict => " ON DELETE RESTRICT".into(),
         DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED".into(),
         DeleteAction::Allow => " ON DELETE CASCADE".into(),
@@ -313,6 +333,38 @@ fn emit_before_delete_trigger(
         "\n    RETURN OLD;\nEND;\n$$;\n\n\
          CREATE TRIGGER {trigger_name}\n\
          BEFORE DELETE ON {table_qname}\n\
+         FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n"
+    ));
+}
+
+/// Like `emit_before_delete_trigger`, but `AFTER DELETE` — required
+/// whenever the trigger body's own delete can cascade back onto the same
+/// row the trigger is firing for (the multilink target-side `DeleteSource`
+/// case: deleting a target cascades to delete the junction row, whose
+/// trigger deletes the owner, whose own junction-cleanup cascade would
+/// otherwise try to delete that same still-being-deleted junction row
+/// again). A `BEFORE DELETE` trigger there hits Postgres's own "tuple to be
+/// deleted was already modified by an operation triggered by the current
+/// command" — confirmed live (`tests/live_execution_on_delete.rs`) — and
+/// Postgres's error hint is literally to use `AFTER` instead, since by then
+/// the row is actually gone and the reentrant cascade has nothing to touch.
+fn emit_after_delete_trigger(
+    fn_qname: &str,
+    trigger_name: &str,
+    table_qname: &str,
+    body: &str,
+    out: &mut String,
+) {
+    out.push_str(&format!(
+        "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+         RETURNS trigger LANGUAGE plpgsql AS $$\n\
+         BEGIN\n"
+    ));
+    out.push_str(body);
+    out.push_str(&format!(
+        "\n    RETURN NULL;\nEND;\n$$;\n\n\
+         CREATE TRIGGER {trigger_name}\n\
+         AFTER DELETE ON {table_qname}\n\
          FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n"
     ));
 }
@@ -459,7 +511,7 @@ fn emit_multilink_deletion_triggers(
                 let src_qname = qn(&t.module, &t.table);
 
                 let body = format!("    DELETE FROM {src_qname} WHERE id = OLD.source;");
-                emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, out);
+                emit_after_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, out);
             }
         }
     }
@@ -1183,8 +1235,8 @@ pub fn compile_search_index_fetch(
 mod tests {
     use super::*;
     use crate::schema::{
-        FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, SchemaDescriptor,
-        TypeDescriptor,
+        DeleteAction, DeleteSide, FunctionDescriptor, FunctionParamDescriptor, MultiLinkDescriptor,
+        OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn person_type() -> TypeDescriptor {
@@ -1351,6 +1403,89 @@ mod tests {
         let seq_pos = ddl.find("CREATE SEQUENCE").unwrap();
         let dom_pos = ddl.find("CREATE DOMAIN").unwrap();
         assert!(seq_pos < dom_pos, "sequence must appear before domain");
+    }
+
+    // ── on_delete regression tests (bugs caught by live-execution testing) ────────
+
+    #[test]
+    fn test_target_fk_suffix_forces_deferrable_when_source_side_deletes_target() {
+        // Regression: a Source-side DeleteTarget/DeleteTargetIfOrphan
+        // trigger deletes the target from a BEFORE DELETE trigger on the
+        // owner row, which still exists at that point — an immediate
+        // (non-deferred) RESTRICT on the same FK's Target side rejects that
+        // nested delete every time. Confirmed live
+        // (`tests/live_execution_on_delete.rs`) before this fix.
+        let policies = vec![OnDeletePolicy { side: DeleteSide::Source, action: DeleteAction::DeleteTarget }];
+        assert_eq!(target_fk_suffix(&policies), " DEFERRABLE INITIALLY DEFERRED");
+
+        let policies = vec![OnDeletePolicy { side: DeleteSide::Source, action: DeleteAction::DeleteTargetIfOrphan }];
+        assert_eq!(target_fk_suffix(&policies), " DEFERRABLE INITIALLY DEFERRED");
+    }
+
+    #[test]
+    fn test_target_fk_suffix_unaffected_when_no_source_side_policy() {
+        // The fix above must not change behavior for the ordinary case.
+        assert_eq!(target_fk_suffix(&[]), " ON DELETE RESTRICT");
+        let policies = vec![OnDeletePolicy { side: DeleteSide::Target, action: DeleteAction::Allow }];
+        assert_eq!(target_fk_suffix(&policies), " ON DELETE SET NULL");
+    }
+
+    #[test]
+    fn test_target_jt_fk_suffix_forces_deferrable_when_source_side_deletes_target() {
+        // Same fix, multilink junction-table variant.
+        let policies = vec![OnDeletePolicy { side: DeleteSide::Source, action: DeleteAction::DeleteTargetIfOrphan }];
+        assert_eq!(target_jt_fk_suffix(&policies), " DEFERRABLE INITIALLY DEFERRED");
+    }
+
+    fn org_type(module: &str) -> TypeDescriptor {
+        TypeDescriptor {
+            name: "Org".into(), module: module.into(), table: "Org".into(),
+            abstract_: false, materialized: true, description: None,
+            parents: vec![], interfaces: vec![],
+            properties: vec![PropertyDescriptor {
+                name: "id".into(), pg_type: "uuid".into(), nullable: false,
+                default_sql: Some("gen_random_uuid()".into()), default_pyql: None,
+                description: None, check_constraints: vec![], is_exclusive: true,
+                is_pk: true, is_readonly: true, rewrites: vec![], tuple_members: None,
+            }],
+            links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+            indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+            triggers: vec![], junction: false,
+        }
+    }
+
+    #[test]
+    fn test_multilink_target_delete_source_trigger_is_after_not_before() {
+        // Regression: the target-side DeleteSource trigger on a multilink's
+        // junction table used to be BEFORE DELETE, which self-conflicts —
+        // deleting the target cascades to delete the junction row, whose
+        // BEFORE trigger deletes the owner, whose own junction-cleanup
+        // cascade then tries to delete that same still-being-deleted
+        // junction row again. Postgres rejects this with "tuple to be
+        // deleted was already modified by an operation triggered by the
+        // current command" and its own hint says to use AFTER instead —
+        // confirmed live (`tests/live_execution_on_delete.rs`) before this fix.
+        let module = "default";
+        let mut owner = org_type(module);
+        owner.name = "Product".into();
+        owner.table = "Product".into();
+        owner.multilinks = vec![MultiLinkDescriptor {
+            name: "tags".into(),
+            target: format!("{module}::Org"),
+            through: None,
+            nullable: false,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![OnDeletePolicy { side: DeleteSide::Target, action: DeleteAction::DeleteSource }],
+        }];
+        let schema = SchemaDescriptor {
+            types: vec![org_type(module), owner],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("AFTER DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
+        assert!(!ddl.contains("BEFORE DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
     }
 }
 
