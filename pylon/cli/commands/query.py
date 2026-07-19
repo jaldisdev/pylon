@@ -436,7 +436,16 @@ def _value(v: object) -> str:
         )
         return f"{_RED}{module}::{cls.__name__}.{v.name}{_RESET}"
     if isinstance(v, _decimal_mod.Decimal):
-        return format(v.normalize(), 'f')
+        # Always at least one fractional digit (never bare "1399", which
+        # reads as an int) and a trailing "n" marking it decimal, not float.
+        # normalize() alone would sometimes render an integer-valued decimal
+        # in exponential notation (e.g. Decimal("1400") -> "1.4E+3") — 'f'
+        # format forces fixed-point first, then ".0" is added back if that
+        # stripped every fractional digit.
+        text = format(v.normalize(), 'f')
+        if '.' not in text:
+            text += '.0'
+        return f"{text}n"
     if isinstance(v, str):
         if _is_uuid(v):
             return f"{_YELLOW}{v}{_RESET}"
