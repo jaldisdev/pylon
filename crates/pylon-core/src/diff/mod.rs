@@ -1622,16 +1622,24 @@ fn emit_fk_diff(
         let cname = format!("{}_{}_fkey", td.table, l.name);
         if existing_fk_names.contains(cname.as_str()) { continue; }
         let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
+        // See `export::needs_deferred_target_fk`'s doc comment — a
+        // Source-side DeleteTarget/DeleteTargetIfOrphan trigger deletes the
+        // target while the still-not-yet-removed owner row would otherwise
+        // trip an immediate RESTRICT on this very FK (confirmed live via
+        // `tests/live_execution_on_delete.rs`); force it deferrable so the
+        // check only runs at commit, after both deletes have completed.
+        let needs_deferred = crate::export::needs_deferred_target_fk(&l.on_delete);
         let on_delete = l.on_delete.iter()
             .find(|p| p.side == DeleteSide::Target)
             .map(|p| match &p.action {
+                DeleteAction::Restrict if needs_deferred => " DEFERRABLE INITIALLY DEFERRED",
                 DeleteAction::Restrict => " ON DELETE RESTRICT",
                 DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED",
                 DeleteAction::DeleteSource => " ON DELETE CASCADE",
                 DeleteAction::Allow => " ON DELETE SET NULL",
                 _ => " ON DELETE RESTRICT",
             })
-            .unwrap_or(" ON DELETE RESTRICT");
+            .unwrap_or(if needs_deferred { " DEFERRABLE INITIALLY DEFERRED" } else { " ON DELETE RESTRICT" });
         push_tx(ops, format!(
             "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id){};",
             qn(&td.module, &td.table),
@@ -1659,16 +1667,19 @@ fn emit_junction_table(
 
     let jt_name = format!("{}.{}", td.table, ml_name);
     let src_on_delete = " ON DELETE CASCADE";
+    // See the identical comment in `emit_fk_diff` above / `export::needs_deferred_target_fk`.
+    let needs_deferred = crate::export::needs_deferred_target_fk(on_delete);
     let tgt_on_delete = on_delete.iter()
         .find(|p| p.side == DeleteSide::Target)
         .map(|p| match &p.action {
+            DeleteAction::Restrict if needs_deferred => " DEFERRABLE INITIALLY DEFERRED",
             DeleteAction::Restrict => " ON DELETE RESTRICT",
             DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED",
             DeleteAction::Allow => " ON DELETE CASCADE",
             DeleteAction::DeleteSource => " ON DELETE CASCADE",
             _ => " ON DELETE RESTRICT",
         })
-        .unwrap_or(" ON DELETE RESTRICT");
+        .unwrap_or(if needs_deferred { " DEFERRABLE INITIALLY DEFERRED" } else { " ON DELETE RESTRICT" });
 
     let tgt_ref = type_map.get(ml_target).map(|(m, t)| qn(m, t))
         .unwrap_or_else(|| qi(ml_target));
