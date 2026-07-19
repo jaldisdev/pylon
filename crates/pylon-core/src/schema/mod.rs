@@ -32,6 +32,21 @@ pub struct RewriteEntry {
     pub handler: String,
 }
 
+// ── Post-commit signal registrations ───────────────────────────────────────────
+
+/// One `on=` registration for a type from the Python-side signal registry —
+/// just the operation bitmask, never the handler itself (the actual
+/// callable stays Python-only and never crosses into this descriptor).
+/// Combined across every handler registered for a type, this drives
+/// whether the DDL emitter attaches a capture trigger to that type's table
+/// at all (see `export::signal_trigger_infos`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignalEntry {
+    /// Bitmask: 1=Insert, 2=Update, 4=Delete (mirrors Python On IntFlag,
+    /// same convention as `RewriteEntry.on`).
+    pub on: u8,
+}
+
 // ── Pointer descriptors ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -264,6 +279,11 @@ pub struct TypeDescriptor {
     pub triggers: Vec<TriggerDescriptor>,
     /// True for `@pylon.junction` — type is a junction table for a MultiLink.
     pub junction: bool,
+    /// Post-commit signal registrations from the Python-side registry — one
+    /// entry per distinct `on=` bitmask a handler was registered with (not
+    /// one per handler). Empty unless at least one signal targets this
+    /// type; drives whether a capture trigger gets attached at all.
+    pub signals: Vec<SignalEntry>,
 }
 
 // ── Scalar / enum / global descriptors ────────────────────────────────────────

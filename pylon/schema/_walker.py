@@ -787,6 +787,7 @@ def _build_type_descriptor(
     class_to_qname: dict[int, str],
     _core: Any,
     junction_to_ml: dict[str, tuple[str, str]] | None = None,
+    signal_ops_by_class: dict[type, int] | None = None,
 ) -> Any:
     from ._constraints import Exclusive, Expression
 
@@ -838,6 +839,12 @@ def _build_type_descriptor(
     ]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
 
+    # Combined on= bitmask across every @pylon.signal handler registered
+    # for this type — the live handler callables themselves never cross
+    # into the schema, only this bitmask does (see `_registry.SignalRegistration`).
+    combined_signal_ops = (signal_ops_by_class or {}).get(cls, 0)
+    signal_descs = [_core.SignalEntry(on=combined_signal_ops)] if combined_signal_ops else []
+
     # Junction types: derive the actual table name from the MultiLink that references them.
     if cfg.junction and junction_to_ml is not None:
         qname = _qualified(cfg.module, cfg.name)
@@ -866,6 +873,7 @@ def _build_type_descriptor(
         search_indexes=search_index_descs,
         triggers=trigger_descs,
         junction=cfg.junction,
+        signals=signal_descs,
     )
 
 
@@ -1133,6 +1141,7 @@ def walk(
     functions: list[Any] | None = None,
     aliases: list[Any] | None = None,
     named_tuples: list[type] | None = None,
+    signals: list[Any] | None = None,
 ) -> Any:
     """Walk the collected schema and return a pylon._core.SchemaDescriptor.
 
@@ -1161,9 +1170,17 @@ def walk(
     # Phase 4.5 — junction type validation
     junction_to_ml = _validate_junctions(types, class_to_qname)
 
+    # Phase 4.6 — combine every @pylon.signal registration's on= bitmask
+    # per target class (the handler callables themselves stay out of the
+    # schema entirely — see `_registry.SignalRegistration`).
+    signal_ops_by_class: dict[type, int] = {}
+    for reg in signals or ():
+        signal_ops_by_class[reg.target] = signal_ops_by_class.get(reg.target, 0) | reg.on
+
     # Phase 5+6 — build PyO3 descriptors
     type_descs = [
-        _build_type_descriptor(cls, class_to_qname, _core, junction_to_ml) for cls in types
+        _build_type_descriptor(cls, class_to_qname, _core, junction_to_ml, signal_ops_by_class)
+        for cls in types
     ]
     scalar_descs = [_build_scalar_descriptor(cls, _core) for cls in custom_scalars]
     enum_descs = [_build_enum_descriptor(cls, _core) for cls in enums]

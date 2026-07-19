@@ -52,6 +52,7 @@ fn smoke_schema(module: &str) -> SchemaDescriptor {
             search_indexes: vec![],
             triggers: vec![],
             junction: false,
+            signals: vec![],
         }],
         ..Default::default()
     }

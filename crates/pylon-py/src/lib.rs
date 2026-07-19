@@ -193,6 +193,28 @@ impl RewriteEntry {
     }
 }
 
+// ── Post-commit signal registration ─────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct SignalEntry {
+    inner: core::schema::SignalEntry,
+}
+
+#[pymethods]
+impl SignalEntry {
+    #[new]
+    fn new(on: u8) -> Self {
+        Self {
+            inner: core::schema::SignalEntry { on },
+        }
+    }
+
+    #[getter]
+    fn on(&self) -> u8 {
+        self.inner.on
+    }
+}
+
 // ── Tuple member descriptor (recursive) ────────────────────────────────────────
 
 /// One member's type within a named-tuple/tuple-shaped value. `kind` selects
@@ -841,7 +863,8 @@ impl TypeDescriptor {
         indexes = None,
         vector_indexes = None,
         search_indexes = None,
-        triggers = None
+        triggers = None,
+        signals = None
     ))]
     fn new(
         name: String,
@@ -863,6 +886,7 @@ impl TypeDescriptor {
         vector_indexes: Option<Vec<PyRef<VectorIndexDescriptor>>>,
         search_indexes: Option<Vec<PyRef<SearchIndexDescriptor>>>,
         triggers: Option<Vec<PyRef<TriggerDescriptor>>>,
+        signals: Option<Vec<PyRef<SignalEntry>>>,
     ) -> Self {
         let mut constraints: Vec<core::schema::TypeConstraint> = Vec::new();
         for c in exclusive_constraints.unwrap_or_default().iter() {
@@ -907,6 +931,11 @@ impl TypeDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|t| t.inner.clone())
+                    .collect(),
+                signals: signals
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.inner.clone())
                     .collect(),
             },
         }
@@ -2069,6 +2098,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Pointer descriptors
     m.add_class::<RewriteEntry>()?;
+    m.add_class::<SignalEntry>()?;
     m.add_class::<TupleMember>()?;
     m.add_class::<PropertyDescriptor>()?;
     m.add_class::<LinkDescriptor>()?;

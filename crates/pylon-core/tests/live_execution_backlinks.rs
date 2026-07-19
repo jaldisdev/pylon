@@ -66,6 +66,7 @@ fn ty(
         search_indexes: vec![],
         triggers: vec![],
         junction: false,
+        signals: vec![],
     }
 }
 

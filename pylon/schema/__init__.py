@@ -59,7 +59,7 @@ from ._indexes import Index, SearchBackend, SearchPointer, SearchIndex, SearchMo
 from ._lazy import lazy
 from ._registry import snapshot as schema_snapshot
 from ._functions import Volatility, Language, function as function_decorator
-from ._triggers import On, Rewrite, Timing, Trigger
+from ._triggers import On, Rewrite, Timing, Trigger, signal as signal_decorator
 from ._meta import PointerMeta, PylonConfig
 from ._scalars import (
     JSON,
@@ -91,6 +91,7 @@ __all__ = [
     "enum",
     "scalar",
     "function_decorator",
+    "signal_decorator",
     # Functions
     "Volatility",
     "Language",
