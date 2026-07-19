@@ -673,7 +673,10 @@ def _to_jsonable(value: Any) -> Any:
         # formatter, which strips it after using it as a label) — the frontend's
         # JsonTree does that same label-vs-fields split itself, since it also
         # needs __pylon_type__ to look up real field types from /api/schema.
-        return {k: _to_jsonable(v) for k, v in attrs.items()}
+        # Every *other* __pylon_*-prefixed attribute (e.g. __pylon_saved__, the
+        # diffing shadow _decode sets for Client.save() — see query.py) is
+        # internal bookkeeping never meant to reach a response body at all.
+        return {k: _to_jsonable(v) for k, v in attrs.items() if k == "__pylon_type__" or not k.startswith("__pylon_")}
     if isinstance(value, NamedTupleValue):
         # A real tuple underneath, but the frontend's shape-driven rendering
         # expects named-tuple values keyed by field name (see shape_value_tags
