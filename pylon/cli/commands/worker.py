@@ -67,6 +67,7 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
 
     import pylon
     import pylon.query as _q
+    from pylon.schema._registry import signals_snapshot
 
     pylon.finalize()
     config = ctx.obj["config"]
@@ -83,8 +84,9 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
         for td in schema.types
         for si in td.search_indexes
     )
+    want_signals = bool(signals_snapshot())
 
-    if not providers and not want_opensearch and not want_meilisearch and not config.cache.enabled:
+    if not providers and not want_opensearch and not want_meilisearch and not config.cache.enabled and not want_signals:
         _print_error(
             "no index workers to start",
             "Add VectorIndex or SearchIndex(backend=...) to your schema, "
@@ -160,10 +162,22 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
             log.info("CacheInvalidationWorker started  channel=%s", NOTIFY_CHANNEL)
             tasks.append(run_cache_invalidation_worker(dsn, str(config.cache.path), config.cache.max_size_mb))
 
-        # Every worker now runs entirely in Rust — its connection and any
-        # HTTP client it owns are dropped along with the process, matching
-        # `worker start`'s own lifecycle (runs until interrupted). No
-        # Python-side cleanup needed.
+        if want_signals:
+            from pylon.signals import run_signal_dispatcher
+            # The one worker that isn't Rust-native — it needs to hold a
+            # live reference to each registered `@pylon.signal` handler,
+            # which only exists in this Python process.
+            log.info(
+                "Signal dispatcher started  batch_size=%d  poll_interval=%.0fs",
+                batch_size, poll_interval,
+            )
+            tasks.append(run_signal_dispatcher(dsn, batch_size=batch_size, poll_interval=poll_interval))
+
+        # Every Rust-native worker's connection and any HTTP client it owns
+        # are dropped along with the process, matching `worker start`'s own
+        # lifecycle (runs until interrupted). No Python-side cleanup needed
+        # there; the signal dispatcher's own connection is likewise dropped
+        # when its task is cancelled.
         await asyncio.gather(*tasks)
 
     try:
