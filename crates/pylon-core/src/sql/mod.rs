@@ -4628,12 +4628,30 @@ mod tests {
     }
 
     #[test]
-    fn test_unrelated_numeric_mismatch_still_rejected() {
-        // Loosening the datetime/duration case must not accidentally loosen
-        // unrelated type mismatches (e.g. decimal + int64 still needs an
-        // explicit cast, matching Gel's own exact-type-only arithmetic).
+    fn test_int_and_float_mix_is_allowed() {
+        // Every int width implicitly casts to every float width, so mixed
+        // int/float arithmetic type-checks without an explicit cast —
+        // Postgres's own operator resolution handles the actual promotion.
+        let out = compile_and_emit("SELECT <int16>1 + <float32>2.0");
+        assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_int_and_decimal_mix_is_allowed() {
+        // int64 -> bigint -> decimal is a separate implicit-cast branch
+        // from int64 -> float32 -> float64, but every int width still
+        // mixes with numeric/decimal directly.
+        let out = compile_and_emit("SELECT <int64>1 + <decimal>2.0");
+        assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_float_and_decimal_mix_still_rejected() {
+        // float and numeric/decimal are separate branches past int64 in
+        // the implicit-cast graph and don't cast to each other — this
+        // still needs an explicit cast.
         let schema = make_schema();
-        let ast = parse::parse("SELECT <decimal>$p + <int64>$n").unwrap();
+        let ast = parse::parse("SELECT <decimal>$p + <float64>$n").unwrap();
         match ir::compile(&ast, &schema) {
             Err(err) => assert!(format!("{err}").contains("cannot be applied"), "got: {err}"),
             Ok(_) => panic!("expected a compile error"),

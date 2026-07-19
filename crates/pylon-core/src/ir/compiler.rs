@@ -6505,7 +6505,20 @@ fn multirange_ctor_for_range_ctor(range_ctor: &str) -> Option<&'static str> {
 
 const INT_TYPES: &[&str] = &["int2", "int4", "int8", "__int_literal"];
 const FLOAT_TYPES: &[&str] = &["float4", "float8", "__float_literal"];
+/// Postgres `numeric` backs both Pylon's `bigint` and `decimal` (see
+/// `pg_type_for_scalar_name`) — Pylon doesn't distinguish them at the
+/// pg_type level, so this bucket covers both.
+const NUMERIC_TYPES: &[&str] = &["numeric"];
 
+/// Pylon's implicit-cast graph for numeric operands:
+/// `int16 → int32 → int64 → float32 → float64` on one branch and
+/// `int64 → bigint → decimal` on another — every int width casts to every
+/// float width and to numeric/decimal, but float and numeric/decimal don't
+/// cast to each other (they're separate branches past `int64`). Postgres's
+/// own operator resolution handles the actual mixed-type arithmetic once
+/// the compile-time gate lets it through (e.g. `int2 + float4` is a native
+/// Postgres operator) — this only needs to match which operand-type
+/// combinations are meant to be allowed.
 fn types_compatible(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -6517,7 +6530,15 @@ fn types_compatible(a: &str, b: &str) -> bool {
     }
     let a_float = FLOAT_TYPES.contains(&a);
     let b_float = FLOAT_TYPES.contains(&b);
-    a_float && b_float
+    if a_float && b_float {
+        return true;
+    }
+    let a_numeric = NUMERIC_TYPES.contains(&a);
+    let b_numeric = NUMERIC_TYPES.contains(&b);
+    if a_numeric && b_numeric {
+        return true;
+    }
+    (a_int && b_float) || (a_float && b_int) || (a_int && b_numeric) || (a_numeric && b_int)
 }
 
 /// Datetime/duration `+`/`-` pairs PostgreSQL supports natively (e.g.
