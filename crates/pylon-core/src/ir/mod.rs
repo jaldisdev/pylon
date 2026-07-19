@@ -348,6 +348,27 @@ pub enum IrMultiLinkJoin {
         /// Column on the junction table that references the target type's id.
         target_col: String,
     },
+    /// Reverse of a single (FK) link — the owner type's rows are correlated
+    /// directly by their FK column, no junction table involved. Still
+    /// many-valued (several owner rows can point at the same current row),
+    /// so this shares `IrMultiLinkPointer`'s array_agg-based emission
+    /// rather than the singular `IrShapePointer::Link` representation.
+    BacklinkFk {
+        /// FK column on the owner (sub-select) table, e.g. `org_id`.
+        fk_col: String,
+    },
+    /// Reverse of a multi-link — same junction table a forward `Standard`/
+    /// `Through` multi-link would use, but with the owner/current column
+    /// roles swapped: the sub-select's own rows correlate via `owner_col`,
+    /// the current (outer) row correlates via `current_col`.
+    BacklinkJunction {
+        junction_table: String,
+        module: String,
+        /// Junction column that references the owner (sub-select) type's id.
+        owner_col: String,
+        /// Junction column that references the current (outer) row's id.
+        current_col: String,
+    },
 }
 
 /// A computed pointer: an expression aliased to a name.
