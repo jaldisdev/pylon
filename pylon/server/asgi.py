@@ -692,6 +692,62 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
+def _mark_decimals(value: Any) -> Any:
+    """A tree mirroring _to_jsonable's own recursive structure (dataclass
+    fields, NamedTupleValue fields, list elements, dict values), `True` at
+    any position whose *raw* decoded value is a Decimal — must run against
+    the hydrated Python objects *before* _to_jsonable's own float(value)
+    conversion, since a Decimal and a float serialize identically once both
+    are whole numbers (there's nothing left in the JSON body itself to tell
+    them apart). Only needs row 0: which position holds a Decimal is a fact
+    about the compiled query's shape, the same for every row, not something
+    that varies row to row — see _merge_decimal_shape, which folds this
+    one-off tree into shape_value_tags' own output instead of shipping a
+    second, per-row structure to the frontend."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        attrs = getattr(value, "__dict__", None)
+        if attrs is None:
+            attrs = {f.name: getattr(value, f.name) for f in dataclasses.fields(value) if hasattr(value, f.name)}
+        return {k: _mark_decimals(v) for k, v in attrs.items()}
+    if isinstance(value, NamedTupleValue):
+        return {name: _mark_decimals(v) for name, v in zip(value._fields, value)}
+    if isinstance(value, (list, tuple)):
+        return [_mark_decimals(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _mark_decimals(v) for k, v in value.items()}
+    return isinstance(value, decimal.Decimal)
+
+
+def _merge_decimal_shape(shape_tag: Any, decimal_marker: Any) -> Any:
+    """Overlays _mark_decimals' per-position True/False onto an already-built
+    shape_value_tags tree, upgrading a scalar position with no tag at all
+    (shape_tag is None) to {"kind": "decimal"} wherever the runtime value
+    there is actually a Decimal — the only way to carry that signal for a
+    position with no schema pointer behind it (a bare cast, or arithmetic
+    over one) to base a static tag on. Leaves every other position (a real
+    tag already resolved some other way, or genuinely not a Decimal) as-is.
+    Recursion is driven entirely by shape_tag's own existing keys/positions
+    (decimal_marker is only ever consulted as a lookup) — walking
+    decimal_marker's own keys instead would leak internal bookkeeping
+    attributes the decoded value carries (__pylon_type__ and friends) into
+    "pointers", which only ever holds real schema pointer names."""
+    if isinstance(shape_tag, dict) and shape_tag.get("kind") == "object":
+        pointers = {
+            k: _merge_decimal_shape(v, decimal_marker.get(k) if isinstance(decimal_marker, dict) else None)
+            for k, v in shape_tag["pointers"].items()
+        }
+        return {**shape_tag, "pointers": pointers}
+    if isinstance(shape_tag, dict) and shape_tag.get("kind") == "array":
+        # An array's shape tag describes one element uniformly — merge
+        # against the first item only, same "row 0 is representative" logic
+        # _mark_decimals itself relies on.
+        element_marker = decimal_marker[0] if isinstance(decimal_marker, list) and decimal_marker else None
+        return {**shape_tag, "element": _merge_decimal_shape(shape_tag.get("element"), element_marker)}
+    if shape_tag is None and decimal_marker is True:
+        return {"kind": "decimal"}
+    return shape_tag
+
+
 def _pylon_error_payload(exc: PylonError) -> dict[str, Any]:
     """Structured error info for JSON API responses — the plain message,
     the real exception class name, and (when the Rust transpiler attached
@@ -763,6 +819,8 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
                 allow_user_specified_id=bool(config_options.get("allow_user_specified_id", False)),
             ).shape
         )
+        if objects:
+            shape = _merge_decimal_shape(shape, _mark_decimals(objects[0]))
     except PylonError:
         pass
 
