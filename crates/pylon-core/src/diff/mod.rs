@@ -1288,6 +1288,26 @@ fn diff_inner(
             }
         }
 
+        // `@pylon.signal` capture triggers — only for types with a
+        // non-empty `signals` list (see `export::signal_trigger_infos`).
+        // Adding/removing a signal handler changes the combined `on=`
+        // bitmask the walker attaches to the schema, so this naturally
+        // adds/drops the trigger on the next migration, same as any other
+        // schema change — no separate sync step needed.
+        for info in crate::export::signal_trigger_infos(target) {
+            let table_key = (info.table_module.clone(), info.table_name.clone());
+            expected_trigger_map.entry(table_key).or_default()
+                .insert(info.trigger_name.clone());
+
+            let cur = cur_trigger_map
+                .get(&(info.table_module.as_str(), info.table_name.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            if !cur.contains(info.trigger_name.as_str()) {
+                push_tx(&mut ops, info.ddl.clone());
+            }
+        }
+
         // Cache-invalidation trigger — every concrete table and every
         // multi-link junction table, unconditionally (not gated by
         // `[cache].enabled`; see the cache layer plan's design decision).

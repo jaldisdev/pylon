@@ -38,6 +38,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_link_source_triggers(schema, &type_map, &mut out);
     emit_junction_tables(schema, &type_map, &mut out);
     emit_multilink_deletion_triggers(schema, &type_map, &mut out);
+    emit_signal_triggers(schema, &mut out);
     emit_unique_indexes(schema, &mut out);
     emit_check_constraints(schema, &mut out);
     emit_plain_indexes(schema, &mut out);
@@ -369,6 +370,35 @@ fn emit_after_delete_trigger(
     ));
 }
 
+/// Like `emit_after_delete_trigger`, but fires on `events` (e.g.
+/// `"INSERT OR DELETE"`) — used for the `@pylon.signal` capture trigger
+/// (`signal_trigger_infos`), scoped to exactly the operations at least one
+/// registered handler cares about, so a type with only an `On.Insert`
+/// handler doesn't pay for capturing (and draining) Update/Delete rows
+/// nobody asked for. `TG_OP` inside the body still distinguishes which of
+/// `events` actually fired.
+fn emit_after_mutation_trigger(
+    fn_qname: &str,
+    trigger_name: &str,
+    table_qname: &str,
+    events: &str,
+    body: &str,
+    out: &mut String,
+) {
+    out.push_str(&format!(
+        "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+         RETURNS trigger LANGUAGE plpgsql AS $$\n\
+         BEGIN\n"
+    ));
+    out.push_str(body);
+    out.push_str(&format!(
+        "\n    RETURN NULL;\nEND;\n$$;\n\n\
+         CREATE TRIGGER {trigger_name}\n\
+         AFTER {events} ON {table_qname}\n\
+         FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n"
+    ));
+}
+
 // ── Phase 5.5: source-side deletion triggers for single links ──────────────────
 
 /// Structured description of one deletion-policy trigger (either a
@@ -581,6 +611,66 @@ pub fn deletion_policy_trigger_infos(schema: &SchemaDescriptor, type_map: &HashM
     let mut result = link_source_trigger_infos(schema, type_map);
     result.extend(multilink_deletion_trigger_infos(schema, type_map));
     result
+}
+
+// ── Post-commit signal capture triggers ─────────────────────────────────────────
+
+/// One capture trigger per concrete type with at least one `@pylon.signal`
+/// handler registered — `td.signals` non-empty is the only condition, so a
+/// type nobody's listening to gets no trigger and pays no per-mutation
+/// cost. Fires on every operation; the function body itself uses `TG_OP`
+/// to decide what to populate. Public entry point for `diff/mod.rs`,
+/// mirroring `deletion_policy_trigger_infos`.
+pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInfo> {
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if t.abstract_ || t.junction || t.signals.is_empty() { continue; }
+
+        let qname = format!("{}::{}", t.module, t.name);
+        let qname_literal = format!("'{}'", qname.replace('\'', "''"));
+        let hash = fnv(&[&t.table, "signal"]);
+        let fname = format!("{}_signal_{}", t.table, &hash[..8]);
+        let fn_qname = qn(&t.module, &fname);
+        let tbl_qname = qn(&t.module, &t.table);
+
+        // Scope the trigger's event list to exactly the operations at
+        // least one registered handler cares about (On.Insert=1,
+        // On.Update=2, On.Delete=4) — a type with only an On.Insert
+        // handler shouldn't also capture (and force the dispatcher to
+        // drain) Update/Delete rows nobody asked for.
+        let combined_on = t.signals.iter().fold(0u8, |acc, s| acc | s.on);
+        let mut events = Vec::new();
+        if combined_on & 1 != 0 { events.push("INSERT"); }
+        if combined_on & 2 != 0 { events.push("UPDATE"); }
+        if combined_on & 4 != 0 { events.push("DELETE"); }
+        let events_str = events.join(" OR ");
+
+        let body = format!(
+            "    INSERT INTO _pylon.\"SignalOutbox\" (type_name, operation, old_row, new_row)\n    \
+             VALUES (\n        \
+             {qname_literal},\n        \
+             TG_OP,\n        \
+             CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN to_jsonb(OLD) ELSE NULL END,\n        \
+             CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN to_jsonb(NEW) ELSE NULL END\n    \
+             );"
+        );
+
+        let mut ddl = String::new();
+        emit_after_mutation_trigger(&fn_qname, &qi(&fname), &tbl_qname, &events_str, &body, &mut ddl);
+        result.push(DeletionTriggerInfo {
+            table_module: t.module.clone(),
+            table_name: t.table.clone(),
+            trigger_name: fname,
+            ddl,
+        });
+    }
+    result
+}
+
+fn emit_signal_triggers(schema: &SchemaDescriptor, out: &mut String) {
+    for info in signal_trigger_infos(schema) {
+        out.push_str(&info.ddl);
+    }
 }
 
 // ── Phase 7: unique indexes ────────────────────────────────────────────────────
@@ -1554,6 +1644,33 @@ mod tests {
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("AFTER DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
         assert!(!ddl.contains("BEFORE DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
+    }
+
+    // ── @pylon.signal capture triggers ──────────────────────────────────────────
+
+    #[test]
+    fn test_type_with_a_signal_gets_a_capture_trigger() {
+        use crate::schema::SignalEntry;
+        let mut with_signal = person_type();
+        with_signal.signals = vec![SignalEntry { on: 5 }]; // Insert | Delete
+        let schema = SchemaDescriptor {
+            types: vec![with_signal],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""), "got:\n{ddl}");
+        assert!(ddl.contains("_pylon.\"SignalOutbox\""), "got:\n{ddl}");
+        assert!(ddl.contains("'default::Person'"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_type_without_a_signal_gets_no_capture_trigger() {
+        // person_type()'s default fixture has an empty `signals` list —
+        // no trigger, no per-mutation cost, for types nobody's listening to.
+        let schema = minimal_schema(vec![]);
+        let ddl = export_schema(&schema).unwrap();
+        assert!(!ddl.contains("SignalOutbox"), "got:\n{ddl}");
     }
 }
 

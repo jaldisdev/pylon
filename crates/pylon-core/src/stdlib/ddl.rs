@@ -171,6 +171,46 @@ pub const INDEX_OUTBOX_DDL: &str = concat!(
     "    FOR EACH ROW EXECUTE FUNCTION _pylon.notify_index_queue();\n",
 );
 
+/// DDL for the `_pylon."SignalOutbox"` table and its supporting types.
+///
+/// Emitted once, at schema-bootstrap time, before any user-schema DDL —
+/// same shape as `INDEX_OUTBOX_DDL`, but every mutation is a distinct
+/// event to deliver rather than a coalescible rebuild job, so there's no
+/// `UNIQUE`/`ON CONFLICT` target here. `old_row`/`new_row` are populated by
+/// a per-type capture trigger (see `export::signal_trigger_infos`) —
+/// `to_jsonb(OLD)`/`to_jsonb(NEW)` of the mutated row, which is exactly the
+/// type's own stored properties and single-link FK columns (neither a
+/// computed pointer nor a multilink has a backing column to capture).
+pub const SIGNAL_OUTBOX_DDL: &str = concat!(
+    "DO $$ BEGIN\n",
+    "    CREATE TYPE _pylon.\"SignalOutboxStatus\" AS ENUM ('Pending', 'Processing', 'Failed');\n",
+    "EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n\n",
+    "CREATE TABLE IF NOT EXISTS _pylon.\"SignalOutbox\" (\n",
+    "    id            uuid        NOT NULL DEFAULT uuidv7(),\n",
+    "    type_name     text        NOT NULL,\n",
+    "    operation     text        NOT NULL,\n",
+    "    old_row       jsonb,\n",
+    "    new_row       jsonb,\n",
+    "    status        _pylon.\"SignalOutboxStatus\" NOT NULL DEFAULT 'Pending',\n",
+    "    attempts      int         NOT NULL DEFAULT 0,\n",
+    "    enqueued_at   timestamptz NOT NULL DEFAULT now(),\n",
+    "    next_attempt  timestamptz,\n",
+    "    PRIMARY KEY (id)\n",
+    ");\n\n",
+    "CREATE INDEX IF NOT EXISTS \"SignalOutbox_status_next_attempt\" ON _pylon.\"SignalOutbox\" (status, next_attempt)\n",
+    "    WHERE status IN ('Pending', 'Failed');\n\n",
+    "CREATE OR REPLACE FUNCTION _pylon.notify_signal_queue()\n",
+    "    RETURNS trigger LANGUAGE plpgsql AS $$\n",
+    "BEGIN\n",
+    "    PERFORM pg_notify('pylon_signal_queue', NEW.id::text);\n",
+    "    RETURN NEW;\n",
+    "END\n",
+    "$$;\n\n",
+    "CREATE OR REPLACE TRIGGER notify_signal_queue\n",
+    "    AFTER INSERT ON _pylon.\"SignalOutbox\"\n",
+    "    FOR EACH ROW EXECUTE FUNCTION _pylon.notify_signal_queue();\n",
+);
+
 /// DDL for the cache-invalidation notify function.
 ///
 /// One statement-level trigger per user table (attached in the diff/export
@@ -216,6 +256,8 @@ pub fn export_stdlib() -> String {
     let mut out = String::from("CREATE SCHEMA IF NOT EXISTS _pylon;\n\n");
 
     out.push_str(INDEX_OUTBOX_DDL);
+    out.push('\n');
+    out.push_str(SIGNAL_OUTBOX_DDL);
     out.push('\n');
     out.push_str(MIGRATION_TRACKING_DDL);
     out.push('\n');
