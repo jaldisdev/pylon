@@ -393,7 +393,7 @@ fn emit_after_mutation_trigger(
     out.push_str(body);
     out.push_str(&format!(
         "\n    RETURN NULL;\nEND;\n$$;\n\n\
-         CREATE TRIGGER {trigger_name}\n\
+         CREATE OR REPLACE TRIGGER {trigger_name}\n\
          AFTER {events} ON {table_qname}\n\
          FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n"
     ));
@@ -622,6 +622,8 @@ pub fn deletion_policy_trigger_infos(schema: &SchemaDescriptor, type_map: &HashM
 /// to decide what to populate. Public entry point for `diff/mod.rs`,
 /// mirroring `deletion_policy_trigger_infos`.
 pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInfo> {
+    use crate::schema::SearchBackend;
+
     let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction || t.signals.is_empty() { continue; }
@@ -645,8 +647,39 @@ pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInf
         if combined_on & 4 != 0 { events.push("DELETE"); }
         let events_str = events.join(" OR ");
 
+        // Columns that hold Pylon-maintained index state rather than
+        // actual business data — a `VectorIndex`'s embedding column (an
+        // ordinary column the vector worker writes back to asynchronously
+        // after re-embedding, confirmed live: an unrelated property update
+        // enqueues a re-embed job, and the worker's own `UPDATE` on that
+        // column fires this same trigger a second time) and a Postgres
+        // `SearchIndex`'s generated tsvector column (always recomputed in
+        // lock-step with the columns it's derived from, so excluding it
+        // never masks a real change, it's just consistent with the vector
+        // case). Skipping these keeps a signal handler's `UPDATE` firing
+        // scoped to changes a caller actually made, not Pylon's own
+        // index-maintenance side effects on the same row.
+        let index_cols: Vec<String> = t.vector_indexes.iter().map(|vi| vi.column_name())
+            .chain(t.search_indexes.iter()
+                .filter(|si| si.backend == SearchBackend::Postgres)
+                .map(|si| si.column_name()))
+            .collect();
+
+        let update_guard = if combined_on & 2 != 0 && !index_cols.is_empty() {
+            let strip: String = index_cols.iter()
+                .map(|c| format!(" - '{}'", c.replace('\'', "''")))
+                .collect();
+            format!(
+                "    IF TG_OP = 'UPDATE' AND (to_jsonb(OLD){strip}) = (to_jsonb(NEW){strip}) THEN\n        \
+                 RETURN NULL;\n    \
+                 END IF;\n"
+            )
+        } else {
+            String::new()
+        };
+
         let body = format!(
-            "    INSERT INTO _pylon.\"SignalOutbox\" (type_name, operation, old_row, new_row)\n    \
+            "{update_guard}    INSERT INTO _pylon.\"SignalOutbox\" (type_name, operation, old_row, new_row)\n    \
              VALUES (\n        \
              {qname_literal},\n        \
              TG_OP,\n        \
@@ -1671,6 +1704,53 @@ mod tests {
         let schema = minimal_schema(vec![]);
         let ddl = export_schema(&schema).unwrap();
         assert!(!ddl.contains("SignalOutbox"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_signal_update_capture_skips_index_maintenance_only_changes() {
+        // A type with a VectorIndex or Postgres SearchIndex gets an async
+        // write-back to its embedding/tsvector column (the vector worker's
+        // own `UPDATE`, confirmed live) that shouldn't itself look like a
+        // caller-made mutation to a signal handler — the generated trigger
+        // function must skip firing when OLD/NEW only differ in those
+        // index-maintenance columns.
+        use crate::schema::{SignalEntry, VectorIndexDescriptor};
+        let mut with_signal = person_type();
+        with_signal.signals = vec![SignalEntry { on: 2 }]; // Update
+        with_signal.vector_indexes = vec![VectorIndexDescriptor {
+            index_name: None,
+            pointers: vec!["name".into()],
+            model: "mistral-embed".into(),
+            metric: "cosine".into(),
+            dimensions: 1024,
+        }];
+        let schema = SchemaDescriptor {
+            types: vec![with_signal],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) - '__vector__') = (to_jsonb(NEW) - '__vector__') THEN"),
+            "got:\n{ddl}"
+        );
+        assert!(ddl.contains("RETURN NULL;\n    END IF;"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_signal_update_capture_has_no_guard_without_an_index() {
+        // person_type() has no vector/search indexes — nothing to exclude,
+        // so the trigger body shouldn't carry the extra jsonb-diff guard.
+        use crate::schema::SignalEntry;
+        let mut with_signal = person_type();
+        with_signal.signals = vec![SignalEntry { on: 2 }]; // Update
+        let schema = SchemaDescriptor {
+            types: vec![with_signal],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+        assert!(!ddl.contains("IF TG_OP = 'UPDATE'"), "got:\n{ddl}");
     }
 }
 

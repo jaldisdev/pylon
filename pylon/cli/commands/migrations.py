@@ -434,7 +434,7 @@ def _reload_schema(config):
             )
         importlib.import_module(stem)
 
-    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot
+    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot, signals_snapshot
     types, enums, custom_scalars = snapshot()
     globals_: list = []
     for py_file in sorted(schema_dir.glob("*.py")):
@@ -449,6 +449,7 @@ def _reload_schema(config):
         globals_,
         functions=functions_snapshot(),
         named_tuples=named_tuples_snapshot(),
+        signals=signals_snapshot(),
     )
     return schema
 

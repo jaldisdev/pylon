@@ -418,6 +418,24 @@ mod tests {
         format!("{prefix}_{nanos}")
     }
 
+    /// Every test in this module runs against the same shared,
+    /// non-isolated `_pylon."Migrations"` table (unlike the rest of the
+    /// live-execution suite, which gets a fresh schema per test via
+    /// `unique_module()` — there's no equivalent scoping for this
+    /// process-wide tracking table). Any test that records a tracking row
+    /// must delete it again here, or it permanently pollutes whatever
+    /// database `PYLON_PGCON_TEST_DSN` points at (this defaults to the
+    /// same DSN pylon-demo uses, and a stray row here can shadow a real
+    /// project's actual migration tip).
+    async fn cleanup_migration_row(pool: &PgPool, id: &str) {
+        pool.execute_typed(
+            r#"DELETE FROM _pylon."Migrations" WHERE id = $1"#,
+            &[CachedValue::Str(id.to_string())],
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     #[ignore]
     async fn ensure_tracking_tables_is_idempotent() {
@@ -482,6 +500,8 @@ mod tests {
         assert!(row.applied);
         assert_eq!(row.onto, "initial");
         assert_eq!(row.db_state, None, "db_state is only ever set separately, by `migration create`'s own UPDATE");
+
+        cleanup_migration_row(&pool, &m.id).await;
     }
 
     #[tokio::test]
@@ -503,6 +523,8 @@ mod tests {
         // Raw text, not a decoded CachedValue::Object tree — `db_state_from_json`
         // (the pyo3-exposed consumer) re-parses this string itself.
         assert_eq!(row.db_state.as_deref(), Some(r#"{"schemas": ["default"]}"#));
+
+        cleanup_migration_row(&pool, &m.id).await;
     }
 
     #[tokio::test]
@@ -529,6 +551,8 @@ mod tests {
                 .await
                 .unwrap();
         assert!(progress.is_empty(), "progress row must be cleared after a successful multi-step apply");
+
+        cleanup_migration_row(&pool, &m.id).await;
     }
 
     #[tokio::test]
@@ -549,6 +573,8 @@ mod tests {
         let rows =
             pool.query_typed(&format!("SELECT (1) AS result FROM {t2}"), &[], &pylon_pgcon::ExtensionOids::default()).await;
         assert!(rows.is_ok(), "step 1 should have run");
+
+        cleanup_migration_row(&pool, &m.id).await;
     }
 
     #[tokio::test]
@@ -564,6 +590,8 @@ mod tests {
 
         let tracking = read_tracking(&pool).await.unwrap();
         assert!(tracking.iter().any(|r| r.id == m.id && r.applied), "still recorded applied despite the swallowed error");
+
+        cleanup_migration_row(&pool, &m.id).await;
     }
 
     #[tokio::test]
@@ -588,6 +616,8 @@ mod tests {
 
         let tracking = read_tracking(&pool).await.unwrap();
         assert!(tracking.iter().any(|r| r.id == m.id && r.applied));
+
+        cleanup_migration_row(&pool, &m.id).await;
     }
 
     #[tokio::test]
