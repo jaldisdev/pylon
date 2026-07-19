@@ -3572,6 +3572,29 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 }
+                // `alias := .<backlink[is Type]` (no shape) → a backlink
+                // used as a computed pointer.
+                if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
+                    let current_qname = format!("{}::{}", td.module, td.name);
+                    return self.compile_backlink_pointer(pointer_name, p, &current_qname, &[]);
+                }
+            }
+            // `alias := .<backlink[is Type] { shape }` — the parser's `:=`
+            // grammar always parses the RHS as a single expression
+            // (`parse_expr`), which greedily folds a trailing `{ }` into
+            // the expression itself as `Expr::Shape` rather than into
+            // `el.nested` (that field is only ever populated by the
+            // separate no-`:=` "bare inclusion with nested shape" parse
+            // path — see `parse_shape_element`). So the shape case has to
+            // be unwrapped here rather than read off `el.nested` the way
+            // `compile_multilink_pointer`'s bare (non-computed) call site does.
+            if let Expr::Shape(sh) = compexpr {
+                if let Some(Expr::Path(p)) = &sh.expr {
+                    if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
+                        let current_qname = format!("{}::{}", td.module, td.name);
+                        return self.compile_backlink_pointer(pointer_name, p, &current_qname, &sh.elements);
+                    }
+                }
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
             // Cross-scope TypeIs: promote to set-valued shape pointer.
@@ -3768,6 +3791,111 @@ impl<'a> Compiler<'a> {
             join,
             subquery,
             link_properties,
+        }))
+    }
+
+    /// Compile `pointer := .<backlink_name[is OwnerType] { shape }` (a
+    /// backlink used as a computed pointer inside another type's shape —
+    /// the missing piece that made backlinks unusable for anything beyond
+    /// `filter exists .<...>`). Mirrors `compile_multilink_pointer`'s
+    /// shape/subquery construction, but the owner type's rows are
+    /// correlated in reverse: via their own FK column for a single-link
+    /// backlink source (`IrMultiLinkJoin::BacklinkFk`), or via the same
+    /// junction table a forward multi-link would use with the owner/current
+    /// column roles swapped (`IrMultiLinkJoin::BacklinkJunction`).
+    fn compile_backlink_pointer(
+        &mut self,
+        output_alias: &str,
+        path: &ast::Path,
+        current_qname: &str,
+        nested_elements: &[ShapeElement],
+    ) -> Result<IrShapePointer, PyQLError> {
+        use ast::PathStep;
+
+        let backlink_name = match path.steps.first() {
+            Some(PathStep::Backlink(n)) => n.clone(),
+            _ => return Err(self.type_err("internal: expected backlink step")),
+        };
+        let type_ref = match path.steps.get(1) {
+            Some(PathStep::TypeIntersection(tr)) => tr,
+            _ => return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "backlink '.< {backlink_name}' requires a type intersection, \
+                     e.g.: .< {backlink_name}[is SomeType]"
+                ),
+                position: Position { line: 0, col: 0 },
+            })),
+        };
+        if path.steps.len() > 2 {
+            return Err(self.type_err(
+                "further path traversal after a backlink shape is not yet supported \
+                 (e.g. '.<link[is Type].property') — attach a nested shape instead: \
+                 '.<link[is Type] { property }'",
+            ));
+        }
+
+        let type_name = match &type_ref.module {
+            Some(m) => format!("{}::{}", m, type_ref.name),
+            None => type_ref.name.clone(),
+        };
+        let owner_td = self.resolve_type(&type_name)?;
+        let owner_qname = format!("{}::{}", owner_td.module, owner_td.name);
+
+        let join = if owner_td.links.iter().any(|l| l.name == backlink_name && l.target == current_qname) {
+            IrMultiLinkJoin::BacklinkFk { fk_col: format!("{}_id", backlink_name) }
+        } else if let Some(ml) = owner_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname) {
+            let (junction_table, module) = match &ml.through {
+                Some(through_qname) => {
+                    let through_td = self.resolve_type(through_qname)?;
+                    (through_td.table.clone(), through_td.module.clone())
+                }
+                None => (format!("{}.{}", owner_td.table, ml.name), owner_td.module.clone()),
+            };
+            IrMultiLinkJoin::BacklinkJunction {
+                junction_table,
+                module,
+                owner_col: "source".to_string(),
+                current_col: "target".to_string(),
+            }
+        } else {
+            return Err(PyQLError::Type(PyQLTypeError {
+                message: format!(
+                    "type {} has no link or multi-link '{}' pointing to {}",
+                    owner_qname, backlink_name, current_qname,
+                ),
+                position: Position { line: 0, col: 0 },
+            }));
+        };
+
+        let sub_alias = self.fresh_alias();
+        let sub_shape = self.compile_shape(nested_elements, owner_td, &sub_alias, &owner_td.module.clone())?;
+
+        // No filter/order_by/offset/limit here: the `pointer := expr`
+        // grammar (`parse_shape_element`'s `:=` branch) never parses
+        // trailing FILTER/ORDER BY/OFFSET/LIMIT after the RHS expression —
+        // those per-link modifiers only exist on the separate no-`:=`
+        // "bare inclusion with nested shape" parse path that
+        // `compile_multilink_pointer`'s other call site reads `el.filter`
+        // etc. from.
+        let subquery = IrSelect {
+            rows: vec![IrRowSource::Bound {
+                source: IrSource { type_name: owner_qname, table: owner_td.table.clone(), alias: sub_alias.clone() },
+                shape: sub_shape,
+            }],
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct: false,
+            dml_source: None,
+            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+        };
+
+        Ok(IrShapePointer::MultiLink(IrMultiLinkPointer {
+            alias: output_alias.to_string(),
+            join,
+            subquery,
+            link_properties: vec![],
         }))
     }
 
@@ -4815,34 +4943,74 @@ impl<'a> Compiler<'a> {
         let target_td = self.resolve_type(&type_name)?;
         let target_qname = format!("{}::{}", target_td.module, target_td.name);
         let target_table = target_td.table.clone();
+        let t_alias = self.fresh_alias();
 
-        // Verify target has a link named `backlink_name` pointing to the current type.
-        if !target_td.links.iter().any(|l| l.name == backlink_name && l.target == current_qname) {
+        // Backlink source is either a single (FK) link or a multi-link
+        // (junction table) on the target type — mirrors the equivalent
+        // link-vs-multilink resolution the general shape-position backlink
+        // code already does (see the `PathStep::Backlink` handling above in
+        // `compile_path_expr`/similar), which this filter/exists-specific
+        // path previously didn't: it only ever checked `target_td.links`,
+        // so a self-referential-multilink backlink like `Person.friends`
+        // failed to compile here even though it worked in a shape position.
+        let join_cond = if target_td.links.iter().any(|l| l.name == backlink_name && l.target == current_qname) {
+            let fk_col = format!("{}_id", backlink_name);
+            // Join condition: target.fk_col = current.id
+            IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: t_alias.clone(),
+                    column: fk_col,
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef {
+                    alias: alias.to_string(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+            }))
+        } else if let Some(ml) = target_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname) {
+            // Junction row connects t_alias (as the multi-link's owner/
+            // "source") to the current row (as its "target") — no direct FK
+            // column on either table, so this is a nested EXISTS over the
+            // junction table rather than a simple column comparison.
+            let (jt_table, jt_module) = match &ml.through {
+                Some(through_qname) => {
+                    let through_td = self.resolve_type(through_qname)?;
+                    (through_td.table.clone(), through_td.module.clone())
+                }
+                None => (format!("{}.{}", target_td.table, ml.name), target_td.module.clone()),
+            };
+            let jt_alias = self.fresh_alias();
+            IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                op: ast::UnaryOpKind::Exists,
+                operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                    IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias.clone() },
+                    vec![],
+                    Some(IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::BinOp(Box::new(IrBinOp {
+                            left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: "source".to_string(), pg_type: "uuid".to_string() },
+                            op: ast::BinOpKind::Eq,
+                            right: IrExpr::ColumnRef { alias: t_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                        })),
+                        op: ast::BinOpKind::And,
+                        right: IrExpr::BinOp(Box::new(IrBinOp {
+                            left: IrExpr::ColumnRef { alias: jt_alias, column: "target".to_string(), pg_type: "uuid".to_string() },
+                            op: ast::BinOpKind::Eq,
+                            right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                        })),
+                    }))),
+                ))),
+            }))
+        } else {
             return Err(PyQLError::Type(PyQLTypeError {
                 message: format!(
-                    "type {} has no link '{}' pointing to {}",
+                    "type {} has no link or multi-link '{}' pointing to {}",
                     target_qname, backlink_name, current_qname,
                 ),
                 position: Position { line: 0, col: 0 },
             }));
-        }
-        let fk_col = format!("{}_id", backlink_name);
-        let t_alias = self.fresh_alias();
-
-        // Join condition: target.fk_col = current.id
-        let join_cond = IrExpr::BinOp(Box::new(IrBinOp {
-            left: IrExpr::ColumnRef {
-                alias: t_alias.clone(),
-                column: fk_col,
-                pg_type: "uuid".to_string(),
-            },
-            op: ast::BinOpKind::Eq,
-            right: IrExpr::ColumnRef {
-                alias: alias.to_string(),
-                column: "id".to_string(),
-                pg_type: "uuid".to_string(),
-            },
-        }));
+        };
 
         let rest = &steps[2..];
         let tail_cond = self.compile_backlink_tail(rest, comparison, &target_qname, &t_alias)?;

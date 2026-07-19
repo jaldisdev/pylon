@@ -704,6 +704,12 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
                     (qn(module, junction_table), "source".to_string(), "target".to_string()),
                 IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } =>
                     (qn(module, junction_table), source_col.clone(), target_col.clone()),
+                // A forward `IrPathJoin::Multi` step is always built from a
+                // real multi-link (`compile_path_select`'s middle-step
+                // handling), never a backlink — the Backlink* variants only
+                // ever appear inside `IrShapePointer::MultiLink.join`.
+                IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } =>
+                    unreachable!("a forward multi-link path step never uses a backlink join variant"),
             };
             format!(
                 " JOIN {} AS {} ON {}.{} = {}.\"id\" JOIN {} AS {} ON {}.{} = {}.\"id\"",
@@ -1117,6 +1123,9 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
                             qi(&target.alias), qi(junction_alias), qi(target_col),
                         ));
                     }
+                    // See the identical comment in `emit_path_join_sql` above.
+                    IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } =>
+                        unreachable!("a forward multi-link path step never uses a backlink join variant"),
                 }
             }
             IrPathJoin::BacklinkSingle { source_alias, fk_col, target } => {
@@ -2165,6 +2174,29 @@ fn emit_multi_link(
                 qi(target_col),
             );
             let cond = format!("\"jt\".{} = {}.id", qi(source_col), qi(parent_alias));
+            (from, cond)
+        }
+        // Reverse of a single link: no junction table, the owner
+        // (sub-select) rows are correlated directly by their own FK column.
+        IrMultiLinkJoin::BacklinkFk { fk_col } => {
+            let from = format!("FROM {} AS {}", source_ref(source), qi(sub_alias));
+            let cond = format!("{}.{} = {}.id", qi(sub_alias), qi(fk_col), qi(parent_alias));
+            (from, cond)
+        }
+        // Reverse of a multi-link: same junction table shape as `Standard`/
+        // `Through`, with the owner/current column roles swapped — the
+        // sub-select's own rows join via `owner_col`, the outer (current)
+        // row correlates via `current_col`.
+        IrMultiLinkJoin::BacklinkJunction { junction_table, module, owner_col, current_col } => {
+            let from = format!(
+                "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
+                qn(module, junction_table),
+                source_ref(source),
+                qi(sub_alias),
+                qi(sub_alias),
+                qi(owner_col),
+            );
+            let cond = format!("\"jt\".{} = {}.id", qi(current_col), qi(parent_alias));
             (from, cond)
         }
     };
@@ -4688,6 +4720,39 @@ mod tests {
             }
             Ok(_) => panic!("expected a compile error"),
         }
+    }
+
+    #[test]
+    fn test_multilink_sourced_backlink_exists_filter_compiles() {
+        // Regression for a gap live-execution testing caught: `filter exists
+        // .<multilink[is Type]` (a backlink whose source pointer on the
+        // target type is a multi-link, e.g. `Person.posts`, not a single
+        // FK link) used to fail to compile with "has no link ... pointing
+        // to" — `compile_backlink_as_exists` only ever checked
+        // `target_td.links`, never `target_td.multilinks`. Fast SQL-text
+        // companion to the live-execution test in
+        // `tests/live_execution_backlinks.rs`, which additionally confirms
+        // the emitted SQL returns the right rows.
+        let out = compile_and_emit("SELECT Post filter exists .<posts[is Person]");
+        assert!(out.sql.contains("EXISTS"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_backlink_as_computed_shape_pointer_compiles() {
+        // Regression for the bigger gap live-execution testing caught: a
+        // backlink could only be used in `filter exists .<...>` — using one
+        // to select/project actual objects as a computed pointer's value
+        // (`authors := .<posts[is Person] { name }`) failed to compile at
+        // all ("shapes and set literals are not valid in expression
+        // context"). `compile_shape_element`'s computed-pointer dispatch
+        // now recognizes a backlink-rooted `Expr::Shape`/`Expr::Path` RHS
+        // and routes it through `compile_backlink_pointer`, mirroring
+        // `compile_multilink_pointer` for the forward direction. Fast
+        // SQL-text companion to the live-execution tests in
+        // `tests/live_execution_backlinks.rs`, which additionally confirm
+        // the emitted SQL returns the right rows, nested 2 levels deep.
+        let out = compile_and_emit("SELECT Post { title, authors := .<posts[is Person] { name } }");
+        assert!(out.sql.contains("array_agg(ROW("), "got:\n{}", out.sql);
     }
 
     #[test]

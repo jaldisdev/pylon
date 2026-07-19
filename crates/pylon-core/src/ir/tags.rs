@@ -270,9 +270,13 @@ fn collect_shape_pointer(p: &IrShapePointer, tags: &mut Vec<String>) {
             collect_select(&ml.subquery, tags);
             match &ml.join {
                 IrMultiLinkJoin::Standard { junction_table, module }
-                | IrMultiLinkJoin::Through { junction_table, module, .. } => {
+                | IrMultiLinkJoin::Through { junction_table, module, .. }
+                | IrMultiLinkJoin::BacklinkJunction { junction_table, module, .. } => {
                     tags.push(qualify(module, junction_table));
                 }
+                // No junction table involved — the owner table's own tag
+                // already comes from `collect_select(&ml.subquery, tags)` above.
+                IrMultiLinkJoin::BacklinkFk { .. } => {}
             }
         }
         IrShapePointer::Computed(c) => collect_expr(&c.expr, tags),
