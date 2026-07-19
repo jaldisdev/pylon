@@ -1267,6 +1267,27 @@ fn diff_inner(
             }
         }
 
+        // Deletion-policy triggers (single-link Source-side DeleteTarget/
+        // DeleteTargetIfOrphan, multilink Source-side same, multilink
+        // Target-side DeleteSource) — previously only `export_schema`'s
+        // fresh-install path emitted these; the incremental migration path
+        // silently never did, so these `on_delete` policies never took
+        // effect for anything added via a real migration (confirmed live,
+        // `tests/live_execution_on_delete.rs`, before this fix).
+        for info in crate::export::deletion_policy_trigger_infos(target, &type_map) {
+            let table_key = (info.table_module.clone(), info.table_name.clone());
+            expected_trigger_map.entry(table_key).or_default()
+                .insert(info.trigger_name.clone());
+
+            let cur = cur_trigger_map
+                .get(&(info.table_module.as_str(), info.table_name.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            if !cur.contains(info.trigger_name.as_str()) {
+                push_tx(&mut ops, info.ddl.clone());
+            }
+        }
+
         // Cache-invalidation trigger — every concrete table and every
         // multi-link junction table, unconditionally (not gated by
         // `[cache].enabled`; see the cache layer plan's design decision).
