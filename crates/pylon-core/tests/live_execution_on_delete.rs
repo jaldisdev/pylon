@@ -22,6 +22,7 @@
 mod common;
 
 use common::*;
+use pylon_core::diff::{diff_schema, DbState};
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{DeleteAction, DeleteSide, MultiLinkDescriptor, OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
@@ -410,4 +411,55 @@ async fn multilink_source_delete_target_if_orphan_respects_other_references() {
     exec(&pool, &schema, &format!("delete {module}::ProductDeleteTargetIfOrphan filter .name = 'Gamma'")).await;
     let sole = rows_of(&pool, &schema, &format!("select {module}::Tag filter .name = 'sole'")).await;
     assert_eq!(sole.len(), 0, "Tag with no remaining references must be deleted when its sole-using Product is deleted");
+}
+
+// ── Migration (diff) path parity ────────────────────────────────────────────────
+
+/// Regression test for the gap this whole test group's investigation
+/// surfaced: `diff/mod.rs` (the incremental-migration DDL path used by
+/// `pylon migration create`/`watch`) never emitted deletion-policy triggers
+/// at all — only `export_schema`'s fresh-install path did. Builds the exact
+/// same schema via `diff_schema(target, &DbState::default())` (a
+/// from-scratch migration against an empty database, not `export_schema`)
+/// and re-runs one single-link and one multilink on_delete scenario against
+/// it, proving the two DDL-generation paths now agree.
+#[tokio::test]
+#[ignore]
+async fn migration_path_emits_working_deletion_policy_triggers() {
+    let module = unique_module("live_on_delete_migration");
+    let schema = on_delete_schema(&module);
+    let ddl_ops = diff_schema(&schema, &DbState::default()).unwrap();
+    assert!(
+        ddl_ops.iter().any(|op| op.contains("AFTER DELETE") || op.contains("BEFORE DELETE")),
+        "expected at least one deletion-policy trigger in the migration-path DDL"
+    );
+
+    let pool = test_pool().await;
+    for op in &ddl_ops {
+        pool.batch_execute(op).await.unwrap();
+    }
+
+    // Single-link DeleteTargetIfOrphan (Source-side) — same scenario as
+    // `single_link_source_delete_target_if_orphan_respects_other_references`.
+    exec(&pool, &schema, &format!("insert {module}::Org {{ name := 'Shared' }}")).await;
+    for stmt in [
+        format!("insert {module}::TeamDeleteTargetIfOrphan {{ name := 'Alpha', org := (select {module}::Org filter .name = 'Shared') }}"),
+        format!("insert {module}::TeamDeleteTargetIfOrphan {{ name := 'Beta', org := (select {module}::Org filter .name = 'Shared') }}"),
+    ] {
+        exec(&pool, &schema, &stmt).await;
+    }
+    exec(&pool, &schema, &format!("delete {module}::TeamDeleteTargetIfOrphan filter .name = 'Alpha'")).await;
+    let orgs = rows_of(&pool, &schema, &format!("select {module}::Org filter .name = 'Shared'")).await;
+    assert_eq!(orgs.len(), 1, "Org still referenced by Beta must survive deleting Alpha (migration-built schema)");
+
+    // Multilink target-side DeleteSource — same scenario as
+    // `multilink_target_delete_source_cascades_to_the_product`.
+    exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
+    exec(
+        &pool, &schema,
+        &format!("insert {module}::ProductCascadeOnTargetDelete {{ name := 'Widget', tags := (select {module}::Tag filter .name = 'red') }}"),
+    ).await;
+    exec(&pool, &schema, &format!("delete {module}::Tag filter .name = 'red'")).await;
+    let products = rows_of(&pool, &schema, &format!("select {module}::ProductCascadeOnTargetDelete filter .name = 'Widget'")).await;
+    assert_eq!(products.len(), 0, "DeleteSource (Target-side) must cascade-delete the Product (migration-built schema)");
 }

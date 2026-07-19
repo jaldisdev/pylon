@@ -371,11 +371,29 @@ fn emit_after_delete_trigger(
 
 // ── Phase 5.5: source-side deletion triggers for single links ──────────────────
 
-fn emit_link_source_triggers(
-    schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
-    out: &mut String,
-) {
+/// Structured description of one deletion-policy trigger (either a
+/// single-link Source-side `DeleteTarget`/`DeleteTargetIfOrphan`, a
+/// multilink Source-side `DeleteTarget`/`DeleteTargetIfOrphan`, or a
+/// multilink Target-side `DeleteSource`). Each trigger has its own
+/// dedicated function (unlike the exclusive-constraint triggers, no
+/// function sharing), so `ddl` carries the combined `CREATE FUNCTION` +
+/// `CREATE TRIGGER` block. Used by both `export_schema` (unconditional
+/// emission) and the diff engine (`diff/mod.rs`, comparing against live
+/// `DbTable.triggers`) so the two DDL-generation paths can't drift the way
+/// they did before — the incremental migration path used to never emit
+/// these triggers at all.
+pub struct DeletionTriggerInfo {
+    pub table_module: String,
+    /// The table the `CREATE TRIGGER` attaches to (the link's/multilink's
+    /// own owner table for Source-side triggers; the junction table for a
+    /// multilink Target-side trigger).
+    pub table_name: String,
+    pub trigger_name: String,
+    pub ddl: String,
+}
+
+fn link_source_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>) -> Vec<DeletionTriggerInfo> {
+    let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         for l in &t.links {
@@ -405,8 +423,26 @@ fn emit_link_source_triggers(
                 format!("    DELETE FROM {tgt_qname} WHERE id = OLD.{col};")
             };
 
-            emit_before_delete_trigger(&fn_qname, &qi(&fname), &tbl_qname, &body, out);
+            let mut ddl = String::new();
+            emit_before_delete_trigger(&fn_qname, &qi(&fname), &tbl_qname, &body, &mut ddl);
+            result.push(DeletionTriggerInfo {
+                table_module: t.module.clone(),
+                table_name: t.table.clone(),
+                trigger_name: fname,
+                ddl,
+            });
         }
+    }
+    result
+}
+
+fn emit_link_source_triggers(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    out: &mut String,
+) {
+    for info in link_source_trigger_infos(schema, type_map) {
+        out.push_str(&info.ddl);
     }
 }
 
@@ -464,11 +500,8 @@ fn emit_junction_tables(
 
 // ── Phase 6.5: multilink deletion policy triggers ──────────────────────────────
 
-fn emit_multilink_deletion_triggers(
-    schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
-    out: &mut String,
-) {
+fn multilink_deletion_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>) -> Vec<DeletionTriggerInfo> {
+    let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         for ml in &t.multilinks {
@@ -496,7 +529,14 @@ fn emit_multilink_deletion_triggers(
                         format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
                     };
 
-                    emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, out);
+                    let mut ddl = String::new();
+                    emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
+                    result.push(DeletionTriggerInfo {
+                        table_module: t.module.clone(),
+                        table_name: jt_name.clone(),
+                        trigger_name: fname,
+                        ddl,
+                    });
                 }
             }
 
@@ -511,10 +551,36 @@ fn emit_multilink_deletion_triggers(
                 let src_qname = qn(&t.module, &t.table);
 
                 let body = format!("    DELETE FROM {src_qname} WHERE id = OLD.source;");
-                emit_after_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, out);
+                let mut ddl = String::new();
+                emit_after_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
+                result.push(DeletionTriggerInfo {
+                    table_module: t.module.clone(),
+                    table_name: jt_name.clone(),
+                    trigger_name: fname,
+                    ddl,
+                });
             }
         }
     }
+    result
+}
+
+fn emit_multilink_deletion_triggers(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    out: &mut String,
+) {
+    for info in multilink_deletion_trigger_infos(schema, type_map) {
+        out.push_str(&info.ddl);
+    }
+}
+
+/// Combined single-link + multilink deletion-policy trigger specs for
+/// `schema`. Public entry point for `diff/mod.rs` — see `DeletionTriggerInfo`.
+pub fn deletion_policy_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>) -> Vec<DeletionTriggerInfo> {
+    let mut result = link_source_trigger_infos(schema, type_map);
+    result.extend(multilink_deletion_trigger_infos(schema, type_map));
+    result
 }
 
 // ── Phase 7: unique indexes ────────────────────────────────────────────────────
