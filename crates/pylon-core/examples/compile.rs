@@ -105,6 +105,7 @@ fn main() {
                 search_indexes: vec![],
                 triggers: vec![],
                 junction: false,
+                signals: vec![],
             },
             TypeDescriptor {
                 name: "Company".into(),
@@ -138,6 +139,7 @@ fn main() {
                 search_indexes: vec![],
                 triggers: vec![],
                 junction: false,
+                signals: vec![],
             },
             TypeDescriptor {
                 name: "Post".into(),
@@ -187,6 +189,7 @@ fn main() {
                 search_indexes: vec![],
                 triggers: vec![],
                 junction: false,
+                signals: vec![],
             },
         ],
         scalars: vec![],
