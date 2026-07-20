@@ -172,7 +172,7 @@ def _resolve_links(
                 meta.link_target = _resolve_target(
                     meta.link_target, cls, class_to_qname, type_map, label
                 )
-            if meta.kind == "multilink" and meta.through is not None:
+            if meta.kind in ("link", "multilink") and meta.through is not None:
                 label = f"{cfg.module}::{cfg.name}.{pointer_name} through"
                 meta.through = _resolve_target(
                     meta.through, cls, class_to_qname, type_map, label
@@ -237,20 +237,20 @@ def _validate_junctions(
     types: list[type],
     class_to_qname: dict[int, str],
 ) -> dict[str, tuple[str, str]]:
-    """Validate junction type usage and return junction_qname → (source_table, ml_name) map.
+    """Validate junction type usage and return junction_qname → (source_table, pointer_name) map.
 
     Enforces:
-    - Each junction type is referenced by exactly one MultiLink.
+    - Each junction type is referenced by exactly one link or multi-link.
     - Junction types have no link or multilink pointers (already enforced at decoration time,
       but re-checked here for types that arrive from non-decorator paths).
     """
-    # Build reverse map: junction_qname → (source_type_cfg, ml_name)
-    junction_to_ml: dict[str, tuple[str, str]] = {}  # qname → (source_table, ml_name)
+    # Build reverse map: junction_qname → (source_table, pointer_name)
+    junction_to_pointer: dict[str, tuple[str, str]] = {}
 
     for cls in types:
         cfg = cls.__pylon_config__
         for fn, meta in cfg.pointers.items():
-            if meta.kind != "multilink" or meta.through is None:
+            if meta.kind not in ("link", "multilink") or meta.through is None:
                 continue
             through_qname = meta.through  # already resolved to a qname string
             through_cls = next(
@@ -264,30 +264,30 @@ def _validate_junctions(
                 continue  # old-style through type — not a junction, no restriction
 
             src_qname = class_to_qname[id(cls)]
-            if through_qname in junction_to_ml:
-                other_src_table, other_ml = junction_to_ml[through_qname]
+            if through_qname in junction_to_pointer:
+                other_src_table, other_pointer = junction_to_pointer[through_qname]
                 raise SchemaError(
                     f"Junction type {through_qname!r} is referenced by more than one "
-                    f"MultiLink: {other_src_table!r}.{other_ml!r} and "
+                    f"link: {other_src_table!r}.{other_pointer!r} and "
                     f"{src_qname!r}.{fn!r}. Each junction type may only be used by "
-                    f"a single MultiLink."
+                    f"a single link or multi-link."
                 )
-            junction_to_ml[through_qname] = (cfg.table, fn)
+            junction_to_pointer[through_qname] = (cfg.table, fn)
 
-    # Every junction type must be referenced by exactly one MultiLink.
+    # Every junction type must be referenced by exactly one link or multi-link.
     for cls in types:
         cfg = cls.__pylon_config__
         if not cfg.junction:
             continue
         qname = class_to_qname[id(cls)]
-        if qname not in junction_to_ml:
+        if qname not in junction_to_pointer:
             raise SchemaError(
-                f"Junction type {qname!r} is not referenced by any MultiLink. "
+                f"Junction type {qname!r} is not referenced by any link or multi-link. "
                 f"Junction types must be used as the 'through' parameter of exactly "
-                f"one MultiLink pointer."
+                f"one link or multi-link pointer."
             )
 
-    return junction_to_ml
+    return junction_to_pointer
 
 
 # ── Interface conformance ──────────────────────────────────────────────────────
@@ -845,7 +845,7 @@ def _build_type_descriptor(
     combined_signal_ops = (signal_ops_by_class or {}).get(cls, 0)
     signal_descs = [_core.SignalEntry(on=combined_signal_ops)] if combined_signal_ops else []
 
-    # Junction types: derive the actual table name from the MultiLink that references them.
+    # Junction types: derive the actual table name from the link/multi-link that references them.
     if cfg.junction and junction_to_ml is not None:
         qname = _qualified(cfg.module, cfg.name)
         source_table, ml_name = junction_to_ml.get(qname, (cfg.table, cfg.name))
