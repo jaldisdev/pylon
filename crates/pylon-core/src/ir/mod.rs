@@ -504,6 +504,11 @@ pub struct IrMultiLinkMutation {
     /// The set of target objects (plus any `@prop := expr` link-property
     /// assignments attached to them).
     pub values: IrMultiLinkValues,
+    /// True for a junction-backed single link — the junction table's own
+    /// unique constraint is `PRIMARY KEY (source)` alone (not `(source,
+    /// target)`), so an `ON CONFLICT` target naming both columns would
+    /// reference a constraint that doesn't exist.
+    pub single: bool,
 }
 
 /// The set of target object ids for a multi-link mutation, plus any

@@ -498,6 +498,7 @@ mod tests {
                     )),
                     link_props: vec![],
                 },
+                single: false,
             }],
         };
         let out = output(IrStmt::Insert(ins));
