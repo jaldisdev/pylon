@@ -194,8 +194,11 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type, not_null, default));
     }
 
-    // Link columns — uuid stubs; FK constraints added in phase 5
+    // Link columns — uuid stubs; FK constraints added in phase 5. A
+    // junction-backed link has no column here at all — it's stored the
+    // same way a multi-link is, via a junction table (`emit_junction_tables`).
     for l in &t.links {
+        if l.is_junction_backed() { continue; }
         let not_null = if l.nullable { "" } else { " NOT NULL" };
         lines.push(format!("    {} uuid{}", qi(&format!("{}_id", l.name)), not_null));
     }
@@ -296,6 +299,7 @@ fn emit_fk_constraints(
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         for l in &t.links {
+            if l.is_junction_backed() { continue; }
             let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
             let cname = qi(&format!("{}_{}_fkey", t.table, l.name));
             let suffix = target_fk_suffix(&l.on_delete);
@@ -427,6 +431,11 @@ fn link_source_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<Strin
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         for l in &t.links {
+            // A junction-backed link has no `{name}_id` column to trigger
+            // off of — its deletion-policy triggers are emitted alongside
+            // multi-links' own, against the junction table's source/target
+            // columns instead (`multilink_deletion_trigger_infos`).
+            if l.is_junction_backed() { continue; }
             let src_action = policy_for(&l.on_delete, &DeleteSide::Source)
                 .unwrap_or(&DeleteAction::Allow);
             match src_action {
@@ -486,46 +495,85 @@ fn emit_junction_tables(
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         for ml in &t.multilinks {
-            let jt_name = format!("{}.{}", t.table, ml.name);
-            let src_suffix = source_jt_fk_suffix(&ml.on_delete);
-            out.push_str(&format!(
-                "CREATE TABLE {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n",
-                qn(&t.module, &jt_name),
-                qn(&t.module, &t.table),
-                src_suffix,
-            ));
-            if let Some((tgt_module, tgt_table)) = type_map.get(&ml.target) {
-                let tgt_suffix = target_jt_fk_suffix(&ml.on_delete);
-                out.push_str(&format!(
-                    "    target uuid NOT NULL REFERENCES {}(id){},\n",
-                    qn(tgt_module, tgt_table),
-                    tgt_suffix,
-                ));
-            } else {
-                out.push_str("    target uuid NOT NULL,\n");
-            }
-
-            // Extra property columns from a junction through type.
-            if let Some(through_qname) = &ml.through {
-                let through_td = schema.types.iter().find(|td| {
-                    format!("{}::{}", td.module, td.name) == *through_qname
-                });
-                if let Some(td) = through_td {
-                    if td.junction {
-                        for p in &td.properties {
-                            if p.name == "id" { continue; }
-                            let not_null = if p.nullable { "" } else { " NOT NULL" };
-                            out.push_str(&format!("    {} {}{},\n", qi(&p.name), p.pg_type, not_null));
-                        }
-                    }
-                }
-            }
-
-            out.push_str("    PRIMARY KEY (source, target)\n);\n\n");
-            out.push_str(&cache_invalidate_trigger_sql(&qn(&t.module, &jt_name)));
-            out.push_str("\n\n");
+            emit_one_junction_table(
+                schema, type_map, t, &ml.name, &ml.target, &ml.on_delete,
+                ml.through.as_deref(), false, false, out,
+            );
+        }
+        // A junction-backed single link is stored exactly like a
+        // multi-link's junction table, just constrained to at most one
+        // row per source (D3): `PRIMARY KEY (source)` instead of
+        // `(source, target)`, plus `UNIQUE (target)` when the link is
+        // also declared exclusive.
+        for l in &t.links {
+            if !l.is_junction_backed() { continue; }
+            emit_one_junction_table(
+                schema, type_map, t, &l.name, &l.target, &l.on_delete,
+                l.through.as_deref(), true, l.is_exclusive, out,
+            );
         }
     }
+}
+
+fn emit_one_junction_table(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    t: &TypeDescriptor,
+    name: &str,
+    target: &str,
+    on_delete: &[OnDeletePolicy],
+    through: Option<&str>,
+    single: bool,
+    exclusive: bool,
+    out: &mut String,
+) {
+    let jt_name = format!("{}.{}", t.table, name);
+    let src_suffix = source_jt_fk_suffix(on_delete);
+    out.push_str(&format!(
+        "CREATE TABLE {} (\n    source uuid NOT NULL REFERENCES {}(id){},\n",
+        qn(&t.module, &jt_name),
+        qn(&t.module, &t.table),
+        src_suffix,
+    ));
+    if let Some((tgt_module, tgt_table)) = type_map.get(target) {
+        let tgt_suffix = target_jt_fk_suffix(on_delete);
+        out.push_str(&format!(
+            "    target uuid NOT NULL REFERENCES {}(id){},\n",
+            qn(tgt_module, tgt_table),
+            tgt_suffix,
+        ));
+    } else {
+        out.push_str("    target uuid NOT NULL,\n");
+    }
+
+    // Extra property columns from a junction through type.
+    if let Some(through_qname) = through {
+        let through_td = schema.types.iter().find(|td| {
+            format!("{}::{}", td.module, td.name) == *through_qname
+        });
+        if let Some(td) = through_td {
+            if td.junction {
+                for p in &td.properties {
+                    if p.name == "id" { continue; }
+                    let not_null = if p.nullable { "" } else { " NOT NULL" };
+                    out.push_str(&format!("    {} {}{},\n", qi(&p.name), p.pg_type, not_null));
+                }
+            }
+        }
+    }
+
+    if single {
+        out.push_str("    PRIMARY KEY (source)");
+    } else {
+        out.push_str("    PRIMARY KEY (source, target)");
+    }
+    if exclusive {
+        out.push_str(",\n    UNIQUE (target)\n);\n\n");
+    } else {
+        out.push_str("\n);\n\n");
+    }
+    out.push_str(&cache_invalidate_trigger_sql(&qn(&t.module, &jt_name)));
+    out.push_str("\n\n");
 }
 
 // ── Phase 6.5: multilink deletion policy triggers ──────────────────────────────
@@ -535,64 +583,82 @@ fn multilink_deletion_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMa
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         for ml in &t.multilinks {
-            let jt_name = format!("{}.{}", t.table, ml.name);
-            let jt_qname = qn(&t.module, &jt_name);
-
-            // Source-side: DeleteTarget / DeleteTargetIfOrphan
-            let src_action = policy_for(&ml.on_delete, &DeleteSide::Source)
-                .unwrap_or(&DeleteAction::Allow);
-            if matches!(src_action, DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan) {
-                if let Some((tgt_module, tgt_table)) = type_map.get(&ml.target) {
-                    let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
-                        "del_orphan"
-                    } else {
-                        "del_target"
-                    };
-                    let hash = fnv(&[&t.table, &ml.name, suffix]);
-                    let fname = format!("{}_{}_{}_{}", t.table, ml.name, suffix, &hash[..8]);
-                    let fn_qname = qn(&t.module, &fname);
-                    let tgt_qname = qn(tgt_module, tgt_table);
-
-                    let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
-                        format!("    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.target;\n    END IF;")
-                    } else {
-                        format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
-                    };
-
-                    let mut ddl = String::new();
-                    emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
-                    result.push(DeletionTriggerInfo {
-                        table_module: t.module.clone(),
-                        table_name: jt_name.clone(),
-                        trigger_name: fname,
-                        ddl,
-                    });
-                }
-            }
-
-            // Target-side: DeleteSource — when target deleted (cascade removes junction row),
-            // also delete the source object.
-            let tgt_action = policy_for(&ml.on_delete, &DeleteSide::Target)
-                .unwrap_or(&DeleteAction::Restrict);
-            if matches!(tgt_action, DeleteAction::DeleteSource) {
-                let hash = fnv(&[&t.table, &ml.name, "del_source"]);
-                let fname = format!("{}_{}_{}", t.table, ml.name, &hash[..8]);
-                let fn_qname = qn(&t.module, &fname);
-                let src_qname = qn(&t.module, &t.table);
-
-                let body = format!("    DELETE FROM {src_qname} WHERE id = OLD.source;");
-                let mut ddl = String::new();
-                emit_after_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
-                result.push(DeletionTriggerInfo {
-                    table_module: t.module.clone(),
-                    table_name: jt_name.clone(),
-                    trigger_name: fname,
-                    ddl,
-                });
-            }
+            push_junction_deletion_triggers(t, &ml.name, &ml.target, &ml.on_delete, type_map, &mut result);
+        }
+        // A junction-backed single link's junction table has the same
+        // source/target columns as a multi-link's, so the same
+        // deletion-policy trigger bodies apply unchanged.
+        for l in &t.links {
+            if !l.is_junction_backed() { continue; }
+            push_junction_deletion_triggers(t, &l.name, &l.target, &l.on_delete, type_map, &mut result);
         }
     }
     result
+}
+
+fn push_junction_deletion_triggers(
+    t: &TypeDescriptor,
+    name: &str,
+    target: &str,
+    on_delete: &[OnDeletePolicy],
+    type_map: &HashMap<String, (&str, &str)>,
+    result: &mut Vec<DeletionTriggerInfo>,
+) {
+    let jt_name = format!("{}.{}", t.table, name);
+    let jt_qname = qn(&t.module, &jt_name);
+
+    // Source-side: DeleteTarget / DeleteTargetIfOrphan
+    let src_action = policy_for(on_delete, &DeleteSide::Source)
+        .unwrap_or(&DeleteAction::Allow);
+    if matches!(src_action, DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan) {
+        if let Some((tgt_module, tgt_table)) = type_map.get(target) {
+            let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                "del_orphan"
+            } else {
+                "del_target"
+            };
+            let hash = fnv(&[&t.table, name, suffix]);
+            let fname = format!("{}_{}_{}_{}", t.table, name, suffix, &hash[..8]);
+            let fn_qname = qn(&t.module, &fname);
+            let tgt_qname = qn(tgt_module, tgt_table);
+
+            let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                format!("    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.target;\n    END IF;")
+            } else {
+                format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
+            };
+
+            let mut ddl = String::new();
+            emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
+            result.push(DeletionTriggerInfo {
+                table_module: t.module.clone(),
+                table_name: jt_name.clone(),
+                trigger_name: fname,
+                ddl,
+            });
+        }
+    }
+
+    // Target-side: DeleteSource — when target deleted (cascade removes junction row),
+    // also delete the source object.
+    let tgt_action = policy_for(on_delete, &DeleteSide::Target)
+        .unwrap_or(&DeleteAction::Restrict);
+    if matches!(tgt_action, DeleteAction::DeleteSource) {
+        let hash = fnv(&[&t.table, name, "del_source"]);
+        let fname = format!("{}_{}_{}", t.table, name, &hash[..8]);
+        let fn_qname = qn(&t.module, &fname);
+        let src_qname = qn(&t.module, &t.table);
+
+        let body = format!("    DELETE FROM {src_qname} WHERE id = OLD.source;");
+        let mut ddl = String::new();
+        emit_after_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
+        result.push(DeletionTriggerInfo {
+            table_module: t.module.clone(),
+            table_name: jt_name.clone(),
+            trigger_name: fname,
+            ddl,
+        });
+    }
 }
 
 fn emit_multilink_deletion_triggers(
@@ -724,7 +790,10 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
             }
         }
         for l in &t.links {
-            if l.is_exclusive {
+            // A junction-backed exclusive link has no `{name}_id` column to
+            // index — its uniqueness is a `UNIQUE (target)` constraint on
+            // the junction table itself, emitted by `emit_one_junction_table`.
+            if l.is_exclusive && !l.is_junction_backed() {
                 out.push_str(&format!(
                     "CREATE UNIQUE INDEX ON {} ({});\n",
                     qname, qi(&format!("{}_id", l.name)),
@@ -1424,8 +1493,8 @@ pub fn compile_search_index_fetch(
 mod tests {
     use super::*;
     use crate::schema::{
-        DeleteAction, DeleteSide, FunctionDescriptor, FunctionParamDescriptor, MultiLinkDescriptor,
-        OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        DeleteAction, DeleteSide, FunctionDescriptor, FunctionParamDescriptor, LinkDescriptor,
+        MultiLinkDescriptor, OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn person_type() -> TypeDescriptor {
@@ -1677,6 +1746,40 @@ mod tests {
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("AFTER DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
         assert!(!ddl.contains("BEFORE DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
+    }
+
+    // ── junction-backed single links ────────────────────────────────────────────
+
+    #[test]
+    fn test_junction_backed_single_link_gets_a_source_pk_junction_table_no_fk_column() {
+        let module = "default";
+        let mut owner = org_type(module);
+        owner.name = "Person".into();
+        owner.table = "Person".into();
+        owner.links = vec![LinkDescriptor {
+            name: "spouse".into(),
+            target: format!("{module}::Org"),
+            nullable: true,
+            through: Some(format!("{module}::Marriage")),
+            description: None,
+            default_pyql: None,
+            is_exclusive: true,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        }];
+        let schema = SchemaDescriptor {
+            types: vec![org_type(module), owner],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+
+        assert!(!ddl.contains("spouse_id"), "no {{name}}_id column/FK for a junction-backed link, got:\n{ddl}");
+        assert!(ddl.contains("CREATE TABLE \"public\".\"Person.spouse\""), "got:\n{ddl}");
+        assert!(ddl.contains("PRIMARY KEY (source)"), "single-link junction table must be capped to one row per source, got:\n{ddl}");
+        assert!(ddl.contains("UNIQUE (target)"), "exclusive single link must also be unique on the target side, got:\n{ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Person\" (\"spouse_id\")"), "got:\n{ddl}");
     }
 
     // ── @pylon.signal capture triggers ──────────────────────────────────────────
