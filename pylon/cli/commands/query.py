@@ -468,7 +468,7 @@ def _value(v: object) -> str:
         pairs = ", ".join(
             f"{_key(k)}: {_value(val)}"
             for k, val in vars(v).items()
-            if k != "__pylon_type__"
+            if not k.startswith("__pylon_")
         )
         return f"{_type(qname)} {_brace('{')}{pairs}{_brace('}')}"
     if isinstance(v, dict):
@@ -516,7 +516,7 @@ def _pformat_value(v: object, depth: int, max_width: int) -> str:
     """Pretty-print a value, recursively expanding objects that are too wide."""
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         qname = vars(v).get("__pylon_type__") or type(v).__name__
-        pointers = {k: val for k, val in vars(v).items() if k != "__pylon_type__"}
+        pointers = {k: val for k, val in vars(v).items() if not k.startswith("__pylon_")}
         return _pformat_object(qname, pointers, depth, max_width)
     if isinstance(v, dict):
         return _pformat_object("", v, depth, max_width)
@@ -554,7 +554,7 @@ def _format_group_row(obj: dict, depth: int, max_width: int) -> str:
         elem_strs = [
             _pformat_object(
                 vars(e).get("__pylon_type__") or type(e).__name__,
-                {k: v for k, v in vars(e).items() if k != "__pylon_type__"},
+                {k: v for k, v in vars(e).items() if not k.startswith("__pylon_")},
                 depth + 2,
                 max_width,
             )
@@ -584,7 +584,7 @@ def _format_vector_search_row(obj: dict, depth: int) -> str:
         type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
         obj_str = _pformat_object(
             type_label,
-            {k: v for k, v in vars(obj_val).items() if k != "__pylon_type__"},
+            {k: v for k, v in vars(obj_val).items() if not k.startswith("__pylon_")},
             depth + 1,
             shutil.get_terminal_size((100, 24)).columns,
         )
@@ -609,7 +609,7 @@ def _format_fts_search_row(obj: dict, depth: int) -> str:
         type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
         obj_str = _pformat_object(
             type_label,
-            {k: v for k, v in vars(obj_val).items() if k != "__pylon_type__"},
+            {k: v for k, v in vars(obj_val).items() if not k.startswith("__pylon_")},
             depth + 1,
             shutil.get_terminal_size((100, 24)).columns,
         )
