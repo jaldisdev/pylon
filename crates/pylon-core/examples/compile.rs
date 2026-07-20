@@ -81,6 +81,7 @@ fn main() {
                     name: "company".into(),
                     target: "default::Company".into(),
                     nullable: true,
+                    through: None,
                     description: None,
                     default_pyql: None,
                     is_exclusive: false,

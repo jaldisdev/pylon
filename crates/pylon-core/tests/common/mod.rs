@@ -80,6 +80,7 @@ pub fn link(name: &str, target_qname: &str) -> LinkDescriptor {
         name: name.into(),
         target: target_qname.into(),
         nullable: false,
+        through: None,
         description: None,
         default_pyql: None,
         is_exclusive: false,

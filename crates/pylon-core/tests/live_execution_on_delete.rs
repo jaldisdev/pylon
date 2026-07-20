@@ -64,6 +64,7 @@ fn nullable_link(name: &str, target_qname: &str, on_delete: Vec<OnDeletePolicy>)
         name: name.into(),
         target: target_qname.into(),
         nullable: true,
+        through: None,
         description: None,
         default_pyql: None,
         is_exclusive: false,

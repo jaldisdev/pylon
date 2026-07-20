@@ -2905,6 +2905,7 @@ mod tests {
                         name: "company".into(),
                         target: "default::Company".into(),
                         nullable: true,
+                        through: None,
                         description: None,
                         default_pyql: None,
                         is_exclusive: false,
@@ -3265,12 +3266,12 @@ mod tests {
                     links: vec![
                         LinkDescriptor {
                             name: "person".into(), target: "default::Person".into(),
-                            nullable: false, description: None, default_pyql: None,
+                            nullable: false, through: None, description: None, default_pyql: None,
                             is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
                         },
                         LinkDescriptor {
                             name: "friend".into(), target: "default::Person".into(),
-                            nullable: false, description: None, default_pyql: None,
+                            nullable: false, through: None, description: None, default_pyql: None,
                             is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
                         },
                     ],
