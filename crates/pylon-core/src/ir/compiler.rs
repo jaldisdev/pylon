@@ -2802,13 +2802,18 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 if let Some(expr) = &el.compexpr {
-                    let (jt, module, src_col, tgt_col, through_td) =
-                        self.link_junction_info(td, l)?;
-                    let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
-                    multi_link_appends.push(IrMultiLinkMutation {
-                        junction_table: jt, module, source_col: src_col,
-                        target_col: tgt_col, values, single: true,
-                    });
+                    // `:= {}` / `:= <Type>{}` at insert time — same as
+                    // omitting the pointer entirely: nothing to append, no
+                    // junction row created yet.
+                    if !is_empty_set_expr(expr) {
+                        let (jt, module, src_col, tgt_col, through_td) =
+                            self.link_junction_info(td, l)?;
+                        let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
+                        multi_link_appends.push(IrMultiLinkMutation {
+                            junction_table: jt, module, source_col: src_col,
+                            target_col: tgt_col, values, single: true,
+                        });
+                    }
                 }
             } else {
                 scalar_elements.push(el.clone());
@@ -3049,7 +3054,7 @@ impl<'a> Compiler<'a> {
                 }
                 let (jt, module, src_col, tgt_col, through_td) = self.link_junction_info(td, l)?;
                 let is_empty = el.compexpr.as_ref()
-                    .map(|e| matches!(e, Expr::Set(v) if v.is_empty()))
+                    .map(is_empty_set_expr)
                     .unwrap_or(false);
                 if is_empty {
                     // := {} — clear the junction row
@@ -3465,6 +3470,7 @@ impl<'a> Compiler<'a> {
                     alias: l.name.clone(),
                     correlation,
                     subquery,
+                    link_properties: vec![],
                 }));
             }
 
@@ -3882,8 +3888,29 @@ impl<'a> Compiler<'a> {
             let target_td = self.resolve_type(&l.target)?;
             let sub_alias = self.fresh_alias();
             let nested_elements = el.nested.as_deref().unwrap_or(&[]);
+
+            // A junction-backed link can carry `@prop` read references
+            // (e.g. `spouse: { name, @since }`), the same as a multi-link's
+            // own nested shape (`compile_multilink_pointer`) — partition
+            // those out before compiling the rest as a regular shape.
+            let (regular_els, link_properties): (Vec<ShapeElement>, Vec<IrLinkProp>) =
+                if l.is_junction_backed() {
+                    let mut regular = Vec::new();
+                    let mut props = Vec::new();
+                    for nel in nested_elements {
+                        if let [ast::PathStep::LinkProp(name)] = nel.path.steps.as_slice() {
+                            props.push(IrLinkProp { name: name.clone() });
+                        } else {
+                            regular.push(nel.clone());
+                        }
+                    }
+                    (regular, props)
+                } else {
+                    (nested_elements.to_vec(), vec![])
+                };
+
             let sub_shape =
-                self.compile_shape(nested_elements, target_td, &sub_alias, &target_td.module.clone())?;
+                self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
             let subquery = IrSelect::schema_bound(
                 IrSource {
                     type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -3903,6 +3930,7 @@ impl<'a> Compiler<'a> {
                 alias: pointer_name.to_string(),
                 correlation,
                 subquery,
+                link_properties,
             }));
         }
 
@@ -6757,6 +6785,19 @@ fn has_any_link_props(vals: &IrMultiLinkValues) -> bool {
     }
     match &vals.source {
         IrMultiLinkValueSource::Union(a, b) => has_any_link_props(a) || has_any_link_props(b),
+        _ => false,
+    }
+}
+
+/// True for a bare `{}` or a `<AnyType>{}` cast of one — the empty-set
+/// literal a caller uses to clear an optional pointer, in either form. A
+/// frontend generating PyQL typically emits the cast form (e.g.
+/// `<Company>{}`, matching `compile_expr`'s own `Expr::TypeCast` handling of
+/// this exact case), while hand-written PyQL more often uses the bare form.
+fn is_empty_set_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Set(elems) => elems.is_empty(),
+        Expr::TypeCast(tc) => matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()),
         _ => false,
     }
 }

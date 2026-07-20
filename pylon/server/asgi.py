@@ -294,14 +294,20 @@ def _pointer_editability(meta: PointerMeta) -> dict[str, Any]:
     """readonly/required/hasDefault/through — sourced from Pylon's own
     PointerMeta (cls.__pylon_config__.pointers), which the raw type annotation
     alone can't tell us. Only meaningful for property/link (readonly/required/
-    hasDefault) and multilink (through, the junction type) — computed pointers
-    are never editable regardless, so nothing is added for them."""
+    hasDefault, plus through when the link is junction-backed) and multilink
+    (through alone, the junction type) — computed pointers are never editable
+    regardless, so nothing is added for them."""
     if meta.kind in ("property", "link"):
-        return {
+        result: dict[str, Any] = {
             "readonly": meta.is_readonly,
             "required": not meta.nullable,
             "hasDefault": meta.default is not dataclasses.MISSING or meta.default_factory is not dataclasses.MISSING,
         }
+        if meta.kind == "link" and meta.through is not None:
+            # Resolved to a qualified "module::Name" string by pylon.finalize()'s
+            # walker (_walker.py's _resolve_links) before this handler ever runs.
+            result["through"] = meta.through
+        return result
     if meta.kind == "multilink" and meta.through is not None:
         # Resolved to a qualified "module::Name" string by pylon.finalize()'s
         # walker (_walker.py's _resolve_links) before this handler ever runs.

@@ -2085,9 +2085,20 @@ fn emit_single_link(
     };
     let sub_alias = &source.alias;
 
-    let (sub_exprs, sub_nodes) = build_shape(shape, sub_alias);
+    let (sub_exprs, mut sub_nodes) = build_shape(shape, sub_alias);
     let mut parts = vec![type_disc(&source.type_name)];
     parts.extend(sub_exprs);
+
+    // Link properties: read from the junction table alias "jt" — only ever
+    // populated for a junction-backed link (see `IrSingleLinkPointer`'s doc
+    // comment), which is exactly when `f.correlation` below puts "jt" in
+    // scope.
+    for lp in &f.link_properties {
+        parts.push(format!("\"jt\".{}", qi(&lp.name)));
+        let pos = sub_nodes.len() + 1;
+        sub_nodes.push(ShapeNode::Scalar { name: format!("@{}", lp.name), position: pos });
+    }
+
     let tuple = parts.join(",\n        ");
 
     let (from_sql, mut where_parts) = match &f.correlation {
@@ -3435,6 +3446,21 @@ mod tests {
     }
 
     #[test]
+    fn test_select_shape_over_junction_backed_single_link_with_link_property() {
+        // A junction-backed single link can read its own link properties
+        // (`@since`) in a nested shape, same as a multi-link's `@weight` —
+        // this is the one read site with no reusable FK-based form
+        // (`IrSingleLinkPointer` needed its own `link_properties`, mirroring
+        // `IrMultiLinkPointer`'s).
+        let schema = make_schema_with_junction_backed_link();
+        let ast = crate::parse::parse("SELECT Person { name, spouse { name, @since } }").unwrap();
+        let ir = crate::ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(out.sql.contains("\"jt\".\"since\""), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("array_agg"), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_select_path_over_junction_backed_single_link() {
         let schema = make_schema_with_junction_backed_link();
         let ast = crate::parse::parse("SELECT Person.spouse { name }").unwrap();
@@ -3499,6 +3525,24 @@ mod tests {
         let schema = make_schema_with_junction_backed_link();
         let out = compile_and_emit_with(
             "UPDATE Person FILTER .id = $id SET { spouse := {} }",
+            &schema,
+        );
+        assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "clearing must not also insert:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_clear_junction_backed_single_link_with_cast_empty_set() {
+        // Regression: the frontend (generateStatements.ts's `setNull`
+        // handling) always emits the cast form `<Type>{}`, never the bare
+        // `{}` — the junction-backed clear path originally only recognized
+        // bare `Expr::Set([])`, so this form fell through to
+        // `compile_multilink_values` and errored with "multilink value must
+        // be a CTE reference, parenthesised subquery, or type path" instead
+        // of clearing (confirmed live via the Data Explorer).
+        let schema = make_schema_with_junction_backed_link();
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { spouse := <Org>{} }",
             &schema,
         );
         assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
