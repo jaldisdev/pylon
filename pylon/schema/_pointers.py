@@ -83,14 +83,19 @@ class PropertyAnnotation:
 
 
 class LinkAnnotation:
-    __slots__ = ("target_type", "constraints", "on_delete")
+    __slots__ = ("target_type", "constraints", "on_delete", "through_type")
 
     def __init__(
-        self, target_type: Any, constraints: list[Any], on_delete: list[OnDelete]
+        self,
+        target_type: Any,
+        constraints: list[Any],
+        on_delete: list[OnDelete],
+        through_type: Any = None,
     ) -> None:
         self.target_type = target_type
         self.constraints = constraints
         self.on_delete = on_delete
+        self.through_type = through_type
 
     def __or__(self, other: Any) -> Any:
         if other is None:
@@ -98,7 +103,7 @@ class LinkAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return f"LinkAnnotation({self.target_type!r}, {self.constraints!r})"
+        return f"LinkAnnotation({self.target_type!r}, {self.constraints!r}, through={self.through_type!r})"
 
 
 class MultiLinkAnnotation:
@@ -142,7 +147,8 @@ class ComputedAnnotation:
 
 
 class _ThroughParam:
-    """Marker produced by through(); recognised inside MultiLink[T, through(X)]."""
+    """Marker produced by through(); recognised inside Link[T, through(X)] and
+    MultiLink[T, through(X)]."""
 
     __slots__ = ("type_",)
 
@@ -154,11 +160,13 @@ class _ThroughParam:
 
 
 def through(type_: Any) -> _ThroughParam:
-    """Declare the intermediate type for a MultiLink with link properties.
+    """Declare the intermediate (junction) type for a link with its own
+    properties — supported on both a single Link and a MultiLink.
 
     Usage::
 
         tags: MultiLink[Tag, through(ProductTag)]
+        spouse: Link[Person, through(Marriage)] | None
     """
     return _ThroughParam(type_)
 
@@ -212,6 +220,7 @@ class Link:
         category: Link[Category] | None
         category: Link[Category, Description('The owning category')]
         chat: Link[MessageThread, OnDelete(Target, DeleteSource)]
+        spouse: Link[Person, through(Marriage)] | None
     """
 
     @classmethod
@@ -220,9 +229,20 @@ class Link:
             params = (params,)
         target_type = params[0]
         rest = list(params[1:])
-        on_delete = [p for p in rest if isinstance(p, OnDelete)]
-        constraints = _consume_descriptions([p for p in rest if not isinstance(p, OnDelete)])
-        return LinkAnnotation(target_type=target_type, constraints=constraints, on_delete=on_delete)
+        through_type = None
+        on_delete: list[OnDelete] = []
+        remaining: list[Any] = []
+        for p in rest:
+            if isinstance(p, _ThroughParam):
+                through_type = p.type_
+            elif isinstance(p, OnDelete):
+                on_delete.append(p)
+            else:
+                remaining.append(p)
+        constraints = _consume_descriptions(remaining)
+        return LinkAnnotation(
+            target_type=target_type, constraints=constraints, on_delete=on_delete, through_type=through_type
+        )
 
 
 class MultiLink:
