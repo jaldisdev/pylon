@@ -20,7 +20,7 @@ use super::{
     IrMultiLinkValueSource,
     IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
     IrRowSource,
-    IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
+    IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
     IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
     VectorEnqueueInfo, SearchEnqueueInfo, TupleCastShape,
 };
@@ -1581,13 +1581,30 @@ impl<'a> Compiler<'a> {
                     alias: target_alias.clone(),
                 };
 
-                // Determine if the link is single (FK) or multi (junction).
-                if owner_td.links.iter().any(|l| l.name == *link_name) {
-                    joins.push(IrPathJoin::BacklinkSingle {
-                        source_alias: current_alias.clone(),
-                        fk_col: format!("{}_id", link_name),
-                        target,
-                    });
+                // Determine if the link is single (FK), junction-backed
+                // single (same shape as a backlinked multi-link), or multi
+                // (junction).
+                if let Some(l) = owner_td.links.iter().find(|l| l.name == *link_name) {
+                    if l.is_junction_backed() {
+                        let junction_alias = self.fresh_alias();
+                        let (junction_table, module, owner_col, current_col, _) =
+                            self.link_junction_info(owner_td, l)?;
+                        joins.push(IrPathJoin::BacklinkMulti {
+                            source_alias: current_alias.clone(),
+                            junction_alias,
+                            junction_table,
+                            module,
+                            owner_col,
+                            current_col,
+                            target,
+                        });
+                    } else {
+                        joins.push(IrPathJoin::BacklinkSingle {
+                            source_alias: current_alias.clone(),
+                            fk_col: format!("{}_id", link_name),
+                            target,
+                        });
+                    }
                 } else {
                     let ml = owner_td.multilinks.iter().find(|ml| ml.name == *link_name).unwrap();
                     let junction_alias = self.fresh_alias();
@@ -1696,11 +1713,26 @@ impl<'a> Compiler<'a> {
                     table: target_td.table.clone(),
                     alias: target_alias.clone(),
                 };
-                joins.push(IrPathJoin::Single {
-                    source_alias: current_alias.clone(),
-                    fk_col: format!("{}_id", l.name),
-                    target,
-                });
+                if l.is_junction_backed() {
+                    // Same join shape a multi-link's own path step uses
+                    // (D1) — `PRIMARY KEY (source)` on the junction table
+                    // already guarantees at most one matching row, so no
+                    // extra cardinality handling is needed here.
+                    let join = self.build_multilink_join(current_td, &l.name, &l.target, &l.through)?;
+                    let junction_alias = self.fresh_alias();
+                    joins.push(IrPathJoin::Multi {
+                        source_alias: current_alias.clone(),
+                        junction_alias,
+                        join,
+                        target,
+                    });
+                } else {
+                    joins.push(IrPathJoin::Single {
+                        source_alias: current_alias.clone(),
+                        fk_col: format!("{}_id", l.name),
+                        target,
+                    });
+                }
                 if is_last(0) {
                     let shape = self.compile_shape(shape_elements, target_td, &target_alias,
                         &target_td.module.clone())?;
@@ -2022,6 +2054,9 @@ impl<'a> Compiler<'a> {
                     }));
                 }
                 if let Some(link) = Self::resolve_link(td, pointer_name) {
+                    if link.is_junction_backed() {
+                        return self.compile_junction_link_exists_check(link, td, alias);
+                    }
                     return Ok(ir_is_not_null(IrExpr::ColumnRef {
                         alias: alias.to_string(),
                         column: format!("{}_id", link.name),
@@ -2081,36 +2116,20 @@ impl<'a> Compiler<'a> {
     /// Build the `IrSelect` over the junction/FK-target rows for a multilink,
     /// correlated to the current row (`alias.id`) — shared by `exists
     /// .multilink` and `count(.multilink)`.
-    fn multilink_correlation_select(
+    /// `EXISTS(SELECT 1 FROM junction WHERE junction.<source_col> = alias.id)`,
+    /// correlated to the current row — shared by a multi-link's own `exists
+    /// .multilink`/`count(.multilink)` and a junction-backed single link's
+    /// `exists .link` (D2: same junction-info resolution either way).
+    fn junction_correlation_select(
         &mut self,
-        ml_name: &str,
         td: &TypeDescriptor,
         alias: &str,
+        name: &str,
+        target: &str,
+        through: &Option<String>,
     ) -> Result<IrSelect, PyQLError> {
-        let ml = Self::resolve_multilink(td, ml_name).unwrap();
-        let ml_through = ml.through.clone();
-        let td_module = td.module.clone();
-        let td_name = td.name.clone();
-        let td_table = td.table.clone();
         let jt_alias = self.fresh_alias();
-
-        let (jt_table, jt_module, jt_src_col) = if let Some(through_qname) = &ml_through {
-            let through_td = self.resolve_type(through_qname)?;
-            if through_td.junction {
-                (through_td.table.clone(), through_td.module.clone(), "source".to_string())
-            } else {
-                let source_qname = format!("{}::{}", td_module, td_name);
-                let src_col = through_td.links.iter()
-                    .find(|l| l.target == source_qname)
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!("through type {through_qname} has no link to {source_qname}"),
-                        position: Position { line: 0, col: 0 },
-                    }))?.name.clone();
-                (through_td.table.clone(), through_td.module.clone(), format!("{}_id", src_col))
-            }
-        } else {
-            (format!("{}.{}", td_table, ml_name), td_module.clone(), "source".to_string())
-        };
+        let (jt_table, jt_module, jt_src_col, _, _) = self.junction_info_for(td, name, target, through)?;
 
         let filter = IrExpr::BinOp(Box::new(IrBinOp {
             left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
@@ -2128,6 +2147,17 @@ impl<'a> Compiler<'a> {
         ))
     }
 
+    fn multilink_correlation_select(
+        &mut self,
+        ml_name: &str,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrSelect, PyQLError> {
+        let ml = Self::resolve_multilink(td, ml_name).unwrap();
+        let (name, target, through) = (ml.name.clone(), ml.target.clone(), ml.through.clone());
+        self.junction_correlation_select(td, alias, &name, &target, &through)
+    }
+
     fn compile_multilink_exists_check(
         &mut self,
         ml_name: &str,
@@ -2139,6 +2169,56 @@ impl<'a> Compiler<'a> {
             op: ast::UnaryOpKind::Exists,
             operand: IrExpr::Subquery(Box::new(inner)),
         })))
+    }
+
+    /// Same as `compile_multilink_exists_check`, for `exists .link` where
+    /// `link` is a junction-backed single link.
+    fn compile_junction_link_exists_check(
+        &mut self,
+        l: &LinkDescriptor,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let (name, target, through) = (l.name.clone(), l.target.clone(), l.through.clone());
+        let inner = self.junction_correlation_select(td, alias, &name, &target, &through)?;
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: ast::UnaryOpKind::Exists,
+            operand: IrExpr::Subquery(Box::new(inner)),
+        })))
+    }
+
+    /// A junction-backed single link's target id, as a scalar correlated
+    /// subquery — `(SELECT jt.<target_col> FROM junction AS jt WHERE
+    /// jt.<source_col> = alias.id)`. Stands in wherever a plain single
+    /// link's `{name}_id` FK column would otherwise be referenced directly
+    /// as a scalar uuid expression (bare `.link` in a filter/order-by,
+    /// `.link.id`, or correlating `.link.<other prop>`).
+    fn junction_target_id_expr(
+        &mut self,
+        td: &TypeDescriptor,
+        l: &LinkDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let (name, target, through) = (l.name.clone(), l.target.clone(), l.through.clone());
+        let (jt_table, jt_module, jt_src_col, jt_tgt_col, _) =
+            self.junction_info_for(td, &name, &target, &through)?;
+        let jt_alias = self.fresh_alias();
+        let filter = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+        }));
+        let select = IrSelect::schema_bound(
+            IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias },
+            vec![IrShapePointer::Scalar(IrScalarPointer {
+                alias: "target".to_string(),
+                column: jt_tgt_col,
+                pg_type: "uuid".to_string(),
+                tuple_shape: None,
+            })],
+            Some(filter),
+        );
+        Ok(IrExpr::Subquery(Box::new(select)))
     }
 
     /// Returns true when the SELECT result expression is not a schema type reference.
@@ -2969,20 +3049,24 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    /// Extract junction table info for a multi-link: (junction_table, module,
-    /// source_col, target_col, through_td). `through_td` is the junction
-    /// type's own TypeDescriptor for a `through(...)` multi-link (needed to
-    /// validate/compile `@prop := expr` link-property assignments against its
-    /// real properties) — `None` for a Standard (implicit) junction table,
-    /// which has no user-declared properties at all.
-    fn multilink_junction_info(
+    /// Extract junction table info for a multi-link (or a junction-backed
+    /// single link, which shares this exact storage shape — D2):
+    /// (junction_table, module, source_col, target_col, through_td).
+    /// `through_td` is the junction type's own TypeDescriptor for a
+    /// `through(...)` link (needed to validate/compile `@prop := expr`
+    /// link-property assignments against its real properties) — `None` for
+    /// a Standard (implicit) junction table, which has no user-declared
+    /// properties at all.
+    fn junction_info_for(
         &mut self,
         td: &TypeDescriptor,
-        ml: &MultiLinkDescriptor,
+        name: &str,
+        target: &str,
+        through: &Option<String>,
     ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
-        match &ml.through {
+        match through {
             None => Ok((
-                format!("{}.{}", td.table, ml.name),
+                format!("{}.{}", td.table, name),
                 td.module.clone(),
                 "source".to_string(),
                 "target".to_string(),
@@ -2995,7 +3079,6 @@ impl<'a> Compiler<'a> {
                     .find(|l| l.target == src_type)
                     .map(|l| l.name.clone())
                     .unwrap_or_else(|| "source".to_string());
-                let tgt_type = &ml.target;
                 // A self-referencing through-link (source type == target
                 // type, e.g. Person.friends via a PersonFriend with two
                 // Person-typed links) would otherwise match the same link
@@ -3003,12 +3086,77 @@ impl<'a> Compiler<'a> {
                 // matching the tie-break already used for the read-side
                 // join resolution elsewhere in this file.
                 let target_col = through_td.links.iter()
-                    .find(|l| &l.target == tgt_type && l.name != source_col)
-                    .or_else(|| through_td.links.iter().find(|l| &l.target == tgt_type))
+                    .find(|l| l.target == target && l.name != source_col)
+                    .or_else(|| through_td.links.iter().find(|l| l.target == target))
                     .map(|l| l.name.clone())
                     .unwrap_or_else(|| "target".to_string());
                 Ok((through_td.table.clone(), through_td.module.clone(), source_col, target_col, Some(through_td)))
             }
+        }
+    }
+
+    fn multilink_junction_info(
+        &mut self,
+        td: &TypeDescriptor,
+        ml: &MultiLinkDescriptor,
+    ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
+        self.junction_info_for(td, &ml.name, &ml.target, &ml.through)
+    }
+
+    /// Same as `multilink_junction_info`, for a junction-backed single link.
+    fn link_junction_info(
+        &mut self,
+        td: &TypeDescriptor,
+        l: &LinkDescriptor,
+    ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
+        self.junction_info_for(td, &l.name, &l.target, &l.through)
+    }
+
+    /// Build the `IrMultiLinkJoin` a multi-link or junction-backed single
+    /// link's forward read-side join uses (`IrPathJoin::Multi`, a shape's
+    /// `IrMultiLinkPointer`, or — for a junction-backed single link — the
+    /// junction variant of `IrSingleLinkCorrelation`).
+    fn build_multilink_join(
+        &mut self,
+        td: &TypeDescriptor,
+        name: &str,
+        target: &str,
+        through: &Option<String>,
+    ) -> Result<IrMultiLinkJoin, PyQLError> {
+        if let Some(through_qname) = through {
+            let through_td = self.resolve_type(through_qname)?;
+            if through_td.junction {
+                Ok(IrMultiLinkJoin::Standard {
+                    junction_table: through_td.table.clone(),
+                    module: through_td.module.clone(),
+                })
+            } else {
+                let source_qname = format!("{}::{}", td.module, td.name);
+                let source_col = through_td.links.iter()
+                    .find(|l| l.target == source_qname)
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!("through type {through_qname} has no link to {source_qname}"),
+                        position: Position { line: 0, col: 0 },
+                    }))?.name.clone();
+                let target_col = through_td.links.iter()
+                    .find(|l| l.target == target && l.name != source_col)
+                    .or_else(|| through_td.links.iter().find(|l| l.target == target))
+                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
+                        message: format!("through type {through_qname} has no link to target {target}"),
+                        position: Position { line: 0, col: 0 },
+                    }))?.name.clone();
+                Ok(IrMultiLinkJoin::Through {
+                    junction_table: through_td.table.clone(),
+                    module: through_td.module.clone(),
+                    source_col,
+                    target_col,
+                })
+            }
+        } else {
+            Ok(IrMultiLinkJoin::Standard {
+                junction_table: format!("{}.{}", td.table, name),
+                module: td.module.clone(),
+            })
         }
     }
 
@@ -3240,10 +3388,15 @@ impl<'a> Compiler<'a> {
                     sub_shape,
                     None,
                 );
+                let correlation = if l.is_junction_backed() {
+                    let join = self.build_multilink_join(td, &l.name, &l.target, &l.through)?;
+                    IrSingleLinkCorrelation::Junction { join, target_pk: "id".to_string() }
+                } else {
+                    IrSingleLinkCorrelation::Fk { fk_column: format!("{}_id", l.name), target_pk: "id".to_string() }
+                };
                 pointers.push(IrShapePointer::SingleLink(IrSingleLinkPointer {
                     alias: l.name.clone(),
-                    fk_column: format!("{}_id", l.name),
-                    target_pk: "id".to_string(),
+                    correlation,
                     subquery,
                 }));
             }
@@ -3400,19 +3553,47 @@ impl<'a> Compiler<'a> {
         for link in links {
             let target_td = self.resolve_type(&link.target)?;
             let sub_alias = self.fresh_alias();
-            let filter = IrExpr::BinOp(Box::new(IrBinOp {
-                left: IrExpr::ColumnRef {
-                    alias: sub_alias.clone(),
-                    column: "id".to_string(),
-                    pg_type: "uuid".to_string(),
-                },
-                op: ast::BinOpKind::Eq,
-                right: IrExpr::ColumnRef {
-                    alias: parent_alias.to_string(),
-                    column: format!("{}_id", link.name),
-                    pg_type: "uuid".to_string(),
-                },
-            }));
+            let filter = if link.is_junction_backed() {
+                let (jt_table, jt_module, jt_src_col, jt_tgt_col, _) =
+                    self.junction_info_for(concrete_td, &link.name, &link.target, &link.through)?;
+                let jt_alias = self.fresh_alias();
+                let jt_filter = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
+                        op: ast::BinOpKind::Eq,
+                        right: IrExpr::ColumnRef { alias: parent_alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                    })),
+                    op: ast::BinOpKind::And,
+                    right: IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_tgt_col, pg_type: "uuid".to_string() },
+                        op: ast::BinOpKind::Eq,
+                        right: IrExpr::ColumnRef { alias: sub_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                    })),
+                }));
+                let exists_select = IrSelect::schema_bound(
+                    IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias },
+                    vec![],
+                    Some(jt_filter),
+                );
+                IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: IrExpr::Subquery(Box::new(exists_select)),
+                }))
+            } else {
+                IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: sub_alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: IrExpr::ColumnRef {
+                        alias: parent_alias.to_string(),
+                        column: format!("{}_id", link.name),
+                        pg_type: "uuid".to_string(),
+                    },
+                }))
+            };
             let sub_shape = Self::pk_returning(target_td);
             let subquery = IrSelect::schema_bound(
                 IrSource {
@@ -3645,10 +3826,15 @@ impl<'a> Compiler<'a> {
                 sub_shape,
                 None,
             );
+            let correlation = if l.is_junction_backed() {
+                let join = self.build_multilink_join(td, &l.name, &l.target, &l.through)?;
+                IrSingleLinkCorrelation::Junction { join, target_pk: "id".to_string() }
+            } else {
+                IrSingleLinkCorrelation::Fk { fk_column: format!("{}_id", l.name), target_pk: "id".to_string() }
+            };
             return Ok(IrShapePointer::SingleLink(IrSingleLinkPointer {
                 alias: pointer_name.to_string(),
-                fk_column: format!("{}_id", l.name),
-                target_pk: "id".to_string(),
+                correlation,
                 subquery,
             }));
         }
@@ -3841,8 +4027,13 @@ impl<'a> Compiler<'a> {
         let owner_td = self.resolve_type(&type_name)?;
         let owner_qname = format!("{}::{}", owner_td.module, owner_td.name);
 
-        let join = if owner_td.links.iter().any(|l| l.name == backlink_name && l.target == current_qname) {
-            IrMultiLinkJoin::BacklinkFk { fk_col: format!("{}_id", backlink_name) }
+        let join = if let Some(l) = owner_td.links.iter().find(|l| l.name == backlink_name && l.target == current_qname) {
+            if l.is_junction_backed() {
+                let (junction_table, module, owner_col, current_col, _) = self.link_junction_info(owner_td, l)?;
+                IrMultiLinkJoin::BacklinkJunction { junction_table, module, owner_col, current_col }
+            } else {
+                IrMultiLinkJoin::BacklinkFk { fk_col: format!("{}_id", backlink_name) }
+            }
         } else if let Some(ml) = owner_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname) {
             let (junction_table, module) = match &ml.through {
                 Some(through_qname) => {
@@ -4544,7 +4735,7 @@ impl<'a> Compiler<'a> {
             };
             let cols = if abstract_ && materialized {
                 src_td.properties.iter().map(|p| p.name.clone())
-                    .chain(src_td.links.iter().map(|l| format!("{}_id", l.name)))
+                    .chain(src_td.links.iter().filter(|l| !l.is_junction_backed()).map(|l| format!("{}_id", l.name)))
                     .collect::<Vec<_>>()
             } else {
                 vec![]
@@ -4751,6 +4942,9 @@ impl<'a> Compiler<'a> {
         }
 
         if let Some(link) = Self::resolve_link(td, pointer_name) {
+            if link.is_junction_backed() {
+                return self.junction_target_id_expr(td, link, alias);
+            }
             // FK column reference (uuid) — e.g. `.company` → `t0."company_id"`
             return Ok(IrExpr::ColumnRef {
                 alias: alias.to_string(),
@@ -4824,17 +5018,28 @@ impl<'a> Compiler<'a> {
         };
 
         if let Some(link) = Self::resolve_link(td, link_name) {
-            let fk_col = format!("{}_id", link_name);
             if pointer_name == "id" {
+                if link.is_junction_backed() {
+                    return self.junction_target_id_expr(td, link, alias);
+                }
                 return Ok(IrExpr::ColumnRef {
                     alias: alias.to_string(),
-                    column: fk_col,
+                    column: format!("{}_id", link_name),
                     pg_type: "uuid".to_string(),
                 });
             }
             let target_td = self.resolve_type(&link.target)?;
             if let Some(prop) = Self::resolve_property(target_td, pointer_name) {
                 let ft_alias = self.fresh_alias();
+                let target_id_expr = if link.is_junction_backed() {
+                    self.junction_target_id_expr(td, link, alias)?
+                } else {
+                    IrExpr::ColumnRef {
+                        alias: alias.to_string(),
+                        column: format!("{}_id", link_name),
+                        pg_type: "uuid".to_string(),
+                    }
+                };
                 return Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                     IrSource {
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -4854,11 +5059,7 @@ impl<'a> Compiler<'a> {
                             pg_type: "uuid".to_string(),
                         },
                         op: ast::BinOpKind::Eq,
-                        right: IrExpr::ColumnRef {
-                            alias: alias.to_string(),
-                            column: fk_col,
-                            pg_type: "uuid".to_string(),
-                        },
+                        right: target_id_expr,
                     }))),
                 ))));
             }
@@ -4953,22 +5154,50 @@ impl<'a> Compiler<'a> {
         // path previously didn't: it only ever checked `target_td.links`,
         // so a self-referential-multilink backlink like `Person.friends`
         // failed to compile here even though it worked in a shape position.
-        let join_cond = if target_td.links.iter().any(|l| l.name == backlink_name && l.target == current_qname) {
-            let fk_col = format!("{}_id", backlink_name);
-            // Join condition: target.fk_col = current.id
-            IrExpr::BinOp(Box::new(IrBinOp {
-                left: IrExpr::ColumnRef {
-                    alias: t_alias.clone(),
-                    column: fk_col,
-                    pg_type: "uuid".to_string(),
-                },
-                op: ast::BinOpKind::Eq,
-                right: IrExpr::ColumnRef {
-                    alias: alias.to_string(),
-                    column: "id".to_string(),
-                    pg_type: "uuid".to_string(),
-                },
-            }))
+        let join_cond = if let Some(l) = target_td.links.iter().find(|l| l.name == backlink_name && l.target == current_qname) {
+            if l.is_junction_backed() {
+                // Same junction-table EXISTS shape the multi-link branch
+                // below uses — no direct FK column, since this link is
+                // itself junction-backed.
+                let (jt_table, jt_module, jt_owner_col, jt_current_col, _) = self.link_junction_info(target_td, l)?;
+                let jt_alias = self.fresh_alias();
+                IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                        IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias.clone() },
+                        vec![],
+                        Some(IrExpr::BinOp(Box::new(IrBinOp {
+                            left: IrExpr::BinOp(Box::new(IrBinOp {
+                                left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_owner_col, pg_type: "uuid".to_string() },
+                                op: ast::BinOpKind::Eq,
+                                right: IrExpr::ColumnRef { alias: t_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                            })),
+                            op: ast::BinOpKind::And,
+                            right: IrExpr::BinOp(Box::new(IrBinOp {
+                                left: IrExpr::ColumnRef { alias: jt_alias, column: jt_current_col, pg_type: "uuid".to_string() },
+                                op: ast::BinOpKind::Eq,
+                                right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                            })),
+                        }))),
+                    ))),
+                }))
+            } else {
+                let fk_col = format!("{}_id", backlink_name);
+                // Join condition: target.fk_col = current.id
+                IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: t_alias.clone(),
+                        column: fk_col,
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: IrExpr::ColumnRef {
+                        alias: alias.to_string(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                }))
+            }
         } else if let Some(ml) = target_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname) {
             // Junction row connects t_alias (as the multi-link's owner/
             // "source") to the current row (as its "target") — no direct FK
@@ -5067,10 +5296,14 @@ impl<'a> Compiler<'a> {
                 return Ok(Some(Self::apply_comparison(col, comparison)));
             }
             if let Some(link) = Self::resolve_link(target_td, pointer_name) {
-                let col = IrExpr::ColumnRef {
-                    alias: t_alias.to_string(),
-                    column: format!("{}_id", link.name),
-                    pg_type: "uuid".to_string(),
+                let col = if link.is_junction_backed() {
+                    self.junction_target_id_expr(target_td, link, t_alias)?
+                } else {
+                    IrExpr::ColumnRef {
+                        alias: t_alias.to_string(),
+                        column: format!("{}_id", link.name),
+                        pg_type: "uuid".to_string(),
+                    }
                 };
                 return Ok(Some(Self::apply_comparison(col, comparison)));
             }
@@ -5081,7 +5314,15 @@ impl<'a> Compiler<'a> {
         if let [PathStep::Name(link_name), PathStep::Name(prop_name)] = steps {
             if let Some(link) = Self::resolve_link(target_td, link_name) {
                 let link_target = link.target.clone();
-                let fk_col = format!("{}_id", link_name);
+                let target_id_expr = if link.is_junction_backed() {
+                    self.junction_target_id_expr(target_td, link, t_alias)?
+                } else {
+                    IrExpr::ColumnRef {
+                        alias: t_alias.to_string(),
+                        column: format!("{}_id", link_name),
+                        pg_type: "uuid".to_string(),
+                    }
+                };
                 let link_target_td = self.resolve_type(&link_target)?;
                 let link_target_qname = format!("{}::{}", link_target_td.module, link_target_td.name);
                 let link_target_table = link_target_td.table.clone();
@@ -5094,11 +5335,7 @@ impl<'a> Compiler<'a> {
                             pg_type: "uuid".to_string(),
                         },
                         op: ast::BinOpKind::Eq,
-                        right: IrExpr::ColumnRef {
-                            alias: t_alias.to_string(),
-                            column: fk_col,
-                            pg_type: "uuid".to_string(),
-                        },
+                        right: target_id_expr,
                     }));
                     let col = IrExpr::ColumnRef {
                         alias: l_alias.clone(),
@@ -5389,6 +5626,19 @@ impl<'a> Compiler<'a> {
         let link = target_td.links.iter()
             .find(|l| l.name == first_name)
             .ok_or_else(|| self.field_err(&first_name, target_type))?;
+        if link.is_junction_backed() {
+            // A junction-backed link's correlation is a subquery, not a
+            // plain FK column, and this recursive path-tail resolver is
+            // built entirely around passing a (alias, column) pair down to
+            // the next level — supporting it here would need a broader
+            // signature change. Fail loudly rather than silently reference
+            // a `{name}_id` column that doesn't exist for this link.
+            return Err(self.type_err(&format!(
+                "filtering through a junction-backed single link ('{first_name}') nested inside \
+                 a multi-link path comparison is not yet supported — filter on '.{first_name}' \
+                 directly instead"
+            )));
+        }
         let next_target = link.target.clone();
         let fk_col = format!("{}_id", first_name);
         let tgt_alias = self.fresh_alias();
@@ -5890,7 +6140,7 @@ impl<'a> Compiler<'a> {
     /// the same columns a polymorphic select would.
     fn poly_dml_columns(td: &TypeDescriptor) -> Vec<String> {
         td.properties.iter().map(|p| p.name.clone())
-            .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
+            .chain(td.links.iter().filter(|l| !l.is_junction_backed()).map(|l| format!("{}_id", l.name)))
             .collect()
     }
 

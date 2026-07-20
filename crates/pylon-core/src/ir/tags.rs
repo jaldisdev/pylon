@@ -442,7 +442,9 @@ mod tests {
     fn single_link_shape_pointer_tags_the_target_table_too() {
         let inner = IrSelect::schema_bound(src("default::Company", "company", "t1"), vec![], None);
         let link = IrShapePointer::SingleLink(IrSingleLinkPointer {
-            alias: "company".into(), fk_column: "company_id".into(), target_pk: "id".into(), subquery: inner,
+            alias: "company".into(),
+            correlation: IrSingleLinkCorrelation::Fk { fk_column: "company_id".into(), target_pk: "id".into() },
+            subquery: inner,
         });
         let sel = IrSelect::schema_bound(src("default::Person", "person", "t0"), vec![link], None);
         let out = output(IrStmt::Select(sel));
@@ -571,10 +573,14 @@ mod tests {
         let inner1 = IrSelect::schema_bound(src("default::Company", "company", "t1"), vec![], None);
         let inner2 = IrSelect::schema_bound(src("default::Company", "company", "t2"), vec![], None);
         let link1 = IrShapePointer::SingleLink(IrSingleLinkPointer {
-            alias: "a".into(), fk_column: "a_id".into(), target_pk: "id".into(), subquery: inner1,
+            alias: "a".into(),
+            correlation: IrSingleLinkCorrelation::Fk { fk_column: "a_id".into(), target_pk: "id".into() },
+            subquery: inner1,
         });
         let link2 = IrShapePointer::SingleLink(IrSingleLinkPointer {
-            alias: "b".into(), fk_column: "b_id".into(), target_pk: "id".into(), subquery: inner2,
+            alias: "b".into(),
+            correlation: IrSingleLinkCorrelation::Fk { fk_column: "b_id".into(), target_pk: "id".into() },
+            subquery: inner2,
         });
         let sel = IrSelect::schema_bound(src("default::Person", "person", "t0"), vec![link1, link2], None);
         let out = output(IrStmt::Select(sel));
