@@ -9,13 +9,17 @@ machinery in _decorators.py), so test classes here must behave like real
 user schema files — which never use PEP 563 string annotations either (see
 pylon-demo/dbschema/*.py)."""
 
+import dataclasses
+
 import pylon.schema as pylon
+from pylon.schema._meta import PointerMeta
 from pylon.server.asgi import (
     _build_named_tuple_entry,
     _build_type_entry,
     _classify_named_tuple_member,
     _classify_pointer,
     _classify_tuple_elements,
+    _pointer_editability,
 )
 
 
@@ -196,3 +200,31 @@ class TestBuildTypeEntryWithArray:
         assert tags["kind"] == "array"
         assert tags["element"] == {"name": None, "kind": "scalar", "typeName": "std::str"}
         assert tags["required"] is True
+
+
+class TestPointerEditabilityForJunctionBackedLink:
+    """A junction-backed single link (`meta.through` set on a `link`-kind
+    pointer) must report `through` *in addition to* its ordinary
+    readonly/required/hasDefault fields — unlike a multilink, which only
+    ever reports `through` alone."""
+
+    def _link_meta(self, *, through: str | None, nullable: bool = True) -> PointerMeta:
+        return PointerMeta(
+            name="spouse", kind="link", scalar_type=None, nullable=nullable,
+            constraints=[], default=dataclasses.MISSING, default_factory=dataclasses.MISSING,
+            through=through,
+        )
+
+    def test_junction_backed_link_reports_through_and_editability(self):
+        result = _pointer_editability(self._link_meta(through="default::Marriage"))
+        assert result == {
+            "readonly": False,
+            "required": False,
+            "hasDefault": False,
+            "through": "default::Marriage",
+        }
+
+    def test_plain_link_has_no_through(self):
+        result = _pointer_editability(self._link_meta(through=None, nullable=False))
+        assert "through" not in result
+        assert result == {"readonly": False, "required": True, "hasDefault": False}

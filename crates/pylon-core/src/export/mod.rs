@@ -995,7 +995,7 @@ pub fn object_function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(
 fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &mut String) {
     let cols: Vec<String> = t.properties.iter()
         .map(|p| qi(&p.name))
-        .chain(t.links.iter().map(|l| qi(&format!("{}_id", l.name))))
+        .chain(t.links.iter().filter(|l| !l.is_junction_backed()).map(|l| qi(&format!("{}_id", l.name))))
         .collect();
     let col_list = cols.join(", ");
     let selects: Vec<String> = impls.iter()
@@ -1147,6 +1147,13 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
         }
         for l in &t.links {
             if !l.is_exclusive { continue; }
+            // A junction-backed exclusive link has no `{name}_id` column to
+            // build a cross-table trigger predicate from — its own
+            // `UNIQUE (target)` junction-table constraint (Phase 4) only
+            // enforces uniqueness within that one link, not across every
+            // concrete implementor of a shared interface. Out of scope for
+            // now (see the junction-backed-single-link plan's exclusions).
+            if l.is_junction_backed() { continue; }
             let fields = vec![format!("{}_id", l.name)];
             for impl_t in impls {
                 result.push(make_excl_info(t, &fields, impl_t));
@@ -1272,6 +1279,7 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
         cols.push(format!("{} {}", qi(&p.name), pg_type));
     }
     for l in &td.links {
+        if l.is_junction_backed() { continue; }
         cols.push(format!("{} uuid", qi(&format!("{}_id", l.name))));
     }
     cols.join(", ")

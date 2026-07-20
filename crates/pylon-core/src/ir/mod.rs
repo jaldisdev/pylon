@@ -304,6 +304,10 @@ pub struct IrSingleLinkPointer {
     pub correlation: IrSingleLinkCorrelation,
     /// Nested SELECT producing the linked object.
     pub subquery: IrSelect,
+    /// Extra scalar columns from a junction through type (`@prop` syntax) —
+    /// always empty for `IrSingleLinkCorrelation::Fk`, since a plain FK
+    /// column has no junction row to read properties from.
+    pub link_properties: Vec<IrLinkProp>,
 }
 
 #[derive(Debug, Clone)]
