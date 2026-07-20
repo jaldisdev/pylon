@@ -2785,10 +2785,30 @@ impl<'a> Compiler<'a> {
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values,
+                                target_col: tgt_col, values, single: false,
                             });
                         }
                     }
+                }
+            } else if let Some(l) = Self::resolve_link(td, pointer_name).filter(|l| l.is_junction_backed()) {
+                // A junction-backed single link is "a multi-link capped to
+                // one row" (D1) — on insert there's nothing to replace yet,
+                // so `:=` populates the junction table the same way a
+                // multi-link's own `:=`/`+=` does above.
+                if matches!(el.op, ShapeOp::Remove) {
+                    return Err(self.type_err(&format!(
+                        "cannot use `-=` for link '{pointer_name}' in an insert; \
+                         there is nothing to remove from yet"
+                    )));
+                }
+                if let Some(expr) = &el.compexpr {
+                    let (jt, module, src_col, tgt_col, through_td) =
+                        self.link_junction_info(td, l)?;
+                    let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
+                    multi_link_appends.push(IrMultiLinkMutation {
+                        junction_table: jt, module, source_col: src_col,
+                        target_col: tgt_col, values, single: true,
+                    });
                 }
             } else {
                 scalar_elements.push(el.clone());
@@ -2894,6 +2914,21 @@ impl<'a> Compiler<'a> {
                             position: Position { line: 0, col: 0 },
                         }));
                     }
+                    if l.is_junction_backed() {
+                        // Reachable only via `UNLESS CONFLICT ... ELSE (UPDATE
+                        // ... SET { ... })` — `compile_insert`/`compile_update`'s
+                        // own shape-classification loop intercepts a junction-
+                        // backed link before it ever reaches this generic
+                        // scalar-assignment path; the ELSE clause has no
+                        // junction-mutation mechanism of its own to reuse.
+                        return Err(PyQLError::Type(PyQLTypeError {
+                            message: format!(
+                                "'{pointer_name}' is a junction-backed link and cannot be \
+                                 assigned inside an UNLESS CONFLICT ELSE clause"
+                            ),
+                            position: Position { line: 0, col: 0 },
+                        }));
+                    }
                     // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
                     // Compile as a scalar subquery returning the target pk (the FK uuid).
                     let fk_col = format!("{}_id", l.name);
@@ -2974,7 +3009,7 @@ impl<'a> Compiler<'a> {
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_replaces.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values,
+                                target_col: tgt_col, values, single: false,
                             });
                         }
                     }
@@ -2983,7 +3018,7 @@ impl<'a> Compiler<'a> {
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values,
+                                target_col: tgt_col, values, single: false,
                             });
                         }
                     }
@@ -2998,10 +3033,42 @@ impl<'a> Compiler<'a> {
                             }
                             multi_link_removals.push(IrMultiLinkMutation {
                                 junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values,
+                                target_col: tgt_col, values, single: false,
                             });
                         }
                     }
+                }
+            } else if let Some(l) = Self::resolve_link(td, pointer_name).filter(|l| l.is_junction_backed()) {
+                // Same replace-via-clear-then-insert shape a multi-link's
+                // own `:=` uses — only `:=` is meaningful for a single
+                // link, whether FK-backed or junction-backed.
+                if !matches!(el.op, ShapeOp::Assign) {
+                    return Err(self.type_err(&format!(
+                        "'{pointer_name}' is a single link; only `:=` is supported, not `+=`/`-=`"
+                    )));
+                }
+                let (jt, module, src_col, tgt_col, through_td) = self.link_junction_info(td, l)?;
+                let is_empty = el.compexpr.as_ref()
+                    .map(|e| matches!(e, Expr::Set(v) if v.is_empty()))
+                    .unwrap_or(false);
+                if is_empty {
+                    // := {} — clear the junction row
+                    multi_link_clears.push(IrMultiLinkClear {
+                        junction_table: jt,
+                        module,
+                        source_col: src_col,
+                    });
+                } else if let Some(expr) = &el.compexpr {
+                    multi_link_clears.push(IrMultiLinkClear {
+                        junction_table: jt.clone(),
+                        module: module.clone(),
+                        source_col: src_col.clone(),
+                    });
+                    let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
+                    multi_link_replaces.push(IrMultiLinkMutation {
+                        junction_table: jt, module, source_col: src_col,
+                        target_col: tgt_col, values, single: true,
+                    });
                 }
             } else {
                 scalar_elements.push(el.clone());

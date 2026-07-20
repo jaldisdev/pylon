@@ -760,9 +760,18 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: 
         let sets: Vec<String> = prop_names.iter()
             .map(|n| format!("{} = EXCLUDED.{}", qi(n), qi(n)))
             .collect();
+        // A junction-backed single link's table only has `PRIMARY KEY
+        // (source)` (D3, cardinality-one) — no composite `(source, target)`
+        // unique constraint exists there for a plain multi-link's own
+        // conflict target to match.
+        let conflict_target = if mutation.single {
+            format!("({})", qi(&mutation.source_col))
+        } else {
+            format!("({}, {})", qi(&mutation.source_col), qi(&mutation.target_col))
+        };
         format!(
-            "ON CONFLICT ({}, {}) DO UPDATE SET {}",
-            qi(&mutation.source_col), qi(&mutation.target_col), sets.join(", "),
+            "ON CONFLICT {} DO UPDATE SET {}",
+            conflict_target, sets.join(", "),
         )
     };
 
@@ -3383,7 +3392,12 @@ mod tests {
                     name: "Marriage".into(), module: "default".into(), table: "Person.spouse".into(),
                     abstract_: false, materialized: false, description: None,
                     parents: vec![], interfaces: vec![],
-                    properties: vec![id_prop()],
+                    properties: vec![id_prop(), PropertyDescriptor {
+                        name: "since".into(), pg_type: "int8".into(), nullable: true,
+                        default_sql: None, description: None, check_constraints: vec![],
+                        default_pyql: None, is_exclusive: false, is_pk: false,
+                        is_readonly: false, rewrites: vec![],
+                    tuple_members: None, }],
                     links: vec![
                         LinkDescriptor {
                             name: "source".into(), target: "default::Person".into(),
@@ -3430,6 +3444,65 @@ mod tests {
         assert!(out.sql.contains("\"source\""), "got:\n{}", out.sql);
         assert!(out.sql.contains("\"target\""), "got:\n{}", out.sql);
         assert!(!out.sql.contains("spouse_id"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_insert_with_junction_backed_single_link() {
+        let schema = make_schema_with_junction_backed_link();
+        let out = compile_and_emit_with(
+            "INSERT Person { name := $name, \
+                spouse := (SELECT Org FILTER .id = $oid) { @since := <int64>$since } }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"since\""), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("spouse_id"), "got:\n{}", out.sql);
+        // A fresh row has no prior junction entry, but the emitted ON
+        // CONFLICT target must still name only `source` — no `(source,
+        // target)` composite unique constraint exists on this table (D3).
+        assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_replace_junction_backed_single_link() {
+        let schema = make_schema_with_junction_backed_link();
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { \
+                spouse := (SELECT Org FILTER .id = $oid) { @since := <int64>$since } }",
+            &schema,
+        );
+        // Replace = clear the existing junction row, then insert the new one.
+        assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_junction_backed_single_link_rejected_in_unless_conflict_else() {
+        // `compile_conflict_else` calls `compile_assignments_for_update`
+        // directly on the raw ELSE-clause shape, bypassing the
+        // shape-classification loop `compile_insert`/`compile_update` use to
+        // intercept a junction-backed link before it reaches the plain
+        // FK-column assignment path — must fail loudly here instead of
+        // emitting a `spouse_id` column that doesn't exist.
+        let schema = make_schema_with_junction_backed_link();
+        let ast = parse::parse(
+            "INSERT Person { name := $name } \
+             UNLESS CONFLICT ON .name ELSE (UPDATE Person SET { \
+                spouse := (SELECT Org FILTER .id = $oid) })",
+        ).unwrap();
+        assert!(ir::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
+    fn test_update_clear_junction_backed_single_link() {
+        let schema = make_schema_with_junction_backed_link();
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { spouse := {} }",
+            &schema,
+        );
+        assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "clearing must not also insert:\n{}", out.sql);
     }
 
     /// Product/Tag/ProductTag — the actual real-world shape link properties
