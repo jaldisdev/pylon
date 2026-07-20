@@ -406,6 +406,7 @@ impl LinkDescriptor {
         target,
         nullable,
         *,
+        through = None,
         default_pyql = None,
         description = None,
         is_exclusive = false,
@@ -417,6 +418,7 @@ impl LinkDescriptor {
         name: String,
         target: String,
         nullable: bool,
+        through: Option<String>,
         default_pyql: Option<String>,
         description: Option<String>,
         is_exclusive: bool,
@@ -429,6 +431,7 @@ impl LinkDescriptor {
                 name,
                 target,
                 nullable,
+                through,
                 default_pyql,
                 description,
                 is_exclusive,
@@ -460,6 +463,11 @@ impl LinkDescriptor {
     #[getter]
     fn nullable(&self) -> bool {
         self.inner.nullable
+    }
+
+    #[getter]
+    fn through(&self) -> Option<&str> {
+        self.inner.through.as_deref()
     }
 
     #[getter]

@@ -658,6 +658,7 @@ def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
         name=name,
         target=meta.link_target,  # already a qualified string
         nullable=meta.nullable,
+        through=meta.through,  # already a qualified string, or None
         default_pyql=_make_default_pyql(meta),
         description=meta.description,
         is_exclusive=is_exclusive,

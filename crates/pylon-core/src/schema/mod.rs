@@ -91,6 +91,18 @@ pub struct LinkDescriptor {
     pub is_readonly: bool,
     pub rewrites: Vec<RewriteEntry>,
     pub on_delete: Vec<OnDeletePolicy>,
+    /// Qualified name of the explicit junction type, if any — when set, this
+    /// link is backed by a junction table (source, target, plus the
+    /// junction's own properties) instead of a `{name}_id` FK column on the
+    /// source table, the same storage MultiLink's own `through` already
+    /// uses, just constrained to at most one row per source.
+    pub through: Option<String>,
+}
+
+impl LinkDescriptor {
+    pub fn is_junction_backed(&self) -> bool {
+        self.through.is_some()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
