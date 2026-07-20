@@ -3,7 +3,7 @@ use crate::ir::{
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkPointer,
     IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrMultiLinkValueSource, IrNulls,
     IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRowSource, IrScalarPointer,
-    IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
+    IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
     IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
@@ -2081,23 +2081,57 @@ fn emit_single_link(
     parts.extend(sub_exprs);
     let tuple = parts.join(",\n        ");
 
-    // join condition: parent FK column = target PK column
-    let mut where_parts = vec![format!(
-        "{}.{} = {}.{}",
-        qi(parent_alias),
-        qi(&f.fk_column),
-        qi(sub_alias),
-        qi(&f.target_pk),
-    )];
+    let (from_sql, mut where_parts) = match &f.correlation {
+        IrSingleLinkCorrelation::Fk { fk_column, target_pk } => {
+            let from = format!("FROM {} AS {}", source_ref(source), qi(sub_alias));
+            let cond = format!(
+                "{}.{} = {}.{}",
+                qi(parent_alias), qi(fk_column), qi(sub_alias), qi(target_pk),
+            );
+            (from, vec![cond])
+        }
+        // Junction-backed — same join shape a multi-link's correlated
+        // subquery uses; cardinality-one is a schema-level invariant on the
+        // junction table, not something this query needs to enforce itself.
+        IrSingleLinkCorrelation::Junction { join, target_pk: _ } => {
+            match join {
+                IrMultiLinkJoin::Standard { junction_table, module } => {
+                    let from = format!(
+                        "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".target",
+                        qn(module, junction_table),
+                        source_ref(source),
+                        qi(sub_alias),
+                        qi(sub_alias),
+                    );
+                    let cond = format!("\"jt\".source = {}.id", qi(parent_alias));
+                    (from, vec![cond])
+                }
+                IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
+                    let from = format!(
+                        "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
+                        qn(module, junction_table),
+                        source_ref(source),
+                        qi(sub_alias),
+                        qi(sub_alias),
+                        qi(target_col),
+                    );
+                    let cond = format!("\"jt\".{} = {}.id", qi(source_col), qi(parent_alias));
+                    (from, vec![cond])
+                }
+                IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } => {
+                    unreachable!("a junction-backed single link's own forward join is always Standard or Through")
+                }
+            }
+        }
+    };
     if let Some(filter) = &sub.filter {
         where_parts.push(emit_expr(filter));
     }
 
     let mut sql = format!(
-        "(SELECT (\n        {}\n    )\n    FROM {} AS {}\n    WHERE {}",
+        "(SELECT (\n        {}\n    )\n    {}\n    WHERE {}",
         tuple,
-        source_ref(source),
-        qi(sub_alias),
+        from_sql,
         where_parts.join(" AND "),
     );
     if !sub.order_by.is_empty() {
@@ -3297,6 +3331,105 @@ mod tests {
         assert!(out.sql.contains("\"person\""));
         // Still emits array_agg pattern
         assert!(out.sql.contains("array_agg(ROW("));
+    }
+
+    /// Person/Org — a junction-backed single link (`Person.spouse: Link[Org,
+    /// through(Marriage)]`, exclusive). Deliberately targets a different
+    /// type (Org) rather than a self-link, for the same reason
+    /// `test_select_through_multi_link` avoids Person-to-Person — see the
+    /// comment on `make_schema_with_through` above.
+    fn make_schema_with_junction_backed_link() -> SchemaDescriptor {
+        let id_prop = || PropertyDescriptor {
+            name: "id".into(), pg_type: "uuid".into(), nullable: false,
+            default_sql: Some("gen_random_uuid()".into()), description: None,
+            default_pyql: None, check_constraints: vec![], is_exclusive: true,
+            is_pk: true, is_readonly: true, rewrites: vec![],
+        tuple_members: None, };
+        let name_prop = || PropertyDescriptor {
+            name: "name".into(), pg_type: "text".into(), nullable: false,
+            default_sql: None, description: None, check_constraints: vec![],
+            default_pyql: None, is_exclusive: false, is_pk: false,
+            is_readonly: false, rewrites: vec![],
+        tuple_members: None, };
+        SchemaDescriptor {
+            types: vec![
+                TypeDescriptor {
+                    name: "Person".into(), module: "default".into(), table: "Person".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), name_prop()],
+                    links: vec![LinkDescriptor {
+                        name: "spouse".into(),
+                        target: "default::Org".into(),
+                        nullable: true,
+                        through: Some("default::Marriage".into()),
+                        description: None, default_pyql: None,
+                        is_exclusive: true, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                    }],
+                    multilinks: vec![],
+                    computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
+                    signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "Org".into(), module: "default".into(), table: "Org".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), name_prop()],
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
+                    signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "Marriage".into(), module: "default".into(), table: "Person.spouse".into(),
+                    abstract_: false, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop()],
+                    links: vec![
+                        LinkDescriptor {
+                            name: "source".into(), target: "default::Person".into(),
+                            nullable: false, through: None, description: None, default_pyql: None,
+                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                        },
+                        LinkDescriptor {
+                            name: "target".into(), target: "default::Org".into(),
+                            nullable: false, through: None, description: None, default_pyql: None,
+                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                        },
+                    ],
+                    multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: true,
+                    signals: vec![],
+                },
+            ],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_select_shape_over_junction_backed_single_link() {
+        let schema = make_schema_with_junction_backed_link();
+        let ast = crate::parse::parse("SELECT Person { name, spouse { name } }").unwrap();
+        let ir = crate::ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        // Junction table is the through type's own table, joined like a multi-link's.
+        assert!(out.sql.contains("\"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"jt\".source"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"jt\".target"), "got:\n{}", out.sql);
+        // Cardinality-one: a scalar correlated subquery, never array_agg.
+        assert!(!out.sql.contains("array_agg"), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("spouse_id"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_select_path_over_junction_backed_single_link() {
+        let schema = make_schema_with_junction_backed_link();
+        let ast = crate::parse::parse("SELECT Person.spouse { name }").unwrap();
+        let ir = crate::ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(out.sql.contains("\"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"source\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"target\""), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("spouse_id"), "got:\n{}", out.sql);
     }
 
     /// Product/Tag/ProductTag — the actual real-world shape link properties

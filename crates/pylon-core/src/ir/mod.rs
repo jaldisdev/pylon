@@ -294,17 +294,34 @@ pub struct IrScalarPointer {
     pub tuple_shape: Option<TupleCastShape>,
 }
 
-/// A single-valued FK link included in the output shape.
-/// Emitted as a correlated scalar subquery.
+/// A single-valued link included in the output shape. Emitted as a
+/// correlated scalar subquery — either a plain FK-column correlation, or,
+/// for a junction-backed single link, the same join shape a multi-link
+/// uses, just implicitly capped to at most one row per source.
 #[derive(Debug, Clone)]
 pub struct IrSingleLinkPointer {
     pub alias: String,
-    /// FK column on the source table, e.g. `category_id`.
-    pub fk_column: String,
-    /// PK column on the target table, e.g. `id`.
-    pub target_pk: String,
+    pub correlation: IrSingleLinkCorrelation,
     /// Nested SELECT producing the linked object.
     pub subquery: IrSelect,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrSingleLinkCorrelation {
+    /// `parent.<fk_column> = target.<target_pk>`.
+    Fk {
+        /// FK column on the source table, e.g. `category_id`.
+        fk_column: String,
+        /// PK column on the target table, e.g. `id`.
+        target_pk: String,
+    },
+    /// Junction-backed — reuses `IrMultiLinkJoin`, the same join a
+    /// multi-link's own correlated subquery uses.
+    Junction {
+        join: IrMultiLinkJoin,
+        /// PK column on the target table, e.g. `id`.
+        target_pk: String,
+    },
 }
 
 /// A multi-valued link included in the output shape.
@@ -1085,7 +1102,8 @@ mod tests {
         assert_eq!(shape.len(), 2);
         let IrShapePointer::SingleLink(link) = &shape[1] else { panic!("expected SingleLink") };
         assert_eq!(link.alias, "company");
-        assert_eq!(link.fk_column, "company_id");
+        let IrSingleLinkCorrelation::Fk { fk_column, .. } = &link.correlation else { panic!("expected Fk correlation") };
+        assert_eq!(fk_column, "company_id");
         assert_eq!(bound(&link.subquery).0.table, "company");
     }
 
