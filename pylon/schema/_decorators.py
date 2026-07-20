@@ -153,6 +153,7 @@ def _annotation_to_meta(
             rewrites=rewrites,
             on_delete=list(annotation.on_delete),
             is_readonly=is_readonly,
+            through=annotation.through_type,
         )
 
     if isinstance(annotation, MultiLinkAnnotation):
