@@ -169,6 +169,10 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             });
         }
         for l in &td.links {
+            // A junction-backed link has no `{name}_id` column — it's
+            // stored via a junction table instead (below), same as a
+            // multi-link.
+            if l.is_junction_backed() { continue; }
             columns.push(DbColumn {
                 name: format!("{}_id", l.name),
                 pg_type: "uuid".to_string(),
@@ -208,6 +212,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         // FK constraints: one per single link
         let mut foreign_keys: Vec<DbForeignKey> = Vec::new();
         for l in &td.links {
+            if l.is_junction_backed() { continue; }
             let cname = format!("{}_{}_fkey", td.table, l.name);
             if let Some((tgt_schema, tgt_table)) = type_map.get(&l.target) {
                 foreign_keys.push(DbForeignKey {
@@ -231,7 +236,10 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             }
         }
         for l in &td.links {
-            if l.is_exclusive {
+            // A junction-backed exclusive link's uniqueness is a
+            // `UNIQUE (target)` table constraint on its junction table
+            // (below), not a separate index on this table.
+            if l.is_exclusive && !l.is_junction_backed() {
                 indexes.push(DbIndex {
                     name: format!("{}_{}_id_key", td.table, l.name),
                     is_unique: true,
@@ -304,58 +312,21 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
 
         // Junction tables for multi-links
         for ml in &td.multilinks {
-            let jt_name = format!("{}.{}", td.table, ml.name);
-            let mut jt_columns = vec![
-                DbColumn { name: "source".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
-                DbColumn { name: "target".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
-            ];
-
-            // Extra columns from the through junction type
-            if let Some(through_qname) = &ml.through {
-                if let Some(through_td) = schema.types.iter().find(|t| {
-                    format!("{}::{}", t.module, t.name) == *through_qname && t.junction
-                }) {
-                    for p in &through_td.properties {
-                        if p.name == "id" { continue; }
-                        let pg_type = col_type_str(&p.pg_type).to_string();
-                        jt_columns.push(DbColumn {
-                            name: p.name.clone(),
-                            pg_type,
-                            nullable: p.nullable,
-                            is_generated: false,
-                            column_default: p.default_sql.clone(),
-                        });
-                    }
-                }
-            }
-
-            let mut jt_fks = Vec::new();
-            let src_fk_name = format!("{}_{}_source_fkey", td.table, ml.name);
-            jt_fks.push(DbForeignKey {
-                constraint_name: src_fk_name,
-                local_column: "source".to_string(),
-                ref_schema: td.module.clone(),
-                ref_table: td.table.clone(),
-            });
-            if let Some((tgt_schema, tgt_table)) = type_map.get(&ml.target) {
-                let tgt_fk_name = format!("{}_{}_target_fkey", td.table, ml.name);
-                jt_fks.push(DbForeignKey {
-                    constraint_name: tgt_fk_name,
-                    local_column: "target".to_string(),
-                    ref_schema: tgt_schema.to_string(),
-                    ref_table: tgt_table.to_string(),
-                });
-            }
-
-            tables.push(DbTable {
-                schema: td.module.clone(),
-                name: jt_name,
-                columns: jt_columns,
-                foreign_keys: jt_fks,
-                indexes: vec![],
-                checks: vec![],
-                triggers: vec![],
-            });
+            tables.push(build_junction_db_table(
+                schema, &type_map, td, &ml.name, &ml.target, ml.through.as_deref(),
+            ));
+        }
+        // Junction tables for junction-backed single links — same shape
+        // (source/target + through columns); cardinality is enforced via
+        // an inline PRIMARY KEY/UNIQUE table constraint the diff engine
+        // doesn't track as a separate index (mirroring how a plain
+        // multi-link's own inline `PRIMARY KEY (source, target)` isn't
+        // tracked as an index here either).
+        for l in &td.links {
+            if !l.is_junction_backed() { continue; }
+            tables.push(build_junction_db_table(
+                schema, &type_map, td, &l.name, &l.target, l.through.as_deref(),
+            ));
         }
     }
 
@@ -373,6 +344,74 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .collect();
 
     DbState { schemas, tables, enums, domains, sequences, views, functions }
+}
+
+/// Builds the expected `DbTable` for one junction table — shared by a
+/// multi-link and a junction-backed single link, since both store
+/// (source, target, through-type properties) identically; only the
+/// caller-supplied cardinality constraint (a `PRIMARY KEY`/`UNIQUE` table
+/// constraint, not tracked here as a separate index — see
+/// `schema_to_db_state`) differs between the two.
+fn build_junction_db_table(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    td: &TypeDescriptor,
+    name: &str,
+    target: &str,
+    through: Option<&str>,
+) -> DbTable {
+    let jt_name = format!("{}.{}", td.table, name);
+    let mut jt_columns = vec![
+        DbColumn { name: "source".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
+        DbColumn { name: "target".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
+    ];
+
+    // Extra columns from the through junction type
+    if let Some(through_qname) = through {
+        if let Some(through_td) = schema.types.iter().find(|t| {
+            format!("{}::{}", t.module, t.name) == *through_qname && t.junction
+        }) {
+            for p in &through_td.properties {
+                if p.name == "id" { continue; }
+                let pg_type = col_type_str(&p.pg_type).to_string();
+                jt_columns.push(DbColumn {
+                    name: p.name.clone(),
+                    pg_type,
+                    nullable: p.nullable,
+                    is_generated: false,
+                    column_default: p.default_sql.clone(),
+                });
+            }
+        }
+    }
+
+    let mut jt_fks = Vec::new();
+    let src_fk_name = format!("{}_{}_source_fkey", td.table, name);
+    jt_fks.push(DbForeignKey {
+        constraint_name: src_fk_name,
+        local_column: "source".to_string(),
+        ref_schema: td.module.clone(),
+        ref_table: td.table.clone(),
+    });
+    if let Some((tgt_schema, tgt_table)) = type_map.get(target) {
+        let tgt_fk_name = format!("{}_{}_target_fkey", td.table, name);
+        jt_fks.push(DbForeignKey {
+            constraint_name: tgt_fk_name,
+            local_column: "target".to_string(),
+            ref_schema: tgt_schema.to_string(),
+            ref_table: tgt_table.to_string(),
+        });
+    }
+
+    DbTable {
+        schema: td.module.clone(),
+        name: jt_name,
+        columns: jt_columns,
+        foreign_keys: jt_fks,
+        indexes: vec![],
+        checks: vec![],
+        triggers: vec![],
+    }
 }
 
 fn ddl_hash(ddl: &str) -> String {
@@ -605,7 +644,8 @@ pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<C
         // Target columns as owned Vec to avoid temporary String lifetime issues.
         let target_cols: Vec<(String, String)> = td.properties.iter()
             .map(|p| (p.name.clone(), col_type_str(&p.pg_type).to_string()))
-            .chain(td.links.iter().map(|l| (format!("{}_id", l.name), "uuid".to_string())))
+            .chain(td.links.iter().filter(|l| !l.is_junction_backed())
+                .map(|l| (format!("{}_id", l.name), "uuid".to_string())))
             .collect();
 
         // Current columns (skip internal __*__ columns).
@@ -775,7 +815,7 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
         }
 
         for l in &td.links {
-            if l.nullable { continue; }
+            if l.nullable || l.is_junction_backed() { continue; }
             let col = format!("{}_id", l.name);
             match cur_col_map.get(col.as_str()) {
                 None => {
@@ -941,10 +981,12 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
             _ => {}
         }
         colour[i] = 1;
-        // Dependencies: FK links only. Multilinks don't create FK columns on
-        // the source table — the junction table does — so they are not ordering
-        // constraints for the source type itself.
+        // Dependencies: FK links only. Multilinks — and junction-backed
+        // single links, which are stored the same way — don't create FK
+        // columns on the source table (the junction table does), so
+        // neither is an ordering constraint for the source type itself.
         for l in &types[i].links {
+            if l.is_junction_backed() { continue; }
             if let Some(&dep) = idx_of.get(&l.target) {
                 visit(dep, types, idx_of, colour, order)?;
             }
@@ -1115,14 +1157,24 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 7: junction tables for new multi-links ──────────────────────────
+    // ── Phase 7: junction tables for new multi-links (and junction-backed
+    // single links, which share the exact same junction-table machinery,
+    // just capped to one row per source) ──────────────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
         if td.abstract_ || td.junction { continue; }
         for ml in &td.multilinks {
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
-                emit_junction_table(td, &ml.name, &ml.target, ml.through.as_deref(), &ml.on_delete, &type_map, target, &mut ops);
+                emit_junction_table(td, &ml.name, &ml.target, ml.through.as_deref(), &ml.on_delete, &type_map, target, false, false, &mut ops);
+                new_tables.insert((td.module.clone(), jt));
+            }
+        }
+        for l in &td.links {
+            if !l.is_junction_backed() { continue; }
+            let jt = format!("{}.{}", td.table, l.name);
+            if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
+                emit_junction_table(td, &l.name, &l.target, l.through.as_deref(), &l.on_delete, &type_map, target, true, l.is_exclusive, &mut ops);
                 new_tables.insert((td.module.clone(), jt));
             }
         }
@@ -1329,6 +1381,10 @@ fn diff_inner(
                 for ml in &td.multilinks {
                     cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
                 }
+                for l in &td.links {
+                    if !l.is_junction_backed() { continue; }
+                    cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
+                }
             }
         }
         for (module, table) in &cache_trigger_tables {
@@ -1367,6 +1423,10 @@ fn diff_inner(
         if !td.abstract_ && !td.junction {
             for ml in &td.multilinks {
                 target_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
+            }
+            for l in &td.links {
+                if !l.is_junction_backed() { continue; }
+                target_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
             }
         }
     }
@@ -1468,6 +1528,7 @@ fn emit_create_table(td: &TypeDescriptor, schema: &SchemaDescriptor, ops: &mut V
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type_str(&p.pg_type), not_null, default));
     }
     for l in &td.links {
+        if l.is_junction_backed() { continue; }
         let not_null = if l.nullable { "" } else { " NOT NULL" };
         let default = resolve_link_default(l, schema)
             .map(|d| format!(" DEFAULT {}", d))
@@ -1530,6 +1591,7 @@ fn emit_column_diff(
         ));
     }
     for l in &td.links {
+        if l.is_junction_backed() { continue; }
         let col = format!("{}_id", l.name);
         if existing_col_map.contains_key(col.as_str()) { continue; }
         let eff_default = resolve_link_default(l, schema);
@@ -1591,6 +1653,7 @@ fn emit_column_diff(
         }
     }
     for l in &td.links {
+        if l.is_junction_backed() { continue; }
         let col = format!("{}_id", l.name);
         let Some(cur) = existing_col_map.get(col.as_str()) else { continue };
         if !cur.nullable && l.nullable {
@@ -1632,7 +1695,7 @@ fn emit_column_diff(
 
     // ── Drop removed columns ──────────────────────────────────────────────────
     let target_cols: HashSet<String> = td.properties.iter().map(|p| p.name.clone())
-        .chain(td.links.iter().map(|l| format!("{}_id", l.name)))
+        .chain(td.links.iter().filter(|l| !l.is_junction_backed()).map(|l| format!("{}_id", l.name)))
         .collect();
     for col in &existing.columns {
         let n = col.name.as_str();
@@ -1660,6 +1723,7 @@ fn emit_fk_diff(
         .collect();
 
     for l in &td.links {
+        if l.is_junction_backed() { continue; }
         let cname = format!("{}_{}_fkey", td.table, l.name);
         if existing_fk_names.contains(cname.as_str()) { continue; }
         let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
@@ -1702,6 +1766,8 @@ fn emit_junction_table(
     on_delete: &[crate::schema::OnDeletePolicy],
     type_map: &HashMap<String, (&str, &str)>,
     schema: &SchemaDescriptor,
+    single: bool,
+    exclusive: bool,
     ops: &mut Vec<DiffOp>,
 ) {
     use crate::schema::{DeleteAction, DeleteSide};
@@ -1745,10 +1811,14 @@ fn emit_junction_table(
         }
     }
 
+    let pk_clause = if single { "PRIMARY KEY (source)" } else { "PRIMARY KEY (source, target)" };
+    let unique_clause = if exclusive { ",\n    UNIQUE (target)" } else { "" };
     push_tx(ops, format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n{},\n    PRIMARY KEY (source, target)\n);",
+        "CREATE TABLE IF NOT EXISTS {} (\n{},\n    {}{}\n);",
         qn(&td.module, &jt_name),
         col_lines,
+        pk_clause,
+        unique_clause,
     ));
 }
 
@@ -1956,7 +2026,7 @@ fn emit_column_diff_from_db(after: &DbTable, before: &DbTable, ops: &mut Vec<Dif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{EnumDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
+    use crate::schema::{EnumDescriptor, LinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 
     fn empty_state() -> DbState { DbState::default() }
 
@@ -2031,6 +2101,84 @@ mod tests {
             "junction table's own td.table and the owning type's multilink both resolve to \
              the same physical table — must be deduped to one trigger, got {trigger_count} in: {ops:?}"
         );
+    }
+
+    fn person_with_junction_backed_spouse() -> SchemaDescriptor {
+        let mut person = simple_type("default", "Person", "Person");
+        person.links.push(LinkDescriptor {
+            name: "spouse".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            through: Some("default::Marriage".into()),
+            description: None,
+            default_pyql: None,
+            is_exclusive: true,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        });
+        let mut junction = simple_type("default", "Marriage", "Person.spouse");
+        junction.junction = true;
+
+        SchemaDescriptor {
+            types: vec![person, junction],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_junction_backed_single_link_creates_junction_table_from_scratch() {
+        let schema = person_with_junction_backed_spouse();
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
+        let joined = ops.join("\n");
+        assert!(!joined.contains("spouse_id"), "no {{name}}_id column/FK for a junction-backed link, got:\n{joined}");
+        assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"public\".\"Person.spouse\""), "got:\n{joined}");
+        assert!(joined.contains("PRIMARY KEY (source)"), "got:\n{joined}");
+        assert!(joined.contains("UNIQUE (target)"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_junction_backed_single_link_diff_is_idempotent_once_applied() {
+        // Regression guard for the drop-detection gap called out in the
+        // junction-backed-single-link plan: without including link-through
+        // junction tables in the create-loop/drop-detection/cache-trigger
+        // sets, the table would get created then immediately flagged for
+        // drop as "unknown" on the very next diff. This models the DbState
+        // a live Postgres introspection would report right after the
+        // create-from-scratch ops above were actually applied.
+        let schema = person_with_junction_backed_spouse();
+        let state = DbState {
+            schemas: vec![],
+            tables: vec![
+                DbTable {
+                    schema: "default".into(), name: "Person".into(),
+                    columns: vec![
+                        DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                        DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    ],
+                    foreign_keys: vec![], indexes: vec![], checks: vec![],
+                    triggers: vec!["pylon_cache_invalidate".into()],
+                },
+                DbTable {
+                    schema: "default".into(), name: "Person.spouse".into(),
+                    columns: vec![
+                        DbColumn { name: "source".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: None },
+                        DbColumn { name: "target".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: None },
+                        DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    ],
+                    foreign_keys: vec![
+                        DbForeignKey { constraint_name: "Person_spouse_source_fkey".into(), local_column: "source".into(), ref_schema: "default".into(), ref_table: "Person".into() },
+                        DbForeignKey { constraint_name: "Person_spouse_target_fkey".into(), local_column: "target".into(), ref_schema: "default".into(), ref_table: "Person".into() },
+                    ],
+                    indexes: vec![], checks: vec![],
+                    triggers: vec!["pylon_cache_invalidate".into()],
+                },
+            ],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        assert!(ops.is_empty(), "already-migrated junction-backed single link must diff to no ops, got: {:?}", ops);
     }
 
     #[test]
