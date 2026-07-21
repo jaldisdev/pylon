@@ -8,7 +8,7 @@
 //! `_hydrate()` in `pylon/query.py` (driven by `CompiledQuery.shape`) does
 //! the real interpretation on both the write and the read side.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -18,9 +18,9 @@ use pylon_cache::{cache_key as cache_key_impl, Cache};
 use crate::pgvalue::{cached_to_py, py_to_cached};
 use crate::PylonCacheError;
 
-static PYLON_CACHE: OnceLock<RwLock<Option<Cache>>> = OnceLock::new();
+static PYLON_CACHE: OnceLock<RwLock<Option<Arc<Cache>>>> = OnceLock::new();
 
-fn cache_slot() -> &'static RwLock<Option<Cache>> {
+fn cache_slot() -> &'static RwLock<Option<Arc<Cache>>> {
     PYLON_CACHE.get_or_init(|| RwLock::new(None))
 }
 
@@ -28,11 +28,21 @@ fn cache_err<E: std::fmt::Display>(e: E) -> PyErr {
     PylonCacheError::new_err(e.to_string())
 }
 
+/// The process-global `Cache` handle `cache_init` opened, if any — shared
+/// with `workers::run_cache_invalidation_worker_shared` so `pylon serve`
+/// (which now also runs the cache-invalidation worker in-process, see
+/// `pylon/server/asgi.py`) evicts through the *same* open LMDB environment
+/// its own read-through cache uses, rather than a second `Cache::open` on
+/// the same path — LMDB refuses that within one process.
+pub(crate) fn shared_cache() -> Option<Arc<Cache>> {
+    cache_slot().read().unwrap().clone()
+}
+
 /// Opens (or reopens) the process-global LMDB-backed cache at `path`.
 #[pyfunction]
 fn cache_init(path: &str, max_size_mb: usize) -> PyResult<()> {
     let cache = Cache::open(std::path::Path::new(path), max_size_mb).map_err(cache_err)?;
-    *cache_slot().write().unwrap() = Some(cache);
+    *cache_slot().write().unwrap() = Some(Arc::new(cache));
     Ok(())
 }
 

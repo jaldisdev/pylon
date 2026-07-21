@@ -9,6 +9,7 @@
 mod cache_worker;
 mod error;
 pub mod index_worker;
+pub mod metrics;
 pub mod search_clients;
 mod search_worker;
 mod vector_worker;
