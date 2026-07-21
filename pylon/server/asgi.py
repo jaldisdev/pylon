@@ -4,13 +4,15 @@ lifespan management (connecting/closing the shared `Client`).
 
 Mounts, per the observability spec's deployment design:
     /api/...  -> data endpoints (schema browser, query console, ...)
+    /metrics  -> Prometheus text exposition (see _handle_get_metrics)
     /         -> the built React SPA, only when `[ui].enabled` (Phase 1 ships
                  no build output yet, so this simply 404s until it does)
-`/metrics` is Prometheus/OTel work, explicitly deferred past Phase 1.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import datetime
 import decimal
@@ -56,13 +58,24 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
     # http request looks up (or lazily builds) the Client for whichever
     # connection its URL names.
     clients: dict[str, Client] = {}
+    # Background worker tasks (cache invalidation, vector/search indexing,
+    # signal dispatch) launched on startup and cancelled on shutdown — see
+    # `_handle_lifespan`. `pylon serve` runs these in-process rather than
+    # requiring a separate `pylon worker start`; both are safe to run at
+    # once (the outbox claim queries use `FOR UPDATE SKIP LOCKED`), so this
+    # is additive, not a replacement for standalone worker processes.
+    worker_tasks: list[asyncio.Task] = []
 
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
-            await _handle_lifespan(config, clients, receive, send)
+            await _handle_lifespan(config, clients, worker_tasks, receive, send)
             return
 
         path, method = scope["path"], scope["method"]
+
+        if path == "/metrics" and method == "GET":
+            await _handle_get_metrics(send)
+            return
 
         # Routes that read/write actual database data are addressed as
         # /api/<connection>/<rest>, mirroring the frontend's own /<branch>/...
@@ -146,7 +159,9 @@ async def _resolve_client(config: Config, clients: dict[str, Client], connection
     return clients[key]
 
 
-async def _handle_lifespan(config: Config, clients: dict[str, Client], receive: Receive, send: Send) -> None:
+async def _handle_lifespan(
+    config: Config, clients: dict[str, Client], worker_tasks: list[asyncio.Task], receive: Receive, send: Send
+) -> None:
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
@@ -156,7 +171,7 @@ async def _handle_lifespan(config: Config, clients: dict[str, Client], receive: 
                 # every other Pylon entry point (repl, worker, ...) makes on startup.
                 import pylon
 
-                pylon.finalize()
+                schema = pylon.finalize()
 
                 # Eagerly connect only the base ("default"/"main") connection
                 # at startup, matching the previous single-Client behavior —
@@ -166,12 +181,28 @@ async def _handle_lifespan(config: Config, clients: dict[str, Client], receive: 
                 client = Client(config)
                 await client.ensure_connected()
                 clients["default"] = client
+
+                # Launch whatever background workers the schema/config imply
+                # (see build_worker_tasks) as plain asyncio tasks in this same
+                # process — cancelled on shutdown below. ensure_future, not
+                # create_task: the Rust-native workers are pyo3-returned
+                # Future-likes, not real Python coroutine objects, and
+                # create_task requires the latter (TypeError on 3.12+).
+                from pylon.cli.commands.worker import build_worker_tasks
+                for coro in build_worker_tasks(schema, config, shared_cache=True):
+                    worker_tasks.append(asyncio.ensure_future(coro))
+
                 await send({"type": "lifespan.startup.complete"})
             except Exception as exc:  # noqa: BLE001 — report to the ASGI server, don't hide it
                 await send({"type": "lifespan.startup.failed", "message": str(exc)})
                 return
         elif message["type"] == "lifespan.shutdown":
             try:
+                for task in worker_tasks:
+                    task.cancel()
+                for task in worker_tasks:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
                 for client in clients.values():
                     await client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
@@ -197,6 +228,34 @@ async def _send_json(send: Send, status: int, payload: Any) -> None:
             "type": "http.response.start",
             "status": status,
             "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+# ---------------------------------------------------------------------------
+# /metrics
+# ---------------------------------------------------------------------------
+#
+# Prometheus text-exposition format — bare, unauthenticated GET, matching
+# Prometheus's own scrape convention (no /api prefix, no connection scoping;
+# metrics aren't per-connection data). Every counter/gauge is registered and
+# updated entirely in Rust (workers, pgcon pool) against the process-global
+# `prometheus` crate registry; this just renders whatever's in it right now.
+# Since `pylon serve` also runs the background workers in-process (see
+# build_worker_tasks in _handle_lifespan), one scrape target here already
+# covers both HTTP-facing and worker-side metrics with no extra listener.
+
+
+async def _handle_get_metrics(send: Send) -> None:
+    from pylon._core import render_prometheus_metrics
+
+    body = render_prometheus_metrics().encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain; version=0.0.4; charset=utf-8")],
         }
     )
     await send({"type": "http.response.body", "body": body})

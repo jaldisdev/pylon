@@ -31,11 +31,33 @@ fn workers_err(err: pylon_workers::Error) -> PyErr {
 /// Connects a `CacheInvalidationWorker` (LISTEN `pylon_cache_invalidate`,
 /// evict matching LMDB entries) and runs it until the returned coroutine is
 /// cancelled — the Rust-native replacement for
-/// `pylon.cache.CacheInvalidationWorker(conn).run()`.
+/// `pylon.cache.CacheInvalidationWorker(conn).run()`. Opens its own LMDB
+/// handle at `cache_path`; for a process (like `pylon serve`) that already
+/// has one open via `cache_init`, use `run_cache_invalidation_worker_shared`
+/// instead — LMDB refuses a second `Env::open` on the same path within one
+/// process.
 #[pyfunction]
 fn run_cache_invalidation_worker(py: Python<'_>, dsn: String, cache_path: String, max_size_mb: usize) -> PyResult<Bound<'_, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let worker = pylon_workers::CacheInvalidationWorker::connect(&dsn, std::path::Path::new(&cache_path), max_size_mb)
+            .await
+            .map_err(workers_err)?;
+        worker.run().await;
+        Ok(())
+    })
+}
+
+/// Like `run_cache_invalidation_worker`, but attaches to the process-global
+/// `Cache` handle `pylon.cache.init()` already opened (via `cache_init`,
+/// `crate::cache`) instead of opening a second one — for `pylon serve`,
+/// which runs its own read-through cache *and* this worker in one process.
+/// Errors immediately if `cache_init` hasn't run yet in this process.
+#[pyfunction]
+fn run_cache_invalidation_worker_shared(py: Python<'_>, dsn: String) -> PyResult<Bound<'_, PyAny>> {
+    let cache = crate::cache::shared_cache()
+        .ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let worker = pylon_workers::CacheInvalidationWorker::connect_with_cache(&dsn, cache)
             .await
             .map_err(workers_err)?;
         worker.run().await;
@@ -130,10 +152,21 @@ fn run_opensearch_worker<'py>(
     })
 }
 
+/// Renders every metric registered so far against the process-global
+/// `prometheus` registry (worker job counts, cache invalidations, ...) as
+/// Prometheus text exposition format — see `pylon_workers::metrics`. Called
+/// from `pylon serve`'s `/metrics` route (`pylon/server/asgi.py`).
+#[pyfunction]
+fn render_prometheus_metrics() -> String {
+    pylon_workers::metrics::render()
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_cache_invalidation_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(run_cache_invalidation_worker_shared, m)?)?;
     m.add_function(wrap_pyfunction!(run_vector_worker, m)?)?;
     m.add_function(wrap_pyfunction!(run_meilisearch_worker, m)?)?;
     m.add_function(wrap_pyfunction!(run_opensearch_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(render_prometheus_metrics, m)?)?;
     Ok(())
 }

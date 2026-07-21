@@ -46,11 +46,24 @@ impl CacheInvalidationWorker {
     /// mapping the same path (matches the old Python worker's own
     /// reasoning for opening its own handle rather than sharing one).
     pub async fn connect(dsn: &str, cache_path: &Path, max_size_mb: usize) -> Result<Self> {
-        let cache = Arc::new(Cache::open(cache_path, max_size_mb)?);
+        Self::connect_with_cache(dsn, Arc::new(Cache::open(cache_path, max_size_mb)?)).await
+    }
+
+    /// Like `connect`, but attaches to an already-open `cache` instead of
+    /// opening its own LMDB handle — for a process that already has one
+    /// open (e.g. `pylon serve`'s own read-through cache, see
+    /// `pylon_py::cache::shared_cache`), since LMDB refuses a second
+    /// `Env::open` on the same path within one process, unlike across
+    /// processes (which is what `connect` is for).
+    pub async fn connect_with_cache(dsn: &str, cache: Arc<Cache>) -> Result<Self> {
         let cache_for_listener = cache.clone();
         let listener = PgListener::connect(dsn, move |n| {
-            if let Err(e) = cache_for_listener.invalidate(&[n.payload().to_string()]) {
-                eprintln!("CacheInvalidationWorker: eviction failed for tag {:?}: {e}", n.payload());
+            match cache_for_listener.invalidate(&[n.payload().to_string()]) {
+                Ok(()) => crate::metrics::CACHE_INVALIDATIONS.with_label_values(&["success"]).inc(),
+                Err(e) => {
+                    crate::metrics::CACHE_INVALIDATIONS.with_label_values(&["error"]).inc();
+                    eprintln!("CacheInvalidationWorker: eviction failed for tag {:?}: {e}", n.payload());
+                }
             }
         })
         .await?;
