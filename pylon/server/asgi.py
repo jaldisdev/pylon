@@ -720,12 +720,33 @@ async def _handle_get_models(config: Config, send: Send) -> None:
 async def _handle_get_stats(client: Client, send: Send) -> None:
     registered_types, _, registered_scalars = schema_snapshot()
 
+    # Junction tables back MultiLinks, not user-facing objects — exclude them
+    # from the estimate the same way _pylon's own bookkeeping tables are
+    # excluded. Table names must come from the compiled SchemaDescriptor, not
+    # the raw Python `__pylon_config__` — a junction type's actual table name
+    # is derived from the MultiLink that references it, not from the
+    # junction class's own name (see `junction_decorator`'s docstring).
+    from pylon.query import _get_schema
+
+    junction_tables = {
+        ("public" if t.module == "default" else t.module, t.table)
+        for t in _get_schema().types
+        if t.junction
+    }
+    junction_filter = ""
+    if junction_tables:
+        excluded = ", ".join(
+            f"('{schema}', '{table}')" for schema, table in sorted(junction_tables)
+        )
+        junction_filter = f"AND (schemaname, relname) NOT IN ({excluded})"
+
     async with client.raw_connection() as pool:
         rows = await pool.query(
-            """
+            f"""
             SELECT (SUM(n_live_tup)::bigint) AS result
             FROM pg_stat_user_tables
             WHERE schemaname NOT IN ('pg_catalog', 'information_schema', '_pylon')
+            {junction_filter}
             """,
             [],
         )
