@@ -4996,6 +4996,34 @@ impl<'a> Compiler<'a> {
             if let Some(resolved) = self.resolve_cte_path(p) {
                 return resolved;
             }
+            // `root.field1.field2...` where `root` is a WITH-bound *schema
+            // object* (`with person := (select detached Person filter ...)
+            // select ... person.company.name ...`). `compile_path_select`
+            // already treats a CTE-bound root exactly like a real type name
+            // (it checks `cte_types` before falling back to `resolve_type`,
+            // via the `@cte:` source-table sentinel — see its own doc
+            // comment and `compile_expr_as_path_select`'s sibling case for
+            // `Detached`), so it already implements the *entire* general
+            // path-traversal feature set here — forward links, multilinks,
+            // backlinks, junction-backed links, nested tuple field access,
+            // "did you mean" on a typo'd name — not just a one-property
+            // special case. Wrapping its result as `IrExpr::PathSubquery`
+            // (the same vehicle `Detached` uses for a type-rooted path in
+            // expression position) turns the whole traversal into one
+            // correlated scalar/id expression.
+            if p.steps.len() > 1 {
+                if let ast::PathStep::Name(root) = &p.steps[0] {
+                    if self.cte_types.get(root.as_str()).map(|t| t.contains("::")).unwrap_or(false) {
+                        let full_path = ast::Path { steps: p.steps.clone(), partial: false };
+                        let synthetic = ast::SelectStmt {
+                            result: Expr::Path(full_path.clone()),
+                            filter: None, order_by: vec![], offset: None, limit: None,
+                        };
+                        let ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
+                        return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                    }
+                }
+            }
             // Absolute path rooted at the current td: `TypeName.prop` inside a schema-bound
             // expression (e.g. the value side of a BinOp in compile_expr_as_path_select).
             // Rewrite to a relative path and compile normally.
