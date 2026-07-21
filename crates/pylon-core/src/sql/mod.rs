@@ -2875,9 +2875,9 @@ fn emit_literal(lit: &IrLiteral) -> String {
         IrLiteral::Float(f) => {
             // Explicit ::float8 cast — a bare untyped numeral like `1.0`
             // defaults to Postgres `numeric`, but an un-cast PyQL float
-            // literal means `float64` (matches the upstream engine/PyQL semantics; only
-            // an explicit `<decimal>`/`123n` literal should ever produce a
-            // real decimal). Without this, `numeric`'s different wire OID
+            // literal means `float64`; only an explicit `<decimal>`/`123n`
+            // literal should ever produce a real decimal. Without this,
+            // `numeric`'s different wire OID
             // also broke decoding inside ROW() composites (see
             // _pg_decode_numeric in pylon/client.py, still needed for
             // genuine decimal casts).
@@ -3274,9 +3274,9 @@ mod tests {
     #[test]
     fn test_deep_splat_fetches_single_link_target_properties_not_just_id() {
         // `**` on a single link must expand to the target type's own
-        // properties (the upstream engine semantics: one level of `*`, not `**` again —
-        // recursing into the target's own links would never terminate for
-        // a cyclic link graph), not just an implicit `{ id }`.
+        // properties (one level of `*`, not `**` again — recursing into
+        // the target's own links would never terminate for a cyclic link
+        // graph), not just an implicit `{ id }`.
         let out = compile_and_emit("SELECT Person { ** }");
         assert!(out.sql.contains("\"name\""), "expected Company.name pulled in via .company's ** expansion, got:\n{}", out.sql);
     }
@@ -3910,10 +3910,9 @@ mod tests {
     #[test]
     fn test_bare_free_cte_reference_in_computed_shape_collapses_to_empty() {
         // A free-object CTE referenced bare (no shape) as a computed shape
-        // element's value has nothing to project — matches the upstream engine, which
-        // needs an explicit shape to know what to expose from a free
-        // object (unlike a tuple, which is a plain value with no such
-        // requirement).
+        // element's value has nothing to project — a free object needs an
+        // explicit shape to know what to expose (unlike a tuple, which is
+        // a plain value with no such requirement).
         let out = compile_and_emit(
             "with\n  test := { test2 := 1.0, test3 := 'str' }\n\
              select default::Person { id, test := test };",
@@ -4004,7 +4003,7 @@ mod tests {
         assert!(out.sql.contains("RETURNING"));
         assert!(out.sql.contains("'default::Person'::text"));
         assert!(out.sql.contains(") AS result"));
-        // Bare INSERT returns pk only (the upstream engine behaviour)
+        // Bare INSERT returns pk only
         let ShapeNode::Object { cardinality, pointers, .. } = &out.shape.root else { panic!() };
         assert_eq!(*cardinality, Cardinality::Required);
         // Only __type__ and id — not name or age
@@ -4044,8 +4043,8 @@ mod tests {
         // already handled) — that TypeCast wraps the empty set, so it fell
         // through to the generic Set/Shape rejection instead ("shapes and
         // set literals are not valid in expression context"). Must compile
-        // to a plain NULL for the link's FK column, matching real PyQL:
-        // `<AnyType>{}` is always NULL regardless of context.
+        // to a plain NULL for the link's FK column: `<AnyType>{}` is always
+        // NULL regardless of context.
         let out = compile_and_emit("UPDATE Person FILTER .id = $id SET { company := <default::Company>{} }");
         assert!(out.sql.contains("\"company_id\" = NULL"), "got:\n{}", out.sql);
     }
@@ -4586,9 +4585,10 @@ mod tests {
 
     #[test]
     fn test_postgis_quantizecoordinates_default_arity_variants_compile() {
-        // The upstream engine documents this with 3 trailing optional params; Pylon has no
-        // notion of default args, so each arity is its own registered
-        // overload — confirm both the 2-arg and 4-arg forms resolve.
+        // The reference binding documents this with 3 trailing optional
+        // params; Pylon has no notion of default args, so each arity is
+        // its own registered overload — confirm both the 2-arg and 4-arg
+        // forms resolve.
         let out = compile_and_emit(
             "SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5)",
         );
@@ -4910,8 +4910,8 @@ mod tests {
     fn test_datetime_plus_duration_type_checks() {
         // Regression: types_compatible's bucket-matching (same type, or
         // both-int, or both-float) rejected this outright, even though
-        // Postgres supports `timestamptz + interval` natively and the upstream engine
-        // declares it as a real operator overload.
+        // Postgres supports `timestamptz + interval` natively and this is
+        // a legitimate operator overload.
         let out = compile_and_emit("SELECT <datetime>$p + <duration>$d");
         assert!(out.sql.contains(" + "), "got:\n{}", out.sql);
     }
@@ -4987,7 +4987,7 @@ mod tests {
     fn test_unknown_pointer_suggests_a_close_match() {
         // `Person` has a `name` property (see make_schema) — `nam` is close
         // enough (missing one trailing character) that a "Did you mean"
-        // suggestion should fire, matching the upstream engine's own UX for this mistake.
+        // suggestion should fire.
         let schema = make_schema();
         let ast = parse::parse("SELECT Person { nam }").unwrap();
         match ir::compile(&ast, &schema) {
@@ -5087,8 +5087,8 @@ mod tests {
     #[test]
     fn test_array_literal_cast_applies_per_element_cast() {
         // Each element gets its own real cast, not a raw untyped ARRAY[...] —
-        // '1' and '2' must actually coerce to int8, matching real PyQL
-        // per-element cast semantics (mirrors the equivalent tuple test).
+        // '1' and '2' must actually coerce to int8 (mirrors the equivalent
+        // tuple test).
         let out = compile_and_emit("SELECT <array<int64>>['1', '2']");
         assert!(out.sql.contains("ARRAY[('1')::int8, ('2')::int8]"), "got:\n{}", out.sql);
     }
@@ -5456,7 +5456,7 @@ mod tests {
         // runtime jsonb index (returning null) instead of failing, because
         // the source is a TypeCast, not a literal Tuple/NamedTuple. The cast's
         // target type is statically known here, so this must bounds-check
-        // and error the same way the upstream engine does.
+        // and error instead.
         let ast = parse::parse("SELECT (<tuple<int64, str>>('1', 3)).2").unwrap();
         let schema = make_schema();
         match ir::compile(&ast, &schema) {
@@ -5475,7 +5475,7 @@ mod tests {
     fn test_positional_tuple_literal_cast_to_tuple_type_compiles() {
         // Each element must be cast to its own declared type — '1' isn't
         // silently jsonb-wrapped unchanged as a string; it's coerced to
-        // int8, matching real PyQL per-element cast semantics.
+        // int8.
         let out = compile_and_emit("SELECT <tuple<int64, str>>(1, 'x')");
         assert!(out.sql.contains("jsonb_build_array((1)::int8, ('x')::text)"), "got:\n{}", out.sql);
     }

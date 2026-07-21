@@ -81,8 +81,8 @@ END"#)),
             sql("to_relative_duration",
                 "SELECT make_interval(days => $1::int, hours => $2::int, mins => $3::int, secs => $4)")),
 
-        // Fuller positional form matching the upstream engine's cal::to_relative_duration
-        // (whose params are all NAMED ONLY there — Pylon has no named-only
+        // Fuller positional form of cal::to_relative_duration (whose params
+        // are conventionally NAMED ONLY — Pylon has no named-only
         // parameter support, so this is positional instead).
         f("cal", "to_duration",
             vec![p("years", Int64), p("months", Int64), p("days", Int64), p("hours", Int64),

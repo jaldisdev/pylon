@@ -1,8 +1,8 @@
 // Pylon IR — a typed, resolved query plan produced by compiling a PyQL AST
 // against a SchemaDescriptor.
 //
-// Deliberately simpler than the upstream engine's IR: no set-semantics wrappers, no PathId
-// deduplication. Every node is already resolved to a concrete table/column.
+// Deliberately simple: no set-semantics wrappers, no PathId deduplication.
+// Every node is already resolved to a concrete table/column.
 
 mod compiler;
 pub mod tags;
@@ -18,8 +18,8 @@ use crate::parse::ast::{BinOpKind, UnaryOpKind};
 
 // ── Session config ───────────────────────────────────────────────────────────────
 
-/// User-configurable session options affecting compile-time validation —
-/// mirrors the upstream engine's session config. Threaded from the client's `with_config()`
+/// User-configurable session options affecting compile-time validation.
+/// Threaded from the client's `with_config()`
 /// (Python) via the ASGI `/api/query` "config" body field; see
 /// `pylon/config_options.py` for the full registry of known option names/
 /// defaults exposed to the frontend. `compile()` (the 2-arg convenience form,
@@ -29,9 +29,8 @@ use crate::parse::ast::{BinOpKind, UnaryOpKind};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct SessionConfig {
     /// When false (the default), an INSERT that explicitly assigns a value
-    /// to a primary-key ("id") property is a compile error — matches the upstream engine's
-    /// `allow_user_specified_id`. An UPDATE never allows assigning `id`,
-    /// regardless of this flag.
+    /// to a primary-key ("id") property is a compile error. An UPDATE never
+    /// allows assigning `id`, regardless of this flag.
     pub allow_user_specified_id: bool,
 }
 
@@ -208,9 +207,8 @@ pub struct IrSelect {
 /// One SELECT output row's source — either a real schema object (with a
 /// FROM clause and projected column shape) or a free literal expression
 /// (set/tuple/free-object/scalar). Replaces the former `IrSelect`/
-/// `IrFreeSelect` type-level split: the upstream engine/PyQL has no such distinction, and
-/// Pylon's version of it caused real bugs (the same logic reimplemented
-/// twice, independently, and drifting) before this merge.
+/// `IrFreeSelect` type-level split, which caused real bugs (the same logic
+/// reimplemented twice, independently, and drifting) before this merge.
 #[derive(Debug, Clone)]
 pub enum IrRowSource {
     Bound { source: IrSource, shape: Vec<IrShapePointer> },
@@ -606,8 +604,8 @@ pub enum IrExpr {
     /// `is_free_object` is true when this actually came from `{ x := 1.0 }`
     /// (curly-brace shape syntax, no subject) rather than `(x := 1.0)`
     /// (paren tuple syntax) — same jsonb encoding/decoding either way, but
-    /// the frontend needs to know which one it was to render the upstream engine's
-    /// `Object {x: 1.0}` vs `(x := 1.0)` literal display correctly (see
+    /// the frontend needs to know which one it was to render an expandable
+    /// `Object {x: 1.0}` vs a `(x := 1.0)` literal display correctly (see
     /// ShapeNode::NamedTuple's own is_free_object).
     NamedTuple { fields: Vec<(String, IrExpr)>, is_free_object: bool },
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
@@ -1132,7 +1130,7 @@ mod tests {
     fn test_select_no_shape_returns_id_only() {
         let ir = compile("SELECT Person");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
-        // Bare SELECT Type returns only { id }, matching the upstream engine semantics.
+        // Bare SELECT Type returns only { id }.
         let (_, shape) = bound(&sel);
         assert_eq!(shape.len(), 1);
         let IrShapePointer::Scalar(f) = &shape[0] else { panic!() };

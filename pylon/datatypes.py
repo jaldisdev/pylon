@@ -67,7 +67,7 @@ class Object:
 
 
 class NamedTupleValue(tuple):
-    """A named-tuple *value* — mirrors the upstream NamedTuple, not Object.
+    """A named-tuple *value*, not Object.
 
     A named tuple is a tuple: its members are ordered and positionally
     indexable/iterable/comparable like any tuple, and each member is also

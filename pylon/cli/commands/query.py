@@ -401,7 +401,7 @@ def _translate_pg_types(msg: str) -> str:
 
 
 def _format_exception(e: BaseException) -> str:
-    """`ClassName: message` — `str(e)` already includes the conventional
+    """`ClassName: message` — `str(e)` already includes the
     caret-snippet rendering for a `pylon.exceptions.PylonError` that
     carries a source position (see `PylonError.__str__`); this just
     prefixes the actual exception class (`InvalidQueryError`,
@@ -630,7 +630,7 @@ def _format_tuple(t: tuple) -> str:
 
 
 def _format_set(items: list[str]) -> str:
-    """Render a set of pre-formatted value strings in the upstream engine style."""
+    """Render a set of pre-formatted value strings."""
     if not items:
         return _brace("{}")
     if len(items) == 1:
@@ -643,7 +643,7 @@ def _format_set(items: list[str]) -> str:
 
 
 def _format_results(results: list[dict], *, wrap: bool = True) -> str:
-    """Render a list of result objects in conventional coloured output."""
+    """Render a list of result objects in coloured output."""
     max_width = shutil.get_terminal_size((100, 24)).columns
     if not results:
         return _brace("{}") if wrap else ""
@@ -667,7 +667,7 @@ def _format_results(results: list[dict], *, wrap: bool = True) -> str:
 def format_error(
     error_type: str, message: str, source: str, line: int, col: int
 ) -> str:
-    """Render a query error in conventional coloured output.
+    """Render a query error in coloured output.
 
     Args:
         error_type: Exception class name, e.g. ``InvalidReferenceError``.

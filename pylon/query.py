@@ -19,9 +19,9 @@ def compile(
     If schema is omitted, falls back to the process-level singleton SchemaDescriptor.
     Synchronous — compilation is CPU-bound; async lives at the DB execution layer.
 
-    ``allow_user_specified_id`` mirrors the upstream engine's session config option of the same
-    name — see ``pylon.config_options`` for the full registry exposed to
-    clients (``Client.with_config()``) and the frontend.
+    ``allow_user_specified_id`` is a session config option — see
+    ``pylon.config_options`` for the full registry exposed to clients
+    (``Client.with_config()``) and the frontend.
     """
     from pylon._core import compile as _core_compile
 
@@ -68,9 +68,9 @@ def _decode_json_tuple(value: Any, node: dict, registry: dict[str, type]) -> Any
     """Decode a jsonb tuple/named-tuple value using its statically-known
     member shape (`node["members"]`) — a real Python tuple for positional
     members, the registered dataclass for a nominal type, or a
-    pylon.datatypes.NamedTupleValue (mirroring the upstream NamedTuple) for an
-    unregistered structural named tuple. Falls back to the raw jsonb value
-    when no member shape was available at compile time."""
+    pylon.datatypes.NamedTupleValue for an unregistered structural named
+    tuple. Falls back to the raw jsonb value when no member shape was
+    available at compile time."""
     if value is None:
         return None
 
@@ -248,7 +248,7 @@ def shape_value_tags(node: dict) -> Any:
     value-tree-aligned "tag tree" — mirrors the structure of the already-
     decoded JSON value (`_to_jsonable`'s output), with no positions, so the
     frontend can walk it alongside the response body to render type tags
-    (`<uuid>`, enum labels, the upstream engine's `(x := 1, y := 2)` tuple literal syntax)
+    (`<uuid>`, enum labels, the `(x := 1, y := 2)` tuple literal syntax)
     for values that aren't a known schema pointer — e.g. a bare top-level
     cast, or a tuple nested inside a free object — the same way it already
     does for object properties via /api/schema."""
@@ -264,7 +264,7 @@ def shape_value_tags(node: dict) -> Any:
         # computed shape element) compiles to the exact same IR/shape node
         # as a real named-tuple literal (`test := (foo := 'bar')`) — same
         # jsonb encoding either way — but the two need different frontend
-        # display (the upstream engine's expandable `Object {foo: 'bar'}` vs. a non-
+        # display (an expandable `Object {foo: 'bar'}` vs. a non-
         # expandable `(foo := 'bar')` tuple literal). is_free_object (see
         # ShapeNode::NamedTuple in query/mod.rs) carries that distinction
         # through from the original curly-brace-vs-paren PyQL syntax.

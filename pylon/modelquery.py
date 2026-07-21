@@ -20,10 +20,10 @@ from pylon.exceptions import InterfaceError
 # ── Expression tree ──────────────────────────────────────────────────────────
 #
 # Built by operator-overloading a proxy object (`_FieldPath`) instead of
-# disassembling lambda bytecode — the same approach the upstream engine's Python client
-# uses. `and`/`or`/`not`/`if` can't be overloaded in Python, so boolean
-# combination uses `&`/`|`/`~`; `__bool__` raises a clear error on misuse
-# rather than silently building a wrong (always-truthy) expression.
+# disassembling lambda bytecode. `and`/`or`/`not`/`if` can't be overloaded
+# in Python, so boolean combination uses `&`/`|`/`~`; `__bool__` raises a
+# clear error on misuse rather than silently building a wrong
+# (always-truthy) expression.
 
 
 class _Node:

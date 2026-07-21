@@ -249,7 +249,7 @@ def _annotation_to_meta(
 
 
 def _inject_repr(cls: type) -> None:
-    """Replace the dataclass-generated __repr__ with a conventional one.
+    """Replace the dataclass-generated __repr__ with a custom one.
 
     Null values render as {} and the class name includes the module prefix
     (e.g. ``default::Person {id: UUID('...'), name: 'Alice', age: {}}``).

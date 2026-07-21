@@ -1,5 +1,4 @@
-"""Registry of known Pylon session config options — mirrors the upstream engine's session
-config (``configure session set ...``). Exposed to clients via
+"""Registry of known Pylon session config options. Exposed to clients via
 ``Client.with_config()`` and to the frontend via ``/api/config-options``
 (``pylon/server/asgi.py``), so the globals/config modal can render a toggle
 plus a value editor for each option without hardcoding the list in the UI.

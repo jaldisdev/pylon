@@ -58,7 +58,7 @@ except KeyError:
 
 
 # ---------------------------------------------------------------------------
-# Field constants (match the the upstream engine wire-protocol field ids)
+# Field constants (match the reference wire-protocol field ids)
 # ---------------------------------------------------------------------------
 
 _FIELD_HINT = 0x00_01
@@ -193,7 +193,7 @@ class PylonError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Source snippet formatter (adapted from the upstream client)
+# Source snippet formatter
 # ---------------------------------------------------------------------------
 
 

@@ -85,7 +85,7 @@ pub enum ShapeNode {
         /// frontend's own value-shape-tag tree (pylon/query.py's
         /// shape_value_tags) uses this to tell the Python API layer to
         /// describe it as an "object" rather than a "namedTuple", so
-        /// JsonTree renders the upstream engine's `Object {x: 1.0}` instead of a
+        /// JsonTree renders an expandable `Object {x: 1.0}` instead of a
         /// non-expandable `(x := 1.0)` tuple literal.
         is_free_object: bool,
     },

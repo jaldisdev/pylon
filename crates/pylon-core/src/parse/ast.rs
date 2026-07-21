@@ -1,5 +1,4 @@
 // AST nodes for PyQL queries.
-// Follows the upstream engine's the upstream grammar but trimmed to Pylon's subset.
 
 // ── Statements ─────────────────────────────────────────────────────────────────
 
@@ -375,7 +374,7 @@ impl TypeExpr {
 
 // ── If / Else ──────────────────────────────────────────────────────────────────
 
-/// PyQL / PyQL `expr IF cond ELSE expr` ternary.
+/// PyQL `expr IF cond ELSE expr` ternary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfElse {
     pub if_expr: Expr,
