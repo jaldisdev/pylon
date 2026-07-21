@@ -300,6 +300,30 @@ impl PgconPool {
         })
     }
 
+    /// Runs `compiled`'s SQL through `EXPLAIN (ANALYZE, FORMAT JSON,
+    /// VERBOSE)` and correlates the result against `compiled`'s own
+    /// `analyze_paths` (populated only for `analyze <query>` — see
+    /// `pylon_core::query::CompiledQuery::analyze_paths`) into the
+    /// coarse-grained tree (`pylon_core::analyze::CoarseGrainedNode`),
+    /// returned as a JSON string — same convention as
+    /// `SchemaDescriptor::to_json` (`lib.rs`): parse with `json.loads()`
+    /// Python-side rather than adding a second Rust-to-Python tree-walking
+    /// bridge just for this one payload.
+    fn analyze_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        let sql = compiled.inner.sql.clone();
+        let path_aliases = compiled.inner.analyze_paths.clone().unwrap_or_default();
+        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = pool.query_explain(&sql, &cached_params).await;
+            pylon_workers::metrics::record_query_result(&result);
+            let raw_json = result.map_err(pgcon_err)?;
+            let tree = pylon_core::analyze::build_coarse_grained(&raw_json, &path_aliases)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            serde_json::to_string(&tree).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })
+    }
+
     /// Runs `sql` with positional `params` and discards the result,
     /// returning the number of rows affected — for `INSERT`/`UPDATE`/
     /// `DELETE` with no `RETURNING` clause to decode.

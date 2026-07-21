@@ -146,7 +146,7 @@ struct RawPlanNode {
 /// subtree. `actual_*` fields are `None` under plain `EXPLAIN` (no
 /// `ANALYZE`, so the query was never actually run) — matches Postgres's own
 /// output, which omits them in that case.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PlanCost {
     pub startup_cost: f64,
     pub total_cost: f64,
@@ -176,16 +176,25 @@ impl From<&RawPlanNode> for PlanCost {
 /// One node of the coarse-grained tree — the REPL text formatter and the
 /// Query Editor's visual view both render this same shape directly (see the
 /// crate's `analyze` design notes).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CoarseGrainedNode {
     pub path: String,
     /// Relation names touched by this path's own plan nodes (not those of a
     /// nested child path) — deduplicated, in first-encountered order.
     pub relations: Vec<String>,
     pub cost: PlanCost,
-    /// `(pointer_name, node)` — the pointer name is `path`'s own last dotted
-    /// segment (e.g. `"villains"` for `"root.villains"`).
-    pub children: Vec<(String, CoarseGrainedNode)>,
+    pub children: Vec<ChildEntry>,
+}
+
+/// One nested pointer under a `CoarseGrainedNode` — `name` is `node.path`'s
+/// own last dotted segment (e.g. `"villains"` for `"root.villains"`). A
+/// named struct (not a bare `(String, CoarseGrainedNode)` tuple) so the JSON
+/// this serializes to (see `PgconPool::analyze_compiled`) is self-describing
+/// on the wire, not a positional pair the frontend has to remember the order of.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ChildEntry {
+    pub name: String,
+    pub node: CoarseGrainedNode,
 }
 
 /// Parse Postgres's `EXPLAIN (FORMAT JSON)` output text and correlate it
@@ -234,7 +243,7 @@ fn collect_plan_nodes(
     alias_to_path: &HashMap<&str, &str>,
     relations: &mut Vec<String>,
     seen_relations: &mut std::collections::HashSet<String>,
-    children: &mut Vec<(String, CoarseGrainedNode)>,
+    children: &mut Vec<ChildEntry>,
 ) {
     if let Some(rel) = &raw.relation_name {
         if seen_relations.insert(rel.clone()) {
@@ -244,8 +253,8 @@ fn collect_plan_nodes(
     for child in &raw.plans {
         match resolve_subtree_path(child, alias_to_path) {
             Some(child_path) if child_path != path => {
-                let pointer_name = child_path.rsplit('.').next().unwrap_or(child_path).to_string();
-                children.push((pointer_name, build_node(child, child_path, alias_to_path)));
+                let name = child_path.rsplit('.').next().unwrap_or(child_path).to_string();
+                children.push(ChildEntry { name, node: build_node(child, child_path, alias_to_path) });
             }
             _ => collect_plan_nodes(child, path, alias_to_path, relations, seen_relations, children),
         }
@@ -526,8 +535,8 @@ mod tests {
         assert_eq!(tree.cost.total_cost, 12.5);
         assert_eq!(tree.children.len(), 1);
 
-        let (pointer_name, villains_node) = &tree.children[0];
-        assert_eq!(pointer_name, "villains");
+        let ChildEntry { name, node: villains_node } = &tree.children[0];
+        assert_eq!(name, "villains");
         assert_eq!(villains_node.path, "root.villains");
         // Both the junction table ("hero.villains", alias "hv" — never in
         // the alias map, see resolve_subtree_path's doc comment) and the
