@@ -298,7 +298,16 @@ fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::Session
     let ir_out = ir::compile_with_config(&ast, schema, config)?;
     // `analyze`'s own shape-path walk is skipped for every other query — no
     // reason to pay for it when nothing will read `analyze_paths`.
-    let analyze_paths = is_analyze.then(|| analyze::collect_shape_path_aliases(&ir_out.stmt));
+    let analyze_paths = is_analyze.then(|| {
+        let mut paths = analyze::collect_shape_path_aliases(&ir_out.stmt);
+        // The root marker has no IR pointer of its own to carry it (see
+        // `root_marker_offset`'s own doc comment) — filled in here from the
+        // original AST, still in scope at this point.
+        if let Some(root) = paths.iter_mut().find(|p| p.path == "root") {
+            root.marker_offset = analyze::root_marker_offset(&ast);
+        }
+        paths
+    });
     let tags = ir::tags::collect_tags(&ir_out);
     let sql_out = sql::emit(&ir_out);
     Ok(CompiledQuery {
@@ -373,9 +382,12 @@ mod tests {
     #[test]
     fn test_analyze_paths_is_populated_for_an_analyze_query() {
         let schema = make_schema();
-        let compiled = compile("analyze select Person { id }", &schema).unwrap();
+        let query = "analyze select Person { id }";
+        let compiled = compile(query, &schema).unwrap();
         let paths = compiled.analyze_paths.expect("analyze query should populate analyze_paths");
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].path, "root");
+        let offset = paths[0].marker_offset.expect("root path should carry a marker offset");
+        assert_eq!(&query[offset..offset + "Person".len()], "Person");
     }
 }

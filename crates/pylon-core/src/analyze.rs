@@ -68,6 +68,30 @@ pub fn collect_shape_path_aliases(stmt: &IrStmt) -> Vec<ShapePathAlias> {
     out
 }
 
+/// The root `analyze` marker's source byte offset — the position of the
+/// query's own root type reference (e.g. `"Hero"` in `select Hero { ... }`).
+/// Unlike nested shape elements (whose offsets flow through the IR, via each
+/// `IrShapePointer`'s own `marker_offset` field), the root marker has no IR
+/// pointer of its own to carry it — it belongs to the statement's outer
+/// `ast::ShapeExpr`, so this reads it directly off the *original* parsed AST
+/// instead (called from `query::compile_uncached`, which still has `ast` in
+/// scope at that point) rather than trying to thread one more thing through
+/// IR compilation just for this single value.
+pub fn root_marker_offset(stmt: &crate::parse::Stmt) -> Option<usize> {
+    use crate::parse::{Expr, Stmt};
+    match stmt {
+        Stmt::Analyze(inner) => root_marker_offset(inner),
+        Stmt::Select(sel) => match &sel.result {
+            Expr::Shape(shape) => shape.marker_offset,
+            _ => None,
+        },
+        // Insert/Update/Delete/Group/etc.: no root marker in v1 — matches
+        // `collect_shape_path_aliases`'s own scope (these still get a
+        // ShapePathAlias root entry, just without a marker_offset).
+        _ => None,
+    }
+}
+
 fn collect_select(sel: &IrSelect, path: &str, marker_offset: Option<usize>, out: &mut Vec<ShapePathAlias>) {
     for row in &sel.rows {
         if let IrRowSource::Bound { source, shape } = row {
@@ -179,6 +203,11 @@ impl From<&RawPlanNode> for PlanCost {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CoarseGrainedNode {
     pub path: String,
+    /// Source byte offset to plant this path's `analyze` marker at in the
+    /// echoed query text (see `ShapePathAlias::marker_offset`) — the REPL
+    /// text formatter's only use for it; the Query Editor's visual view has
+    /// no echoed query text to mark up, so it just ignores this field.
+    pub marker_offset: Option<usize>,
     /// Relation names touched by this path's own plan nodes (not those of a
     /// nested child path) — deduplicated, in first-encountered order.
     pub relations: Vec<String>,
@@ -209,16 +238,24 @@ pub fn build_coarse_grained(raw_json: &str, path_aliases: &[ShapePathAlias]) -> 
 
     let alias_to_path: HashMap<&str, &str> =
         path_aliases.iter().map(|p| (p.sql_alias.as_str(), p.path.as_str())).collect();
+    let path_to_marker: HashMap<&str, Option<usize>> =
+        path_aliases.iter().map(|p| (p.path.as_str(), p.marker_offset)).collect();
 
-    Ok(build_node(&root.plan, ROOT_PATH, &alias_to_path))
+    Ok(build_node(&root.plan, ROOT_PATH, &alias_to_path, &path_to_marker))
 }
 
-fn build_node(raw: &RawPlanNode, path: &str, alias_to_path: &HashMap<&str, &str>) -> CoarseGrainedNode {
+fn build_node(
+    raw: &RawPlanNode,
+    path: &str,
+    alias_to_path: &HashMap<&str, &str>,
+    path_to_marker: &HashMap<&str, Option<usize>>,
+) -> CoarseGrainedNode {
     let mut relations = Vec::new();
     let mut seen_relations = std::collections::HashSet::new();
     let mut children = Vec::new();
-    collect_plan_nodes(raw, path, alias_to_path, &mut relations, &mut seen_relations, &mut children);
-    CoarseGrainedNode { path: path.to_string(), relations, cost: PlanCost::from(raw), children }
+    collect_plan_nodes(raw, path, alias_to_path, &mut relations, &mut seen_relations, &mut children, path_to_marker);
+    let marker_offset = path_to_marker.get(path).copied().flatten();
+    CoarseGrainedNode { path: path.to_string(), marker_offset, relations, cost: PlanCost::from(raw), children }
 }
 
 /// Walk `raw`'s own subtree, folding nodes into `relations`/this level's
@@ -244,6 +281,7 @@ fn collect_plan_nodes(
     relations: &mut Vec<String>,
     seen_relations: &mut std::collections::HashSet<String>,
     children: &mut Vec<ChildEntry>,
+    path_to_marker: &HashMap<&str, Option<usize>>,
 ) {
     if let Some(rel) = &raw.relation_name {
         if seen_relations.insert(rel.clone()) {
@@ -254,9 +292,9 @@ fn collect_plan_nodes(
         match resolve_subtree_path(child, alias_to_path) {
             Some(child_path) if child_path != path => {
                 let name = child_path.rsplit('.').next().unwrap_or(child_path).to_string();
-                children.push(ChildEntry { name, node: build_node(child, child_path, alias_to_path) });
+                children.push(ChildEntry { name, node: build_node(child, child_path, alias_to_path, path_to_marker) });
             }
-            _ => collect_plan_nodes(child, path, alias_to_path, relations, seen_relations, children),
+            _ => collect_plan_nodes(child, path, alias_to_path, relations, seen_relations, children, path_to_marker),
         }
     }
 }
@@ -547,6 +585,31 @@ mod tests {
         // not the inner villain scan's — see resolve_subtree_path.
         assert_eq!(villains_node.cost.total_cost, 8.2);
         assert!(villains_node.children.is_empty());
+    }
+
+    #[test]
+    fn test_build_coarse_grained_carries_marker_offsets_for_repl_rendering() {
+        let query = "select Hero { name, villains: { name } }";
+        let ir = compile(query);
+        let mut paths = collect_shape_path_aliases(&ir.stmt);
+        // The root marker is filled in by `query::compile_uncached` (from
+        // the original AST, which this test's `compile()` helper doesn't
+        // expose) — reproduced here directly, same as that call site does.
+        let ast = crate::parse::parse(query).unwrap();
+        if let Some(root) = paths.iter_mut().find(|p| p.path == "root") {
+            root.marker_offset = root_marker_offset(&ast);
+        }
+        let root_alias = paths.iter().find(|p| p.path == "root").unwrap().sql_alias.clone();
+        let villains_alias = paths.iter().find(|p| p.path == "root.villains").unwrap().sql_alias.clone();
+
+        let raw_json = explain_json_fixture(&root_alias, &villains_alias);
+        let tree = build_coarse_grained(&raw_json, &paths).unwrap();
+
+        let root_offset = tree.marker_offset.expect("root should carry a marker offset");
+        assert_eq!(&query[root_offset..root_offset + "Hero".len()], "Hero");
+
+        let villains_offset = tree.children[0].node.marker_offset.expect("villains should carry a marker offset");
+        assert_eq!(&query[villains_offset..villains_offset + "villains".len()], "villains");
     }
 
     #[test]

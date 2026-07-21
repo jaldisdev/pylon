@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -187,6 +189,13 @@ class RetryingTransaction:
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
+
+
+# `analyze` is a soft keyword (see pylon-core's parser) — legal as a leading
+# statement token only; `Client.analyze()` mirrors that by accepting a query
+# with or without it already written, rather than requiring callers to
+# remember to type it themselves.
+_ANALYZE_PREFIX_RE = re.compile(r"(?is)^analyze\b")
 
 
 class _PoolRef:
@@ -448,6 +457,27 @@ class Client:
                 "query_required_single_json returned an empty result set."
             )
         return result
+
+    async def analyze(self, pyql: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Run *pyql* through Postgres's `EXPLAIN (ANALYZE, FORMAT JSON)` and
+        return a query plan grouped by the query's own shape (its root
+        select, each nested link, etc.) instead of raw SQL relation names.
+
+        *pyql* doesn't need the leading ``analyze`` keyword already written —
+        it's added automatically if missing, so ``client.analyze("select
+        Person { name }")`` and ``client.analyze("analyze select Person {
+        name }")`` behave identically. The returned dict is the
+        coarse-grained tree (``pylon_core::analyze::CoarseGrainedNode``,
+        Rust-side): ``path``, ``marker_offset``, ``relations``, ``cost``,
+        ``children`` (each a ``{"name": ..., "node": {...}}`` entry).
+        """
+        pool = self._require_pool()
+        normalized = pyql if _ANALYZE_PREFIX_RE.match(pyql.lstrip()) else f"analyze {pyql}"
+        compiled, params = await _compile_and_resolve(
+            normalized, _merge_args(args, kwargs), self._config, self._globals, self._config_options
+        )
+        raw_json = await pool.analyze_compiled(compiled, params)
+        return json.loads(raw_json)
 
     async def save(self, *objs: Any) -> None:
         """Insert or update each of *objs* — instances of `@pylon.type`
