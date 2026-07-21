@@ -2218,6 +2218,7 @@ impl<'a> Compiler<'a> {
         let select = IrSelect::schema_bound(
             IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias },
             vec![IrShapePointer::Scalar(IrScalarPointer {
+                marker_offset: None,
                 alias: "target".to_string(),
                 column: jt_tgt_col,
                 pg_type: "uuid".to_string(),
@@ -3436,6 +3437,7 @@ impl<'a> Compiler<'a> {
             .properties
             .iter()
             .map(|p| IrShapePointer::Scalar(IrScalarPointer {
+                marker_offset: None,
                 alias: p.name.clone(),
                 column: p.name.clone(),
                 pg_type: p.pg_type.clone(),
@@ -3448,6 +3450,7 @@ impl<'a> Compiler<'a> {
                 .map_err(|e| PyQLError::Syntax(e))?;
             let ir = self.compile_expr(&expr_ast, td, alias)?;
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: None,
                 alias: cd.name.clone(),
                 expr: ir,
             }));
@@ -3479,6 +3482,7 @@ impl<'a> Compiler<'a> {
                     IrSingleLinkCorrelation::Fk { fk_column: format!("{}_id", l.name), target_pk: "id".to_string() }
                 };
                 pointers.push(IrShapePointer::SingleLink(IrSingleLinkPointer {
+                    marker_offset: None,
                     alias: l.name.clone(),
                     correlation,
                     subquery,
@@ -3553,6 +3557,7 @@ impl<'a> Compiler<'a> {
                 );
 
                 pointers.push(IrShapePointer::MultiLink(IrMultiLinkPointer {
+                    marker_offset: None,
                     alias: ml.name.clone(),
                     join,
                     subquery,
@@ -3623,6 +3628,7 @@ impl<'a> Compiler<'a> {
                     alias: sub_alias,
                 },
                 vec![IrShapePointer::Scalar(IrScalarPointer {
+                    marker_offset: None,
                     alias: prop.name.clone(),
                     column: prop.name.clone(),
                     pg_type: prop.pg_type.clone(),
@@ -3631,6 +3637,7 @@ impl<'a> Compiler<'a> {
                 Some(filter),
             );
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: None,
                 alias: prop.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
             }));
@@ -3692,6 +3699,7 @@ impl<'a> Compiler<'a> {
                 Some(filter),
             );
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: None,
                 alias: link.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
             }));
@@ -3706,6 +3714,7 @@ impl<'a> Compiler<'a> {
         type_ref: &ast::ObjectRef,
         tail_steps: &[ast::PathStep],
         parent_alias: &str,
+        marker_offset: Option<usize>,
     ) -> Result<IrShapePointer, PyQLError> {
         let expr = self.compile_type_intersection_expr_steps(type_ref, tail_steps, parent_alias)?;
         // Alias is the last Name step
@@ -3713,7 +3722,7 @@ impl<'a> Compiler<'a> {
             Some(ast::PathStep::Name(n)) => n.clone(),
             _ => return Err(self.type_err("type intersection must end with a pointer name")),
         };
-        Ok(IrShapePointer::Computed(IrComputedPointer { alias, expr }))
+        Ok(IrShapePointer::Computed(IrComputedPointer { alias, expr, marker_offset }))
     }
 
     /// Compile `[is Type].name` as an `IrExpr` (for computed pointer / expression context).
@@ -3781,6 +3790,7 @@ impl<'a> Compiler<'a> {
                 alias: sub_alias,
             },
             vec![IrShapePointer::Scalar(IrScalarPointer {
+                marker_offset: None,
                 alias: prop_name.clone(),
                 column: prop_name,
                 pg_type: prop_type,
@@ -3801,7 +3811,7 @@ impl<'a> Compiler<'a> {
         if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first() {
             if el.compexpr.is_none() && el.path.steps.len() >= 2 {
                 let type_ref = type_ref.clone();
-                return self.compile_type_intersection_pointer(&type_ref, &el.path.steps[1..], alias);
+                return self.compile_type_intersection_pointer(&type_ref, &el.path.steps[1..], alias, el.marker_offset);
             }
         }
 
@@ -3821,6 +3831,7 @@ impl<'a> Compiler<'a> {
                 IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
             };
             return Ok(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: el.marker_offset,
                 alias: "__type__".to_string(),
                 expr,
             }));
@@ -3844,7 +3855,7 @@ impl<'a> Compiler<'a> {
                 // used as a computed pointer.
                 if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
                     let current_qname = format!("{}::{}", td.module, td.name);
-                    return self.compile_backlink_pointer(pointer_name, p, &current_qname, &[]);
+                    return self.compile_backlink_pointer(pointer_name, p, &current_qname, &[], el.marker_offset);
                 }
             }
             // `alias := .<backlink[is Type] { shape }` — the parser's `:=`
@@ -3860,7 +3871,7 @@ impl<'a> Compiler<'a> {
                 if let Some(Expr::Path(p)) = &sh.expr {
                     if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
                         let current_qname = format!("{}::{}", td.module, td.name);
-                        return self.compile_backlink_pointer(pointer_name, p, &current_qname, &sh.elements);
+                        return self.compile_backlink_pointer(pointer_name, p, &current_qname, &sh.elements, el.marker_offset);
                     }
                 }
             }
@@ -3877,11 +3888,13 @@ impl<'a> Compiler<'a> {
                     }));
                 }
                 return Ok(IrShapePointer::Computed(IrComputedPointer {
+                    marker_offset: el.marker_offset,
                     alias: pointer_name.to_string(),
                     expr: IrExpr::ArrayFromSelect(src),
                 }));
             }
             return Ok(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: el.marker_offset,
                 alias: pointer_name.to_string(),
                 expr: ir,
             }));
@@ -3890,6 +3903,7 @@ impl<'a> Compiler<'a> {
         // Scalar property
         if let Some(p) = Self::resolve_property(td, pointer_name) {
             return Ok(IrShapePointer::Scalar(IrScalarPointer {
+                marker_offset: el.marker_offset,
                 alias: pointer_name.to_string(),
                 column: p.name.clone(),
                 pg_type: p.pg_type.clone(),
@@ -3941,6 +3955,7 @@ impl<'a> Compiler<'a> {
                 IrSingleLinkCorrelation::Fk { fk_column: format!("{}_id", l.name), target_pk: "id".to_string() }
             };
             return Ok(IrShapePointer::SingleLink(IrSingleLinkPointer {
+                marker_offset: el.marker_offset,
                 alias: pointer_name.to_string(),
                 correlation,
                 subquery,
@@ -3959,6 +3974,7 @@ impl<'a> Compiler<'a> {
                 .map_err(|e| PyQLError::Syntax(e))?;
             let ir = self.compile_expr(&expr_ast, td, alias)?;
             return Ok(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: el.marker_offset,
                 alias: pointer_name.to_string(),
                 expr: ir,
             }));
@@ -4082,6 +4098,7 @@ impl<'a> Compiler<'a> {
         };
 
         Ok(IrShapePointer::MultiLink(IrMultiLinkPointer {
+            marker_offset: el.marker_offset,
             alias: output_alias.to_string(),
             join,
             subquery,
@@ -4104,6 +4121,7 @@ impl<'a> Compiler<'a> {
         path: &ast::Path,
         current_qname: &str,
         nested_elements: &[ShapeElement],
+        marker_offset: Option<usize>,
     ) -> Result<IrShapePointer, PyQLError> {
         use ast::PathStep;
 
@@ -4196,6 +4214,7 @@ impl<'a> Compiler<'a> {
             join,
             subquery,
             link_properties: vec![],
+            marker_offset,
         }))
     }
 
@@ -5204,6 +5223,7 @@ impl<'a> Compiler<'a> {
                         alias: ft_alias.clone(),
                     },
                     vec![IrShapePointer::Scalar(IrScalarPointer {
+                        marker_offset: None,
                         alias: prop.name.clone(),
                         column: prop.name.clone(),
                         pg_type: prop.pg_type.clone(),
@@ -6802,6 +6822,7 @@ impl<'a> Compiler<'a> {
             .filter(|p| p.is_pk)
             .map(|p| {
                 IrShapePointer::Scalar(IrScalarPointer {
+                    marker_offset: None,
                     alias: p.name.clone(),
                     column: p.name.clone(),
                     pg_type: p.pg_type.clone(),
