@@ -74,7 +74,7 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
         path, method = scope["path"], scope["method"]
 
         if path == "/metrics" and method == "GET":
-            await _handle_get_metrics(send)
+            await _handle_get_metrics(clients, send)
             return
 
         # Routes that read/write actual database data are addressed as
@@ -238,17 +238,33 @@ async def _send_json(send: Send, status: int, payload: Any) -> None:
 # ---------------------------------------------------------------------------
 #
 # Prometheus text-exposition format — bare, unauthenticated GET, matching
-# Prometheus's own scrape convention (no /api prefix, no connection scoping;
-# metrics aren't per-connection data). Every counter/gauge is registered and
-# updated entirely in Rust (workers, pgcon pool) against the process-global
-# `prometheus` crate registry; this just renders whatever's in it right now.
-# Since `pylon serve` also runs the background workers in-process (see
-# build_worker_tasks in _handle_lifespan), one scrape target here already
-# covers both HTTP-facing and worker-side metrics with no extra listener.
+# Prometheus's own scrape convention (no /api prefix; metrics aren't
+# per-connection data, though pool gauges below do carry a `connection`
+# label). Every counter/gauge (worker job counts, cache invalidations,
+# cache hit/miss, pgcon pool size/available/waiting) is registered and
+# updated entirely in Rust against the process-global `prometheus` crate
+# registry; this just samples the pgcon pools (the one piece of state Rust
+# can't reach on its own — see below) and renders whatever's in the
+# registry right now. Since `pylon serve` also runs the background workers
+# in-process (see build_worker_tasks in _handle_lifespan), one scrape
+# target here already covers both HTTP-facing and worker-side metrics with
+# no extra listener. Deliberately no HTTP request/latency metrics — this
+# process's traffic is internal Pylon UI traffic only, not a
+# production-facing API, so it isn't worth instrumenting.
 
 
-async def _handle_get_metrics(send: Send) -> None:
+async def _handle_get_metrics(clients: dict[str, Client], send: Send) -> None:
     from pylon._core import render_prometheus_metrics
+
+    # Pool gauges are point-in-time, not event-driven (deadpool exposes no
+    # checkout/return hooks to count as they happen) — sample every
+    # currently-connected pool fresh on each scrape, right before
+    # rendering. Lazily-connected named connections that haven't been used
+    # yet simply don't appear until they have (matching `clients`' own
+    # lazy-connect behavior — see _resolve_client).
+    for name, client in clients.items():
+        async with client.raw_connection() as pool:
+            pool.record_pool_metrics(name)
 
     body = render_prometheus_metrics().encode()
     await send(

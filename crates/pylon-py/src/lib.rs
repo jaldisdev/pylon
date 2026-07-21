@@ -1496,6 +1496,16 @@ fn compile(query: &str, schema: &SchemaDescriptor, allow_user_specified_id: bool
         .map_err(|e| pyql_err(e, Some(query)))
 }
 
+/// Records a compile-stage outcome in `pylon_queries_total{stage="compile"}`
+/// — called from `pylon.client._compile_and_resolve`/`_compile_and_bind`
+/// right after their own `pylon.query.compile()` call, since those (not
+/// this bare function, which the LSP and other tooling also call for
+/// non-serving purposes) are the actual query-serving compile step.
+#[pyfunction]
+fn record_query_compile_result(success: bool) {
+    pylon_workers::metrics::record_compile_result(success);
+}
+
 #[pyfunction]
 fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
     core::export::export_schema(&schema.inner).map_err(|e| pyql_err(e, None))
@@ -2138,6 +2148,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Functions
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(record_query_compile_result, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
     m.add_function(wrap_pyfunction!(compile_index_fetch, m)?)?;

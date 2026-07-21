@@ -71,6 +71,20 @@ pub struct PgPool {
     pool: deadpool_postgres::Pool,
 }
 
+/// Snapshot of a pool's connection accounting — deadpool's own `Status`,
+/// re-exported under this crate's name so callers (the Prometheus gauge
+/// sampler in `pylon-py`) don't need a direct `deadpool_postgres`
+/// dependency just to read four numbers.
+pub struct PoolStatus {
+    /// Connections actually established right now (idle + checked out).
+    pub size: usize,
+    /// Idle connections available for immediate checkout right now.
+    pub available: usize,
+    /// Callers currently blocked in `.get()` waiting for a connection.
+    pub waiting: usize,
+    pub max_size: usize,
+}
+
 impl PgPool {
     /// Connects using a `postgresql://` DSN, matching the DSN Python's
     /// `DatabaseConfig`/`_build_dsn` already produces today. No TLS support
@@ -97,6 +111,13 @@ impl PgPool {
             .build()?;
         let _ = pool.get().await?;
         Ok(Self { pool })
+    }
+
+    /// Current connection accounting — for the Prometheus gauge sampler
+    /// (`pylon-py`'s `record_pool_metrics`), not used on any query path.
+    pub fn status(&self) -> PoolStatus {
+        let s = self.pool.status();
+        PoolStatus { size: s.size, available: s.available, waiting: s.waiting, max_size: s.max_size }
     }
 
     /// Executes `sql` with no parameters and returns the raw rows.
