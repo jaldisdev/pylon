@@ -1999,8 +1999,8 @@ fn shape_node_to_py<'py>(
 /// Converts a 1-based `(line, col)` position (as `error::Position` reports
 /// it — `col` counts *bytes* within the line, since the lexer operates on
 /// raw bytes) into a 0-based *character* offset into `text`, matching the
-/// Gel wire-protocol convention `pylon.exceptions.PylonError`'s
-/// caret-snippet renderer expects (`_FIELD_CHARACTER_START`). Returns
+/// wire-protocol convention `pylon.exceptions.PylonError`'s caret-snippet
+/// renderer expects (`_FIELD_CHARACTER_START`). Returns
 /// `None` for a dead/unset position (`line == 0` — used by compile-time
 /// type/resolution errors, which don't track a real position yet) rather
 /// than rendering a nonsensical snippet.
@@ -2040,8 +2040,8 @@ fn char_offset(text: &str, line: u32, col: u32) -> Option<usize> {
 /// `pgcon_err` pattern in `pgcon.rs` for Postgres errors. Callers get the
 /// right exception class *and*, when a real position is available (syntax
 /// and type errors always carry one; resolution/cardinality/fragment
-/// errors don't track one yet), the Gel-style annotated-source-snippet
-/// rendering `PylonError.__str__` already implements via
+/// errors don't track one yet), the annotated-source-snippet rendering
+/// `PylonError.__str__` already implements via
 /// `_from_transpiler` — previously unreachable because nothing ever called
 /// it, and because `pylon.client`'s blanket `except BaseException` used to
 /// collapse every compile error into `InternalServerError` regardless.

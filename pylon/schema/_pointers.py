@@ -309,7 +309,7 @@ class TupleAnnotation:
 
 
 class Tuple:
-    """Structural tuple pointer annotation (Gel's inline `tuple<...>` equivalent).
+    """Structural tuple pointer annotation (an inline `tuple<...>` equivalent).
 
     Usage::
 
@@ -380,7 +380,7 @@ class ArrayAnnotation:
 
 
 class Array:
-    """One-dimensional array pointer annotation (Gel's inline `array<...>`
+    """One-dimensional array pointer annotation (an inline `array<...>`
     equivalent). The element type may be anything except another array —
     Pylon arrays are always one-dimensional, matching a plain Postgres
     `T[]` column (never jsonb, unlike Tuple).

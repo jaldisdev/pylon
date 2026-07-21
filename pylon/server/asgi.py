@@ -220,7 +220,7 @@ async def _send_json(send: Send, status: int, payload: Any) -> None:
 # reference *string* (`Link["Company"]` written before Company is defined) —
 # both are handled below.
 
-# Canonical PyQL/EdgeQL-style type names for every scalar marker class
+# Canonical PyQL-style type names for every scalar marker class
 # (pylon.Str, pylon.UUID, ..., plus stdlib uuid.UUID used for the injected
 # `id` property) — shown below the pointer name in the Data Explorer's column
 # headers, and used by the frontend to decide which types get a `<tag>`
@@ -265,7 +265,7 @@ def _merged_annotations(cls: type) -> dict[str, Any]:
 def _resolve_target(target: Any, owning_cls: type) -> str:
     """Link/MultiLink target_type is either the real class or a forward-ref
     string (e.g. Link["Company"]) — a string is assumed to name a type in the
-    referencing pointer's own module, the same convention PyQL/EdgeQL use for
+    referencing pointer's own module, the standard convention for
     unqualified same-module references."""
     if isinstance(target, str):
         return f"{_infer_module(owning_cls)}::{target}"
@@ -558,10 +558,9 @@ async def _handle_get_globals(config: Config, send: Send) -> None:
 # ---------------------------------------------------------------------------
 #
 # Powers the globals/config modal's "Config" scope — session config options
-# (Client.with_config(), applied per-query in _handle_run_query above) mirror
-# Gel's `configure session set ...`. Unlike globals this is a small fixed
-# registry (pylon/config_options.py), not schema-derived, so it never touches
-# the schema-dir.
+# (Client.with_config(), applied per-query in _handle_run_query above).
+# Unlike globals this is a small fixed registry (pylon/config_options.py),
+# not schema-derived, so it never touches the schema-dir.
 
 
 async def _handle_get_config_options(send: Send) -> None:
@@ -624,10 +623,10 @@ async def _handle_get_models(config: Config, send: Send) -> None:
 # estimate straight from Postgres's own autovacuum-maintained statistics
 # (pg_stat_user_tables.n_live_tup) rather than a real `count(*)` over every
 # type — an exact count would mean one query per table (or a big UNION ALL),
-# which doesn't scale and isn't what Gel's own dashboard does either; this is
-# an estimate, same tradeoff. "_pylon" is Pylon's own internal schema
-# (migrations bookkeeping etc — never user data), excluded the same way
-# pg_catalog/information_schema are. "types" is every registered schema type
+# which doesn't scale, so this is an estimate instead. "_pylon" is Pylon's
+# own internal schema (migrations bookkeeping etc — never user data),
+# excluded the same way pg_catalog/information_schema are. "types" is
+# every registered schema type
 # (concrete, abstract, interface, junction — schema_snapshot()'s first
 # element already includes all four, confirmed via _decorators.py's shared
 # _build_type() registering every one of them) plus registered custom scalars
@@ -846,8 +845,8 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
 # now, hardcoded-default — see pylon-ui's AI tab plan) system/user prompt
 # around it, and calls the selected chat-purpose model. No prompt-template
 # registry exists in Pylon yet, so this is the one place that default prompt
-# text lives; a real registry (like Gel's `builtin::rag-default`) is future
-# work, not something to fake here.
+# text lives; a real, named-template registry is future work, not something
+# to fake here.
 
 _DEFAULT_PROMPT_SYSTEM = """You are an expert Q&A system.
 Always answer questions based on the provided context information. Never use prior knowledge.

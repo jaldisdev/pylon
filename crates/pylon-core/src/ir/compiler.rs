@@ -884,7 +884,7 @@ impl<'a> Compiler<'a> {
 
     /// Render a cast target `TypeExpr` for error messages, e.g.
     /// `tuple<std::int64, std::str>` or `default::Point` — used by the
-    /// compile-time tuple-index bounds check to match Gel's own wording.
+    /// compile-time tuple-index bounds check.
     fn type_expr_to_display_str(&self, ty: &ast::TypeExpr) -> String {
         match ty {
             ast::TypeExpr::Tuple { elements } => {
@@ -2649,7 +2649,7 @@ impl<'a> Compiler<'a> {
         };
         let module = td.module.clone();
 
-        // Compile the element shape. No explicit shape → implicit { id }, matching Gel semantics.
+        // Compile the element shape. No explicit shape → implicit { id }.
         let shape = self.compile_shape(
             g.shape.as_deref().unwrap_or(&[]),
             td,
@@ -2897,8 +2897,7 @@ impl<'a> Compiler<'a> {
                     // A primary-key ("id") property: an UPDATE never allows
                     // reassigning it (deny_readonly is true there, regardless
                     // of the session config); an INSERT only allows an
-                    // explicit value when allow_user_specified_id is set —
-                    // matches Gel's own `allow_user_specified_id` semantics.
+                    // explicit value when allow_user_specified_id is set.
                     if p.is_pk && (deny_readonly || !self.config.allow_user_specified_id) {
                         return Err(PyQLError::Type(PyQLTypeError {
                             message: "cannot assign to property 'id'".to_string(),
@@ -3396,7 +3395,7 @@ impl<'a> Compiler<'a> {
         module: &str,
     ) -> Result<Vec<IrShapePointer>, PyQLError> {
         if elements.is_empty() {
-            // No explicit shape: implicit { id } only, matching Gel semantics.
+            // No explicit shape: implicit { id } only.
             return Ok(Self::pk_returning(td));
         }
 
@@ -3450,11 +3449,11 @@ impl<'a> Compiler<'a> {
             for l in &td.links {
                 let target_td = self.resolve_type(&l.target)?;
                 let sub_alias = self.fresh_alias();
-                // Gel's `**` fetches every property (not further nested
-                // links) of a linked object — a `Shallow` (`*`) expansion of
-                // the target type, one level deep. Recursing with `Deep`
-                // here instead would walk the target's own links too, which
-                // for a two-way or cyclic link graph never terminates.
+                // `**` fetches every property (not further nested links) of
+                // a linked object — a `Shallow` (`*`) expansion of the
+                // target type, one level deep. Recursing with `Deep` here
+                // instead would walk the target's own links too, which for
+                // a two-way or cyclic link graph never terminates.
                 let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, module)?;
                 let subquery = IrSelect::schema_bound(
                     IrSource {
@@ -4262,7 +4261,7 @@ impl<'a> Compiler<'a> {
                 // target at all, so resolve_cast_pg_type couldn't handle it
                 // below anyway). Generalizes the same bare-`{}`-in-assignment-
                 // position special case in compile_assignments_inner to any
-                // expression context, matching real EdgeQL semantics.
+                // expression context.
                 if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
                     return Ok(IrExpr::Null);
                 }
@@ -4622,7 +4621,7 @@ impl<'a> Compiler<'a> {
                     // jsonb positional access (`$param.1`, `(<tuple<...>>expr).1`, …).
                     // When the source is a cast to a statically-known tuple type,
                     // bounds-check the index against its arity at compile time
-                    // (matches Gel: `2 is not a member of tuple<std::int64, std::str>`).
+                    // (e.g. `2 is not a member of tuple<std::int64, std::str>`).
                     _ => {
                         if let Expr::TypeCast(tc) = inner.as_ref() {
                             if let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty) {
@@ -4936,10 +4935,10 @@ impl<'a> Compiler<'a> {
         }
         // A free-object-bound CTE (`with x := { a := 1 } select ... x ...`),
         // referenced bare with no shape to project through, has nothing to
-        // expose — matching Gel (a free *object* needs an explicit shape to
-        // know what to return; unlike a tuple/named tuple, it has no
-        // "default" projection), this collapses to an empty free object,
-        // the same as `Expr::Shape`'s `is_free_cte_ref` case for `x { ... }`.
+        // expose — a free *object* needs an explicit shape to know what to
+        // return (unlike a tuple/named tuple, it has no "default"
+        // projection), so this collapses to an empty free object, the same
+        // as `Expr::Shape`'s `is_free_cte_ref` case for `x { ... }`.
         // It also sidesteps a real problem: this CTE has no "v" column
         // (only `IrFreeExpr::Scalar` CTEs get one), so falling through to
         // the generic `IrExpr::CteRef` below would reference a column that
@@ -6738,7 +6737,7 @@ impl<'a> Compiler<'a> {
     /// Fuzzy-matches `name` against every pointer (property/link/multilink/
     /// computed — Pylon's term for a type's own attributes; "field" is a
     /// Postgres-level term that doesn't apply here) on `td`, returning the
-    /// closest candidate when it's plausibly a typo — mirrors Gel's own
+    /// closest candidate when it's plausibly a typo — powers a
     /// "Did you mean X?" suggestion for an unknown property/link.
     /// Jaro-Winkler (favors a shared prefix, which is where most real typos
     /// preserve the most characters, e.g. `nam` -> `name`) with a
@@ -6757,10 +6756,10 @@ impl<'a> Compiler<'a> {
             .map(|(name, _)| name.to_string())
     }
 
-    // ── Default returning (pk only, matching Gel's bare DML behaviour) ────────────
+    // ── Default returning (pk only) ────────────────────────────────────────────
 
-    /// For bare DML (not wrapped in SELECT) return only primary-key properties,
-    /// matching Gel: `INSERT … ` returns `{ id }`, same for UPDATE/DELETE.
+    /// For bare DML (not wrapped in SELECT) return only primary-key properties:
+    /// `INSERT … ` returns `{ id }`, same for UPDATE/DELETE.
     fn pk_returning(td: &TypeDescriptor) -> Vec<IrShapePointer> {
         td.properties
             .iter()
@@ -7096,10 +7095,8 @@ fn types_compatible(a: &str, b: &str) -> bool {
 
 /// Datetime/duration `+`/`-` pairs PostgreSQL supports natively (e.g.
 /// `timestamptz + interval`) that `types_compatible`'s bucket-matching
-/// (same type, or both-int, or both-float) doesn't cover — Gel declares an
-/// extensive set of these as real `CREATE INFIX OPERATOR` overloads (see
-/// `std/30-datetimefuncs.edgeql`/`cal.edgeql`). Deliberately a separate,
-/// narrower check from `types_compatible` (also used for UNION-branch
+/// (same type, or both-int, or both-float) doesn't cover. Deliberately a
+/// separate, narrower check from `types_compatible` (also used for UNION-branch
 /// compatibility, where "a datetime and a duration are interchangeable"
 /// would be nonsensical) rather than folded into it, so this can't leak
 /// into a context where "arithmetic-compatible" isn't the same relation as

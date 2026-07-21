@@ -297,8 +297,7 @@ class Client:
     def with_config(self, options: dict[str, Any]) -> "Client":
         """Return a client view that applies session config *options* to every query.
 
-        The returned client shares the same connection pool. Mirrors Gel's
-        session config (``configure session set ...``) — see
+        The returned client shares the same connection pool. See
         ``pylon.config_options`` for the registry of known option names/
         defaults. An unrecognized option name is stored but has no effect
         (only names ``pylon.query.compile()`` actually consumes change

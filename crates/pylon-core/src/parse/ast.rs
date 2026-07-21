@@ -1,5 +1,4 @@
 // AST nodes for PyQL queries.
-// Follows Gel's edb/edgeql/ast.py but trimmed to Pylon's subset.
 
 // ── Statements ─────────────────────────────────────────────────────────────────
 
@@ -375,7 +374,7 @@ impl TypeExpr {
 
 // ── If / Else ──────────────────────────────────────────────────────────────────
 
-/// EdgeQL / PyQL `expr IF cond ELSE expr` ternary.
+/// PyQL `expr IF cond ELSE expr` ternary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfElse {
     pub if_expr: Expr,

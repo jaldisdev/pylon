@@ -22,7 +22,7 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("std", "max",       vec![p("s", set_of(AnyOrderable))], opt(AnyOrderable), B("max")),
         f("std", "mean",      vec![p("s", set_of(Float64))],      Float64, B("avg")),
         f("std", "mean",      vec![p("s", set_of(Decimal))],      Decimal, B("avg")),
-        // PG's avg(bigint) returns numeric; cast down to match Gel's float64 return type.
+        // PG's avg(bigint) returns numeric; cast down to the declared float64 return type.
         f("std", "mean",      vec![p("s", set_of(Int64))],        Float64, E("avg($1)::float8")),
         f("std", "all",       vec![p("vals", set_of(Bool))],      Bool,    B("bool_and")),
         f("std", "any",       vec![p("vals", set_of(Bool))],      Bool,    B("bool_or")),

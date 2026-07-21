@@ -4,13 +4,13 @@ use super::{Bool, Box2D, Box3D, Bytes, FnDescriptor, Float64, Geography, Geometr
 /// Straight passthrough to PostgreSQL's `postgis` extension (`CREATE EXTENSION
 /// IF NOT EXISTS postgis;` must be run on the target database — same
 /// expectation as `pgvector`'s `vector` extension, neither of which Pylon
-/// auto-provisions). Generated from PostGIS's own EdgeQL extension package
-/// source (the `ext::postgis` bindings) rather than hand-transcribed, so
-/// every underlying SQL function name/cast here is taken directly from
-/// that verified source, not guessed. Each Pylon overload here corresponds
-/// to one fully-applied arity of a Gel function that may have trailing
+/// auto-provisions). Generated from a verified reference binding source
+/// (the `ext::postgis` bindings) rather than hand-transcribed, so every
+/// underlying SQL function name/cast here is taken directly from that
+/// source, not guessed. Each Pylon overload here corresponds to one
+/// fully-applied arity of a reference function that may have trailing
 /// default-valued parameters — Pylon has no notion of default arguments,
-/// so a Gel function documented with N optional trailing params becomes N+1
+/// so a function documented with N optional trailing params becomes N+1
 /// separate registry entries here, each delegating to the same underlying
 /// call (PostgreSQL fills in its own defaults for the omitted trailing args).
 pub(super) fn build() -> Vec<FnDescriptor> {

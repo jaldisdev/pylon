@@ -425,7 +425,7 @@ impl Parser {
     }
 
     fn parse_if_else(&mut self) -> Result<Expr, PyQLSyntaxError> {
-        // Gel-style prefix: if condition then value else fallback
+        // Prefix form: if condition then value else fallback
         if matches!(self.current(), Token::If) {
             self.advance();
             let condition = self.parse_or()?;
@@ -1274,7 +1274,7 @@ impl Parser {
             });
         }
 
-        // Nested shape: `.link { ... }` or `.link: { ... }` (Gel-style colon optional)
+        // Nested shape: `.link { ... }` or `.link: { ... }` (colon optional)
         if matches!(self.current(), Token::Colon) {
             self.advance();
         }
