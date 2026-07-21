@@ -3837,6 +3837,99 @@ mod tests {
     }
 
     #[test]
+    fn test_with_bound_schema_object_property_access_in_filter_expression() {
+        // Regression: `with person := (select detached Person filter ...)
+        // select Person filter .id not in person.id;` failed with "absolute
+        // paths are not valid in expression context" — compile_path's
+        // schema-bound-CTE-in-expression-position case only ever handled a
+        // WITH-bound *free object* (resolve_cte_path), never a WITH-bound
+        // *schema object* CTE, even though its own SELECT * CTE source
+        // (emit_dml_as_cte_source) always exposes every raw column.
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with\n  person := (select detached Person filter .id = <uuid>$id)\n\
+             select Person filter .id not in person.id;",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("<> ALL((SELECT")
+                && out.sql.contains(".\"id\"")
+                && out.sql.contains("FROM \"person\""),
+            "got:\n{}", out.sql
+        );
+    }
+
+    #[test]
+    fn test_with_bound_schema_object_scalar_property_access() {
+        // Not just `.id` — any scalar property of the bound type is
+        // reachable, since the CTE source is `SELECT *` regardless of the
+        // binding's own declared shape.
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with\n  person := (select detached Person filter .id = <uuid>$id)\n\
+             select Person filter .name = person.name;",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("(SELECT") && out.sql.contains(".\"name\"") && out.sql.contains("FROM \"person\""),
+            "got:\n{}", out.sql
+        );
+    }
+
+    #[test]
+    fn test_with_bound_schema_object_link_traversal_reaches_nested_property() {
+        // Generalization: a with-bound schema object's CTE source is
+        // `SELECT *`, so it's traversable exactly like a real type name —
+        // not just its own scalar properties, but a *link's* properties too
+        // (`person.company.name`), via the same path-traversal machinery
+        // `TypeName.a.b.c` already uses (compile_path_select), wrapped as a
+        // correlated subquery (IrExpr::PathSubquery).
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with\n  person := (select detached Person filter .id = <uuid>$id)\n\
+             select Company filter .name = person.company.name;",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("(SELECT") && out.sql.contains("\"name\"") && out.sql.contains("\"Company\""),
+            "got:\n{}", out.sql
+        );
+    }
+
+    #[test]
+    fn test_with_bound_schema_object_bare_link_reduces_to_id() {
+        // A bare link at the end of the chain (`person.company`, no further
+        // traversal) reduces to the linked object's id, matching the
+        // existing bare-CTE-reference convention (IrExpr::CteRef).
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with\n  person := (select detached Person filter .id = <uuid>$id)\n\
+             select Person filter .id = person.company;",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("(SELECT") && out.sql.contains("\"id\""),
+            "got:\n{}", out.sql
+        );
+    }
+
+    #[test]
+    fn test_with_bound_schema_object_unknown_property_suggests_a_close_match() {
+        let schema = make_schema();
+        let ast = parse::parse(
+            "with\n  person := (select detached Person filter .id = <uuid>$id)\n\
+             select Person filter .name = person.nam;",
+        ).unwrap();
+        match ir::compile(&ast, &schema) {
+            Err(err) => assert!(
+                format!("{err}").contains("Did you mean 'name'"),
+                "got: {err}"
+            ),
+            Ok(_) => panic!("expected a compile error"),
+        }
+    }
+
+    #[test]
     fn test_with_bound_free_object_passthrough_preserves_all_fields() {
         // Regression: `with test := { test2 := 1.0, test3 := 'str' } select
         // test;` decoded as just `1.0` (the CTE's first field) — a bare
