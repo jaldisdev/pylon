@@ -179,6 +179,17 @@ impl PgPool {
         execute_typed_on(&client, sql, params).await
     }
 
+    /// Runs `EXPLAIN (ANALYZE, FORMAT JSON, VERBOSE) sql` with bound
+    /// `params` and returns the raw JSON output text verbatim — for
+    /// `analyze <query>` (see `pylon_core::analyze`), which parses this text
+    /// itself to correlate plan nodes back to the query's own shape.
+    /// Actually *runs* the query (`ANALYZE`), same as Postgres's own
+    /// `EXPLAIN ANALYZE`, not just its planner estimate.
+    pub async fn query_explain(&self, sql: &str, params: &[CachedValue]) -> Result<String> {
+        let client = self.pool.get().await?;
+        query_explain_on(&client, sql, params).await
+    }
+
     /// Acquires one pooled connection and starts an explicit transaction at
     /// the given isolation level (`"read_uncommitted"`, `"read_committed"`,
     /// `"repeatable_read"`, or `"serializable"` — matching
@@ -297,6 +308,23 @@ pub(crate) async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str,
     let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
         bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
     Ok(client.execute(&stmt, &param_refs).await?)
+}
+
+/// `EXPLAIN (FORMAT JSON)` returns exactly one row with one column (named
+/// `QUERY PLAN`, typed `json`) holding the entire plan as JSON text — reused
+/// via `RawBytes` (see its own doc comment) rather than depending on the
+/// `with-serde_json-1` feature, since `json`'s wire format is just its plain
+/// UTF-8 text (unlike `jsonb`, which prefixes a version byte).
+pub(crate) async fn query_explain_on(client: &tokio_postgres::Client, sql: &str, params: &[CachedValue]) -> Result<String> {
+    let wrapped = format!("EXPLAIN (ANALYZE, FORMAT JSON, VERBOSE) {sql}");
+    let stmt = client.prepare(&wrapped).await?;
+    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+    let rows = client.query(&stmt, &param_refs).await?;
+    let row = rows.into_iter().next().ok_or_else(|| Error::message("EXPLAIN produced no output row".to_string()))?;
+    let RawBytes(bytes) = row.try_get::<_, RawBytes<'_>>(0)?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// An explicit transaction on a single connection checked out of the pool.
@@ -602,6 +630,28 @@ mod tests {
         let sql = format!("SELECT ($1::{pg_type}) AS result");
         let rows = pool.query_typed(&sql, &[param], &ExtensionOids::default()).await.unwrap();
         rows.into_iter().next().unwrap()
+    }
+
+    // ── query_explain against real Postgres ─────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn query_explain_returns_parseable_json_with_a_plan_node() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let raw = pool.query_explain("SELECT 1 + 1", &[]).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed[0]["Plan"]["Node Type"].is_string());
+        // ANALYZE was requested, so the plan must carry real execution stats.
+        assert!(parsed[0]["Plan"]["Actual Total Time"].is_number());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn query_explain_binds_params_the_same_way_query_typed_does() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let raw = pool.query_explain("SELECT $1::int8 + 1", &[CachedValue::I64(41)]).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed[0]["Plan"]["Node Type"].is_string());
     }
 
     #[tokio::test]
