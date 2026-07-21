@@ -3272,6 +3272,22 @@ mod tests {
     }
 
     #[test]
+    fn test_deep_splat_fetches_single_link_target_properties_not_just_id() {
+        // `**` on a single link must expand to the target type's own
+        // properties (Gel semantics: one level of `*`, not `**` again —
+        // recursing into the target's own links would never terminate for
+        // a cyclic link graph), not just an implicit `{ id }`.
+        let out = compile_and_emit("SELECT Person { ** }");
+        assert!(out.sql.contains("\"name\""), "expected Company.name pulled in via .company's ** expansion, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_deep_splat_fetches_multilink_target_properties_not_just_id() {
+        let out = compile_and_emit("SELECT Person { ** }");
+        assert!(out.sql.contains("\"title\""), "expected Post.title pulled in via .posts' ** expansion, got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_schema_type_cast_select() {
         let out = compile_and_emit(
             "SELECT <default::Person><uuid>'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'",

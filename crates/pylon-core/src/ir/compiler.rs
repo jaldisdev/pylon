@@ -3450,7 +3450,12 @@ impl<'a> Compiler<'a> {
             for l in &td.links {
                 let target_td = self.resolve_type(&l.target)?;
                 let sub_alias = self.fresh_alias();
-                let sub_shape = Self::pk_returning(target_td);
+                // Gel's `**` fetches every property (not further nested
+                // links) of a linked object — a `Shallow` (`*`) expansion of
+                // the target type, one level deep. Recursing with `Deep`
+                // here instead would walk the target's own links too, which
+                // for a two-way or cyclic link graph never terminates.
+                let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, module)?;
                 let subquery = IrSelect::schema_bound(
                     IrSource {
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -3477,7 +3482,9 @@ impl<'a> Compiler<'a> {
             for ml in &td.multilinks {
                 let sub_alias = self.fresh_alias();
                 let target_td = self.resolve_type(&ml.target)?;
-                let sub_shape = Self::pk_returning(target_td);
+                // See the single-link loop above — same Shallow-not-Deep
+                // reasoning applies to multilink targets.
+                let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, module)?;
 
                 let join = if let Some(through_qname) = &ml.through {
                     let through_td = self.resolve_type(through_qname)?;
