@@ -112,6 +112,57 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_wraps_inner_stmt() {
+        let stmt = parse("analyze select Person { name }").unwrap();
+        let Stmt::Analyze(inner) = stmt else { panic!("expected Analyze") };
+        assert!(matches!(*inner, Stmt::Select(_)));
+    }
+
+    #[test]
+    fn test_analyze_is_case_insensitive_and_not_reserved_elsewhere() {
+        assert!(matches!(parse("ANALYZE select Person").unwrap(), Stmt::Analyze(_)));
+        // "analyze" stays a legal identifier everywhere except as the
+        // leading token of a statement — it's a soft keyword, not reserved.
+        let stmt = parse("SELECT Person { name }").unwrap();
+        assert!(matches!(stmt, Stmt::Select(_)));
+    }
+
+    #[test]
+    fn test_analyze_wraps_insert_and_update_too() {
+        assert!(matches!(
+            parse("analyze insert Person { name := 'a' }").unwrap(),
+            Stmt::Analyze(inner) if matches!(*inner, Stmt::Insert(_))
+        ));
+        assert!(matches!(
+            parse("analyze update Person set { name := 'a' }").unwrap(),
+            Stmt::Analyze(inner) if matches!(*inner, Stmt::Update(_))
+        ));
+    }
+
+    #[test]
+    fn test_analyze_marker_offsets_mark_root_and_nested_shape_elements() {
+        let query = "analyze select Person { name, posts { title } }";
+        let stmt = parse(query).unwrap();
+        let Stmt::Analyze(inner) = stmt else { panic!("expected Analyze") };
+        let Stmt::Select(sel) = *inner else { panic!() };
+        let Expr::Shape(shape) = sel.result else { panic!() };
+
+        // Root marker sits right at "Person", after "analyze select ".
+        let root_offset = shape.marker_offset.expect("root shape should carry an offset");
+        assert_eq!(&query[root_offset..root_offset + "Person".len()], "Person");
+
+        let name_offset = shape.elements[0].marker_offset.expect("name element should carry an offset");
+        assert_eq!(&query[name_offset..name_offset + "name".len()], "name");
+
+        let posts = &shape.elements[1];
+        let posts_offset = posts.marker_offset.expect("posts element should carry an offset");
+        assert_eq!(&query[posts_offset..posts_offset + "posts".len()], "posts");
+
+        let title_offset = posts.nested.as_ref().unwrap()[0].marker_offset.expect("nested element should carry an offset");
+        assert_eq!(&query[title_offset..title_offset + "title".len()], "title");
+    }
+
+    #[test]
     fn test_select_free_object() {
         let stmt = parse("SELECT { foo := 'bar', n := 42 }").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };

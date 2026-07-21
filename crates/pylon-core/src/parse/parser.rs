@@ -22,6 +22,10 @@ impl Parser {
         self.tokens[self.pos].pos.clone()
     }
 
+    fn current_offset(&self) -> usize {
+        self.tokens[self.pos].byte_offset
+    }
+
     fn peek_ahead(&self, offset: usize) -> &Token {
         let idx = (self.pos + offset).min(self.tokens.len() - 1);
         &self.tokens[idx].token
@@ -116,19 +120,7 @@ impl Parser {
     // ── Top-level ───────────────────────────────────────────────────────────────
 
     pub fn parse_stmt(&mut self) -> Result<Stmt, PyQLSyntaxError> {
-        let stmt = match self.current() {
-            Token::With => self.parse_with(),
-            Token::For => self.parse_for(),
-            Token::Select => self.parse_select(),
-            Token::Insert => self.parse_insert(),
-            Token::Update => self.parse_update(),
-            Token::Delete => self.parse_delete(),
-            Token::Group => self.parse_group(),
-            _ => Err(self.err(&format!(
-                "expected the start of a statement (with, for, select, insert, update, delete, or group), found {}",
-                self.current()
-            ))),
-        }?;
+        let stmt = self.parse_stmt_inner()?;
         // Optional trailing semicolon
         if matches!(self.current(), Token::Semicolon) {
             self.advance();
@@ -137,6 +129,27 @@ impl Parser {
             return Err(self.err(&format!("unexpected {} after the end of the query", self.current())));
         }
         Ok(stmt)
+    }
+
+    /// A "soft" keyword: `analyze` isn't reserved (it stays a legal type/field
+    /// name everywhere else), so it's only recognized here, as the leading
+    /// token of a statement.
+    fn at_analyze_keyword(&self) -> bool {
+        matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("analyze"))
+    }
+
+    /// Like `parse_inner_stmt`, but additionally accepts a leading `analyze`
+    /// — deliberately *not* folded into `parse_inner_stmt` itself, since
+    /// `analyze` is only a top-level statement form (unlike a parenthesised
+    /// subquery's `(select ...)`, `(insert ...)`, etc., it can't appear as a
+    /// nested expression).
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, PyQLSyntaxError> {
+        if self.at_analyze_keyword() {
+            self.advance();
+            let inner = self.parse_stmt_inner()?;
+            return Ok(Stmt::Analyze(Box::new(inner)));
+        }
+        self.parse_inner_stmt()
     }
 
     // ── SELECT ──────────────────────────────────────────────────────────────────
@@ -741,6 +754,7 @@ impl Parser {
 
     // Postfix: shape `{...}`, dot traversal, type intersection `[is T]`, link prop `@prop`
     fn parse_postfix(&mut self) -> Result<Expr, PyQLSyntaxError> {
+        let root_offset = self.current_offset();
         let mut expr = self.parse_primary()?;
 
         loop {
@@ -749,7 +763,11 @@ impl Parser {
                     self.advance();
                     let elements = self.parse_shape_body()?;
                     self.eat(&Token::RBrace)?;
-                    expr = Expr::Shape(Box::new(ShapeExpr { expr: Some(expr), elements }));
+                    expr = Expr::Shape(Box::new(ShapeExpr {
+                        expr: Some(expr),
+                        elements,
+                        marker_offset: Some(root_offset),
+                    }));
                 }
                 Token::Dot => {
                     self.advance();
@@ -904,7 +922,7 @@ impl Parser {
                 if is_free_object {
                     let elements = self.parse_shape_body()?;
                     self.eat(&Token::RBrace)?;
-                    return Ok(Expr::Shape(Box::new(ShapeExpr { expr: None, elements })));
+                    return Ok(Expr::Shape(Box::new(ShapeExpr { expr: None, elements, marker_offset: None })));
                 }
                 // Set literal: comma-separated value expressions
                 let mut elems = vec![self.parse_expr()?];
@@ -1134,6 +1152,7 @@ impl Parser {
     }
 
     fn parse_shape_element(&mut self) -> Result<ShapeElement, PyQLSyntaxError> {
+        let element_offset = Some(self.current_offset());
         // Type intersection shape element: `[is Type].*`, `[is Type].**`, or `[is Type].field`
         if matches!(self.current(), Token::LBracket) && matches!(self.peek_ahead(1), Token::Is) {
             self.advance(); // [
@@ -1162,6 +1181,7 @@ impl Parser {
                     filter: None,
                     order_by: vec![],
                     offset: None,
+                    marker_offset: element_offset,
                     limit: None,
                 });
             }
@@ -1185,6 +1205,7 @@ impl Parser {
                     filter: None,
                     order_by: vec![],
                     offset: None,
+                    marker_offset: element_offset,
                     limit: None,
                 });
             }
@@ -1197,6 +1218,7 @@ impl Parser {
                 filter: None,
                 order_by: vec![],
                 offset: None,
+                marker_offset: element_offset,
                 limit: None,
             });
         }
@@ -1236,6 +1258,7 @@ impl Parser {
                 filter: None,
                 order_by: vec![],
                 offset: None,
+                marker_offset: element_offset,
                 limit: None,
             });
         }
@@ -1270,6 +1293,7 @@ impl Parser {
                 filter: None,
                 order_by: vec![],
                 offset: None,
+                marker_offset: element_offset,
                 limit: None,
             });
         }
@@ -1319,6 +1343,7 @@ impl Parser {
                 filter,
                 order_by,
                 offset,
+                marker_offset: element_offset,
                 limit,
             });
         }
@@ -1333,6 +1358,7 @@ impl Parser {
             filter: None,
             order_by: vec![],
             offset: None,
+            marker_offset: element_offset,
             limit: None,
         })
     }
