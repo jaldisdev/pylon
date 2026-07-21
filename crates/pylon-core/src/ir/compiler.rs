@@ -503,6 +503,7 @@ impl<'a> Compiler<'a> {
             Expr::Shape(Box::new(ast::ShapeExpr {
                 expr: Some(inner_sel.result.clone()),
                 elements: shape_elements.to_vec(),
+                marker_offset: None,
             }))
         };
 
@@ -684,6 +685,7 @@ impl<'a> Compiler<'a> {
             Expr::Shape(Box::new(ast::ShapeExpr {
                 expr: Some(inner_sel.result.clone()),
                 elements: shape_elements.to_vec(),
+                marker_offset: None,
             }))
         };
 
@@ -1219,6 +1221,7 @@ impl<'a> Compiler<'a> {
                                     result: Expr::Shape(Box::new(ast::ShapeExpr {
                                         expr: Some(Expr::Path(ast::Path::absolute(name))),
                                         elements: sh.elements.clone(),
+                                        marker_offset: None,
                                     })),
                                     filter: merged_filter,
                                     order_by: s.order_by.clone(),
@@ -1437,6 +1440,10 @@ impl<'a> Compiler<'a> {
                 self.compile_stmt(&w.stmt)
             }
             Stmt::For(f) => self.compile_for(f).map(IrStmt::For),
+            // `analyze` only changes how the query is *executed* (see
+            // `analyze.rs`) — the inner statement's IR is identical either
+            // way, so this layer just unwraps and compiles it normally.
+            Stmt::Analyze(inner) => self.compile_stmt(inner),
         }
     }
 
@@ -2715,6 +2722,7 @@ impl<'a> Compiler<'a> {
             Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
             Stmt::With(w) => self.dml_subject_type(&w.stmt),
             Stmt::For(f) => self.dml_subject_type(&f.body),
+            Stmt::Analyze(inner) => self.dml_subject_type(inner),
             Stmt::Group(g) => self.expr_as_type_name(&g.subject),
             Stmt::Select(sel) => {
                 // <Module::Type>expr — type name comes from the cast target

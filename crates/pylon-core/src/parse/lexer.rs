@@ -192,6 +192,11 @@ impl std::fmt::Display for Token {
 pub struct SpannedToken {
     pub token: Token,
     pub pos: Position,
+    /// Byte offset of this token's first byte in the source string. Tracked
+    /// directly from the lexer's own running byte cursor (no line/col
+    /// conversion needed) — used to place `analyze` markers in the echoed
+    /// query text.
+    pub byte_offset: usize,
 }
 
 pub struct Lexer<'a> {
@@ -211,12 +216,13 @@ impl<'a> Lexer<'a> {
         loop {
             self.skip_whitespace_and_comments();
             let pos = Position { line: self.line, col: self.col };
+            let byte_offset = self.pos;
             if self.pos >= self.input.len() {
-                tokens.push(SpannedToken { token: Token::Eof, pos });
+                tokens.push(SpannedToken { token: Token::Eof, pos, byte_offset });
                 break;
             }
             let tok = self.next_token(pos.clone())?;
-            tokens.push(SpannedToken { token: tok, pos });
+            tokens.push(SpannedToken { token: tok, pos, byte_offset });
         }
         Ok(tokens)
     }

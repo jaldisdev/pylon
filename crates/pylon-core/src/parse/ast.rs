@@ -13,6 +13,10 @@ pub enum Stmt {
     With(WithStmt),
     /// `for var in iterator union body`
     For(ForStmt),
+    /// `analyze <stmt>` — run the inner statement through Postgres's
+    /// EXPLAIN ANALYZE and report a query plan instead of the inner
+    /// statement's own result.
+    Analyze(Box<Stmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +206,10 @@ pub enum ShapeOp {
 pub struct ShapeExpr {
     pub expr: Option<Expr>,
     pub elements: Vec<ShapeElement>,
+    /// Source byte offset of `expr`'s first token, if any — used only to
+    /// place the root `analyze` marker in the echoed query text (see
+    /// `analyze.rs`); not populated (and not needed) outside that path.
+    pub marker_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,6 +237,10 @@ pub struct ShapeElement {
     pub order_by: Vec<SortExpr>,
     pub offset: Option<Expr>,
     pub limit: Option<Expr>,
+    /// Source byte offset of this element's first token — used only to place
+    /// per-pointer `analyze` markers in the echoed query text (see
+    /// `analyze.rs`); not populated (and not needed) outside that path.
+    pub marker_offset: Option<usize>,
 }
 
 impl ShapeElement {
@@ -243,6 +255,7 @@ impl ShapeElement {
             order_by: vec![],
             offset: None,
             limit: None,
+            marker_offset: None,
         }
     }
 }
