@@ -290,6 +290,11 @@ pub struct IrScalarPointer {
     /// `__nt__:` `pg_type` marker, or structural, via `pylon.Tuple[...]`)
     /// whose member shape is statically known — see `TupleCastShape`.
     pub tuple_shape: Option<TupleCastShape>,
+    /// Source byte offset of the originating `ast::ShapeElement`, if this
+    /// pointer came from one written directly in the query (`analyze`'s
+    /// marker placement — see `analyze.rs`); `None` for a pointer synthesized
+    /// by the compiler itself (splat expansion, implicit `{ id }`, etc.).
+    pub marker_offset: Option<usize>,
 }
 
 /// A single-valued link included in the output shape. Emitted as a
@@ -306,6 +311,8 @@ pub struct IrSingleLinkPointer {
     /// always empty for `IrSingleLinkCorrelation::Fk`, since a plain FK
     /// column has no junction row to read properties from.
     pub link_properties: Vec<IrLinkProp>,
+    /// See `IrScalarPointer::marker_offset`.
+    pub marker_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +344,8 @@ pub struct IrMultiLinkPointer {
     pub subquery: IrSelect,
     /// Extra scalar columns from a junction table (`@prop` syntax).
     pub link_properties: Vec<IrLinkProp>,
+    /// See `IrScalarPointer::marker_offset`.
+    pub marker_offset: Option<usize>,
 }
 
 /// A single link property pulled from a junction table.
@@ -395,6 +404,8 @@ pub enum IrMultiLinkJoin {
 pub struct IrComputedPointer {
     pub alias: String,
     pub expr: IrExpr,
+    /// See `IrScalarPointer::marker_offset`.
+    pub marker_offset: Option<usize>,
 }
 
 // ── Vector index enqueue ────────────────────────────────────────────────────────

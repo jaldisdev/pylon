@@ -1,3 +1,4 @@
+pub mod analyze;
 pub mod cast;
 pub mod diff;
 pub mod error;

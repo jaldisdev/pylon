@@ -2,9 +2,10 @@ use std::sync::{OnceLock, RwLock};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
+use crate::analyze::ShapePathAlias;
 use crate::error::PyQLError;
 use crate::schema::SchemaDescriptor;
-use crate::{ir, parse, sql};
+use crate::{analyze, ir, parse, sql};
 
 const CACHE_CAPACITY: usize = 1024;
 
@@ -231,6 +232,11 @@ pub struct CompiledQuery {
     /// set of tags to cache this result under; for an INSERT/UPDATE/DELETE,
     /// the set of tags a cache layer must invalidate after the write commits.
     pub tags: Vec<String>,
+    /// `Some` only for `analyze <query>` — the shape-path↔SQL-alias map an
+    /// `analyze` execution needs to correlate Postgres's `EXPLAIN` plan
+    /// nodes back to the query's own shape (see `analyze` module). `None`
+    /// for every other query, which doesn't pay for this extra shape walk.
+    pub analyze_paths: Option<Vec<ShapePathAlias>>,
 }
 
 /// Compile a PyQL expression string in the context of a named type to a bare SQL
@@ -288,7 +294,11 @@ pub fn compile_with_config(
 
 fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::SessionConfig) -> Result<CompiledQuery, PyQLError> {
     let ast = parse::parse(query)?;
+    let is_analyze = matches!(ast, parse::Stmt::Analyze(_));
     let ir_out = ir::compile_with_config(&ast, schema, config)?;
+    // `analyze`'s own shape-path walk is skipped for every other query — no
+    // reason to pay for it when nothing will read `analyze_paths`.
+    let analyze_paths = is_analyze.then(|| analyze::collect_shape_path_aliases(&ir_out.stmt));
     let tags = ir::tags::collect_tags(&ir_out);
     let sql_out = sql::emit(&ir_out);
     Ok(CompiledQuery {
@@ -299,5 +309,73 @@ fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::Session
         warnings: ir_out.warnings,
         inference_plan: sql_out.inference_plan,
         tags,
+        analyze_paths,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{PropertyDescriptor, TypeDescriptor};
+
+    fn make_schema() -> SchemaDescriptor {
+        SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: "Person".into(),
+                module: "default".into(),
+                table: "person".into(),
+                abstract_: false,
+                materialized: false,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
+                properties: vec![PropertyDescriptor {
+                    name: "id".into(),
+                    pg_type: "uuid".into(),
+                    nullable: false,
+                    default_sql: Some("uuidv7()".into()),
+                    default_pyql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: true,
+                    is_pk: true,
+                    is_readonly: true,
+                    rewrites: vec![],
+                    tuple_members: None,
+                }],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+                signals: vec![],
+            }],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_analyze_paths_is_none_for_a_plain_query() {
+        let schema = make_schema();
+        let compiled = compile("select Person { id }", &schema).unwrap();
+        assert!(compiled.analyze_paths.is_none());
+    }
+
+    #[test]
+    fn test_analyze_paths_is_populated_for_an_analyze_query() {
+        let schema = make_schema();
+        let compiled = compile("analyze select Person { id }", &schema).unwrap();
+        let paths = compiled.analyze_paths.expect("analyze query should populate analyze_paths");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].path, "root");
+    }
 }

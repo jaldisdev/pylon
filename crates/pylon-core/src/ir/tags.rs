@@ -443,6 +443,7 @@ mod tests {
 
     fn scalar_pointer(alias: &str) -> IrShapePointer {
         IrShapePointer::Scalar(IrScalarPointer {
+            marker_offset: None,
             alias: alias.into(), column: alias.into(), pg_type: "text".into(), tuple_shape: None,
         })
     }
@@ -465,6 +466,7 @@ mod tests {
     fn single_link_shape_pointer_tags_the_target_table_too() {
         let inner = IrSelect::schema_bound(src("default::Company", "company", "t1"), vec![], None);
         let link = IrShapePointer::SingleLink(IrSingleLinkPointer {
+            marker_offset: None,
             alias: "company".into(),
             correlation: IrSingleLinkCorrelation::Fk { fk_column: "company_id".into(), target_pk: "id".into() },
             subquery: inner,
@@ -486,6 +488,7 @@ mod tests {
         // Data Explorer kept showing stale data after commit).
         let inner = IrSelect::schema_bound(src("default::Org", "org", "t1"), vec![], None);
         let link = IrShapePointer::SingleLink(IrSingleLinkPointer {
+            marker_offset: None,
             alias: "spouse".into(),
             correlation: IrSingleLinkCorrelation::Junction {
                 join: IrMultiLinkJoin::Standard { junction_table: "person.spouse".into(), module: "default".into() },
@@ -528,6 +531,7 @@ mod tests {
     fn multi_link_tags_target_table_and_junction_table() {
         let inner = IrSelect::schema_bound(src("default::Post", "post", "t1"), vec![], None);
         let ml = IrShapePointer::MultiLink(IrMultiLinkPointer {
+            marker_offset: None,
             alias: "posts".into(),
             join: IrMultiLinkJoin::Standard { junction_table: "person.posts".into(), module: "default".into() },
             subquery: inner,
@@ -647,12 +651,14 @@ mod tests {
         let inner1 = IrSelect::schema_bound(src("default::Company", "company", "t1"), vec![], None);
         let inner2 = IrSelect::schema_bound(src("default::Company", "company", "t2"), vec![], None);
         let link1 = IrShapePointer::SingleLink(IrSingleLinkPointer {
+            marker_offset: None,
             alias: "a".into(),
             correlation: IrSingleLinkCorrelation::Fk { fk_column: "a_id".into(), target_pk: "id".into() },
             subquery: inner1,
             link_properties: vec![],
         });
         let link2 = IrShapePointer::SingleLink(IrSingleLinkPointer {
+            marker_offset: None,
             alias: "b".into(),
             correlation: IrSingleLinkCorrelation::Fk { fk_column: "b_id".into(), target_pk: "id".into() },
             subquery: inner2,
