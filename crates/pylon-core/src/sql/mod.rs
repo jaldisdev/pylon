@@ -3254,6 +3254,24 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_in_set_literal_compiles_to_any_array() {
+        let out = compile_and_emit("SELECT Person { name } FILTER .name IN {'Carol'}");
+        assert!(out.sql.contains("= ANY(ARRAY['Carol'])"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_filter_in_multi_element_set_literal_compiles_to_any_array() {
+        let out = compile_and_emit("SELECT Person { name } FILTER .name IN {'Carol', 'Bob'}");
+        assert!(out.sql.contains("= ANY(ARRAY['Carol', 'Bob'])"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_filter_not_in_set_literal_compiles_to_all_array() {
+        let out = compile_and_emit("SELECT Person { name } FILTER .name NOT IN {'Carol'}");
+        assert!(out.sql.contains("<> ALL(ARRAY['Carol'])"), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_schema_type_cast_select() {
         let out = compile_and_emit(
             "SELECT <default::Person><uuid>'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'",

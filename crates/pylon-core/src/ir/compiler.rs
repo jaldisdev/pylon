@@ -4315,6 +4315,26 @@ impl<'a> Compiler<'a> {
                         return Ok(exists);
                     }
                 }
+                // `x in {a, b, c}` / `x not in {a, b, c}`: a set *literal*
+                // specifically on the right of in/not-in compiles to a
+                // Postgres array, not through the generic Set-literal path
+                // below (which hard-errors on any bare set literal in
+                // expression position) — In/NotIn's own SQL emission
+                // (`= ANY(...)`/`<> ALL(...)`, sql/mod.rs) already expects
+                // an array-typed right operand, so this is the one
+                // expression position a set literal is actually meaningful
+                // in, in either schema-bound or free context.
+                if matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn) {
+                    if let Expr::Set(elems) = &b.right {
+                        let left = self.compile_expr_ctx(&b.left, ctx)?;
+                        let items = elems
+                            .iter()
+                            .map(|e| self.compile_expr_ctx(e, ctx))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let right = IrExpr::Array(items);
+                        return Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })));
+                    }
+                }
                 let left = self.compile_expr_ctx(&b.left, ctx)?;
                 let right = self.compile_expr_ctx(&b.right, ctx)?;
                 if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
