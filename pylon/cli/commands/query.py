@@ -22,6 +22,11 @@ _SET_GLOBAL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Soft keyword, same convention as pylon-core's own parser (see
+# parse/parser.rs's at_analyze_keyword) — only recognized as the leading
+# token, "analyze" stays a legal identifier everywhere else.
+_ANALYZE_PREFIX_RE = re.compile(r"^analyze\b", re.IGNORECASE)
+
 
 # --- parameter prompting -------------------------------------------------------
 
@@ -238,6 +243,19 @@ async def _execute(
             click.echo(_format_exception(e))
             return
 
+    if _ANALYZE_PREFIX_RE.match(pyql):
+        try:
+            coarse_grained = await client.analyze(pyql, **kwargs)
+        except Exception as e:
+            click.echo(_format_exception(e))
+            return
+        if as_json:
+            import json as _json
+            click.echo(_json.dumps(coarse_grained))
+        else:
+            click.echo(_format_analyze_result(pyql, coarse_grained))
+        return
+
     if as_json:
         try:
             click.echo(await client.query_json(pyql, **kwargs))
@@ -408,6 +426,114 @@ def _format_exception(e: BaseException) -> str:
     `UnknownLinkError`, ...) instead of the previous generic literal
     "error:" text, which discarded which kind of error it was."""
     return f"{_BOLD_RED}{type(e).__name__}:{_RESET} {_translate_pg_types(str(e))}"
+
+
+# --- analyze result formatting --------------------------------------------------
+#
+# Mirrors pylon-ui's analyzeFormat.ts field-for-field, so `analyze <query>`
+# reads identically whether typed here or in the web REPL — see that file's
+# own comment for the exact Gel/EdgeQL output this reproduces. `root` is the
+# JSON dict `Client.analyze()` returns (pylon-core's `CoarseGrainedNode`,
+# camelCase-free — its own field names, e.g. `marker_offset`, are used as-is).
+
+_CIRCLED_DIGITS = ["➊", "➋", "➌", "➍", "➎", "➏", "➐", "➑", "➒", "➓"]
+
+
+def _analyze_marker(n: int) -> str:
+    return _CIRCLED_DIGITS[n - 1] if n <= len(_CIRCLED_DIGITS) else f"({n})"
+
+
+def _flatten_analyze_tree(root: dict) -> list[dict]:
+    """Flattens in *source-text order* (by marker_offset), not tree order —
+    see analyzeFormat.ts's `flatten` for why (sibling links can appear in
+    either order in the plan tree, but must still read top-to-bottom the way
+    the query was written)."""
+    all_nodes: list[dict] = []
+
+    def walk(node: dict) -> None:
+        all_nodes.append(node)
+        for child in node.get("children", []):
+            walk(child["node"])
+
+    walk(root)
+
+    with_offset = [n for n in all_nodes if n.get("marker_offset") is not None]
+    without_offset = [n for n in all_nodes if n.get("marker_offset") is None]
+    with_offset.sort(key=lambda n: n["marker_offset"])
+    return with_offset + without_offset
+
+
+def _analyze_total_time(node: dict) -> float:
+    """Matches explainVis/state.ts's own convention: total time across every
+    loop iteration, not one iteration's average."""
+    cost = node["cost"]
+    if cost.get("actual_total_time") is None:
+        return 0.0
+    return cost["actual_total_time"] * (cost.get("actual_loops") or 1)
+
+
+def _annotate_analyze_query(query: str, markers: list[str], nodes: list[dict]) -> str:
+    """Inserts each row's marker text at its own marker_offset inside
+    `query` — highest offset first, so an earlier insertion never shifts a
+    not-yet-processed later offset out of place."""
+    pairs = [(m, n) for m, n in zip(markers, nodes) if n.get("marker_offset") is not None]
+    pairs.sort(key=lambda pair: pair[1]["marker_offset"], reverse=True)
+    text = query
+    for m, n in pairs:
+        offset = n["marker_offset"]
+        text = text[:offset] + m + "  " + text[offset:]
+    return text
+
+
+def _format_analyze_result(query: str, root: dict) -> str:
+    nodes = _flatten_analyze_tree(root)
+    markers = [_analyze_marker(i + 1) for i in range(len(nodes))]
+    labels = [
+        "root" if n["path"] == "root" else "." + n["path"].rsplit(".", 1)[-1]
+        for n in nodes
+    ]
+    label_cells = [
+        (m + " " + label) if n["path"] == "root" else ("╰──" + m + " " + label)
+        for m, label, n in zip(markers, labels, nodes)
+    ]
+
+    time_cells = ["Time"] + [f"{_analyze_total_time(n):.1f}" for n in nodes]
+    cost_cells = ["Cost"] + [f"{n['cost']['total_cost']:.2f}" for n in nodes]
+    loops_cells = ["Loops"] + [f"{n['cost'].get('actual_loops') or 0:.1f}" for n in nodes]
+    rows_cells = ["Rows"] + [f"{n['cost'].get('actual_rows') or 0:.1f}" for n in nodes]
+    width_cells = ["Width"] + [str(n["cost"]["plan_width"]) for n in nodes]
+    relations_cells = ["Relations"] + [", ".join(n["relations"]) for n in nodes]
+
+    label_width = max([0, *(len(c) for c in label_cells)])
+    time_width = max(len(c) for c in time_cells)
+    cost_width = max(len(c) for c in cost_cells)
+    loops_width = max(len(c) for c in loops_cells)
+    rows_width = max(len(c) for c in rows_cells)
+    width_width = max(len(c) for c in width_cells)
+
+    def render_line(label: str, i: int) -> str:
+        return " ".join([
+            label.ljust(label_width),
+            "│",
+            time_cells[i].rjust(time_width),
+            cost_cells[i].rjust(cost_width),
+            loops_cells[i].rjust(loops_width),
+            rows_cells[i].rjust(rows_width),
+            width_cells[i].rjust(width_width),
+            "│",
+            relations_cells[i],
+        ])
+
+    header = render_line("", 0)
+    data_lines = [render_line(label_cells[i], i + 1) for i in range(len(nodes))]
+
+    title = " Coarse-grained Query Plan "
+    dashes = max(0, len(header) - len(title))
+    title_line = "─" * ((dashes + 1) // 2) + title + "─" * (dashes // 2)
+
+    annotated = _annotate_analyze_query(query, markers, nodes) + ";"
+
+    return "\n".join([annotated, "", title_line, header, *data_lines])
 
 
 def _type(s: str) -> str:
