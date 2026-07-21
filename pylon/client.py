@@ -589,6 +589,17 @@ def _emit_warnings(compiled: "CompiledQuery") -> None:
         _warnings.warn(msg, stacklevel=4)
 
 
+def _record_compile(success: bool) -> None:
+    """Records a compile-stage outcome in `pylon_queries_total{stage="compile"}`
+    (see `pylon-workers::metrics`) — called from `_compile_and_resolve`/
+    `_compile_and_bind`, the actual query-serving compile step, not every
+    `pylon.query.compile()` caller (the LSP compiles too, but that isn't a
+    served query)."""
+    from pylon._core import record_query_compile_result
+
+    record_query_compile_result(success)
+
+
 async def _compile_and_resolve(
     pyql: str,
     kwargs: dict[str, Any],
@@ -611,13 +622,16 @@ async def _compile_and_resolve(
             allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
         )
     except PylonError:
+        _record_compile(False)
         # Already a real pylon.exceptions.* class (InvalidQueryError,
         # UnknownLinkError, ...) with position/query attached by
         # pyql_err/_from_transpiler on the Rust side — let it propagate
         # as-is instead of relabeling every compile error InternalServerError.
         raise
     except BaseException as exc:
+        _record_compile(False)
         raise InternalServerError(str(exc)) from exc
+    _record_compile(True)
 
     plan = compiled.inference_plan
     if plan is None:
@@ -748,10 +762,13 @@ def _compile_and_bind(
             allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
         )
     except PylonError:
+        _record_compile(False)
         # See the matching comment in _compile_and_resolve above.
         raise
     except BaseException as exc:
+        _record_compile(False)
         raise InternalServerError(str(exc)) from exc
+    _record_compile(True)
     try:
         params: list[Any] = []
         for name in compiled.param_names:

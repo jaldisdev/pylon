@@ -47,14 +47,20 @@ fn cache_init(path: &str, max_size_mb: usize) -> PyResult<()> {
 }
 
 /// Returns the cached rows for `key` (each ready to feed directly into
-/// `_decode(row, shape, registry)`), or `None` on a cache miss.
+/// `_decode(row, shape, registry)`), or `None` on a cache miss. The single
+/// choke point every read-through cache lookup goes through — both
+/// `pylon.cache.get` and `.get_json` call this same primitive — so this is
+/// where the hit/miss counters (`pylon_workers::metrics::CACHE_REQUESTS`)
+/// live, rather than duplicated in each Python caller.
 #[pyfunction]
 fn cache_get<'py>(py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyList>>> {
     let guard = cache_slot().read().unwrap();
     let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
     let Some(entry) = cache.get(key).map_err(cache_err)? else {
+        pylon_workers::metrics::CACHE_REQUESTS.with_label_values(&["miss"]).inc();
         return Ok(None);
     };
+    pylon_workers::metrics::CACHE_REQUESTS.with_label_values(&["hit"]).inc();
     let rows = entry
         .rows
         .iter()
