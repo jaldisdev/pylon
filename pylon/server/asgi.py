@@ -109,6 +109,12 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
                 await _send_json(send, 404, {"error": f"No connection named {conn_rest[0]!r}"})
             else:
                 await _handle_run_query(client, receive, send)
+        elif conn_rest is not None and conn_rest[1] == "/analyze" and method == "POST":
+            client = await _resolve_client(config, clients, conn_rest[0])
+            if client is None:
+                await _send_json(send, 404, {"error": f"No connection named {conn_rest[0]!r}"})
+            else:
+                await _handle_run_analyze(client, receive, send)
         elif conn_rest is not None and conn_rest[1] == "/ai/chat" and method == "POST":
             client = await _resolve_client(config, clients, conn_rest[0])
             if client is None:
@@ -913,6 +919,36 @@ async def _handle_run_query(client: Client, receive: Receive, send: Send) -> Non
     await _send_json(
         send, 200, {"objects": [_to_jsonable(o) for o in objects], "duration_ms": duration_ms, "shape": shape}
     )
+
+
+async def _handle_run_analyze(client: Client, receive: Receive, send: Send) -> None:
+    """Like `_handle_run_query`, but for `analyze <query>` — runs
+    `Client.analyze()` (EXPLAIN ANALYZE, correlated back to the query's own
+    shape) instead of executing the query normally. Same request body shape
+    (`pyql`/`params`/`globals`/`config`) and same error handling; no shape
+    descriptor to compute (the coarse-grained tree already carries whatever
+    type info it needs — relation names, not schema pointer shapes).
+    """
+    body = await _read_json_body(receive)
+    pyql = body.get("pyql", "")
+    params = body.get("params") or {}
+    globals_ = body.get("globals") or {}
+    config_options = body.get("config") or {}
+
+    start = time.perf_counter()
+    try:
+        target = client
+        if globals_:
+            target = target.with_globals(globals_)
+        if config_options:
+            target = target.with_config(config_options)
+        coarse_grained = await target.analyze(pyql, **params)
+    except PylonError as exc:
+        await _send_json(send, 400, _pylon_error_payload(exc))
+        return
+    duration_ms = (time.perf_counter() - start) * 1000
+
+    await _send_json(send, 200, {"coarse_grained": coarse_grained, "duration_ms": duration_ms})
 
 
 # ---------------------------------------------------------------------------
