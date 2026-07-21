@@ -73,7 +73,7 @@ def create_app(config: Config) -> Callable[[Scope, Receive, Send], Awaitable[Non
 
         path, method = scope["path"], scope["method"]
 
-        if path == "/metrics" and method == "GET":
+        if path == "/metrics" and method == "GET" and config.metrics.enabled:
             await _handle_get_metrics(clients, send)
             return
 
@@ -240,7 +240,10 @@ async def _send_json(send: Send, status: int, payload: Any) -> None:
 # Prometheus text-exposition format — bare, unauthenticated GET, matching
 # Prometheus's own scrape convention (no /api prefix; metrics aren't
 # per-connection data, though pool gauges below do carry a `connection`
-# label). Every counter/gauge (worker job counts, cache invalidations,
+# label). Off by default — gated by [metrics].enabled (see
+# pylon.config.MetricsConfig) — an unauthenticated endpoint exposing
+# internal counters shouldn't be reachable unless an operator opts in.
+# Every counter/gauge (worker job counts, cache invalidations,
 # cache hit/miss, pgcon pool size/available/waiting) is registered and
 # updated entirely in Rust against the process-global `prometheus` crate
 # registry; this just samples the pgcon pools (the one piece of state Rust
