@@ -975,6 +975,11 @@ impl TypeDescriptor {
     }
 
     #[getter]
+    fn junction(&self) -> bool {
+        self.inner.junction
+    }
+
+    #[getter]
     fn description(&self) -> Option<&str> {
         self.inner.description.as_deref()
     }
