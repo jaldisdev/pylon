@@ -4,6 +4,12 @@
 //! binary, so this lives under `tests/common/` (no trailing file named
 //! `common.rs` alongside it) specifically so Cargo does *not* treat it as
 //! an additional top-level test binary of its own.
+//!
+//! Every helper here is used by at least one `live_execution_*.rs` binary,
+//! but not all of them — since each binary compiles this module separately,
+//! rustc has no visibility into siblings and flags whichever subset a given
+//! binary doesn't call as dead code.
+#![allow(dead_code)]
 
 use pylon_core::query;
 use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor};

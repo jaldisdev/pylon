@@ -51,12 +51,14 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
 /// deprecated single `root_uri`, matching what most clients (including Zed)
 /// actually populate.
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
+    #[allow(deprecated)]
+    let root_uri = params.root_uri.as_ref();
     let uri = params
         .workspace_folders
         .as_ref()
         .and_then(|folders| folders.first())
         .map(|f| &f.uri)
-        .or(params.root_uri.as_ref())?;
+        .or(root_uri)?;
     uri_to_path(uri)
 }
 
