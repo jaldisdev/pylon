@@ -137,6 +137,22 @@ class UiConfig:
     enabled: bool = True
 
 
+@dataclass(slots=True, frozen=True)
+class MetricsConfig:
+    """``[metrics]`` — whether `pylon serve` mounts the Prometheus
+    text-exposition endpoint at ``/metrics`` (see `pylon.server.asgi`).
+
+    Off by default — an unauthenticated endpoint exposing internal
+    counters/gauges shouldn't be reachable unless an operator opts in. The
+    counters/gauges themselves are still always registered and updated in
+    Rust regardless of this flag (negligible cost, and other things in the
+    same process may still want to `prometheus::gather()` them some other
+    way) — this only gates whether the HTTP route is reachable.
+    """
+
+    enabled: bool = False
+
+
 # ---------------------------------------------------------------------------
 # CacheConfig
 # ---------------------------------------------------------------------------
@@ -203,6 +219,7 @@ class Config:
     connections: dict[str, DatabaseConfig] = field(default_factory=dict)
     webserver: WebserverConfig = field(default_factory=WebserverConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    metrics: MetricsConfig = field(default_factory=MetricsConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     toml_path: Path | None = None
 
@@ -495,6 +512,11 @@ def load_config(path: str | Path | None = None) -> Config:
         ui_kwargs["enabled"] = bool(raw_ui["enabled"])
     ui = UiConfig(**ui_kwargs)
 
+    metrics_kwargs: dict[str, object] = {}
+    if isinstance(raw_metrics := raw.get("metrics"), dict) and "enabled" in raw_metrics:
+        metrics_kwargs["enabled"] = bool(raw_metrics["enabled"])
+    metrics = MetricsConfig(**metrics_kwargs)
+
     # ------------------------------------------------------------------
     # [cache]
     # ------------------------------------------------------------------
@@ -532,6 +554,7 @@ def load_config(path: str | Path | None = None) -> Config:
         connections=connections,
         webserver=webserver,
         ui=ui,
+        metrics=metrics,
         cache=cache,
         toml_path=toml_path,
     )

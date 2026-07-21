@@ -13,6 +13,7 @@ from pylon.config import (
     CacheSetConfig,
     Config,
     DatabaseConfig,
+    MetricsConfig,
     ModelConfig,
     ProjectConfig,
     SearchConfig,
@@ -461,6 +462,38 @@ class TestCacheConfig:
 
     def test_set_override_defaults_enabled(self):
         assert CacheSetConfig().enabled is True
+
+
+class TestMetricsConfig:
+    def test_defaults_disabled(self):
+        assert MetricsConfig().enabled is False
+
+
+class TestLoadConfigMetrics:
+    def _base(self) -> str:
+        return """
+            [project]
+            schema-dir = "dbschema"
+
+            [database]
+            host = "localhost"
+            port = 5432
+            name = "mydb"
+            user = "myuser"
+        """
+
+    def test_metrics_absent_defaults_disabled(self, toml_dir):
+        d = toml_dir(self._base())
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.metrics.enabled is False
+
+    def test_metrics_section_enables(self, toml_dir):
+        d = toml_dir(self._base() + """
+            [metrics]
+            enabled = true
+        """)
+        cfg = load_config(d / "pylon.toml")
+        assert cfg.metrics.enabled is True
 
 
 class TestLoadConfigCache:
