@@ -1632,18 +1632,9 @@ impl<'a> Compiler<'a> {
                         });
                     }
                 } else {
-                    let ml = owner_td.multilinks.iter().find(|ml| ml.name == *link_name).unwrap();
+                    let ml = owner_td.multilinks.iter().find(|ml| ml.name == *link_name).unwrap().clone();
                     let junction_alias = self.fresh_alias();
-                    let (junction_table, module) = match &ml.through {
-                        Some(through_qname) => {
-                            let through_td = self.resolve_type(through_qname)?;
-                            (through_td.table.clone(), through_td.module.clone())
-                        }
-                        None => (
-                            format!("{}.{}", owner_td.table, ml.name),
-                            owner_td.module.clone(),
-                        ),
-                    };
+                    let (junction_table, module, _, _, _) = self.multilink_junction_info(owner_td, &ml)?;
                     joins.push(IrPathJoin::BacklinkMulti {
                         source_alias: current_alias.clone(),
                         junction_alias,
@@ -1790,9 +1781,11 @@ impl<'a> Compiler<'a> {
                 let join_info = if let Some(through_qname) = &ml.through {
                     let through_td = self.resolve_type(through_qname)?;
                     if through_td.junction {
+                        // See `junction_info_for`'s doc comment: owner-derived,
+                        // never `through_td.table` itself.
                         IrMultiLinkJoin::Standard {
-                            junction_table: through_td.table.clone(),
-                            module: through_td.module.clone(),
+                            junction_table: format!("{}.{}", current_td.table, ml.name),
+                            module: current_td.module.clone(),
                         }
                     } else {
                         let source_qname = format!("{}::{}", current_td.module, current_td.name);
@@ -3189,7 +3182,26 @@ impl<'a> Compiler<'a> {
                     .or_else(|| through_td.links.iter().find(|l| l.target == target))
                     .map(|l| l.name.clone())
                     .unwrap_or_else(|| "target".to_string());
-                Ok((through_td.table.clone(), through_td.module.clone(), source_col, target_col, Some(through_td)))
+                // A dedicated `@pylon.junction` type has no physical table
+                // of its own — `emit_one_junction_table` always names it
+                // `"{owner.table}.{name}"`, one per *owner* (so that e.g.
+                // an interface-inherited junction-backed link gets one
+                // physically separate table per concrete implementor,
+                // never a single table shared — and thus impossibly
+                // FK'd — across several). `through_td.table` only holds
+                // the right name here by accident, for the common case of
+                // exactly one owner ever referencing that junction type
+                // (the Python walker pre-renames it for that one owner).
+                // A non-junction "through" type, in contrast, *is* a real,
+                // independently-queryable object with its own genuine
+                // table — `through_td.table` is correct for that case and
+                // must stay as-is.
+                let (junction_table, junction_module) = if through_td.junction {
+                    (format!("{}.{}", td.table, name), td.module.clone())
+                } else {
+                    (through_td.table.clone(), through_td.module.clone())
+                };
+                Ok((junction_table, junction_module, source_col, target_col, Some(through_td)))
             }
         }
     }
@@ -3225,9 +3237,13 @@ impl<'a> Compiler<'a> {
         if let Some(through_qname) = through {
             let through_td = self.resolve_type(through_qname)?;
             if through_td.junction {
+                // See `junction_info_for`'s doc comment: a dedicated
+                // junction type's physical table is always owner-derived
+                // (one per concrete implementor), never `through_td.table`
+                // itself.
                 Ok(IrMultiLinkJoin::Standard {
-                    junction_table: through_td.table.clone(),
-                    module: through_td.module.clone(),
+                    junction_table: format!("{}.{}", td.table, name),
+                    module: td.module.clone(),
                 })
             } else {
                 let source_qname = format!("{}::{}", td.module, td.name);
@@ -3519,9 +3535,10 @@ impl<'a> Compiler<'a> {
                 let join = if let Some(through_qname) = &ml.through {
                     let through_td = self.resolve_type(through_qname)?;
                     if through_td.junction {
+                        // See `junction_info_for`'s doc comment: owner-derived.
                         IrMultiLinkJoin::Standard {
-                            junction_table: through_td.table.clone(),
-                            module: through_td.module.clone(),
+                            junction_table: format!("{}.{}", td.table, ml.name),
+                            module: td.module.clone(),
                         }
                     } else {
                         let source_qname = format!("{}::{}", td.module, td.name);
@@ -4035,10 +4052,12 @@ impl<'a> Compiler<'a> {
         let join = if let Some(through_qname) = &ml.through {
             let through_td = self.resolve_type(through_qname)?;
             if through_td.junction {
-                // Junction type: columns are always named `source` and `target`.
+                // Junction type: columns are always named `source` and
+                // `target`. See `junction_info_for`'s doc comment: the
+                // physical table is owner-derived, never `through_td.table`.
                 IrMultiLinkJoin::Standard {
-                    junction_table: through_td.table.clone(),
-                    module: through_td.module.clone(),
+                    junction_table: format!("{}.{}", td.table, ml_name),
+                    module: td.module.clone(),
                 }
             } else {
                 let source_qname = format!("{}::{}", td.module, td.name);
@@ -4180,14 +4199,8 @@ impl<'a> Compiler<'a> {
             } else {
                 IrMultiLinkJoin::BacklinkFk { fk_col: format!("{}_id", backlink_name) }
             }
-        } else if let Some(ml) = owner_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname) {
-            let (junction_table, module) = match &ml.through {
-                Some(through_qname) => {
-                    let through_td = self.resolve_type(through_qname)?;
-                    (through_td.table.clone(), through_td.module.clone())
-                }
-                None => (format!("{}.{}", owner_td.table, ml.name), owner_td.module.clone()),
-            };
+        } else if let Some(ml) = owner_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname).cloned() {
+            let (junction_table, module, _, _, _) = self.multilink_junction_info(owner_td, &ml)?;
             IrMultiLinkJoin::BacklinkJunction {
                 junction_table,
                 module,
@@ -5394,18 +5407,12 @@ impl<'a> Compiler<'a> {
                     },
                 }))
             }
-        } else if let Some(ml) = target_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname) {
+        } else if let Some(ml) = target_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname).cloned() {
             // Junction row connects t_alias (as the multi-link's owner/
             // "source") to the current row (as its "target") — no direct FK
             // column on either table, so this is a nested EXISTS over the
             // junction table rather than a simple column comparison.
-            let (jt_table, jt_module) = match &ml.through {
-                Some(through_qname) => {
-                    let through_td = self.resolve_type(through_qname)?;
-                    (through_td.table.clone(), through_td.module.clone())
-                }
-                None => (format!("{}.{}", target_td.table, ml.name), target_td.module.clone()),
-            };
+            let (jt_table, jt_module, _, _, _) = self.multilink_junction_info(target_td, &ml)?;
             let jt_alias = self.fresh_alias();
             IrExpr::UnaryOp(Box::new(IrUnaryOp {
                 op: ast::UnaryOpKind::Exists,
@@ -5643,9 +5650,11 @@ impl<'a> Compiler<'a> {
         let (jt_table, jt_module, jt_src_col, jt_tgt_col) = if let Some(through_qname) = &ml_through {
             let through_td = self.resolve_type(through_qname)?;
             if through_td.junction {
+                // See `junction_info_for`'s doc comment: owner-derived,
+                // never `through_td.table` itself.
                 (
-                    through_td.table.clone(),
-                    through_td.module.clone(),
+                    format!("{}.{}", td_table, ml_name),
+                    td_module.clone(),
                     "source".to_string(),
                     "target".to_string(),
                 )
