@@ -470,18 +470,6 @@ async fn junction_backed_updating_into_a_cross_table_duplicate_is_rejected() {
         &format!("insert {module}::Organization {{ name := 'Beta', employer := (select {module}::Company filter .name = 'Globex') }}"),
     ).await.unwrap();
 
-    // FIXME (separate, newly-found bug, unrelated to junction table naming):
-    // reassigning an *already-set* junction-backed single link compiles to
-    // one statement with a DELETE CTE followed by an INSERT ... ON
-    // CONFLICT DO NOTHING CTE — writable CTEs in the same statement all
-    // see the pre-statement snapshot, so the INSERT still sees Beta's
-    // about-to-be-deleted old row and treats it as a `PRIMARY KEY(source)`
-    // conflict, silently no-opping instead of writing the new target.
-    // Confirmed live against pylon-demo's own Person.employer (unrelated to
-    // interfaces): a second `update ... set { employer := ... }` on an
-    // already-employed Person silently leaves the old employer in place.
-    // This test demonstrates the *intended* behavior and will start
-    // passing once that's fixed.
     let result = exec(
         &pool, &schema,
         &format!("update {module}::Organization filter .name = 'Beta' set {{ employer := (select {module}::Company filter .name = 'Acme') }}"),
