@@ -452,6 +452,33 @@ fn update_has_any_multilink(upd: &IrUpdate) -> bool {
         || !upd.multi_link_removals.is_empty()
 }
 
+/// Extra `AND target NOT IN (...)` clause for a junction clear paired with
+/// a replace at the same index (`friends := expr` — see `IrUpdate.
+/// multi_link_clears`'s own doc comment on the shared-index pairing).
+///
+/// Without this, a target present in *both* the old and new sets gets
+/// deleted here and then silently fails to come back: the paired INSERT
+/// (`emit_ml_append_cte`) runs its `ON CONFLICT` check against the same
+/// statement-wide snapshot every CTE in one `WITH` shares, which still
+/// shows the row this DELETE is *about to* remove as present — Postgres
+/// treats that as a real conflict and skips the insert (`ON CONFLICT DO
+/// NOTHING`) or updates the row this DELETE is also deleting (`DO UPDATE`,
+/// the link-properties case), not "insert the row back." Confirmed live:
+/// reassigning a junction-backed single link to its own already-set value,
+/// or replacing a multi-link with a set overlapping its current one,
+/// silently dropped every overlapping member. Excluding still-wanted
+/// targets from the DELETE instead means they're never touched at all, so
+/// there's nothing for the INSERT to conflict with.
+fn ml_clear_exclusion(rep: Option<&IrMultiLinkMutation>) -> String {
+    match rep {
+        Some(rep) => {
+            let vals_ref = emit_multilink_values_subquery(&rep.values, &[]);
+            format!(" AND {} NOT IN (SELECT \"_v\".\"id\" FROM {} AS \"_v\")", qi(&rep.target_col), vals_ref)
+        }
+        None => String::new(),
+    }
+}
+
 /// Builds the CTE chain for an UPDATE with multi-link (junction table)
 /// mutations, bound to a single external `name` (a user WITH-binding, or the
 /// implicit "_dml" wrapper for `SELECT (UPDATE ...)`). Junction INSERT/DELETE
@@ -495,9 +522,10 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     }
 
     for (i, clr) in upd.multi_link_clears.iter().enumerate() {
+        let exclude = ml_clear_exclusion(upd.multi_link_replaces.get(i));
         let del = format!(
-            "DELETE FROM {} WHERE {} IN (SELECT id FROM \"{}\")",
-            qn(&clr.module, &clr.junction_table), qi(&clr.source_col), ids_name,
+            "DELETE FROM {} WHERE {} IN (SELECT id FROM \"{}\"){}",
+            qn(&clr.module, &clr.junction_table), qi(&clr.source_col), ids_name, exclude,
         );
         parts.push(format!("\"{}__clr_{}\" AS (\n{}\n)", name, i, del));
     }
@@ -754,24 +782,28 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: 
     // Re-checking an already-linked target with a new property value must
     // update in place rather than error — a bare `DO NOTHING` (the no-
     // properties case) would silently keep the old value instead.
-    let conflict_clause = if prop_names.is_empty() {
+    let conflict_clause = if mutation.single {
+        // A junction-backed single link's table has `PRIMARY KEY (source)`
+        // alone (D3, cardinality-one) — the paired `_clr_i` DELETE (see
+        // `ml_clear_exclusion`) removes any existing row for this source in
+        // a sibling CTE that shares this whole statement's one snapshot, so
+        // this INSERT still "sees" that old row and treats it as a
+        // same-key conflict regardless of what the new target is — a plain
+        // `DO NOTHING` would then silently drop a genuine reassignment.
+        // `source` alone is always this table's conflict target, so this
+        // must always be an upsert, not just when link properties exist.
+        let mut sets = vec![format!("{} = EXCLUDED.{}", qi(&mutation.target_col), qi(&mutation.target_col))];
+        sets.extend(prop_names.iter().map(|n| format!("{} = EXCLUDED.{}", qi(n), qi(n))));
+        format!("ON CONFLICT ({}) DO UPDATE SET {}", qi(&mutation.source_col), sets.join(", "))
+    } else if prop_names.is_empty() {
         "ON CONFLICT DO NOTHING".to_string()
     } else {
         let sets: Vec<String> = prop_names.iter()
             .map(|n| format!("{} = EXCLUDED.{}", qi(n), qi(n)))
             .collect();
-        // A junction-backed single link's table only has `PRIMARY KEY
-        // (source)` (D3, cardinality-one) — no composite `(source, target)`
-        // unique constraint exists there for a plain multi-link's own
-        // conflict target to match.
-        let conflict_target = if mutation.single {
-            format!("({})", qi(&mutation.source_col))
-        } else {
-            format!("({}, {})", qi(&mutation.source_col), qi(&mutation.target_col))
-        };
         format!(
-            "ON CONFLICT {} DO UPDATE SET {}",
-            conflict_target, sets.join(", "),
+            "ON CONFLICT ({}, {}) DO UPDATE SET {}",
+            qi(&mutation.source_col), qi(&mutation.target_col), sets.join(", "),
         )
     };
 
@@ -1794,9 +1826,10 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Junction clears (`:= {}` and `:= expr` — the clear part of replace).
     for (i, clr) in upd.multi_link_clears.iter().enumerate() {
+        let exclude = ml_clear_exclusion(upd.multi_link_replaces.get(i));
         let del = format!(
-            "DELETE FROM {} WHERE {} IN (SELECT id FROM \"_ids\")",
-            qn(&clr.module, &clr.junction_table), qi(&clr.source_col),
+            "DELETE FROM {} WHERE {} IN (SELECT id FROM \"_ids\"){}",
+            qn(&clr.module, &clr.junction_table), qi(&clr.source_col), exclude,
         );
         cte_parts.push(format!("\"_clr_{}\" AS (\n{}\n)", i, del));
     }
@@ -3520,7 +3553,10 @@ mod tests {
         // A fresh row has no prior junction entry, but the emitted ON
         // CONFLICT target must still name only `source` — no `(source,
         // target)` composite unique constraint exists on this table (D3).
-        assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
+        // The conflict action is always an upsert (not DO NOTHING) since a
+        // same-statement reassignment's paired DELETE shares this
+        // statement's snapshot and can still "conflict" with the old row.
+        assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"target\" = EXCLUDED.\"target\", \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -3534,7 +3570,12 @@ mod tests {
         // Replace = clear the existing junction row, then insert the new one.
         assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
         assert!(out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
-        assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"target\" = EXCLUDED.\"target\", \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
+        // The paired DELETE must not race the new INSERT for a target that's
+        // being kept, but for a single link (PK is `source` alone) ANY
+        // existing row conflicts regardless of target, so the upsert above
+        // is what actually makes reassignment work, not the exclusion here.
+        assert!(out.sql.contains("NOT IN"), "got:\n{}", out.sql);
     }
 
     #[test]
