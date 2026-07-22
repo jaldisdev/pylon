@@ -44,6 +44,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_plain_indexes(schema, &mut out);
     emit_triggers(schema, &mut out);
     emit_interface_views(schema, &mut out);
+    emit_junction_excl_views(schema, &mut out);
     emit_interface_exclusive_triggers(schema, &mut out);
     emit_object_functions(schema, &mut out)?;
     emit_vector_columns(schema, &mut out);
@@ -963,6 +964,70 @@ pub fn interface_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, 
     result
 }
 
+/// The view name a junction-backed exclusive link's cross-implementor
+/// helper view gets — `"{iface_table}.{link_name}"`, matching the same
+/// `{table}.{name}` convention an ordinary junction table already uses
+/// (e.g. `"Product.tags"`), just one level up (per-interface instead of
+/// per-implementor).
+fn junction_excl_view_name(iface_table: &str, link_name: &str) -> String {
+    format!("{}.{}", iface_table, link_name)
+}
+
+/// A junction-backed exclusive link has no `{name}_id`/`{name}` column on
+/// the owner row at all (see `PropertyDescriptor`'s object-view analogue,
+/// `emit_one_interface_view`) — its data instead lives one level down, in
+/// each implementor's own physically separate junction table (`emit_one_
+/// junction_table`'s `jt_name = "{impl.table}.{name}"`; a `through()` type
+/// only ever contributes extra property columns, never a shared physical
+/// table, so *every* implementor gets its own). Cross-implementor
+/// exclusivity therefore needs its own helper view unioning `(source,
+/// target)` across every implementor's own junction table for this link —
+/// this returns one `(module, view_name, ddl)` per (interface, junction-
+/// backed exclusive link), for `make_excl_junction_info` to query and for
+/// the migration diff engine to create/hash-diff/drop exactly like
+/// `interface_view_ddl_with_names`'s object views.
+pub fn junction_excl_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
+    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
+    for t in &schema.types {
+        if !t.abstract_ {
+            for iface in &t.interfaces {
+                implementors.entry(iface.clone()).or_default().push(t);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if !(t.abstract_ && t.materialized) { continue; }
+        let key = format!("{}::{}", t.module, t.name);
+        let Some(impls) = implementors.get(&key) else { continue };
+        if impls.is_empty() { continue; }
+        for l in &t.links {
+            if !(l.is_exclusive && l.is_junction_backed()) { continue; }
+            let view_name = junction_excl_view_name(&t.table, &l.name);
+            let selects: Vec<String> = impls.iter()
+                .map(|impl_t| {
+                    let jt_name = format!("{}.{}", impl_t.table, l.name);
+                    format!("    SELECT source, target FROM {}", qn(&impl_t.module, &jt_name))
+                })
+                .collect();
+            let ddl = format!(
+                "CREATE VIEW {} AS\n{};",
+                qn(&t.module, &view_name),
+                selects.join("\n    UNION ALL\n"),
+            );
+            result.push((t.module.clone(), view_name, ddl));
+        }
+    }
+    result
+}
+
+fn emit_junction_excl_views(schema: &SchemaDescriptor, out: &mut String) {
+    for (_, _, ddl) in junction_excl_view_ddl_with_names(schema) {
+        out.push_str(&ddl);
+        out.push_str("\n\n");
+    }
+}
+
 /// Return `CREATE OR REPLACE FUNCTION` DDL for every user-defined function in `schema`.
 pub fn function_ddl(schema: &SchemaDescriptor) -> Result<Vec<String>, crate::error::PyQLError> {
     function_ddl_with_names(schema)
@@ -1118,6 +1183,72 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
     }
 }
 
+/// Like `make_excl_info`, but for a junction-backed exclusive link — the
+/// value being deduplicated (`target`) lives in each implementor's own
+/// separate junction table (`"{impl.table}.{link_name}"`), never on the
+/// owner row itself, so both the trigger's own query (against
+/// `junction_excl_view_ddl_with_names`'s helper view) and the constraint
+/// trigger's attachment point (the junction table, not `impl_t` itself)
+/// differ from the plain-property/plain-link case.
+fn make_excl_junction_info(iface: &TypeDescriptor, link_name: &str, impl_t: &TypeDescriptor) -> ExclTriggerInfo {
+    let fn_name = excl_fn_name(&iface.table, std::slice::from_ref(&link_name.to_string()));
+    let fn_qname = format!("{}.{}", pg_schema(&iface.module), qi(&fn_name));
+    let view_qname = qn(&iface.module, &junction_excl_view_name(&iface.table, link_name));
+    let jt_name = format!("{}.{}", impl_t.table, link_name);
+    let jt_qname = qn(&impl_t.module, &jt_name);
+
+    let where_clause = "\"target\" = NEW.\"target\" AND \"source\" <> NEW.\"source\"";
+
+    let fn_ddl = format!(
+        "CREATE OR REPLACE FUNCTION {}()\n\
+         RETURNS trigger LANGUAGE plpgsql AS $$\n\
+         BEGIN\n\
+           IF EXISTS (\n\
+             SELECT 1 FROM {}\n\
+             WHERE {}\n\
+           ) THEN\n\
+             RAISE unique_violation\n\
+               USING CONSTRAINT = '{}',\n\
+                     DETAIL = format('Key (target)=(%s) already exists.', NEW.\"target\"::text);\n\
+           END IF;\n\
+           RETURN NEW;\n\
+         END;\n\
+         $$;",
+        fn_qname, view_qname, where_clause, fn_name,
+    );
+
+    let ins_trigger_name = format!("{}_ins", fn_name);
+    let upd_trigger_name = format!("{}_upd", fn_name);
+
+    let ins_ddl = format!(
+        "CREATE CONSTRAINT TRIGGER {}\n\
+         AFTER INSERT ON {}\n\
+         DEFERRABLE INITIALLY DEFERRED\n\
+         FOR EACH ROW EXECUTE FUNCTION {}();",
+        qi(&ins_trigger_name), jt_qname, fn_qname,
+    );
+    let upd_ddl = format!(
+        "CREATE CONSTRAINT TRIGGER {}\n\
+         AFTER UPDATE OF \"target\" ON {}\n\
+         DEFERRABLE INITIALLY DEFERRED\n\
+         FOR EACH ROW WHEN (OLD.\"target\" IS DISTINCT FROM NEW.\"target\")\n\
+         EXECUTE FUNCTION {}();",
+        qi(&upd_trigger_name), jt_qname, fn_qname,
+    );
+
+    ExclTriggerInfo {
+        fn_module: iface.module.clone(),
+        fn_name,
+        fn_ddl,
+        impl_module: impl_t.module.clone(),
+        impl_table: jt_name,
+        ins_trigger_name,
+        ins_ddl,
+        upd_trigger_name,
+        upd_ddl,
+    }
+}
+
 /// Collect all cross-table exclusive constraint trigger specs for `schema`.
 ///
 /// Returns one `ExclTriggerInfo` per (interface exclusive constraint, concrete implementor).
@@ -1149,13 +1280,20 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
         }
         for l in &t.links {
             if !l.is_exclusive { continue; }
-            // A junction-backed exclusive link has no `{name}_id` column to
-            // build a cross-table trigger predicate from — its own
-            // `UNIQUE (target)` junction-table constraint (Phase 4) only
-            // enforces uniqueness within that one link, not across every
-            // concrete implementor of a shared interface. Out of scope for
-            // now (see the junction-backed-single-link plan's exclusions).
-            if l.is_junction_backed() { continue; }
+            // A junction-backed exclusive link has no `{name}_id` column
+            // on the owner row — its value lives one level down, in each
+            // implementor's own separate junction table (a `through()`
+            // type only ever contributes extra property columns, never a
+            // shared physical table — see `junction_excl_view_ddl_with_
+            // names`'s own doc comment) — so it needs the junction-specific
+            // helper view + trigger builder instead of the plain
+            // object-column path every other exclusive pointer here uses.
+            if l.is_junction_backed() {
+                for impl_t in impls {
+                    result.push(make_excl_junction_info(t, &l.name, impl_t));
+                }
+                continue;
+            }
             let fields = vec![format!("{}_id", l.name)];
             for impl_t in impls {
                 result.push(make_excl_info(t, &fields, impl_t));
@@ -1720,6 +1858,110 @@ mod tests {
             ddl.contains("\"email\" \"public\".\"EmailStr\" NOT NULL"),
             "column must use the domain type, not the plain base type — got:\n{}", ddl
         );
+    }
+
+    // ── interface cross-table exclusive constraint tests ──────────────────────
+
+    fn account_interface_schema() -> SchemaDescriptor {
+        let mut account = TypeDescriptor {
+            name: "Account".into(), module: "default".into(), table: "Account".into(),
+            abstract_: true, materialized: true, description: None,
+            parents: vec![], interfaces: vec![],
+            properties: vec![PropertyDescriptor {
+                name: "email".into(), pg_type: "text".into(), nullable: false,
+                default_sql: None, default_pyql: None, description: None,
+                check_constraints: vec![], is_exclusive: true, is_pk: false,
+                is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
+            }],
+            links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+            indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+            triggers: vec![], junction: false, signals: vec![],
+        };
+        let mut individual = account.clone();
+        individual.name = "Individual".into();
+        individual.table = "Individual".into();
+        individual.abstract_ = false;
+        individual.materialized = true;
+        individual.interfaces = vec!["default::Account".into()];
+        let mut organization = individual.clone();
+        organization.name = "Organization".into();
+        organization.table = "Organization".into();
+        account.constraints = vec![]; // interface itself has no table of its own to constrain
+        SchemaDescriptor {
+            types: vec![account, individual, organization],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_interface_exclusive_property_gets_per_table_index_and_cross_table_trigger() {
+        let schema = account_interface_schema();
+        let ddl = export_schema(&schema).unwrap();
+
+        assert!(ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Individual\" (\"email\")"), "got:\n{ddl}");
+        assert!(ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Organization\" (\"email\")"), "got:\n{ddl}");
+
+        // One shared trigger function (not duplicated per implementor)...
+        assert_eq!(
+            ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"_excl_Account_email\"").count(), 1,
+            "the trigger function must be emitted exactly once, shared by every implementor; got:\n{ddl}"
+        );
+        // ...checking the interface's own UNION-ALL view, not a single table.
+        assert!(ddl.contains("SELECT 1 FROM \"public\".\"Account\""), "got:\n{ddl}");
+
+        // ...but a constraint trigger attached to *each* implementor's own table.
+        assert!(
+            ddl.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Individual\""),
+            "got:\n{ddl}"
+        );
+        assert!(
+            ddl.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Organization\""),
+            "got:\n{ddl}"
+        );
+        assert!(ddl.contains("DEFERRABLE INITIALLY DEFERRED"), "got:\n{ddl}");
+        assert!(
+            ddl.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_upd\"\nAFTER UPDATE OF \"email\""),
+            "the UPDATE trigger must only fire when the exclusive column itself changes; got:\n{ddl}"
+        );
+    }
+
+    #[test]
+    fn test_junction_backed_exclusive_link_gets_a_cross_implementor_helper_view_and_trigger() {
+        // A junction-backed exclusive link on an interface has no
+        // `{name}_id` column on the owner row to check via the object
+        // view — its own separate helper view (unioning `(source,
+        // target)` across every implementor's own junction table) and
+        // trigger, attached to each implementor's *junction* table (not
+        // the owner table itself).
+        use crate::schema::LinkDescriptor;
+        let mut schema = account_interface_schema();
+        for t in &mut schema.types {
+            t.properties.retain(|p| p.name != "email");
+            if t.name == "Account" || t.name == "Individual" || t.name == "Organization" {
+                t.links.push(LinkDescriptor {
+                    name: "owner".into(), target: "default::Person".into(), nullable: true,
+                    through: Some("default::AccountOwner".into()), description: None, default_pyql: None,
+                    is_exclusive: true, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                });
+            }
+        }
+
+        let views = junction_excl_view_ddl_with_names(&schema);
+        assert_eq!(views.len(), 1, "expected exactly one helper view, got: {views:?}");
+        let (view_module, view_name, view_ddl) = &views[0];
+        assert_eq!(view_module, "default");
+        assert_eq!(view_name, "Account.owner");
+        assert!(view_ddl.contains("SELECT source, target FROM \"public\".\"Individual.owner\""), "got:\n{view_ddl}");
+        assert!(view_ddl.contains("SELECT source, target FROM \"public\".\"Organization.owner\""), "got:\n{view_ddl}");
+
+        let infos = interface_exclusive_trigger_infos(&schema);
+        assert_eq!(infos.len(), 2, "expected one entry per implementor, got: {}", infos.len());
+        assert!(
+            infos.iter().any(|i| i.impl_table == "Individual.owner" && i.ins_ddl.contains("AFTER INSERT ON \"public\".\"Individual.owner\"")),
+            "the constraint trigger must attach to the implementor's own *junction* table, not the owner table"
+        );
+        assert!(infos.iter().any(|i| i.fn_ddl.contains("SELECT 1 FROM \"public\".\"Account.owner\"")), "the trigger function must query the helper view");
+        assert!(infos.iter().all(|i| i.upd_ddl.contains("AFTER UPDATE OF \"target\"")));
     }
 
     // ── on_delete regression tests (bugs caught by live-execution testing) ────────

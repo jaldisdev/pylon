@@ -1321,6 +1321,25 @@ fn diff_inner(
         if emit { push_tx(&mut ops, ddl); }
     }
 
+    // ── Phase 10.5: junction-backed exclusive link cross-implementor views ───
+    // Same add/hash-diff treatment as Phase 10's interface object views —
+    // see `export::junction_excl_view_ddl_with_names`'s own doc comment for
+    // why a junction-backed exclusive link needs its own helper view at
+    // all (its value lives in each implementor's own separate junction
+    // table, never on the owner row). Must run before Phase 11.5, which
+    // queries these views from the trigger functions it emits.
+    for (module, name, ddl) in crate::export::junction_excl_view_ddl_with_names(target) {
+        let emit = if for_migration {
+            let hash = ddl_hash(&ddl);
+            cur_views.get(&(module.as_str(), name.as_str()))
+                .map(|&h| h != hash)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if emit { push_tx(&mut ops, ddl); }
+    }
+
     // ── Phase 11: object-returning functions (after tables and views exist) ──
     let obj_fn_ddls = crate::export::object_function_ddl_with_names(target)
         .map_err(|e| e.to_string())?;
@@ -2493,6 +2512,113 @@ mod tests {
         assert_eq!(
             joined.matches("CREATE VIEW \"public\".\"Account\"").count(), 1,
             "view must be recreated exactly once, not duplicated by Phase 10; got:\n{joined}"
+        );
+    }
+
+    fn exclusive_email_account_schema(implementor_names: &[&str]) -> SchemaDescriptor {
+        let mut account = simple_type("default", "Account", "Account");
+        account.abstract_ = true;
+        account.materialized = true;
+        account.properties = vec![prop("id", "uuid", false), prop("email", "text", false)];
+        account.properties[1].is_exclusive = true;
+
+        let mut types = vec![account];
+        for name in implementor_names {
+            let mut t = simple_type("default", name, name);
+            t.interfaces = vec!["default::Account".into()];
+            t.properties = vec![prop("id", "uuid", false), prop("email", "text", false)];
+            t.properties[1].is_exclusive = true;
+            types.push(t);
+        }
+        SchemaDescriptor {
+            types,
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn test_new_implementor_added_to_existing_interface_gets_exclusive_triggers_retroactively() {
+        // `Individual` already exists (with its own triggers already
+        // applied by a prior migration); `Organization` is a brand new
+        // implementor of the same interface — it must get the cross-table
+        // exclusive trigger from the moment its table is created, and
+        // `Individual`'s already-present triggers must not be re-emitted.
+        let schema = exclusive_email_account_schema(&["Individual", "Organization"]);
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Individual".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "email".into(), pg_type: "text".into(), nullable: false, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                triggers: vec![
+                    "pylon_cache_invalidate".into(),
+                    "_excl_Account_email_ins".into(),
+                    "_excl_Account_email_upd".into(),
+                ],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Organization\""),
+            "the new implementor must get the exclusive trigger; got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("ON \"public\".\"Individual\""),
+            "the already-migrated implementor's existing triggers must not be re-emitted; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_removing_exclusivity_drops_the_cross_table_triggers() {
+        // The target schema no longer marks `email` exclusive at all (the
+        // user removed `Exclusive` from the interface) — both the INSERT
+        // and UPDATE constraint triggers on every implementor must be
+        // dropped, matching any other trigger's removal.
+        let mut schema = exclusive_email_account_schema(&["Individual"]);
+        for t in &mut schema.types {
+            for p in &mut t.properties {
+                if p.name == "email" { p.is_exclusive = false; }
+            }
+        }
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Individual".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "email".into(), pg_type: "text".into(), nullable: false, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                triggers: vec![
+                    "pylon_cache_invalidate".into(),
+                    "_excl_Account_email_ins".into(),
+                    "_excl_Account_email_upd".into(),
+                ],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("DROP TRIGGER IF EXISTS \"_excl_Account_email_ins\" ON \"public\".\"Individual\""),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("DROP TRIGGER IF EXISTS \"_excl_Account_email_upd\" ON \"public\".\"Individual\""),
+            "got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("DROP TRIGGER IF EXISTS \"pylon_cache_invalidate\""),
+            "unrelated triggers must not be touched; got:\n{joined}"
         );
     }
 
