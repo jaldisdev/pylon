@@ -29,7 +29,7 @@ fn main() {
                         is_pk: true,
                         is_readonly: true,
                         rewrites: vec![],
-                        tuple_members: None,
+                        tuple_members: None, column_type: None,
                     },
                     PropertyDescriptor {
                         name: "name".into(),
@@ -43,7 +43,7 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None,
+                        tuple_members: None, column_type: None,
                     },
                     PropertyDescriptor {
                         name: "age".into(),
@@ -57,7 +57,7 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None,
+                        tuple_members: None, column_type: None,
                     },
                     PropertyDescriptor {
                         name: "slug".into(),
@@ -74,7 +74,7 @@ fn main() {
                             RewriteEntry { on: 1, handler: "str_lower(.name)".into() },
                             RewriteEntry { on: 2, handler: "str_lower(.name)".into() },
                         ],
-                        tuple_members: None,
+                        tuple_members: None, column_type: None,
                     },
                 ],
                 links: vec![LinkDescriptor {
@@ -128,7 +128,7 @@ fn main() {
                     is_pk: false,
                     is_readonly: false,
                     rewrites: vec![],
-                    tuple_members: None,
+                    tuple_members: None, column_type: None,
                 }],
                 links: vec![],
                 multilinks: vec![],
@@ -163,7 +163,7 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None,
+                        tuple_members: None, column_type: None,
                     },
                     PropertyDescriptor {
                         name: "body".into(),
@@ -177,7 +177,7 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None,
+                        tuple_members: None, column_type: None,
                     },
                 ],
                 links: vec![],

@@ -162,7 +162,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         for p in &td.properties {
             columns.push(DbColumn {
                 name: p.name.clone(),
-                pg_type: col_type_str(&p.pg_type).to_string(),
+                pg_type: col_type_str(p).to_string(),
                 nullable: p.nullable,
                 is_generated: false,
                 column_default: resolve_default(p, schema),
@@ -373,7 +373,7 @@ fn build_junction_db_table(
         }) {
             for p in &through_td.properties {
                 if p.name == "id" { continue; }
-                let pg_type = col_type_str(&p.pg_type).to_string();
+                let pg_type = col_type_str(p).to_string();
                 jt_columns.push(DbColumn {
                     name: p.name.clone(),
                     pg_type,
@@ -643,7 +643,7 @@ pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<C
 
         // Target columns as owned Vec to avoid temporary String lifetime issues.
         let target_cols: Vec<(String, String)> = td.properties.iter()
-            .map(|p| (p.name.clone(), col_type_str(&p.pg_type).to_string()))
+            .map(|p| (p.name.clone(), col_type_str(p).to_string()))
             .chain(td.links.iter().filter(|l| !l.is_junction_backed())
                 .map(|l| (format!("{}_id", l.name), "uuid".to_string())))
             .collect();
@@ -791,7 +791,7 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
                             module: td.module.clone(),
                             table: td.table.clone(),
                             column: p.name.clone(),
-                            pg_type: col_type_str(&p.pg_type).to_string(),
+                            pg_type: col_type_str(p).to_string(),
                             type_name: td.name.clone(),
                             is_new_column: true,
                             default_sql: None,
@@ -804,7 +804,7 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
                         module: td.module.clone(),
                         table: td.table.clone(),
                         column: p.name.clone(),
-                        pg_type: col_type_str(&p.pg_type).to_string(),
+                        pg_type: col_type_str(p).to_string(),
                         type_name: td.name.clone(),
                         is_new_column: false,
                         default_sql: p.default_sql.clone(),
@@ -1002,8 +1002,60 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
     Ok(order)
 }
 
-fn col_type_str(pg_type: &str) -> &str {
-    pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(pg_type)
+/// A property's actual DDL column type: its own registered-scalar DOMAIN
+/// name when it has one (`column_type`), else its plain `pg_type` (with the
+/// `__nt__:` nominal-tuple marker resolved to `jsonb`).
+fn col_type_str(p: &crate::schema::PropertyDescriptor) -> &str {
+    p.column_type.as_deref().unwrap_or_else(|| {
+        p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type)
+    })
+}
+
+/// Maps a Pylon-internal base `pg_type` spelling to PostgreSQL's own
+/// canonical `format_type()` display name (`int8` -> `bigint`, etc.), so a
+/// freshly-introspected `DbColumn.pg_type` can be compared against a
+/// target schema's type without every alias spelling looking like drift.
+/// Recurses into array element types (`int8[]` -> `bigint[]`).
+fn canonical_pg_type(pg_type: &str) -> String {
+    if let Some(elem) = pg_type.strip_suffix("[]") {
+        return format!("{}[]", canonical_pg_type(elem));
+    }
+    match pg_type {
+        "int2" => "smallint",
+        "int4" => "integer",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "timestamptz" => "timestamp with time zone",
+        "timestamp" => "timestamp without time zone",
+        "time" => "time without time zone",
+        other => other,
+    }.to_string()
+}
+
+/// The bare (unqualified, unquoted) identifier at the end of a possibly
+/// schema-qualified, possibly-quoted PostgreSQL type reference — e.g.
+/// `"public"."Gender"`, `public."Gender"`, and `"Gender"` all yield
+/// `Gender`. `format_type()` omits the schema qualifier whenever it's on
+/// `search_path` (which a live column's introspected type always is, but
+/// Pylon's own qualified references never bother checking), so comparing
+/// only this trailing segment is what lets a domain/enum-typed column's
+/// *type itself* changing be distinguished from a same-domain column that
+/// merely looks unqualified.
+fn bare_type_name(pg_type: &str) -> &str {
+    pg_type.rsplit('.').next().unwrap_or(pg_type).trim_matches('"')
+}
+
+/// Whether a property's own DDL column type (`col_type_str`'s output —
+/// either a registered scalar's schema-qualified DOMAIN reference or a
+/// plain base type) actually differs from a live column's introspected
+/// `format_type()` string, warranting `ALTER COLUMN ... TYPE`.
+fn pg_type_changed(target: &str, current: &str) -> bool {
+    if target.starts_with('"') {
+        bare_type_name(target) != bare_type_name(current)
+    } else {
+        canonical_pg_type(target) != canonical_pg_type(current)
+    }
 }
 
 // ── Core diff implementation ──────────────────────────────────────────────────
@@ -1525,7 +1577,7 @@ fn emit_create_table(td: &TypeDescriptor, schema: &SchemaDescriptor, ops: &mut V
         let default = resolve_default(p, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        lines.push(format!("    {} {}{}{}", qi(&p.name), col_type_str(&p.pg_type), not_null, default));
+        lines.push(format!("    {} {}{}{}", qi(&p.name), col_type_str(p), not_null, default));
     }
     for l in &td.links {
         if l.is_junction_backed() { continue; }
@@ -1587,7 +1639,7 @@ fn emit_column_diff(
             .unwrap_or_default();
         push_tx(ops, format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
-            qn(&td.module, &td.table), qi(&p.name), col_type_str(&p.pg_type), not_null, default
+            qn(&td.module, &td.table), qi(&p.name), col_type_str(p), not_null, default
         ));
     }
     for l in &td.links {
@@ -1605,6 +1657,40 @@ fn emit_column_diff(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{}{};",
             qn(&td.module, &td.table), qi(&col), not_null, default
         ));
+    }
+
+    // ── Type changes on existing columns ──────────────────────────────────────
+    // e.g. a property gaining a registered custom scalar's own DOMAIN (see
+    // PropertyDescriptor.column_type), or any other base-type change.
+    let type_changes: Vec<(&str, &str)> = td.properties.iter()
+        .filter_map(|p| {
+            let cur = existing_col_map.get(p.name.as_str())?;
+            if cur.is_generated { return None; }
+            let target_type = col_type_str(p);
+            pg_type_changed(target_type, &cur.pg_type).then_some((p.name.as_str(), target_type))
+        })
+        .collect();
+    if !type_changes.is_empty() {
+        // A column any interface view selects from can't be retyped directly
+        // — Postgres refuses ALTER COLUMN TYPE while a view depends on it —
+        // so drop those views first and recreate them (identical DDL,
+        // unaffected by a column's own type) right after.
+        let affected_views: Vec<(String, String, String)> = crate::export::interface_view_ddl_with_names(schema)
+            .into_iter()
+            .filter(|(m, n, _)| td.interfaces.contains(&format!("{}::{}", m, n)))
+            .collect();
+        for (m, n, _) in &affected_views {
+            push_tx(ops, format!("DROP VIEW IF EXISTS {};", qn(m, n)));
+        }
+        for (col, target_type) in &type_changes {
+            push_tx(ops, format!(
+                "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
+                qn(&td.module, &td.table), qi(col), target_type, qi(col), target_type
+            ));
+        }
+        for (_, _, ddl) in &affected_views {
+            push_tx(ops, ddl.clone());
+        }
     }
 
     // ── Nullability + DEFAULT changes on existing columns ─────────────────────
@@ -1805,8 +1891,7 @@ fn emit_junction_table(
             for p in &through_td.properties {
                 if p.name == "id" { continue; }
                 let not_null = if p.nullable { "" } else { " NOT NULL" };
-                let pg_type = p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type);
-                col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), pg_type, not_null));
+                col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), col_type_str(p), not_null));
             }
         }
     }
@@ -2038,7 +2123,7 @@ mod tests {
             description: None, check_constraints: vec![],
             is_exclusive: name == "id", is_pk: name == "id",
             is_readonly: name == "id", rewrites: vec![],
-        tuple_members: None, }
+        tuple_members: None, column_type: None, }
     }
 
     fn simple_type(module: &str, name: &str, table: &str) -> TypeDescriptor {
@@ -2281,6 +2366,134 @@ mod tests {
         let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
         assert!(joined.contains("ADD COLUMN IF NOT EXISTS \"email\""), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_property_type_change_emits_alter_column_type() {
+        // A genuine type change (text -> int8) on an existing column must be
+        // migrated, not silently left stale.
+        let mut td = simple_type("default", "Person", "Person");
+        td.properties.push(prop("rating", "int8", true));
+        let schema = SchemaDescriptor {
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn { name: "rating".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        let joined = ops.join("\n");
+        assert!(
+            joined.contains("ALTER TABLE \"public\".\"Person\" ALTER COLUMN \"rating\" TYPE int8 USING \"rating\"::int8;"),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_equivalent_base_type_spelling_is_not_a_diff() {
+        // format_type() reports Postgres's own canonical alias spelling
+        // (int8 -> bigint, timestamptz -> timestamp with time zone, ...) —
+        // comparing against that verbatim would treat every existing
+        // column as "changed" on every diff. Confirms the alias table
+        // avoids that false positive.
+        let mut td = simple_type("default", "Person", "Person");
+        td.properties.push(prop("age", "int8", true));
+        let schema = SchemaDescriptor {
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn { name: "age".into(), pg_type: "bigint".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec!["pylon_cache_invalidate".into()],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+        let ops = diff_schema(&schema, &state).unwrap();
+        assert!(ops.iter().all(|op| !op.contains("ALTER COLUMN")), "expected no ALTER COLUMN ops, got: {:?}", ops);
+    }
+
+    #[test]
+    fn test_registered_scalar_domain_adoption_drops_and_recreates_dependent_interface_view() {
+        // A property switching to a registered custom scalar's own DOMAIN
+        // (PropertyDescriptor.column_type) on a table an interface view
+        // selects from must drop that view before the ALTER (Postgres
+        // refuses to retype a column a view depends on) and recreate it
+        // afterward — not silently fail, and not leave the view missing.
+        use crate::schema::ScalarDescriptor;
+
+        let mut account = simple_type("default", "Account", "Account");
+        account.abstract_ = true;
+        account.materialized = true;
+        account.properties = vec![prop("id", "uuid", false), prop("email", "text", false)];
+        account.properties[1].column_type = Some("\"public\".\"Email\"".into());
+
+        let mut individual = simple_type("default", "Individual", "Individual");
+        individual.interfaces = vec!["default::Account".into()];
+        individual.properties = vec![prop("id", "uuid", false), prop("email", "text", false)];
+        individual.properties[1].column_type = Some("\"public\".\"Email\"".into());
+
+        let schema = SchemaDescriptor {
+            types: vec![account, individual],
+            scalars: vec![ScalarDescriptor {
+                name: "Email".into(), module: "default".into(), base: "Str".into(),
+                pg_type: "text".into(), check_constraints: vec!["value ~ '@'".into()], is_sequence: false,
+            }],
+            enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+
+        // The view's own SELECT text never mentions column types, so its
+        // hash is unaffected by this migration — matching that hash in
+        // `current` confirms Phase 10 doesn't ALSO try to (redundantly,
+        // and invalidly, since it'd already exist) recreate it.
+        let view_ddl = crate::export::interface_view_ddl_with_names(&schema)
+            .into_iter().find(|(_, n, _)| n == "Account").unwrap().2;
+
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Individual".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "email".into(), pg_type: "text".into(), nullable: false, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec!["pylon_cache_invalidate".into()],
+            }],
+            views: vec![DbView { schema: "default".into(), name: "Account".into(), body_hash: ddl_hash(&view_ddl) }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+
+        // Migration mode (`diff_schema_ops`, what `pylon migration create`
+        // uses) — unlike watch mode, this respects the interface view's
+        // unchanged DDL hash and doesn't redundantly re-emit it.
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        let drop_pos = joined.find("DROP VIEW IF EXISTS \"public\".\"Account\"").expect(&format!("missing DROP VIEW; got:\n{joined}"));
+        let alter_pos = joined.find("ALTER TABLE \"public\".\"Individual\" ALTER COLUMN \"email\" TYPE \"public\".\"Email\"").expect(&format!("missing ALTER COLUMN TYPE; got:\n{joined}"));
+        let create_pos = joined.rfind("CREATE VIEW \"public\".\"Account\"").expect(&format!("missing CREATE VIEW; got:\n{joined}"));
+        assert!(drop_pos < alter_pos, "DROP VIEW must precede the ALTER; got:\n{joined}");
+        assert!(alter_pos < create_pos, "CREATE VIEW must follow the ALTER; got:\n{joined}");
+        assert_eq!(
+            joined.matches("CREATE VIEW \"public\".\"Account\"").count(), 1,
+            "view must be recreated exactly once, not duplicated by Phase 10; got:\n{joined}"
+        );
     }
 
     #[test]

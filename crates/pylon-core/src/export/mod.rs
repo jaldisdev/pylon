@@ -190,7 +190,9 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
         let default = p.default_sql.as_deref()
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        let col_type = p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type);
+        let col_type = p.column_type.as_deref().unwrap_or_else(|| {
+            p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type)
+        });
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type, not_null, default));
     }
 
@@ -1528,7 +1530,7 @@ mod tests {
                     is_pk: true,
                     is_readonly: true,
                     rewrites: vec![],
-                tuple_members: None, },
+                tuple_members: None, column_type: None, },
                 PropertyDescriptor {
                     name: "age".into(),
                     pg_type: "int8".into(),
@@ -1541,7 +1543,7 @@ mod tests {
                     is_pk: false,
                     is_readonly: false,
                     rewrites: vec![],
-                tuple_members: None, },
+                tuple_members: None, column_type: None, },
             ],
             links: vec![],
             multilinks: vec![],
@@ -1672,6 +1674,54 @@ mod tests {
         assert!(seq_pos < dom_pos, "sequence must appear before domain");
     }
 
+    #[test]
+    fn test_registered_scalar_domain_is_used_as_the_column_type() {
+        // A property typed with a *registered* custom scalar must get that
+        // scalar's own DOMAIN as its actual column type (via
+        // `PropertyDescriptor.column_type`) — not just a same-named,
+        // never-referenced `CREATE DOMAIN` sitting next to a plain-base-type
+        // column, which is what this looked like before this fix.
+        use crate::schema::ScalarDescriptor;
+        let schema = SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: "Contact".into(), module: "default".into(), table: "Contact".into(),
+                abstract_: false, materialized: true, description: None,
+                parents: vec![], interfaces: vec![],
+                properties: vec![PropertyDescriptor {
+                    name: "email".into(), pg_type: "text".into(), nullable: false,
+                    default_sql: None, default_pyql: None, description: None,
+                    check_constraints: vec![], is_exclusive: false, is_pk: false,
+                    is_readonly: false, rewrites: vec![], tuple_members: None,
+                    column_type: Some("\"public\".\"EmailStr\"".into()),
+                }],
+                links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                triggers: vec![], junction: false, signals: vec![],
+            }],
+            scalars: vec![ScalarDescriptor {
+                name: "EmailStr".into(),
+                module: "default".into(),
+                base: "Str".into(),
+                pg_type: "text".into(),
+                check_constraints: vec!["value ~ '^[^@]+@[^@]+\\.[^@]+$'".into()],
+                is_sequence: false,
+            }],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("CREATE DOMAIN \"public\".\"EmailStr\" AS text\n    CHECK (value ~ '^[^@]+@[^@]+\\.[^@]+$')"),
+            "got:\n{}", ddl
+        );
+        assert!(
+            ddl.contains("\"email\" \"public\".\"EmailStr\" NOT NULL"),
+            "column must use the domain type, not the plain base type — got:\n{}", ddl
+        );
+    }
+
     // ── on_delete regression tests (bugs caught by live-execution testing) ────────
 
     #[test]
@@ -1714,6 +1764,7 @@ mod tests {
                 default_sql: Some("gen_random_uuid()".into()), default_pyql: None,
                 description: None, check_constraints: vec![], is_exclusive: true,
                 is_pk: true, is_readonly: true, rewrites: vec![], tuple_members: None,
+                column_type: None,
             }],
             links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
             indexes: vec![], vector_indexes: vec![], search_indexes: vec![],

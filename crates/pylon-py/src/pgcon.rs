@@ -44,7 +44,7 @@ pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
     // `DeadlockDetectedError` were always raised with the raw message —
     // so this matches that exactly rather than applying it uniformly.
     let message = if class_name == "QueryError" {
-        pylonize_pg_message(&err.pg_message())
+        check_violation_message(&err).unwrap_or_else(|| pylonize_pg_message(&err.pg_message()))
     } else {
         err.pg_message()
     };
@@ -67,6 +67,30 @@ pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
             Err(construct_err) => construct_err,
         }
     })
+}
+
+/// A friendlier message for a `CHECK_VIOLATION` (SQLSTATE 23514), or
+/// `None` for anything else (falls back to `pylonize_pg_message`).
+/// Postgres's own message names the *auto-generated* constraint identifier
+/// (`value for domain "Email" violates check constraint "Email_check"`) —
+/// an internal detail the user never wrote and Gel would never surface —
+/// so this substitutes the scalar type or object type name instead, using
+/// the structured `DataTypeName`/`TableName` error fields rather than
+/// parsing the message text.
+fn check_violation_message(err: &pylon_pgcon::Error) -> Option<String> {
+    use tokio_postgres::error::SqlState;
+    if err.sqlstate() != Some(&SqlState::CHECK_VIOLATION) {
+        return None;
+    }
+    if let Some((schema, datatype)) = err.violated_scalar() {
+        let module = if schema == "public" { "default" } else { schema };
+        return Some(format!("value violates a check constraint for scalar type '{module}::{datatype}'"));
+    }
+    if let Some((schema, table)) = err.violated_table() {
+        let module = if schema == "public" { "default" } else { schema };
+        return Some(format!("value violates a check constraint for object type '{module}::{table}'"));
+    }
+    None
 }
 
 /// Rewrites Postgres's `"schema"."table"` quoted-identifier notation to

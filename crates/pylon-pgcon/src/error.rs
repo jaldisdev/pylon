@@ -67,6 +67,16 @@ impl Error {
         Error::Other(msg.into().into())
     }
 
+    /// The structured `DbError` a real server response carries — `None`
+    /// for a connection/pool/decode failure, none of which have one.
+    fn as_db_error(&self) -> Option<&tokio_postgres::error::DbError> {
+        match self {
+            Error::Postgres(e) => e.as_db_error(),
+            Error::Pool(deadpool_postgres::PoolError::Backend(e)) => e.as_db_error(),
+            _ => None,
+        }
+    }
+
     /// The message a caller should actually show. `tokio_postgres::Error`'s
     /// own `Display` only renders a generic category string for a
     /// server-side error (`"db error"` for every `DbError`-backed failure,
@@ -75,14 +85,28 @@ impl Error {
     /// one level deeper, in the `DbError` its `source()` wraps, so this
     /// prefers that when present and falls back to `Display` otherwise.
     pub fn pg_message(&self) -> String {
-        let db_message = match self {
-            Error::Postgres(e) => e.as_db_error(),
-            Error::Pool(deadpool_postgres::PoolError::Backend(e)) => e.as_db_error(),
-            _ => None,
-        };
-        match db_message {
+        match self.as_db_error() {
             Some(db) => db.message().to_string(),
             None => self.to_string(),
         }
+    }
+
+    /// `(schema, type name)` for the PostgreSQL scalar/domain a
+    /// `CHECK_VIOLATION` failed against (Postgres's `SchemaName`/
+    /// `DataTypeName` error fields — both populated for a domain check,
+    /// confirmed live) — `Some(("public", "Email"))` for a registered
+    /// custom scalar's own DOMAIN check; `None` for an ordinary
+    /// table-level CHECK (use `violated_table` instead).
+    pub fn violated_scalar(&self) -> Option<(&str, &str)> {
+        let db = self.as_db_error()?;
+        Some((db.schema()?, db.datatype()?))
+    }
+
+    /// `(schema, table)` a `CHECK_VIOLATION`'s table-level constraint
+    /// belongs to, when Postgres reports one (a domain-level check
+    /// reports `violated_datatype` instead, not this).
+    pub fn violated_table(&self) -> Option<(&str, &str)> {
+        let db = self.as_db_error()?;
+        Some((db.schema()?, db.table()?))
     }
 }

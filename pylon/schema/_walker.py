@@ -404,7 +404,13 @@ def _to_pg_type(scalar_type: Any) -> str:
     if scalar_type in SHORTHAND_MAP:
         return PG_TYPE_MAP.get(SHORTHAND_MAP[scalar_type], "text")
 
-    # Custom named scalar (decorator form): use its base PG type for the domain
+    # Custom named scalar (decorator or functional form): every read/write/
+    # cast/comparison site relies on `pg_type` being a plain base type (see
+    # `PropertyDescriptor.pg_type`'s own doc comment on the Rust side), so
+    # this always resolves to the scalar's base type — a *registered*
+    # scalar's own DOMAIN name is exposed separately, via
+    # `_domain_type_ref`/`PropertyDescriptor.column_type`, consulted only
+    # for the column's DDL type.
     if isinstance(scalar_type, type) and issubclass(scalar_type, Scalar):
         base = getattr(scalar_type, "__pylon_base__", None)
         if base and issubclass(base, _PylonScalar):
@@ -450,6 +456,31 @@ def _to_pg_type(scalar_type: Any) -> str:
         return "jsonb"
 
     return "text"
+
+
+def _domain_type_ref(scalar_type: Any) -> str | None:
+    """Schema-qualified PostgreSQL DOMAIN name for *scalar_type*, or None.
+
+    Only a *registered* custom scalar (decorator form, or functional form
+    with `name=`) has a nominal PostgreSQL identity to hang a domain off of
+    — see `pylon.scalar`'s docstring. Consumed solely by
+    `PropertyDescriptor.column_type` for the column's own DDL type; every
+    other use of the property keeps resolving through `_to_pg_type`'s plain
+    base type, so a domain-typed column still casts/compares/decodes
+    exactly like its base type everywhere except its own `CREATE TABLE` /
+    `ADD COLUMN` definition.
+    """
+    from ._scalars import Scalar
+
+    if not (isinstance(scalar_type, type) and issubclass(scalar_type, Scalar)):
+        return None
+    from . import _registry
+    if scalar_type not in _registry.snapshot()[2]:
+        return None
+    mod = getattr(scalar_type, "__pylon_module__", None) or (
+        (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+    )
+    return f'"{_pg_schema(mod).replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
 
 
 def _scalar_type_name(scalar_type: Any) -> str:
@@ -594,7 +625,22 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         )
 
     pg_type = _to_pg_type(meta.scalar_type)
-    checks, is_exclusive = _field_checks_and_exclusive(meta, name)
+    domain_type = _domain_type_ref(meta.scalar_type)
+
+    # An anonymous (functional-form `pylon.scalar(Base, ...)`, no `name=`)
+    # scalar has no nominal PostgreSQL domain of its own (see
+    # _domain_type_ref), so its inline constraints only take effect by
+    # folding them into whichever property actually uses it. A *registered*
+    # scalar already enforces its own constraints via its DOMAIN's CHECK, so
+    # its constraints are left out here to avoid enforcing the same rule
+    # twice.
+    combined_constraints = list(meta.constraints)
+    scalar_type = meta.scalar_type
+    if domain_type is None and isinstance(scalar_type, type) and issubclass(scalar_type, PylonScalar):
+        combined_constraints.extend(getattr(scalar_type, "__pylon_constraints__", ()))
+    checks, is_exclusive = _field_checks_and_exclusive(
+        type("_m", (), {"constraints": combined_constraints})(), name
+    )
 
     # SequenceNext default: generate nextval('"module"."Name_seq"')
     default_sql = None
@@ -639,6 +685,7 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         is_readonly=meta.is_readonly,
         rewrites=rewrites,
         tuple_members=tuple_members,
+        column_type=domain_type,
     )
 
 

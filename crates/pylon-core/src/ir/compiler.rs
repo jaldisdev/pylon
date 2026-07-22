@@ -786,6 +786,17 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// Resolve a registered custom scalar (`pylon.scalar(..., name=...)` or
+    /// the `@pylon.scalar` decorator form) by name — used to recognize a
+    /// cast target as that scalar's own PostgreSQL DOMAIN (see
+    /// `resolve_cast_pg_type`); an anonymous (unregistered) scalar has no
+    /// name reachable here at all, so it's never a valid cast target.
+    fn resolve_scalar(&self, name: &str) -> Option<&'a crate::schema::ScalarDescriptor> {
+        self.schema.scalars.iter().find(|s| {
+            s.name == name || format!("{}::{}", s.module, s.name) == name
+        })
+    }
+
     /// Resolve a registered (nominal) `@pylon.named_tuple` type by name — used only
     /// to recognize a cast target as a named tuple (member structure isn't
     /// validated here; the value is trusted the same way a plain `<json>` cast is).
@@ -996,6 +1007,14 @@ impl<'a> Compiler<'a> {
         }
         if self.resolve_named_tuple(&qname).is_some() {
             return Ok("jsonb".to_string());
+        }
+        // A registered custom scalar casts directly to its own DOMAIN (not
+        // just its base type) — Postgres enforces the domain's CHECK right
+        // at cast time, the same way it would on column assignment (see
+        // `PropertyDescriptor.column_type`'s own doc comment for why this
+        // is safe to do everywhere else too).
+        if let Some(sd) = self.resolve_scalar(&qname) {
+            return Ok(format!("{}.\"{}\"", crate::sql::pg_schema_str(&sd.module), sd.name));
         }
         type_expr_to_pg(ty)
     }

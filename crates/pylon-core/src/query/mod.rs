@@ -351,6 +351,7 @@ mod tests {
                     is_readonly: true,
                     rewrites: vec![],
                     tuple_members: None,
+                    column_type: None,
                 }],
                 links: vec![],
                 multilinks: vec![],
