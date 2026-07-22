@@ -1,0 +1,480 @@
+//! Cross-table `exclusive` enforcement for interface types — live-execution
+//! tests. See `live_execution_smoke.rs` for the harness's purpose and how
+//! to run these (same pattern, this binary is `--test
+//! live_execution_interface_exclusive`).
+//!
+//! This whole area had **zero** prior test coverage — the DDL generator
+//! (`export::interface_exclusive_trigger_infos` / `make_excl_info`) and its
+//! migration-diff mirror (`diff/mod.rs`'s Phase 11.5) were never exercised
+//! by so much as a fast SQL-text snapshot test, let alone a real insert
+//! against a real database. Every case here inserts real rows into real
+//! implementor tables and asserts on whether the insert/update actually
+//! succeeded or failed — the only way to confirm a `DEFERRABLE INITIALLY
+//! DEFERRED` constraint trigger checking a UNION-ALL interface view does
+//! what it's supposed to.
+//!
+//! Confirmed live: a per-implementor `CREATE UNIQUE INDEX` catches
+//! same-table duplicates (ordinary Postgres uniqueness, nothing special),
+//! and the cross-table constraint trigger catches a duplicate landing in a
+//! *different* implementor's table — including one introduced by an
+//! `UPDATE`, and including within a single transaction across two
+//! different tables (caught only because the trigger is deferred to
+//! statement/commit time, by which point both new rows already exist).
+//! NULL values on a nullable exclusive property are correctly never
+//! considered duplicates of each other, matching plain SQL UNIQUE
+//! semantics.
+//!
+//! The junction-backed-link cases below insert into each implementor's
+//! junction table directly via raw SQL rather than through a compiled PyQL
+//! `insert ... { employer := ... }` — a *separate*, pre-existing bug means
+//! sharing one `through()` type across multiple owner types (exactly what
+//! an interface-inherited junction-backed link requires) doesn't compile
+//! correctly yet: `build_multilink_join`/`link_junction_info` (`ir/
+//! compiler.rs`, ~18 call sites) resolve the junction table name from
+//! `through_td.table`, which the Python walker only ever pre-renames for
+//! a *single* owner+link pair (confirmed live against `pylon-demo`:
+//! `Employment`'s own `TypeDescriptor.table` is hardcoded to
+//! `"Person.employer"`). Tracked as its own follow-up task — these tests
+//! verify the DDL/trigger mechanism this session added is itself correct,
+//! independent of that separate compiler limitation.
+
+mod common;
+
+use common::*;
+use pylon_core::diff::{diff_schema, DbState};
+use pylon_core::export::export_schema;
+use pylon_core::query;
+use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeConstraint, TypeDescriptor};
+use pylon_pgcon::PgPool;
+
+fn exclusive_prop(name: &str, nullable: bool) -> PropertyDescriptor {
+    PropertyDescriptor {
+        name: name.into(),
+        pg_type: "text".into(),
+        nullable,
+        default_sql: None,
+        default_pyql: None,
+        description: None,
+        check_constraints: vec![],
+        is_exclusive: true,
+        is_pk: false,
+        is_readonly: false,
+        rewrites: vec![],
+        tuple_members: None,
+        column_type: None,
+    }
+}
+
+fn interface_ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
+    TypeDescriptor {
+        name: name.into(),
+        module: module.into(),
+        table: name.into(),
+        abstract_: true,
+        materialized: true,
+        description: None,
+        parents: vec![],
+        interfaces: vec![],
+        properties,
+        links: vec![],
+        multilinks: vec![],
+        computed: vec![],
+        constraints: vec![],
+        indexes: vec![],
+        vector_indexes: vec![],
+        search_indexes: vec![],
+        triggers: vec![],
+        junction: false,
+        signals: vec![],
+    }
+}
+
+fn implementor_ty(
+    name: &str,
+    module: &str,
+    interface_qname: &str,
+    inherited_properties: Vec<PropertyDescriptor>,
+    own_properties: Vec<PropertyDescriptor>,
+) -> TypeDescriptor {
+    let mut properties = inherited_properties;
+    properties.extend(own_properties);
+    TypeDescriptor {
+        name: name.into(),
+        module: module.into(),
+        table: name.into(),
+        abstract_: false,
+        materialized: true,
+        description: None,
+        parents: vec![],
+        interfaces: vec![interface_qname.into()],
+        properties,
+        links: vec![],
+        multilinks: vec![],
+        computed: vec![],
+        constraints: vec![],
+        indexes: vec![],
+        vector_indexes: vec![],
+        search_indexes: vec![],
+        triggers: vec![],
+        junction: false,
+        signals: vec![],
+    }
+}
+
+/// One interface (`Account`, exclusive non-nullable `email`) with two
+/// implementors (`Individual`/`Organization`, each with one own property)
+/// — the minimal shape needed to exercise cross-table exclusivity.
+fn account_schema(module: &str) -> SchemaDescriptor {
+    let account_q = format!("{module}::Account");
+    SchemaDescriptor {
+        types: vec![
+            interface_ty("Account", module, vec![id_prop(), exclusive_prop("email", false)]),
+            implementor_ty("Individual", module, &account_q, vec![id_prop(), exclusive_prop("email", false)], vec![text_prop("first_name")]),
+            implementor_ty("Organization", module, &account_q, vec![id_prop(), exclusive_prop("email", false)], vec![text_prop("legal_name")]),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Same shape, but `email` is nullable — for the NULL-handling case.
+fn nullable_account_schema(module: &str) -> SchemaDescriptor {
+    let account_q = format!("{module}::Account");
+    SchemaDescriptor {
+        types: vec![
+            interface_ty("Account", module, vec![id_prop(), exclusive_prop("email", true)]),
+            implementor_ty("Individual", module, &account_q, vec![id_prop(), exclusive_prop("email", true)], vec![text_prop("first_name")]),
+            implementor_ty("Organization", module, &account_q, vec![id_prop(), exclusive_prop("email", true)], vec![text_prop("legal_name")]),
+        ],
+        ..Default::default()
+    }
+}
+
+/// A composite exclusive constraint (`unique on (first_name, email)`)
+/// declared directly on the interface — exercises the `TypeConstraint`
+/// path (as opposed to a single exclusive property), spanning implementors
+/// whose own extra property differs (`first_name` vs `legal_name`), so
+/// only `Individual` can even participate in this particular composite.
+fn composite_account_schema(module: &str) -> SchemaDescriptor {
+    let account_q = format!("{module}::Account");
+    let mut account = interface_ty(
+        "Account", module,
+        vec![id_prop(), text_prop("email"), text_prop("first_name")],
+    );
+    account.constraints.push(TypeConstraint::Exclusive {
+        pointers: vec!["first_name".into(), "email".into()],
+        unless: None,
+    });
+    let mut individual_a = implementor_ty("IndividualA", module, &account_q, vec![id_prop(), text_prop("email"), text_prop("first_name")], vec![]);
+    individual_a.constraints.push(TypeConstraint::Exclusive {
+        pointers: vec!["first_name".into(), "email".into()],
+        unless: None,
+    });
+    let mut individual_b = implementor_ty("IndividualB", module, &account_q, vec![id_prop(), text_prop("email"), text_prop("first_name")], vec![]);
+    individual_b.constraints.push(TypeConstraint::Exclusive {
+        pointers: vec!["first_name".into(), "email".into()],
+        unless: None,
+    });
+    SchemaDescriptor {
+        types: vec![account, individual_a, individual_b],
+        ..Default::default()
+    }
+}
+
+/// An interface (`Account`) with a junction-backed exclusive single link
+/// (`employer: Link[Company, through(Employment), Exclusive]`) inherited by
+/// two implementors — each implementor gets its own physically separate
+/// junction table (`"Individual.employer"` / `"Organization.employer"`;
+/// `through(Employment)` only ever contributes extra link-property
+/// columns, never a shared physical table), so this exercises
+/// `junction_excl_view_ddl_with_names`/`make_excl_junction_info` rather
+/// than the plain-object-column path every other schema in this file uses.
+fn employer_account_schema(module: &str) -> SchemaDescriptor {
+    use pylon_core::schema::LinkDescriptor;
+
+    let account_q = format!("{module}::Account");
+    let company_q = format!("{module}::Company");
+    let employment_q = format!("{module}::Employment");
+
+    let employer_link = LinkDescriptor {
+        name: "employer".into(),
+        target: company_q.clone(),
+        nullable: true,
+        through: Some(employment_q.clone()),
+        description: None,
+        default_pyql: None,
+        is_exclusive: true,
+        is_readonly: false,
+        rewrites: vec![],
+        on_delete: vec![],
+    };
+
+    let mut account = interface_ty("Account", module, vec![id_prop(), text_prop("name")]);
+    account.links.push(employer_link.clone());
+
+    let mut individual = implementor_ty("Individual", module, &account_q, vec![id_prop(), text_prop("name")], vec![]);
+    individual.links.push(employer_link.clone());
+
+    let mut organization = implementor_ty("Organization", module, &account_q, vec![id_prop(), text_prop("name")], vec![]);
+    organization.links.push(employer_link);
+
+    let company = simple_named_type(module, "Company");
+    let mut employment = simple_named_type(module, "Employment");
+    employment.junction = true;
+    employment.properties = vec![];
+
+    SchemaDescriptor {
+        types: vec![account, individual, organization, company, employment],
+        ..Default::default()
+    }
+}
+
+fn simple_named_type(module: &str, name: &str) -> TypeDescriptor {
+    TypeDescriptor {
+        name: name.into(),
+        module: module.into(),
+        table: name.into(),
+        abstract_: false,
+        materialized: true,
+        description: None,
+        parents: vec![],
+        interfaces: vec![],
+        properties: vec![id_prop(), text_prop("name")],
+        links: vec![],
+        multilinks: vec![],
+        computed: vec![],
+        constraints: vec![],
+        indexes: vec![],
+        vector_indexes: vec![],
+        search_indexes: vec![],
+        triggers: vec![],
+        junction: false,
+        signals: vec![],
+    }
+}
+
+async fn setup(schema: &SchemaDescriptor) -> PgPool {
+    let ddl = export_schema(schema).unwrap();
+    let pool = test_pool().await;
+    pool.batch_execute(&ddl).await.unwrap();
+    pool
+}
+
+async fn exec(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Result<(), pylon_pgcon::Error> {
+    let compiled = query::compile(pyql, schema).unwrap();
+    pool.execute_typed(&compiled.sql, &[]).await.map(|_| ())
+}
+
+#[tokio::test]
+#[ignore]
+async fn same_table_duplicate_is_rejected() {
+    let module = unique_module("live_excl");
+    let schema = account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    let result = exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'B' }}")).await;
+    assert!(result.is_err(), "a second Individual with the same email must be rejected by the per-table UNIQUE index");
+}
+
+#[tokio::test]
+#[ignore]
+async fn cross_table_duplicate_is_rejected() {
+    let module = unique_module("live_excl");
+    let schema = account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}")).await;
+    assert!(result.is_err(), "an Organization with the same email as an existing Individual must be rejected by the cross-table constraint trigger");
+}
+
+#[tokio::test]
+#[ignore]
+async fn distinct_emails_across_implementors_succeed() {
+    let module = unique_module("live_excl");
+    let schema = account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'b@x.com', legal_name := 'Corp' }}")).await;
+    assert!(result.is_ok(), "distinct emails across different implementors must both succeed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn same_transaction_cross_table_duplicate_is_still_caught() {
+    // Both new rows exist by the time the DEFERRED trigger actually runs
+    // (end of statement/transaction), so even inserting the conflicting
+    // pair back-to-back in one implicit transaction must still fail —
+    // confirms the constraint trigger isn't only checking pre-existing
+    // committed state.
+    let module = unique_module("live_excl");
+    let schema = account_schema(&module);
+    let pool = setup(&schema).await;
+
+    let insert_individual = query::compile(&format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"), &schema).unwrap();
+    let insert_org = query::compile(&format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}"), &schema).unwrap();
+    let result = pool.batch_execute(&format!("{}\n{}", insert_individual.sql, insert_org.sql)).await;
+    assert!(result.is_err(), "two conflicting inserts across implementors in one transaction must still be rejected");
+}
+
+#[tokio::test]
+#[ignore]
+async fn updating_into_a_cross_table_duplicate_is_rejected() {
+    let module = unique_module("live_excl");
+    let schema = account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'b@x.com', legal_name := 'Corp' }}")).await.unwrap();
+
+    let result = exec(
+        &pool, &schema,
+        &format!("update {module}::Organization filter .legal_name = 'Corp' set {{ email := 'a@x.com' }}"),
+    ).await;
+    assert!(result.is_err(), "updating Organization's email to collide with an existing Individual's must be rejected");
+}
+
+#[tokio::test]
+#[ignore]
+async fn updating_an_unrelated_field_does_not_trigger_the_check() {
+    let module = unique_module("live_excl");
+    let schema = account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    let result = exec(
+        &pool, &schema,
+        &format!("update {module}::Individual filter .email = 'a@x.com' set {{ first_name := 'Renamed' }}"),
+    ).await;
+    assert!(result.is_ok(), "updating a field other than the exclusive one must not run the exclusive check at all");
+}
+
+#[tokio::test]
+#[ignore]
+async fn null_values_are_never_considered_duplicates_of_each_other() {
+    let module = unique_module("live_excl");
+    let schema = nullable_account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ first_name := 'A' }}")).await.unwrap();
+    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ legal_name := 'Corp' }}")).await;
+    assert!(result.is_ok(), "two different implementors both leaving a nullable exclusive property NULL must not collide (matches plain SQL UNIQUE semantics)");
+}
+
+#[tokio::test]
+#[ignore]
+async fn composite_exclusive_constraint_is_enforced_across_implementors() {
+    let module = unique_module("live_excl");
+    let schema = composite_account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::IndividualA {{ email := 'a@x.com', first_name := 'Alice' }}")).await.unwrap();
+    let result = exec(&pool, &schema, &format!("insert {module}::IndividualB {{ email := 'a@x.com', first_name := 'Alice' }}")).await;
+    assert!(result.is_err(), "the same (first_name, email) pair across implementors must violate the composite exclusive constraint");
+
+    let ok = exec(&pool, &schema, &format!("insert {module}::IndividualB {{ email := 'a@x.com', first_name := 'Bob' }}")).await;
+    assert!(ok.is_ok(), "a differing first_name means the composite pair no longer collides");
+}
+
+/// Mirrors `live_execution_on_delete.rs`'s
+/// `migration_path_emits_working_deletion_policy_triggers` — the
+/// incremental-migration path (`diff_schema` against an empty `DbState`)
+/// shares `interface_exclusive_trigger_infos` with `export_schema`, but
+/// confirms the *emitted, applied* DDL from that path actually works too,
+/// not just that it type-checks.
+#[tokio::test]
+#[ignore]
+async fn migration_path_emits_working_exclusive_triggers() {
+    let module = unique_module("live_excl_mig");
+    let schema = account_schema(&module);
+    let ddl_ops = diff_schema(&schema, &DbState::default()).unwrap();
+    let pool = test_pool().await;
+    for op in &ddl_ops {
+        pool.batch_execute(op).await.unwrap();
+    }
+
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}")).await;
+    assert!(result.is_err(), "a cross-table duplicate must be rejected via the migration-path-emitted trigger too");
+}
+
+// ── Junction-backed exclusive link (cross-implementor helper view) ─────────────
+//
+// PyQL can't compile `employer := (select Company filter ...)` on these
+// types yet (see the module doc comment's tracked, separate bug), so these
+// insert straight into each implementor's own junction table via raw SQL —
+// exactly the rows a working compiler would eventually produce — to verify
+// the trigger/view mechanism itself independent of that.
+
+async fn insert_junction_row(pool: &PgPool, module: &str, impl_table: &str, link_name: &str, owner_name: &str, target_name: &str) -> Result<(), pylon_pgcon::Error> {
+    let sql = format!(
+        "INSERT INTO \"{module}\".\"{impl_table}.{link_name}\" (source, target) \
+         SELECT o.id, c.id FROM \"{module}\".\"{impl_table}\" o, \"{module}\".\"Company\" c \
+         WHERE o.name = '{owner_name}' AND c.name = '{target_name}'"
+    );
+    pool.batch_execute(&sql).await
+}
+
+async fn update_junction_row_target(pool: &PgPool, module: &str, impl_table: &str, link_name: &str, owner_name: &str, new_target_name: &str) -> Result<(), pylon_pgcon::Error> {
+    let sql = format!(
+        "UPDATE \"{module}\".\"{impl_table}.{link_name}\" SET target = (SELECT id FROM \"{module}\".\"Company\" WHERE name = '{new_target_name}') \
+         WHERE source = (SELECT id FROM \"{module}\".\"{impl_table}\" WHERE name = '{owner_name}')"
+    );
+    pool.batch_execute(&sql).await
+}
+
+#[tokio::test]
+#[ignore]
+async fn junction_backed_cross_table_duplicate_target_is_rejected() {
+    let module = unique_module("live_excl_jt");
+    let schema = employer_account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ name := 'Alice' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Organization {{ name := 'Beta' }}")).await.unwrap();
+
+    insert_junction_row(&pool, &module, "Individual", "employer", "Alice", "Acme").await.unwrap();
+    let result = insert_junction_row(&pool, &module, "Organization", "employer", "Beta", "Acme").await;
+    assert!(
+        result.is_err(),
+        "an Organization can't take the same employer as an existing Individual — the cross-implementor junction-view trigger must reject it"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn junction_backed_distinct_targets_across_implementors_succeed() {
+    let module = unique_module("live_excl_jt");
+    let schema = employer_account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Globex' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ name := 'Alice' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Organization {{ name := 'Beta' }}")).await.unwrap();
+
+    insert_junction_row(&pool, &module, "Individual", "employer", "Alice", "Acme").await.unwrap();
+    let result = insert_junction_row(&pool, &module, "Organization", "employer", "Beta", "Globex").await;
+    assert!(result.is_ok(), "distinct employers across different implementors must both succeed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn junction_backed_updating_into_a_cross_table_duplicate_is_rejected() {
+    let module = unique_module("live_excl_jt");
+    let schema = employer_account_schema(&module);
+    let pool = setup(&schema).await;
+
+    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Globex' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Individual {{ name := 'Alice' }}")).await.unwrap();
+    exec(&pool, &schema, &format!("insert {module}::Organization {{ name := 'Beta' }}")).await.unwrap();
+
+    insert_junction_row(&pool, &module, "Individual", "employer", "Alice", "Acme").await.unwrap();
+    insert_junction_row(&pool, &module, "Organization", "employer", "Beta", "Globex").await.unwrap();
+
+    let result = update_junction_row_target(&pool, &module, "Organization", "employer", "Beta", "Acme").await;
+    assert!(result.is_err(), "updating Organization's employer to collide with Individual's must be rejected");
+}
