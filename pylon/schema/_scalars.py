@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import sys
 import uuid as _uuid_mod
 from typing import Any
 
@@ -171,15 +172,29 @@ class Scalar:
 def scalar(
     base_type: type[_PylonScalar],
     *constraints: _PointerConstraint,
+    name: str | None = None,
+    module: str | None = None,
 ) -> type[Scalar] | Any:
     """Define a custom scalar type.
 
-    Functional form — returns a new anonymous scalar type immediately::
+    Functional form — returns a new scalar type immediately. Pass ``name=``
+    to register it as a nominal PostgreSQL DOMAIN: its constraints compile
+    into the domain's own CHECK, enforced by Postgres on every write, and
+    any property using this scalar gets that domain as its actual column
+    type (see `pylon.schema._walker._to_pg_type`)::
+
+        EmailStr = pylon.scalar(pylon.Str, Regexp(r'^[^@]+@[^@]+\\.[^@]+$'), name='EmailStr')
+        Rating   = pylon.scalar(pylon.Int16, MinValue(1), MaxValue(5), name='Rating')
+
+    Omitting ``name=`` returns an unregistered scalar with no PostgreSQL
+    identity of its own — its constraints still apply, but individually on
+    each property that uses it (no named type is created)::
 
         PositiveInt = pylon.scalar(pylon.Int64, MinValue(0))
-        EmailStr    = pylon.scalar(pylon.Str, Regexp(r'^[^@]+@[^@]+\\.[^@]+$'))
 
-    Decorator form — applied to a Scalar subclass for full control::
+    Decorator form — applied to a Scalar subclass for full control (always
+    registered under the class's own name; constraints aren't supported
+    here since `validate()` covers logic a CHECK can't express)::
 
         @pylon.scalar(pylon.Str)
         class Email(pylon.Scalar):
@@ -192,15 +207,27 @@ def scalar(
             @staticmethod
             def to_db(value: Email) -> str: ...
     """
-    if constraints:
-        return type(
-            "_AnonymousScalar",
+    if constraints or name is not None:
+        caller_module = module or sys._getframe(1).f_globals.get("__name__", "default")
+        cls = type(
+            name or "_AnonymousScalar",
             (Scalar,),
             {
                 "__pylon_base__": base_type,
                 "__pylon_constraints__": constraints,
+                "__module__": caller_module,
             },
         )
+        if name is not None:
+            defining = sys.modules.get(caller_module)
+            override = getattr(defining, "__pylon_module__", None) if defining else None
+            cls.__pylon_module__ = (
+                override if isinstance(override, str)
+                else (caller_module or "default").rpartition(".")[-1] or "default"
+            )
+            from . import _registry
+            _registry.register_scalar(cls)
+        return cls
 
     def _decorator(cls: type[Scalar]) -> type[Scalar]:
         cls.__pylon_base__ = base_type

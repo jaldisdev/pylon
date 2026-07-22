@@ -59,6 +59,7 @@ pub fn id_prop() -> PropertyDescriptor {
         is_readonly: true,
         rewrites: vec![],
         tuple_members: None,
+        column_type: None,
     }
 }
 
@@ -76,6 +77,7 @@ pub fn text_prop(name: &str) -> PropertyDescriptor {
         is_readonly: false,
         rewrites: vec![],
         tuple_members: None,
+        column_type: None,
     }
 }
 

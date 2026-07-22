@@ -308,7 +308,8 @@ impl PropertyDescriptor {
         is_pk = false,
         is_readonly = false,
         rewrites = None,
-        tuple_members = None
+        tuple_members = None,
+        column_type = None
     ))]
     fn new(
         name: String,
@@ -323,6 +324,7 @@ impl PropertyDescriptor {
         is_readonly: bool,
         rewrites: Option<Vec<PyRef<RewriteEntry>>>,
         tuple_members: Option<Vec<PyRef<TupleMember>>>,
+        column_type: Option<String>,
     ) -> Self {
         Self {
             inner: core::schema::PropertyDescriptor {
@@ -343,6 +345,7 @@ impl PropertyDescriptor {
                     .collect(),
                 tuple_members: tuple_members
                     .map(|ms| ms.iter().map(|m| m.inner.clone()).collect()),
+                column_type,
             },
         }
     }
@@ -390,6 +393,11 @@ impl PropertyDescriptor {
     #[getter]
     fn is_readonly(&self) -> bool {
         self.inner.is_readonly
+    }
+
+    #[getter]
+    fn column_type(&self) -> Option<&str> {
+        self.inner.column_type.as_deref()
     }
 }
 

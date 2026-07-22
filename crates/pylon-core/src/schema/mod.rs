@@ -52,7 +52,10 @@ pub struct SignalEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropertyDescriptor {
     pub name: String,
-    /// PostgreSQL column type, e.g. `text`, `int8`, `uuid`.
+    /// PostgreSQL column type, e.g. `text`, `int8`, `uuid`. Always a plain
+    /// base type — every read/write/cast/comparison site relies on that, so
+    /// a registered custom scalar's own DOMAIN name lives in `column_type`
+    /// instead, never here.
     pub pg_type: String,
     pub nullable: bool,
     /// SQL expression for the column DEFAULT clause.
@@ -75,6 +78,17 @@ pub struct PropertyDescriptor {
     /// `@pylon.named_tuple`-typed property instead carries its shape via the
     /// `__nt__:module::Name` `pg_type` marker + `NamedTupleDescriptor.members`.
     pub tuple_members: Option<Vec<TupleMemberDescriptor>>,
+    /// `Some("\"schema\".\"Name\"")` only when this property's scalar type is
+    /// a *registered* custom scalar (see `pylon.scalar(..., name=...)` /
+    /// the `@pylon.scalar` decorator form) — the schema-qualified name of
+    /// the PostgreSQL DOMAIN that scalar compiles to (see
+    /// `export::emit_scalars`). Consulted only for the column's own DDL
+    /// type (`CREATE TABLE` / `ADD COLUMN`); every other use of this
+    /// property (casts, comparisons, wire decode) keeps using `pg_type`'s
+    /// plain base type, so a domain-typed column still round-trips exactly
+    /// like its base type — Postgres enforces the domain's CHECK on writes
+    /// regardless of which type name the read/write path itself uses.
+    pub column_type: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

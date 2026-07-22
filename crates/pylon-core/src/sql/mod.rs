@@ -2927,7 +2927,7 @@ mod tests {
                             is_pk: true,
                             is_readonly: true,
                             rewrites: vec![],
-                        tuple_members: None, },
+                        tuple_members: None, column_type: None, },
                         PropertyDescriptor {
                             name: "name".into(),
                             pg_type: "text".into(),
@@ -2940,7 +2940,7 @@ mod tests {
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        tuple_members: None, },
+                        tuple_members: None, column_type: None, },
                         PropertyDescriptor {
                             name: "age".into(),
                             pg_type: "int8".into(),
@@ -2953,7 +2953,7 @@ mod tests {
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        tuple_members: None, },
+                        tuple_members: None, column_type: None, },
                     ],
                     links: vec![LinkDescriptor {
                         name: "company".into(),
@@ -3006,7 +3006,7 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    tuple_members: None, }],
+                    tuple_members: None, column_type: None, }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -3039,7 +3039,7 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    tuple_members: None, }],
+                    tuple_members: None, column_type: None, }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -3322,13 +3322,13 @@ mod tests {
                         default_pyql: None,
             check_constraints: vec![], is_exclusive: true, is_pk: true,
             is_readonly: true, rewrites: vec![],
-        tuple_members: None, };
+        tuple_members: None, column_type: None, };
         let name_prop = || PropertyDescriptor {
             name: "name".into(), pg_type: "text".into(), nullable: false,
             default_sql: None, description: None, check_constraints: vec![],
                         default_pyql: None,
             is_exclusive: false, is_pk: false, is_readonly: false, rewrites: vec![],
-        tuple_members: None, };
+        tuple_members: None, column_type: None, };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
@@ -3398,13 +3398,13 @@ mod tests {
             default_sql: Some("gen_random_uuid()".into()), description: None,
             default_pyql: None, check_constraints: vec![], is_exclusive: true,
             is_pk: true, is_readonly: true, rewrites: vec![],
-        tuple_members: None, };
+        tuple_members: None, column_type: None, };
         let name_prop = || PropertyDescriptor {
             name: "name".into(), pg_type: "text".into(), nullable: false,
             default_sql: None, description: None, check_constraints: vec![],
             default_pyql: None, is_exclusive: false, is_pk: false,
             is_readonly: false, rewrites: vec![],
-        tuple_members: None, };
+        tuple_members: None, column_type: None, };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
@@ -3442,7 +3442,7 @@ mod tests {
                         default_sql: None, description: None, check_constraints: vec![],
                         default_pyql: None, is_exclusive: false, is_pk: false,
                         is_readonly: false, rewrites: vec![],
-                    tuple_members: None, }],
+                    tuple_members: None, column_type: None, }],
                     links: vec![
                         LinkDescriptor {
                             name: "source".into(), target: "default::Person".into(),
@@ -3596,13 +3596,13 @@ mod tests {
             default_sql: Some("gen_random_uuid()".into()), description: None,
             default_pyql: None, check_constraints: vec![], is_exclusive: true,
             is_pk: true, is_readonly: true, rewrites: vec![],
-        tuple_members: None, };
+        tuple_members: None, column_type: None, };
         let name_prop = || PropertyDescriptor {
             name: "name".into(), pg_type: "text".into(), nullable: false,
             default_sql: None, description: None, check_constraints: vec![],
             default_pyql: None, is_exclusive: false, is_pk: false,
             is_readonly: false, rewrites: vec![],
-        tuple_members: None, };
+        tuple_members: None, column_type: None, };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
@@ -3640,7 +3640,7 @@ mod tests {
                         default_sql: None, default_pyql: None, description: None,
                         check_constraints: vec![], is_exclusive: false, is_pk: false,
                         is_readonly: false, rewrites: vec![],
-                    tuple_members: None, }],
+                    tuple_members: None, column_type: None, }],
                     // No declared Link pointers — matches pylon-demo's actual
                     // ProductTag, which relies on multilink_junction_info's
                     // "source"/"target" defaults.
@@ -4302,7 +4302,7 @@ mod tests {
                 RewriteEntry { on: 1, handler: "str_lower(.name)".into() },  // INSERT
                 RewriteEntry { on: 2, handler: "str_lower(.name)".into() },  // UPDATE
             ],
-        tuple_members: None, });
+        tuple_members: None, column_type: None, });
         schema
     }
 
@@ -5293,6 +5293,7 @@ mod tests {
                             kind: TupleMemberKind::Scalar { pg_type: "text".into() },
                         },
                     ]),
+                    column_type: None,
                 }],
                 links: vec![],
                 multilinks: vec![],
@@ -5379,6 +5380,7 @@ mod tests {
                             kind: TupleMemberKind::Scalar { pg_type: "text".into() },
                         },
                     ]),
+                    column_type: None,
                 }],
                 links: vec![],
                 multilinks: vec![],
@@ -5446,6 +5448,7 @@ mod tests {
                             kind: TupleMemberKind::Scalar { pg_type: "text".into() },
                         },
                     ]),
+                    column_type: None,
                 }],
                 links: vec![],
                 multilinks: vec![],

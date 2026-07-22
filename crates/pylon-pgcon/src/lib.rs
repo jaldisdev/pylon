@@ -904,6 +904,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
+        // Temp tables live in a session-specific `pg_temp_N` schema, so only
+        // the table name (not the exact schema) is asserted here.
+        assert_eq!(err.violated_table().map(|(_, table)| table), Some("pgcon_check_test"));
+        assert_eq!(err.violated_scalar(), None);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn domain_check_violation_reports_the_domain_name_not_the_constraint_name() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw(
+            "DO $$ BEGIN CREATE DOMAIN pgcon_rating AS int8 CHECK (VALUE BETWEEN 1 AND 5); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ).await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_domain_check_test (rating pgcon_rating)").await.unwrap();
+
+        let err = pool
+            .execute_typed("INSERT INTO pgcon_domain_check_test (rating) VALUES ($1::pgcon_rating)", &[CachedValue::I64(99)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
+        assert_eq!(err.violated_scalar(), Some(("public", "pgcon_rating")));
     }
 
     #[tokio::test]
