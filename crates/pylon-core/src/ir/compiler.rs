@@ -3652,6 +3652,17 @@ impl<'a> Compiler<'a> {
             .cloned()
             .collect();
 
+        // Same for computed pointers not already defined on the interface —
+        // `[is Concrete].*` must include the concrete type's own computed
+        // properties (e.g. `full_name`), not just its stored properties.
+        let interface_computed: std::collections::HashSet<String> = parent_td.computed.iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let computed: Vec<_> = concrete_td.computed.iter()
+            .filter(|c| !interface_computed.contains(&c.name))
+            .cloned()
+            .collect();
+
         // For deep splat, also include links
         let links: Vec<_> = if matches!(splat, ast::Splat::Deep) {
             concrete_td.links.iter().cloned().collect()
@@ -3693,6 +3704,43 @@ impl<'a> Compiler<'a> {
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset: None,
                 alias: prop.name.clone(),
+                expr: IrExpr::Subquery(Box::new(subquery)),
+            }));
+        }
+
+        for cd in computed {
+            let sub_alias = self.fresh_alias();
+            let filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: sub_alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef {
+                    alias: parent_alias.to_string(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+            }));
+            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+            let inner_ir = self.compile_expr(&expr_ast, concrete_td, &sub_alias)?;
+            let subquery = IrSelect::schema_bound(
+                IrSource {
+                    type_name: concrete_qname.clone(),
+                    table: concrete_table.clone(),
+                    alias: sub_alias,
+                },
+                vec![IrShapePointer::Computed(IrComputedPointer {
+                    marker_offset: None,
+                    alias: cd.name.clone(),
+                    expr: inner_ir,
+                })],
+                Some(filter),
+            );
+            pointers.push(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset: None,
+                alias: cd.name.clone(),
                 expr: IrExpr::Subquery(Box::new(subquery)),
             }));
         }
