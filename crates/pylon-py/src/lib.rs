@@ -1003,6 +1003,11 @@ impl TypeDescriptor {
     }
 
     #[getter]
+    fn multilinks(&self) -> Vec<MultiLinkDescriptor> {
+        self.inner.multilinks.iter().map(|m| MultiLinkDescriptor { inner: m.clone() }).collect()
+    }
+
+    #[getter]
     fn vector_indexes(&self) -> Vec<VectorIndexDescriptor> {
         self.inner.vector_indexes.iter().map(|v| VectorIndexDescriptor { inner: v.clone() }).collect()
     }
