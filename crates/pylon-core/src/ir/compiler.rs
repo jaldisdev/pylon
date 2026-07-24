@@ -1236,9 +1236,15 @@ impl<'a> Compiler<'a> {
                                         right: existing.clone(),
                                     }))),
                                 };
+                                // Keep the module qualification so an unknown
+                                // target reports its full name, not a bare one.
+                                let qname = match module {
+                                    Some(m) => format!("{}::{}", m, name),
+                                    None => name.to_string(),
+                                };
                                 let synthetic = ast::SelectStmt {
                                     result: Expr::Shape(Box::new(ast::ShapeExpr {
-                                        expr: Some(Expr::Path(ast::Path::absolute(name))),
+                                        expr: Some(Expr::Path(ast::Path::absolute(&qname))),
                                         elements: sh.elements.clone(),
                                         marker_offset: None,
                                     })),
@@ -1275,6 +1281,10 @@ impl<'a> Compiler<'a> {
                         }
                         if self.resolve_named_tuple(&qname).is_some() {
                             return self.scalar_cast_free_select(tc, "jsonb".to_string(), distinct);
+                        }
+                        if let Some(sd) = self.resolve_scalar(&qname) {
+                            let pg_type = format!("{}.\"{}\"", crate::sql::pg_schema_str(&sd.module), sd.name);
+                            return self.scalar_cast_free_select(tc, pg_type, distinct);
                         }
                         if module.map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false) {
                             return self.compile_schema_cast_select(s, tc).map(IrStmt::Select);
@@ -1489,10 +1499,18 @@ impl<'a> Compiler<'a> {
         };
         // Callers only reach this function after confirming `tc.ty` is `Named`
         // (a structural tuple is never an object-type lookup).
-        let (_, name) = tc.ty.as_named()
+        let (module, name) = tc.ty.as_named()
             .ok_or_else(|| self.type_err("cannot use a tuple or array type as a schema object cast"))?;
+        // Keep the module qualification in the synthetic path so a genuinely
+        // unknown target (neither an object type, enum, scalar, nor named
+        // tuple) reports its full name via `resolve_type`'s own error,
+        // instead of silently dropping the module and reporting a bare name.
+        let qname = match module {
+            Some(m) => format!("{}::{}", m, name),
+            None => name.to_string(),
+        };
         let synthetic = ast::SelectStmt {
-            result: Expr::Path(ast::Path::absolute(name)),
+            result: Expr::Path(ast::Path::absolute(&qname)),
             filter: merged_filter,
             order_by: sel.order_by.clone(),
             offset: sel.offset.clone(),
