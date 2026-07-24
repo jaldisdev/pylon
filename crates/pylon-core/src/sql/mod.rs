@@ -2590,6 +2590,12 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             let mut sql = if shape.is_empty() {
                 // EXISTS inner: SELECT 1 FROM …
                 format!("(SELECT 1\nFROM {} AS {}", source_ref(source), qi(alias))
+            } else if let Some(c) = shape.iter().find_map(|f| if let IrShapePointer::Computed(c) = f { Some(c) } else { None }) {
+                // Computed subquery (e.g. a type-intersection splat's
+                // computed pointer): select the compiled expression itself,
+                // not a bare column — the expression already references
+                // `alias`'s own columns via ColumnRef.
+                format!("(SELECT {}\nFROM {} AS {}", emit_expr(&c.expr), source_ref(source), qi(alias))
             } else {
                 // Scalar subquery: SELECT alias.col FROM …
                 let pk_col = shape
@@ -4507,6 +4513,74 @@ mod tests {
         });
         let out = compile_and_emit_with("SELECT Person { upper_name }", &schema);
         assert!(out.sql.to_lowercase().contains("upper"), "expected upper() in SQL, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_type_intersection_splat_includes_concrete_computed_pointers() {
+        // `[is Concrete].*` must expand to the concrete type's own computed
+        // pointers too (e.g. `full_name`), not just its stored properties —
+        // querying `Individual` directly with `*` already included them, but
+        // the interface-splat path never even looked at `td.computed`.
+        fn id_prop() -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: "id".into(), pg_type: "uuid".into(), nullable: false,
+                default_sql: Some("uuidv7()".into()), default_pyql: None, description: None,
+                check_constraints: vec![], is_exclusive: true, is_pk: true, is_readonly: true,
+                rewrites: vec![], tuple_members: None, column_type: None,
+            }
+        }
+        let schema = SchemaDescriptor {
+            types: vec![
+                TypeDescriptor {
+                    name: "Account".into(), module: "default".into(), table: "Account".into(),
+                    abstract_: true, materialized: false, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), PropertyDescriptor {
+                        name: "email".into(), pg_type: "text".into(), nullable: false,
+                        default_sql: None, default_pyql: None, description: None,
+                        check_constraints: vec![], is_exclusive: false, is_pk: false,
+                        is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
+                    }],
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "Individual".into(), module: "default".into(), table: "Individual".into(),
+                    abstract_: false, materialized: true, description: None,
+                    parents: vec![], interfaces: vec!["default::Account".into()],
+                    properties: vec![id_prop(), PropertyDescriptor {
+                        name: "first_name".into(), pg_type: "text".into(), nullable: false,
+                        default_sql: None, default_pyql: None, description: None,
+                        check_constraints: vec![], is_exclusive: false, is_pk: false,
+                        is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
+                    }],
+                    links: vec![], multilinks: vec![],
+                    computed: vec![crate::schema::ComputedDescriptor {
+                        name: "full_name".into(),
+                        expression: "str_upper(.first_name)".into(),
+                        return_type: Some("text".into()),
+                    }],
+                    constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+            ],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let out = compile_and_emit_with(
+            "SELECT Account { *, [is Individual].* }",
+            &schema,
+        );
+        assert!(
+            out.sql.to_lowercase().contains("upper"),
+            "expected the concrete type's computed pointer (str_upper(...)) in the shape, got:\n{}", out.sql
+        );
+        assert!(
+            out.sql.contains("\"first_name\""),
+            "expected the concrete type's stored property too, got:\n{}", out.sql
+        );
     }
 
     #[test]
