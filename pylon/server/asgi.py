@@ -726,12 +726,27 @@ async def _handle_get_stats(client: Client, send: Send) -> None:
     # the raw Python `__pylon_config__` — a junction type's actual table name
     # is derived from the MultiLink that references it, not from the
     # junction class's own name (see `junction_decorator`'s docstring).
+    #
+    # A MultiLink declared with an explicit `through()` type gets its own
+    # `TypeDescriptor` with `.junction = True` (e.g. `Employment`,
+    # `ProductTag`) — those are covered below. But a MultiLink with no
+    # `through()` at all (e.g. `Person.friends`) has no backing type
+    # descriptor whatsoever; its implicit junction table is named
+    # `"{owner.table}.{multilink.name}"` and lives in the owner's own
+    # schema, so it has to be derived directly from each type's own
+    # `multilinks` list instead.
     from pylon.query import _get_schema
 
+    schema_types = _get_schema().types
     junction_tables = {
         ("public" if t.module == "default" else t.module, t.table)
-        for t in _get_schema().types
+        for t in schema_types
         if t.junction
+    } | {
+        ("public" if t.module == "default" else t.module, f"{t.table}.{ml.name}")
+        for t in schema_types
+        for ml in t.multilinks
+        if ml.through is None
     }
     junction_filter = ""
     if junction_tables:
