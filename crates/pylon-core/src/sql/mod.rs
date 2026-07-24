@@ -4996,6 +4996,54 @@ mod tests {
     }
 
     #[test]
+    fn test_top_level_cast_to_registered_scalar_uses_its_own_domain() {
+        // A bare top-level `SELECT <module::Scalar>expr` must compile as a
+        // plain scalar cast to that scalar's own DOMAIN — not get misrouted
+        // to `compile_schema_cast_select`'s object-by-id lookup (which
+        // treated any non-stdlib-module named cast target as an object type,
+        // since it never checked `resolve_scalar` before falling through).
+        use crate::schema::ScalarDescriptor;
+        let mut schema = make_schema();
+        schema.scalars.push(ScalarDescriptor {
+            name: "Email".into(),
+            module: "default".into(),
+            base: "Str".into(),
+            pg_type: "text".into(),
+            check_constraints: vec!["value ~ '^[^@]+@[^@]+\\.[^@]+$'".into()],
+            is_sequence: false,
+        });
+        let out = compile_and_emit_with("SELECT <default::Email>'test@test.de'", &schema);
+        assert!(
+            out.sql.contains("\"public\".\"Email\""),
+            "expected a cast to the scalar's own domain, got:\n{}", out.sql
+        );
+        assert!(
+            !out.sql.to_lowercase().contains("\"person\""),
+            "must not be misrouted to an object-type lookup, got:\n{}", out.sql
+        );
+    }
+
+    #[test]
+    fn test_top_level_cast_to_unknown_type_names_full_type() {
+        // The object-cast fallback (`compile_schema_cast_select`) used to
+        // discard the module before building its synthetic path, so an
+        // unknown top-level cast target reported a bare name even when
+        // written with an explicit module.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT <default::Ghost>$name").unwrap();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected compile error for unknown type"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unknown type 'default::Ghost'"),
+                    "expected full type name in error, got: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_structural_tuple_cast_unnamed_resolves_to_jsonb() {
         let out = compile_and_emit("SELECT <tuple<str, bool>>$p");
         assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
