@@ -1,0 +1,154 @@
+//! Read-through query-result caching — thin helpers over `pylon_cache::Cache`,
+//! mirroring `pylon/cache.py`'s own `_cache_key`/`get`/`put`/`get_json`/
+//! `put_json`. Deliberately smaller than the Python surface: a single
+//! global on/off (whether `Client` was built with `Builder::cache(..)`),
+//! no per-type (`[cache.sets.<Name>]`) overrides, and no invalidation —
+//! see `exec.rs` for where these are actually called from.
+
+use pylon_core::query::CompiledQuery;
+use pylon_value::CachedValue;
+
+use crate::error::{Error, Result};
+
+fn map_err<E: std::fmt::Display>(e: E) -> Error {
+    Error::Cache(e.to_string())
+}
+
+/// `kind` namespaces the key so `query`/`query_single` (kind `"rows"`, a
+/// decoded row list) and the `_json` methods (kinds `"json_all"`/
+/// `"json_single"`, a raw JSON string) never collide on the same
+/// underlying SQL+params — mirrors `pylon/cache.py::_cache_key`'s
+/// `f"{kind}\x00{compiled.sql}"` prefix.
+fn cache_key(kind: &str, sql: &str, params: &[CachedValue]) -> Result<String> {
+    pylon_cache::cache_key(&format!("{kind}\0{sql}"), params).map_err(map_err)
+}
+
+/// Returns cached rows for `compiled`+`params`, or `None` on a cache miss.
+pub(crate) fn get_rows(
+    cache: &pylon_cache::Cache,
+    compiled: &CompiledQuery,
+    params: &[CachedValue],
+) -> Result<Option<Vec<CachedValue>>> {
+    let key = cache_key("rows", &compiled.sql, params)?;
+    Ok(cache.get(&key).map_err(map_err)?.map(|entry| entry.rows))
+}
+
+/// Caches `rows` under a key derived from `compiled`+`params`, tagged with
+/// `compiled.tags` for later invalidation by whatever else is watching
+/// this cache directory. A no-op when there are no tags to key eviction
+/// on — mirrors `pylon/cache.py::put`.
+pub(crate) fn put_rows(
+    cache: &pylon_cache::Cache,
+    compiled: &CompiledQuery,
+    params: &[CachedValue],
+    rows: &[CachedValue],
+) -> Result<()> {
+    if compiled.tags.is_empty() {
+        return Ok(());
+    }
+    let key = cache_key("rows", &compiled.sql, params)?;
+    cache.put(&key, rows.to_vec(), compiled.tags.clone()).map_err(map_err)
+}
+
+/// Returns `Some(value)` on a cache hit (`value` is `None` for a
+/// legitimately-cached empty `query_single_json` result — distinguished
+/// from a miss by the outer `Option`, matching `pylon/cache.py::get_json`'s
+/// `(hit, value)` tuple).
+pub(crate) fn get_json(
+    cache: &pylon_cache::Cache,
+    kind: &str,
+    compiled: &CompiledQuery,
+    params: &[CachedValue],
+) -> Result<Option<Option<String>>> {
+    let key = cache_key(kind, &compiled.sql, params)?;
+    let Some(entry) = cache.get(&key).map_err(map_err)? else {
+        return Ok(None);
+    };
+    Ok(Some(match entry.rows.into_iter().next() {
+        Some(CachedValue::Str(s)) => Some(s),
+        _ => None,
+    }))
+}
+
+/// Counterpart to `get_json` — `value = None` caches a legitimately-empty
+/// `query_single_json` result rather than skipping the cache entry
+/// entirely. A no-op when there are no tags to key eviction on.
+pub(crate) fn put_json(
+    cache: &pylon_cache::Cache,
+    kind: &str,
+    compiled: &CompiledQuery,
+    params: &[CachedValue],
+    value: Option<&str>,
+) -> Result<()> {
+    if compiled.tags.is_empty() {
+        return Ok(());
+    }
+    let key = cache_key(kind, &compiled.sql, params)?;
+    let rows = value.map(|v| vec![CachedValue::Str(v.to_string())]).unwrap_or_default();
+    cache.put(&key, rows, compiled.tags.clone()).map_err(map_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> (tempfile::TempDir, pylon_cache::Cache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = pylon_cache::Cache::open(dir.path(), 10).unwrap();
+        (dir, cache)
+    }
+
+    fn compiled_with_tags(sql: &str, tags: &[&str]) -> CompiledQuery {
+        CompiledQuery {
+            sql: sql.to_string(),
+            param_names: vec![],
+            params: vec![],
+            shape: pylon_core::query::ShapeDescriptor { root: pylon_core::query::ShapeNode::RawScalar },
+            warnings: vec![],
+            inference_plan: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            analyze_paths: None,
+        }
+    }
+
+    #[test]
+    fn rows_miss_then_hit() {
+        let (_dir, cache) = open_temp();
+        let compiled = compiled_with_tags("select 1", &["public.person"]);
+        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), None);
+
+        put_rows(&cache, &compiled, &[], &[CachedValue::I64(1)]).unwrap();
+        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![CachedValue::I64(1)]));
+    }
+
+    #[test]
+    fn no_tags_means_put_is_a_no_op() {
+        let (_dir, cache) = open_temp();
+        let compiled = compiled_with_tags("select 1", &[]);
+        put_rows(&cache, &compiled, &[], &[CachedValue::I64(1)]).unwrap();
+        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn rows_and_json_kinds_do_not_collide_on_the_same_sql() {
+        let (_dir, cache) = open_temp();
+        let compiled = compiled_with_tags("select 1", &["public.person"]);
+        put_rows(&cache, &compiled, &[], &[CachedValue::I64(1)]).unwrap();
+        put_json(&cache, "json_all", &compiled, &[], Some("[1]")).unwrap();
+
+        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![CachedValue::I64(1)]));
+        assert_eq!(get_json(&cache, "json_all", &compiled, &[]).unwrap(), Some(Some("[1]".to_string())));
+        // A different kind namespace for the same SQL is a genuine miss.
+        assert_eq!(get_json(&cache, "json_single", &compiled, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn json_single_caches_a_legitimately_empty_result_distinct_from_a_miss() {
+        let (_dir, cache) = open_temp();
+        let compiled = compiled_with_tags("select Person filter false", &["public.person"]);
+        assert_eq!(get_json(&cache, "json_single", &compiled, &[]).unwrap(), None);
+
+        put_json(&cache, "json_single", &compiled, &[], None).unwrap();
+        assert_eq!(get_json(&cache, "json_single", &compiled, &[]).unwrap(), Some(None));
+    }
+}

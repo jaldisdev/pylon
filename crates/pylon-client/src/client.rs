@@ -32,11 +32,17 @@ pub struct Builder {
     dsn: String,
     max_pool_size: usize,
     schema_path: PathBuf,
+    cache: Option<(PathBuf, usize)>,
 }
 
 impl Builder {
     pub fn new(dsn: impl Into<String>) -> Self {
-        Self { dsn: dsn.into(), max_pool_size: 10, schema_path: schema::default_schema_path() }
+        Self {
+            dsn: dsn.into(),
+            max_pool_size: 10,
+            schema_path: schema::default_schema_path(),
+            cache: None,
+        }
     }
 
     pub fn max_pool_size(mut self, max_pool_size: usize) -> Self {
@@ -52,18 +58,41 @@ impl Builder {
         self
     }
 
+    /// Opts into read-through result caching at an LMDB-backed directory —
+    /// mirrors `pylon.toml`'s `[cache]` section, minus per-type
+    /// (`[cache.sets.<Name>]`) overrides: caching here is a single global
+    /// on/off. Omit this entirely for no caching (today's default
+    /// behavior). Only `Client`'s own query methods read/write the cache —
+    /// `Transaction` never does, matching `pylon/client.py`'s
+    /// `AsyncTransaction`.
+    ///
+    /// Nothing evicts entries automatically here — pair this with a
+    /// process elsewhere that invalidates the same directory (e.g.
+    /// `pylon worker start`) if the underlying data changes while cached.
+    pub fn cache(mut self, path: impl Into<PathBuf>, max_size_mb: usize) -> Self {
+        self.cache = Some((path.into(), max_size_mb));
+        self
+    }
+
     /// Connects (eagerly — a bad DSN/host/credentials fails right here,
     /// matching `PgPool::connect`'s own eager-connect behavior) and loads
     /// the schema.
     pub async fn build(self) -> Result<Client> {
         let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size).await.map_err(Error::Db)?;
         let schema = schema::load(&self.schema_path)?;
+        let cache = self
+            .cache
+            .map(|(path, max_size_mb)| {
+                pylon_cache::Cache::open(&path, max_size_mb).map(Arc::new).map_err(|e| Error::Cache(e.to_string()))
+            })
+            .transpose()?;
         Ok(Client {
             pool: Arc::new(pool),
             schema: Arc::new(RwLock::new(schema)),
             schema_path: Arc::new(self.schema_path),
             globals: Arc::new(HashMap::new()),
             config: SessionConfig::default(),
+            cache,
         })
     }
 }
@@ -83,6 +112,10 @@ pub struct Client {
     schema_path: Arc<PathBuf>,
     globals: Arc<HashMap<String, CachedValue>>,
     config: SessionConfig,
+    /// `None` unless `Builder::cache` was called — read-through caching is
+    /// opt-in. Shared across `with_globals`/`with_config` clones, same as
+    /// `pool`/`schema`.
+    cache: Option<Arc<pylon_cache::Cache>>,
 }
 
 impl Client {
@@ -124,17 +157,21 @@ impl Client {
 
     pub async fn query(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref()).await
     }
 
     pub async fn query_single(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Option<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_single(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref())
+            .await
     }
 
     pub async fn query_required_single(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Value> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_required_single(
+            &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
+        )
+        .await
     }
 
     pub async fn execute(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<()> {
@@ -144,17 +181,42 @@ impl Client {
 
     pub async fn query_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_json(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_json(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref())
+            .await
     }
 
     pub async fn query_single_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Option<String>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single_json(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_single_json(
+            &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
+        )
+        .await
     }
 
     pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single_json(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_required_single_json(
+            &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
+        )
+        .await
+    }
+
+    /// Current cache size, or `None` if `Builder::cache` wasn't configured
+    /// — mirrors `pylon.cache.stat()`.
+    pub fn cache_stat(&self) -> Result<Option<pylon_cache::CacheStats>> {
+        match &self.cache {
+            None => Ok(None),
+            Some(cache) => cache.stat().map(Some).map_err(|e| Error::Cache(e.to_string())),
+        }
+    }
+
+    /// Evicts every cache entry — a no-op if `Builder::cache` wasn't
+    /// configured. Mirrors `pylon.cache.clear()`.
+    pub fn cache_clear(&self) -> Result<()> {
+        match &self.cache {
+            None => Ok(()),
+            Some(cache) => cache.clear().map_err(|e| Error::Cache(e.to_string())),
+        }
     }
 
     /// Runs `pyql` through Postgres's `EXPLAIN (ANALYZE, FORMAT JSON)` and

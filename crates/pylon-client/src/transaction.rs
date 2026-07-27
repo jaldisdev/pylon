@@ -54,19 +54,23 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    // Every query method below passes `None` for `exec`'s `cache`
+    // parameter — `pylon/client.py`'s `AsyncTransaction` never reads or
+    // writes the read-through cache either, only `Client` itself does.
+
     pub async fn query(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 
     pub async fn query_single(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Option<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_single(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 
     pub async fn query_required_single(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Value> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_required_single(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 
     pub async fn execute(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<()> {
@@ -76,16 +80,16 @@ impl Transaction {
 
     pub async fn query_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_json(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_json(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 
     pub async fn query_single_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Option<String>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single_json(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_single_json(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 
     pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single_json(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::query_required_single_json(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 }

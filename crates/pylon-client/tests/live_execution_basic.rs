@@ -108,6 +108,27 @@ async fn setup(schema: &SchemaDescriptor) -> Client {
     Client::builder(test_dsn()).max_pool_size(5).schema_path(path).build().await.unwrap()
 }
 
+/// Like `setup`, but also opts into read-through caching at a fresh temp
+/// LMDB directory — for tests exercising `Builder::cache`.
+async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
+    let ddl = export_schema(schema).unwrap();
+    let pool = pylon_pgcon::PgPool::connect(&test_dsn(), 5).await.unwrap();
+    pool.batch_execute(&ddl).await.unwrap();
+
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let path = std::env::temp_dir().join(format!("pylon-client-live-test-{nanos}.json"));
+    std::fs::write(&path, serde_json::to_string(schema).unwrap()).unwrap();
+    let cache_dir = std::env::temp_dir().join(format!("pylon-client-live-test-cache-{nanos}"));
+
+    Client::builder(test_dsn())
+        .max_pool_size(5)
+        .schema_path(path)
+        .cache(cache_dir, 10)
+        .build()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 #[ignore]
 async fn query_and_execute_round_trip() {
@@ -234,4 +255,52 @@ async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors
 
     let rows = client.query(&format!("select {module}::Person"), &[]).await.unwrap();
     assert!(rows.is_empty(), "the insert must have been rolled back, got: {rows:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
+    let module = unique_module("live_client_cache");
+    let client = setup_with_cache(&person_schema(&module)).await;
+
+    client
+        .execute(
+            &format!("insert {module}::Person {{ name := <str>$name }}"),
+            &[("name", CachedValue::Str("Alice".into()))],
+        )
+        .await
+        .unwrap();
+
+    let query = format!("select {module}::Person {{ name }}");
+    let first = client.query(&query, &[]).await.unwrap();
+    assert_eq!(first.len(), 1);
+    let Value::Object(person) = &first[0] else { panic!("expected Object") };
+    assert_eq!(person.get("name"), Some(&Value::Str("Alice".into())));
+
+    // Mutate the underlying row directly, bypassing the cache entirely.
+    client
+        .raw_connection()
+        .execute_typed(&format!("UPDATE \"{module}\".\"Person\" SET name = 'Mutated'"), &[])
+        .await
+        .unwrap();
+
+    // No invalidation listener is running (by design — see Builder::cache's
+    // docs), so the second call must still serve the stale cached value.
+    let second = client.query(&query, &[]).await.unwrap();
+    assert_eq!(second, first, "a read-through cache hit must return the stale cached value");
+
+    // Confirm the cache actually holds an entry (not just a coincidental
+    // real re-fetch that happened to match).
+    let stats = client.cache_stat().unwrap().expect("cache was configured");
+    assert!(stats.entry_count >= 1);
+
+    client.cache_clear().unwrap();
+    let stats_after_clear = client.cache_stat().unwrap().unwrap();
+    assert_eq!(stats_after_clear.entry_count, 0);
+
+    // After clearing the cache, the same query now genuinely re-fetches
+    // and observes the mutation.
+    let third = client.query(&query, &[]).await.unwrap();
+    let Value::Object(person) = &third[0] else { panic!("expected Object") };
+    assert_eq!(person.get("name"), Some(&Value::Str("Mutated".into())));
 }

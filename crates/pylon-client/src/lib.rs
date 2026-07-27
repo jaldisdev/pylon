@@ -11,6 +11,7 @@
 //! counterpart of `pylon/query.py`'s `_decode` (which only ever ran
 //! Python-side, operating on already-Pythonized values).
 
+mod cache;
 mod client;
 mod decode;
 mod error;
@@ -21,6 +22,7 @@ mod value;
 
 pub use client::{Builder, Client, TxFuture};
 pub use error::{Error, Result};
+pub use pylon_cache::CacheStats;
 pub use pylon_value::CachedValue;
 pub use transaction::{Isolation, Transaction};
 pub use value::{Group, Object, Range, Value};
