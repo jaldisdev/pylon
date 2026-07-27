@@ -1,0 +1,68 @@
+//! The crate's single error type. Follows `pylon_pgcon::Error`'s own
+//! convention (a real enum, not a boxed `dyn Error`) for the same reason:
+//! the transaction retry loop (`transaction.rs`) needs the Postgres SQLSTATE
+//! to tell a retriable serialization failure/deadlock apart from anything
+//! else, and erasing to `dyn Error` at every `?` site would throw that away.
+
+use tokio_postgres::error::SqlState;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A connection/pool/decode/server-response failure from the driver.
+    #[error(transparent)]
+    Db(#[from] pylon_pgcon::Error),
+    /// PyQL failed to compile — a syntax/type/resolution/cardinality error.
+    #[error(transparent)]
+    Compile(#[from] pylon_core::error::PyQLError),
+    /// A required query parameter (named or `__global__`-prefixed) had no
+    /// matching entry in the params/globals passed by the caller.
+    #[error("missing query parameter: {0}")]
+    MissingParam(String),
+    /// `query_single`/`query_required_single` (and their `_json` siblings)
+    /// got more than one row back.
+    #[error("expected at most one result, got {got}")]
+    ResultCardinality { got: usize },
+    /// `query_required_single` (and its `_json` sibling) got zero rows.
+    #[error("expected exactly one result, got none")]
+    NoData,
+    /// `.pylon/schema.json` couldn't be read or didn't parse.
+    #[error("failed to load schema from {path}: {source}")]
+    Schema { path: String, source: std::io::Error },
+    #[error("failed to parse schema JSON: {0}")]
+    SchemaJson(#[from] serde_json::Error),
+    /// `EXPLAIN`'s raw JSON output failed to correlate against the query's
+    /// own `analyze_paths` (`pylon_core::analyze::build_coarse_grained`).
+    #[error("failed to build analyze tree: {0}")]
+    Analyze(String),
+}
+
+impl Error {
+    /// The Postgres SQLSTATE code, when this wraps a real server response —
+    /// `None` for a compile error or a connection/pool/decode failure.
+    pub fn sqlstate(&self) -> Option<&SqlState> {
+        match self {
+            Error::Db(e) => e.sqlstate(),
+            _ => None,
+        }
+    }
+
+    /// `40001` — a serializable/repeatable-read transaction lost a write
+    /// skew race. Retriable by re-running the whole transaction body.
+    pub fn is_serialization_error(&self) -> bool {
+        self.sqlstate() == Some(&SqlState::T_R_SERIALIZATION_FAILURE)
+    }
+
+    /// `40P01` — Postgres broke a deadlock by aborting this transaction.
+    /// Retriable the same way a serialization failure is.
+    pub fn is_deadlock(&self) -> bool {
+        self.sqlstate() == Some(&SqlState::T_R_DEADLOCK_DETECTED)
+    }
+
+    /// Either of the two conditions the retrying transaction loop
+    /// (`transaction.rs`) automatically retries on.
+    pub fn is_retriable(&self) -> bool {
+        self.is_serialization_error() || self.is_deadlock()
+    }
+}
