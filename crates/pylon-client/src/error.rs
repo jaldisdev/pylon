@@ -36,6 +36,12 @@ pub enum Error {
     /// own `analyze_paths` (`pylon_core::analyze::build_coarse_grained`).
     #[error("failed to build analyze tree: {0}")]
     Analyze(String),
+    /// A `pylon_cache::Cache` open/get/put failure — that crate's own
+    /// errors are a boxed `dyn Error + Send + Sync`, not a good match for
+    /// thiserror's `#[from]`/`transparent`, so this just carries the
+    /// rendered message.
+    #[error("cache error: {0}")]
+    Cache(String),
 }
 
 impl Error {

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pylon-cache = { path = "../pylon-cache" }
 pylon-core = { path = "../pylon-core" }
 pylon-pgcon = { path = "../pylon-pgcon" }
 pylon-value = { path = "../pylon-value" }
@@ -15,3 +16,4 @@ uuid = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tempfile = "3"
