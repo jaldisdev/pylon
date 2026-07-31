@@ -633,9 +633,15 @@ mod tests {
             password_env = "PYLON_SERVER_TEST_DB_PASSWORD"
             "#,
         );
-        std::env::set_var("PYLON_SERVER_TEST_DB_PASSWORD", "s3cret");
+        // Safety: this test doesn't run alongside anything else touching
+        // this specific env var name.
+        unsafe {
+            std::env::set_var("PYLON_SERVER_TEST_DB_PASSWORD", "s3cret");
+        }
         let config = load_config(Some(&dir.0)).unwrap();
-        std::env::remove_var("PYLON_SERVER_TEST_DB_PASSWORD");
+        unsafe {
+            std::env::remove_var("PYLON_SERVER_TEST_DB_PASSWORD");
+        }
         assert_eq!(config.database.password.as_deref(), Some("s3cret"));
     }
 
