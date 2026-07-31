@@ -23,18 +23,19 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::json::not_found;
 use crate::state::AppState;
+use crate::workers::WorkerToggles;
 
 /// Builds a fresh multi-threaded Tokio runtime and blocks on `serve` until
 /// Ctrl+C; nothing here depends on pyo3 or a Python event loop.
 /// `static_dir` is an optional on-disk override for the frontend build,
 /// otherwise served from the assets embedded into the binary at compile
 /// time (see `static_files::STATIC_DIR`) — `None` is the common case.
-pub fn run(config: Config, static_dir: Option<PathBuf>) -> Result<()> {
+pub fn run(config: Config, static_dir: Option<PathBuf>, worker_toggles: WorkerToggles, no_http: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| Error::Invalid(format!("failed to start Tokio runtime: {e}")))?;
-    rt.block_on(serve(config, static_dir))
+    rt.block_on(serve(config, static_dir, worker_toggles, no_http))
 }
 
-async fn serve(config: Config, static_dir: Option<PathBuf>) -> Result<()> {
+async fn serve(config: Config, static_dir: Option<PathBuf>, worker_toggles: WorkerToggles, no_http: bool) -> Result<()> {
     let addr = format!("{}:{}", config.webserver.host, config.webserver.port);
     let state = Arc::new(AppState::new(config, static_dir)?);
 
@@ -53,9 +54,25 @@ async fn serve(config: Config, static_dir: Option<PathBuf>) -> Result<()> {
         .map_err(|e| Error::Invalid(format!("failed to connect base [database] connection: {e}")))?
         .ok_or_else(|| Error::Invalid("no [database] connection configured".to_string()))?;
     let worker_handles = match state.config.connections.get("default") {
-        Some(db) => crate::workers::spawn(&main_client.schema(), &state.config, &db.dsn_string(), state.cache.clone()),
+        Some(db) => {
+            crate::workers::spawn(&main_client.schema(), &state.config, &db.dsn_string(), state.cache.clone(), worker_toggles)
+        }
         None => Vec::new(),
     };
+
+    // `--no-http`: skip binding a port entirely — just run the background
+    // workers spawned above and block until Ctrl+C, for a pure worker
+    // container with no API/UI surface at all (the counterpart to
+    // `--disable-*-worker`, which keeps HTTP but skips specific workers).
+    if no_http {
+        eprintln!("pylon-server: HTTP server disabled (--no-http); running workers only");
+        tokio::signal::ctrl_c().await.map_err(|e| Error::Invalid(format!("failed to listen for ctrl-c: {e}")))?;
+        eprintln!("pylon-server: shutting down");
+        for handle in &worker_handles {
+            handle.abort();
+        }
+        return Ok(());
+    }
 
     let listener = TcpListener::bind(&addr)
         .await
