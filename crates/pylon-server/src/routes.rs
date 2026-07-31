@@ -228,3 +228,34 @@ pub fn handle_config_options() -> Response<Full<Bytes>> {
         .collect();
     json_response(StatusCode::OK, &serde_json::json!({"options": options}))
 }
+
+/// Schema/globals are process-level (identical regardless of which named
+/// connection is selected — the same `.pylon/schema.json` backs all of
+/// them), so these two routes just need *some* connected `Client` to read
+/// `.schema()` off of; the base/"main" connection always exists in
+/// `config.connections`.
+async fn any_client(state: &AppState) -> Result<std::sync::Arc<pylon_client::Client>, Response<Full<Bytes>>> {
+    match state.resolve_client("main").await {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Err(json_response(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({"error": "no [database] connection configured"}))),
+        Err(e) => Err(json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e))),
+    }
+}
+
+/// `GET /api/schema`.
+pub async fn handle_schema(state: Arc<AppState>) -> Response<Full<Bytes>> {
+    let client = match any_client(&state).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    json_response(StatusCode::OK, &crate::schema_json::schema_json(&client.schema()))
+}
+
+/// `GET /api/globals`.
+pub async fn handle_globals(state: Arc<AppState>) -> Response<Full<Bytes>> {
+    let client = match any_client(&state).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    json_response(StatusCode::OK, &crate::schema_json::globals_json(&client.schema()))
+}

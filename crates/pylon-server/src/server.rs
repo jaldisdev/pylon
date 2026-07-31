@@ -97,6 +97,12 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
             pylon_workers::metrics::render(),
         );
     }
+    if method == Method::GET && path == "/api/schema" {
+        return crate::routes::handle_schema(state.clone()).await;
+    }
+    if method == Method::GET && path == "/api/globals" {
+        return crate::routes::handle_globals(state.clone()).await;
+    }
     if method == Method::GET && path == "/api/connections" {
         return crate::routes::handle_connections(&state);
     }

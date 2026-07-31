@@ -13,6 +13,7 @@ pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_fn_body;
 pub use compiler::compile_scalar_default;
 pub use compiler::compile_with_config;
+pub use compiler::pg_type_to_pyql;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 
