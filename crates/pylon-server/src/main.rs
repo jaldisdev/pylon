@@ -21,6 +21,7 @@ Options:
   --static-dir PATH     Serve the frontend build from this directory instead
                         of the one embedded into the binary at compile time
   -h, --help            Show this help and exit
+  -v, --version         Show the pylon-server version and exit
 ";
 
 struct Args {
@@ -38,6 +39,10 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-v" | "--version" => {
+                println!("pylon-server {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--config" => args.config = Some(PathBuf::from(it.next().ok_or("--config requires a value")?)),
