@@ -1,0 +1,23 @@
+[package]
+name = "pylon-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pylon-cache = { path = "../pylon-cache" }
+pylon-client = { path = "../pylon-client" }
+pylon-core = { path = "../pylon-core" }
+pylon-providers = { path = "../pylon-providers" }
+pylon-workers = { path = "../pylon-workers" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+toml = "0.8"
+serde_json = "1"
+thiserror = "2.0.19"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

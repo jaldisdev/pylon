@@ -483,6 +483,83 @@ def _domain_type_ref(scalar_type: Any) -> str | None:
     return f'"{_pg_schema(mod).replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
 
 
+# Canonical PyQL-style type names for every built-in Pylon scalar marker
+# class (pylon.Str, pylon.UUID, ...) — mirrors `pylon.server.asgi`'s own
+# `_TYPE_NAME_BY_CLASS` (duplicated here rather than imported: the server
+# is being migrated to Rust, so schema-descriptor construction needs to
+# work with zero server-layer involvement).
+_PYQL_TYPE_NAME_BY_CLASS = {
+    "Str": "std::str",
+    "Int16": "std::int16",
+    "Int32": "std::int32",
+    "Int64": "std::int64",
+    "Float32": "std::float32",
+    "Float64": "std::float64",
+    "Decimal": "std::decimal",
+    "Bool": "std::bool",
+    "DateTime": "std::datetime",
+    "LocalDateTime": "cal::local_datetime",
+    "LocalDate": "cal::local_date",
+    "LocalTime": "cal::local_time",
+    "Duration": "std::duration",
+    "UUID": "std::uuid",
+    "JSON": "std::json",
+    "Bytes": "std::bytes",
+    "Sequence": "std::int64",  # sequences are backed by int64
+}
+
+
+def _pyql_type_name(scalar_type: Any) -> str | None:
+    """Renders *scalar_type* (a Pylon scalar class, an Array/TupleAnnotation
+    instance, or an enum/named-tuple class) as a PyQL-style type-name
+    string — e.g. ``"std::str"``, ``"default::Gender"``,
+    ``"tuple<x: std::float64, y: std::float64>"``, ``"array<std::str>"``.
+
+    Used for `GlobalDescriptor.scalar_type` so a Rust-side consumer (the
+    schema/globals introspection endpoints) can render a global's type
+    without needing live Python annotations — `_build_global_descriptor`
+    previously stored a bare `__name__`/`repr()` here, which was never a
+    real PyQL type string and was outright broken (a non-deterministic
+    object repr) for Array/Tuple-typed globals.
+    """
+    from ._enums import Enum as PylonEnum
+    from ._named_tuples import NamedTuple as PylonNamedTuple
+    from ._pointers import ArrayAnnotation, TupleAnnotation
+    from ._scalars import SHORTHAND_MAP
+
+    if isinstance(scalar_type, TupleAnnotation):
+        positional = all(e.name is None for e in scalar_type.elements)
+        parts: list[str] = []
+        for e in scalar_type.elements:
+            elem_text = _pyql_type_name(e.type_)
+            if elem_text is None:
+                return None
+            parts.append(elem_text if positional else f"{e.name}: {elem_text}")
+        return f"tuple<{', '.join(parts)}>"
+    if isinstance(scalar_type, ArrayAnnotation):
+        elem_text = _pyql_type_name(scalar_type.element)
+        return f"array<{elem_text}>" if elem_text is not None else None
+    if typing.get_origin(scalar_type) is list and typing.get_args(scalar_type):
+        element = SHORTHAND_MAP.get(typing.get_args(scalar_type)[0], typing.get_args(scalar_type)[0])
+        elem_text = _pyql_type_name(element)
+        return f"array<{elem_text}>" if elem_text is not None else None
+    if isinstance(scalar_type, type) and (issubclass(scalar_type, PylonEnum) or issubclass(scalar_type, PylonNamedTuple)):
+        mod = getattr(scalar_type, "__pylon_module__", None) or (
+            (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+        )
+        return f"{mod}::{scalar_type.__name__}"
+    if isinstance(scalar_type, type):
+        builtin_name = _PYQL_TYPE_NAME_BY_CLASS.get(scalar_type.__name__)
+        if builtin_name:
+            return builtin_name
+        if hasattr(scalar_type, "__pylon_base__"):
+            mod = getattr(scalar_type, "__pylon_module__", None) or (
+                (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+            )
+            return f"{mod}::{scalar_type.__name__}"
+    return None
+
+
 def _scalar_type_name(scalar_type: Any) -> str:
     """Return a short human-readable name for the scalar type (for Rust ScalarDescriptor.base)."""
     if hasattr(scalar_type, "__name__"):
@@ -1006,13 +1083,14 @@ def _build_named_tuple_descriptor(cls: type, _core: Any) -> Any:
 
 
 def _build_global_descriptor(g: Any, _core: Any) -> Any:
-    from ._scalars import _PylonScalar
-
-    scalar_cls = g.scalar_type
-    if isinstance(scalar_cls, type) and issubclass(scalar_cls, _PylonScalar):
-        scalar_type_name = scalar_cls.__name__
-    else:
-        scalar_type_name = getattr(scalar_cls, "__name__", repr(scalar_cls))
+    # A real PyQL-style type name (e.g. "std::str", "array<std::str>"),
+    # not a bare `__name__`/`repr()` — see `_pyql_type_name`'s own
+    # docstring for why the previous version of this was broken for
+    # Array/Tuple-typed globals. Falls back to `__name__`/`repr()` only if
+    # `_pyql_type_name` genuinely can't classify the value at all (should
+    # not happen in practice — every real global scalar_type is one of the
+    # cases it covers).
+    scalar_type_name = _pyql_type_name(g.scalar_type) or getattr(g.scalar_type, "__name__", repr(g.scalar_type))
 
     default_expr: str | None = None
     if g.default is not MISSING:
