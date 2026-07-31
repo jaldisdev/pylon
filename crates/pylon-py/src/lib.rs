@@ -1772,11 +1772,9 @@ fn diff_states(before: &DbState, after: &DbState) -> Vec<(String, bool)> {
 fn detect_type_renames(
     target: &SchemaDescriptor,
     current: &DbState,
+    guidance: &Guidance,
 ) -> Vec<(String, String, String, String, String, f64)> {
-    // TODO(migration-overhaul phase 2): thread a real `Guidance` through from
-    // the interactive CLI loop so a rejected rename candidate isn't proposed
-    // again on re-diff.
-    core::diff::detect_type_renames(&target.inner, &current.inner, &core::diff::Guidance::default())
+    core::diff::detect_type_renames(&target.inner, &current.inner, &guidance.inner)
         .into_iter()
         .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table, c.new_type_name, c.confidence))
         .collect()
@@ -1788,12 +1786,90 @@ fn detect_type_renames(
 fn detect_col_renames(
     target: &SchemaDescriptor,
     current: &DbState,
+    guidance: &Guidance,
 ) -> Vec<(String, String, String, String, String)> {
-    // TODO(migration-overhaul phase 2): thread a real `Guidance` through, see above.
-    core::diff::detect_col_renames(&target.inner, &current.inner, &core::diff::Guidance::default())
+    core::diff::detect_col_renames(&target.inner, &current.inner, &guidance.inner)
         .into_iter()
         .map(|c| (c.module, c.table, c.old_col, c.new_col, c.pg_type))
         .collect()
+}
+
+/// Accumulates rejected rename candidates so a re-diff (after the user says
+/// "no" to a proposed rename) doesn't propose the same pair again — the CLI
+/// creates one of these per `migration create` invocation and calls
+/// `ban_type_rename`/`ban_col_rename` on rejection.
+#[pyclass(module = "pylon._core")]
+pub struct Guidance {
+    pub(crate) inner: core::diff::Guidance,
+}
+
+#[pymethods]
+impl Guidance {
+    #[new]
+    fn new() -> Self {
+        Self { inner: core::diff::Guidance::default() }
+    }
+
+    fn ban_type_rename(&mut self, old_module: String, old_table: String, new_module: String, new_table: String) {
+        self.inner.banned_type_renames.insert((old_module, old_table, new_module, new_table));
+    }
+
+    fn ban_col_rename(&mut self, module: String, table: String, old_col: String, new_col: String) {
+        self.inner.banned_col_renames.insert((module, table, old_col, new_col));
+    }
+}
+
+/// One logical schema-level question ("did you create scalar type 'X'?"),
+/// bundling every DDL statement that answers it — see
+/// `pylon_core::diff::MigrationStep`.
+#[pyclass(module = "pylon._core", frozen)]
+pub struct MigrationStep {
+    pub(crate) inner: core::diff::MigrationStep,
+}
+
+#[pymethods]
+impl MigrationStep {
+    #[getter]
+    fn prompt(&self) -> &str {
+        &self.inner.prompt
+    }
+
+    #[getter]
+    fn verb(&self) -> &str {
+        self.inner.verb.as_str()
+    }
+
+    #[getter]
+    fn object_desc(&self) -> &str {
+        &self.inner.object_desc
+    }
+
+    /// List of (sql, non_transactional) tuples, in emission order.
+    #[getter]
+    fn ddl(&self) -> Vec<(String, bool)> {
+        self.inner.ddl.iter().map(|op| (op.sql.clone(), op.non_transactional)).collect()
+    }
+}
+
+/// Compute the diff as one `MigrationStep` per logical schema-level question,
+/// with confirmed renames and fill expressions already applied — the
+/// interactive-loop counterpart of `diff_schema_ops_with_renames_and_fills`.
+/// `type_renames`: list of (old_module, old_table, new_module, new_table).
+/// `col_renames`:  list of (module, table, old_col, new_col).
+/// `fills`:        list of (module, table, column, sql_expr).
+#[pyfunction]
+fn diff_schema_steps_with_renames_and_fills(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    type_renames: Vec<(String, String, String, String)>,
+    col_renames: Vec<(String, String, String, String)>,
+    fills: Vec<(String, String, String, String)>,
+) -> PyResult<Vec<MigrationStep>> {
+    core::diff::diff_schema_steps_with_renames_and_fills(
+        &target.inner, &current.inner, &type_renames, &col_renames, &fills,
+    )
+    .map(|steps| steps.into_iter().map(|inner| MigrationStep { inner }).collect())
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 /// Diff with confirmed renames applied.
@@ -2189,6 +2265,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Diff / watch
     m.add_class::<DbState>()?;
+    m.add_class::<Guidance>()?;
+    m.add_class::<MigrationStep>()?;
     m.add_function(wrap_pyfunction!(diff_schema, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops, m)?)?;
     m.add_function(wrap_pyfunction!(diff_states, m)?)?;
@@ -2198,6 +2276,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;
     m.add_function(wrap_pyfunction!(detect_fill_required, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
+    m.add_function(wrap_pyfunction!(diff_schema_steps_with_renames_and_fills, m)?)?;
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_to_json, m)?)?;
