@@ -1,12 +1,15 @@
 //! Native Rust HTTP server backing `pylon serve` — see the project memory
-//! `project-rust-server-backlog` for the full migration plan. Phase 1
-//! (this crate's current state) is just the `pylon.toml` config parser;
-//! the hyper server itself lands in a later phase.
+//! `project-rust-server-backlog` for the full migration plan.
 
 pub mod config;
+pub mod config_options;
 pub mod error;
 pub mod json;
+pub mod routes;
 pub mod server;
+pub mod state;
+pub mod static_files;
+pub mod to_json;
 
 pub use config::{load_config, Config};
 pub use error::{Error, Result};
