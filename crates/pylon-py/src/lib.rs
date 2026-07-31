@@ -1849,6 +1849,14 @@ impl MigrationStep {
     fn ddl(&self) -> Vec<(String, bool)> {
         self.inner.ddl.iter().map(|op| (op.sql.clone(), op.non_transactional)).collect()
     }
+
+    /// Best-effort "equivalent Python schema declaration" for this step's
+    /// object, shown alongside its DDL in the interactive migration CLI.
+    /// `None` for step kinds not covered yet (modules, functions, interface
+    /// views) — see `pylon_core::export::python_snippet`'s doc comment.
+    fn python_snippet(&self, schema: &SchemaDescriptor) -> Option<String> {
+        core::export::python_snippet::python_snippet_for_step(&self.inner, &schema.inner)
+    }
 }
 
 /// Compute the diff as one `MigrationStep` per logical schema-level question,

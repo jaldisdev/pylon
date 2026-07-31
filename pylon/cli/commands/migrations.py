@@ -547,10 +547,16 @@ def _print_ddl(ddl: list[str]) -> None:
             click.echo(f"    {line}")
 
 
-def _ask_action(prompt_text: str, ddl: list[str], confirmed_so_far: list[str], expert: bool) -> str:
-    """Render one step (prompt, optional DDL preview, action menu) and return
-    a validated action key: y, n, b, s, or q. "l" and "c" are handled here —
-    they print and re-loop rather than returning.
+def _ask_action(
+    prompt_text: str,
+    ddl: list[str],
+    confirmed_so_far: list[str],
+    expert: bool,
+    python_snippet: str | None = None,
+) -> str:
+    """Render one step (prompt, optional DDL + schema preview, action menu)
+    and return a validated action key: y, n, b, s, or q. "l" and "c" are
+    handled here — they print and re-loop rather than returning.
     """
     choices = _ACTIONS_EXPERT if expert else _ACTIONS
     hint = ",".join(key for key, _, _ in choices) + ",?"
@@ -561,6 +567,12 @@ def _ask_action(prompt_text: str, ddl: list[str], confirmed_so_far: list[str], e
         click.echo("If so, the following DDL statement(s) will be applied:")
         click.echo()
         _print_ddl(ddl)
+        if python_snippet is not None:
+            click.echo()
+            click.echo("Equivalent schema declaration:")
+            click.echo()
+            for line in python_snippet.splitlines():
+                click.echo(f"    {line}")
         click.echo()
         click.echo("Select an action:")
         click.echo()
@@ -686,7 +698,7 @@ def _rename_prompt_loop(
             return confirmed_type, confirmed_col, True, False
 
 
-def _migration_prompt_loop(steps: list, expert: bool) -> tuple[list[tuple[str, bool]], bool]:
+def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tuple[str, bool]], bool]:
     """Interactively walk each general create/alter/drop step one at a time.
 
     Returns (confirmed, quit_requested). `confirmed` is a list of
@@ -703,7 +715,7 @@ def _migration_prompt_loop(steps: list, expert: bool) -> tuple[list[tuple[str, b
             sql for i, s in enumerate(steps) if decisions[i] == "y" for sql, _ in s.ddl
         ]
 
-        action = _ask_action(step.prompt, ddl, confirmed_so_far, expert)
+        action = _ask_action(step.prompt, ddl, confirmed_so_far, expert, step.python_snippet(schema))
 
         if action == "y":
             decisions[idx] = "y"
@@ -899,7 +911,7 @@ async def _create_from_diff(
             steps = _core_diff_schema_steps_with_renames_and_fills(
                 schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
             )
-            confirmed_ddl, quit_requested = _migration_prompt_loop(steps, expert)
+            confirmed_ddl, quit_requested = _migration_prompt_loop(steps, schema, expert)
             if quit_requested:
                 raise click.ClickException("Aborted.")
             ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames) + confirmed_ddl
