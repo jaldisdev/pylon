@@ -1653,6 +1653,10 @@ impl DbState {
         self.inner.domains.push(core::diff::DbDomain { schema, name });
     }
 
+    fn add_extension(&mut self, name: String) {
+        self.inner.extensions.push(name);
+    }
+
     /// Add a table. Columns, FKs, indexes, checks, and triggers are set via add_column etc.
     fn add_table(&mut self, schema: String, name: String) {
         self.inner.tables.push(core::diff::DbTable {
@@ -1864,6 +1868,51 @@ impl MigrationStep {
             .collect()
     }
 
+    /// One of "module", "scalar", "table", "function", "view" — the kind of
+    /// object this step's identity refers to. Lets a caller correlate steps
+    /// (e.g. an interface's "view" step with its implementors' "table"
+    /// steps) without parsing `prompt`/`object_desc` display text.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match &self.inner.op_key {
+            core::diff::OpKey::Module(_) => "module",
+            core::diff::OpKey::Scalar(_, _) => "scalar",
+            core::diff::OpKey::Table(_, _) => "table",
+            core::diff::OpKey::Function(_, _) => "function",
+            core::diff::OpKey::View(_, _) => "view",
+        }
+    }
+
+    /// This step's object as a qualified `module::name` string. For a
+    /// "table" step this is the *type's* name, not its physical table
+    /// (which may differ via `table=`) — resolved by looking the type up
+    /// in `schema`. `None` only if no matching descriptor is found
+    /// (shouldn't happen in practice).
+    fn qualified_name(&self, schema: &SchemaDescriptor) -> Option<String> {
+        match &self.inner.op_key {
+            core::diff::OpKey::Module(m) => Some(m.clone()),
+            core::diff::OpKey::Scalar(m, n) | core::diff::OpKey::Function(m, n) | core::diff::OpKey::View(m, n) => {
+                Some(format!("{m}::{n}"))
+            }
+            core::diff::OpKey::Table(m, table) => schema.inner.types.iter()
+                .find(|t| &t.module == m && &t.table == table)
+                .map(|t| format!("{}::{}", t.module, t.name)),
+        }
+    }
+
+    /// For a "table" step, the qualified names of every interface its type
+    /// implements (empty for any other step kind, or if no matching type is
+    /// found) — lets the CLI ask about an interface before its first
+    /// implementor even though the interface's own DDL (a view selecting
+    /// from its implementors) must still be assembled afterward.
+    fn implements(&self, schema: &SchemaDescriptor) -> Vec<String> {
+        let core::diff::OpKey::Table(m, table) = &self.inner.op_key else { return vec![] };
+        schema.inner.types.iter()
+            .find(|t| &t.module == m && &t.table == table)
+            .map(|t| t.interfaces.clone())
+            .unwrap_or_default()
+    }
+
     /// This step's DDL with every `\(placeholder)` token substituted —
     /// `overrides[placeholder]` if given, else that input's own
     /// `default_expr`. Returns (sql, non_transactional) tuples, same shape
@@ -1973,6 +2022,17 @@ fn diff_schema_ops_with_renames_and_fills(
 fn schema_to_db_state_json(schema: &SchemaDescriptor) -> String {
     let state = core::diff::schema_to_db_state(&schema.inner);
     core::diff::db_state_to_json(&state)
+}
+
+/// `CREATE EXTENSION IF NOT EXISTS` statements for every Postgres extension
+/// `target` requires (currently just `vector`, needed the moment any type
+/// declares a vector index) that isn't already present in `current` — meant
+/// to be prepended to an assembled migration/`watch` sync unconditionally,
+/// not offered as a per-step confirmation (enabling a required extension
+/// isn't a design decision, it's a hard prerequisite).
+#[pyfunction]
+fn missing_extension_ddl(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
+    core::diff::missing_extension_ddl(&target.inner, &current.inner)
 }
 
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
@@ -2308,6 +2368,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_steps_with_renames_and_fills, m)?)?;
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
+    m.add_function(wrap_pyfunction!(missing_extension_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;

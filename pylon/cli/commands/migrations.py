@@ -380,6 +380,7 @@ async def _sync_once(config) -> None:
     """Recompile schema, introspect DB, diff, apply."""
     from pylon._core import (
         diff_schema as _diff_schema,
+        missing_extension_ddl as _core_missing_extension_ddl,
         pgcon_connect,
         introspect_db_state,
         migration_ensure_tracking_tables,
@@ -392,6 +393,11 @@ async def _sync_once(config) -> None:
     db_state = await introspect_db_state(pool)
 
     ops = _diff_schema(schema, db_state)
+
+    # A required Postgres extension (e.g. pgvector) is a hard prerequisite,
+    # not something to ask about — always ensure it's enabled before the
+    # rest of the DDL that needs it.
+    ops = _core_missing_extension_ddl(schema, db_state) + ops
 
     if not ops:
         click.echo("Schema up to date.")
@@ -583,15 +589,19 @@ def _ask_action(
     click.echo(f"\n{prompt_text}")
     if not expert:
         click.echo()
-        click.echo("If so, the following DDL statement(s) will be applied:")
-        click.echo()
-        _print_ddl(ddl)
         if python_snippet is not None:
-            click.echo()
-            click.echo("Equivalent schema declaration:")
+            # The Python declaration reads far better than PyQL's compiled
+            # SQL (deeply nested CTEs for anything non-trivial) — show only
+            # one, not both. Raw DDL is still one "l" away for anyone who
+            # wants to double check exactly what will run.
+            click.echo("If so, the following schema declaration will apply:")
             click.echo()
             for line in python_snippet.splitlines():
                 click.echo(f"    {line}")
+        else:
+            click.echo("If so, the following DDL statement(s) will be applied:")
+            click.echo()
+            _print_ddl(ddl)
         click.echo()
         click.echo("Select an action:")
         click.echo()
@@ -746,19 +756,62 @@ def _resolve_required_input(step, schema) -> dict[str, str]:
     return overrides
 
 
+def _reorder_for_presentation(steps: list, schema) -> list[int]:
+    """Returns a permutation of `range(len(steps))` for the order steps are
+    *asked about* — an interface's "view" step moves to right before the
+    first of its implementors' "table" steps, since a user thinks of "did
+    you create the Account concept" as preceding "did you create
+    Individual", even though the interface's own DDL (a view selecting from
+    its implementors) still has to be *assembled* afterward. Callers must
+    keep using `steps`' original order — not this one — when assembling the
+    final migration body; only the walk order changes.
+    """
+    first_table_step_for_interface: dict[str, int] = {}
+    for i, step in enumerate(steps):
+        if step.kind != "table":
+            continue
+        for iface in step.implements(schema):
+            first_table_step_for_interface.setdefault(iface, i)
+
+    view_insert_before: dict[int, int] = {}
+    for i, step in enumerate(steps):
+        if step.kind != "view":
+            continue
+        qname = step.qualified_name(schema)
+        if qname in first_table_step_for_interface:
+            view_insert_before[i] = first_table_step_for_interface[qname]
+
+    if not view_insert_before:
+        return list(range(len(steps)))
+
+    order: list[int] = []
+    for i in range(len(steps)):
+        if i in view_insert_before:
+            continue  # placed just before its target index below instead
+        for view_i, target_i in view_insert_before.items():
+            if target_i == i:
+                order.append(view_i)
+        order.append(i)
+    return order
+
+
 def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tuple[str, bool]], bool]:
     """Interactively walk each general create/alter/drop step one at a time.
 
     Returns (confirmed, quit_requested). `confirmed` is a list of
-    (sql, non_transactional) tuples, the same shape `_assemble_migration_body`
-    already expects — with any `required_input` placeholders already
-    resolved (see `_resolve_required_input`).
+    (sql, non_transactional) tuples, in `steps`' original (dependency-safe)
+    order — the same shape `_assemble_migration_body` already expects —
+    with any `required_input` placeholders already resolved (see
+    `_resolve_required_input`). Questions themselves are asked in
+    `_reorder_for_presentation`'s order, which may differ.
     """
+    order = _reorder_for_presentation(steps, schema)
     decisions: list[str | None] = [None] * len(steps)
     resolved: dict[int, list[tuple[str, bool]]] = {}
-    idx = 0
+    pos = 0
 
-    while idx < len(steps):
+    while pos < len(order):
+        idx = order[pos]
         step = steps[idx]
         ddl = [sql for sql, _ in step.ddl]
         confirmed_so_far = [
@@ -771,17 +824,17 @@ def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tupl
             overrides = _resolve_required_input(step, schema) if step.required_input else {}
             resolved[idx] = step.resolved_ddl(overrides)
             decisions[idx] = "y"
-            idx += 1
+            pos += 1
         elif action == "n":
             decisions[idx] = "n"
-            idx += 1
+            pos += 1
         elif action == "b":
-            if idx == 0:
+            if pos == 0:
                 click.echo("  Already at the first question.")
                 continue
-            idx -= 1
-            decisions[idx] = None
-            resolved.pop(idx, None)
+            pos -= 1
+            decisions[order[pos]] = None
+            resolved.pop(order[pos], None)
         elif action == "s":
             break
         elif action == "q":
@@ -870,9 +923,8 @@ async def _create_from_diff(
 ) -> None:
     import sys
     from pylon._core import (
-        diff_schema_ops as _core_diff_schema_ops,
-        diff_schema_ops_with_renames_and_fills as _core_diff_schema_ops_with_renames_and_fills,
         diff_schema_steps_with_renames_and_fills as _core_diff_schema_steps_with_renames_and_fills,
+        missing_extension_ddl as _core_missing_extension_ddl,
         detect_fill_required as _core_detect_fill_required,
         render_migration_file,
         compute_migration_short_id,
@@ -960,37 +1012,53 @@ async def _create_from_diff(
         fill_candidates = _core_detect_fill_required(schema, db_state)
         fills = _fill_prompt_loop(fill_candidates, is_interactive, schema)
 
+        steps = _core_diff_schema_steps_with_renames_and_fills(
+            schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
+        )
+
         if is_interactive:
-            steps = _core_diff_schema_steps_with_renames_and_fills(
-                schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
-            )
             confirmed_ddl, quit_requested = _migration_prompt_loop(steps, schema, expert)
             if quit_requested:
                 raise click.ClickException("Aborted.")
             ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames) + confirmed_ddl
-        elif confirmed_type_renames or confirmed_col_renames or fills:
-            ops = _core_diff_schema_ops_with_renames_and_fills(
-                schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
-            )
         else:
-            ops = _core_diff_schema_ops(schema, db_state)
+            # Non-interactive: auto-accept every step (any required_input
+            # placeholder resolves to its own default expression).
+            ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames)
+            for step in steps:
+                ops.extend(step.resolved_ddl({}))
+
+    # A required Postgres extension (e.g. pgvector) isn't a design decision
+    # to confirm/reject — it's a hard prerequisite the rest of the DDL can't
+    # succeed without — so it's prepended unconditionally rather than routed
+    # through the per-step confirmation flow.
+    ext_ddl = _core_missing_extension_ddl(schema, db_state)
+    if ext_ddl:
+        ops = [(sql, False) for sql in ext_ddl] + ops
 
     if not ops:
         click.echo("No schema changes detected.")
         return
 
     # Non-interactive mode never got a per-step preview — show one summary
-    # before writing. Interactive mode already confirmed everything step by
-    # step, so there's nothing left to re-display (matches how the loop
-    # above goes straight to writing once every question is answered).
-    if not is_interactive:
-        has_concurrent = any(nt for _, nt in ops)
-        click.echo(f"\n{len(ops)} change(s):")
-        for sql, non_tx in ops:
-            marker = " [CONCURRENTLY]" if non_tx else ""
-            click.echo(f"  {sql.splitlines()[0]}{marker}")
-        if has_concurrent:
-            click.echo("\n  Note: CONCURRENTLY statements run outside a transaction wrapper.")
+    # before writing, one line per grouped step (not per raw DDL statement,
+    # matching the readability the interactive loop already has). Interactive
+    # mode already confirmed everything step by step, so there's nothing
+    # left to re-display.
+    if not is_interactive and not stop_early:
+        click.echo(f"\n{len(steps)} change(s):")
+        for step in steps:
+            snippet = step.python_snippet(schema)
+            if snippet is not None:
+                click.echo()
+                for line in snippet.splitlines():
+                    click.echo(f"  {line}")
+            else:
+                # No snippet for this step kind yet (e.g. modules) — fall
+                # back to the question text.
+                click.echo(f"  {step.prompt}")
+        if any(nt for _, nt in ops):
+            click.echo("\n  Note: some changes use CONCURRENTLY statements that run outside a transaction wrapper.")
 
     # Assemble migration body and write the file.
     body = _assemble_migration_body(ops)
