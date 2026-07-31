@@ -12,6 +12,7 @@ pub mod server;
 pub mod state;
 pub mod static_files;
 pub mod to_json;
+pub mod workers;
 
 pub use config::{load_config, Config};
 pub use error::{Error, Result};

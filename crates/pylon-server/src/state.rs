@@ -28,14 +28,32 @@ pub struct AppState {
     /// a real packaging decision in a later phase.
     static_dir: PathBuf,
     clients: Mutex<HashMap<String, Arc<pylon_client::Client>>>,
+    /// Opened once here (not per-connection) and handed to every `Client`
+    /// via `Builder::cache_handle` — `heed` (the LMDB binding
+    /// `pylon-cache` uses) refuses a second `Env::open` on the same
+    /// canonicalized path while an earlier handle is still alive in the
+    /// same process, which a naive per-connection `Builder::cache(path,
+    /// ...)` call would hit the moment a second named connection got
+    /// resolved (confirmed live: the second `Cache::open` call for the
+    /// same path returns `Err("environment already open in this
+    /// program...")` rather than silently deduping). `None` when
+    /// `[cache].enabled = false`.
+    pub cache: Option<Arc<pylon_cache::Cache>>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> crate::error::Result<Self> {
         let toml_dir = config.toml_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
         let schema_path = toml_dir.join(".pylon/schema.json");
         let static_dir = toml_dir.join(".pylon/static");
-        Self { config, schema_path, static_dir, clients: Mutex::new(HashMap::new()) }
+        let cache = if config.cache.enabled {
+            let cache = pylon_cache::Cache::open(&config.cache.path, config.cache.max_size_mb as usize)
+                .map_err(|e| crate::error::Error::Invalid(format!("failed to open cache at {}: {e}", config.cache.path.display())))?;
+            Some(Arc::new(cache))
+        } else {
+            None
+        };
+        Ok(Self { config, schema_path, static_dir, clients: Mutex::new(HashMap::new()), cache })
     }
 
     pub fn static_dir(&self) -> &std::path::Path {
@@ -54,11 +72,13 @@ impl AppState {
         if let Some(existing) = clients.get(key) {
             return Ok(Some(existing.clone()));
         }
-        let client = pylon_client::Client::builder(db.dsn_string())
+        let mut builder = pylon_client::Client::builder(db.dsn_string())
             .max_pool_size(db.pool_max_size as usize)
-            .schema_path(self.schema_path.clone())
-            .build()
-            .await?;
+            .schema_path(self.schema_path.clone());
+        if let Some(cache) = &self.cache {
+            builder = builder.cache_handle(cache.clone());
+        }
+        let client = builder.build().await?;
         let client = Arc::new(client);
         clients.insert(key.to_string(), client.clone());
         Ok(Some(client))

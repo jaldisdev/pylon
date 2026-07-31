@@ -25,6 +25,14 @@ use crate::value::Value;
 /// the ecosystem handle exactly this shape.
 pub type TxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// Either a `(path, max_size_mb)` this `Builder` should open itself, or an
+/// already-open handle a caller wants shared in as-is — see
+/// `Builder::cache`/`Builder::cache_handle`.
+enum CacheSource {
+    Open { path: PathBuf, max_size_mb: usize },
+    Shared(Arc<pylon_cache::Cache>),
+}
+
 /// Builds a [`Client`]. `dsn` is required up front (this crate never
 /// parses `pylon.toml` — see the crate-level docs); everything else has a
 /// sensible default.
@@ -32,7 +40,7 @@ pub struct Builder {
     dsn: String,
     max_pool_size: usize,
     schema_path: PathBuf,
-    cache: Option<(PathBuf, usize)>,
+    cache: Option<CacheSource>,
 }
 
 impl Builder {
@@ -69,8 +77,24 @@ impl Builder {
     /// Nothing evicts entries automatically here — pair this with a
     /// process elsewhere that invalidates the same directory (e.g.
     /// `pylon worker start`) if the underlying data changes while cached.
+    ///
+    /// Opens its own LMDB handle for `path` — `heed` (the LMDB binding this
+    /// crate uses) refuses a second `Env::open` on the same canonicalized
+    /// path while an earlier handle onto it is still alive within the same
+    /// process, so a caller building more than one `Client` that should
+    /// share one cache directory (e.g. one per named `pylon.toml`
+    /// connection) must use `Builder::cache_handle` with one already-open
+    /// `Arc<pylon_cache::Cache>` instead of calling this per client.
     pub fn cache(mut self, path: impl Into<PathBuf>, max_size_mb: usize) -> Self {
-        self.cache = Some((path.into(), max_size_mb));
+        self.cache = Some(CacheSource::Open { path: path.into(), max_size_mb });
+        self
+    }
+
+    /// Like `Builder::cache`, but attaches to an already-open handle instead
+    /// of opening a new one — see that method's doc comment for why this
+    /// exists.
+    pub fn cache_handle(mut self, cache: Arc<pylon_cache::Cache>) -> Self {
+        self.cache = Some(CacheSource::Shared(cache));
         self
     }
 
@@ -80,12 +104,13 @@ impl Builder {
     pub async fn build(self) -> Result<Client> {
         let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size).await.map_err(Error::Db)?;
         let schema = schema::load(&self.schema_path)?;
-        let cache = self
-            .cache
-            .map(|(path, max_size_mb)| {
-                pylon_cache::Cache::open(&path, max_size_mb).map(Arc::new).map_err(|e| Error::Cache(e.to_string()))
-            })
-            .transpose()?;
+        let cache = match self.cache {
+            None => None,
+            Some(CacheSource::Open { path, max_size_mb }) => {
+                Some(Arc::new(pylon_cache::Cache::open(&path, max_size_mb).map_err(|e| Error::Cache(e.to_string()))?))
+            }
+            Some(CacheSource::Shared(cache)) => Some(cache),
+        };
         Ok(Client {
             pool: Arc::new(pool),
             schema: Arc::new(RwLock::new(schema)),
@@ -161,6 +186,16 @@ impl Client {
     /// than returning a guard, same reasoning as every query method here.
     pub fn schema(&self) -> SchemaDescriptor {
         self.schema.read().unwrap().clone()
+    }
+
+    /// The `Arc<pylon_cache::Cache>` this client reads/writes through, if
+    /// `Builder::cache` was configured — for a caller (`pylon-server`'s
+    /// worker-wiring startup) that needs to attach a `CacheInvalidationWorker`
+    /// to the exact same LMDB handle this client's own read-through caching
+    /// uses, rather than opening a second one (LMDB refuses a second
+    /// `Env::open` on the same path within one process).
+    pub fn cache_handle(&self) -> Option<Arc<pylon_cache::Cache>> {
+        self.cache.clone()
     }
 
     pub async fn query(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Vec<Value>> {
