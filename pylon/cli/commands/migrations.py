@@ -465,6 +465,8 @@ def _reload_schema(config):
               help="Print the file content without writing it.")
 @click.option("--non-interactive", "non_interactive", is_flag=True, default=False,
               help="Skip the confirmation prompt (also the default when stdout is not a TTY).")
+@click.option("--expert", is_flag=True, default=False,
+              help="Terser prompts: hide DDL/schema previews by default (press 'l' to reveal).")
 @requires_config
 @click.pass_context
 def create(
@@ -473,6 +475,7 @@ def create(
     name: str | None,
     dry_run: bool,
     non_interactive: bool,
+    expert: bool,
 ) -> None:
     """Generate a new migration file.
 
@@ -483,7 +486,7 @@ def create(
     if blank:
         _create_blank(ctx, name, dry_run)
     else:
-        asyncio.run(_create_from_diff(ctx, name, dry_run, non_interactive))
+        asyncio.run(_create_from_diff(ctx, name, dry_run, non_interactive, expert))
 
 
 def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
@@ -516,116 +519,214 @@ def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
     click.echo("Edit the file, then run 'pylon migration rehash' to recompute its ID.")
 
 
-_RENAME_HELP = """\
-  y   — accept rename (emit ALTER … RENAME)
-  n   — reject (emit DROP + CREATE instead)
-  l   — show the DDL statement(s) for this change
-  c   — list all changes confirmed so far
-  b   — go back to the previous question
-  s   — stop rename prompts and write a migration from what's confirmed so far
-  q   — quit without writing anything
-  h/? — show this help"""
+_ACTIONS: list[tuple[str, tuple[str, str], str]] = [
+    ("y", ("y", "yes"), "Confirm the prompt"),
+    ("n", ("n", "no"),
+     "Reject the prompt; a rejected rename gets a fresh suggestion, anything else is left out of this migration"),
+    ("c", ("c", "confirmed"), "List already confirmed SQL statements for the current migration"),
+    ("b", ("b", "back"), "Go back a step by reverting the latest accepted statement(s)"),
+    ("s", ("s", "stop"), "Stop and finalize the migration with only the currently accepted changes"),
+    ("q", ("q", "quit"), "Quit without saving any changes"),
+]
+
+_ACTIONS_EXPERT: list[tuple[str, tuple[str, str], str]] = [
+    ("y", ("y", "yes"), 'Confirm the prompt ("l" to see the DDL statement(s))'),
+    ("n", ("n", "no"),
+     "Reject the prompt; a rejected rename gets a fresh suggestion, anything else is left out of this migration"),
+    ("l", ("l", "list"), "List the DDL statement(s) for this step"),
+    ("c", ("c", "confirmed"), "List already confirmed SQL statements for the current migration"),
+    ("b", ("b", "back"), "Go back a step by reverting the latest accepted statement(s)"),
+    ("s", ("s", "stop"), "Stop and finalize the migration with only the currently accepted changes"),
+    ("q", ("q", "quit"), "Quit without saving any changes"),
+]
+
+
+def _print_ddl(ddl: list[str]) -> None:
+    for sql in ddl:
+        for line in sql.splitlines():
+            click.echo(f"    {line}")
+
+
+def _ask_action(prompt_text: str, ddl: list[str], confirmed_so_far: list[str], expert: bool) -> str:
+    """Render one step (prompt, optional DDL preview, action menu) and return
+    a validated action key: y, n, b, s, or q. "l" and "c" are handled here —
+    they print and re-loop rather than returning.
+    """
+    choices = _ACTIONS_EXPERT if expert else _ACTIONS
+    hint = ",".join(key for key, _, _ in choices) + ",?"
+
+    click.echo(f"\n{prompt_text}")
+    if not expert:
+        click.echo()
+        click.echo("If so, the following DDL statement(s) will be applied:")
+        click.echo()
+        _print_ddl(ddl)
+        click.echo()
+        click.echo("Select an action:")
+        click.echo()
+        for _, aliases, help_text in choices:
+            click.echo(f'"{aliases[1]}" (or "{aliases[0]}"): {help_text}')
+        click.echo()
+
+    question = "Which action do you want to take?" if not expert else ""
+
+    while True:
+        raw = click.prompt(question, prompt_suffix=f" [{hint}] ").strip().lower()
+        matched = next((key for key, aliases, _ in choices if raw in aliases), None)
+        if matched == "l":
+            click.echo("The following DDL statement(s) will be applied:")
+            _print_ddl(ddl)
+        elif matched == "c":
+            if confirmed_so_far:
+                click.echo("Confirmed so far:")
+                _print_ddl(confirmed_so_far)
+            else:
+                click.echo("  (nothing confirmed yet)")
+        elif matched is not None:
+            return matched
+        elif raw in ("h", "?"):
+            for _, aliases, help_text in choices:
+                click.echo(f'"{aliases[1]}" (or "{aliases[0]}"): {help_text}')
+        else:
+            click.echo(f"  Unknown option. Enter one of: {hint}")
+
+
+def _rename_ddl(type_renames: list[tuple], col_renames: list[tuple]) -> list[tuple[str, bool]]:
+    """Render confirmed rename tuples back to (sql, non_transactional) pairs
+    — used both by the rename loop's own "confirmed"/"stop" display and to
+    assemble the final migration body alongside the general diff's DDL.
+    """
+    ops: list[tuple[str, bool]] = []
+    for old_mod, old_table, new_mod, new_table in type_renames:
+        if old_mod == new_mod:
+            ops.append((f'ALTER TABLE "{old_mod}"."{old_table}" RENAME TO "{new_table}";', False))
+        else:
+            ops.append((f'ALTER TABLE "{old_mod}"."{old_table}" SET SCHEMA "{new_mod}";', False))
+            ops.append((f'ALTER TABLE "{new_mod}"."{old_table}" RENAME TO "{new_table}";', False))
+    for module, table, old_col, new_col in col_renames:
+        ops.append((f'ALTER TABLE "{module}"."{table}" RENAME COLUMN "{old_col}" TO "{new_col}";', False))
+    return ops
 
 
 def _rename_prompt_loop(
-    type_candidates: list,
-    col_candidates: list,
-) -> tuple[list[tuple], list[tuple], bool]:
-    """Present each rename candidate interactively.
+    schema,
+    db_state,
+    expert: bool,
+) -> tuple[list[tuple], list[tuple], bool, bool]:
+    """Interactively resolve rename candidates one at a time.
 
-    Returns (confirmed_type_renames, confirmed_col_renames, quit_requested).
-    quit_requested=True means the user chose 'q' — caller should abort.
+    Rejecting a candidate bans it for the rest of this invocation (via
+    `Guidance`) and re-diffs, so the next question proposes a different
+    explanation (typically drop + create) instead of asking about the same
+    pair again — the one place Pylon's diff engine has real ambiguity to
+    search over; a rejected non-rename step has no alternative to search
+    for and is simply excluded (see `_migration_prompt_loop`).
+
+    Returns (confirmed_type_renames, confirmed_col_renames, quit_requested, stopped).
     """
-    # Build a flat list of prompt entries.
-    entries: list[dict] = []
-    for old_mod, old_table, new_mod, new_table, new_type_name, confidence in type_candidates:
-        pct = int(confidence * 100)
-        if old_mod == new_mod:
-            ddl = f'ALTER TABLE "{old_mod}"."{old_table}" RENAME TO "{new_table}";'
-        else:
-            ddl = (
-                f'ALTER TABLE "{old_mod}"."{old_table}" SET SCHEMA "{new_mod}";\n'
-                f'ALTER TABLE "{new_mod}"."{old_table}" RENAME TO "{new_table}";'
-            )
-        entries.append({
-            "question": f"did you rename type '{old_mod}::{old_table}' to '{new_type_name}' ({pct}%)?",
-            "ddl": ddl,
-            "kind": "type",
-            "data": (old_mod, old_table, new_mod, new_table),
-        })
-    for mod, table, old_col, new_col, pg_type in col_candidates:
-        entries.append({
-            "question": (
-                f"did you rename property '{old_col}' to '{new_col}' "
-                f"on '{mod}::{table}' ({pg_type})?"
-            ),
-            "ddl": f'ALTER TABLE "{mod}"."{table}" RENAME COLUMN "{old_col}" TO "{new_col}";',
-            "kind": "col",
-            "data": (mod, table, old_col, new_col),
-        })
+    from pylon._core import Guidance, detect_type_renames as _detect_type, detect_col_renames as _detect_col
 
-    if not entries:
-        return [], [], False
-
-    decisions: list[bool | None] = [None] * len(entries)
-    idx = 0
-
-    while idx < len(entries):
-        e = entries[idx]
-        click.echo(f"\n{e['question']}")
-
-        confirmed_ddls = [
-            entries[i]["ddl"] for i in range(len(entries)) if decisions[i] is True
-        ]
-
-        while True:
-            raw = click.prompt("", prompt_suffix="[y,n,l,c,b,s,q,?] ").strip().lower()
-            if raw == "y":
-                decisions[idx] = True
-                idx += 1
-                break
-            elif raw == "n":
-                decisions[idx] = False
-                idx += 1
-                break
-            elif raw == "l":
-                for line in e["ddl"].splitlines():
-                    click.echo(f"  {line}")
-            elif raw == "c":
-                if confirmed_ddls:
-                    click.echo("Confirmed so far:")
-                    for ddl in confirmed_ddls:
-                        for line in ddl.splitlines():
-                            click.echo(f"  {line}")
-                else:
-                    click.echo("  (nothing confirmed yet)")
-            elif raw == "b":
-                if idx > 0:
-                    idx -= 1
-                    decisions[idx] = None
-                else:
-                    click.echo("  Already at the first question.")
-                break  # re-enter outer loop at new idx
-            elif raw == "s":
-                # Stop prompting; write a migration from what's confirmed so far.
-                idx = len(entries)
-                break
-            elif raw == "q":
-                return [], [], True
-            elif raw in ("h", "?"):
-                click.echo(_RENAME_HELP)
-            else:
-                click.echo(f"  Unknown option. Enter y, n, l, c, b, s, q, or ?")
-
+    guidance = Guidance()
     confirmed_type: list[tuple] = []
     confirmed_col: list[tuple] = []
-    for i, e in enumerate(entries):
-        if decisions[i] is True:
-            if e["kind"] == "type":
-                confirmed_type.append(e["data"])
+    # Accepted decisions only, in order — "back" undoes the most recent one.
+    # A rejection isn't undoable via "back" either, matching how a plain
+    # step's "no" isn't reversible (nothing was recorded to undo).
+    history: list[tuple[str, tuple]] = []
+
+    while True:
+        type_candidates = [
+            c for c in _detect_type(schema, db_state, guidance)
+            if (c[0], c[1], c[2], c[3]) not in confirmed_type
+        ]
+        col_candidates = [
+            c for c in _detect_col(schema, db_state, guidance)
+            if (c[0], c[1], c[2], c[3]) not in confirmed_col
+        ]
+        if not type_candidates and not col_candidates:
+            return confirmed_type, confirmed_col, False, False
+
+        if type_candidates:
+            old_mod, old_table, new_mod, new_table, new_type_name, _confidence = type_candidates[0]
+            if old_mod == new_mod:
+                ddl = [f'ALTER TABLE "{old_mod}"."{old_table}" RENAME TO "{new_table}";']
             else:
-                confirmed_col.append(e["data"])
-    return confirmed_type, confirmed_col, False
+                ddl = [
+                    f'ALTER TABLE "{old_mod}"."{old_table}" SET SCHEMA "{new_mod}";',
+                    f'ALTER TABLE "{new_mod}"."{old_table}" RENAME TO "{new_table}";',
+                ]
+            prompt = f"did you rename object type '{old_mod}::{old_table}' to '{new_type_name}'?"
+            kind, data = "type", (old_mod, old_table, new_mod, new_table)
+        else:
+            module, table, old_col, new_col, _pg_type = col_candidates[0]
+            ddl = [f'ALTER TABLE "{module}"."{table}" RENAME COLUMN "{old_col}" TO "{new_col}";']
+            prompt = f"did you rename property '{old_col}' of object type '{module}::{table}' to '{new_col}'?"
+            kind, data = "col", (module, table, old_col, new_col)
+
+        confirmed_so_far = [sql for sql, _ in _rename_ddl(confirmed_type, confirmed_col)]
+        action = _ask_action(prompt, ddl, confirmed_so_far, expert)
+
+        if action == "y":
+            (confirmed_type if kind == "type" else confirmed_col).append(data)
+            history.append((kind, data))
+        elif action == "n":
+            if kind == "type":
+                guidance.ban_type_rename(*data)
+            else:
+                guidance.ban_col_rename(*data)
+        elif action == "b":
+            if not history:
+                click.echo("  Already at the first question.")
+                continue
+            prev_kind, prev_data = history.pop()
+            (confirmed_type if prev_kind == "type" else confirmed_col).remove(prev_data)
+        elif action == "s":
+            return confirmed_type, confirmed_col, False, True
+        elif action == "q":
+            return confirmed_type, confirmed_col, True, False
+
+
+def _migration_prompt_loop(steps: list, expert: bool) -> tuple[list[tuple[str, bool]], bool]:
+    """Interactively walk each general create/alter/drop step one at a time.
+
+    Returns (confirmed, quit_requested). `confirmed` is a list of
+    (sql, non_transactional) tuples, the same shape `_assemble_migration_body`
+    already expects.
+    """
+    decisions: list[str | None] = [None] * len(steps)
+    idx = 0
+
+    while idx < len(steps):
+        step = steps[idx]
+        ddl = [sql for sql, _ in step.ddl]
+        confirmed_so_far = [
+            sql for i, s in enumerate(steps) if decisions[i] == "y" for sql, _ in s.ddl
+        ]
+
+        action = _ask_action(step.prompt, ddl, confirmed_so_far, expert)
+
+        if action == "y":
+            decisions[idx] = "y"
+            idx += 1
+        elif action == "n":
+            decisions[idx] = "n"
+            idx += 1
+        elif action == "b":
+            if idx == 0:
+                click.echo("  Already at the first question.")
+                continue
+            idx -= 1
+            decisions[idx] = None
+        elif action == "s":
+            break
+        elif action == "q":
+            return [], True
+
+    confirmed: list[tuple[str, bool]] = []
+    for i, step in enumerate(steps):
+        if decisions[i] == "y":
+            confirmed.extend(step.ddl)
+    return confirmed, False
 
 
 def _fill_prompt_loop(
@@ -700,14 +801,14 @@ async def _create_from_diff(
     name: str | None,
     dry_run: bool,
     non_interactive: bool,
+    expert: bool,
 ) -> None:
     import sys
     from pylon._core import (
         diff_schema_ops as _core_diff_schema_ops,
-        detect_type_renames as _core_detect_type_renames,
-        detect_col_renames as _core_detect_col_renames,
-        detect_fill_required as _core_detect_fill_required,
         diff_schema_ops_with_renames_and_fills as _core_diff_schema_ops_with_renames_and_fills,
+        diff_schema_steps_with_renames_and_fills as _core_diff_schema_steps_with_renames_and_fills,
+        detect_fill_required as _core_detect_fill_required,
         render_migration_file,
         compute_migration_short_id,
         db_state_from_json,
@@ -766,53 +867,65 @@ async def _create_from_diff(
     else:
         db_state = await introspect_db_state(pool)
 
-    # ── Rename detection (interactive) ────────────────────────────────────────
     confirmed_type_renames: list[tuple[str, str, str, str]] = []
     confirmed_col_renames: list[tuple[str, str, str, str]] = []
-
     is_interactive = not non_interactive and sys.stdout.isatty()
+    stop_early = False
 
     if is_interactive:
-        type_candidates = _core_detect_type_renames(schema, db_state)
-        col_candidates = _core_detect_col_renames(schema, db_state)
+        if not expert:
+            click.echo("Running in interactive mode.")
+            click.echo("HINT: Use `--expert` to run with less detailed prompts, or `--non-interactive`")
+            click.echo("      to attempt to apply migrations without user input.")
 
-        if type_candidates or col_candidates:
-            confirmed_type_renames, confirmed_col_renames, quit_requested = (
-                _rename_prompt_loop(type_candidates, col_candidates)
+        # ── Rename detection ───────────────────────────────────────────────
+        confirmed_type_renames, confirmed_col_renames, quit_requested, stop_early = (
+            _rename_prompt_loop(schema, db_state, expert)
+        )
+        if quit_requested:
+            raise click.ClickException("Aborted.")
+
+    if stop_early:
+        # "stop" during rename prompts: finalize with only what's been
+        # confirmed so far, skipping fill detection and the general diff
+        # entirely — same semantics as "stop" anywhere else in the flow.
+        ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames)
+    else:
+        # ── Fill expression detection ──────────────────────────────────────
+        fill_candidates = _core_detect_fill_required(schema, db_state)
+        fills = _fill_prompt_loop(fill_candidates, is_interactive, schema)
+
+        if is_interactive:
+            steps = _core_diff_schema_steps_with_renames_and_fills(
+                schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
             )
+            confirmed_ddl, quit_requested = _migration_prompt_loop(steps, expert)
             if quit_requested:
                 raise click.ClickException("Aborted.")
-
-    # ── Fill expression detection ─────────────────────────────────────────────
-    fill_candidates = _core_detect_fill_required(schema, db_state)
-    fills = _fill_prompt_loop(fill_candidates, is_interactive, schema)
-
-    # ── Compute final diff ────────────────────────────────────────────────────
-    if confirmed_type_renames or confirmed_col_renames or fills:
-        ops = _core_diff_schema_ops_with_renames_and_fills(
-            schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
-        )
-    else:
-        ops = _core_diff_schema_ops(schema, db_state)
+            ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames) + confirmed_ddl
+        elif confirmed_type_renames or confirmed_col_renames or fills:
+            ops = _core_diff_schema_ops_with_renames_and_fills(
+                schema, db_state, confirmed_type_renames, confirmed_col_renames, fills
+            )
+        else:
+            ops = _core_diff_schema_ops(schema, db_state)
 
     if not ops:
         click.echo("No schema changes detected.")
         return
 
-    # Show proposed changes.
-    has_concurrent = any(nt for _, nt in ops)
-    click.echo(f"\n{len(ops)} proposed change(s):")
-    for sql, non_tx in ops:
-        marker = " [CONCURRENTLY]" if non_tx else ""
-        click.echo(f"  {sql.splitlines()[0]}{marker}")
-    if has_concurrent:
-        click.echo("\n  Note: CONCURRENTLY statements run outside a transaction wrapper.")
-
-    # Final write confirmation (always ask unless --non-interactive or no TTY).
-    if is_interactive:
-        click.echo()
-        if not click.confirm("Write migration?"):
-            raise click.ClickException("Aborted.")
+    # Non-interactive mode never got a per-step preview — show one summary
+    # before writing. Interactive mode already confirmed everything step by
+    # step, so there's nothing left to re-display (matches how the loop
+    # above goes straight to writing once every question is answered).
+    if not is_interactive:
+        has_concurrent = any(nt for _, nt in ops)
+        click.echo(f"\n{len(ops)} change(s):")
+        for sql, non_tx in ops:
+            marker = " [CONCURRENTLY]" if non_tx else ""
+            click.echo(f"  {sql.splitlines()[0]}{marker}")
+        if has_concurrent:
+            click.echo("\n  Note: CONCURRENTLY statements run outside a transaction wrapper.")
 
     # Assemble migration body and write the file.
     body = _assemble_migration_body(ops)
