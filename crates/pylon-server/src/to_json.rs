@@ -148,8 +148,18 @@ pub fn compile_error_payload(err: &pylon_core::error::PyQLError) -> Json {
 /// Error payload for anything else (`pylon_client::Error`) — no compile
 /// position to report, just a message and a coarse error-kind label.
 pub fn client_error_payload(err: &pylon_client::Error) -> Json {
-    if let pylon_client::Error::Compile(e) = err {
-        return compile_error_payload(e);
+    match err {
+        pylon_client::Error::Compile(e) => compile_error_payload(e),
+        // `tokio_postgres::Error`'s own `Display` collapses every real
+        // server-side failure to the generic string `"db error"` — the
+        // actual detail (e.g. a unique-constraint violation's message)
+        // lives one level deeper, in `pg_message()`. Discovered live while
+        // testing this endpoint against a real Postgres, not a Python-
+        // parity concern (Python surfaces the equivalent detail via
+        // asyncpg's own typed exceptions).
+        pylon_client::Error::Db(e) => {
+            serde_json::json!({"error": e.pg_message(), "errorType": "PylonExecutionError"})
+        }
+        _ => serde_json::json!({"error": err.to_string(), "errorType": "PylonExecutionError"}),
     }
-    serde_json::json!({"error": err.to_string(), "errorType": "PylonExecutionError"})
 }

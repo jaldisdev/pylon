@@ -1,6 +1,7 @@
 //! Native Rust HTTP server backing `pylon serve` — see the project memory
 //! `project-rust-server-backlog` for the full migration plan.
 
+pub mod ai_chat;
 pub mod config;
 pub mod config_options;
 pub mod error;

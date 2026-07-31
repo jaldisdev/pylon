@@ -129,8 +129,12 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
                 Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
             };
         }
-        // `/ai/chat` lands in Phase 6; `/api/schema`/`/api/globals` (no
-        // connection segment) land in Phase 5.
+        if method == Method::POST && rest == "/ai/chat" {
+            return match crate::json::read_json_body(req).await {
+                Ok(body) => crate::ai_chat::handle_ai_chat(state.clone(), &connection, body).await,
+                Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
+            };
+        }
     }
 
     if state.config.ui.enabled {
