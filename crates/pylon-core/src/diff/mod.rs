@@ -1106,6 +1106,68 @@ pub fn diff_schema_ops_with_renames_and_fills(
     Ok(ops)
 }
 
+/// Like `diff_schema_ops_with_renames_and_fills` but returns `MigrationStep`s
+/// grouped by object instead of a flat `DiffOp` list — for the interactive
+/// confirmation loop. Renames themselves aren't represented as steps here;
+/// the caller resolves those first (see `detect_type_renames`/
+/// `detect_col_renames` + `Guidance`) and passes the confirmed set in, same
+/// as the flat-`DiffOp` version. A fill's `UPDATE` + `SET NOT NULL` folds
+/// into its own table's step (falling back to a standalone step in the rare
+/// case that table has no other change in this diff).
+pub fn diff_schema_steps_with_renames_and_fills(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    type_renames: &[(String, String, String, String)],
+    col_renames: &[(String, String, String, String)],
+    fills: &[(String, String, String, String)],
+) -> Result<Vec<MigrationStep>, String> {
+    let mut modified = current.clone();
+
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        if let Some(t) = modified.tables.iter_mut()
+            .find(|t| &t.schema == old_mod && &t.name == old_table)
+        {
+            t.schema = new_mod.clone();
+            t.name = new_table.clone();
+        }
+    }
+    for (module, table, old_col, new_col) in col_renames {
+        if let Some(t) = modified.tables.iter_mut()
+            .find(|t| &t.schema == module && &t.name == table)
+        {
+            if let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col) {
+                col.name = new_col.clone();
+            }
+        }
+    }
+
+    let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for (module, table, col, _) in fills {
+        fill_index.entry((module.clone(), table.clone())).or_default().insert(col.clone());
+    }
+
+    let mut steps = diff_inner(target, &modified, true, &fill_index)?;
+
+    for (module, table, col, fill_expr) in fills {
+        let fill_ops = vec![
+            DiffOp { sql: format!("UPDATE {} SET {} = {} WHERE {} IS NULL;", qn(module, table), qi(col), fill_expr, qi(col)), non_transactional: false },
+            DiffOp { sql: format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;", qn(module, table), qi(col)), non_transactional: false },
+        ];
+        match steps.iter_mut().find(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == module && t == table)) {
+            Some(step) => step.ddl.extend(fill_ops),
+            None => steps.push(MigrationStep {
+                prompt: format!("did you {} {}?", Verb::Alter.as_str(), verbosename_type(module, table)),
+                verb: Verb::Alter,
+                object_desc: verbosename_type(module, table),
+                ddl: fill_ops,
+                op_key: OpKey::Table(module.clone(), table.clone()),
+            }),
+        }
+    }
+
+    Ok(steps)
+}
+
 // ── Identifier helpers ────────────────────────────────────────────────────────
 
 fn qi(s: &str) -> String {
