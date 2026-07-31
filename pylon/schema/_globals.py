@@ -132,7 +132,7 @@ def collect_all_globals(schema_dir: Path, modules: list[Any] | None = None) -> l
     instance, or an enum/named-tuple class.
 
     Shared by pylon._finalize.finalize() (which stringifies the result away
-    when handing it to the Rust walker) and pylon.server.asgi's /api/globals
+    when handing it to the Rust walker) and pylon-server's /api/globals
     handler (which needs the real, structured type to render a proper
     typeName string for non-scalar globals — see _global_type_text)."""
     result: list[GlobalDescriptor] = []

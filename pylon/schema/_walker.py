@@ -484,10 +484,9 @@ def _domain_type_ref(scalar_type: Any) -> str | None:
 
 
 # Canonical PyQL-style type names for every built-in Pylon scalar marker
-# class (pylon.Str, pylon.UUID, ...) — mirrors `pylon.server.asgi`'s own
-# `_TYPE_NAME_BY_CLASS` (duplicated here rather than imported: the server
-# is being migrated to Rust, so schema-descriptor construction needs to
-# work with zero server-layer involvement).
+# class (pylon.Str, pylon.UUID, ...) — mirrors `pylon-server`'s own
+# type-name table (duplicated here rather than imported: schema-descriptor
+# construction needs to work with zero server-layer involvement).
 _PYQL_TYPE_NAME_BY_CLASS = {
     "Str": "std::str",
     "Int16": "std::int16",

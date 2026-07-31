@@ -1,5 +1,6 @@
-//! Native Rust HTTP server backing `pylon serve` — see the project memory
-//! `project-rust-server-backlog` for the full migration plan.
+//! Native Rust HTTP server, run as the standalone `pylon-server` binary —
+//! see the project memory `project-rust-server-backlog` for the full
+//! migration plan.
 
 pub mod ai_chat;
 pub mod config_options;

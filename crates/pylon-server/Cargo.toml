@@ -29,6 +29,7 @@ hex = "0.4"
 # integers as ISO-8601 strings for JSON responses. Naive types only, no
 # "clock"/timezone-database features required.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+include_dir = "0.7.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
