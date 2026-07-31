@@ -1200,13 +1200,16 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 6: FK constraints for existing tables ───────────────────────────
+    // ── Phase 6: FK constraints for new and existing tables ───────────────────
+    // Must run for brand-new tables too (`emit_create_table` only emits plain
+    // `uuid` link columns, never a `REFERENCES` clause) — a table absent from
+    // `cur_tables` still needs every one of its FKs added, just against an
+    // empty "already has" set instead of an introspected one.
     for &i in &sort_order {
         let td = &target.types[i];
         if td.abstract_ || td.junction { continue; }
-        if let Some(existing) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) {
-            emit_fk_diff(td, existing, &type_map, &mut ops);
-        }
+        let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str())).copied();
+        emit_fk_diff(td, existing, &type_map, &mut ops);
     }
 
     // ── Phase 7: junction tables for new multi-links (and junction-backed
@@ -1817,15 +1820,15 @@ fn emit_column_diff(
 
 fn emit_fk_diff(
     td: &TypeDescriptor,
-    existing: &DbTable,
+    existing: Option<&DbTable>,
     type_map: &HashMap<String, (&str, &str)>,
     ops: &mut Vec<DiffOp>,
 ) {
     use crate::schema::{DeleteAction, DeleteSide};
 
-    let existing_fk_names: HashSet<&str> = existing.foreign_keys.iter()
-        .map(|fk| fk.constraint_name.as_str())
-        .collect();
+    let existing_fk_names: HashSet<&str> = existing
+        .map(|e| e.foreign_keys.iter().map(|fk| fk.constraint_name.as_str()).collect())
+        .unwrap_or_default();
 
     for l in &td.links {
         if l.is_junction_backed() { continue; }
@@ -2172,6 +2175,38 @@ mod tests {
         assert!(
             joined.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"catalog\".\"Product\""),
             "new table must get the cache-invalidation trigger; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_new_table_with_plain_link_gets_its_fk_constraint() {
+        // Regression guard: a brand-new table's `emit_create_table` only ever
+        // emits a plain `uuid` column for a single link — the FK constraint
+        // itself comes from Phase 6 (`emit_fk_diff`), which used to run only
+        // for tables already present in `cur_tables`, silently skipping every
+        // link on a table created in the same diff pass.
+        let mut order = simple_type("default", "Order", "Order");
+        order.links.push(LinkDescriptor {
+            name: "customer".into(),
+            target: "default::Person".into(),
+            nullable: false,
+            through: None,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        });
+        let schema = SchemaDescriptor {
+            types: vec![order, simple_type("default", "Person", "Person")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
+        let joined = ops.join("\n");
+        assert!(
+            joined.contains("ADD CONSTRAINT \"Order_customer_fkey\" FOREIGN KEY (\"customer_id\") REFERENCES \"public\".\"Person\"(id)"),
+            "new table's plain link must get its FK constraint in the same diff; got:\n{joined}"
         );
     }
 
