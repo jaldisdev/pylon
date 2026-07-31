@@ -815,7 +815,9 @@ def _make_computed_desc(name: str, meta: Any, _core: Any) -> Any:
     return _core.ComputedDescriptor(
         name=name,
         expression=meta.expression,
-        return_type=None,  # resolved by compiler, not walker
+        # The user's own declared `Computed[ReturnType, "expr"]` type — same
+        # helper _make_property_desc uses for a plain property's pg_type.
+        return_type=_to_pg_type(meta.scalar_type),
     )
 
 
