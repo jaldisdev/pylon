@@ -13,8 +13,7 @@ dependencies = [
     "click>=8.4.2",
     "prompt_toolkit>=3.0.52",
     "httpx>=0.28.1",
-    "watchfiles>=1.2",
-    "uvicorn>=0.51.0"
+    "watchfiles>=1.2"
 ]
 
 [project.optional-dependencies]

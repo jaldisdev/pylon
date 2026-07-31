@@ -23,5 +23,5 @@ fn main() {
         config.webserver.host,
         config.webserver.port,
     );
-    pylon_server::run(config).unwrap();
+    pylon_server::run(config, None).unwrap();
 }

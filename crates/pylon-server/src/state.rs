@@ -21,11 +21,15 @@ pub struct AppState {
     /// directory (mirrors how `[cache].path` and `[project].schema-dir`
     /// are both resolved relative to it too).
     schema_path: PathBuf,
-    /// Directory a production build of the frontend is copied into —
-    /// mirrors `asgi.py::STATIC_DIR`. Placeholder location (no build
-    /// output is shipped yet on the Python side either, so this simply
-    /// 404s in practice today, same as the system it's replacing) pending
-    /// a real packaging decision in a later phase.
+    /// Directory the production frontend build is served from — mirrors
+    /// `asgi.py::STATIC_DIR` (`Path(__file__).parent / "static"`, i.e.
+    /// package-install-relative, not project-relative). This crate has no
+    /// notion of "where is the installed `pylon` package" on its own —
+    /// `static_dir_override` (threaded down from `run`) is how the pyo3
+    /// binding supplies that, computed on the Python side where `__file__`
+    /// is meaningful. Falls back to `.pylon/static` relative to
+    /// `pylon.toml`'s own directory when `None` (this crate's own examples/
+    /// tests run standalone, with no installed Python package to ask).
     static_dir: PathBuf,
     clients: Mutex<HashMap<String, Arc<pylon_client::Client>>>,
     /// Opened once here (not per-connection) and handed to every `Client`
@@ -42,10 +46,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> crate::error::Result<Self> {
+    pub fn new(config: Config, static_dir_override: Option<PathBuf>) -> crate::error::Result<Self> {
         let toml_dir = config.toml_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
         let schema_path = toml_dir.join(".pylon/schema.json");
-        let static_dir = toml_dir.join(".pylon/static");
+        let static_dir = static_dir_override.unwrap_or_else(|| toml_dir.join(".pylon/static"));
         let cache = if config.cache.enabled {
             let cache = pylon_cache::Cache::open(&config.cache.path, config.cache.max_size_mb as usize)
                 .map_err(|e| crate::error::Error::Invalid(format!("failed to open cache at {}: {e}", config.cache.path.display())))?;
