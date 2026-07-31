@@ -134,6 +134,7 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
     let path = req.uri().path().to_string();
 
     if method == Method::GET && path == "/metrics" && state.config.metrics.enabled {
+        state.record_pool_metrics().await;
         return crate::json::text_response(
             StatusCode::OK,
             "text/plain; version=0.0.4; charset=utf-8",

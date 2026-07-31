@@ -74,4 +74,16 @@ impl AppState {
         clients.insert(key.to_string(), client.clone());
         Ok(Some(client))
     }
+
+    /// Samples every currently-connected client's pool accounting
+    /// (size/available/waiting/max_size) into the `pylon_pgcon_pool_*`
+    /// Prometheus gauges, labeled by connection name — called right before
+    /// rendering `/metrics`. Only already-connected clients are sampled; a
+    /// named connection nothing has touched yet has no pool to sample.
+    pub async fn record_pool_metrics(&self) {
+        let clients = self.clients.lock().await;
+        for (name, client) in clients.iter() {
+            pylon_workers::metrics::record_pool_status(name, &client.raw_connection().status());
+        }
+    }
 }

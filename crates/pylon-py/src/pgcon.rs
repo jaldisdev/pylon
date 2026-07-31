@@ -372,16 +372,6 @@ impl PgconPool {
         })
     }
 
-    /// Samples this pool's current connection accounting (size/available/
-    /// waiting/max_size) into the `pylon_pgcon_pool_*` Prometheus gauges,
-    /// labeled `connection`. Synchronous — `deadpool`'s `.status()` is a
-    /// point-in-time read with no I/O. Called from `pylon serve`'s
-    /// `/metrics` route (`pylon/server/asgi.py`) right before rendering,
-    /// once per live `Client` connection.
-    fn record_pool_metrics(&self, connection: &str) {
-        pylon_workers::metrics::record_pool_status(connection, &self.inner.status());
-    }
-
     /// Starts an explicit transaction on a fresh pooled connection.
     /// `isolation` is one of `"read_uncommitted"`, `"read_committed"`,
     /// `"repeatable_read"`, `"serializable"` — the same values
@@ -578,28 +568,6 @@ impl PgconListener {
             inner.listen(&channel).await.map_err(pgcon_err)?;
             callbacks.lock().unwrap().insert(channel, callback);
             Ok(())
-        })
-    }
-
-    /// Matches `asyncpg.Connection.remove_listener(channel, callback)`'s
-    /// signature; `callback` is accepted but not consulted since this
-    /// registry only ever holds one callback per channel.
-    fn remove_listener<'py>(&self, py: Python<'py>, channel: String, _callback: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let callbacks = self.callbacks.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            inner.unlisten(&channel).await.map_err(pgcon_err)?;
-            callbacks.lock().unwrap().remove(&channel);
-            Ok(())
-        })
-    }
-
-    fn query<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows = inner.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
         })
     }
 

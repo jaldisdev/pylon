@@ -152,21 +152,11 @@ fn run_opensearch_worker<'py>(
     })
 }
 
-/// Renders every metric registered so far against the process-global
-/// `prometheus` registry (worker job counts, cache invalidations, ...) as
-/// Prometheus text exposition format — see `pylon_workers::metrics`. Called
-/// from `pylon serve`'s `/metrics` route (`pylon/server/asgi.py`).
-#[pyfunction]
-fn render_prometheus_metrics() -> String {
-    pylon_workers::metrics::render()
-}
-
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_cache_invalidation_worker, m)?)?;
     m.add_function(wrap_pyfunction!(run_cache_invalidation_worker_shared, m)?)?;
     m.add_function(wrap_pyfunction!(run_vector_worker, m)?)?;
     m.add_function(wrap_pyfunction!(run_meilisearch_worker, m)?)?;
     m.add_function(wrap_pyfunction!(run_opensearch_worker, m)?)?;
-    m.add_function(wrap_pyfunction!(render_prometheus_metrics, m)?)?;
     Ok(())
 }
