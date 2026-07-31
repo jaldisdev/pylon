@@ -599,8 +599,52 @@ pub struct MigrationStep {
     /// e.g. `"scalar type 'perspective::DomainStatus'"`.
     pub object_desc: String,
     /// Every statement that answers this one question, in emission order.
+    /// A statement may contain a `\(placeholder)` token — see
+    /// `required_input` — that the caller must substitute before executing it.
     pub ddl: Vec<DiffOp>,
     pub op_key: OpKey,
+    /// Free-form expressions the caller must supply before this step's `ddl`
+    /// is usable — e.g. a conversion expression for a property's type
+    /// change. Empty for the common case.
+    pub required_input: Vec<RequiredInput>,
+}
+
+impl MigrationStep {
+    /// This step's DDL with every `\(placeholder)` token substituted —
+    /// `overrides.get(placeholder)` if present, else that input's own
+    /// `default_expr`. Statements naming no placeholder pass through as-is.
+    pub fn resolved_ddl(&self, overrides: &HashMap<String, String>) -> Vec<DiffOp> {
+        self.ddl
+            .iter()
+            .map(|op| {
+                let mut sql = op.sql.clone();
+                for input in &self.required_input {
+                    let value = overrides.get(&input.placeholder).unwrap_or(&input.default_expr);
+                    sql = sql.replace(&format!("\\({})", input.placeholder), value);
+                }
+                DiffOp { sql, non_transactional: op.non_transactional }
+            })
+            .collect()
+    }
+}
+
+/// One `\(placeholder)` token embedded in a step's DDL that the caller must
+/// resolve to a PyQL expression (compiled via `query::compile_fill_expr`,
+/// evaluated against `type_name`) before executing that statement — mirrors
+/// how a fill expression is resolved, just for a type-change's conversion
+/// expression instead of a backfill.
+#[derive(Debug, Clone)]
+pub struct RequiredInput {
+    /// The `\(name)` token to substitute in the owning step's DDL text.
+    pub placeholder: String,
+    /// Prompt text for the caller to show the user.
+    pub prompt: String,
+    /// A reasonable default expression — the caller may offer this and
+    /// accept it on an empty response, matching how a fill's declared
+    /// default is offered.
+    pub default_expr: String,
+    /// Qualified type name to compile the user's PyQL expression against.
+    pub type_name: String,
 }
 
 fn verbosename_module(name: &str) -> String {
@@ -628,11 +672,12 @@ fn verbosename_function(module: &str, name: &str) -> String {
 
 /// Accumulates `DiffOp`s into `MigrationStep`s keyed by `OpKey`, preserving
 /// first-insertion order. A key's verb/description are fixed by whichever
-/// call inserts it first; later calls under the same key just append DDL.
+/// call inserts it first; later calls under the same key just append DDL
+/// (and any required-input entries).
 #[derive(Default)]
 struct StepBuilder {
     order: Vec<OpKey>,
-    drafts: HashMap<OpKey, (Verb, String, Vec<DiffOp>)>,
+    drafts: HashMap<OpKey, (Verb, String, Vec<DiffOp>, Vec<RequiredInput>)>,
 }
 
 impl StepBuilder {
@@ -645,14 +690,28 @@ impl StepBuilder {
     }
 
     fn extend(&mut self, key: OpKey, verb: Verb, object_desc: impl Into<String>, ops: Vec<DiffOp>) {
-        if ops.is_empty() {
+        self.extend_with_input(key, verb, object_desc, ops, vec![]);
+    }
+
+    fn extend_with_input(
+        &mut self,
+        key: OpKey,
+        verb: Verb,
+        object_desc: impl Into<String>,
+        ops: Vec<DiffOp>,
+        inputs: Vec<RequiredInput>,
+    ) {
+        if ops.is_empty() && inputs.is_empty() {
             return;
         }
         use std::collections::hash_map::Entry;
         match self.drafts.entry(key.clone()) {
-            Entry::Occupied(mut e) => e.get_mut().2.extend(ops),
+            Entry::Occupied(mut e) => {
+                e.get_mut().2.extend(ops);
+                e.get_mut().3.extend(inputs);
+            }
             Entry::Vacant(e) => {
-                e.insert((verb, object_desc.into(), ops));
+                e.insert((verb, object_desc.into(), ops, inputs));
                 self.order.push(key);
             }
         }
@@ -663,9 +722,9 @@ impl StepBuilder {
         order
             .into_iter()
             .map(|key| {
-                let (verb, object_desc, ddl) = drafts.remove(&key).unwrap();
+                let (verb, object_desc, ddl, required_input) = drafts.remove(&key).unwrap();
                 let prompt = format!("did you {} {}?", verb.as_str(), object_desc);
-                MigrationStep { prompt, verb, object_desc, ddl, op_key: key }
+                MigrationStep { prompt, verb, object_desc, ddl, op_key: key, required_input }
             })
             .collect()
     }
@@ -717,8 +776,15 @@ pub fn diff_schema_steps(
     diff_inner(target, current, true, fill_index)
 }
 
+/// Flattens steps to a plain `DiffOp` list for every non-interactive caller
+/// (`watch`, `diff_schema_ops`, squash) — resolving any `\(placeholder)`
+/// token to its `RequiredInput::default_expr` along the way, since these
+/// callers have no interactive loop to ask the user for an override. The
+/// interactive path (`diff_schema_steps`) returns `MigrationStep`s
+/// untouched instead, placeholders and all, for the caller to resolve itself.
 fn flatten_ops(steps: Vec<MigrationStep>) -> Vec<DiffOp> {
-    steps.into_iter().flat_map(|s| s.ddl).collect()
+    let no_overrides = HashMap::new();
+    steps.iter().flat_map(|s| s.resolved_ddl(&no_overrides)).collect()
 }
 
 /// Diff two live-database snapshots (used by squash to capture the net effect
@@ -1160,6 +1226,7 @@ pub fn diff_schema_steps_with_renames_and_fills(
                 verb: Verb::Alter,
                 object_desc: verbosename_type(module, table),
                 ddl: fill_ops,
+                required_input: vec![],
                 op_key: OpKey::Table(module.clone(), table.clone()),
             }),
         }
@@ -1450,8 +1517,9 @@ fn diff_inner(
                     .cloned()
                     .unwrap_or_default();
                 let mut local: Vec<DiffOp> = Vec::new();
-                emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target);
-                steps.extend(OpKey::Table(td.module.clone(), td.table.clone()), Verb::Alter, verbosename_type(&td.module, &td.name), local);
+                let mut inputs: Vec<RequiredInput> = Vec::new();
+                emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target, &mut inputs);
+                steps.extend_with_input(OpKey::Table(td.module.clone(), td.table.clone()), Verb::Alter, verbosename_type(&td.module, &td.name), local, inputs);
             }
         }
     }
@@ -1974,6 +2042,7 @@ fn emit_column_diff(
     for_migration: bool,
     fill_cols: &HashSet<String>,
     schema: &SchemaDescriptor,
+    required_input: &mut Vec<RequiredInput>,
 ) {
     let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter()
         .map(|c| (c.name.as_str(), c))
@@ -2035,9 +2104,27 @@ fn emit_column_diff(
             push_tx(ops, format!("DROP VIEW IF EXISTS {};", qn(m, n)));
         }
         for (col, target_type) in &type_changes {
+            // The conversion expression is a placeholder, not a blind cast —
+            // an interactive caller offers `default_expr` (identical to what
+            // this used to emit unconditionally) and lets the user override
+            // it with their own PyQL expression before substituting it in;
+            // `diff_schema_ops`/`watch` callers that never resolve any
+            // `required_input` still get the exact same default behavior via
+            // `RequiredInput::default_expr`-as-fallback at the CLI layer.
+            let placeholder = format!("cast_expr__{col}");
+            let default_expr = format!("{}::{target_type}", qi(col));
+            required_input.push(RequiredInput {
+                placeholder: placeholder.clone(),
+                prompt: format!(
+                    "Please specify a conversion expression to alter the type of property '{col}' of {}",
+                    verbosename_type(&td.module, &td.name),
+                ),
+                default_expr,
+                type_name: format!("{}::{}", td.module, td.name),
+            });
             push_tx(ops, format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
-                qn(&td.module, &td.table), qi(col), target_type, qi(col), target_type
+                "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING \\({});",
+                qn(&td.module, &td.table), qi(col), target_type, placeholder
             ));
         }
         for (_, _, ddl) in &affected_views {
@@ -2780,6 +2867,47 @@ mod tests {
         assert!(
             joined.contains("ALTER TABLE \"public\".\"Person\" ALTER COLUMN \"rating\" TYPE int8 USING \"rating\"::int8;"),
             "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_property_type_change_surfaces_a_required_cast_expression_step() {
+        let mut td = simple_type("default", "Person", "Person");
+        td.properties.push(prop("rating", "int8", true));
+        let schema = SchemaDescriptor {
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn { name: "rating".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+
+        let steps = diff_schema_steps(&schema, &state, &HashMap::new()).unwrap();
+        let step = steps.iter()
+            .find(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == "default" && t == "Person"))
+            .expect("expected an alter step for Person");
+
+        assert_eq!(step.required_input.len(), 1, "got: {:?}", step.required_input);
+        let input = &step.required_input[0];
+        assert_eq!(input.placeholder, "cast_expr__rating");
+        assert_eq!(input.default_expr, "\"rating\"::int8");
+        assert_eq!(input.type_name, "default::Person");
+
+        let placeholder_token = format!("\\({})", input.placeholder);
+        assert!(
+            step.ddl.iter().any(|op| op.sql.contains(&placeholder_token)),
+            "expected the placeholder token in the step's DDL, got: {:?}",
+            step.ddl.iter().map(|op| &op.sql).collect::<Vec<_>>()
         );
     }
 
