@@ -17,16 +17,11 @@ const MAIN_CONNECTION_ALIAS: &str = "main";
 
 pub struct AppState {
     pub config: Config,
-    /// Directory the production frontend build is served from — mirrors
-    /// `asgi.py::STATIC_DIR` (`Path(__file__).parent / "static"`, i.e.
-    /// package-install-relative, not project-relative). This crate has no
-    /// notion of "where is the installed `pylon` package" on its own —
-    /// `static_dir_override` (threaded down from `run`) is how the pyo3
-    /// binding supplies that, computed on the Python side where `__file__`
-    /// is meaningful. Falls back to `.pylon/static` relative to
-    /// `pylon.toml`'s own directory when `None` (this crate's own examples/
-    /// tests run standalone, with no installed Python package to ask).
-    static_dir: PathBuf,
+    /// On-disk frontend build to serve instead of the assets embedded into
+    /// the binary at compile time (`static_files::STATIC_DIR`) — set via
+    /// `--static-dir`, for iterating on the frontend without a Rust
+    /// rebuild each time. `None` (the default) serves the embedded build.
+    static_dir_override: Option<PathBuf>,
     clients: Mutex<HashMap<String, Arc<pylon_client::Client>>>,
     /// Opened once here (not per-connection) and handed to every `Client`
     /// via `Builder::cache_handle` — `heed` (the LMDB binding
@@ -43,8 +38,6 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config, static_dir_override: Option<PathBuf>) -> crate::error::Result<Self> {
-        let toml_dir = config.toml_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
-        let static_dir = static_dir_override.unwrap_or_else(|| toml_dir.join(".pylon/static"));
         let cache = if config.cache.enabled {
             let cache = pylon_cache::Cache::open(&config.cache.path, config.cache.max_size_mb as usize)
                 .map_err(|e| crate::error::Error::Invalid(format!("failed to open cache at {}: {e}", config.cache.path.display())))?;
@@ -52,11 +45,11 @@ impl AppState {
         } else {
             None
         };
-        Ok(Self { config, static_dir, clients: Mutex::new(HashMap::new()), cache })
+        Ok(Self { config, static_dir_override, clients: Mutex::new(HashMap::new()), cache })
     }
 
-    pub fn static_dir(&self) -> &std::path::Path {
-        &self.static_dir
+    pub fn static_dir_override(&self) -> Option<&std::path::Path> {
+        self.static_dir_override.as_deref()
     }
 
     /// Looks up (or lazily connects) the `Client` for `connection_name` —

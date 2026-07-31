@@ -116,7 +116,7 @@ class ModelConfig:
 
 @dataclass(slots=True, frozen=True)
 class WebserverConfig:
-    """``[webserver]`` — where `pylon serve`'s ASGI process binds.
+    """``[webserver]`` — where the `pylon-server` process binds.
 
     Applies regardless of what's mounted on it (``/api``, ``/metrics``, the SPA).
     """
@@ -127,7 +127,7 @@ class WebserverConfig:
 
 @dataclass(slots=True, frozen=True)
 class UiConfig:
-    """``[ui]`` — whether `pylon serve` mounts the built React SPA at ``/``.
+    """``[ui]`` — whether `pylon-server` mounts the built React SPA at ``/``.
 
     Kept separate from ``[webserver]`` so enabling/disabling the GUI never
     touches network config, and changing the port never touches whether the
@@ -139,8 +139,8 @@ class UiConfig:
 
 @dataclass(slots=True, frozen=True)
 class MetricsConfig:
-    """``[metrics]`` — whether `pylon serve` mounts the Prometheus
-    text-exposition endpoint at ``/metrics`` (see `pylon.server.asgi`).
+    """``[metrics]`` — whether `pylon-server` mounts the Prometheus
+    text-exposition endpoint at ``/metrics``.
 
     Off by default — an unauthenticated endpoint exposing internal
     counters/gauges shouldn't be reachable unless an operator opts in. The

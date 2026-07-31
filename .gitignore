@@ -56,8 +56,11 @@ Cargo.lock
 # pylon
 pylon.toml
 
-# pylon-ui build output, copied in by the deploy workflow (see pylon/server/asgi.py)
-pylon/server/static/
+# pylon-ui build output, embedded into the pylon-server binary at compile
+# time — the directory itself must still exist (include_dir! requires it),
+# so only its contents are ignored; see crates/pylon-server/static/.gitkeep
+crates/pylon-server/static/*
+!crates/pylon-server/static/.gitkeep
 
 # Editor extension build output
 editor/zed-pylon/extension.wasm

@@ -1,7 +1,7 @@
-//! The hyper server itself — `pub fn run` is the sole entry point a future
-//! pyo3 binding (Phase 8) will call from `pylon serve`, blocking inside
-//! `py.allow_threads` until shutdown. Builds its own Tokio runtime; no
-//! Python event loop involved anywhere in this crate.
+//! The hyper server itself — `pub fn run` is the sole entry point, meant to
+//! be called from a standalone `pylon-server` binary rather than through
+//! Python. Builds its own Tokio runtime; no Python event loop involved
+//! anywhere in this crate.
 //!
 //! HTTP/2 support is via `hyper-util`'s auto H1/H2 connection builder —
 //! cleartext only (h2c), matching this project's existing no-TLS-anywhere
@@ -25,16 +25,10 @@ use crate::json::not_found;
 use crate::state::AppState;
 
 /// Builds a fresh multi-threaded Tokio runtime and blocks on `serve` until
-/// Ctrl+C — called from inside `py.detach` by `pylon-py`'s `run_server`
-/// binding; nothing here depends on pyo3 or a Python event loop.
-/// `static_dir` is the frontend build's location — this crate has no way
-/// to discover that on its own (it isn't installed alongside a Python
-/// package the way `pylon-py` is), so the pyo3 binding computes it
-/// (package-`__file__`-relative, matching `asgi.py::STATIC_DIR`'s own
-/// convention) and passes it straight through; `None` falls back to
-/// `.pylon/static` relative to `pylon.toml`'s directory (used by this
-/// crate's own standalone examples/tests, which have no installed package
-/// to ask).
+/// Ctrl+C; nothing here depends on pyo3 or a Python event loop.
+/// `static_dir` is an optional on-disk override for the frontend build,
+/// otherwise served from the assets embedded into the binary at compile
+/// time (see `static_files::STATIC_DIR`) — `None` is the common case.
 pub fn run(config: Config, static_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| Error::Invalid(format!("failed to start Tokio runtime: {e}")))?;
     rt.block_on(serve(config, static_dir))
@@ -170,7 +164,7 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
     }
 
     if state.config.ui.enabled {
-        return crate::static_files::serve(state.static_dir(), &path).await;
+        return crate::static_files::serve(&path, state.static_dir_override()).await;
     }
     not_found()
 }
