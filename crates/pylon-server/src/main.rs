@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use pylon_server::WorkerToggles;
+
 const USAGE: &str = "\
 Usage: pylon-server [OPTIONS]
 
@@ -14,14 +16,31 @@ Run from within a Pylon project (or a subdirectory of one) containing
 pylon.toml, or pass --config to point at one explicitly.
 
 Options:
-  --config PATH        Path to pylon.toml (skips the cwd-upward search)
-  --host HOST          Override [webserver].host
-  --port PORT          Override [webserver].port
-  --ui / --no-ui        Override [ui].enabled
-  --static-dir PATH     Serve the frontend build from this directory instead
-                        of the one embedded into the binary at compile time
-  -h, --help            Show this help and exit
-  -v, --version         Show the pylon-server version and exit
+  --config PATH           Path to pylon.toml (skips the cwd-upward search)
+  --host HOST             Override [webserver].host
+  --port PORT             Override [webserver].port
+  --ui / --no-ui           Override [ui].enabled
+  --static-dir PATH        Serve the frontend build from this directory instead
+                           of the one embedded into the binary at compile time
+  --vector-worker /        Force the vector-index worker on/off, regardless
+  --disable-vector-worker  of whether the schema declares vector indexes
+  --search-worker /        Force Meilisearch/OpenSearch index workers on/off,
+  --disable-search-worker  regardless of [search] config
+  --cache-worker /         Force the cache-invalidation worker on/off,
+  --disable-cache-worker   regardless of [cache].enabled (forcing it on has
+                           no effect if [cache].enabled = false, since no
+                           cache handle was ever opened to attach it to)
+  --http / --no-http       Bind a port and serve at all, or don't — with
+                           --no-http, just run background workers and block
+                           until Ctrl+C (a pure worker container, no API/UI)
+  -h, --help               Show this help and exit
+  -v, --version            Show the pylon-server version and exit
+
+The --disable-*-worker flags are for deployments that run these workers in
+their own process (`pylon worker start`) instead of in-process here; the
+positive form opts back in if schema/config would otherwise skip a worker.
+--no-http is the reverse split: a pure worker container with no API/UI.
+Passing both forms of the same flag pair is an error.
 ";
 
 struct Args {
@@ -30,10 +49,30 @@ struct Args {
     port: Option<u16>,
     ui_enabled: Option<bool>,
     static_dir: Option<PathBuf>,
+    worker_toggles: WorkerToggles,
+    http_enabled: Option<bool>,
+}
+
+/// Sets a `--flag`/`--opposite-flag` boolean pair, erroring if the
+/// opposite form was already given.
+fn set_flag(current: &mut Option<bool>, value: bool, flag: &str, opposite: &str) -> Result<(), String> {
+    if *current == Some(!value) {
+        return Err(format!("{flag} conflicts with {opposite} (both given)"));
+    }
+    *current = Some(value);
+    Ok(())
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { config: None, host: None, port: None, ui_enabled: None, static_dir: None };
+    let mut args = Args {
+        config: None,
+        host: None,
+        port: None,
+        ui_enabled: None,
+        static_dir: None,
+        worker_toggles: WorkerToggles::default(),
+        http_enabled: None,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -51,9 +90,29 @@ fn parse_args() -> Result<Args, String> {
                 let raw = it.next().ok_or("--port requires a value")?;
                 args.port = Some(raw.parse::<u16>().map_err(|_| format!("--port: invalid port {raw:?}"))?);
             }
-            "--ui" => args.ui_enabled = Some(true),
-            "--no-ui" => args.ui_enabled = Some(false),
+            "--ui" => set_flag(&mut args.ui_enabled, true, "--ui", "--no-ui")?,
+            "--no-ui" => set_flag(&mut args.ui_enabled, false, "--no-ui", "--ui")?,
             "--static-dir" => args.static_dir = Some(PathBuf::from(it.next().ok_or("--static-dir requires a value")?)),
+            "--vector-worker" => {
+                set_flag(&mut args.worker_toggles.vector, true, "--vector-worker", "--disable-vector-worker")?
+            }
+            "--disable-vector-worker" => {
+                set_flag(&mut args.worker_toggles.vector, false, "--disable-vector-worker", "--vector-worker")?
+            }
+            "--search-worker" => {
+                set_flag(&mut args.worker_toggles.search, true, "--search-worker", "--disable-search-worker")?
+            }
+            "--disable-search-worker" => {
+                set_flag(&mut args.worker_toggles.search, false, "--disable-search-worker", "--search-worker")?
+            }
+            "--cache-worker" => {
+                set_flag(&mut args.worker_toggles.cache, true, "--cache-worker", "--disable-cache-worker")?
+            }
+            "--disable-cache-worker" => {
+                set_flag(&mut args.worker_toggles.cache, false, "--disable-cache-worker", "--cache-worker")?
+            }
+            "--http" => set_flag(&mut args.http_enabled, true, "--http", "--no-http")?,
+            "--no-http" => set_flag(&mut args.http_enabled, false, "--no-http", "--http")?,
             other => return Err(format!("unrecognized argument: {other}")),
         }
     }
@@ -90,7 +149,8 @@ fn main() -> ExitCode {
         config.ui.enabled = ui_enabled;
     }
 
-    if let Err(e) = pylon_server::run(config, args.static_dir) {
+    let no_http = args.http_enabled == Some(false);
+    if let Err(e) = pylon_server::run(config, args.static_dir, args.worker_toggles, no_http) {
         eprintln!("pylon-server: error: {e}");
         return ExitCode::FAILURE;
     }

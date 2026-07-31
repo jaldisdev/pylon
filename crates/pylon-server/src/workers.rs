@@ -29,6 +29,28 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// `timeout_secs` (`pylon-py/src/workers.rs`).
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-worker override, set via `pylon-server`'s `--<worker>-worker` /
+/// `--disable-<worker>-worker` flag pairs — `None` (the default) defers to
+/// whatever `schema`/`config` would otherwise imply; `Some(false)` always
+/// wins and skips the worker entirely, for deployments that run it in its
+/// own process (`pylon worker start`) instead and don't want `pylon-server`
+/// double-spawning it in-process. `Some(true)` explicitly opts back in —
+/// for the vector/search workers this only matters if they'd otherwise be
+/// skipped for lack of a matching schema declaration, since there's
+/// nothing else gating them; it can't invent vector/search indexes the
+/// schema doesn't have. For the cache worker, `Some(true)` still can't
+/// start it if `[cache].enabled = false`, since no LMDB handle was ever
+/// opened for it to attach to (that handle is shared with every `Client`'s
+/// own read-through query cache in `AppState`, so forcing it open here
+/// would silently turn query caching on for every request too — a bigger
+/// change than "just this worker" — see `main.rs`'s CLI help text).
+#[derive(Default, Clone, Copy)]
+pub struct WorkerToggles {
+    pub vector: Option<bool>,
+    pub search: Option<bool>,
+    pub cache: Option<bool>,
+}
+
 /// Spawns whatever background workers `schema`/`config` imply as detached
 /// Tokio tasks, returning their `JoinHandle`s so the caller can abort them
 /// on shutdown. A worker that fails to start (missing config, bad HTTP
@@ -40,65 +62,78 @@ pub fn spawn(
     config: &Config,
     dsn: &str,
     cache: Option<Arc<pylon_cache::Cache>>,
+    toggles: WorkerToggles,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
-    let providers = build_providers(schema, config);
-    if !providers.is_empty() {
-        match VectorIndexWorker::new(schema.clone(), providers) {
-            Ok(worker) => {
-                eprintln!("pylon-server: VectorIndexWorker started");
-                handles.push(spawn_index_worker(dsn.to_string(), worker, "VectorIndexWorker"));
+    if toggles.vector == Some(false) {
+        eprintln!("pylon-server: VectorIndexWorker disabled (--disable-vector-worker)");
+    } else {
+        let providers = build_providers(schema, config);
+        if !providers.is_empty() {
+            match VectorIndexWorker::new(schema.clone(), providers) {
+                Ok(worker) => {
+                    eprintln!("pylon-server: VectorIndexWorker started");
+                    handles.push(spawn_index_worker(dsn.to_string(), worker, "VectorIndexWorker"));
+                }
+                Err(e) => eprintln!("pylon-server: failed to start VectorIndexWorker: {e}"),
             }
-            Err(e) => eprintln!("pylon-server: failed to start VectorIndexWorker: {e}"),
         }
     }
 
-    let want_opensearch =
-        schema.types.iter().any(|t| t.search_indexes.iter().any(|si| si.backend == SearchBackend::OpenSearch));
-    let want_meilisearch =
-        schema.types.iter().any(|t| t.search_indexes.iter().any(|si| si.backend == SearchBackend::Meilisearch));
+    if toggles.search == Some(false) {
+        eprintln!("pylon-server: search index workers disabled (--disable-search-worker)");
+    } else {
+        let want_opensearch =
+            schema.types.iter().any(|t| t.search_indexes.iter().any(|si| si.backend == SearchBackend::OpenSearch));
+        let want_meilisearch =
+            schema.types.iter().any(|t| t.search_indexes.iter().any(|si| si.backend == SearchBackend::Meilisearch));
 
-    if want_opensearch {
-        match config.search.get("default") {
-            None => eprintln!(
-                "pylon-server: SearchIndex(backend=OpenSearch) declared but no [search] config found; skipping"
-            ),
-            Some(search_cfg) => {
-                let base_url = format!("http://{}:{}", search_cfg.host, search_cfg.port);
-                let auth = search_cfg.user.as_deref().zip(search_cfg.password.as_deref());
-                match OpenSearchClient::new(&base_url, auth, SEARCH_TIMEOUT) {
-                    Ok(client) => {
-                        eprintln!("pylon-server: OpenSearchWorker started  base_url={base_url}");
-                        let worker = SearchIndexWorker::new(schema.clone(), client, "OpenSearch");
-                        handles.push(spawn_index_worker(dsn.to_string(), worker, "OpenSearchWorker"));
+        if want_opensearch {
+            match config.search.get("default") {
+                None => eprintln!(
+                    "pylon-server: SearchIndex(backend=OpenSearch) declared but no [search] config found; skipping"
+                ),
+                Some(search_cfg) => {
+                    let base_url = format!("http://{}:{}", search_cfg.host, search_cfg.port);
+                    let auth = search_cfg.user.as_deref().zip(search_cfg.password.as_deref());
+                    match OpenSearchClient::new(&base_url, auth, SEARCH_TIMEOUT) {
+                        Ok(client) => {
+                            eprintln!("pylon-server: OpenSearchWorker started  base_url={base_url}");
+                            let worker = SearchIndexWorker::new(schema.clone(), client, "OpenSearch");
+                            handles.push(spawn_index_worker(dsn.to_string(), worker, "OpenSearchWorker"));
+                        }
+                        Err(e) => eprintln!("pylon-server: failed to start OpenSearchWorker: {e}"),
                     }
-                    Err(e) => eprintln!("pylon-server: failed to start OpenSearchWorker: {e}"),
+                }
+            }
+        }
+
+        if want_meilisearch {
+            match config.search.get("default") {
+                None => eprintln!(
+                    "pylon-server: SearchIndex(backend=Meilisearch) declared but no [search] config found; skipping"
+                ),
+                Some(search_cfg) => {
+                    let base_url = format!("http://{}:{}", search_cfg.host, search_cfg.port);
+                    match MeilisearchClient::new(&base_url, search_cfg.api_key.as_deref(), SEARCH_TIMEOUT) {
+                        Ok(client) => {
+                            eprintln!("pylon-server: MeilisearchWorker started  base_url={base_url}");
+                            let worker = SearchIndexWorker::new(schema.clone(), client, "Meilisearch");
+                            handles.push(spawn_index_worker(dsn.to_string(), worker, "MeilisearchWorker"));
+                        }
+                        Err(e) => eprintln!("pylon-server: failed to start MeilisearchWorker: {e}"),
+                    }
                 }
             }
         }
     }
 
-    if want_meilisearch {
-        match config.search.get("default") {
-            None => eprintln!(
-                "pylon-server: SearchIndex(backend=Meilisearch) declared but no [search] config found; skipping"
-            ),
-            Some(search_cfg) => {
-                let base_url = format!("http://{}:{}", search_cfg.host, search_cfg.port);
-                match MeilisearchClient::new(&base_url, search_cfg.api_key.as_deref(), SEARCH_TIMEOUT) {
-                    Ok(client) => {
-                        eprintln!("pylon-server: MeilisearchWorker started  base_url={base_url}");
-                        let worker = SearchIndexWorker::new(schema.clone(), client, "Meilisearch");
-                        handles.push(spawn_index_worker(dsn.to_string(), worker, "MeilisearchWorker"));
-                    }
-                    Err(e) => eprintln!("pylon-server: failed to start MeilisearchWorker: {e}"),
-                }
-            }
+    if toggles.cache == Some(false) {
+        if cache.is_some() {
+            eprintln!("pylon-server: CacheInvalidationWorker disabled (--disable-cache-worker)");
         }
-    }
-
-    if let Some(cache) = cache {
+    } else if let Some(cache) = cache {
         let dsn = dsn.to_string();
         eprintln!("pylon-server: CacheInvalidationWorker started (shared cache)  channel={}", pylon_workers::CACHE_NOTIFY_CHANNEL);
         handles.push(tokio::spawn(async move {
@@ -107,6 +142,11 @@ pub fn spawn(
                 Err(e) => eprintln!("pylon-server: failed to start CacheInvalidationWorker: {e}"),
             }
         }));
+    } else if toggles.cache == Some(true) {
+        eprintln!(
+            "pylon-server: --cache-worker given but [cache].enabled = false in pylon.toml; \
+             no cache handle to attach to, so there's nothing to invalidate"
+        );
     }
 
     handles
