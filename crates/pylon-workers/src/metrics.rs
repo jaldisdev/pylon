@@ -124,9 +124,9 @@ static POOL_MAX_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 
 /// Samples a pgcon pool's current connection accounting into the pool
 /// gauges above, labeled by `connection` (e.g. "default", or a named
-/// `[connections.*]` entry — see `pylon/server/asgi.py`'s `clients` dict).
+/// `[connections.*]` entry — see `pylon-server`'s `AppState::clients`).
 /// Gauges, not counters: called fresh on every `/metrics` scrape (from
-/// `pylon-py`'s `record_pool_metrics`) rather than updated as pool events
+/// `AppState::record_pool_metrics`) rather than updated as pool events
 /// happen, since deadpool doesn't expose checkout/return as observable
 /// events, only a point-in-time `status()` snapshot.
 pub fn record_pool_status(connection: &str, status: &pylon_pgcon::PoolStatus) {

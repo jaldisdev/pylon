@@ -12,92 +12,12 @@ mod providers;
 mod workers;
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
+//
+// `pylon.exceptions.*` (Python) is what actually gets raised — `pyql_err`/
+// `pgcon_err` construct those by name — so only the two classes below that
+// are genuinely raised from Rust by their own type (cache/pgcon usage
+// errors, which have no Python-side equivalent) are registered here.
 
-pyo3::create_exception!(
-    pylon._core,
-    PyQLError,
-    pyo3::exceptions::PyException,
-    "Base class for all PyQL compilation errors."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLSyntaxError,
-    PyQLError,
-    "Raised on lexer or parser failure in the PyQL string."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLTypeError,
-    PyQLError,
-    "Raised on type mismatch or invalid cast detected during compilation."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLResolutionError,
-    PyQLError,
-    "Base class for unknown-identifier errors."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLUnknownTypeError,
-    PyQLResolutionError,
-    "Referenced type name does not exist in the schema."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLUnknownFieldError,
-    PyQLResolutionError,
-    "Referenced property or link does not exist on the type."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLUnknownParameterError,
-    PyQLResolutionError,
-    "Query parameter ($name) not declared."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLCardinalityError,
-    PyQLError,
-    "Cardinality mismatch inferred at compile time."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PyQLFragmentError,
-    PyQLError,
-    "Failure compiling a schema-level PyQL fragment during schema export."
-);
-
-pyo3::create_exception!(
-    pylon._core,
-    PylonExecutionError,
-    pyo3::exceptions::PyException,
-    "Base class for all Pylon execution errors."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PylonConstraintViolationError,
-    PylonExecutionError,
-    "A database constraint (unique, check, exclusive) was violated."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PylonCardinalityViolationError,
-    PylonExecutionError,
-    "A single-cardinality pointer received multiple values."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PylonMissingRequiredError,
-    PylonExecutionError,
-    "A required property or link was not provided."
-);
-pyo3::create_exception!(
-    pylon._core,
-    PylonInvalidValueError,
-    PylonExecutionError,
-    "Invalid value for a type (e.g. out-of-range, bad format)."
-);
 pyo3::create_exception!(
     pylon._core,
     PylonCacheError,
@@ -1535,26 +1455,6 @@ fn export_stdlib() -> String {
     core::stdlib::export_stdlib()
 }
 
-#[pyfunction]
-#[pyo3(signature = (type_name, schema, *, index_name = None))]
-fn compile_index_fetch(
-    type_name: &str,
-    schema: &SchemaDescriptor,
-    index_name: Option<&str>,
-) -> PyResult<String> {
-    core::export::compile_index_fetch(type_name, index_name, &schema.inner).map_err(|e| pyql_err(e, None))
-}
-
-#[pyfunction]
-#[pyo3(signature = (type_name, schema, *, index_name = None))]
-fn compile_search_index_fetch(
-    type_name: &str,
-    schema: &SchemaDescriptor,
-    index_name: Option<&str>,
-) -> PyResult<String> {
-    core::export::compile_search_index_fetch(type_name, index_name, &schema.inner).map_err(|e| pyql_err(e, None))
-}
-
 // ── Migration ─────────────────────────────────────────────────────────────────
 
 /// Parsed migration file exposed to Python.
@@ -1582,12 +1482,6 @@ fn parse_migration(content: &str, filename: &str) -> PyResult<MigrationFile> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
-/// Verify a migration file's body matches its header ID.
-#[pyfunction]
-fn verify_migration(m: &MigrationFile) -> PyResult<()> {
-    core::migration::verify_integrity(&m.inner)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-}
 
 /// Validate a list of migration files form a single unbroken chain.
 /// Returns them in chain order (oldest first).
@@ -1633,111 +1527,6 @@ pub struct DbState {
     pub(crate) inner: core::diff::DbState,
 }
 
-#[pymethods]
-impl DbState {
-    #[new]
-    fn new() -> Self {
-        Self { inner: core::diff::DbState::default() }
-    }
-
-    fn add_schema(&mut self, name: String) {
-        self.inner.schemas.push(name);
-    }
-
-    fn add_enum(&mut self, schema: String, name: String, members: Vec<String>) {
-        self.inner.enums.push(core::diff::DbEnum { schema, name, members });
-    }
-
-    fn add_domain(&mut self, schema: String, name: String) {
-        self.inner.domains.push(core::diff::DbDomain { schema, name });
-    }
-
-    fn add_extension(&mut self, name: String) {
-        self.inner.extensions.push(name);
-    }
-
-    /// Add a table. Columns, FKs, indexes, checks, and triggers are set via add_column etc.
-    fn add_table(&mut self, schema: String, name: String) {
-        self.inner.tables.push(core::diff::DbTable {
-            schema,
-            name,
-            columns: vec![],
-            foreign_keys: vec![],
-            indexes: vec![],
-            checks: vec![],
-            triggers: vec![],
-        });
-    }
-
-    fn add_trigger(&mut self, schema: &str, table: &str, trigger_name: String) {
-        self.inner.add_trigger(schema, table, &trigger_name);
-    }
-
-    fn add_column(
-        &mut self,
-        schema: &str,
-        table: &str,
-        name: String,
-        pg_type: String,
-        nullable: bool,
-        is_generated: bool,
-        column_default: Option<String>,
-    ) {
-        if let Some(t) = self.inner.tables.iter_mut()
-            .find(|t| t.schema == schema && t.name == table)
-        {
-            t.columns.push(core::diff::DbColumn { name, pg_type, nullable, is_generated, column_default });
-        }
-    }
-
-    fn add_foreign_key(
-        &mut self,
-        schema: &str,
-        table: &str,
-        constraint_name: String,
-        local_column: String,
-        ref_schema: String,
-        ref_table: String,
-    ) {
-        if let Some(t) = self.inner.tables.iter_mut()
-            .find(|t| t.schema == schema && t.name == table)
-        {
-            t.foreign_keys.push(core::diff::DbForeignKey {
-                constraint_name,
-                local_column,
-                ref_schema,
-                ref_table,
-            });
-        }
-    }
-
-    fn add_index(
-        &mut self,
-        schema: &str,
-        table: &str,
-        name: String,
-        is_unique: bool,
-        method: String,
-    ) {
-        if let Some(t) = self.inner.tables.iter_mut()
-            .find(|t| t.schema == schema && t.name == table)
-        {
-            t.indexes.push(core::diff::DbIndex { name, is_unique, method });
-        }
-    }
-
-    fn add_sequence(&mut self, schema: String, name: String) {
-        self.inner.sequences.push(core::diff::DbSequence { schema, name });
-    }
-
-    fn add_view(&mut self, schema: String, name: String, body_hash: String) {
-        self.inner.views.push(core::diff::DbView { schema, name, body_hash });
-    }
-
-    fn add_function(&mut self, schema: String, name: String, body_hash: String) {
-        self.inner.functions.push(core::diff::DbFunction { schema, name, body_hash });
-    }
-}
 
 /// Compute ordered DDL SQL statements to bring `current` in sync with `target`.
 /// Returns a list of SQL strings; empty when nothing needs to change.
@@ -2043,13 +1832,6 @@ fn db_state_from_json(json: &str) -> PyResult<DbState> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
-/// Serialize an existing `DbState` (e.g. from `introspect_db_state`) to JSON
-/// — the inverse of `db_state_from_json`.
-#[pyfunction]
-fn db_state_to_json(state: &DbState) -> String {
-    core::diff::db_state_to_json(&state.inner)
-}
-
 /// Discard all cached compiled queries. Must be called after a schema reload
 /// so stale compiled SQL is not reused against the new schema.
 #[pyfunction]
@@ -2279,23 +2061,7 @@ fn construct_pylon_error(class_name: &str, message: &str, query: Option<&str>, p
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
 
-    // Exceptions — compilation
-    m.add("PyQLError", PyQLError::type_object(py))?;
-    m.add("PyQLSyntaxError", PyQLSyntaxError::type_object(py))?;
-    m.add("PyQLTypeError", PyQLTypeError::type_object(py))?;
-    m.add("PyQLResolutionError", PyQLResolutionError::type_object(py))?;
-    m.add("PyQLUnknownTypeError", PyQLUnknownTypeError::type_object(py))?;
-    m.add("PyQLUnknownFieldError", PyQLUnknownFieldError::type_object(py))?;
-    m.add("PyQLUnknownParameterError", PyQLUnknownParameterError::type_object(py))?;
-    m.add("PyQLCardinalityError", PyQLCardinalityError::type_object(py))?;
-    m.add("PyQLFragmentError", PyQLFragmentError::type_object(py))?;
-
-    // Exceptions — execution
-    m.add("PylonExecutionError", PylonExecutionError::type_object(py))?;
-    m.add("PylonConstraintViolationError", PylonConstraintViolationError::type_object(py))?;
-    m.add("PylonCardinalityViolationError", PylonCardinalityViolationError::type_object(py))?;
-    m.add("PylonMissingRequiredError", PylonMissingRequiredError::type_object(py))?;
-    m.add("PylonInvalidValueError", PylonInvalidValueError::type_object(py))?;
+    // Exceptions
     m.add("PylonCacheError", PylonCacheError::type_object(py))?;
     m.add("PylonPgconError", PylonPgconError::type_object(py))?;
 
@@ -2339,13 +2105,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(record_query_compile_result, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
-    m.add_function(wrap_pyfunction!(compile_index_fetch, m)?)?;
-    m.add_function(wrap_pyfunction!(compile_search_index_fetch, m)?)?;
 
     // Migration
     m.add_class::<MigrationFile>()?;
     m.add_function(wrap_pyfunction!(parse_migration, m)?)?;
-    m.add_function(wrap_pyfunction!(verify_migration, m)?)?;
     m.add_function(wrap_pyfunction!(validate_migration_chain, m)?)?;
     m.add_function(wrap_pyfunction!(compute_migration_id, m)?)?;
     m.add_function(wrap_pyfunction!(compute_migration_short_id, m)?)?;
@@ -2369,7 +2132,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
     m.add_function(wrap_pyfunction!(missing_extension_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
-    m.add_function(wrap_pyfunction!(db_state_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;
 
     // Cache
