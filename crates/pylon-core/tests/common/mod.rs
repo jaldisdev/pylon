@@ -15,6 +15,7 @@ use pylon_core::query;
 use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor};
 use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::CachedValue;
+use std::collections::HashMap;
 
 pub fn test_dsn() -> String {
     std::env::var("PYLON_PGCON_TEST_DSN")
@@ -111,6 +112,15 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
         default_pyql: None,
         on_delete: vec![],
     }
+}
+
+/// Diffs `schema` against Postgres's actual live state — the assertion
+/// every "no phantom changes after apply" test needs (see
+/// `live_execution_migration_diff.rs`).
+pub async fn assert_zero_further_steps(pool: &PgPool, schema: &SchemaDescriptor) {
+    let live = pylon_core::introspect::introspect_db_state(pool).await.unwrap();
+    let steps = pylon_core::diff::diff_schema_steps(schema, &live, &HashMap::new()).unwrap();
+    assert!(steps.is_empty(), "expected zero further migration steps, got: {steps:?}");
 }
 
 /// Compiles and live-executes a schema-free scalar `select` expression,

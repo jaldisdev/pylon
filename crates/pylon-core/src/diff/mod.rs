@@ -646,6 +646,7 @@ pub enum OpKey {
     View(String, String),
 }
 
+#[derive(Debug)]
 pub struct MigrationStep {
     /// `"did you {verb} {object_desc}?"` — matches the phrasing convention
     /// this feature is modeled on.
@@ -1772,6 +1773,26 @@ fn diff_inner(
         }
     }
 
+    // Every physical table (including multilink/junction-backed-link tables)
+    // `target` still wants — computed here, ahead of Phase 11.5, so that
+    // phase can tell a table being *fully dropped* (Phase 12) apart from one
+    // that's merely losing a trigger. Reused as-is by Phase 12 itself below.
+    let mut target_tables: HashSet<(String, String)> = HashSet::new();
+    for td in &target.types {
+        if !td.abstract_ {
+            target_tables.insert((td.module.clone(), td.table.clone()));
+        }
+        if !td.abstract_ && !td.junction {
+            for ml in &td.multilinks {
+                target_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
+            }
+            for l in &td.links {
+                if !l.is_junction_backed() { continue; }
+                target_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
+            }
+        }
+    }
+
     // ── Phase 11.5: interface exclusive constraint triggers (folded into the
     // owning concrete table's step — a user thinks of these as part of
     // "altering type X", not as separate objects) ────────────────────────────
@@ -1906,9 +1927,21 @@ fn diff_inner(
             }
         }
 
-        // Drop triggers that no longer exist in the target schema.
+        // Drop triggers that no longer exist in the target schema — but not
+        // for a table that's being dropped in its entirety (Phase 12): that
+        // table's whole existence, triggers included, will be removed via
+        // `DROP TABLE ... CASCADE`, so an explicit `DROP TRIGGER` here is
+        // both redundant and actively wrong — `owner_of` has no real target
+        // type to fold it into for such a table, so it fell back to a bare
+        // `Verb::Alter` default, which then won the "first write wins" race
+        // for this step's verb/prompt against Phase 12's own correct
+        // `Verb::Drop` (confirmed live: `migration create` asked "did you
+        // *alter* object type 'Widget'?" for a table being fully dropped).
         for cur_table in &current.tables {
             let key = (cur_table.schema.clone(), cur_table.name.clone());
+            if !target_tables.contains(&key) {
+                continue;
+            }
             let expected = expected_trigger_map.get(&key).cloned().unwrap_or_default();
             for trigger_name in &cur_table.triggers {
                 if !expected.contains(trigger_name) {
@@ -1923,21 +1956,6 @@ fn diff_inner(
     }
 
     // ── Phase 12: drop removed tables ────────────────────────────────────────
-    let mut target_tables: HashSet<(String, String)> = HashSet::new();
-    for td in &target.types {
-        if !td.abstract_ {
-            target_tables.insert((td.module.clone(), td.table.clone()));
-        }
-        if !td.abstract_ && !td.junction {
-            for ml in &td.multilinks {
-                target_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
-            }
-            for l in &td.links {
-                if !l.is_junction_backed() { continue; }
-                target_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
-            }
-        }
-    }
     for cur_table in &current.tables {
         let key = (cur_table.schema.clone(), cur_table.name.clone());
         if !target_tables.contains(&key) {

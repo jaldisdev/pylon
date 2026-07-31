@@ -29,3 +29,5 @@ module-name = "pylon._core"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live_db: requires a real Postgres reachable via PYLON_PGCON_TEST_DSN (opt-in)"]
+addopts = "-m 'not live_db'"
