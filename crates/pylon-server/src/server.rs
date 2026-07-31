@@ -21,13 +21,7 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::json::not_found;
-
-/// Shared state every request handler sees — just the parsed config for
-/// now; Phase 4 adds a per-connection `pylon_client::Client` map here
-/// (mirrors `asgi.py`'s own lazily-built `clients: dict[str, Client]`).
-pub struct AppState {
-    pub config: Config,
-}
+use crate::state::AppState;
 
 /// Builds a fresh multi-threaded Tokio runtime and blocks on `serve` until
 /// Ctrl+C. Intended to be called from inside `py.allow_threads` once the
@@ -40,7 +34,7 @@ pub fn run(config: Config) -> Result<()> {
 
 async fn serve(config: Config) -> Result<()> {
     let addr = format!("{}:{}", config.webserver.host, config.webserver.port);
-    let state = Arc::new(AppState { config });
+    let state = Arc::new(AppState::new(config));
 
     let listener = TcpListener::bind(&addr)
         .await
@@ -77,17 +71,64 @@ async fn serve(config: Config) -> Result<()> {
     }
 }
 
-/// Top-level route dispatch — mirrors `asgi.py`'s own `app()` if/elif
-/// chain. Only `/metrics` is wired up in this phase (fully mechanical —
-/// `pylon_workers::metrics::render()` needs no per-connection state at
-/// all); `/api/...` routes land in Phase 4 once the per-connection
-/// `pylon_client::Client` map exists on `AppState`.
-async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<Bytes>> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/metrics") if state.config.metrics.enabled => {
-            let body = pylon_workers::metrics::render();
-            crate::json::text_response(StatusCode::OK, "text/plain; version=0.0.4; charset=utf-8", body)
-        }
-        _ => not_found(),
+/// Splits `"/api/<connection>/<rest>"` into `(connection, "/<rest>")` —
+/// mirrors `asgi.py::_split_connection_path`. `None` for anything that
+/// isn't at least `/api/<segment>/<segment>`, including the bare
+/// process-level routes (`/api/schema`, `/api/connections`, ...), which
+/// have no connection segment to split off at all.
+fn split_connection_path(path: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 4 || parts[0] != "" || parts[1] != "api" || parts[2].is_empty() {
+        return None;
     }
+    Some((parts[2].to_string(), format!("/{}", parts[3..].join("/"))))
+}
+
+/// Top-level route dispatch — mirrors `asgi.py`'s own `app()` if/elif
+/// chain.
+async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<Bytes>> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    if method == Method::GET && path == "/metrics" && state.config.metrics.enabled {
+        return crate::json::text_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            pylon_workers::metrics::render(),
+        );
+    }
+    if method == Method::GET && path == "/api/connections" {
+        return crate::routes::handle_connections(&state);
+    }
+    if method == Method::GET && path == "/api/models" {
+        return crate::routes::handle_models(&state);
+    }
+    if method == Method::GET && path == "/api/config-options" {
+        return crate::routes::handle_config_options();
+    }
+
+    if let Some((connection, rest)) = split_connection_path(&path) {
+        if method == Method::GET && rest == "/stats" {
+            return crate::routes::handle_stats(state.clone(), &connection).await;
+        }
+        if method == Method::POST && rest == "/query" {
+            return match crate::json::read_json_body(req).await {
+                Ok(body) => crate::routes::handle_query(state.clone(), &connection, body).await,
+                Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
+            };
+        }
+        if method == Method::POST && rest == "/analyze" {
+            return match crate::json::read_json_body(req).await {
+                Ok(body) => crate::routes::handle_analyze(state.clone(), &connection, body).await,
+                Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
+            };
+        }
+        // `/ai/chat` lands in Phase 6; `/api/schema`/`/api/globals` (no
+        // connection segment) land in Phase 5.
+    }
+
+    if state.config.ui.enabled {
+        return crate::static_files::serve(state.static_dir(), &path).await;
+    }
+    not_found()
 }

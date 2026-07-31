@@ -155,6 +155,14 @@ impl Client {
         &self.pool
     }
 
+    /// A clone of the currently-loaded schema — for callers that need to
+    /// introspect it directly (e.g. a schema-browser endpoint), not just
+    /// compile queries against it. Clones out from behind the lock rather
+    /// than returning a guard, same reasoning as every query method here.
+    pub fn schema(&self) -> SchemaDescriptor {
+        self.schema.read().unwrap().clone()
+    }
+
     pub async fn query(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
         exec::query(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref()).await

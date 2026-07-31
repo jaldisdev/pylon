@@ -39,6 +39,31 @@ pub struct DatabaseConfig {
     pub pool_max_size: u32,
 }
 
+impl DatabaseConfig {
+    /// Resolves to a `postgresql://` DSN string — either `dsn` verbatim
+    /// (with a `pylon://` scheme swapped for `postgresql://`, matching
+    /// `pylon/client.py::Client.ensure_connected`'s own swap) or built from
+    /// the discrete fields, matching `pylon/config.py::_build_dsn`.
+    pub fn dsn_string(&self) -> String {
+        if let Some(dsn) = &self.dsn {
+            return if let Some(rest) = dsn.strip_prefix("pylon://") {
+                format!("postgresql://{rest}")
+            } else {
+                dsn.clone()
+            };
+        }
+        let password_part = self.password.as_deref().map(|p| format!(":{p}")).unwrap_or_default();
+        format!(
+            "postgresql://{}{}@{}:{}/{}",
+            self.user.as_deref().unwrap_or(""),
+            password_part,
+            self.host.as_deref().unwrap_or(""),
+            self.port.unwrap_or(5432),
+            self.name.as_deref().unwrap_or(""),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchServiceBackend {
     OpenSearch,
