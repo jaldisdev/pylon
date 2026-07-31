@@ -17,6 +17,11 @@ fn main() {
     // Overridden away from pylon.toml's own [webserver] port to avoid
     // colliding with whatever else is already bound to it locally.
     config.webserver.port = 15656;
-    println!("loaded config for project {:?}, webserver {}:{}", config.project.name, config.webserver.host, config.webserver.port);
+    println!(
+        "loaded config for project {}, webserver {}:{}",
+        config.project.name.as_deref().unwrap_or("<unnamed>"),
+        config.webserver.host,
+        config.webserver.port,
+    );
     pylon_server::run(config).unwrap();
 }

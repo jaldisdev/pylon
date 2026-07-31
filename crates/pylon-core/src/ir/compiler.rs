@@ -7288,7 +7288,19 @@ fn collect_search_enqueue(
         .collect()
 }
 
-fn pg_type_to_pyql(pg: &str) -> &str {
+/// Reverse of `type_expr_to_pg`'s plain-scalar branch — renders a base
+/// Postgres type back to its canonical PyQL display name. `pub` (not just
+/// crate-local): reused by `pylon-server`'s `/api/schema` port
+/// (`_scalar_type_name`'s equivalent) so that display-name logic isn't
+/// duplicated across crates.
+///
+/// `"interval"`/`"date"`/`"time"`/`"timestamp"` are inherently ambiguous
+/// from the bare pg_type alone: `interval` backs both `std::duration` and
+/// `cal::relative_duration` (defaults to the former — the more common
+/// case), while `date`/`time`/`timestamp` (no tz) are unambiguous (only
+/// `cal::local_date`/`cal::local_time`/`cal::local_datetime` use them, as
+/// opposed to `timestamptz` for `std::datetime`).
+pub fn pg_type_to_pyql(pg: &str) -> &str {
     match pg {
         "text" | "varchar" => "std::str",
         "uuid"             => "std::uuid",
@@ -7300,6 +7312,12 @@ fn pg_type_to_pyql(pg: &str) -> &str {
         "boolean"          => "std::bool",
         "numeric"          => "std::decimal",
         "timestamptz"      => "std::datetime",
+        "timestamp"        => "cal::local_datetime",
+        "date"             => "cal::local_date",
+        "time"             => "cal::local_time",
+        "interval"         => "std::duration",
+        "bytea"            => "std::bytes",
+        "jsonb"            => "std::json",
         "__int_literal"    => "std::int64",
         "__float_literal"  => "std::float64",
         other              => other,

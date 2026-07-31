@@ -557,6 +557,14 @@ def _pyql_type_name(scalar_type: Any) -> str | None:
                 (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
             )
             return f"{mod}::{scalar_type.__name__}"
+        # A real `@pylon.type`-decorated schema type (e.g. a computed
+        # global like `current_user: Global[Person | None, "select ..."]`)
+        # — reuses this file's own `_is_pylon_type`/`_pylon_module_of`/
+        # `_pylon_name_of` rather than re-deriving the module inline, since
+        # `__pylon_config__.module` (not `__pylon_module__`) is the
+        # authoritative source for these.
+        if _is_pylon_type(scalar_type):
+            return _qualified(_pylon_module_of(scalar_type), _pylon_name_of(scalar_type))
     return None
 
 

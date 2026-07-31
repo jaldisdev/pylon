@@ -6,6 +6,7 @@ pub mod config_options;
 pub mod error;
 pub mod json;
 pub mod routes;
+pub mod schema_json;
 pub mod server;
 pub mod state;
 pub mod static_files;
