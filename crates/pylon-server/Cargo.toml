@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 pylon-cache = { path = "../pylon-cache" }
+pylon-config = { path = "../pylon-config" }
 pylon-client = { path = "../pylon-client" }
 pylon-core = { path = "../pylon-core" }
 pylon-pgcon = { path = "../pylon-pgcon" }

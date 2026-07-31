@@ -95,7 +95,7 @@ async fn poll_loop(workspace_root: PathBuf, shared: Arc<Mutex<Option<SchemaDescr
 }
 
 fn resolve_dsn(workspace_root: &std::path::Path) -> Result<String, String> {
-    let config = pylon_server::config::load_config(Some(workspace_root)).map_err(|e| format!("failed to load pylon.toml: {e}"))?;
+    let config = pylon_config::config::load_config(Some(workspace_root)).map_err(|e| format!("failed to load pylon.toml: {e}"))?;
     let db = config.connections.get("default").ok_or_else(|| "no [database] configured in pylon.toml".to_string())?;
     Ok(db.dsn_string())
 }
