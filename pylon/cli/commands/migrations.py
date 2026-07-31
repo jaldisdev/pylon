@@ -698,26 +698,59 @@ def _rename_prompt_loop(
             return confirmed_type, confirmed_col, True, False
 
 
+def _resolve_required_input(step, schema) -> dict[str, str]:
+    """Prompt for each of `step.required_input`'s expressions, reusing
+    `_fill_prompt_loop`'s "PyQL expression, compiled via `compile_fill_expr`"
+    UX. An empty response accepts that input's own default expression as-is
+    (it's already valid SQL, not a PyQL string, so it needs no compiling).
+    """
+    from pylon._core import compile_fill_expr
+
+    overrides: dict[str, str] = {}
+    for placeholder, prompt_text, default_expr, type_name in step.required_input:
+        click.echo(f"\n{prompt_text}.")
+        click.echo("If left blank, the migration will use the default expression:")
+        click.echo()
+        click.echo(f"    {default_expr}")
+        click.echo()
+        while True:
+            expr_str = click.prompt(f"PyQL expression {placeholder!r}", prompt_suffix="> ").strip()
+            if not expr_str:
+                overrides[placeholder] = default_expr
+                break
+            try:
+                overrides[placeholder] = compile_fill_expr(type_name, expr_str, schema)
+            except Exception as exc:
+                click.echo(f"  Error: {exc}")
+                continue
+            break
+    return overrides
+
+
 def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tuple[str, bool]], bool]:
     """Interactively walk each general create/alter/drop step one at a time.
 
     Returns (confirmed, quit_requested). `confirmed` is a list of
     (sql, non_transactional) tuples, the same shape `_assemble_migration_body`
-    already expects.
+    already expects — with any `required_input` placeholders already
+    resolved (see `_resolve_required_input`).
     """
     decisions: list[str | None] = [None] * len(steps)
+    resolved: dict[int, list[tuple[str, bool]]] = {}
     idx = 0
 
     while idx < len(steps):
         step = steps[idx]
         ddl = [sql for sql, _ in step.ddl]
         confirmed_so_far = [
-            sql for i, s in enumerate(steps) if decisions[i] == "y" for sql, _ in s.ddl
+            sql for i in range(len(steps)) if decisions[i] == "y" for sql, _ in resolved[i]
         ]
 
         action = _ask_action(step.prompt, ddl, confirmed_so_far, expert, step.python_snippet(schema))
 
         if action == "y":
+            overrides = _resolve_required_input(step, schema) if step.required_input else {}
+            resolved[idx] = step.resolved_ddl(overrides)
             decisions[idx] = "y"
             idx += 1
         elif action == "n":
@@ -729,15 +762,16 @@ def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tupl
                 continue
             idx -= 1
             decisions[idx] = None
+            resolved.pop(idx, None)
         elif action == "s":
             break
         elif action == "q":
             return [], True
 
     confirmed: list[tuple[str, bool]] = []
-    for i, step in enumerate(steps):
+    for i in range(len(steps)):
         if decisions[i] == "y":
-            confirmed.extend(step.ddl)
+            confirmed.extend(resolved[i])
     return confirmed, False
 
 

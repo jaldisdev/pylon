@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::PyTypeInfo;
 use pylon_core as core;
+use std::collections::HashMap;
 
 mod cache;
 mod introspect;
@@ -1844,10 +1845,31 @@ impl MigrationStep {
         &self.inner.object_desc
     }
 
-    /// List of (sql, non_transactional) tuples, in emission order.
+    /// List of (sql, non_transactional) tuples, in emission order. May
+    /// contain `\(placeholder)` tokens — see `required_input` — that must be
+    /// resolved via `resolved_ddl` before executing.
     #[getter]
     fn ddl(&self) -> Vec<(String, bool)> {
         self.inner.ddl.iter().map(|op| (op.sql.clone(), op.non_transactional)).collect()
+    }
+
+    /// List of (placeholder, prompt, default_expr, type_name) tuples — one
+    /// per free-form expression the caller must resolve (e.g. a property's
+    /// type-change conversion expression) before this step's `ddl` is
+    /// directly usable. Empty for the common case.
+    #[getter]
+    fn required_input(&self) -> Vec<(String, String, String, String)> {
+        self.inner.required_input.iter()
+            .map(|r| (r.placeholder.clone(), r.prompt.clone(), r.default_expr.clone(), r.type_name.clone()))
+            .collect()
+    }
+
+    /// This step's DDL with every `\(placeholder)` token substituted —
+    /// `overrides[placeholder]` if given, else that input's own
+    /// `default_expr`. Returns (sql, non_transactional) tuples, same shape
+    /// as `ddl`.
+    fn resolved_ddl(&self, overrides: HashMap<String, String>) -> Vec<(String, bool)> {
+        self.inner.resolved_ddl(&overrides).into_iter().map(|op| (op.sql, op.non_transactional)).collect()
     }
 
     /// Best-effort "equivalent Python schema declaration" for this step's
