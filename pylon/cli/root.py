@@ -7,6 +7,7 @@ from pylon.config import load_config
 
 from .banner import _BOLD_RED, _RESET
 from .commands.cache import cache
+from .commands.completion import completion_cmd
 from .commands.database import database
 from .commands.info import info_cmd
 from .commands.migrations import migration
@@ -15,6 +16,15 @@ from .commands.serve import serve
 from .commands.version import version
 from .commands.worker import worker
 from .config import NO_CONFIG_HINT, _print_error, requires_config
+
+
+def _complete_db_name(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
+    """Shell-completion callback: named [database.<name>] connections from pylon.toml."""
+    try:
+        config = load_config()
+    except Exception:
+        return []
+    return [k for k in config.connections if k != "default" and k.startswith(incomplete)]
 
 
 def main() -> None:
@@ -34,6 +44,7 @@ def main() -> None:
 @click.option(
     "-d", "--database", "db_name",
     default=None, metavar="NAME",
+    shell_complete=_complete_db_name,
     help="Named database connection from pylon.toml (e.g. -d staging).",
 )
 @click.pass_context
@@ -87,6 +98,7 @@ cli.add_command(version)
 cli.add_command(query_cmd)
 cli.add_command(info_cmd)
 cli.add_command(serve)
+cli.add_command(completion_cmd)
 
 
 # --- shortcuts ----------------------------------------------------------------

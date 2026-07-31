@@ -63,6 +63,18 @@ def _next_seq(d: Path) -> int:
     return int(existing[-1].name[:5]) + 1 if existing else 1
 
 
+def _complete_migration_id(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
+    """Shell-completion callback: on-disk migration IDs matching the prefix."""
+    try:
+        from pylon.config import load_config
+
+        config = load_config()
+        migrations = _load_migrations(_migrations_dir(config))
+    except Exception:
+        return []
+    return [m.id for m in migrations if m.id.startswith(incomplete)]
+
+
 # ── CLI group ─────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -74,6 +86,7 @@ def migration() -> None:
 
 @migration.command()
 @click.option("--to", "to_id", default=None, metavar="ID",
+              shell_complete=_complete_migration_id,
               help="Stop applying at this migration ID.")
 @click.option("--dev-mode", is_flag=True, default=False,
               help="Skip DDL already applied via 'watch'; just move the tracking pointer.")
@@ -1169,8 +1182,10 @@ def rehash(ctx: click.Context, file: Path) -> None:
 
 @migration.command()
 @click.option("--from", "from_id", default=None, metavar="ID",
+              shell_complete=_complete_migration_id,
               help="First migration in the range to squash (inclusive).")
 @click.option("--to", "to_id", default=None, metavar="ID",
+              shell_complete=_complete_migration_id,
               help="Last migration in the range to squash (inclusive).")
 @click.option("--count", type=int, default=None, metavar="N",
               help="Squash the last N migrations.")
