@@ -479,7 +479,7 @@ mod tests {
     impl ScratchDir {
         fn new(tag: &str) -> Self {
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let dir = std::env::temp_dir().join(format!("pylon-server-config-test-{tag}-{nanos}"));
+            let dir = std::env::temp_dir().join(format!("pylon-config-test-{tag}-{nanos}"));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
