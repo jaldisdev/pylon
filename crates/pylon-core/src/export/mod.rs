@@ -2,6 +2,8 @@ use crate::error::{PyQLError, PyQLFragmentError};
 use crate::schema::{DeleteAction, DeleteSide, FunctionDescriptor, OnDeletePolicy, SchemaDescriptor, TypeDescriptor, TypeConstraint};
 use std::collections::{BTreeSet, HashMap};
 
+pub mod python_snippet;
+
 /// Export the full schema as a PostgreSQL DDL string.
 ///
 /// Emits, in order:
