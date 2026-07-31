@@ -128,19 +128,4 @@ def finalize(
     )
     _set_schema(schema)
     _set_signal_index(build_signal_index(signals))
-    _export_schema_json(cfg, schema)
     return schema
-
-
-def _export_schema_json(cfg: Any, schema: "SchemaDescriptor") -> None:
-    """Write the schema to ``.pylon/schema.json`` next to ``pylon.toml``.
-
-    Lets `pylon-lsp` (a pure-Rust binary with no embedded Python) load the
-    same schema this process just built, so it can run the full compiler
-    and surface semantic diagnostics instead of only parser errors.
-    """
-    if cfg.toml_path is None:
-        return
-    pylon_dir = cfg.toml_path.parent / ".pylon"
-    pylon_dir.mkdir(exist_ok=True)
-    (pylon_dir / "schema.json").write_text(schema.to_json())

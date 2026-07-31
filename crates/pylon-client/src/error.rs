@@ -27,9 +27,11 @@ pub enum Error {
     /// `query_required_single` (and its `_json` sibling) got zero rows.
     #[error("expected exactly one result, got none")]
     NoData,
-    /// `.pylon/schema.json` couldn't be read or didn't parse.
-    #[error("failed to load schema from {path}: {source}")]
-    Schema { path: String, source: std::io::Error },
+    /// Neither `pylon migration apply` nor `pylon migration watch` has ever
+    /// run against this database, so there's no schema snapshot to load —
+    /// a bare schema-file edit has no effect until one of those does.
+    #[error("no schema snapshot found in the database — run `pylon migration create` and `pylon migration apply` first")]
+    NoSchemaSnapshot,
     #[error("failed to parse schema JSON: {0}")]
     SchemaJson(#[from] serde_json::Error),
     /// `EXPLAIN`'s raw JSON output failed to correlate against the query's
