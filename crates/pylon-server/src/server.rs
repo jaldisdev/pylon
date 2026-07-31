@@ -34,7 +34,26 @@ pub fn run(config: Config) -> Result<()> {
 
 async fn serve(config: Config) -> Result<()> {
     let addr = format!("{}:{}", config.webserver.host, config.webserver.port);
-    let state = Arc::new(AppState::new(config));
+    let state = Arc::new(AppState::new(config)?);
+
+    // Eagerly connect the base ("default"/"main") connection at startup —
+    // mirrors `asgi.py::_handle_lifespan`'s own lifespan-startup behavior
+    // (a bad DSN/host/credentials fails the whole server at startup there,
+    // not just the first request that happens to touch it); every other
+    // named connection still connects lazily on first use, same as before.
+    // The resulting `SchemaDescriptor` is also what decides which
+    // background workers to spawn (`workers::spawn`), same as
+    // `build_worker_tasks(schema, config, ...)` being called from that
+    // same lifespan-startup handler.
+    let main_client = state
+        .resolve_client("main")
+        .await
+        .map_err(|e| Error::Invalid(format!("failed to connect base [database] connection: {e}")))?
+        .ok_or_else(|| Error::Invalid("no [database] connection configured".to_string()))?;
+    let worker_handles = match state.config.connections.get("default") {
+        Some(db) => crate::workers::spawn(&main_client.schema(), &state.config, &db.dsn_string(), state.cache.clone()),
+        None => Vec::new(),
+    };
 
     let listener = TcpListener::bind(&addr)
         .await
@@ -65,6 +84,11 @@ async fn serve(config: Config) -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("pylon-server: shutting down");
+                // Mirrors `_handle_lifespan`'s own shutdown: cancel every
+                // background worker task before returning.
+                for handle in &worker_handles {
+                    handle.abort();
+                }
                 return Ok(());
             }
         }
