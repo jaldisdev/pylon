@@ -9,6 +9,7 @@
 //! reasoning: nothing in this codebase terminates TLS itself today).
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use http_body_util::Full;
@@ -24,17 +25,24 @@ use crate::json::not_found;
 use crate::state::AppState;
 
 /// Builds a fresh multi-threaded Tokio runtime and blocks on `serve` until
-/// Ctrl+C. Intended to be called from inside `py.allow_threads` once the
-/// CLI cutover (Phase 8) lands — nothing here depends on pyo3 or a Python
-/// event loop.
-pub fn run(config: Config) -> Result<()> {
+/// Ctrl+C — called from inside `py.detach` by `pylon-py`'s `run_server`
+/// binding; nothing here depends on pyo3 or a Python event loop.
+/// `static_dir` is the frontend build's location — this crate has no way
+/// to discover that on its own (it isn't installed alongside a Python
+/// package the way `pylon-py` is), so the pyo3 binding computes it
+/// (package-`__file__`-relative, matching `asgi.py::STATIC_DIR`'s own
+/// convention) and passes it straight through; `None` falls back to
+/// `.pylon/static` relative to `pylon.toml`'s directory (used by this
+/// crate's own standalone examples/tests, which have no installed package
+/// to ask).
+pub fn run(config: Config, static_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| Error::Invalid(format!("failed to start Tokio runtime: {e}")))?;
-    rt.block_on(serve(config))
+    rt.block_on(serve(config, static_dir))
 }
 
-async fn serve(config: Config) -> Result<()> {
+async fn serve(config: Config, static_dir: Option<PathBuf>) -> Result<()> {
     let addr = format!("{}:{}", config.webserver.host, config.webserver.port);
-    let state = Arc::new(AppState::new(config)?);
+    let state = Arc::new(AppState::new(config, static_dir)?);
 
     // Eagerly connect the base ("default"/"main") connection at startup —
     // mirrors `asgi.py::_handle_lifespan`'s own lifespan-startup behavior
