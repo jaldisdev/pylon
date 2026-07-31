@@ -1773,7 +1773,10 @@ fn detect_type_renames(
     target: &SchemaDescriptor,
     current: &DbState,
 ) -> Vec<(String, String, String, String, String, f64)> {
-    core::diff::detect_type_renames(&target.inner, &current.inner)
+    // TODO(migration-overhaul phase 2): thread a real `Guidance` through from
+    // the interactive CLI loop so a rejected rename candidate isn't proposed
+    // again on re-diff.
+    core::diff::detect_type_renames(&target.inner, &current.inner, &core::diff::Guidance::default())
         .into_iter()
         .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table, c.new_type_name, c.confidence))
         .collect()
@@ -1786,7 +1789,8 @@ fn detect_col_renames(
     target: &SchemaDescriptor,
     current: &DbState,
 ) -> Vec<(String, String, String, String, String)> {
-    core::diff::detect_col_renames(&target.inner, &current.inner)
+    // TODO(migration-overhaul phase 2): thread a real `Guidance` through, see above.
+    core::diff::detect_col_renames(&target.inner, &current.inner, &core::diff::Guidance::default())
         .into_iter()
         .map(|c| (c.module, c.table, c.old_col, c.new_col, c.pg_type))
         .collect()
