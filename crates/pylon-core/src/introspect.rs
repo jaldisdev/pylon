@@ -185,16 +185,28 @@ const FUNCTIONS_SQL: &str = r#"
     ORDER BY n.nspname, p.proname
 "#;
 
+// Every non-internal trigger, not just constraint triggers (`tgconstraint
+// != 0`) — that used to exclude `pylon_cache_invalidate` and `@pylon.signal`
+// capture triggers (both plain `CREATE TRIGGER`s, not `CREATE CONSTRAINT
+// TRIGGER`s) from ever being recognized as "already present", so the diff
+// engine proposed recreating every one of them on every single
+// `migration create`/`watch` run, forever, even with zero schema changes
+// (confirmed live against the demo project).
 const TRIGGERS_SQL: &str = r#"
     SELECT (t.tgname, n.nspname, c.relname) AS result
     FROM pg_trigger t
     JOIN pg_class c ON c.oid = t.tgrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE NOT t.tgisinternal
-      AND t.tgconstraint != 0
       AND n.nspname NOT LIKE 'pg_%'
       AND n.nspname <> ALL($1::text[])
     ORDER BY n.nspname, c.relname, t.tgname
+"#;
+
+const EXTENSIONS_SQL: &str = r#"
+    SELECT extname AS result
+    FROM pg_extension
+    ORDER BY extname
 "#;
 
 /// Query pg_catalog and return a `DbState` describing the live database.
@@ -313,6 +325,13 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
             continue;
         };
         state.add_trigger(&pg_to_module(&pg_schema), &table_name, &tgname);
+    }
+
+    // Installed extensions (no excludes — this list is small and deliberate).
+    for row in query(pool, EXTENSIONS_SQL, &[]).await? {
+        if let Some(extname) = as_str(row) {
+            state.extensions.push(extname);
+        }
     }
 
     Ok(state)

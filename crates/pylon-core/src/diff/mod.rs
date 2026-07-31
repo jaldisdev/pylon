@@ -31,6 +31,11 @@ pub struct DbState {
     pub views: Vec<DbView>,
     #[serde(default)]
     pub functions: Vec<DbFunction>,
+    /// Installed Postgres extension names (e.g. `vector`) — used to decide
+    /// whether a `CREATE EXTENSION` needs to be added to a migration; see
+    /// `required_extensions`/`missing_extension_ddl`.
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +156,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .map(|s| DbSequence { schema: s.module.clone(), name: format!("{}_seq", s.name) })
         .collect();
 
-    let excl_trigger_names = expected_excl_trigger_names(schema);
+    let expected_trigger_names = expected_triggers(schema, &type_map);
     let mut tables: Vec<DbTable> = Vec::new();
 
     for td in &schema.types {
@@ -296,10 +301,12 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             }
         }
 
-        let triggers = excl_trigger_names
+        let triggers: Vec<String> = expected_trigger_names
             .get(&(td.module.clone(), td.table.clone()))
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         tables.push(DbTable {
             schema: td.module.clone(),
             name: td.table.clone(),
@@ -313,7 +320,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         // Junction tables for multi-links
         for ml in &td.multilinks {
             tables.push(build_junction_db_table(
-                schema, &type_map, td, &ml.name, &ml.target, ml.through.as_deref(),
+                schema, &type_map, td, &ml.name, &ml.target, ml.through.as_deref(), &expected_trigger_names,
             ));
         }
         // Junction tables for junction-backed single links — same shape
@@ -325,7 +332,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         for l in &td.links {
             if !l.is_junction_backed() { continue; }
             tables.push(build_junction_db_table(
-                schema, &type_map, td, &l.name, &l.target, l.through.as_deref(),
+                schema, &type_map, td, &l.name, &l.target, l.through.as_deref(), &expected_trigger_names,
             ));
         }
     }
@@ -343,7 +350,36 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .map(|(module, name, ddl)| DbFunction { schema: module, name, body_hash: ddl_hash(&ddl) })
         .collect();
 
-    DbState { schemas, tables, enums, domains, sequences, views, functions }
+    let extensions: Vec<String> = required_extensions(schema).iter().map(|s| s.to_string()).collect();
+
+    DbState { schemas, tables, enums, domains, sequences, views, functions, extensions }
+}
+
+/// Postgres extensions `target` needs in order for its own DDL to apply
+/// cleanly — currently just `vector` (pgvector), needed the moment any
+/// type declares a vector index. Extending this to a future
+/// extension-dependent feature is just adding another check here; the
+/// caller-facing surface (`missing_extension_ddl`) doesn't change.
+pub fn required_extensions(target: &SchemaDescriptor) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if target.types.iter().any(|t| !t.vector_indexes.is_empty()) {
+        out.push("vector");
+    }
+    out
+}
+
+/// `CREATE EXTENSION IF NOT EXISTS` statements for every extension
+/// `target` requires that isn't already present in `current` — meant to be
+/// prepended to an assembled migration/`watch` sync unconditionally,
+/// outside the interactive per-step confirmation flow: enabling a
+/// required extension isn't a design decision to confirm or reject, it's
+/// a hard prerequisite the rest of the DDL can't succeed without.
+pub fn missing_extension_ddl(target: &SchemaDescriptor, current: &DbState) -> Vec<String> {
+    required_extensions(target)
+        .into_iter()
+        .filter(|ext| !current.extensions.iter().any(|e| e == ext))
+        .map(|ext| format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\";"))
+        .collect()
 }
 
 /// Builds the expected `DbTable` for one junction table — shared by a
@@ -359,6 +395,7 @@ fn build_junction_db_table(
     name: &str,
     target: &str,
     through: Option<&str>,
+    expected_trigger_names: &HashMap<(String, String), HashSet<String>>,
 ) -> DbTable {
     let jt_name = format!("{}.{}", td.table, name);
     let mut jt_columns = vec![
@@ -403,6 +440,13 @@ fn build_junction_db_table(
         });
     }
 
+    let triggers: Vec<String> = expected_trigger_names
+        .get(&(td.module.clone(), jt_name.clone()))
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
     DbTable {
         schema: td.module.clone(),
         name: jt_name,
@@ -410,7 +454,7 @@ fn build_junction_db_table(
         foreign_keys: jt_fks,
         indexes: vec![],
         checks: vec![],
-        triggers: vec![],
+        triggers,
     }
 }
 
@@ -439,54 +483,65 @@ impl DbState {
     }
 }
 
-/// Compute the expected constraint trigger names per concrete table for all
-/// interface-level exclusive constraints in `schema`.
+/// Every trigger name a table (or its junction tables) should have once
+/// `schema` is fully applied — constraint triggers for interface-exclusive
+/// enforcement, deletion-policy triggers, `@pylon.signal` capture triggers,
+/// and the unconditional cache-invalidation trigger.
 ///
-/// Returns a map from `(module, table)` to the list of trigger names that
-/// should exist on that concrete table.
-fn expected_excl_trigger_names(schema: &SchemaDescriptor) -> HashMap<(String, String), Vec<String>> {
-    use crate::schema::TypeConstraint;
+/// Shared by the diff engine's own add/drop decisions (`diff_inner`'s
+/// trigger phase) and `schema_to_db_state`'s baseline snapshot — both need
+/// the exact same "what should be there" answer. Having two separate,
+/// independently-maintained copies of this logic is exactly how they
+/// drifted apart before: cache-invalidate and `@pylon.signal` triggers were
+/// only ever recognized by the diff engine's own live-comparison path, so
+/// `schema_to_db_state`'s snapshot never listed them as already
+/// present — making `migration create` propose recreating every single
+/// one of them, forever, even with zero schema changes (confirmed live
+/// against the demo project).
+pub fn expected_triggers(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+) -> HashMap<(String, String), HashSet<String>> {
+    let mut expected: HashMap<(String, String), HashSet<String>> = HashMap::new();
 
-    let mut impl_map: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
-    for t in &schema.types {
-        if !t.abstract_ {
-            for iface in &t.interfaces {
-                impl_map.entry(iface.clone()).or_default().push(t);
+    for info in crate::export::interface_exclusive_trigger_infos(schema) {
+        expected.entry((info.impl_module.clone(), info.impl_table.clone())).or_default()
+            .extend([info.ins_trigger_name, info.upd_trigger_name]);
+    }
+    for info in crate::export::deletion_policy_trigger_infos(schema, type_map) {
+        expected.entry((info.table_module.clone(), info.table_name.clone())).or_default()
+            .insert(info.trigger_name);
+    }
+    for info in crate::export::signal_trigger_infos(schema) {
+        expected.entry((info.table_module.clone(), info.table_name.clone())).or_default()
+            .insert(info.trigger_name);
+    }
+
+    // Cache-invalidation trigger — every concrete table and every
+    // multi-link junction table (or junction-backed single link's own
+    // physical table), unconditionally (not gated by `[cache].enabled`;
+    // see the cache layer plan's design decision).
+    let mut cache_trigger_tables: HashSet<(String, String)> = HashSet::new();
+    for td in &schema.types {
+        if td.abstract_ { continue; }
+        cache_trigger_tables.insert((td.module.clone(), td.table.clone()));
+        if !td.junction {
+            for ml in &td.multilinks {
+                cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
+            }
+            for l in &td.links {
+                if !l.is_junction_backed() { continue; }
+                cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
             }
         }
     }
-
-    let mut result: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for t in &schema.types {
-        if !(t.abstract_ && t.materialized) { continue; }
-        let key = format!("{}::{}", t.module, t.name);
-        let Some(impls) = impl_map.get(&key) else { continue };
-        if impls.is_empty() { continue; }
-
-        let mut fields_list: Vec<Vec<String>> = Vec::new();
-        for p in &t.properties {
-            if p.is_exclusive && !p.is_pk { fields_list.push(vec![p.name.clone()]); }
-        }
-        for l in &t.links {
-            if l.is_exclusive { fields_list.push(vec![format!("{}_id", l.name)]); }
-        }
-        for c in &t.constraints {
-            if let TypeConstraint::Exclusive { pointers: fields, .. } = c { fields_list.push(fields.clone()); }
-        }
-
-        for fields in &fields_list {
-            let fn_name = format!("_excl_{}_{}", t.table, fields.join("_"));
-            for impl_t in impls {
-                let entry = result
-                    .entry((impl_t.module.clone(), impl_t.table.clone()))
-                    .or_default();
-                entry.push(format!("{}_ins", fn_name));
-                entry.push(format!("{}_upd", fn_name));
-            }
-        }
+    for key in cache_trigger_tables {
+        expected.entry(key).or_default().insert("pylon_cache_invalidate".to_string());
     }
-    result
+
+    expected
 }
+
 
 // ── Rename candidates ─────────────────────────────────────────────────────────
 
@@ -1729,8 +1784,12 @@ fn diff_inner(
             ))
             .collect();
 
-        // Track expected triggers per table (for the drop phase below).
-        let mut expected_trigger_map: HashMap<(String, String), HashSet<String>> = HashMap::new();
+        // What every table's trigger set *should* be once `target` is fully
+        // applied — the single source of truth both the add-decisions below
+        // and the final drop phase compare `current` against (see
+        // `expected_triggers`'s own doc comment for why this must be one
+        // shared computation, not two).
+        let expected_trigger_map = expected_triggers(target, &type_map);
         // Track which trigger functions have been emitted in this diff pass.
         let mut fn_emitted: HashSet<String> = HashSet::new();
 
@@ -1756,10 +1815,6 @@ fn diff_inner(
         };
 
         for info in &infos {
-            let table_key = (info.impl_module.clone(), info.impl_table.clone());
-            expected_trigger_map.entry(table_key).or_default()
-                .extend([info.ins_trigger_name.clone(), info.upd_trigger_name.clone()]);
-
             let cur = cur_trigger_map
                 .get(&(info.impl_module.as_str(), info.impl_table.as_str()))
                 .cloned()
@@ -1786,10 +1841,6 @@ fn diff_inner(
         // effect for anything added via a real migration (confirmed live,
         // `tests/live_execution_on_delete.rs`, before this fix).
         for info in crate::export::deletion_policy_trigger_infos(target, &type_map) {
-            let table_key = (info.table_module.clone(), info.table_name.clone());
-            expected_trigger_map.entry(table_key).or_default()
-                .insert(info.trigger_name.clone());
-
             let cur = cur_trigger_map
                 .get(&(info.table_module.as_str(), info.table_name.as_str()))
                 .cloned()
@@ -1807,10 +1858,6 @@ fn diff_inner(
         // adds/drops the trigger on the next migration, same as any other
         // schema change — no separate sync step needed.
         for info in crate::export::signal_trigger_infos(target) {
-            let table_key = (info.table_module.clone(), info.table_name.clone());
-            expected_trigger_map.entry(table_key).or_default()
-                .insert(info.trigger_name.clone());
-
             let cur = cur_trigger_map
                 .get(&(info.table_module.as_str(), info.table_name.as_str()))
                 .cloned()
@@ -1849,8 +1896,6 @@ fn diff_inner(
             }
         }
         for (module, table) in &cache_trigger_tables {
-            expected_trigger_map.entry((module.clone(), table.clone())).or_default()
-                .insert("pylon_cache_invalidate".to_string());
             let already_present = cur_trigger_map
                 .get(&(module.as_str(), table.as_str()))
                 .map(|t| t.contains("pylon_cache_invalidate"))
@@ -3182,6 +3227,34 @@ mod tests {
         let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
         assert!(idx_op.non_transactional, "index on pre-existing table should be non-transactional");
         assert!(idx_op.sql.contains("CONCURRENTLY"), "should use CONCURRENTLY: {}", idx_op.sql);
+    }
+
+    #[test]
+    fn test_required_extensions_empty_without_vector_indexes() {
+        let schema = SchemaDescriptor {
+            types: vec![simple_type("default", "Post", "Post")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        assert!(required_extensions(&schema).is_empty());
+    }
+
+    #[test]
+    fn test_missing_extension_ddl_when_vector_index_present_and_not_yet_installed() {
+        use crate::schema::VectorIndexDescriptor;
+        let mut td = simple_type("default", "Post", "Post");
+        td.vector_indexes.push(VectorIndexDescriptor {
+            index_name: None, pointers: vec!["name".into()], model: "test".into(), metric: "cosine".into(), dimensions: 1536,
+        });
+        let schema = SchemaDescriptor {
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        assert_eq!(required_extensions(&schema), vec!["vector"]);
+
+        let ddl = missing_extension_ddl(&schema, &DbState::default());
+        assert_eq!(ddl, vec!["CREATE EXTENSION IF NOT EXISTS \"vector\";".to_string()]);
+
+        let already_installed = DbState { extensions: vec!["vector".into()], ..DbState::default() };
+        assert!(missing_extension_ddl(&schema, &already_installed).is_empty());
     }
 
     #[test]

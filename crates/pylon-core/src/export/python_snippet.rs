@@ -5,22 +5,30 @@
 //! than the Python declaration it corresponds to.
 //!
 //! Best-effort and display-only: covers the common cases (scalar/enum
-//! creation, object-type creation with its full pointer list, and
-//! object-type alteration — which also shows the full current pointer
-//! list, not just the changed ones, since a step's `MigrationStep` doesn't
-//! carry a "before" shape to diff against here) and is not meant to be
-//! round-trippable. The actual `.py` schema file stays authoritative.
+//! creation, object-type and interface-type creation with the full pointer
+//! list, object-type alteration — which also shows the full current
+//! pointer list, not just the changed ones, since a step's `MigrationStep`
+//! doesn't carry a "before" shape to diff against here — and functions,
+//! shown as their original PyQL body rather than the compiled SQL a
+//! function's DDL preview otherwise shows, since PyQL's compiled form is a
+//! deeply nested CTE tree that reads nothing like what the user actually
+//! wrote) and is not meant to be round-trippable. The actual `.py` schema
+//! file stays authoritative.
 
 use crate::diff::{MigrationStep, OpKey};
-use crate::schema::{EnumDescriptor, ScalarDescriptor, SchemaDescriptor, TypeDescriptor};
+use crate::schema::{EnumDescriptor, FunctionDescriptor, ScalarDescriptor, SchemaDescriptor, TypeDescriptor};
 
-/// `None` for step kinds this renderer doesn't cover yet (modules,
-/// functions, interface views — see the module doc comment).
+/// `None` for step kinds this renderer doesn't cover yet (modules — see
+/// the module doc comment).
 pub fn python_snippet_for_step(step: &MigrationStep, schema: &SchemaDescriptor) -> Option<String> {
     match &step.op_key {
         OpKey::Table(module, table) => {
             let td = schema.types.iter().find(|t| &t.module == module && &t.table == table)?;
-            Some(python_snippet_for_type(td))
+            Some(python_snippet_for_class(td, "@pylon.type"))
+        }
+        OpKey::View(module, name) => {
+            let td = schema.types.iter().find(|t| &t.module == module && &t.name == name)?;
+            Some(python_snippet_for_class(td, "@pylon.interface"))
         }
         OpKey::Scalar(module, name) => {
             if let Some(e) = schema.enums.iter().find(|e| &e.module == module && &e.name == name) {
@@ -29,12 +37,18 @@ pub fn python_snippet_for_step(step: &MigrationStep, schema: &SchemaDescriptor) 
             let s = schema.scalars.iter().find(|s| &s.module == module && &s.name == name)?;
             Some(python_snippet_for_scalar(s))
         }
-        OpKey::Module(_) | OpKey::Function(_, _) | OpKey::View(_, _) => None,
+        OpKey::Function(module, name) => {
+            let f = schema.functions.iter().find(|f| &f.module == module && &f.name == name)?;
+            Some(python_snippet_for_function(f))
+        }
+        OpKey::Module(_) => None,
     }
 }
 
-fn python_snippet_for_type(td: &TypeDescriptor) -> String {
-    let mut lines = vec!["@pylon.type".to_string(), format!("class {}:", td.name)];
+/// Shared by object types (`@pylon.type`) and interface types
+/// (`@pylon.interface`) — same pointer declarations either way.
+fn python_snippet_for_class(td: &TypeDescriptor, decorator: &str) -> String {
+    let mut lines = vec![decorator.to_string(), format!("class {}:", td.name)];
     let mut body: Vec<String> = Vec::new();
 
     for p in &td.properties {
@@ -69,6 +83,35 @@ fn python_snippet_for_enum(e: &EnumDescriptor) -> String {
 
 fn python_snippet_for_scalar(s: &ScalarDescriptor) -> String {
     format!("@pylon.scalar(pylon.{})\nclass {}(pylon.Scalar):\n    pass", s.base, s.name)
+}
+
+fn python_snippet_for_function(f: &FunctionDescriptor) -> String {
+    let params: Vec<String> = f.params.iter().map(|p| format!("{}: {}", p.name, python_type_hint(&p.pg_type, None))).collect();
+
+    let mut return_hint = if f.return_is_object { bare_name(&f.return_pg_type).to_string() } else { python_type_hint(&f.return_pg_type, None) };
+    if f.return_is_set {
+        return_hint = format!("set[{return_hint}]");
+    }
+
+    format!(
+        "@pylon.function\ndef {}({}) -> {}:\n    \"\"\"\n{}\n    \"\"\"",
+        f.name,
+        params.join(", "),
+        return_hint,
+        indent_block(f.body.trim(), "    "),
+    )
+}
+
+/// Indents every line of `text` by `indent` — a multi-line PyQL body needs
+/// each of its own lines re-indented under the docstring, not just the
+/// first (its *relative* indentation between lines, e.g. a `with`
+/// binding's continuation, is left untouched — only a uniform baseline is
+/// added).
+fn indent_block(text: &str, indent: &str) -> String {
+    text.lines()
+        .map(|line| if line.is_empty() { line.to_string() } else { format!("{indent}{line}") })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The trailing unqualified segment of a possibly `module::Name`-qualified
@@ -178,6 +221,26 @@ mod tests {
     }
 
     #[test]
+    fn renders_an_interface_type_as_pylon_interface_not_the_view_sql() {
+        let mut td = empty_type("default", "Account", "Account");
+        td.abstract_ = true;
+        td.materialized = true;
+        td.properties.push(prop("id", "uuid", false));
+        td.properties.push(prop("email", "text", false));
+        let schema = SchemaDescriptor {
+            types: vec![td],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let step = MigrationStep {
+            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            required_input: vec![],
+            op_key: OpKey::View("default".into(), "Account".into()),
+        };
+        let snippet = python_snippet_for_step(&step, &schema).unwrap();
+        assert_eq!(snippet, "@pylon.interface\nclass Account:\n    email: str");
+    }
+
+    #[test]
     fn renders_an_enum() {
         let schema = SchemaDescriptor {
             types: vec![],
@@ -192,6 +255,92 @@ mod tests {
         };
         let snippet = python_snippet_for_step(&step, &schema).unwrap();
         assert_eq!(snippet, "@pylon.enum(\"Active\", \"Inactive\")\nclass Status(pylon.Enum):\n    pass");
+    }
+
+    #[test]
+    fn renders_a_scalar_function_as_its_pyql_body_not_compiled_sql() {
+        let schema = SchemaDescriptor {
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![],
+            functions: vec![FunctionDescriptor {
+                name: "get_content_type".into(),
+                module: "default".into(),
+                params: vec![crate::schema::FunctionParamDescriptor { name: "uuid_val".into(), pg_type: "uuid".into() }],
+                return_pg_type: "int2".into(),
+                return_is_object: false,
+                return_is_set: false,
+                return_is_polymorphic: false,
+                volatility: "immutable".into(),
+                body: "select 1".into(),
+            }],
+        };
+        let step = MigrationStep {
+            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            required_input: vec![],
+            op_key: OpKey::Function("default".into(), "get_content_type".into()),
+        };
+        let snippet = python_snippet_for_step(&step, &schema).unwrap();
+        assert_eq!(
+            snippet,
+            "@pylon.function\ndef get_content_type(uuid_val: pylon.UUID) -> pylon.Int16:\n    \"\"\"\n    select 1\n    \"\"\""
+        );
+    }
+
+    #[test]
+    fn indents_every_line_of_a_multiline_pyql_body() {
+        let schema = SchemaDescriptor {
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![],
+            functions: vec![FunctionDescriptor {
+                name: "get_content_type".into(),
+                module: "default".into(),
+                params: vec![crate::schema::FunctionParamDescriptor { name: "uuid_val".into(), pg_type: "uuid".into() }],
+                return_pg_type: "int8".into(),
+                return_is_object: false,
+                return_is_set: false,
+                return_is_polymorphic: false,
+                volatility: "immutable".into(),
+                body: "with\n  h := str_replace(<str>uuid_val, '-', ''),\n  ct_bytes := std::from_hex(h[20:24])\nselect ct_bytes".into(),
+            }],
+        };
+        let step = MigrationStep {
+            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            required_input: vec![],
+            op_key: OpKey::Function("default".into(), "get_content_type".into()),
+        };
+        let snippet = python_snippet_for_step(&step, &schema).unwrap();
+        assert_eq!(
+            snippet,
+            "@pylon.function\ndef get_content_type(uuid_val: pylon.UUID) -> pylon.Int64:\n    \"\"\"\n    with\n      h := str_replace(<str>uuid_val, '-', ''),\n      ct_bytes := std::from_hex(h[20:24])\n    select ct_bytes\n    \"\"\""
+        );
+    }
+
+    #[test]
+    fn function_snippet_survives_the_real_diff_pipeline() {
+        // Regression guard: `renders_a_scalar_function_...` above only
+        // exercises `python_snippet_for_step` with a hand-built `MigrationStep`
+        // — this instead goes through the actual
+        // `diff_schema_steps_with_renames_and_fills` entry point the CLI
+        // calls, to catch a mismatch between the OpKey a real diff pass
+        // produces and what this renderer looks up.
+        let schema = SchemaDescriptor {
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![],
+            functions: vec![FunctionDescriptor {
+                name: "get_content_type".into(),
+                module: "default".into(),
+                params: vec![crate::schema::FunctionParamDescriptor { name: "uuid_val".into(), pg_type: "uuid".into() }],
+                return_pg_type: "int2".into(),
+                return_is_object: false,
+                return_is_set: false,
+                return_is_polymorphic: false,
+                volatility: "immutable".into(),
+                body: "select 1".into(),
+            }],
+        };
+        let steps = crate::diff::diff_schema_steps_with_renames_and_fills(
+            &schema, &crate::diff::DbState::default(), &[], &[], &[],
+        ).unwrap();
+        let step = steps.iter().find(|s| s.prompt.contains("get_content_type")).expect("expected a step for get_content_type");
+        let snippet = python_snippet_for_step(step, &schema);
+        assert!(snippet.is_some(), "expected a snippet for the function step, prompt was: {:?}", step.prompt);
     }
 
     #[test]
