@@ -538,7 +538,7 @@ pub struct FillRequired {
 // ── Diff operation ─────────────────────────────────────────────────────────────
 
 /// A single DDL operation produced by the diff engine.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiffOp {
     pub sql: String,
     /// When true the statement must run outside any transaction wrapper —
@@ -547,13 +547,151 @@ pub struct DiffOp {
     pub non_transactional: bool,
 }
 
+// ── Migration steps ─────────────────────────────────────────────────────────
+//
+// One logical schema-level question ("did you create scalar type 'X'?"),
+// bundling every DDL statement that answers it — so an interactive caller
+// can confirm/reject one object at a time instead of a flat DDL dump.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Create,
+    Alter,
+    Drop,
+    Rename,
+}
+
+impl Verb {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verb::Create => "create",
+            Verb::Alter => "alter",
+            Verb::Drop => "drop",
+            Verb::Rename => "rename",
+        }
+    }
+}
+
+/// Stable identity an emitted step is grouped by. Every DDL statement that
+/// answers the same logical question (e.g. every column/FK/trigger change
+/// to one table) shares one key and therefore one step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OpKey {
+    Module(String),
+    /// Covers enums, custom scalar domains, and sequence scalars — all
+    /// three share one object identity (a scalar can only be one of them).
+    Scalar(String, String),
+    /// Covers a concrete type's own table plus everything folded into it:
+    /// column/FK diffs, junction tables for its multi-/through-links,
+    /// vector/search index columns, and constraint/deletion/signal/cache
+    /// triggers — a user thinks of all of these as "altering type X", not
+    /// as separate objects.
+    Table(String, String),
+    Function(String, String),
+    View(String, String),
+}
+
+pub struct MigrationStep {
+    /// `"did you {verb} {object_desc}?"` — matches the phrasing convention
+    /// this feature is modeled on.
+    pub prompt: String,
+    pub verb: Verb,
+    /// e.g. `"scalar type 'perspective::DomainStatus'"`.
+    pub object_desc: String,
+    /// Every statement that answers this one question, in emission order.
+    pub ddl: Vec<DiffOp>,
+    pub op_key: OpKey,
+}
+
+fn verbosename_module(name: &str) -> String {
+    format!("module '{name}'")
+}
+
+/// Covers both enums and custom scalar domains — Pylon describes both as
+/// "scalar type" in migration prompts, matching how neither reads naturally
+/// as its own separate noun to someone reviewing a schema change.
+fn verbosename_scalar(module: &str, name: &str) -> String {
+    format!("scalar type '{module}::{name}'")
+}
+
+fn verbosename_type(module: &str, name: &str) -> String {
+    format!("object type '{module}::{name}'")
+}
+
+fn verbosename_interface(module: &str, name: &str) -> String {
+    format!("interface type '{module}::{name}'")
+}
+
+fn verbosename_function(module: &str, name: &str) -> String {
+    format!("function '{module}::{name}'")
+}
+
+/// Accumulates `DiffOp`s into `MigrationStep`s keyed by `OpKey`, preserving
+/// first-insertion order. A key's verb/description are fixed by whichever
+/// call inserts it first; later calls under the same key just append DDL.
+#[derive(Default)]
+struct StepBuilder {
+    order: Vec<OpKey>,
+    drafts: HashMap<OpKey, (Verb, String, Vec<DiffOp>)>,
+}
+
+impl StepBuilder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, key: OpKey, verb: Verb, object_desc: impl Into<String>, op: DiffOp) {
+        self.extend(key, verb, object_desc, vec![op]);
+    }
+
+    fn extend(&mut self, key: OpKey, verb: Verb, object_desc: impl Into<String>, ops: Vec<DiffOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        use std::collections::hash_map::Entry;
+        match self.drafts.entry(key.clone()) {
+            Entry::Occupied(mut e) => e.get_mut().2.extend(ops),
+            Entry::Vacant(e) => {
+                e.insert((verb, object_desc.into(), ops));
+                self.order.push(key);
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<MigrationStep> {
+        let Self { order, mut drafts } = self;
+        order
+            .into_iter()
+            .map(|key| {
+                let (verb, object_desc, ddl) = drafts.remove(&key).unwrap();
+                let prompt = format!("did you {} {}?", verb.as_str(), object_desc);
+                MigrationStep { prompt, verb, object_desc, ddl, op_key: key }
+            })
+            .collect()
+    }
+}
+
+/// Guidance for re-diffing after a rejected rename candidate — mirrors the
+/// two ambiguity detectors below; a plain create/alter/drop has no
+/// alternative reading to search for, so rejecting one of those just
+/// excludes it (handled by the interactive caller, not here).
+#[derive(Debug, Default, Clone)]
+pub struct Guidance {
+    /// `(old_module, old_table, new_module, new_table)` tuples the caller
+    /// has rejected as a rename — never propose these again.
+    pub banned_type_renames: HashSet<(String, String, String, String)>,
+    /// `(module, table, old_col, new_col)` tuples the caller has rejected
+    /// as a rename.
+    pub banned_col_renames: HashSet<(String, String, String, String)>,
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Compute ordered DDL SQL strings to bring a database in sync with `target`.
 /// All statements use plain (non-CONCURRENTLY) index creation — suitable for
 /// `watch` mode where everything runs inside a single transaction.
 pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<String>, String> {
-    Ok(diff_inner(target, current, false, &HashMap::new())?
+    Ok(flatten_ops(diff_inner(target, current, false, &HashMap::new())?)
         .into_iter()
         .map(|op| op.sql)
         .collect())
@@ -563,7 +701,24 @@ pub fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<S
 /// Index creation on pre-existing tables uses `CONCURRENTLY` and is marked
 /// `non_transactional = true` so `create` can insert step-boundary markers.
 pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Result<Vec<DiffOp>, String> {
-    diff_inner(target, current, true, &HashMap::new())
+    Ok(flatten_ops(diff_inner(target, current, true, &HashMap::new())?))
+}
+
+/// Compute the diff as one `MigrationStep` per logical schema-level question
+/// — for an interactive caller that confirms/rejects one object at a time
+/// instead of a flat DDL dump. `fill_index` marks columns whose NOT NULL
+/// constraint is deferred to a caller-supplied backfill (see
+/// `diff_schema_ops_with_renames_and_fills`'s doc comment).
+pub fn diff_schema_steps(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    fill_index: &HashMap<(String, String), HashSet<String>>,
+) -> Result<Vec<MigrationStep>, String> {
+    diff_inner(target, current, true, fill_index)
+}
+
+fn flatten_ops(steps: Vec<MigrationStep>) -> Vec<DiffOp> {
+    steps.into_iter().flat_map(|s| s.ddl).collect()
 }
 
 /// Diff two live-database snapshots (used by squash to capture the net effect
@@ -577,7 +732,9 @@ pub fn diff_states(before: &DbState, after: &DbState) -> Vec<DiffOp> {
 /// Detect potential type (table) renames: tables that exist in `current` but
 /// not in `target`, paired with types that exist in `target` but not in
 /// `current`, where the column-set Jaccard similarity meets a threshold.
-pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<TypeRenameCandidate> {
+/// Candidates already rejected once (`guidance.banned_type_renames`) are
+/// never proposed again — a re-diff after "no" should offer something else.
+pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState, guidance: &Guidance) -> Vec<TypeRenameCandidate> {
     let target_keys: HashSet<(&str, &str)> = target.types.iter()
         .filter(|t| !t.abstract_ && !t.junction)
         .map(|t| (t.module.as_str(), t.table.as_str()))
@@ -612,7 +769,11 @@ pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<
             let union_size = old_cols.union(&new_cols).count();
             if union_size == 0 { continue; }
             let confidence = intersection as f64 / union_size as f64;
-            if confidence >= 0.4 {
+            let banned = guidance.banned_type_renames.contains(&(
+                dropped_t.schema.clone(), dropped_t.name.clone(),
+                new_type.module.clone(), new_type.table.clone(),
+            ));
+            if confidence >= 0.4 && !banned {
                 candidates.push(TypeRenameCandidate {
                     old_module: dropped_t.schema.clone(),
                     old_table: dropped_t.name.clone(),
@@ -630,8 +791,9 @@ pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<
 
 /// Detect potential column renames within tables that exist in both `current`
 /// and `target`. A candidate is a (dropped_col, added_col) pair in the same
-/// table with the same Postgres type.
-pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<ColRenameCandidate> {
+/// table with the same Postgres type. Candidates already rejected once
+/// (`guidance.banned_col_renames`) are never proposed again.
+pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState, guidance: &Guidance) -> Vec<ColRenameCandidate> {
     let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
         .collect();
@@ -680,13 +842,19 @@ pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState) -> Vec<C
         for (pg_type, dropped_names) in &dropped_by_type {
             if let Some(added_names) = added_by_type.get(pg_type) {
                 if dropped_names.len() == 1 && added_names.len() == 1 {
-                    candidates.push(ColRenameCandidate {
-                        module: td.module.clone(),
-                        table: td.table.clone(),
-                        old_col: dropped_names[0].to_string(),
-                        new_col: added_names[0].to_string(),
-                        pg_type: pg_type.to_string(),
-                    });
+                    let banned = guidance.banned_col_renames.contains(&(
+                        td.module.clone(), td.table.clone(),
+                        dropped_names[0].to_string(), added_names[0].to_string(),
+                    ));
+                    if !banned {
+                        candidates.push(ColRenameCandidate {
+                            module: td.module.clone(),
+                            table: td.table.clone(),
+                            old_col: dropped_names[0].to_string(),
+                            new_col: added_names[0].to_string(),
+                            pg_type: pg_type.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -751,7 +919,7 @@ pub fn diff_schema_ops_with_renames(
     }
 
     // ── Run the standard diff against the modified state ──────────────────────
-    let mut diff_ops = diff_inner(target, &modified, true, &HashMap::new())?;
+    let mut diff_ops = flatten_ops(diff_inner(target, &modified, true, &HashMap::new())?);
     ops.append(&mut diff_ops);
     Ok(ops)
 }
@@ -920,7 +1088,7 @@ pub fn diff_schema_ops_with_renames_and_fills(
     }
 
     // ── Standard diff (renames already resolved in `modified`) ───────────────
-    let mut diff_ops = diff_inner(target, &modified, true, &fill_index)?;
+    let mut diff_ops = flatten_ops(diff_inner(target, &modified, true, &fill_index)?);
     ops.append(&mut diff_ops);
 
     // ── Fill DDL: UPDATE backfill + SET NOT NULL ──────────────────────────────
@@ -1065,8 +1233,8 @@ fn diff_inner(
     current: &DbState,
     for_migration: bool,
     fill_index: &HashMap<(String, String), HashSet<String>>,
-) -> Result<Vec<DiffOp>, String> {
-    let mut ops: Vec<DiffOp> = Vec::new();
+) -> Result<Vec<MigrationStep>, String> {
+    let mut steps = StepBuilder::new();
 
     let cur_schemas: HashSet<&str> = current.schemas.iter().map(|s| s.as_str()).collect();
     let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
@@ -1097,50 +1265,65 @@ fn diff_inner(
     for e in &target.enums  { target_schemas.insert(e.module.clone()); }
     for s in &target.scalars { target_schemas.insert(s.module.clone()); }
 
-    // ── Phase 1: schemas ─────────────────────────────────────────────────────
-    for schema in &target_schemas {
-        if schema == "default" { continue; } // public always exists
-        if !cur_schemas.contains(schema.as_str()) {
-            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(schema)));
+    // ── Phase 1: modules ─────────────────────────────────────────────────────
+    for module in &target_schemas {
+        if module == "default" { continue; } // public always exists
+        if !cur_schemas.contains(module.as_str()) {
+            steps.push(
+                OpKey::Module(module.clone()), Verb::Create, verbosename_module(module),
+                DiffOp { sql: format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(module)), non_transactional: false },
+            );
         }
     }
 
-    // ── Phase 2: enums ───────────────────────────────────────────────────────
+    // ── Phase 2: enums (described as "scalar type", matching how a custom
+    // scalar domain is described — see `verbosename_scalar`) ─────────────────
     for e in &target.enums {
         match cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
             None => {
                 let members: Vec<String> = e.members.iter()
                     .map(|m| format!("'{}'", m.replace('\'', "''")))
                     .collect();
-                push_tx(&mut ops, format!(
-                    "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
-                     EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                    pg_schema(&e.module), qi(&e.name), members.join(", ")
-                ));
+                steps.push(
+                    OpKey::Scalar(e.module.clone(), e.name.clone()), Verb::Create, verbosename_scalar(&e.module, &e.name),
+                    DiffOp { sql: format!(
+                        "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
+                         EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+                        pg_schema(&e.module), qi(&e.name), members.join(", ")
+                    ), non_transactional: false },
+                );
             }
             Some(existing) => {
                 let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
                 for member in &e.members {
                     if !existing_set.contains(member.as_str()) {
-                        push_tx(&mut ops, format!(
-                            "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                            pg_schema(&e.module), qi(&e.name), member.replace('\'', "''")
-                        ));
+                        steps.push(
+                            OpKey::Scalar(e.module.clone(), e.name.clone()), Verb::Alter, verbosename_scalar(&e.module, &e.name),
+                            DiffOp { sql: format!(
+                                "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                                pg_schema(&e.module), qi(&e.name), member.replace('\'', "''")
+                            ), non_transactional: false },
+                        );
                     }
                 }
             }
         }
     }
 
-    // ── Phase 2.5: sequences (for sequence scalars) ───────────────────────────
+    // ── Phase 2.5: sequences (for sequence scalars — folded into the same
+    // scalar's step, see `OpKey::Scalar`'s doc comment) ──────────────────────
     for s in &target.scalars {
         if s.is_sequence {
             let seq_name = format!("{}_seq", s.name);
             if !cur_sequences.contains(&(s.module.as_str(), seq_name.as_str())) {
-                push_tx(&mut ops, format!(
-                    "CREATE SEQUENCE IF NOT EXISTS {}.{};",
-                    pg_schema(&s.module), qi(&seq_name)
-                ));
+                let verb = if cur_domains.contains(&(s.module.as_str(), s.name.as_str())) { Verb::Alter } else { Verb::Create };
+                steps.push(
+                    OpKey::Scalar(s.module.clone(), s.name.clone()), verb, verbosename_scalar(&s.module, &s.name),
+                    DiffOp { sql: format!(
+                        "CREATE SEQUENCE IF NOT EXISTS {}.{};",
+                        pg_schema(&s.module), qi(&seq_name)
+                    ), non_transactional: false },
+                );
             }
         }
     }
@@ -1152,11 +1335,14 @@ fn diff_inner(
                 .map(|c| format!("    CHECK ({})", c))
                 .collect();
             let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
-            push_tx(&mut ops, format!(
-                "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
-                 EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
-                pg_schema(&s.module), qi(&s.name), s.pg_type, check_clause
-            ));
+            steps.push(
+                OpKey::Scalar(s.module.clone(), s.name.clone()), Verb::Create, verbosename_scalar(&s.module, &s.name),
+                DiffOp { sql: format!(
+                    "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
+                     EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
+                    pg_schema(&s.module), qi(&s.name), s.pg_type, check_clause
+                ), non_transactional: false },
+            );
         }
     }
 
@@ -1172,7 +1358,11 @@ fn diff_inner(
         } else {
             true
         };
-        if emit { push_tx(&mut ops, ddl); }
+        if emit {
+            let verb = if cur_functions.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
+            steps.push(OpKey::Function(module.clone(), name.clone()), verb, verbosename_function(&module, &name),
+                DiffOp { sql: ddl, non_transactional: false });
+        }
     }
 
     // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
@@ -1187,7 +1377,9 @@ fn diff_inner(
         let key = (td.module.as_str(), td.table.as_str());
         match cur_tables.get(&key) {
             None => {
-                emit_create_table(td, target, &mut ops);
+                let mut local: Vec<DiffOp> = Vec::new();
+                emit_create_table(td, target, &mut local);
+                steps.extend(OpKey::Table(td.module.clone(), td.table.clone()), Verb::Create, verbosename_type(&td.module, &td.name), local);
                 new_tables.insert((td.module.clone(), td.table.clone()));
             }
             Some(existing) => {
@@ -1195,12 +1387,15 @@ fn diff_inner(
                     .get(&(td.module.clone(), td.table.clone()))
                     .cloned()
                     .unwrap_or_default();
-                emit_column_diff(td, existing, &mut ops, for_migration, &fill_cols, target);
+                let mut local: Vec<DiffOp> = Vec::new();
+                emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target);
+                steps.extend(OpKey::Table(td.module.clone(), td.table.clone()), Verb::Alter, verbosename_type(&td.module, &td.name), local);
             }
         }
     }
 
-    // ── Phase 6: FK constraints for new and existing tables ───────────────────
+    // ── Phase 6: FK constraints for new and existing tables (folded into the
+    // same table step) ────────────────────────────────────────────────────────
     // Must run for brand-new tables too (`emit_create_table` only emits plain
     // `uuid` link columns, never a `REFERENCES` clause) — a table absent from
     // `cur_tables` still needs every one of its FKs added, just against an
@@ -1209,19 +1404,29 @@ fn diff_inner(
         let td = &target.types[i];
         if td.abstract_ || td.junction { continue; }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str())).copied();
-        emit_fk_diff(td, existing, &type_map, &mut ops);
+        let verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) { Verb::Create } else { Verb::Alter };
+        let mut local: Vec<DiffOp> = Vec::new();
+        emit_fk_diff(td, existing, &type_map, &mut local);
+        steps.extend(OpKey::Table(td.module.clone(), td.table.clone()), verb, verbosename_type(&td.module, &td.name), local);
     }
 
     // ── Phase 7: junction tables for new multi-links (and junction-backed
     // single links, which share the exact same junction-table machinery,
-    // just capped to one row per source) ──────────────────────────────────
+    // just capped to one row per source) — folded into the owning type's
+    // step, since a user thinks of this as "altering/creating the type to
+    // add a multi-link", not as a separate table ────────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
         if td.abstract_ || td.junction { continue; }
+        let owner_key = OpKey::Table(td.module.clone(), td.table.clone());
+        let owner_verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) { Verb::Create } else { Verb::Alter };
+        let owner_desc = verbosename_type(&td.module, &td.name);
         for ml in &td.multilinks {
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
-                emit_junction_table(td, &ml.name, &ml.target, ml.through.as_deref(), &ml.on_delete, &type_map, target, false, false, &mut ops);
+                let mut local: Vec<DiffOp> = Vec::new();
+                emit_junction_table(td, &ml.name, &ml.target, ml.through.as_deref(), &ml.on_delete, &type_map, target, false, false, &mut local);
+                steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
         }
@@ -1229,25 +1434,31 @@ fn diff_inner(
             if !l.is_junction_backed() { continue; }
             let jt = format!("{}.{}", td.table, l.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
-                emit_junction_table(td, &l.name, &l.target, l.through.as_deref(), &l.on_delete, &type_map, target, true, l.is_exclusive, &mut ops);
+                let mut local: Vec<DiffOp> = Vec::new();
+                emit_junction_table(td, &l.name, &l.target, l.through.as_deref(), &l.on_delete, &type_map, target, true, l.is_exclusive, &mut local);
+                steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
         }
     }
 
-    // ── Phase 8: vector columns + indexes ─────────────────────────────────────
+    // ── Phase 8: vector columns + indexes (folded into the owning type's step) ──
     for &i in &sort_order {
         let td = &target.types[i];
         if td.abstract_ || td.vector_indexes.is_empty() { continue; }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str()));
         let table_is_new = new_tables.contains(&(td.module.clone(), td.table.clone()));
+        let owner_key = OpKey::Table(td.module.clone(), td.table.clone());
+        let owner_verb = if table_is_new { Verb::Create } else { Verb::Alter };
+        let owner_desc = verbosename_type(&td.module, &td.name);
 
         for vi in &td.vector_indexes {
             let col = vi.column_name();
             if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
                 continue;
             }
-            push_tx(&mut ops, format!(
+            let mut local: Vec<DiffOp> = Vec::new();
+            push_tx(&mut local, format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} vector({});",
                 qn(&td.module, &td.table), qi(&col), vi.dimensions
             ));
@@ -1265,16 +1476,20 @@ fn diff_inner(
                 format!("CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});",
                     qi(&idx_name), qn(&td.module, &td.table), qi(&col), vi.ops_class())
             };
-            ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            local.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
         }
     }
 
-    // ── Phase 9: search tsvector columns + GIN indexes ────────────────────────
+    // ── Phase 9: search tsvector columns + GIN indexes (folded likewise) ─────
     for &i in &sort_order {
         let td = &target.types[i];
         if td.abstract_ || td.search_indexes.is_empty() { continue; }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str()));
         let table_is_new = new_tables.contains(&(td.module.clone(), td.table.clone()));
+        let owner_key = OpKey::Table(td.module.clone(), td.table.clone());
+        let owner_verb = if table_is_new { Verb::Create } else { Verb::Alter };
+        let owner_desc = verbosename_type(&td.module, &td.name);
 
         for si in &td.search_indexes {
             if si.backend != SearchBackend::Postgres { continue; }
@@ -1282,6 +1497,7 @@ fn diff_inner(
             if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
                 continue;
             }
+            let mut local: Vec<DiffOp> = Vec::new();
             let parts: Vec<String> = si.pointers.iter()
                 .map(|sf| format!(
                     "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
@@ -1289,7 +1505,7 @@ fn diff_inner(
                 ))
                 .collect();
             let expr = if parts.len() == 1 { parts.into_iter().next().unwrap() } else { parts.join(" || ") };
-            push_tx(&mut ops, format!(
+            push_tx(&mut local, format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} tsvector GENERATED ALWAYS AS ({}) STORED;",
                 qn(&td.module, &td.table), qi(&col), expr
             ));
@@ -1305,7 +1521,8 @@ fn diff_inner(
                 format!("CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});",
                     qi(&idx_name), qn(&td.module, &td.table), qi(&col))
             };
-            ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            local.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
         }
     }
 
@@ -1321,7 +1538,11 @@ fn diff_inner(
         } else {
             true
         };
-        if emit { push_tx(&mut ops, ddl); }
+        if emit {
+            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
+            steps.push(OpKey::View(module.clone(), name.clone()), verb, verbosename_interface(&module, &name),
+                DiffOp { sql: ddl, non_transactional: false });
+        }
     }
 
     // ── Phase 10.5: junction-backed exclusive link cross-implementor views ───
@@ -1340,7 +1561,11 @@ fn diff_inner(
         } else {
             true
         };
-        if emit { push_tx(&mut ops, ddl); }
+        if emit {
+            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
+            steps.push(OpKey::View(module.clone(), name.clone()), verb, verbosename_interface(&module, &name),
+                DiffOp { sql: ddl, non_transactional: false });
+        }
     }
 
     // ── Phase 11: object-returning functions (after tables and views exist) ──
@@ -1355,10 +1580,16 @@ fn diff_inner(
         } else {
             true
         };
-        if emit { push_tx(&mut ops, ddl); }
+        if emit {
+            let verb = if cur_functions.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
+            steps.push(OpKey::Function(module.clone(), name.clone()), verb, verbosename_function(&module, &name),
+                DiffOp { sql: ddl, non_transactional: false });
+        }
     }
 
-    // ── Phase 11.5: interface exclusive constraint triggers ──────────────────
+    // ── Phase 11.5: interface exclusive constraint triggers (folded into the
+    // owning concrete table's step — a user thinks of these as part of
+    // "altering type X", not as separate objects) ────────────────────────────
     {
         let infos = crate::export::interface_exclusive_trigger_infos(target);
         let cur_trigger_map: HashMap<(&str, &str), HashSet<&str>> = current.tables.iter()
@@ -1373,6 +1604,27 @@ fn diff_inner(
         // Track which trigger functions have been emitted in this diff pass.
         let mut fn_emitted: HashSet<String> = HashSet::new();
 
+        // A physical table's (module, name) -> the type whose step its
+        // trigger changes should fold into. Concrete tables own themselves;
+        // junction tables (a multi-link or junction-backed single link's own
+        // physical table) fold into the type that declared that link.
+        let owner_of = |module: &str, table: &str| -> (OpKey, Verb, String) {
+            for &i in &sort_order {
+                let td = &target.types[i];
+                if td.abstract_ || td.junction { continue; }
+                let is_owner = td.module == module && (
+                    td.table == table
+                    || td.multilinks.iter().any(|ml| format!("{}.{}", td.table, ml.name) == table)
+                    || td.links.iter().any(|l| l.is_junction_backed() && format!("{}.{}", td.table, l.name) == table)
+                );
+                if is_owner {
+                    let verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) { Verb::Create } else { Verb::Alter };
+                    return (OpKey::Table(td.module.clone(), td.table.clone()), verb, verbosename_type(&td.module, &td.name));
+                }
+            }
+            (OpKey::Table(module.to_string(), table.to_string()), Verb::Alter, verbosename_type(module, table))
+        };
+
         for info in &infos {
             let table_key = (info.impl_module.clone(), info.impl_table.clone());
             expected_trigger_map.entry(table_key).or_default()
@@ -1385,11 +1637,14 @@ fn diff_inner(
             let need_ins = !cur.contains(info.ins_trigger_name.as_str());
             let need_upd = !cur.contains(info.upd_trigger_name.as_str());
             if need_ins || need_upd {
+                let mut local: Vec<DiffOp> = Vec::new();
                 if fn_emitted.insert(info.fn_name.clone()) {
-                    push_tx(&mut ops, info.fn_ddl.clone());
+                    push_tx(&mut local, info.fn_ddl.clone());
                 }
-                if need_ins { push_tx(&mut ops, info.ins_ddl.clone()); }
-                if need_upd { push_tx(&mut ops, info.upd_ddl.clone()); }
+                if need_ins { push_tx(&mut local, info.ins_ddl.clone()); }
+                if need_upd { push_tx(&mut local, info.upd_ddl.clone()); }
+                let (key, verb, desc) = owner_of(&info.impl_module, &info.impl_table);
+                steps.extend(key, verb, desc, local);
             }
         }
 
@@ -1410,7 +1665,8 @@ fn diff_inner(
                 .cloned()
                 .unwrap_or_default();
             if !cur.contains(info.trigger_name.as_str()) {
-                push_tx(&mut ops, info.ddl.clone());
+                let (key, verb, desc) = owner_of(&info.table_module, &info.table_name);
+                steps.extend(key, verb, desc, vec![DiffOp { sql: info.ddl.clone(), non_transactional: false }]);
             }
         }
 
@@ -1430,7 +1686,8 @@ fn diff_inner(
                 .cloned()
                 .unwrap_or_default();
             if !cur.contains(info.trigger_name.as_str()) {
-                push_tx(&mut ops, info.ddl.clone());
+                let (key, verb, desc) = owner_of(&info.table_module, &info.table_name);
+                steps.extend(key, verb, desc, vec![DiffOp { sql: info.ddl.clone(), non_transactional: false }]);
             }
         }
 
@@ -1469,7 +1726,8 @@ fn diff_inner(
                 .map(|t| t.contains("pylon_cache_invalidate"))
                 .unwrap_or(false);
             if !already_present {
-                push_tx(&mut ops, cache_invalidate_trigger_sql(&qn(module, table)));
+                let (key, verb, desc) = owner_of(module, table);
+                steps.extend(key, verb, desc, vec![DiffOp { sql: cache_invalidate_trigger_sql(&qn(module, table)), non_transactional: false }]);
             }
         }
 
@@ -1479,10 +1737,11 @@ fn diff_inner(
             let expected = expected_trigger_map.get(&key).cloned().unwrap_or_default();
             for trigger_name in &cur_table.triggers {
                 if !expected.contains(trigger_name) {
-                    push_tx(&mut ops, format!(
+                    let (owner_key, verb, desc) = owner_of(&cur_table.schema, &cur_table.name);
+                    steps.extend(owner_key, verb, desc, vec![DiffOp { sql: format!(
                         "DROP TRIGGER IF EXISTS {} ON {};",
                         qi(trigger_name), qn(&cur_table.schema, &cur_table.name)
-                    ));
+                    ), non_transactional: false }]);
                 }
             }
         }
@@ -1507,10 +1766,11 @@ fn diff_inner(
     for cur_table in &current.tables {
         let key = (cur_table.schema.clone(), cur_table.name.clone());
         if !target_tables.contains(&key) {
-            push_tx(&mut ops, format!(
-                "DROP TABLE IF EXISTS {} CASCADE;",
-                qn(&cur_table.schema, &cur_table.name)
-            ));
+            steps.push(
+                OpKey::Table(cur_table.schema.clone(), cur_table.name.clone()), Verb::Drop,
+                verbosename_type(&cur_table.schema, &cur_table.name),
+                DiffOp { sql: format!("DROP TABLE IF EXISTS {} CASCADE;", qn(&cur_table.schema, &cur_table.name)), non_transactional: false },
+            );
         }
     }
 
@@ -1520,10 +1780,11 @@ fn diff_inner(
         .collect();
     for cur_enum in &current.enums {
         if !target_enum_set.contains(&(cur_enum.schema.clone(), cur_enum.name.clone())) {
-            push_tx(&mut ops, format!(
-                "DROP TYPE IF EXISTS {}.{} CASCADE;",
-                pg_schema(&cur_enum.schema), qi(&cur_enum.name)
-            ));
+            steps.push(
+                OpKey::Scalar(cur_enum.schema.clone(), cur_enum.name.clone()), Verb::Drop,
+                verbosename_scalar(&cur_enum.schema, &cur_enum.name),
+                DiffOp { sql: format!("DROP TYPE IF EXISTS {}.{} CASCADE;", pg_schema(&cur_enum.schema), qi(&cur_enum.name)), non_transactional: false },
+            );
         }
     }
 
@@ -1533,36 +1794,43 @@ fn diff_inner(
         .collect();
     for cur_domain in &current.domains {
         if !target_domain_set.contains(&(cur_domain.schema.clone(), cur_domain.name.clone())) {
-            push_tx(&mut ops, format!(
-                "DROP DOMAIN IF EXISTS {}.{} CASCADE;",
-                pg_schema(&cur_domain.schema), qi(&cur_domain.name)
-            ));
+            steps.push(
+                OpKey::Scalar(cur_domain.schema.clone(), cur_domain.name.clone()), Verb::Drop,
+                verbosename_scalar(&cur_domain.schema, &cur_domain.name),
+                DiffOp { sql: format!("DROP DOMAIN IF EXISTS {}.{} CASCADE;", pg_schema(&cur_domain.schema), qi(&cur_domain.name)), non_transactional: false },
+            );
         }
     }
 
-    // ── Phase 14.5: drop removed sequences ───────────────────────────────────
+    // ── Phase 14.5: drop removed sequences (folded into their scalar's drop
+    // step by name, matching phase 2.5's own OpKey::Scalar grouping) ────────
     let target_sequence_set: HashSet<(String, String)> = target.scalars.iter()
         .filter(|s| s.is_sequence)
         .map(|s| (s.module.clone(), format!("{}_seq", s.name)))
         .collect();
     for cur_seq in &current.sequences {
         if !target_sequence_set.contains(&(cur_seq.schema.clone(), cur_seq.name.clone())) {
-            push_tx(&mut ops, format!(
-                "DROP SEQUENCE IF EXISTS {}.{};",
-                pg_schema(&cur_seq.schema), qi(&cur_seq.name)
-            ));
+            let scalar_name = cur_seq.name.strip_suffix("_seq").unwrap_or(&cur_seq.name).to_string();
+            steps.push(
+                OpKey::Scalar(cur_seq.schema.clone(), scalar_name.clone()), Verb::Drop,
+                verbosename_scalar(&cur_seq.schema, &scalar_name),
+                DiffOp { sql: format!("DROP SEQUENCE IF EXISTS {}.{};", pg_schema(&cur_seq.schema), qi(&cur_seq.name)), non_transactional: false },
+            );
         }
     }
 
-    // ── Phase 15: drop removed schemas ───────────────────────────────────────
-    for schema in &current.schemas {
-        if schema == "default" { continue; } // never drop public
-        if !target_schemas.contains(schema) {
-            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(schema)));
+    // ── Phase 15: drop removed modules ───────────────────────────────────────
+    for module in &current.schemas {
+        if module == "default" { continue; } // never drop public
+        if !target_schemas.contains(module) {
+            steps.push(
+                OpKey::Module(module.clone()), Verb::Drop, verbosename_module(module),
+                DiffOp { sql: format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(module)), non_transactional: false },
+            );
         }
     }
 
-    Ok(ops)
+    Ok(steps.finish())
 }
 
 fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
@@ -2805,5 +3073,102 @@ mod tests {
         let joined = ops.join("\n");
         assert!(joined.contains("DROP DOMAIN IF EXISTS \"public\".\"OrderNumber\""), "got:\n{joined}");
         assert!(joined.contains("DROP SEQUENCE IF EXISTS \"public\".\"OrderNumber_seq\""), "got:\n{joined}");
+    }
+
+    // ── MigrationStep grouping ───────────────────────────────────────────────
+
+    #[test]
+    fn test_diff_schema_steps_groups_multiple_column_changes_into_one_alter_step() {
+        let mut person = simple_type("default", "Person", "Person");
+        person.properties.push(prop("nickname", "text", true));
+        person.properties.push(prop("age", "int8", true));
+        let schema = SchemaDescriptor {
+            types: vec![person],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                triggers: vec!["pylon_cache_invalidate".into()],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+
+        let steps = diff_schema_steps(&schema, &state, &HashMap::new()).unwrap();
+        let table_steps: Vec<&MigrationStep> = steps.iter()
+            .filter(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == "default" && t == "Person"))
+            .collect();
+        assert_eq!(
+            table_steps.len(), 1,
+            "two new columns on the same table must produce one step, got: {:?}",
+            steps.iter().map(|s| &s.prompt).collect::<Vec<_>>()
+        );
+        assert_eq!(table_steps[0].verb, Verb::Alter);
+        assert_eq!(table_steps[0].prompt, "did you alter object type 'default::Person'?");
+        assert_eq!(
+            table_steps[0].ddl.len(), 2,
+            "expected one ADD COLUMN per new property, got: {:?}",
+            table_steps[0].ddl.iter().map(|d| &d.sql).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_diff_schema_steps_new_table_is_one_create_step_including_its_trigger() {
+        let schema = SchemaDescriptor {
+            types: vec![simple_type("catalog", "Product", "Product")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let steps = diff_schema_steps(&schema, &empty_state(), &HashMap::new()).unwrap();
+        let table_steps: Vec<&MigrationStep> = steps.iter()
+            .filter(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == "catalog" && t == "Product"))
+            .collect();
+        assert_eq!(table_steps.len(), 1, "got steps: {:?}", steps.iter().map(|s| &s.prompt).collect::<Vec<_>>());
+        assert_eq!(table_steps[0].verb, Verb::Create);
+        assert_eq!(table_steps[0].prompt, "did you create object type 'catalog::Product'?");
+
+        // The cache-invalidation trigger for a brand new table must fold
+        // into this same create step, not a separate one (Phase 11.5).
+        let joined: String = table_steps[0].ddl.iter().map(|d| d.sql.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""), "got:\n{joined}");
+        assert!(joined.contains("pylon_cache_invalidate"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_guidance_bans_a_rejected_type_rename_candidate() {
+        let schema = SchemaDescriptor {
+            types: vec![simple_type("default", "Customer", "Customer")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(), name: "Person".into(),
+                columns: vec![
+                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
+                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                ],
+                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+            }],
+            enums: vec![], domains: vec![],
+            ..DbState::default()
+        };
+
+        let candidates = detect_type_renames(&schema, &state, &Guidance::default());
+        assert_eq!(candidates.len(), 1, "expected Person -> Customer to be proposed as a rename");
+
+        let mut guidance = Guidance::default();
+        guidance.banned_type_renames.insert((
+            "default".to_string(), "Person".to_string(),
+            "default".to_string(), "Customer".to_string(),
+        ));
+        let candidates = detect_type_renames(&schema, &state, &guidance);
+        assert!(candidates.is_empty(), "a banned rename candidate must not be re-proposed");
     }
 }
