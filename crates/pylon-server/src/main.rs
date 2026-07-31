@@ -1,7 +1,8 @@
 //! `pylon-server` — the standalone binary. Discovers `pylon.toml` by
 //! walking up from the current directory (same as the `pylon` CLI's own
-//! project discovery), then runs the server to completion (blocks until
-//! Ctrl+C). No Python involved anywhere in this path.
+//! project discovery), unless `--config` points at one explicitly, then
+//! runs the server to completion (blocks until Ctrl+C). No Python involved
+//! anywhere in this path.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,18 +10,21 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 Usage: pylon-server [OPTIONS]
 
-Run from within a Pylon project (or a subdirectory of one) containing pylon.toml.
+Run from within a Pylon project (or a subdirectory of one) containing
+pylon.toml, or pass --config to point at one explicitly.
 
 Options:
-  --host HOST         Override [webserver].host
-  --port PORT         Override [webserver].port
-  --ui / --no-ui       Override [ui].enabled
-  --static-dir PATH    Directory to serve the frontend build from
-                       (falls back to .pylon/static next to pylon.toml)
-  -h, --help           Show this help and exit
+  --config PATH        Path to pylon.toml (skips the cwd-upward search)
+  --host HOST          Override [webserver].host
+  --port PORT          Override [webserver].port
+  --ui / --no-ui        Override [ui].enabled
+  --static-dir PATH     Serve the frontend build from this directory instead
+                        of the one embedded into the binary at compile time
+  -h, --help            Show this help and exit
 ";
 
 struct Args {
+    config: Option<PathBuf>,
     host: Option<String>,
     port: Option<u16>,
     ui_enabled: Option<bool>,
@@ -28,7 +32,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { host: None, port: None, ui_enabled: None, static_dir: None };
+    let mut args = Args { config: None, host: None, port: None, ui_enabled: None, static_dir: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -36,6 +40,7 @@ fn parse_args() -> Result<Args, String> {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
+            "--config" => args.config = Some(PathBuf::from(it.next().ok_or("--config requires a value")?)),
             "--host" => args.host = Some(it.next().ok_or("--host requires a value")?),
             "--port" => {
                 let raw = it.next().ok_or("--port requires a value")?;
@@ -59,7 +64,11 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut config = match pylon_server::load_config(None) {
+    let config_result = match &args.config {
+        Some(path) => pylon_server::load_config_at(path),
+        None => pylon_server::load_config(None),
+    };
+    let mut config = match config_result {
         Ok(c) => c,
         Err(e) => {
             eprintln!("pylon-server: error: {e}");

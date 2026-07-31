@@ -362,7 +362,17 @@ pub fn load_config(start_dir: Option<&Path>) -> Result<Config> {
         None => std::env::current_dir().map_err(|e| Error::Io { path: PathBuf::from("."), source: e })?,
     };
     let toml_path = find_toml(&start)?;
+    parse_config_file(toml_path)
+}
 
+/// Parses an explicit `pylon.toml` path directly — no directory walk, for
+/// callers (e.g. `pylon-server --config`) that already know exactly which
+/// file to use rather than discovering one relative to `cwd`.
+pub fn load_config_at(toml_path: &Path) -> Result<Config> {
+    parse_config_file(toml_path.to_path_buf())
+}
+
+fn parse_config_file(toml_path: PathBuf) -> Result<Config> {
     let text = std::fs::read_to_string(&toml_path).map_err(|e| Error::Io { path: toml_path.clone(), source: e })?;
     let raw: Table = text.parse().map_err(|e| Error::TomlParse { path: toml_path.clone(), source: e })?;
 
