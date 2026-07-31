@@ -101,6 +101,7 @@ async def _apply(
         migration_advisory_lock,
         migration_try_advisory_lock,
         migration_record_applied,
+        migration_write_schema_snapshot,
     )
 
     config = ctx.obj["config"]
@@ -178,6 +179,12 @@ async def _apply(
             'UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2',
             [db_state_snapshot, tip.id],
         )
+
+        # Update the schema snapshot every client fetches at startup — this
+        # migration just changed what the live database actually looks like,
+        # so clients should see it now, not whatever the schema files say
+        # (those have no effect until migrated, by design).
+        await migration_write_schema_snapshot(pool, schema.to_json())
 
     finally:
         await lock.unlock()
@@ -371,7 +378,13 @@ async def _watch(ctx: click.Context) -> None:
 
 async def _sync_once(config) -> None:
     """Recompile schema, introspect DB, diff, apply."""
-    from pylon._core import diff_schema as _diff_schema, pgcon_connect, introspect_db_state
+    from pylon._core import (
+        diff_schema as _diff_schema,
+        pgcon_connect,
+        introspect_db_state,
+        migration_ensure_tracking_tables,
+        migration_write_schema_snapshot,
+    )
 
     schema = _reload_schema(config)
 
@@ -394,6 +407,12 @@ async def _sync_once(config) -> None:
         # Print first line of each statement as a brief summary
         first_line = sql.splitlines()[0]
         click.echo(f"  {first_line}")
+
+    # A dev-mode sync just changed the live database the same way a real
+    # migration would — clients should be able to pick that up immediately
+    # too, not just once a formal `migration apply` eventually records it.
+    await migration_ensure_tracking_tables(pool)
+    await migration_write_schema_snapshot(pool, schema.to_json())
 
 
 def _reload_schema(config):

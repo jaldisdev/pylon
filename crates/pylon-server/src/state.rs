@@ -17,10 +17,6 @@ const MAIN_CONNECTION_ALIAS: &str = "main";
 
 pub struct AppState {
     pub config: Config,
-    /// `.pylon/schema.json`, resolved relative to `pylon.toml`'s own
-    /// directory (mirrors how `[cache].path` and `[project].schema-dir`
-    /// are both resolved relative to it too).
-    schema_path: PathBuf,
     /// Directory the production frontend build is served from — mirrors
     /// `asgi.py::STATIC_DIR` (`Path(__file__).parent / "static"`, i.e.
     /// package-install-relative, not project-relative). This crate has no
@@ -48,7 +44,6 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config, static_dir_override: Option<PathBuf>) -> crate::error::Result<Self> {
         let toml_dir = config.toml_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
-        let schema_path = toml_dir.join(".pylon/schema.json");
         let static_dir = static_dir_override.unwrap_or_else(|| toml_dir.join(".pylon/static"));
         let cache = if config.cache.enabled {
             let cache = pylon_cache::Cache::open(&config.cache.path, config.cache.max_size_mb as usize)
@@ -57,7 +52,7 @@ impl AppState {
         } else {
             None
         };
-        Ok(Self { config, schema_path, static_dir, clients: Mutex::new(HashMap::new()), cache })
+        Ok(Self { config, static_dir, clients: Mutex::new(HashMap::new()), cache })
     }
 
     pub fn static_dir(&self) -> &std::path::Path {
@@ -77,8 +72,7 @@ impl AppState {
             return Ok(Some(existing.clone()));
         }
         let mut builder = pylon_client::Client::builder(db.dsn_string())
-            .max_pool_size(db.pool_max_size as usize)
-            .schema_path(self.schema_path.clone());
+            .max_pool_size(db.pool_max_size as usize);
         if let Some(cache) = &self.cache {
             builder = builder.cache_handle(cache.clone());
         }

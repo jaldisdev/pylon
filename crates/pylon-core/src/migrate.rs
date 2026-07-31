@@ -54,10 +54,49 @@ pub async fn ensure_tracking_tables(pool: &PgPool) -> Result<()> {
             step_index  integer     NOT NULL,
             updated_at  timestamptz NOT NULL DEFAULT now()
         );
+        CREATE TABLE IF NOT EXISTS _pylon."Schema" (
+            singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),
+            snapshot    jsonb       NOT NULL,
+            updated_at  timestamptz NOT NULL DEFAULT now()
+        );
         "#,
     )
     .await?;
     Ok(())
+}
+
+/// Upserts the process-wide schema snapshot every client fetches at
+/// startup instead of reading `.pylon/schema.json` — a single row (the
+/// `singleton` PK/CHECK forces at most one), written both by `migration
+/// apply` (the formal path) and `watch` (immediate dev-mode sync), since
+/// either is a point where the live database's actual shape just changed.
+/// A bare schema-file edit with neither applied has no effect here, by
+/// design — clients keep seeing the last-applied/synced shape until one of
+/// those two actually run.
+pub async fn write_schema_snapshot(pool: &PgPool, snapshot_json: &str) -> Result<()> {
+    pool.execute_typed(
+        r#"INSERT INTO _pylon."Schema" (singleton, snapshot, updated_at) VALUES (true, $1::jsonb, now())
+           ON CONFLICT (singleton) DO UPDATE SET snapshot = $1::jsonb, updated_at = now()"#,
+        &[CachedValue::Str(snapshot_json.to_string())],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Reads the current schema snapshot, or `None` if neither `migration
+/// apply` nor `watch` has ever run against this database.
+pub async fn read_schema_snapshot(pool: &PgPool) -> Result<Option<String>> {
+    let rows = pool
+        .query_typed(
+            r#"SELECT (snapshot::text) AS result FROM _pylon."Schema" WHERE singleton"#,
+            &[],
+            &pylon_pgcon::ExtensionOids::default(),
+        )
+        .await?;
+    Ok(match rows.into_iter().next() {
+        Some(CachedValue::Str(s)) => Some(s),
+        _ => None,
+    })
 }
 
 /// One row of `_pylon."Migrations"` — covers both `apply`'s own tracking
@@ -442,6 +481,32 @@ mod tests {
         let pool = test_pool().await;
         ensure_tracking_tables(&pool).await.unwrap();
         ensure_tracking_tables(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn schema_snapshot_round_trips() {
+        // `_pylon."Schema"` is a shared singleton row across this whole test
+        // module's DSN (same non-isolation concern as `_pylon."Migrations"`
+        // — see `cleanup_migration_row`'s doc comment), so save and restore
+        // whatever was there before rather than leaving test data behind.
+        let pool = test_pool().await;
+        let previous = read_schema_snapshot(&pool).await.unwrap();
+
+        write_schema_snapshot(&pool, r#"{"probe": "schema_snapshot_round_trips"}"#).await.unwrap();
+        let read_back = read_schema_snapshot(&pool).await.unwrap();
+        assert_eq!(read_back.as_deref(), Some(r#"{"probe": "schema_snapshot_round_trips"}"#));
+
+        // Upsert overwrites in place, so a second write must still round-trip
+        // (not silently keep the first value).
+        write_schema_snapshot(&pool, r#"{"probe": "second_write"}"#).await.unwrap();
+        let read_back_2 = read_schema_snapshot(&pool).await.unwrap();
+        assert_eq!(read_back_2.as_deref(), Some(r#"{"probe": "second_write"}"#));
+
+        match previous {
+            Some(prior) => write_schema_snapshot(&pool, &prior).await.unwrap(),
+            None => pool.batch_execute(r#"DELETE FROM _pylon."Schema""#).await.unwrap(),
+        }
     }
 
     #[tokio::test]

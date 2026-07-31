@@ -132,6 +132,7 @@ mod tests {
             verb,
             object_desc: String::new(),
             ddl: vec![],
+            required_input: vec![],
             op_key: OpKey::Table(td.module.clone(), td.table.clone()),
         }
     }
@@ -186,6 +187,7 @@ mod tests {
         };
         let step = MigrationStep {
             prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            required_input: vec![],
             op_key: OpKey::Scalar("default".into(), "Status".into()),
         };
         let snippet = python_snippet_for_step(&step, &schema).unwrap();
@@ -199,6 +201,7 @@ mod tests {
         };
         let step = MigrationStep {
             prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            required_input: vec![],
             op_key: OpKey::Module("catalog".into()),
         };
         assert!(python_snippet_for_step(&step, &schema).is_none());

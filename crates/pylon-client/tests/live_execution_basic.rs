@@ -92,20 +92,26 @@ fn person_schema(module: &str) -> SchemaDescriptor {
     }
 }
 
-/// Writes `schema` to a fresh temp file and applies its DDL against a real
-/// Postgres, returning a `Client` pointed at that schema/DSN — exercises
-/// the real `.pylon/schema.json` file-loading path (`Builder::schema_path`),
-/// not just an in-memory `SchemaDescriptor`.
+/// Applies `schema`'s DDL against a real Postgres and writes it to
+/// `_pylon."Schema"` (the same singleton row `Builder::build` fetches from —
+/// see `pylon_core::migrate::write_schema_snapshot`), returning a `Client`
+/// pointed at that DSN. Exercises the real DB-fetch path, not just an
+/// in-memory `SchemaDescriptor`.
+///
+/// `_pylon."Schema"` is one row shared by the whole test DSN — unlike
+/// `unique_module`'s per-test isolation, concurrent `setup`/`setup_with_cache`
+/// calls race on this same row, so this file's tests must run with
+/// `--test-threads=1` (or otherwise serialized), not cargo's default
+/// parallelism.
 async fn setup(schema: &SchemaDescriptor) -> Client {
     let ddl = export_schema(schema).unwrap();
     let pool = pylon_pgcon::PgPool::connect(&test_dsn(), 5).await.unwrap();
+    pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
+    pylon_core::migrate::ensure_tracking_tables(&pool).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
+    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap()).await.unwrap();
 
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let path = std::env::temp_dir().join(format!("pylon-client-live-test-{nanos}.json"));
-    std::fs::write(&path, serde_json::to_string(schema).unwrap()).unwrap();
-
-    Client::builder(test_dsn()).max_pool_size(5).schema_path(path).build().await.unwrap()
+    Client::builder(test_dsn()).max_pool_size(5).build().await.unwrap()
 }
 
 /// Like `setup`, but also opts into read-through caching at a fresh temp
@@ -113,16 +119,16 @@ async fn setup(schema: &SchemaDescriptor) -> Client {
 async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
     let ddl = export_schema(schema).unwrap();
     let pool = pylon_pgcon::PgPool::connect(&test_dsn(), 5).await.unwrap();
+    pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
+    pylon_core::migrate::ensure_tracking_tables(&pool).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
+    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap()).await.unwrap();
 
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let path = std::env::temp_dir().join(format!("pylon-client-live-test-{nanos}.json"));
-    std::fs::write(&path, serde_json::to_string(schema).unwrap()).unwrap();
     let cache_dir = std::env::temp_dir().join(format!("pylon-client-live-test-cache-{nanos}"));
 
     Client::builder(test_dsn())
         .max_pool_size(5)
-        .schema_path(path)
         .cache(cache_dir, 10)
         .build()
         .await

@@ -230,9 +230,9 @@ pub fn handle_config_options() -> Response<Full<Bytes>> {
 }
 
 /// Schema/globals are process-level (identical regardless of which named
-/// connection is selected — the same `.pylon/schema.json` backs all of
-/// them), so these two routes just need *some* connected `Client` to read
-/// `.schema()` off of; the base/"main" connection always exists in
+/// connection is selected — the same `_pylon."Schema"` snapshot row backs
+/// all of them), so these two routes just need *some* connected `Client` to
+/// read `.schema()` off of; the base/"main" connection always exists in
 /// `config.connections`.
 async fn any_client(state: &AppState) -> Result<std::sync::Arc<pylon_client::Client>, Response<Full<Bytes>>> {
     match state.resolve_client("main").await {

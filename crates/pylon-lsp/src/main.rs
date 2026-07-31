@@ -3,9 +3,9 @@
 //! basedpyright/ruff) that finds embedded PyQL query strings and republishes
 //! `pylon_core`'s own compile diagnostics at the right location in the `.py`
 //! file. Runs the full compiler (syntax, type, and "did you mean"
-//! resolution diagnostics) once a schema has been loaded from
-//! `.pylon/schema.json` (see `schema.rs`); falls back to parser-only
-//! (syntax) diagnostics when no schema export is found yet.
+//! resolution diagnostics) once a schema snapshot has been fetched from the
+//! database (see `schema.rs`); falls back to parser-only (syntax)
+//! diagnostics when none is reachable yet.
 
 mod diagnostics;
 mod scan;
@@ -39,9 +39,9 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let params: InitializeParams = serde_json::from_value(init_params)?;
 
     let workspace_root = workspace_root(&params);
-    let mut schema_state = SchemaState::new(workspace_root);
+    let schema_state = SchemaState::new(workspace_root);
 
-    main_loop(&connection, &mut schema_state)?;
+    main_loop(&connection, &schema_state)?;
     io_threads.join()?;
     eprintln!("pylon-lsp: shut down");
     Ok(())
@@ -89,7 +89,7 @@ fn percent_decode(s: &str) -> String {
 
 fn main_loop(
     connection: &Connection,
-    schema_state: &mut SchemaState,
+    schema_state: &SchemaState,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     for msg in &connection.receiver {
         match msg {
@@ -130,22 +130,22 @@ fn main_loop(
 /// Scans `text` for PyQL call-site strings and publishes diagnostics for
 /// `uri` (replacing whatever was previously published for it, per standard
 /// LSP `publishDiagnostics` semantics). Runs the full compiler
-/// (`pylon_core::query::compile`) against the schema loaded from
-/// `.pylon/schema.json` when one is available — surfacing semantic errors
-/// (unknown property/link with "did you mean", type mismatches) alongside
-/// syntax errors — and falls back to parser-only checking otherwise.
+/// (`pylon_core::query::compile`) against the schema snapshot fetched from
+/// the database (see `schema.rs`) when one is available — surfacing
+/// semantic errors (unknown property/link with "did you mean", type
+/// mismatches) alongside syntax errors — and falls back to parser-only
+/// checking otherwise.
 fn publish_for(
     connection: &Connection,
-    schema_state: &mut SchemaState,
+    schema_state: &SchemaState,
     uri: &Uri,
     text: &str,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    schema_state.reload_if_changed();
     let matches = scan::scan(text);
     let mut diags: Vec<Diagnostic> = Vec::new();
     for m in &matches {
         let result: Result<(), pylon_core::error::PyQLError> = match schema_state.get() {
-            Some(schema) => pylon_core::query::compile(&m.text, schema).map(|_| ()),
+            Some(schema) => pylon_core::query::compile(&m.text, &schema).map(|_| ()),
             None => pylon_core::parse::parse(&m.text)
                 .map(|_| ())
                 .map_err(pylon_core::error::PyQLError::Syntax),

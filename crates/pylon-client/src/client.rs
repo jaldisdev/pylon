@@ -39,7 +39,6 @@ enum CacheSource {
 pub struct Builder {
     dsn: String,
     max_pool_size: usize,
-    schema_path: PathBuf,
     cache: Option<CacheSource>,
 }
 
@@ -48,21 +47,12 @@ impl Builder {
         Self {
             dsn: dsn.into(),
             max_pool_size: 10,
-            schema_path: schema::default_schema_path(),
             cache: None,
         }
     }
 
     pub fn max_pool_size(mut self, max_pool_size: usize) -> Self {
         self.max_pool_size = max_pool_size;
-        self
-    }
-
-    /// Defaults to `.pylon/schema.json` relative to the current working
-    /// directory — the same artifact `pylon.finalize()` writes and
-    /// `pylon-lsp` already consumes.
-    pub fn schema_path(mut self, schema_path: impl Into<PathBuf>) -> Self {
-        self.schema_path = schema_path.into();
         self
     }
 
@@ -99,11 +89,13 @@ impl Builder {
     }
 
     /// Connects (eagerly — a bad DSN/host/credentials fails right here,
-    /// matching `PgPool::connect`'s own eager-connect behavior) and loads
-    /// the schema.
+    /// matching `PgPool::connect`'s own eager-connect behavior) and fetches
+    /// the schema snapshot from `_pylon."Schema"` — fails with
+    /// `Error::NoSchemaSnapshot` if neither `pylon migration apply` nor
+    /// `pylon migration watch` has ever run against this database.
     pub async fn build(self) -> Result<Client> {
         let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size).await.map_err(Error::Db)?;
-        let schema = schema::load(&self.schema_path)?;
+        let schema = schema::fetch(&pool).await?;
         let cache = match self.cache {
             None => None,
             Some(CacheSource::Open { path, max_size_mb }) => {
@@ -114,7 +106,6 @@ impl Builder {
         Ok(Client {
             pool: Arc::new(pool),
             schema: Arc::new(RwLock::new(schema)),
-            schema_path: Arc::new(self.schema_path),
             globals: Arc::new(HashMap::new()),
             config: SessionConfig::default(),
             cache,
@@ -134,7 +125,6 @@ pub struct Client {
     /// resulting future non-`Send` (fatal for `Client::transaction`'s boxed
     /// futures, and a footgun on a multi-threaded runtime generally).
     schema: Arc<RwLock<SchemaDescriptor>>,
-    schema_path: Arc<PathBuf>,
     globals: Arc<HashMap<String, CachedValue>>,
     config: SessionConfig,
     /// `None` unless `Builder::cache` was called — read-through caching is
@@ -148,12 +138,13 @@ impl Client {
         Builder::new(dsn)
     }
 
-    /// Re-reads `.pylon/schema.json` from disk. Visible to every clone
-    /// sharing this client's pool (`with_globals`/`with_config` views
-    /// included) — there's only one schema slot per underlying connection
-    /// pool, matching `pylon/client.py`'s single process-level singleton.
-    pub fn reload_schema(&self) -> Result<()> {
-        let fresh = schema::load(&self.schema_path)?;
+    /// Re-fetches the schema snapshot from `_pylon."Schema"`. Visible to
+    /// every clone sharing this client's pool (`with_globals`/`with_config`
+    /// views included) — there's only one schema slot per underlying
+    /// connection pool, matching `pylon/client.py`'s single process-level
+    /// singleton.
+    pub async fn reload_schema(&self) -> Result<()> {
+        let fresh = schema::fetch(&self.pool).await?;
         *self.schema.write().unwrap() = fresh;
         pylon_core::query::clear_query_cache();
         Ok(())
