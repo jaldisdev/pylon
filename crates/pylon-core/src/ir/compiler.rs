@@ -293,7 +293,60 @@ pub fn compile_trigger_handler(
         (vec![], c.compile_stmt(&ast)?)
     };
 
+    let recursive_kind = recursive_dml_event(&ir, type_name)
+        .or_else(|| ctes.iter().find_map(|cte| recursive_dml_event(&cte.stmt, type_name)));
+    if let Some(kind) = recursive_kind {
+        if kind & on_mask != 0 {
+            return Err(crate::error::PyQLError::Fragment(crate::error::PyQLFragmentError {
+                message: format!(
+                    "trigger on {type_name} is recursive: its handler {}s its own type, \
+                     which this trigger also fires on",
+                    dml_event_word(kind),
+                ),
+                context: type_name.to_string(),
+                position: crate::error::Position { line: 0, col: 0 },
+            }));
+        }
+    }
+
     Ok(super::IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
+}
+
+fn dml_event_word(kind: u8) -> &'static str {
+    match kind {
+        1 => "insert",
+        2 => "update",
+        4 => "delete",
+        _ => "mutate",
+    }
+}
+
+/// Walks a compiled trigger handler's IR looking for a nested `INSERT`/
+/// `UPDATE`/`DELETE` targeting `owner_type` — the same type the trigger
+/// itself is declared on. Returns that DML's own event bit (1/2/4) the
+/// first time one is found, so the caller can check it against the
+/// trigger's own `on_mask`: a handler that inserts into its own type only
+/// matters if this trigger *also* fires on Insert (mirrors the upstream engine's own
+/// recursive-trigger check in `edb/schema/triggers.py` — the mask
+/// determines what would actually refire, not just "does it touch itself
+/// at all").
+///
+/// Deliberately not exhaustive: covers the direct statement, a `SELECT
+/// (INSERT/UPDATE/DELETE …) { … }` wrapper, and `for x in … union (…)`
+/// loop bodies — the shapes every trigger handler in this codebase's own
+/// test suite actually uses. A DML nested inside a free tuple/set literal
+/// (`select { (insert A {...}), (insert B {...}) }`) isn't walked; a
+/// handler written that way relies on Postgres's own runtime recursion-
+/// depth guard instead, same fallback as before this check existed.
+fn recursive_dml_event(stmt: &IrStmt, owner_type: &str) -> Option<u8> {
+    match stmt {
+        IrStmt::Insert(ins) if ins.target.type_name == owner_type => Some(1),
+        IrStmt::Update(upd) if upd.target.type_name == owner_type => Some(2),
+        IrStmt::Delete(del) if del.target.type_name == owner_type => Some(4),
+        IrStmt::Select(sel) => sel.dml_source.as_deref().and_then(|inner| recursive_dml_event(inner, owner_type)),
+        IrStmt::For(for_stmt) => recursive_dml_event(&for_stmt.body, owner_type),
+        _ => None,
+    }
 }
 
 /// Compile a single PyQL expression in the context of a named type.
