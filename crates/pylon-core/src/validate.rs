@@ -128,6 +128,40 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
                 ));
             }
         }
+
+        // Mutation rewrites: only `PropertyDescriptor.rewrites` is ever read
+        // by the real INSERT/UPDATE compiler (`Compiler::compile_rewrites`)
+        // — `LinkDescriptor.rewrites` exists on the struct but nothing
+        // compiles it, so there's nothing to validate there yet.
+        for prop in &td.properties {
+            for rw in &prop.rewrites {
+                let context = format!("{}.{} (rewrite)", type_name, prop.name);
+                let expr_ast = match crate::parse::parse_expr(&rw.handler) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        errors.push(PyQLError::Syntax(e));
+                        continue;
+                    }
+                };
+                let ir = match compile_expr_in_type(&expr_ast, &type_name, schema) {
+                    Ok((ir, _params)) => ir,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
+                    }
+                };
+                let Some(actual) = infer_ir_type(&ir) else { continue };
+                if !types_compatible(actual, &prop.pg_type) {
+                    errors.push(mismatch(
+                        context.clone(),
+                        format!(
+                            "rewrite handler type mismatch for '{}': expected {}, handler produces {}",
+                            context, prop.pg_type, actual
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     if errors.is_empty() { Ok(()) } else { Err(errors) }
@@ -136,7 +170,7 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, TypeDescriptor};
+    use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, RewriteEntry, TypeDescriptor};
 
     fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
         let mut props = vec![PropertyDescriptor {
@@ -307,5 +341,27 @@ mod tests {
         assert_eq!(errs.len(), 1);
         let (_, msg, _) = errs[0].class_name_message_position();
         assert!(msg.contains("Person.score"), "{msg}");
+    }
+
+    #[test]
+    fn rewrite_type_match_passes() {
+        let mut prop = base_property("name", "text");
+        prop.rewrites = vec![RewriteEntry { on: 1, handler: "'unnamed'".into() }];
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn rewrite_type_mismatch_rejected() {
+        let mut prop = base_property("name", "text");
+        prop.rewrites = vec![RewriteEntry { on: 1, handler: "1".into() }];
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("Person.name (rewrite)"), "{msg}");
+        assert!(msg.contains("expected text"), "{msg}");
     }
 }

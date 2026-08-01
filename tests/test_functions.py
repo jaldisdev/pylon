@@ -122,6 +122,22 @@ class TestReturnTypeConsistency:
         with pytest.raises(pylon_exceptions.SchemaError, match="default value type mismatch"):
             walk([Person], [], [], [])
 
+    def test_rewrite_type_match_passes(self):
+        @pylon.type(module="t", name="Person")
+        class Person:
+            name: pylon.Property[pylon.Str, pylon.Rewrite(pylon.On.Insert, "'unnamed'")]
+
+        schema = walk([Person], [], [], [])
+        assert schema is not None
+
+    def test_rewrite_type_mismatch_rejected(self):
+        @pylon.type(module="t", name="Person")
+        class Person:
+            name: pylon.Property[pylon.Str, pylon.Rewrite(pylon.On.Insert, "1")]
+
+        with pytest.raises(pylon_exceptions.SchemaError, match="rewrite handler type mismatch"):
+            walk([Person], [], [], [])
+
 
 class TestDuplicateFunctionSignature:
     def test_duplicate_signature_rejected(self):
