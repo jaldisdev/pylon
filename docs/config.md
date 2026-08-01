@@ -160,6 +160,78 @@ secret_env = "AZURE_OPENAI_SECRET"
 
 ---
 
+## `[webserver]`
+
+**Optional.** Where the [`pylon-server`](server.md) process binds — regardless of what's mounted on it (`/api`, `/metrics`, the UI).
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `host` | string | no | `"localhost"` | Bind address. |
+| `port` | integer | no | `5656` | Bind port. |
+
+**Example:**
+
+```toml
+[webserver]
+host = "0.0.0.0"
+port = 8080
+```
+
+---
+
+## `[ui]`
+
+**Optional.** Whether `pylon-server` mounts the built frontend SPA at `/`. Kept separate from `[webserver]` so toggling the UI never touches network config, and changing the port never touches whether the UI exists.
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `enabled` | boolean | no | `true` | Serve the UI. |
+
+---
+
+## `[metrics]`
+
+**Optional.** Whether `pylon-server` mounts the Prometheus text-exposition endpoint at `/metrics`. Off by default — an unauthenticated endpoint exposing internal counters/gauges shouldn't be reachable unless explicitly opted into. The counters/gauges themselves are always registered and updated regardless of this flag; it only gates whether the HTTP route is reachable.
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `enabled` | boolean | no | `false` | Mount `/metrics`. |
+
+---
+
+## `[cache]`
+
+**Optional.** Read-through LMDB cache in front of Postgres, off by default. `path` resolves relative to `pylon.toml` (like `schema-dir`) if not already absolute; `~` is expanded.
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `enabled` | boolean | no | `false` | Turn on caching. |
+| `backend` | `"lmdb"` | no | `"lmdb"` | Only LMDB is currently supported. |
+| `max_size_mb` | integer | no | `1024` | LMDB map size cap, in MB. |
+| `path` | string | no | `.pylon/cache` | Directory the LMDB environment lives in. |
+
+### `[cache.sets.<Name>]`
+
+Per-set override, keyed by short Pylon type name (e.g. `[cache.sets.Order]`) — lets one type opt out of caching individually (e.g. if its invalidation write-throughput becomes a bottleneck) without disabling the cache globally.
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `enabled` | boolean | no | `true` | Cache this type's query results. |
+
+**Example:**
+
+```toml
+[cache]
+enabled = true
+max_size_mb = 2048
+path = ".pylon/cache"
+
+[cache.sets.Order]
+enabled = false
+```
+
+---
+
 ## Full example
 
 ```toml
