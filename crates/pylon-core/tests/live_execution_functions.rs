@@ -95,6 +95,13 @@ async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) 
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
 }
 
+async fn rows_with_params(
+    pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str, params: &[CachedValue],
+) -> Vec<CachedValue> {
+    let compiled = query::compile(pyql, sd).unwrap();
+    pool.query_typed(&compiled.sql, params, &ExtensionOids::default()).await.unwrap()
+}
+
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
     match row {
         CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
@@ -217,4 +224,95 @@ async fn overload_resolution_by_argument_count() {
     let rows = rows_of(&pool, &sd, &format!("select {module}::greet('Hi', 'Bob')")).await;
     let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
     assert_eq!(shape[0], CachedValue::Str("Hi, Bob".to_string()));
+}
+
+#[tokio::test]
+#[ignore]
+async fn function_call_argument_gets_cast_to_the_declared_param_type() {
+    let module = unique_module("live_fn_arg_cast");
+    let discount = FunctionDescriptor {
+        name: "discount_price".into(),
+        module: module.clone(),
+        params: vec![param("price", "numeric"), param("pct", "numeric")],
+        return_pg_type: "numeric".into(),
+        return_is_object: false,
+        return_is_set: false,
+        return_is_polymorphic: false,
+        volatility: "immutable".into(),
+        body: "price * (1 - pct / 100)".into(),
+    };
+    let sd = SchemaDescriptor { types: vec![], functions: vec![discount], ..Default::default() };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    // Bound $0/$1 positional parameters — not literals baked into the PyQL
+    // text — must still get wrapped in the function's own declared-param
+    // cast (`Compiler::compile_expr`'s user-function fallback wraps every
+    // arg in `IrExpr::TypeCast` to `fd.params[i].pg_type` regardless of
+    // whether the arg expression is a literal or a bound parameter).
+    let rows = rows_with_params(
+        &pool, &sd,
+        &format!("select {module}::discount_price($0, $1)"),
+        &[CachedValue::Decimal("200".to_string()), CachedValue::Decimal("50".to_string())],
+    ).await;
+    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
+    let CachedValue::Decimal(s) = &shape[0] else { panic!("expected Decimal, got {:?}", shape[0]) };
+    assert_eq!(s.parse::<f64>().unwrap(), 100.0, "got {s}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn function_call_mixes_a_bound_parameter_and_a_literal_argument() {
+    let module = unique_module("live_fn_mixed_args");
+    let discount = FunctionDescriptor {
+        name: "discount_price".into(),
+        module: module.clone(),
+        params: vec![param("price", "numeric"), param("pct", "numeric")],
+        return_pg_type: "numeric".into(),
+        return_is_object: false,
+        return_is_set: false,
+        return_is_polymorphic: false,
+        volatility: "immutable".into(),
+        body: "price * (1 - pct / 100)".into(),
+    };
+    let sd = SchemaDescriptor { types: vec![], functions: vec![discount], ..Default::default() };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    // First arg is a bound parameter, second is a literal baked straight
+    // into the PyQL text — both must resolve through the same call.
+    let rows = rows_with_params(
+        &pool, &sd,
+        &format!("select {module}::discount_price($0, 25)"),
+        &[CachedValue::Decimal("100".to_string())],
+    ).await;
+    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
+    let CachedValue::Decimal(s) = &shape[0] else { panic!("expected Decimal, got {:?}", shape[0]) };
+    assert_eq!(s.parse::<f64>().unwrap(), 75.0, "got {s}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn function_call_composed_as_an_argument_to_another_function_call() {
+    let module = unique_module("live_fn_nested_call");
+    let double = FunctionDescriptor {
+        name: "double".into(),
+        module: module.clone(),
+        params: vec![param("n", "int8")],
+        return_pg_type: "int8".into(),
+        return_is_object: false,
+        return_is_set: false,
+        return_is_polymorphic: false,
+        volatility: "immutable".into(),
+        body: "n * 2".into(),
+    };
+    let sd = SchemaDescriptor { types: vec![], functions: vec![double], ..Default::default() };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    // double(double(3)) — the inner call's IR result must be a valid
+    // argument expression to the outer call, not just a top-level scalar.
+    let rows = rows_of(&pool, &sd, &format!("select {module}::double({module}::double(3))")).await;
+    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
+    assert_eq!(shape[0], CachedValue::I64(12));
 }
