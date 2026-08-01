@@ -15,8 +15,8 @@
 
 use crate::error::{Position, PyQLError, PyQLFragmentError};
 use crate::ir::{
-    compile_expr_in_type, compile_fn_body, compile_scalar_default_typed, infer_ir_type,
-    types_compatible, IrFreeExpr, IrRowSource, IrStmt,
+    compile_expr_in_type, compile_fn_body, compile_scalar_default_typed, compile_trigger_handler,
+    infer_ir_type, types_compatible, IrFreeExpr, IrRowSource, IrStmt,
 };
 use crate::schema::SchemaDescriptor;
 
@@ -162,6 +162,18 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
                 }
             }
         }
+
+        // Schema-defined triggers: compile-only — a trigger handler has no
+        // declared return type to check (it's a side-effecting statement,
+        // not a value producer), but it currently only ever gets compiled
+        // at DDL-emission time (`export::emit_triggers`), so a broken
+        // handler on a type nobody's exported yet would otherwise pass
+        // `finalize()` silently.
+        for trig in &td.triggers {
+            if let Err(e) = compile_trigger_handler(&trig.handler, &type_name, trig.on, schema) {
+                errors.push(e);
+            }
+        }
     }
 
     if errors.is_empty() { Ok(()) } else { Err(errors) }
@@ -170,7 +182,7 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, RewriteEntry, TypeDescriptor};
+    use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor};
 
     fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
         let mut props = vec![PropertyDescriptor {
@@ -363,5 +375,26 @@ mod tests {
         let (_, msg, _) = errs[0].class_name_message_position();
         assert!(msg.contains("Person.name (rewrite)"), "{msg}");
         assert!(msg.contains("expected text"), "{msg}");
+    }
+
+    #[test]
+    fn trigger_handler_compiles_passes() {
+        let mut td = person_type(vec![], vec![]);
+        td.triggers = vec![TriggerDescriptor { on: 1, timing: "After".into(), handler: "select Person".into() }];
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn trigger_handler_unknown_field_rejected() {
+        let mut td = person_type(vec![], vec![]);
+        td.triggers = vec![TriggerDescriptor {
+            on: 1,
+            timing: "After".into(),
+            handler: "select Person filter .nonexistent_field = 1".into(),
+        }];
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
     }
 }
