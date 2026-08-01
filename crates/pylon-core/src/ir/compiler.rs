@@ -25,8 +25,8 @@ use crate::parse::ast::{
     self, Expr, Literal, NonesOrder, ShapeElement, ShapeOp, SortDirection, Stmt,
 };
 use crate::schema::{
-    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, SearchBackend,
-    TypeDescriptor,
+    FunctionDescriptor, LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor,
+    SearchBackend, TypeDescriptor,
 };
 
 use std::collections::HashMap;
@@ -6381,12 +6381,28 @@ impl<'a> Compiler<'a> {
                 _ => (module.map(str::to_string), name.to_string(), None),
             }
         } else {
-            // Fall back to user-defined scalar functions.
+            // Fall back to user-defined scalar functions. Overload
+            // resolution is by (module, name, argument count) only — true
+            // Postgres-style resolution by argument *type* isn't
+            // implemented (a call whose args happen to have the right
+            // count for the wrong-typed overload still picks that one,
+            // relying on the forced TypeCast below rather than erroring).
+            // Candidates are searched for one whose param count actually
+            // matches the call — taking just the first (module, name)
+            // match regardless of arg count used to silently pick the
+            // wrong overload's signature (and then error on arg count)
+            // whenever an earlier-declared overload happened to have a
+            // different arity than the one actually being called
+            // (confirmed live: a 2-arg call to an overload set whose
+            // first-declared member takes 1 arg reported "expects 1
+            // argument(s), got 2" even though a 2-arg overload existed).
             let effective_module = module.unwrap_or("default");
-            let user_fn = self.schema.functions.iter().find(|f| {
+            let candidates: Vec<&FunctionDescriptor> = self.schema.functions.iter().filter(|f| {
                 let module_matches = module.map(|m| m == f.module.as_str()).unwrap_or(true);
                 module_matches && f.name == name && !f.return_is_object
-            });
+            }).collect();
+            let user_fn = candidates.iter().find(|f| f.params.len() == args.len()).copied()
+                .or_else(|| candidates.first().copied());
             if let Some(fd) = user_fn {
                 if fd.params.len() != args.len() {
                     return Err(self.type_err(&format!(

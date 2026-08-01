@@ -1468,10 +1468,18 @@ fn diff_inner(
         .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
         .collect();
 
+    // Every kind of top-level declaration can live in a module of its own,
+    // including one with no types/scalars/enums at all (see the matching
+    // comment on `export::emit_schemas`, which had the same gap — a
+    // function/global/alias-only module's own CREATE SCHEMA step was never
+    // generated, so its first CREATE FUNCTION/etc. failed outright).
     let mut target_schemas: HashSet<String> = HashSet::new();
-    for t in &target.types  { target_schemas.insert(t.module.clone()); }
-    for e in &target.enums  { target_schemas.insert(e.module.clone()); }
-    for s in &target.scalars { target_schemas.insert(s.module.clone()); }
+    for t in &target.types     { target_schemas.insert(t.module.clone()); }
+    for e in &target.enums     { target_schemas.insert(e.module.clone()); }
+    for s in &target.scalars   { target_schemas.insert(s.module.clone()); }
+    for f in &target.functions { target_schemas.insert(f.module.clone()); }
+    for g in &target.globals   { target_schemas.insert(g.module.clone()); }
+    for a in &target.aliases   { target_schemas.insert(a.module.clone()); }
 
     // ── Phase 1: modules ─────────────────────────────────────────────────────
     for module in &target_schemas {
