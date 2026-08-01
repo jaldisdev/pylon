@@ -1712,16 +1712,28 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     let alias = &upd.target.alias;
     let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
 
-    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+    // Nested-DML CTEs first — a single hoisted CTE (e.g. a nested INSERT)
+    // is materialized once and safely referenced from every per-implementor
+    // branch below via its own FROM clause; at most one branch's filter
+    // will ever actually match a row, since each row belongs to exactly
+    // one concrete implementor table.
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
+    cte_parts.extend(emit_user_cte_parts(user_ctes));
     let mut union_parts = vec![];
+    let from_ctes = if upd.nested_ctes.is_empty() {
+        String::new()
+    } else {
+        format!("\nFROM {}", upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", "))
+    };
 
     for (i, imp) in upd.poly_implementors.iter().enumerate() {
         let cte_name = format!("_u{}", i);
         let mut upd_sql = format!(
-            "UPDATE {} AS {}\nSET {}",
+            "UPDATE {} AS {}\nSET {}{}",
             qn(&imp.module, &imp.table),
             qi(alias),
             sets.join(", "),
+            from_ctes,
         );
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
@@ -1792,10 +1804,15 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             "    UPDATE {} AS {}\n    SET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
         );
+        if !upd.nested_ctes.is_empty() {
+            let from_ctes = upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+            upd_sql.push_str(&format!("\n    FROM {}", from_ctes));
+        }
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\n    RETURNING \"id\"");
 
-        let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+        let mut cte_parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
+        cte_parts.extend(emit_user_cte_parts(user_ctes));
         cte_parts.push(format!("\"_w\" AS (\n{}\n)", upd_sql));
         cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_w"));
         cte_parts.extend(enqueue_search_ctes(&upd.enqueue_search, "_w", upd.enqueue_vector.len()));
@@ -1821,8 +1838,11 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
 
-    // User CTEs first.
-    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+    // Nested-DML CTEs first (see IrUpdate::nested_ctes) — only relevant when
+    // has_scalar_changes, since nested_ctes is only ever populated while
+    // compiling scalar assignments, which is exactly the condition below.
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
+    cte_parts.extend(emit_user_cte_parts(user_ctes));
 
     // _ids: the target rows (updated or selected).
     if has_scalar_changes {
@@ -1831,6 +1851,10 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             "UPDATE {} AS {}\nSET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
         );
+        if !upd.nested_ctes.is_empty() {
+            let from_ctes = upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+            upd_sql.push_str(&format!("\nFROM {}", from_ctes));
+        }
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\nRETURNING *");
         cte_parts.push(format!("\"_ids\" AS (\n{}\n)", upd_sql));
@@ -4635,6 +4659,111 @@ mod tests {
         // must be added so the SET clause can reference the CTE's column.
         assert!(out.sql.contains("\nFROM \""), "expected a FROM clause referencing the nested CTE, got:\n{}", out.sql);
         assert!(out.sql.contains("SET \"company_id\" = "), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_link_value_from_nested_insert_combines_with_multilink_mutation() {
+        // A nested-insert link value and a `+=` multi-link mutation in the
+        // same UPDATE route through a completely different emitter branch
+        // (the junction-CTE "_ids" path, not the plain-UPDATE path the
+        // previous test covers) — both must still see the hoisted CTE.
+        let out = compile_and_emit(
+            "UPDATE Person FILTER .id = $id SET { \
+                 company := (select (insert Company { name := 'Acme' }) { id }), \
+                 posts += (SELECT Post FILTER .title = $t) \
+             }",
+        );
+        assert!(out.sql.starts_with("WITH"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Company\""),
+            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+        );
+        assert!(
+            out.sql.contains("\"_ids\" AS (\nUPDATE") && out.sql.contains("\nFROM \""),
+            "expected the _ids UPDATE to gain a FROM clause referencing the nested CTE, got:\n{}", out.sql,
+        );
+        assert!(out.sql.contains("\"_ml_add_0\""), "expected the junction-append CTE to still be present, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_link_value_from_nested_insert_combines_with_interface_target() {
+        // A nested-insert link value on an UPDATE targeting an interface
+        // (abstract + materialized) type routes through the poly fan-out
+        // branch (emit_poly_update_stmt) — a third, independent emitter path
+        // from the previous two tests. The hoisted CTE must be materialized
+        // once and referenced from every per-implementor UPDATE branch.
+        fn id_prop() -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: "id".into(), pg_type: "uuid".into(), nullable: false,
+                default_sql: Some("uuidv7()".into()), default_pyql: None, description: None,
+                check_constraints: vec![], is_exclusive: true, is_pk: true, is_readonly: true,
+                rewrites: vec![], tuple_members: None, column_type: None,
+            }
+        }
+        fn text_prop(name: &str) -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: name.into(), pg_type: "text".into(), nullable: false,
+                default_sql: None, default_pyql: None, description: None,
+                check_constraints: vec![], is_exclusive: false, is_pk: false,
+                is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
+            }
+        }
+        fn company_link() -> LinkDescriptor {
+            LinkDescriptor {
+                name: "company".into(), target: "default::Company".into(), nullable: true,
+                through: None, description: None, default_pyql: None, is_exclusive: false,
+                is_readonly: false, rewrites: vec![], on_delete: vec![],
+            }
+        }
+        let schema = SchemaDescriptor {
+            types: vec![
+                TypeDescriptor {
+                    name: "Company".into(), module: "default".into(), table: "Company".into(),
+                    abstract_: false, materialized: true, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), text_prop("name")],
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "Account".into(), module: "default".into(), table: "Account".into(),
+                    abstract_: true, materialized: true, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop(), text_prop("email")],
+                    links: vec![company_link()],
+                    multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "Individual".into(), module: "default".into(), table: "Individual".into(),
+                    abstract_: false, materialized: true, description: None,
+                    parents: vec![], interfaces: vec!["default::Account".into()],
+                    properties: vec![id_prop(), text_prop("email"), text_prop("first_name")],
+                    links: vec![company_link()],
+                    multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+            ],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let out = compile_and_emit_with(
+            "UPDATE Account FILTER .email = $email \
+             SET { company := (select (insert Company { name := 'Acme' }) { id }) }",
+            &schema,
+        );
+        assert!(out.sql.starts_with("WITH"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Company\""),
+            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+        );
+        assert!(
+            out.sql.contains("UPDATE \"public\".\"Individual\"") && out.sql.contains("\nFROM \"_nested_dml_0\""),
+            "expected the per-implementor UPDATE to gain a FROM clause referencing the nested CTE, got:\n{}", out.sql,
+        );
     }
 
     #[test]
