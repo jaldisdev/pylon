@@ -6282,6 +6282,20 @@ impl<'a> Compiler<'a> {
                  use SELECT (INSERT …) { id } to assign from a DML result",
             ));
         };
+        // NOTE: `SELECT (INSERT …) { id }` as a link-assignment value — the
+        // exact workaround this function's own error message above
+        // recommends — does NOT actually work: Postgres has no way to run a
+        // nested INSERT inside another statement's value list without
+        // hoisting it into a `WITH` CTE first, and nothing in the IR
+        // (`IrInsert` has no CTE-hoisting field) does that hoisting today.
+        // A prior attempt to special-case this here (delegating to
+        // `compile_select`, which does know how to chain a `dml_source` for
+        // a *top-level* `SELECT (INSERT …) { ... }` statement) compiled
+        // without error but silently emitted a subquery that dropped the
+        // nested INSERT and selected an unrelated, arbitrary pre-existing
+        // row instead — worse than this function's current clear rejection.
+        // Tracked as a real gap (nested-DML-as-link-value needs proper CTE
+        // hoisting across compile_insert/compile_update), not fixed here.
         let type_name = self.expr_as_type_name(&sel.result)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
