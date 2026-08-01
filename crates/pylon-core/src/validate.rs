@@ -1,17 +1,28 @@
-//! Post-build schema type-consistency validation.
+//! Post-build schema validation.
 //!
 //! `walk()` (the Python schema builder) checks structure — duplicate names,
-//! dangling references, link cycles, interface conformance — but never
-//! whether a function's/computed pointer's/default's declared PostgreSQL
-//! type actually matches what its PyQL body compiles to. This module closes
-//! that gap by compiling every such body and comparing.
+//! dangling references, link cycles, interface conformance — but every PyQL
+//! body embedded in the schema (function bodies, computed pointers,
+//! defaults, mutation rewrites, triggers, aliases, computed globals) used to
+//! only ever get compiled lazily, the first time something actually
+//! exercised it (a query, a migration, a DDL export) — so a broken one could
+//! sit undetected in the schema indefinitely. This module closes that gap by
+//! eagerly compiling every one of them at `finalize()` time.
 //!
-//! Best-effort, not exhaustive: `infer_ir_type` only recognizes a handful of
-//! `IrExpr` variants (column refs, casts, literals, enum members, named
-//! tuples, global params) — anything else (a binop, a function call, an
-//! if/else) is silently skipped rather than rejected. This still catches the
-//! common, real-world cases while leaving complex expressions as a known
-//! limitation a future pass can extend `infer_ir_type` to cover.
+//! Two kinds of check:
+//! - **Type consistency** (functions, computed pointers, defaults, rewrites)
+//!   — the body compiles *and* its inferred return type matches what's
+//!   declared. Best-effort, not exhaustive: `infer_ir_type` only recognizes a
+//!   handful of `IrExpr` variants (column refs, casts, literals, enum
+//!   members, named tuples, function params, global params) — anything else
+//!   (a binop, a function call, an if/else) is silently skipped rather than
+//!   rejected. This still catches the common, real-world cases while leaving
+//!   complex expressions as a known limitation a future pass can extend
+//!   `infer_ir_type` to cover.
+//! - **Compile-only** (triggers, aliases, computed globals) — these have no
+//!   single declared scalar type to compare against (a trigger handler is
+//!   void, an alias/computed-global can select any shape), so only "does it
+//!   compile" is checked.
 
 use crate::error::{Position, PyQLError, PyQLFragmentError};
 use crate::ir::{
@@ -196,13 +207,36 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         }
     }
 
+    // Computed globals: compile-only, same reasoning as aliases — a computed
+    // global (`select User filter .id = global current_user_id`) can select
+    // any shape, not just a scalar matching `scalar_type`, and it's also
+    // only ever compiled lazily today, the first time a query references it
+    // (`Compiler::compile_global`). `Global.default_expr` (as opposed to
+    // `computed_expr`) is deliberately not checked here — it's always a raw
+    // SQL literal built from a plain Python value at schema-build time
+    // (`_python_value_to_sql`), never a PyQL expression, so there's nothing
+    // to compile.
+    for global in &schema.globals {
+        let Some(computed_expr) = &global.computed_expr else { continue };
+        let parsed = match crate::parse::parse(computed_expr) {
+            Ok(ast) => ast,
+            Err(e) => {
+                errors.push(PyQLError::Syntax(e));
+                continue;
+            }
+        };
+        if let Err(e) = compile(&parsed, schema) {
+            errors.push(e);
+        }
+    }
+
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AliasDescriptor, ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor};
+    use crate::schema::{AliasDescriptor, ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor};
 
     fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
         let mut props = vec![PropertyDescriptor {
@@ -432,5 +466,48 @@ mod tests {
         schema.aliases = vec![AliasDescriptor { name: "bad".into(), module: "default".into(), expr: "select NoSuchType".into() }];
         let errs = validate_schema_types(&schema).unwrap_err();
         assert_eq!(errs.len(), 1);
+    }
+
+    fn base_global(name: &str) -> GlobalDescriptor {
+        GlobalDescriptor {
+            name: name.into(),
+            module: "default".into(),
+            scalar_type: "std::str".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        }
+    }
+
+    #[test]
+    fn computed_global_compiles_passes() {
+        let td = person_type(vec![], vec![]);
+        let mut schema = minimal_schema(vec![td], vec![]);
+        let mut g = base_global("first_person");
+        g.computed_expr = Some("select Person".into());
+        schema.globals = vec![g];
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn computed_global_unknown_type_rejected() {
+        let mut schema = minimal_schema(vec![], vec![]);
+        let mut g = base_global("bad");
+        g.computed_expr = Some("select NoSuchType".into());
+        schema.globals = vec![g];
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn session_global_with_no_computed_expr_is_untouched() {
+        // A plain (non-computed) global has only a `default_expr`, which is
+        // always a pre-built raw SQL literal (see `_python_value_to_sql`),
+        // never PyQL — nothing to compile, so this must never be flagged.
+        let mut schema = minimal_schema(vec![], vec![]);
+        let mut g = base_global("current_user_id");
+        g.default_expr = Some("'not actually pyql, just a sql literal'".into());
+        schema.globals = vec![g];
+        assert!(validate_schema_types(&schema).is_ok());
     }
 }

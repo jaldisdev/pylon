@@ -175,6 +175,37 @@ class TestReturnTypeConsistency:
         with pytest.raises(pylon_exceptions.SchemaError, match="unknown type"):
             walk([], [], [], [], aliases=[alias])
 
+    def test_computed_global_compiles_passes(self):
+        @pylon.type(module="t", name="Person")
+        class Person:
+            name: pylon.Str
+
+        g = pylon.GlobalDescriptor(
+            name="first_person", module="t", scalar_type=pylon.UUID, required=False,
+            computed_expr="select Person",
+        )
+        schema = walk([Person], [], [], [g])
+        assert schema is not None
+
+    def test_computed_global_unknown_type_rejected(self):
+        g = pylon.GlobalDescriptor(
+            name="bad", module="t", scalar_type=pylon.UUID, required=False,
+            computed_expr="select NoSuchType",
+        )
+        with pytest.raises(pylon_exceptions.SchemaError, match="unknown type"):
+            walk([], [], [], [g])
+
+    def test_session_global_with_plain_default_passes(self):
+        # A session global's `default` is a plain Python value converted
+        # straight to a SQL literal — never PyQL — so this must never trip
+        # the eager compile check that computed globals get.
+        g = pylon.GlobalDescriptor(
+            name="current_user_id", module="t", scalar_type=pylon.UUID, required=False,
+            default="not pyql, just a literal",
+        )
+        schema = walk([], [], [], [g])
+        assert schema is not None
+
 
 class TestDuplicateFunctionSignature:
     def test_duplicate_signature_rejected(self):
