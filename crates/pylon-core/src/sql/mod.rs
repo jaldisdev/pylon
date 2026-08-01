@@ -3779,7 +3779,7 @@ mod tests {
         ).unwrap();
         match crate::ir::compile(&ast, &make_schema()) {
             Ok(_) => panic!("expected a compile error for link property on a Standard junction"),
-            Err(e) => assert!(e.to_string().contains("through"), "expected a through(...)-related error, got: {e}"),
+            Err(e) => assert!(e.to_string().contains("Through"), "expected a Through[...]-related error, got: {e}"),
         }
     }
 

@@ -137,6 +137,21 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
     }
 }
 
+/// A multilink backed by an explicit `@pylon.junction` type (`Through[...]`
+/// in the schema DSL) — the junction type itself carries the link
+/// properties, referenced in PyQL via `@propname`.
+pub fn multilink_through(name: &str, target_qname: &str, through_qname: &str) -> MultiLinkDescriptor {
+    MultiLinkDescriptor {
+        name: name.into(),
+        target: target_qname.into(),
+        through: Some(through_qname.into()),
+        nullable: false,
+        description: None,
+        default_pyql: None,
+        on_delete: vec![],
+    }
+}
+
 /// A user-declared schema `Trigger` — `on` is Pylon's `On` bitmask
 /// (1=Insert, 2=Update, 4=Delete), `timing` is `"Before"`/`"After"`/
 /// `"InsteadOf"`, `handler` a PyQL statement (`__new__`/`__old__` row-
