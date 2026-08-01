@@ -3386,24 +3386,12 @@ impl<'a> Compiler<'a> {
             })
             .collect();
         let enqueue_search = collect_search_enqueue(td, &type_name, "index");
+        // Nested-DML CTEs (see IrUpdate::nested_ctes) compose with every
+        // other UPDATE shape — multi-link mutation, interface-type fan-out,
+        // and vector/search enqueue each have their own emitter branch
+        // (emit_update_stmt / emit_poly_update_stmt) that now prepends
+        // these CTEs and adds the FROM clause a hoisted CTE reference needs.
         let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
-
-        if !nested_ctes.is_empty() {
-            let has_any_multilink = !multi_link_clears.is_empty()
-                || !multi_link_replaces.is_empty()
-                || !multi_link_appends.is_empty()
-                || !multi_link_removals.is_empty();
-            if has_any_multilink || !poly_implementors.is_empty()
-                || !enqueue_vector.is_empty() || !enqueue_search.is_empty()
-            {
-                return Err(self.type_err(
-                    "a link assignment sourced from a nested INSERT/UPDATE/DELETE \
-                     (`SELECT (INSERT …) { id }`) cannot yet be combined in the same \
-                     UPDATE with a multi-link mutation, an interface-type target, or \
-                     a vector/search index enqueue — split this into separate statements",
-                ));
-            }
-        }
 
         Ok(IrUpdate {
             target, filter, assignments, rewrites, returning,

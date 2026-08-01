@@ -1303,14 +1303,16 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_dml_link_value_combined_with_multilink_mutation_is_rejected() {
+    fn test_nested_dml_link_value_combines_with_multilink_mutation_in_the_same_update() {
         // A link value sourced from a hoisted nested INSERT/UPDATE/DELETE
-        // (`company := (select (insert Company {...}) { id })`) shares the
-        // same WITH clause as this update's own row — but the multi-link
-        // junction CTE machinery (emit_update_multilink_ctes) builds a
-        // completely different WITH structure that nothing here threads
-        // `nested_ctes` through yet. Compiler::compile_update rejects the
-        // combination outright rather than silently mis-emitting it.
+        // (`company := (select (insert Company {...}) { id })`) and a
+        // multi-link mutation (`posts +=`) in the same UPDATE both compile
+        // — `IrUpdate` carries both `nested_ctes` and `multi_link_appends`,
+        // and `emit_update_stmt`'s junction-CTE branch threads the former
+        // through into the `_ids` UPDATE's own FROM clause. See the SQL-shape
+        // assertion in `sql::tests::
+        // test_update_link_value_from_nested_insert_combines_with_multilink_mutation`
+        // for the actual emitted structure.
         let schema = make_schema();
         let ast = parse::parse(
             "UPDATE Person FILTER .id = $id SET { \
@@ -1318,8 +1320,10 @@ mod tests {
                  posts += (SELECT Post FILTER .title = $t) \
              }",
         ).unwrap();
-        let err = super::compile(&ast, &schema).err().expect("expected a compile error");
-        assert!(err.to_string().contains("cannot yet be combined"), "unexpected: {err}");
+        let ir = super::compile(&ast, &schema).unwrap();
+        let IrStmt::Update(upd) = ir.stmt else { panic!("expected Update") };
+        assert_eq!(upd.nested_ctes.len(), 1);
+        assert_eq!(upd.multi_link_appends.len(), 1);
     }
 
     #[test]
