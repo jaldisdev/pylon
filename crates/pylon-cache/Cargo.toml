@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 heed = "0.22"
 rkyv = { version = "0.8", default-features = false, features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 pylon-value = { path = "../pylon-value" }
 
