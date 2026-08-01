@@ -1350,7 +1350,7 @@ mod tests {
         schema.globals.push(GlobalDescriptor {
             name: "viewer_id".into(),
             module: "default".into(),
-            scalar_type: "UUID".into(),
+            scalar_type: "std::uuid".into(),
             required: false,
             default_expr: None,
             computed_expr: None,
@@ -1360,6 +1360,32 @@ mod tests {
         assert_eq!(ir.global_ctes.len(), 1);
         assert_eq!(ir.global_ctes[0].cte_name(), "__global__default::viewer_id");
         assert_eq!(ir.params, vec!["__global__default::viewer_id"]);
+    }
+
+    #[test]
+    fn test_session_global_pg_type_matches_pyql_type_name() {
+        // Regression: `GlobalDescriptor.scalar_type` is a PyQL-style type
+        // name built by the Python walker's `_pyql_type_name` (e.g.
+        // "std::uuid"), never a bare class name like "UUID" —
+        // `resolve_global_pg_type` used to match against the latter and
+        // silently fall back to "text" for every builtin-typed session
+        // global, which only surfaced once something actually compiled a
+        // query/expression comparing the global against a real uuid column.
+        let mut schema = make_schema();
+        schema.globals.push(GlobalDescriptor {
+            name: "viewer_id".into(),
+            module: "default".into(),
+            scalar_type: "std::uuid".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        });
+        let ast = parse::parse("SELECT Person FILTER .id = global viewer_id").unwrap();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrGlobalCte::Session(session) = &ir.global_ctes[0] else {
+            panic!("expected a session global CTE");
+        };
+        assert_eq!(session.pg_type, "uuid");
     }
 
     #[test]

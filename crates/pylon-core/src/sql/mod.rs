@@ -3836,7 +3836,7 @@ mod tests {
         schema.globals.push(GlobalDescriptor {
             name: "current_user_id".into(),
             module: "default".into(),
-            scalar_type: "UUID".into(),
+            scalar_type: "std::uuid".into(),
             required: false,
             default_expr: None,
             computed_expr: None,
@@ -3872,7 +3872,7 @@ mod tests {
         schema.globals.push(GlobalDescriptor {
             name: "current_user_id".into(),
             module: "default".into(),
-            scalar_type: "UUID".into(),
+            scalar_type: "std::uuid".into(),
             required: false,
             default_expr: None,
             computed_expr: None,
