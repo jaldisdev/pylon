@@ -486,7 +486,8 @@ impl DbState {
 /// Every trigger name a table (or its junction tables) should have once
 /// `schema` is fully applied — constraint triggers for interface-exclusive
 /// enforcement, deletion-policy triggers, `@pylon.signal` capture triggers,
-/// and the unconditional cache-invalidation trigger.
+/// user-declared schema `Trigger`s, and the unconditional cache-invalidation
+/// trigger.
 ///
 /// Shared by the diff engine's own add/drop decisions (`diff_inner`'s
 /// trigger phase) and `schema_to_db_state`'s baseline snapshot — both need
@@ -515,6 +516,9 @@ pub fn expected_triggers(
     for info in crate::export::signal_trigger_infos(schema) {
         expected.entry((info.table_module.clone(), info.table_name.clone())).or_default()
             .insert(info.trigger_name);
+    }
+    for (module, table, name) in crate::export::user_trigger_names(schema) {
+        expected.entry((module, table)).or_default().insert(name);
     }
 
     // Cache-invalidation trigger — every concrete table and every
@@ -1889,6 +1893,27 @@ fn diff_inner(
             }
         }
 
+        // User-declared schema `Trigger`s — same previously-missing-parity
+        // bug as deletion-policy triggers above: only `export_schema`'s
+        // fresh-install path used to emit these at all (`emit_triggers` was
+        // never called from the incremental migration path), so adding or
+        // changing a `Trigger(...)` on an existing type via `migration
+        // create` silently did nothing. A changed handler changes this
+        // trigger's hash-derived name (`export::trigger_ddl_name`), so an
+        // in-place edit surfaces here as "add the new name" — the stale
+        // old-named trigger is caught by the generic "drop what's no longer
+        // expected" sweep below, using the same `expected_trigger_map`.
+        for info in crate::export::user_trigger_infos(target).map_err(|e| e.to_string())? {
+            let cur = cur_trigger_map
+                .get(&(info.table_module.as_str(), info.table_name.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            if !cur.contains(info.trigger_name.as_str()) {
+                let (key, verb, desc) = owner_of(&info.table_module, &info.table_name);
+                steps.extend(key, verb, desc, vec![DiffOp { sql: info.ddl.clone(), non_transactional: false }]);
+            }
+        }
+
         // Cache-invalidation trigger — every concrete table and every
         // multi-link junction table, unconditionally (not gated by
         // `[cache].enabled`; see the cache layer plan's design decision).
@@ -2656,6 +2681,44 @@ mod tests {
             joined.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"catalog\".\"Product\""),
             "new table must get the cache-invalidation trigger; got:\n{joined}"
         );
+    }
+
+    fn widget_with_trigger(on: u8, timing: &str, handler: &str) -> TypeDescriptor {
+        let mut t = simple_type("default", "Widget", "Widget");
+        t.triggers = vec![crate::schema::TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }];
+        t
+    }
+
+    #[test]
+    fn test_new_table_with_user_trigger_emits_the_compiled_trigger_ddl() {
+        // Regression guard for the previously-missing incremental-migration
+        // path: `export_schema` always emitted a schema's user-declared
+        // `Trigger`s, but `diff_schema`/`diff_schema_steps` (the path
+        // `migration create` actually uses) never did, so adding a
+        // `Trigger(...)` to an existing type had zero effect on a real
+        // migration.
+        let schema = SchemaDescriptor {
+            types: vec![widget_with_trigger(1, "After", "update Widget set { name := __new__.name }")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let ops = diff_schema(&schema, &empty_state()).unwrap();
+        let joined = ops.join("\n");
+        assert!(joined.contains("NEW.\"name\""), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_user_trigger_already_present_in_offline_baseline_produces_no_further_steps() {
+        // Same "phantom step" bug class fixed earlier for cache-invalidate/
+        // signal triggers: `schema_to_db_state`'s projection must recognize
+        // a user Trigger as already present, or `migration create` would
+        // propose recreating it forever, even with zero real schema changes.
+        let schema = SchemaDescriptor {
+            types: vec![widget_with_trigger(1, "After", "update Widget set { name := __new__.name }")],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let baseline = schema_to_db_state(&schema);
+        let steps = diff_schema_steps(&schema, &baseline, &HashMap::new()).unwrap();
+        assert!(steps.is_empty(), "expected zero further migration steps, got: {steps:?}");
     }
 
     #[test]

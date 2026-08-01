@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use pylon_core::query;
-use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor};
+use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TriggerDescriptor};
 use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::CachedValue;
 use std::collections::HashMap;
@@ -112,6 +112,15 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
         default_pyql: None,
         on_delete: vec![],
     }
+}
+
+/// A user-declared schema `Trigger` — `on` is Pylon's `On` bitmask
+/// (1=Insert, 2=Update, 4=Delete), `timing` is `"Before"`/`"After"`/
+/// `"InsteadOf"`, `handler` a PyQL statement (`__new__`/`__old__` row-
+/// context anchors are legal per `on` — see
+/// `pylon_core::ir::compile_trigger_handler`'s own doc comment).
+pub fn trigger(on: u8, timing: &str, handler: &str) -> TriggerDescriptor {
+    TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }
 }
 
 /// Diffs `schema` against Postgres's actual live state — the assertion
