@@ -17,25 +17,29 @@
 // limitations under the License.
 //
 
-//! Live-Postgres tests for `INSERT` shapes not covered elsewhere:
-//! `select (insert ...) { ... }` chaining (reading the newly inserted row's
-//! own fields back out, not just its `id`), and a multilink assigned
-//! directly at insert time (`members := {...}`) rather than appended after
-//! the fact via `+=`. Concepts inspired by the upstream engine's own
-//! the upstream insert suite, not ported literally — `+=`/`-=` multi-link
-//! mutation and link-property (`Through[...]`) round-tripping are already
-//! covered in depth by `live_execution_linkprops.rs` and
-//! `live_execution_backlinks.rs`; this file is scoped to the two shapes
-//! above, neither of which had any live coverage before this file.
+//! Live-Postgres tests for `INSERT` shapes not covered elsewhere: a nested
+//! `insert` used as a link's value (`author := (select (insert Person
+//! {...}) { id })` — the only spelling Pylon accepts; a bare `(insert ...)`
+//! is still rejected with a "use SELECT (INSERT …) { id }" error, since
+//! only `SELECT` is valid there), `select (insert ...) { ... }` chaining
+//! (reading the newly inserted row's own fields back out, not just its
+//! `id`), and a multilink assigned directly at insert time (`members :=
+//! {...}`) rather than appended after the fact via `+=`. Concepts inspired
+//! by the upstream insert suite, not ported literally — `+=`/`-=`
+//! multi-link mutation and link-property (`Through[...]`) round-tripping
+//! are already covered in depth by `live_execution_linkprops.rs` and
+//! `live_execution_backlinks.rs`; this file is scoped to the three shapes
+//! above, none of which had any live coverage before this file.
 //!
-//! Deliberately NOT covered: nested DML as a link's value
-//! (`author := (insert Person {...})`, or the `select (insert ...) { id }`
-//! workaround its rejection error recommends). Postgres has no way to run a
-//! nested `INSERT` inside another statement's value list without hoisting
-//! it into a `WITH` CTE first, and nothing in the IR does that hoisting
-//! today (`IrInsert` has no CTE-hoisting field — see
-//! `Compiler::compile_link_subquery`'s own doc comment). This is a real,
-//! deliberately-untouched gap, not an oversight.
+//! The nested-insert-as-link-value case is hoisted into its own `WITH` CTE
+//! at compile time (`Compiler::compile_link_subquery` /
+//! `IrInsert::nested_ctes`) — Postgres has no way to run a nested `INSERT`
+//! inside another statement's value list otherwise. A first attempt at this
+//! feature (a different session) tried inlining it as an ordinary subquery
+//! instead; that compiled but silently dropped the nested INSERT and
+//! selected an unrelated, arbitrary pre-existing row. The CTE-hoisting
+//! approach here was verified correct manually against real Postgres before
+//! being wired into the compiler.
 //!
 //! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
@@ -126,6 +130,35 @@ fn as_array(v: &CachedValue) -> &[CachedValue] {
         CachedValue::Array(items) => items,
         other => panic!("expected Array, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn insert_link_value_from_a_nested_insert_subquery() {
+    let module = unique_module("live_insert_nested_link");
+    let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
+    let mut post = ty("Post", &module, vec![id_prop(), text_prop("title")]);
+    post.links = vec![link("author", &format!("{module}::Person"))];
+    let sd = SchemaDescriptor { types: vec![person, post], ..Default::default() };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!(
+        "insert {module}::Post {{ \
+             title := 'Hello', \
+             author := (select (insert {module}::Person {{ name := 'Alice', age := 30 }}) {{ id }}) \
+         }}"
+    )).await;
+
+    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }}")).await;
+    assert_eq!(people.len(), 1, "the nested insert must have actually created the Person row");
+    assert_eq!(as_str(field(&people[0], 1)), "Alice");
+    assert_eq!(as_i64(field(&people[0], 2)), 30);
+
+    let posts = rows_of(&pool, &sd, &format!("select {module}::Post {{ title, author: {{ name }} }}")).await;
+    assert_eq!(posts.len(), 1);
+    let author = field(&posts[0], 2);
+    assert_eq!(as_str(field(author, 1)), "Alice", "Post.author must point at the row the nested insert created");
 }
 
 #[tokio::test]

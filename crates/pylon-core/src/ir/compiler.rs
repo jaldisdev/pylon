@@ -456,6 +456,15 @@ struct Compiler<'a> {
     special_anchors: HashMap<String, (&'a TypeDescriptor, String)>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
+    /// Nested DML hoisted out of a link-assignment value currently being
+    /// compiled (`author := (select (insert Person {...}) { id })`) — see
+    /// `compile_link_subquery`'s doc comment. `compile_insert`/
+    /// `compile_update` save-and-clear this on entry and drain it back into
+    /// their own `IrInsert`/`IrUpdate::nested_ctes` on exit, so nesting
+    /// (a nested insert whose own link value nests another insert) attaches
+    /// each level's discoveries to the right statement.
+    pending_nested_ctes: Vec<IrCteDef>,
+    nested_cte_counter: usize,
     /// Non-fatal warnings collected during compilation.
     warnings: Vec<String>,
     /// User-configurable session options — see `SessionConfig`. Always
@@ -479,6 +488,8 @@ impl<'a> Compiler<'a> {
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
             global_ctes: vec![],
+            pending_nested_ctes: vec![],
+            nested_cte_counter: 0,
             warnings: vec![],
             config,
         }
@@ -569,6 +580,15 @@ impl<'a> Compiler<'a> {
         let a = format!("t{}", self.alias_counter);
         self.alias_counter += 1;
         a
+    }
+
+    /// A distinct naming scheme from `fresh_alias`'s `t0`, `t1`, ... (table
+    /// aliases) so a hoisted nested-DML CTE name can never collide with one
+    /// — see `pending_nested_ctes`.
+    fn fresh_nested_cte_name(&mut self) -> String {
+        let n = self.nested_cte_counter;
+        self.nested_cte_counter += 1;
+        format!("_nested_dml_{n}")
     }
 
     /// Register a named parameter and return its 0-based index.
@@ -2976,6 +2996,12 @@ impl<'a> Compiler<'a> {
     // ── INSERT ────────────────────────────────────────────────────────────────────
 
     fn compile_insert(&mut self, ins: &ast::InsertStmt) -> Result<IrInsert, PyQLError> {
+        // Isolate this insert's own nested-DML discoveries (see
+        // `pending_nested_ctes`'s doc comment) from whatever an enclosing
+        // compile (e.g. this insert itself being the nested DML inside an
+        // *outer* insert's link value) had pending, so each level attaches
+        // only its own CTEs to its own `IrInsert`.
+        let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
         let type_name = format!("{}", ins.subject.name);
         let td = self.resolve_type(&type_name)?;
         if td.abstract_ && td.materialized {
@@ -3090,6 +3116,7 @@ impl<'a> Compiler<'a> {
             })
             .collect();
         let enqueue_search = collect_search_enqueue(td, &type_name, "index");
+        let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
 
         Ok(IrInsert {
             target,
@@ -3100,6 +3127,7 @@ impl<'a> Compiler<'a> {
             enqueue_vector,
             enqueue_search,
             multi_link_appends,
+            nested_ctes,
         })
     }
 
@@ -3206,6 +3234,8 @@ impl<'a> Compiler<'a> {
     // ── UPDATE ────────────────────────────────────────────────────────────────────
 
     fn compile_update(&mut self, upd: &ast::UpdateStmt) -> Result<IrUpdate, PyQLError> {
+        // See `compile_insert`'s identical save/restore of `pending_nested_ctes`.
+        let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
         let type_name = self.expr_as_type_name(&upd.subject)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
@@ -3348,7 +3378,7 @@ impl<'a> Compiler<'a> {
         let written_cols: std::collections::HashSet<&str> =
             assignments.iter().map(|(c, _)| c.as_str()).collect();
         let type_name = format!("{}::{}", td.module, td.name);
-        let enqueue_vector = td.vector_indexes.iter()
+        let enqueue_vector: Vec<VectorEnqueueInfo> = td.vector_indexes.iter()
             .filter(|vi| vi.pointers.iter().any(|f| written_cols.contains(f.as_str())))
             .map(|vi| VectorEnqueueInfo {
                 type_name: type_name.clone(),
@@ -3356,6 +3386,24 @@ impl<'a> Compiler<'a> {
             })
             .collect();
         let enqueue_search = collect_search_enqueue(td, &type_name, "index");
+        let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
+
+        if !nested_ctes.is_empty() {
+            let has_any_multilink = !multi_link_clears.is_empty()
+                || !multi_link_replaces.is_empty()
+                || !multi_link_appends.is_empty()
+                || !multi_link_removals.is_empty();
+            if has_any_multilink || !poly_implementors.is_empty()
+                || !enqueue_vector.is_empty() || !enqueue_search.is_empty()
+            {
+                return Err(self.type_err(
+                    "a link assignment sourced from a nested INSERT/UPDATE/DELETE \
+                     (`SELECT (INSERT …) { id }`) cannot yet be combined in the same \
+                     UPDATE with a multi-link mutation, an interface-type target, or \
+                     a vector/search index enqueue — split this into separate statements",
+                ));
+            }
+        }
 
         Ok(IrUpdate {
             target, filter, assignments, rewrites, returning,
@@ -3364,6 +3412,7 @@ impl<'a> Compiler<'a> {
             poly_implementors, poly_columns,
             enqueue_vector,
             enqueue_search,
+            nested_ctes,
         })
     }
 
@@ -6282,20 +6331,56 @@ impl<'a> Compiler<'a> {
                  use SELECT (INSERT …) { id } to assign from a DML result",
             ));
         };
-        // NOTE: `SELECT (INSERT …) { id }` as a link-assignment value — the
-        // exact workaround this function's own error message above
-        // recommends — does NOT actually work: Postgres has no way to run a
-        // nested INSERT inside another statement's value list without
-        // hoisting it into a `WITH` CTE first, and nothing in the IR
-        // (`IrInsert` has no CTE-hoisting field) does that hoisting today.
-        // A prior attempt to special-case this here (delegating to
-        // `compile_select`, which does know how to chain a `dml_source` for
-        // a *top-level* `SELECT (INSERT …) { ... }` statement) compiled
+
+        // `SELECT (INSERT …) { id }` / `SELECT (UPDATE …) { id }` /
+        // `SELECT (DELETE …) { id }` — the exact workaround this function's
+        // own error message above recommends. Postgres has no way to run a
+        // nested INSERT/UPDATE/DELETE inside another statement's value list
+        // without hoisting it into a `WITH` CTE first, so that's what this
+        // does: compile the inner DML as its own statement, stash it in
+        // `self.pending_nested_ctes` under a fresh CTE name (drained by
+        // whichever `compile_insert`/`compile_update` is compiling the
+        // assignment this value belongs to — see those functions' own doc
+        // comments — and prepended as a `WITH` CTE by the emitter, which
+        // also switches the outer statement's own row source from
+        // `VALUES (...)` / a bare `SET` to something that can actually
+        // reference it), and return a plain reference to that CTE's `id`
+        // column in place of the subquery.
+        //
+        // A prior attempt to handle this by delegating to `compile_select`
+        // (which does know how to chain a `dml_source`, but only for a
+        // *top-level* `SELECT (INSERT …) { ... }` statement) compiled
         // without error but silently emitted a subquery that dropped the
         // nested INSERT and selected an unrelated, arbitrary pre-existing
-        // row instead — worse than this function's current clear rejection.
-        // Tracked as a real gap (nested-DML-as-link-value needs proper CTE
-        // hoisting across compile_insert/compile_update), not fixed here.
+        // row instead — do not repeat that approach.
+        let nested_dml = match &sel.result {
+            Expr::SubQuery(inner) if matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
+                Some(inner.as_ref())
+            }
+            Expr::Shape(s) => match s.expr.as_ref() {
+                Some(Expr::SubQuery(inner)) if matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
+                    Some(inner.as_ref())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(inner_stmt) = nested_dml {
+            let inner_type_name = self.dml_subject_type(inner_stmt)?;
+            let inner_ir = self.compile_stmt(inner_stmt)?;
+            let cte_name = self.fresh_nested_cte_name();
+            self.pending_nested_ctes.push(IrCteDef {
+                name: cte_name.clone(),
+                stmt: inner_ir,
+                type_name: inner_type_name,
+            });
+            return Ok(IrExpr::ColumnRef {
+                alias: cte_name,
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            });
+        }
+
         let type_name = self.expr_as_type_name(&sel.result)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();

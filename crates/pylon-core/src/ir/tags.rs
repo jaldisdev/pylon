@@ -597,6 +597,7 @@ mod tests {
                 },
                 single: false,
             }],
+            nested_ctes: vec![],
         };
         let out = output(IrStmt::Insert(ins));
         assert_eq!(collect_tags(&out), vec!["public.person", "public.person.posts", "public.post"]);
@@ -620,6 +621,7 @@ mod tests {
             multi_link_replaces: vec![],
             multi_link_appends: vec![],
             multi_link_removals: vec![],
+            nested_ctes: vec![],
         };
         let out = output(IrStmt::Update(upd));
         assert_eq!(collect_tags(&out), vec!["public.person", "public.person.posts"]);

@@ -479,6 +479,15 @@ pub struct IrInsert {
     /// there's no clear/remove list: a brand-new row has no prior junction
     /// rows to clear or remove from.
     pub multi_link_appends: Vec<IrMultiLinkMutation>,
+    /// DML (INSERT/UPDATE/DELETE) discovered nested inside a link-assignment
+    /// value — `author := (select (insert Person {...}) { id })` — hoisted
+    /// into its own `WITH` CTE ahead of this insert, since Postgres has no
+    /// way to run a nested INSERT inside a VALUES list otherwise. When
+    /// non-empty, the emitter switches this insert's own row source from
+    /// `VALUES (...)` to `SELECT ... FROM <cte>, ...`, and any assignment
+    /// value referencing one of these CTEs is a plain `ColumnRef` to its
+    /// `id` column. See `Compiler::compile_link_subquery`.
+    pub nested_ctes: Vec<IrCteDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +528,13 @@ pub struct IrUpdate {
     pub multi_link_appends: Vec<IrMultiLinkMutation>,
     /// `friends -= expr` — DELETE specific junction rows.
     pub multi_link_removals: Vec<IrMultiLinkMutation>,
+    /// Same as `IrInsert::nested_ctes` — hoisted nested DML from a link
+    /// assignment value in this update's own SET shape. Only supported
+    /// (see `Compiler::compile_update`) when this update has no multi-link
+    /// mutation, no interface fan-out, and nothing to enqueue; combining
+    /// those with a nested DML value is a compile error for now rather than
+    /// attempting to emit anything, until that combination is implemented.
+    pub nested_ctes: Vec<IrCteDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -1284,6 +1300,26 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT Ghost { name }").unwrap();
         assert!(super::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
+    fn test_nested_dml_link_value_combined_with_multilink_mutation_is_rejected() {
+        // A link value sourced from a hoisted nested INSERT/UPDATE/DELETE
+        // (`company := (select (insert Company {...}) { id })`) shares the
+        // same WITH clause as this update's own row — but the multi-link
+        // junction CTE machinery (emit_update_multilink_ctes) builds a
+        // completely different WITH structure that nothing here threads
+        // `nested_ctes` through yet. Compiler::compile_update rejects the
+        // combination outright rather than silently mis-emitting it.
+        let schema = make_schema();
+        let ast = parse::parse(
+            "UPDATE Person FILTER .id = $id SET { \
+                 company := (select (insert Company { name := 'Acme' }) { id }), \
+                 posts += (SELECT Post FILTER .title = $t) \
+             }",
+        ).unwrap();
+        let err = super::compile(&ast, &schema).err().expect("expected a compile error");
+        assert!(err.to_string().contains("cannot yet be combined"), "unexpected: {err}");
     }
 
     #[test]

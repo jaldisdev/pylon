@@ -579,24 +579,9 @@ fn insert_has_any_multilink(ins: &IrInsert) -> bool {
 /// `RETURNING *`) so the junction CTEs can reference its freshly-generated id.
 fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
     let ids_name = format!("{}__ids", name);
-    let mut parts: Vec<String> = vec![];
+    let mut parts: Vec<String> = emit_user_cte_parts(&ins.nested_ctes);
 
-    let rewrite_cols: std::collections::HashSet<&str> =
-        ins.rewrites.iter().map(|r| r.column.as_str()).collect();
-    let cols: Vec<String> = ins.assignments.iter()
-        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
-        .map(|(c, _)| qi(c))
-        .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
-        .collect();
-    let vals: Vec<String> = ins.assignments.iter()
-        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
-        .map(|(_, e)| emit_expr(e))
-        .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
-        .collect();
-    let mut insert_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        source_ref(&ins.target), cols.join(", "), vals.join(", "),
-    );
+    let mut insert_sql = emit_insert_row_sql(ins);
     if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
     insert_sql.push_str("\nRETURNING *");
     parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, insert_sql));
@@ -1651,47 +1636,63 @@ fn shape_select_from_cte(
     (shape, Some(sql))
 }
 
-fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
+/// Builds the base `INSERT INTO t (cols) VALUES (...)` row source — or,
+/// when `ins.nested_ctes` is non-empty, `INSERT INTO t (cols) SELECT ...
+/// FROM cte1, cte2, ...` instead, since a VALUES list can't reference a
+/// CTE's columns (needed when a link's value is sourced from a hoisted
+/// nested INSERT/UPDATE/DELETE — see `IrInsert::nested_ctes`). Each nested
+/// CTE is guaranteed exactly one row, so an implicit cross join is safe.
+/// Shared by the plain wrap path and the multi-link junction wrap path
+/// below, both of which need this same VALUES/SELECT choice.
+fn emit_insert_row_sql(ins: &IrInsert) -> String {
     let rewrite_cols: std::collections::HashSet<&str> =
         ins.rewrites.iter().map(|r| r.column.as_str()).collect();
-    let mut cols: Vec<String> = ins.assignments.iter()
+    let cols: Vec<String> = ins.assignments.iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(c, _)| qi(c))
+        .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
         .collect();
-    let mut vals: Vec<String> = ins.assignments.iter()
+    let vals: Vec<String> = ins.assignments.iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(_, e)| emit_expr(e))
+        .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
         .collect();
-    for rw in &ins.rewrites {
-        cols.push(qi(&rw.column));
-        vals.push(emit_expr(&rw.expr));
+    if ins.nested_ctes.is_empty() {
+        format!("INSERT INTO {} ({}) VALUES ({})", source_ref(&ins.target), cols.join(", "), vals.join(", "))
+    } else {
+        let from_ctes = ins.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+        format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {}",
+            source_ref(&ins.target), cols.join(", "), vals.join(", "), from_ctes,
+        )
     }
+}
 
-    if ins.enqueue_vector.is_empty() && ins.enqueue_search.is_empty() && !insert_has_any_multilink(ins) {
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            source_ref(&ins.target), cols.join(", "), vals.join(", "),
-        );
+fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
+    if ins.enqueue_vector.is_empty() && ins.enqueue_search.is_empty()
+        && !insert_has_any_multilink(ins) && ins.nested_ctes.is_empty()
+    {
+        let mut sql = emit_insert_row_sql(ins);
         if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut sql, conflict); }
         let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
         if let Some(r) = returning_sql { sql.push_str(&r); }
         return SqlOutput { sql, shape, inference_plan: None };
     }
 
-    // Wrap path: needed for outbox enqueue CTEs and/or (see
-    // emit_insert_multilink_ctes) junction-table population, both of which
-    // require the row's own id, so the plain single-statement INSERT above
-    // can't be used.
+    // Wrap path: needed for outbox enqueue CTEs, junction-table population
+    // (see emit_insert_multilink_ctes), and/or hoisted nested-DML CTEs (see
+    // IrInsert::nested_ctes) — all of which require either the row's own id
+    // or a WITH prefix, so the plain single-statement INSERT above can't be
+    // used.
     let mut cte_parts = if insert_has_any_multilink(ins) {
         emit_insert_multilink_ctes(ins, "_w")
     } else {
-        let mut insert_sql = format!(
-            "    INSERT INTO {} ({}) VALUES ({})",
-            source_ref(&ins.target), cols.join(", "), vals.join(", "),
-        );
+        let mut cte_parts = emit_user_cte_parts(&ins.nested_ctes);
+        let mut insert_sql = emit_insert_row_sql(ins);
         if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
-        insert_sql.push_str("\n    RETURNING \"id\"");
-        vec![format!("\"_w\" AS (\n{}\n)", insert_sql)]
+        insert_sql.push_str("\nRETURNING \"id\"");
+        cte_parts.push(format!("\"_w\" AS (\n{}\n)", insert_sql));
+        cte_parts
     };
     cte_parts.extend(enqueue_ctes(&ins.enqueue_vector, "_w"));
     cte_parts.extend(enqueue_search_ctes(&ins.enqueue_search, "_w", ins.enqueue_vector.len()));
@@ -1759,16 +1760,27 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         || !upd.multi_link_removals.is_empty();
 
     if !has_any_multilink && upd.enqueue_vector.is_empty() && upd.enqueue_search.is_empty() {
-        // No junction changes, no enqueue — plain UPDATE (possibly with user CTE prefix).
+        // No junction changes, no enqueue — plain UPDATE (possibly with a
+        // user CTE prefix and/or hoisted nested-DML CTEs from a link value
+        // like `author := (select (insert Person {...}) { id })` — see
+        // IrUpdate::nested_ctes). A nested CTE's `id` column is referenced
+        // from the SET clause, which needs a `FROM` clause to see it —
+        // ordinary `UPDATE ... SET ...` has no FROM of its own otherwise.
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut sql = format!(
             "UPDATE {} AS {}\nSET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
         );
+        if !upd.nested_ctes.is_empty() {
+            let from_ctes = upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+            sql.push_str(&format!("\nFROM {}", from_ctes));
+        }
         append_filter(&mut sql, &upd.filter);
         if let Some(r) = returning_sql { sql.push_str(&r); }
-        if !user_ctes.is_empty() {
-            sql = format!("{}{}", emit_cte_prefix(user_ctes), sql);
+        let combined_ctes: Vec<IrCteDef> =
+            upd.nested_ctes.iter().cloned().chain(user_ctes.iter().cloned()).collect();
+        if !combined_ctes.is_empty() {
+            sql = format!("{}{}", emit_cte_prefix(&combined_ctes), sql);
         }
         return SqlOutput { sql, shape, inference_plan: None };
     }
@@ -4581,6 +4593,48 @@ mod tests {
         assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
         assert!(out.sql.contains("FROM \"public\".\"Company\""));
+    }
+
+    #[test]
+    fn test_insert_link_value_from_nested_insert_hoists_a_with_cte() {
+        // `company := (select (insert Company {...}) { id })` — Postgres has
+        // no way to run a nested INSERT inside another statement's VALUES
+        // list without hoisting it into its own WITH CTE first (confirmed
+        // live against real Postgres — see live_execution_insert_nested.rs).
+        // Regression: an earlier attempt at this compiled cleanly but
+        // silently emitted a subquery that dropped the nested INSERT
+        // entirely and selected an arbitrary unrelated row instead.
+        let out = compile_and_emit(
+            "INSERT Person { name := 'Alice', company := (select (insert Company { name := 'Acme' }) { id }) }",
+        );
+        assert!(out.sql.starts_with("WITH"), "expected a WITH-hoisted CTE, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Company\""),
+            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+        );
+        // The outer insert must reference the nested CTE's own id, not a
+        // freestanding subquery against the Company table.
+        assert!(
+            out.sql.contains("\"company_id\") SELECT") && out.sql.contains(".\"id\" FROM"),
+            "expected the outer insert to switch from VALUES to SELECT ... FROM <cte>, got:\n{}", out.sql,
+        );
+        assert!(!out.sql.contains("FROM \"public\".\"Company\" AS"), "must not select from the real Company table, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_link_value_from_nested_insert_hoists_a_with_cte_and_adds_from_clause() {
+        let out = compile_and_emit(
+            "UPDATE Person FILTER .id = $id SET { company := (select (insert Company { name := 'Acme' }) { id }) }",
+        );
+        assert!(out.sql.starts_with("WITH"), "expected a WITH-hoisted CTE, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Company\""),
+            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+        );
+        // Plain `UPDATE ... SET ...` has no FROM clause of its own — one
+        // must be added so the SET clause can reference the CTE's column.
+        assert!(out.sql.contains("\nFROM \""), "expected a FROM clause referencing the nested CTE, got:\n{}", out.sql);
+        assert!(out.sql.contains("SET \"company_id\" = "), "got:\n{}", out.sql);
     }
 
     #[test]
