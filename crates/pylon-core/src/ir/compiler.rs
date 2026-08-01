@@ -382,6 +382,16 @@ pub fn compile_expr_unaliased(
 /// Wraps the expression in `SELECT <expr>`, compiles it as a free scalar, and
 /// returns the emitted SQL expression (without the SELECT wrapper).
 pub fn compile_scalar_default(pyql: &str, schema: &SchemaDescriptor) -> Result<String, String> {
+    compile_scalar_default_typed(pyql, schema).map(|(sql, _ir)| sql)
+}
+
+/// Like `compile_scalar_default`, but also returns the compiled `IrExpr` —
+/// used by schema-type-consistency validation (`crate::validate`) to infer
+/// the default's actual produced type via `infer_ir_type`.
+pub fn compile_scalar_default_typed(
+    pyql: &str,
+    schema: &SchemaDescriptor,
+) -> Result<(String, IrExpr), String> {
     use crate::parse::ast::Stmt;
     let full = format!("SELECT {}", pyql);
     let ast = crate::parse::parse(&full).map_err(|e| e.message)?;
@@ -390,7 +400,8 @@ pub fn compile_scalar_default(pyql: &str, schema: &SchemaDescriptor) -> Result<S
     };
     let mut c = Compiler::new(schema);
     let ir = c.compile_free_expr(&sel.result).map_err(|e| e.to_string())?;
-    Ok(crate::sql::emit_expr(&ir))
+    let sql = crate::sql::emit_expr(&ir);
+    Ok((sql, ir))
 }
 
 // ── Compiler context ────────────────────────────────────────────────────────────
@@ -2447,6 +2458,13 @@ impl<'a> Compiler<'a> {
                         }
                         // Scalar CTE: type string has no "::" (object types always do).
                         if self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false) {
+                            return true;
+                        }
+                        // Function parameter — only populated while compiling a
+                        // function body (see `compile_fn_body`), so a bare `select a`
+                        // where `a` is a param must resolve as the param, not be
+                        // misread as a schema-type-name select.
+                        if self.fn_params.contains_key(n.as_str()) {
                             return true;
                         }
                     }
@@ -7310,10 +7328,11 @@ fn positional_tuple_type_str(elems: &[ast::Expr]) -> String {
     format!("tuple<{}>", inner)
 }
 
-fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
+pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
     match expr {
         IrExpr::ColumnRef { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::TypeCast(tc) => Some(tc.pg_type.as_str()),
+        IrExpr::FnParam { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::Literal(lit) => Some(match lit {
             IrLiteral::Str(_) => "text",
             IrLiteral::Int(_) => "__int_literal",
@@ -7373,7 +7392,7 @@ const NUMERIC_TYPES: &[&str] = &["numeric"];
 /// the compile-time gate lets it through (e.g. `int2 + float4` is a native
 /// Postgres operator) — this only needs to match which operand-type
 /// combinations are meant to be allowed.
-fn types_compatible(a: &str, b: &str) -> bool {
+pub(crate) fn types_compatible(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }

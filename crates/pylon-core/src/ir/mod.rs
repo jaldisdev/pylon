@@ -12,9 +12,12 @@ pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_fn_body;
 pub use compiler::compile_scalar_default;
+pub use compiler::compile_scalar_default_typed;
 pub use compiler::compile_trigger_handler;
 pub use compiler::compile_with_config;
 pub use compiler::pg_type_to_pyql;
+pub(crate) use compiler::infer_ir_type;
+pub(crate) use compiler::types_compatible;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 

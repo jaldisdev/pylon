@@ -14,6 +14,9 @@ class Volatility:
     Modifying = "volatile"  # PostgreSQL maps this to VOLATILE
 
 
+_VALID_VOLATILITIES = {Volatility.Immutable, Volatility.Stable, Volatility.Volatile}
+
+
 class Language:
     PyQL = "pyql"
 
@@ -69,6 +72,11 @@ def function(
     """
 
     def decorator(func: Any) -> Any:
+        # Deferred to dodge the walker/functions import cycle (_walker imports
+        # Volatility from this module; see the matching deferred imports
+        # throughout _walker.py for the same reason).
+        from ._walker import SchemaError
+
         config = _PylonFunctionConfig(
             func=func,
             name=name,
@@ -76,6 +84,19 @@ def function(
             language=language,
             volatility=volatility,
         )
+        qname = f"{config.module}::{config.name}"
+
+        if volatility is not None and volatility not in _VALID_VOLATILITIES:
+            raise SchemaError(
+                f"function {qname!r}: invalid volatility {volatility!r}, expected one "
+                f"of 'immutable', 'stable', 'volatile'"
+            )
+        if language != Language.PyQL:
+            raise SchemaError(
+                f"function {qname!r}: invalid language {language!r}, only "
+                f"{Language.PyQL!r} is currently supported"
+            )
+
         func.__pylon_function__ = config
         from ._registry import register_function
         register_function(func)

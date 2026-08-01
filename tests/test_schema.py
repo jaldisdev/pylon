@@ -34,7 +34,7 @@ from pylon.schema import (
 )
 from pylon.schema._pointers import ArrayAnnotation, TupleAnnotation
 from pylon.schema._scalars import PG_TYPE_MAP, SHORTHAND_MAP
-from pylon.schema._walker import _to_pg_type
+from pylon.schema._walker import SchemaError, _to_pg_type
 
 MISSING = dataclasses.MISSING
 REQUIRED = inspect.Parameter.empty
@@ -321,6 +321,22 @@ class TestTupleField:
         assert f.nullable is False
         assert [e.name for e in f.scalar_type.elements] == ["r", "g", "b"]
 
+    def test_object_type_element_rejected(self):
+        @pylon.type
+        class Product:
+            name: str
+
+        with pytest.raises(SchemaError, match="expected a scalar type, got an object type"):
+            _to_pg_type(Tuple[Product, pylon.Str])
+
+    def test_nested_object_type_element_rejected(self):
+        @pylon.type
+        class Product:
+            name: str
+
+        with pytest.raises(SchemaError, match="expected a scalar type, got an object type"):
+            _to_pg_type(Tuple[Tuple[Product, pylon.Str], pylon.Int64])
+
 
 # ---------------------------------------------------------------------------
 # One-dimensional array types (pylon.Array[T] and the bare list[T] shorthand)
@@ -346,6 +362,14 @@ class TestArrayField:
         # a structural tuple — the array itself still stays a native pg
         # array (jsonb[]), it's just an array of jsonb-backed values.
         assert _to_pg_type(Array[Tuple[pylon.Str, pylon.Bool]]) == "jsonb[]"
+
+    def test_object_type_element_rejected(self):
+        @pylon.type
+        class Product:
+            name: str
+
+        with pytest.raises(SchemaError, match="expected a scalar type, got an object type"):
+            _to_pg_type(Array[Product])
 
     def test_optional_via_union(self):
         @pylon.type

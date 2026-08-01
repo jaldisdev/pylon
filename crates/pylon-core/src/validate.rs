@@ -1,0 +1,311 @@
+//! Post-build schema type-consistency validation.
+//!
+//! `walk()` (the Python schema builder) checks structure — duplicate names,
+//! dangling references, link cycles, interface conformance — but never
+//! whether a function's/computed pointer's/default's declared PostgreSQL
+//! type actually matches what its PyQL body compiles to. This module closes
+//! that gap by compiling every such body and comparing.
+//!
+//! Best-effort, not exhaustive: `infer_ir_type` only recognizes a handful of
+//! `IrExpr` variants (column refs, casts, literals, enum members, named
+//! tuples, global params) — anything else (a binop, a function call, an
+//! if/else) is silently skipped rather than rejected. This still catches the
+//! common, real-world cases while leaving complex expressions as a known
+//! limitation a future pass can extend `infer_ir_type` to cover.
+
+use crate::error::{Position, PyQLError, PyQLFragmentError};
+use crate::ir::{
+    compile_expr_in_type, compile_fn_body, compile_scalar_default_typed, infer_ir_type,
+    types_compatible, IrFreeExpr, IrRowSource, IrStmt,
+};
+use crate::schema::SchemaDescriptor;
+
+fn mismatch(context: String, message: String) -> PyQLError {
+    PyQLError::Fragment(PyQLFragmentError { message, position: Position { line: 0, col: 0 }, context })
+}
+
+/// Compile every user function body, computed-pointer expression, and
+/// property/link default in `schema`, and collect every declared-vs-actual
+/// return-type mismatch found — not fail-fast, so a caller can report every
+/// problem in the schema at once rather than a fix-one-rerun loop.
+pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLError>> {
+    let mut errors = Vec::new();
+
+    for fd in &schema.functions {
+        // Object-returning functions build a row shape, not a single scalar
+        // IrExpr — matching-object-shape correctness is a separate, larger
+        // problem than this pass's scope.
+        if fd.return_is_object {
+            continue;
+        }
+        let context = format!("{}::{}", fd.module, fd.name);
+        let ir_output = match compile_fn_body(fd, schema) {
+            Ok(o) => o,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        let IrStmt::Select(sel) = &ir_output.stmt else { continue };
+        let [IrRowSource::Free(IrFreeExpr::Scalar(e))] = sel.rows.as_slice() else { continue };
+        let Some(actual) = infer_ir_type(e) else { continue };
+        if !types_compatible(actual, &fd.return_pg_type) {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "return type mismatch in function '{}': declared {}, body produces {}",
+                    context, fd.return_pg_type, actual
+                ),
+            ));
+        }
+    }
+
+    for td in &schema.types {
+        let type_name = format!("{}::{}", td.module, td.name);
+
+        for cd in &td.computed {
+            let Some(declared) = &cd.return_type else { continue };
+            let context = format!("{}.{} (computed)", type_name, cd.name);
+            let expr_ast = match crate::parse::parse_expr(&cd.expression) {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(PyQLError::Syntax(e));
+                    continue;
+                }
+            };
+            let ir = match compile_expr_in_type(&expr_ast, &type_name, schema) {
+                Ok((ir, _params)) => ir,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            };
+            let Some(actual) = infer_ir_type(&ir) else { continue };
+            if !types_compatible(actual, declared) {
+                errors.push(mismatch(
+                    context.clone(),
+                    format!(
+                        "return type mismatch in computed pointer '{}': declared {}, expression produces {}",
+                        context, declared, actual
+                    ),
+                ));
+            }
+        }
+
+        for prop in &td.properties {
+            let Some(pyql) = &prop.default_pyql else { continue };
+            // Best-effort: a default that fails to compile here is silently
+            // skipped rather than collected — `pylon migrate` is still the
+            // authority on default-expression validity itself, this pass
+            // only adds a type-consistency check on top of an already-valid
+            // one.
+            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else { continue };
+            let Some(actual) = infer_ir_type(&ir) else { continue };
+            if !types_compatible(actual, &prop.pg_type) {
+                let context = format!("{}.{} (default)", type_name, prop.name);
+                errors.push(mismatch(
+                    context.clone(),
+                    format!(
+                        "default value type mismatch for '{}': expected {}, default produces {}",
+                        context, prop.pg_type, actual
+                    ),
+                ));
+            }
+        }
+
+        for link in &td.links {
+            let Some(pyql) = &link.default_pyql else { continue };
+            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else { continue };
+            let Some(actual) = infer_ir_type(&ir) else { continue };
+            if !types_compatible(actual, "uuid") {
+                let context = format!("{}.{} (default)", type_name, link.name);
+                errors.push(mismatch(
+                    context.clone(),
+                    format!(
+                        "default value type mismatch for '{}': expected uuid, default produces {}",
+                        context, actual
+                    ),
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, TypeDescriptor};
+
+    fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
+        let mut props = vec![PropertyDescriptor {
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: Some("uuidv7()".into()),
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }];
+        props.extend(properties);
+        TypeDescriptor {
+            name: "Person".into(),
+            module: "default".into(),
+            table: "default_person".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: props,
+            links: vec![],
+            multilinks: vec![],
+            computed,
+            constraints: vec![],
+            indexes: vec![],
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }
+    }
+
+    fn base_property(name: &str, pg_type: &str) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: false,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }
+    }
+
+    fn minimal_schema(types: Vec<TypeDescriptor>, functions: Vec<FunctionDescriptor>) -> SchemaDescriptor {
+        SchemaDescriptor {
+            types,
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions,
+            aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn function_return_type_match_passes() {
+        let fd = FunctionDescriptor {
+            name: "myid".into(),
+            module: "default".into(),
+            params: vec![FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() }],
+            return_pg_type: "int8".into(),
+            body: "a".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+        };
+        let schema = minimal_schema(vec![], vec![fd]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn function_return_type_mismatch_rejected() {
+        let fd = FunctionDescriptor {
+            name: "bad".into(),
+            module: "default".into(),
+            params: vec![FunctionParamDescriptor { name: "a".into(), pg_type: "text".into() }],
+            return_pg_type: "int8".into(),
+            body: "a".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+        };
+        let schema = minimal_schema(vec![], vec![fd]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("bad"), "{msg}");
+        assert!(msg.contains("declared int8"), "{msg}");
+        assert!(msg.contains("produces text"), "{msg}");
+    }
+
+    #[test]
+    fn function_call_body_is_skipped_not_rejected() {
+        // `infer_ir_type` doesn't recognize FunctionCall, so a body built
+        // from a stdlib call (or anything else it can't type) must be
+        // silently skipped rather than falsely flagged — even though this
+        // one's declared type is deliberately wrong (str_lower returns
+        // text, not int8).
+        let fd = FunctionDescriptor {
+            name: "caller".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "int8".into(),
+            body: "str_lower('X')".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+        };
+        let schema = minimal_schema(vec![], vec![fd]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn computed_return_type_match_passes() {
+        let cd = ComputedDescriptor { name: "double_id".into(), expression: ".id".into(), return_type: Some("uuid".into()) };
+        let td = person_type(vec![cd], vec![]);
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn computed_return_type_mismatch_rejected() {
+        let cd = ComputedDescriptor { name: "bad".into(), expression: ".id".into(), return_type: Some("text".into()) };
+        let td = person_type(vec![cd], vec![]);
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("Person.bad"), "{msg}");
+    }
+
+    #[test]
+    fn default_type_match_passes() {
+        let mut prop = base_property("score", "int8");
+        prop.default_pyql = Some("1".into());
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn default_type_mismatch_rejected() {
+        let mut prop = base_property("score", "int8");
+        prop.default_pyql = Some("'not a number'".into());
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("Person.score"), "{msg}");
+    }
+}

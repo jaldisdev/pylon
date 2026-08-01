@@ -1450,6 +1450,30 @@ fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
     core::export::export_schema(&schema.inner).map_err(|e| pyql_err(e, None))
 }
 
+/// Compiles every user function body, computed-pointer expression, and
+/// property/link default and checks each one's declared type against what
+/// its body actually produces — see `pylon_core::validate` for the details
+/// and its best-effort scope. Every mismatch found is collected and reported
+/// together, joined by newline, as a single `SchemaError`.
+#[pyfunction]
+fn validate_schema_types(schema: &SchemaDescriptor) -> PyResult<()> {
+    core::validate::validate_schema_types(&schema.inner).map_err(|errs| {
+        let message = errs
+            .iter()
+            .map(|e| e.class_name_message_position().1.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        pyql_err(
+            core::error::PyQLError::Fragment(core::error::PyQLFragmentError {
+                message,
+                position: core::error::Position { line: 0, col: 0 },
+                context: "schema".to_string(),
+            }),
+            None,
+        )
+    })
+}
+
 #[pyfunction]
 fn export_stdlib() -> String {
     core::stdlib::export_stdlib()
@@ -2104,6 +2128,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(record_query_compile_result, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_schema_types, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
 
     // Migration
