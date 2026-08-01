@@ -564,32 +564,49 @@ impl<'a> Compiler<'a> {
 
     // ── Global variable resolution ────────────────────────────────────────────────
 
+    /// `scalar_type` is a PyQL-style type-name string built by the Python
+    /// walker's `_pyql_type_name` (e.g. `"std::str"`, `"std::uuid"`,
+    /// `"cal::local_date"`, `"default::Gender"`, `"array<std::str>"`) — never
+    /// a bare Python class name. Mirrors every shape `_pyql_type_name` can
+    /// produce for a `Global[T]` annotation.
     fn resolve_global_pg_type(&self, scalar_type: &str) -> String {
         let builtin = match scalar_type {
-            "Str"           => Some("text"),
-            "Int16"         => Some("int2"),
-            "Int32"         => Some("int4"),
-            "Int64"         => Some("int8"),
-            "Float32"       => Some("float4"),
-            "Float64"       => Some("float8"),
-            "Decimal"       => Some("numeric"),
-            "Bool"          => Some("boolean"),
-            "DateTime"      => Some("timestamptz"),
-            "LocalDateTime" => Some("timestamp"),
-            "LocalDate"     => Some("date"),
-            "LocalTime"     => Some("time"),
-            "UUID"          => Some("uuid"),
-            "Bytes"         => Some("bytea"),
-            "Json"          => Some("jsonb"),
-            "Duration"      => Some("interval"),
-            _               => None,
+            "std::str"            => Some("text"),
+            "std::int16"          => Some("int2"),
+            "std::int32"          => Some("int4"),
+            "std::int64"          => Some("int8"),
+            "std::float32"        => Some("float4"),
+            "std::float64"        => Some("float8"),
+            "std::decimal"        => Some("numeric"),
+            "std::bool"           => Some("boolean"),
+            "std::datetime"       => Some("timestamptz"),
+            "cal::local_datetime" => Some("timestamp"),
+            "cal::local_date"     => Some("date"),
+            "cal::local_time"     => Some("time"),
+            "std::uuid"           => Some("uuid"),
+            "std::bytes"          => Some("bytea"),
+            "std::json"           => Some("jsonb"),
+            "std::duration"       => Some("interval"),
+            _                     => None,
         };
         if let Some(t) = builtin {
             return t.to_string();
         }
-        // Fall back to custom scalar lookup
+        if let Some(inner) = scalar_type.strip_prefix("array<").and_then(|s| s.strip_suffix('>')) {
+            return format!("{}[]", self.resolve_global_pg_type(inner));
+        }
+        if scalar_type.starts_with("tuple<") {
+            return "jsonb".to_string();
+        }
+        if let Some(ed) = self.resolve_enum(scalar_type) {
+            return format!("\"{}\".\"{}\"", ed.module, ed.name);
+        }
+        if self.resolve_named_tuple(scalar_type).is_some() {
+            return "jsonb".to_string();
+        }
+        // Fall back to a registered custom scalar lookup.
         self.schema.scalars.iter()
-            .find(|s| s.name.split("::").last() == Some(scalar_type) || s.name == scalar_type)
+            .find(|s| s.name == scalar_type || format!("{}::{}", s.module, s.name) == scalar_type)
             .map(|s| s.pg_type.clone())
             .unwrap_or_else(|| "text".to_string())
     }
