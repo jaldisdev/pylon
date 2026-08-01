@@ -15,8 +15,8 @@
 
 use crate::error::{Position, PyQLError, PyQLFragmentError};
 use crate::ir::{
-    compile_expr_in_type, compile_fn_body, compile_scalar_default_typed, compile_trigger_handler,
-    infer_ir_type, types_compatible, IrFreeExpr, IrRowSource, IrStmt,
+    compile, compile_expr_in_type, compile_fn_body, compile_scalar_default_typed,
+    compile_trigger_handler, infer_ir_type, types_compatible, IrFreeExpr, IrRowSource, IrStmt,
 };
 use crate::schema::SchemaDescriptor;
 
@@ -176,13 +176,33 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         }
     }
 
+    // Schema aliases: compile-only — an alias has no declared return type at
+    // all (it's just a named query fragment that can select any shape, not
+    // just a scalar), so there's nothing to type-compare against. But like
+    // triggers, an alias's own body currently only ever gets compiled lazily,
+    // the first time a query actually references it (`try_compile_alias_select`)
+    // — so a broken alias nobody's queried yet would otherwise pass
+    // `finalize()` silently.
+    for alias in &schema.aliases {
+        let parsed = match crate::parse::parse(&alias.expr) {
+            Ok(ast) => ast,
+            Err(e) => {
+                errors.push(PyQLError::Syntax(e));
+                continue;
+            }
+        };
+        if let Err(e) = compile(&parsed, schema) {
+            errors.push(e);
+        }
+    }
+
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor};
+    use crate::schema::{AliasDescriptor, ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor};
 
     fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
         let mut props = vec![PropertyDescriptor {
@@ -394,6 +414,22 @@ mod tests {
             handler: "select Person filter .nonexistent_field = 1".into(),
         }];
         let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn alias_compiles_passes() {
+        let td = person_type(vec![], vec![]);
+        let mut schema = minimal_schema(vec![td], vec![]);
+        schema.aliases = vec![AliasDescriptor { name: "all_people".into(), module: "default".into(), expr: "select Person".into() }];
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn alias_unknown_type_rejected() {
+        let mut schema = minimal_schema(vec![], vec![]);
+        schema.aliases = vec![AliasDescriptor { name: "bad".into(), module: "default".into(), expr: "select NoSuchType".into() }];
         let errs = validate_schema_types(&schema).unwrap_err();
         assert_eq!(errs.len(), 1);
     }
