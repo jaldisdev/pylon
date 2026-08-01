@@ -19,12 +19,14 @@
 
 //! Live-Postgres tests for the bare `UPDATE` statement: a filtered scalar
 //! property update, a self-referential update expression that reads the
-//! row's *existing* value (`age := .age + 1`), replacing a single link,
-//! and the `RETURNING id` shape every update implicitly gets
-//! (`Compiler::compile_update` always returns `pk_returning`, same as
-//! `DELETE` — see `live_execution_delete.rs`). Concepts inspired by Gel's
-//! own `test_edgeql_update.py`, not ported literally — `+=`/`-=`
-//! multi-link append/remove semantics are already covered in depth by
+//! row's *existing* value (`age := .age + 1`), replacing a single link
+//! (both from an existing row and from a nested `insert`, the latter
+//! exercising `IrUpdate::nested_ctes`' WITH-CTE hoisting), and the
+//! `RETURNING id` shape every update implicitly gets (`Compiler::
+//! compile_update` always returns `pk_returning`, same as `DELETE` — see
+//! `live_execution_delete.rs`). Concepts inspired by Gel's own
+//! `test_edgeql_update.py`, not ported literally — `+=`/`-=` multi-link
+//! append/remove semantics are already covered in depth by
 //! `live_execution_linkprops.rs`, so this file is scoped to plain
 //! scalar/single-link `:=` updates, which had no live coverage of their
 //! own anywhere in the suite before this file (only indirectly, as setup
@@ -185,6 +187,36 @@ async fn update_replaces_a_single_link() {
     // Post's shape: [type-tag, author]; author link's own row: [type-tag, name].
     let author = field(&rows[0], 1);
     assert_eq!(as_str(field(author, 1)), "Bob", "the link should now point at Bob, got {rows:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn update_replaces_a_single_link_with_a_nested_insert() {
+    let module = unique_module("live_update_nested_link");
+    let sd = schema_with_post(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
+    exec(&pool, &sd, &format!(
+        "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
+    )).await;
+
+    // The link value is sourced from a brand-new row, not an existing one —
+    // exercises `IrUpdate::nested_ctes`' WITH-CTE hoisting (`Compiler::
+    // compile_update`), not just `compile_insert`'s.
+    exec(&pool, &sd, &format!(
+        "update {module}::Post filter .title = 'Hello' \
+         set {{ author := (select (insert {module}::Person {{ name := 'Bob', age := 40 }}) {{ id }}) }}"
+    )).await;
+
+    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }} order by .name")).await;
+    assert_eq!(people.len(), 2, "the nested insert must have actually created a new Person row");
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
+    assert_eq!(rows.len(), 1);
+    let author = field(&rows[0], 1);
+    assert_eq!(as_str(field(author, 1)), "Bob", "the link should now point at the newly-inserted Bob, got {rows:?}");
 }
 
 #[tokio::test]
