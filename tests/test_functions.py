@@ -160,6 +160,21 @@ class TestReturnTypeConsistency:
         with pytest.raises(pylon_exceptions.SchemaError, match="nonexistent_field"):
             walk([Person], [], [], [])
 
+    def test_alias_compiles_passes(self):
+        @pylon.type(module="t", name="Person")
+        class Person:
+            name: pylon.Str
+
+        alias = pylon.AliasDescriptor(name="all_people", module="t", expr="select Person")
+        schema = walk([Person], [], [], [], aliases=[alias])
+        assert schema is not None
+
+    def test_alias_unknown_type_rejected(self):
+        alias = pylon.AliasDescriptor(name="bad", module="t", expr="select NoSuchType")
+
+        with pytest.raises(pylon_exceptions.SchemaError, match="unknown type"):
+            walk([], [], [], [], aliases=[alias])
+
 
 class TestDuplicateFunctionSignature:
     def test_duplicate_signature_rejected(self):
