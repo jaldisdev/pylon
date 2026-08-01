@@ -1,15 +1,16 @@
 //! Background index/cache workers — spawns `pylon_workers`' native
 //! LISTEN/NOTIFY loops as Tokio tasks on server startup, mirroring
-//! `asgi.py::_handle_lifespan`'s `build_worker_tasks(schema, config,
-//! shared_cache=True)` call (`asyncio.ensure_future`'d there,
+//! `pylon/cli/commands/worker.py::build_worker_tasks(schema, config,
+//! shared_cache=True)`'s own worker set (`asyncio.ensure_future`'d there,
 //! `tokio::spawn`'d here — cancelled on shutdown either way).
 //!
 //! The signals dispatcher is deliberately excluded here (unlike every
 //! other worker `build_worker_tasks` can return) — it needs a live
 //! reference to each `@pylon.signal`-decorated Python callable, which only
 //! exists in a Python process. A user relying on signals runs `pylon
-//! worker start` alongside `pylon serve`, the same additive story that's
-//! already true today (see the plan's own Context section).
+//! worker start` in its own process alongside `pylon-server` — there's no
+//! way for this binary to launch it in-process the way the old Python ASGI
+//! server (`asgi.py`, since removed) once did.
 
 use std::collections::HashMap;
 use std::sync::Arc;
