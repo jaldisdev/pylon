@@ -72,7 +72,7 @@ Field/constraint/index/trigger flattening walks the full MRO, most-distant ances
 
 ## Junctions: `@pylon.junction`
 
-A junction type holds extra properties on a many-to-many relationship (see [Links](links.md#multilink-one-to-many-many-to-many) for the full `MultiLink(..., through(...))` picture):
+A junction type holds extra properties on a many-to-many relationship (see [Links](links.md#multilink-one-to-many-many-to-many) for the full `MultiLink[..., Through[...]]` picture):
 
 ```python
 @pylon.junction
@@ -82,14 +82,14 @@ class ProductTag:
 
 @pylon.type
 class Product:
-    tags: pylon.MultiLink[Tag, pylon.through(ProductTag)]
+    tags: pylon.MultiLink[Tag, pylon.Through[ProductTag]]
 ```
 
 Rules, enforced at `finalize()` time:
 
 - A junction type may only declare scalar properties — no links, multilinks, or nested junctions.
 - `source` and `target` are reserved names on a junction type (the generated table's own FK columns).
-- Each junction type must be referenced by **exactly one** link or multi-link's `through=` — reusing one junction type across two different relationships is rejected.
+- Each junction type must be referenced by **exactly one** link or multi-link's `Through[...]` — reusing one junction type across two different relationships is rejected.
 - The junction table's actual name derives from the `MultiLink` that references it, not from the junction class's own name.
 
 ## Table naming

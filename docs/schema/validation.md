@@ -7,7 +7,7 @@ Everything on this page runs at `pylon.finalize()` time — before your schema i
 Run first, by `pylon.schema._walker.walk()`:
 
 - **Duplicate names** — two types, or two functions with an identical `(module, name, param_types)` signature, sharing a qualified name.
-- **Dangling references** — a `Link`/`MultiLink` target, an interface, a `through=` junction, that doesn't resolve to a real declared type.
+- **Dangling references** — a `Link`/`MultiLink` target, an interface, a `Through[...]` junction, that doesn't resolve to a real declared type.
 - **Required-link cycles** — a cycle of non-nullable links, which would make `INSERT` impossible on either side. See [Links](links.md#required-link-cycles-are-rejected).
 - **Interface conformance** — every concrete subtype of an [`@pylon.interface`](types.md) actually declares (or inherits) a matching pointer, by name and kind, for each of the interface's own pointers.
 - **Junction rules** — a `@pylon.junction` type has only scalar properties, doesn't use `source`/`target` as property names, and is referenced by exactly one link/multi-link. See [Object types § Junctions](types.md#junctions-pylonjunction).

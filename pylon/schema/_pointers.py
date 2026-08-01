@@ -143,32 +143,30 @@ class ComputedAnnotation:
         return f"ComputedAnnotation({self.return_type!r}, {self.expression!r})"
 
 
-# ── Through helper ─────────────────────────────────────────────────────────────
+# ── Through ────────────────────────────────────────────────────────────────────
 
 
-class _ThroughParam:
-    """Marker produced by through(); recognised inside Link[T, through(X)] and
-    MultiLink[T, through(X)]."""
+class Through:
+    """Declare the intermediate (junction) type for a link with its own
+    properties — supported on both a single Link and a MultiLink.
+
+    Usage::
+
+        tags: MultiLink[Tag, Through[ProductTag]]
+        spouse: Link[Person, Through[Marriage]] | None
+    """
 
     __slots__ = ("type_",)
 
     def __init__(self, type_: Any) -> None:
         self.type_ = type_
 
+    @classmethod
+    def __class_getitem__(cls, type_: Any) -> "Through":
+        return cls(type_)
+
     def __repr__(self) -> str:
-        return f"through({self.type_!r})"
-
-
-def through(type_: Any) -> _ThroughParam:
-    """Declare the intermediate (junction) type for a link with its own
-    properties — supported on both a single Link and a MultiLink.
-
-    Usage::
-
-        tags: MultiLink[Tag, through(ProductTag)]
-        spouse: Link[Person, through(Marriage)] | None
-    """
-    return _ThroughParam(type_)
+        return f"Through[{self.type_!r}]"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -220,7 +218,7 @@ class Link:
         category: Link[Category] | None
         category: Link[Category, Description('The owning category')]
         chat: Link[MessageThread, OnDelete(Target, DeleteSource)]
-        spouse: Link[Person, through(Marriage)] | None
+        spouse: Link[Person, Through[Marriage]] | None
     """
 
     @classmethod
@@ -233,7 +231,7 @@ class Link:
         on_delete: list[OnDelete] = []
         remaining: list[Any] = []
         for p in rest:
-            if isinstance(p, _ThroughParam):
+            if isinstance(p, Through):
                 through_type = p.type_
             elif isinstance(p, OnDelete):
                 on_delete.append(p)
@@ -251,7 +249,7 @@ class MultiLink:
     Usage::
 
         tags: MultiLink[Tag]
-        tags: MultiLink[Tag, through(ProductTag)]
+        tags: MultiLink[Tag, Through[ProductTag]]
         tags: MultiLink[Tag] | None
         messages: MultiLink[Message, OnDelete(Source, DeleteTargetIfOrphan)]
     """
@@ -264,7 +262,7 @@ class MultiLink:
         through_type = None
         on_delete: list[OnDelete] = []
         for p in params[1:]:
-            if isinstance(p, _ThroughParam):
+            if isinstance(p, Through):
                 through_type = p.type_
             elif isinstance(p, OnDelete):
                 on_delete.append(p)

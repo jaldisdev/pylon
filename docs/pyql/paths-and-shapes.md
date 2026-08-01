@@ -71,7 +71,7 @@ select Author {
 
 ### Link properties: `@name`
 
-Inside a nested shape for a `through=`-junction link, `@propname` reaches a property declared on the junction type itself, alongside the target object's own fields:
+Inside a nested shape for a `Through[...]`-junction link, `@propname` reaches a property declared on the junction type itself, alongside the target object's own fields:
 
 ```pyql
 select Product { name, tags: { name, @weight } }
