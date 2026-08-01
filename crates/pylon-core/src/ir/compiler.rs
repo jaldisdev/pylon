@@ -3357,7 +3357,7 @@ impl<'a> Compiler<'a> {
     /// single link, which shares this exact storage shape — D2):
     /// (junction_table, module, source_col, target_col, through_td).
     /// `through_td` is the junction type's own TypeDescriptor for a
-    /// `through(...)` link (needed to validate/compile `@prop := expr`
+    /// `Through[...]` link (needed to validate/compile `@prop := expr`
     /// link-property assignments against its real properties) — `None` for
     /// a Standard (implicit) junction table, which has no user-declared
     /// properties at all.
@@ -3493,7 +3493,7 @@ impl<'a> Compiler<'a> {
     /// against this scope, same as any other UPDATE SET assignment — they
     /// cannot reference the linked target's own properties, only the outer
     /// record's or bound params/literals). `through_td` is the junction
-    /// type's own TypeDescriptor for a `through(...)` multi-link, or `None`
+    /// type's own TypeDescriptor for a `Through[...]` multi-link, or `None`
     /// for a Standard junction (which has no properties to assign).
     fn compile_multilink_values(
         &mut self,
@@ -3524,7 +3524,7 @@ impl<'a> Compiler<'a> {
             let Some(through) = through_td else {
                 return Err(self.type_err(
                     "link properties (`@prop := value`) are only valid on a multi-link \
-                     declared with `through(...)`"
+                     declared with `Through[...]`"
                 ));
             };
 
