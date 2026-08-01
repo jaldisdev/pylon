@@ -127,6 +127,12 @@ async fn setup(schema: &SchemaDescriptor) -> Client {
     let pool = pylon_pgcon::PgPool::connect(&test_dsn(), 5).await.unwrap();
     pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
     pylon_core::migrate::ensure_tracking_tables(&pool).await.unwrap();
+    // Every concrete table's DDL below includes an unconditional
+    // `pylon_cache_invalidate` trigger referencing
+    // `_pylon.notify_cache_invalidate()` — only `export_stdlib()` creates
+    // that function, so it must run first (mirrors every other
+    // `live_execution_*.rs` file's `bootstrap()` helper).
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
     pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap()).await.unwrap();
 
@@ -140,6 +146,7 @@ async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
     let pool = pylon_pgcon::PgPool::connect(&test_dsn(), 5).await.unwrap();
     pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
     pylon_core::migrate::ensure_tracking_tables(&pool).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
     pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap()).await.unwrap();
 
