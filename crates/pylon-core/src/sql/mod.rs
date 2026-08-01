@@ -4944,6 +4944,27 @@ mod tests {
                 volatility: "stable".into(),
                 body: "select Person filter .age > 18".into(),
             },
+            // A second, 3-arg overload of `mysum`, declared *before* the
+            // 2-arg one is looked up by resolution below — regression for a
+            // bug where call resolution grabbed the first name-matching
+            // overload regardless of arity, instead of searching all
+            // same-named overloads for one whose param count actually
+            // matches the call site.
+            FunctionDescriptor {
+                name: "mysum".into(),
+                module: "default".into(),
+                params: vec![
+                    FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() },
+                    FunctionParamDescriptor { name: "b".into(), pg_type: "int8".into() },
+                    FunctionParamDescriptor { name: "c".into(), pg_type: "int8".into() },
+                ],
+                return_pg_type: "int8".into(),
+                return_is_object: false,
+                return_is_set: false,
+                return_is_polymorphic: false,
+                volatility: "immutable".into(),
+                body: "a + b + c".into(),
+            },
         ];
         s
     }
@@ -4953,6 +4974,27 @@ mod tests {
         let schema = make_schema_with_fns();
         let out = compile_and_emit_with("SELECT mysum(1, 2)", &schema);
         assert!(out.sql.contains("\"public\".\"mysum\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_user_fn_overload_resolved_by_argument_count() {
+        // Regression: with a 2-arg and a 3-arg `mysum` overload both
+        // declared, a 3-arg call must resolve to the 3-arg overload rather
+        // than erroring against whichever overload happens to be first in
+        // `schema.functions`.
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with("SELECT mysum(1, 2, 3)", &schema);
+        assert!(
+            out.sql.contains("\"public\".\"mysum\"((1)::int8, (2)::int8, (3)::int8)"),
+            "got:\n{}", out.sql,
+        );
+
+        // The 2-arg call must still resolve to the 2-arg overload.
+        let out = compile_and_emit_with("SELECT mysum(1, 2)", &schema);
+        assert!(
+            out.sql.contains("\"public\".\"mysum\"((1)::int8, (2)::int8)"),
+            "got:\n{}", out.sql,
+        );
     }
 
     #[test]

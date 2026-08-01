@@ -128,10 +128,19 @@ fn trigger_timing(timing: &str) -> &str {
 // ── Phase 1: schemas ───────────────────────────────────────────────────────────
 
 fn emit_schemas(schema: &SchemaDescriptor, out: &mut String) {
+    // Every kind of top-level declaration can live in a module of its own,
+    // including one with *no* types/scalars/enums at all (a pure-function
+    // utility module, a globals-only module, ...) — omitting any of these
+    // means that module's own `CREATE SCHEMA` never gets emitted, so its
+    // first `CREATE FUNCTION`/global/alias DDL then fails outright with
+    // "schema does not exist" (confirmed live).
     let mut modules: BTreeSet<&str> = BTreeSet::new();
-    for t in &schema.types   { modules.insert(&t.module); }
-    for s in &schema.scalars { modules.insert(&s.module); }
-    for e in &schema.enums   { modules.insert(&e.module); }
+    for t in &schema.types     { modules.insert(&t.module); }
+    for s in &schema.scalars   { modules.insert(&s.module); }
+    for e in &schema.enums     { modules.insert(&e.module); }
+    for f in &schema.functions { modules.insert(&f.module); }
+    for g in &schema.globals   { modules.insert(&g.module); }
+    for a in &schema.aliases   { modules.insert(&a.module); }
     let non_default: Vec<&str> = modules.into_iter().filter(|m| *m != "default").collect();
     for module in &non_default {
         out.push_str(&format!("CREATE SCHEMA IF NOT EXISTS {};\n", pg_schema(module)));
