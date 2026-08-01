@@ -504,7 +504,13 @@ mod tests {
         // `Client.ensure_connected()` depends on to map this straight to
         // `ConnectionFailedError` instead of silently deferring the
         // failure past `ensure_connected()` returning successfully.
-        let bad_dsn = test_dsn().replace("/app", "/pgcon_definitely_does_not_exist");
+        // Swap out whatever the real database name is (not a hardcoded
+        // substring — that silently no-ops and leaves this pointed at the
+        // real, existing test database if the DSN's db name ever changes)
+        // for one guaranteed not to exist.
+        let dsn = test_dsn();
+        let (prefix, _db) = dsn.rsplit_once('/').expect("DSN must have a database path segment");
+        let bad_dsn = format!("{prefix}/pgcon_definitely_does_not_exist");
         let result = PgPool::connect(&bad_dsn, 5).await;
         assert!(result.is_err());
     }
