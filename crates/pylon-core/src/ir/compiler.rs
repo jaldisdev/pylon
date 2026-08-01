@@ -3036,9 +3036,27 @@ impl<'a> Compiler<'a> {
         }
 
         let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
-        // Compile INSERT rewrites; substitute column refs so they are valid in VALUES.
-        let assignment_map: HashMap<String, IrExpr> =
+        // Compile INSERT rewrites; substitute column refs so they are valid in
+        // VALUES — a plain `INSERT ... VALUES (...)` has no FROM-clause for a
+        // real ColumnRef (`"t0"."name"`) to resolve against (confirmed live:
+        // "missing FROM-clause entry for table t0"), unlike UPDATE's SET
+        // clause, which can validly reference the table's own alias. For a
+        // property with no explicit assignment here, fall back to its own
+        // `default_sql` (the same value Postgres's column DEFAULT would
+        // produce) rather than leaving its self-reference unsubstituted — a
+        // `default_pyql` default isn't covered by this fallback (it would
+        // need a full recursive compile at this point, not just a raw-SQL
+        // substitution), so a rewrite self-referencing a `default_pyql`
+        // property with no explicit assignment still hits the same error.
+        let mut assignment_map: HashMap<String, IrExpr> =
             assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
+        for prop in &td.properties {
+            if !assignment_map.contains_key(&prop.name) {
+                if let Some(default_sql) = &prop.default_sql {
+                    assignment_map.insert(prop.name.clone(), IrExpr::RawSql(default_sql.clone()));
+                }
+            }
+        }
         let rewrites = self.compile_rewrites(td, &alias, 1)?
             .into_iter()
             .map(|rw| IrRewrite {

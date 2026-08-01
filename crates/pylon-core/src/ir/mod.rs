@@ -670,6 +670,16 @@ pub enum IrExpr {
     /// A named parameter reference inside a user-defined function body.
     /// Emitted as a double-quoted SQL identifier: `"param_name"`.
     FnParam { name: String, pg_type: String },
+    /// Verbatim SQL text, emitted parenthesized exactly as given. Never
+    /// produced by ordinary PyQL compilation — only used to substitute an
+    /// INSERT rewrite's self-reference (`.name`) to a property that has no
+    /// explicit assignment in this statement with that property's own
+    /// `default_sql`, the same value Postgres's column DEFAULT would have
+    /// produced. A plain `INSERT ... VALUES (...)` has no FROM-clause for a
+    /// real `ColumnRef` to resolve against (confirmed live — "missing
+    /// FROM-clause entry"), unlike UPDATE's SET clause, which can reference
+    /// the table's own alias validly, so this substitution is INSERT-only.
+    RawSql(String),
 }
 
 // ── Vector search ─────────────────────────────────────────────────────────────

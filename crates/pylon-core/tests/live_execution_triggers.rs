@@ -26,7 +26,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/app \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
 //!     cargo test -p pylon-core --test live_execution_triggers -- --ignored
 //! ```
 

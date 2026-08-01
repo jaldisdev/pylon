@@ -27,11 +27,11 @@
 //! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring the
 //! existing live-DB test pattern in `pylon_core::migrate`'s test module and
 //! `pylon-pgcon`'s own tests — same DSN env var, same default
-//! (`postgresql://postgres:postgres@localhost:5418/app`, matching
+//! (`postgresql://postgres:postgres@localhost:5418/pylon_migration_test`, matching
 //! `pylon-demo`'s `docker-compose.yml`). Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/app \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
 //!     cargo test -p pylon-core --test live_execution_smoke -- --ignored
 //! ```
 //!
