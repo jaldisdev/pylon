@@ -4501,6 +4501,24 @@ mod tests {
     }
 
     #[test]
+    fn test_unless_conflict_else_update_self_reference_is_qualified() {
+        // Regression: a self-referencing ELSE-update assignment (`age :=
+        // .age + 1`) used to compile its RHS with an empty (unqualified)
+        // alias, emitting a bare `"age"` — ambiguous in Postgres's `ON
+        // CONFLICT DO UPDATE SET` context between the existing row and the
+        // `excluded` pseudo-row (confirmed live: "column reference ... is
+        // ambiguous"). It must be qualified with the target table's own
+        // bare name instead.
+        let out = compile_and_emit(
+            "INSERT Person { name := $name, age := 0 } \
+             UNLESS CONFLICT ON .name \
+             ELSE (UPDATE Person SET { age := .age + 1 })",
+        );
+        assert!(out.sql.contains("\"Person\".\"age\""), "self-reference must be qualified with the table's own name, got:\n{}", out.sql);
+        assert!(!out.sql.contains("SET \"age\" = (\"age\""), "must not emit an unqualified (ambiguous) self-reference, got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_unless_conflict_do_update_no_on() {
         let out = compile_and_emit(
             "INSERT Person { name := $name } \

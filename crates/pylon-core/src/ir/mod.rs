@@ -1604,6 +1604,29 @@ mod tests {
     }
 
     #[test]
+    fn test_alias_whose_own_body_has_a_shape_plus_outer_shape() {
+        // Regression: when the alias's own body *also* declares a shape
+        // (a legitimate, documented pattern — e.g. `select Type { field }
+        // order by ... limit ...`), the outer shape used to wrap the
+        // inner Shape node wholesale instead of the type reference inside
+        // it, producing a Shape-of-a-Shape the compiler rejected with
+        // "expected a type name as SELECT subject" (confirmed live).
+        use crate::schema::AliasDescriptor;
+        let mut schema = make_schema();
+        schema.aliases.push(AliasDescriptor {
+            name: "OldestActive".into(),
+            module: "default".into(),
+            expr: "select Person { name } order by .age desc limit 1".into(),
+        });
+        let ast = parse::parse("SELECT OldestActive { name, age }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("\"name\""), "expected name pointer, got: {sql}");
+        assert!(sql.contains("\"age\""), "expected age pointer, got: {sql}");
+        assert!(sql.contains("ORDER BY") && sql.contains("LIMIT"), "alias's own order/limit must still apply, got: {sql}");
+    }
+
+    #[test]
     fn test_positional_param_names() {
         let schema = make_schema();
         let ast = parse::parse("SELECT Person FILTER .name = $0").unwrap();

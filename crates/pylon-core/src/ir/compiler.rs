@@ -848,11 +848,25 @@ impl<'a> Compiler<'a> {
         };
 
         // Merge outer shape / filter / modifiers over the alias's select.
+        // `inner_sel.result` is itself an `Expr::Shape` whenever the
+        // alias's own body declares a shape (e.g. `select Type { field }
+        // order by ... limit ...`, a legitimate, documented pattern — an
+        // alias's own body may combine a shape with modifiers) — wrapping
+        // it wholesale as the outer shape's own `expr` would nest a Shape
+        // inside a Shape, which the compiler's SELECT-subject resolution
+        // rejects ("expected a type name as SELECT subject", confirmed
+        // live). The outer shape must bind to the same underlying *type*
+        // reference the alias's own shape does, not to the alias's shape
+        // node itself — so unwrap through it first.
+        let inner_base = match &inner_sel.result {
+            Expr::Shape(sh) => sh.expr.clone(),
+            other => Some(other.clone()),
+        };
         let merged_result = if shape_elements.is_empty() {
             inner_sel.result.clone()
         } else {
             Expr::Shape(Box::new(ast::ShapeExpr {
-                expr: Some(inner_sel.result.clone()),
+                expr: inner_base,
                 elements: shape_elements.to_vec(),
                 marker_offset: None,
             }))
@@ -6223,9 +6237,18 @@ impl<'a> Compiler<'a> {
 
     /// Compile the ELSE clause of UNLESS CONFLICT, which must be `(UPDATE Type SET { … })`.
     ///
-    /// Assignments are compiled with an empty table alias so ColumnRefs emit as bare
-    /// column names — valid in PostgreSQL's `DO UPDATE SET` context, where bare names
-    /// reference the existing (conflicting) row.
+    /// Assignments are compiled with the target table's own bare name (not
+    /// schema-qualified, and not the usual `t0`-style fresh alias) as the
+    /// qualifying "alias" so a self-referencing RHS (`.stock` in `stock :=
+    /// .stock + 1`) resolves unambiguously to the *existing* conflicting
+    /// row. A genuinely bare, unqualified column reference here is
+    /// ambiguous in Postgres between the existing row and the `excluded`
+    /// pseudo-row (confirmed live: "column reference ... is ambiguous")
+    /// even though only one of the two is ever actually reachable this way
+    /// (nothing here ever compiles a reference to `excluded`) — Postgres's
+    /// own docs describe exactly this qualification: "the existing row
+    /// using the table's name (or an alias)," no explicit `AS` needed on
+    /// the INSERT target for that self-reference to work.
     fn compile_conflict_else(
         &mut self,
         expr: &Expr,
@@ -6244,7 +6267,8 @@ impl<'a> Compiler<'a> {
         let upd_td = self.resolve_type(&type_name)?;
         // Filter on the ELSE UPDATE is ignored — PostgreSQL infers the conflicting
         // row from the ON CONFLICT target automatically.
-        self.compile_assignments_for_update(&upd.shape, upd_td, "")
+        let table = upd_td.table.clone();
+        self.compile_assignments_for_update(&upd.shape, upd_td, &table)
     }
 
     /// Compile `(SELECT TargetType FILTER …)` as a scalar subquery for use in a
