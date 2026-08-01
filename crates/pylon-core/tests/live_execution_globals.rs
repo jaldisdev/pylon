@@ -42,7 +42,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_globals -- --ignored
 //! ```
 
@@ -110,12 +110,23 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
 /// `compiled.param_names`' own order — the caller is responsible for
 /// knowing that order (every test here references exactly one global, so
 /// it's always a single-element params slice).
-async fn rows_with_params(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str, params: &[CachedValue]) -> Vec<CachedValue> {
+async fn rows_with_params(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+    params: &[CachedValue],
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, params, &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, params, &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     rows_with_params(pool, sd, pyql, &[]).await
 }
 
@@ -127,7 +138,9 @@ fn field(row: &CachedValue, i: usize) -> &CachedValue {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -148,18 +161,29 @@ async fn session_global_of_uuid_type_filters_correctly() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Widget {{ name := 'Alice' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Widget {{ name := 'Alice' }}"),
+    )
+    .await;
     let inserted = rows_of(&pool, &sd, &format!("select {module}::Widget {{ id }}")).await;
-    let CachedValue::Composite(shape) = &inserted[0] else { panic!("expected Composite") };
+    let CachedValue::Composite(shape) = &inserted[0] else {
+        panic!("expected Composite")
+    };
     let viewer_id = shape[1].clone();
 
     let rows = rows_with_params(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("select {module}::Widget {{ name }} filter .id = global viewer_id"),
         &[viewer_id],
-    ).await;
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     assert_eq!(field(&rows[0], 1), &CachedValue::Str("Alice".to_string()));
 }
@@ -177,16 +201,28 @@ async fn session_global_unbound_is_null() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Widget {{ name := 'Alice' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Widget {{ name := 'Alice' }}"),
+    )
+    .await;
 
     let rows = rows_with_params(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("select {module}::Widget {{ name }} filter .id = global viewer_id"),
         &[CachedValue::Null],
-    ).await;
-    assert!(rows.is_empty(), "an unbound (NULL) global must not accidentally match every row, got {rows:?}");
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "an unbound (NULL) global must not accidentally match every row, got {rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -204,15 +240,24 @@ async fn session_global_of_array_type_resolves_correctly() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
     let rows = rows_with_params(
-        &pool, &sd,
+        &pool,
+        &sd,
         "select array_join(global tags, ',')",
-        &[CachedValue::Array(vec![CachedValue::Str("a".into()), CachedValue::Str("b".into())])],
-    ).await;
+        &[CachedValue::Array(vec![
+            CachedValue::Str("a".into()),
+            CachedValue::Str("b".into()),
+        ])],
+    )
+    .await;
     assert_eq!(rows.len(), 1);
-    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
+    let CachedValue::Composite(shape) = &rows[0] else {
+        panic!("expected Composite")
+    };
     assert_eq!(shape[0], CachedValue::Str("a,b".to_string()));
 }
 
@@ -231,7 +276,9 @@ async fn computed_global_reads_a_session_global_it_references() {
         globals: vec![
             session_global("current_user_id", &module, "std::uuid"),
             computed_global(
-                "current_user", &module, &format!("{module}::Person"),
+                "current_user",
+                &module,
+                &format!("{module}::Person"),
                 &format!("select {module}::Person filter .id = global current_user_id"),
             ),
         ],
@@ -240,18 +287,33 @@ async fn computed_global_reads_a_session_global_it_references() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Ada' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Ada' }}"),
+    )
+    .await;
     let inserted = rows_of(&pool, &sd, &format!("select {module}::Person {{ id }}")).await;
-    let CachedValue::Composite(shape) = &inserted[0] else { panic!("expected Composite") };
+    let CachedValue::Composite(shape) = &inserted[0] else {
+        panic!("expected Composite")
+    };
     let person_id = shape[1].clone();
 
     let rows = rows_with_params(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("select global current_user {{ name }}"),
         &[person_id],
-    ).await;
-    assert_eq!(rows.len(), 1, "computed global should resolve to exactly the referenced Person, got {rows:?}");
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "computed global should resolve to exactly the referenced Person, got {rows:?}"
+    );
     assert_eq!(field(&rows[0], 1), &CachedValue::Str("Ada".to_string()));
 }

@@ -34,7 +34,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_rewrites -- --ignored
 //! ```
 
@@ -47,7 +47,11 @@ use pylon_core::schema::{SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
 use pylon_value::CachedValue;
 
-fn ty(name: &str, module: &str, properties: Vec<pylon_core::schema::PropertyDescriptor>) -> TypeDescriptor {
+fn ty(
+    name: &str,
+    module: &str,
+    properties: Vec<pylon_core::schema::PropertyDescriptor>,
+) -> TypeDescriptor {
     TypeDescriptor {
         name: name.into(),
         module: module.into(),
@@ -81,9 +85,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str)
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    schema: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
@@ -97,7 +107,9 @@ fn field(row: &CachedValue, i: usize) -> &CachedValue {
 /// tables, ...) — every concrete table gets an unconditional
 /// `pylon_cache_invalidate` trigger, which references that function.
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -107,17 +119,36 @@ async fn insert_rewrite_overrides_assigned_value() {
     let module = unique_module("live_rw_insert");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].rewrites = vec![rewrite(1, "'inserted'")]; // On.Insert
-    let schema = SchemaDescriptor { types: vec![widget], ..Default::default() };
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'Whiplash' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'Whiplash' }}"),
+    )
+    .await;
 
-    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
+    let rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ name }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("inserted".to_string()), "insert rewrite should override the assigned value");
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::Str("inserted".to_string()),
+        "insert rewrite should override the assigned value"
+    );
 }
 
 #[tokio::test]
@@ -127,20 +158,52 @@ async fn update_rewrite_overrides_assigned_value() {
     let module = unique_module("live_rw_update");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].rewrites = vec![rewrite(2, "'updated'")]; // On.Update
-    let schema = SchemaDescriptor { types: vec![widget], ..Default::default() };
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'Whiplash' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'Whiplash' }}"),
+    )
+    .await;
     // Insert rewrite is not declared, so the insert itself is unaffected.
-    let after_insert = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
-    assert_eq!(field(&after_insert[0], 1), &CachedValue::Str("Whiplash".to_string()));
+    let after_insert = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ name }}"),
+    )
+    .await;
+    assert_eq!(
+        field(&after_insert[0], 1),
+        &CachedValue::Str("Whiplash".to_string())
+    );
 
-    exec(&pool, &schema, &format!("update {module}::Widget set {{ name := 'The Godfather' }}")).await;
-    let after_update = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
-    assert_eq!(field(&after_update[0], 1), &CachedValue::Str("updated".to_string()), "update rewrite should override the assigned value");
+    exec(
+        &pool,
+        &schema,
+        &format!("update {module}::Widget set {{ name := 'The Godfather' }}"),
+    )
+    .await;
+    let after_update = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ name }}"),
+    )
+    .await;
+    assert_eq!(
+        field(&after_update[0], 1),
+        &CachedValue::Str("updated".to_string()),
+        "update rewrite should override the assigned value"
+    );
 }
 
 #[tokio::test]
@@ -153,19 +216,41 @@ async fn insert_rewrite_applies_to_defaulted_value() {
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].default_sql = Some("'untitled'".into());
     widget.properties[1].rewrites = vec![rewrite(1, ".name ++ ' (new)'")]; // On.Insert
-    let schema = SchemaDescriptor { types: vec![widget], ..Default::default() };
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'Whiplash' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'Whiplash' }}"),
+    )
+    .await;
     exec(&pool, &schema, &format!("insert {module}::Widget {{ }}")).await; // no name given — falls back to the default first
 
-    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }} order by .name")).await;
+    let rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ name }} order by .name"),
+    )
+    .await;
     assert_eq!(rows.len(), 2);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("untitled (new)".to_string()), "rewrite should still apply to the defaulted value");
-    assert_eq!(field(&rows[1], 1), &CachedValue::Str("Whiplash (new)".to_string()));
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::Str("untitled (new)".to_string()),
+        "rewrite should still apply to the defaulted value"
+    );
+    assert_eq!(
+        field(&rows[1], 1),
+        &CachedValue::Str("Whiplash (new)".to_string())
+    );
 }
 
 #[tokio::test]
@@ -176,21 +261,49 @@ async fn update_rewrite_references_sibling_property() {
     // context a computed pointer gets) and calls a stdlib function, and
     // fires even though its own column (`shout`) is never itself assigned.
     let module = unique_module("live_rw_sibling");
-    let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name"), text_prop("shout")]);
+    let mut widget = ty(
+        "Widget",
+        &module,
+        vec![id_prop(), text_prop("name"), text_prop("shout")],
+    );
     widget.properties[2].rewrites = vec![rewrite(2, "str_upper(.name)")]; // On.Update
-    let schema = SchemaDescriptor { types: vec![widget], ..Default::default() };
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'quiet', shout := 'quiet' }}")).await;
-    exec(&pool, &schema, &format!("update {module}::Widget set {{ name := 'loud' }}")).await; // shout not mentioned
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'quiet', shout := 'quiet' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &schema,
+        &format!("update {module}::Widget set {{ name := 'loud' }}"),
+    )
+    .await; // shout not mentioned
 
-    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name, shout }}")).await;
+    let rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ name, shout }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     assert_eq!(field(&rows[0], 1), &CachedValue::Str("loud".to_string()));
-    assert_eq!(field(&rows[0], 2), &CachedValue::Str("LOUD".to_string()), "update rewrite should fire and see the sibling property's new value even though shout wasn't itself assigned");
+    assert_eq!(
+        field(&rows[0], 2),
+        &CachedValue::Str("LOUD".to_string()),
+        "update rewrite should fire and see the sibling property's new value even though shout wasn't itself assigned"
+    );
 }
 
 #[tokio::test]
@@ -201,39 +314,86 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
     let module = unique_module("live_rw_scope");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].rewrites = vec![rewrite(1, "'inserted'")]; // On.Insert only
-    let schema = SchemaDescriptor { types: vec![widget], ..Default::default() };
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'Whiplash' }}")).await;
-    exec(&pool, &schema, &format!("update {module}::Widget set {{ name := 'my-real-name' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'Whiplash' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &schema,
+        &format!("update {module}::Widget set {{ name := 'my-real-name' }}"),
+    )
+    .await;
 
-    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
+    let rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ name }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("my-real-name".to_string()), "an insert-only rewrite must not fire on update");
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::Str("my-real-name".to_string()),
+        "an insert-only rewrite must not fire on update"
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn multiple_rewrites_on_different_properties_do_not_interfere() {
     let module = unique_module("live_rw_multi");
-    let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("a"), text_prop("b")]);
+    let mut widget = ty(
+        "Widget",
+        &module,
+        vec![id_prop(), text_prop("a"), text_prop("b")],
+    );
     widget.properties[1].rewrites = vec![rewrite(1, "'A'")];
     widget.properties[2].rewrites = vec![rewrite(1, "'B'")];
-    let schema = SchemaDescriptor { types: vec![widget], ..Default::default() };
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ a := 'x', b := 'y' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ a := 'x', b := 'y' }}"),
+    )
+    .await;
 
-    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ a, b }}")).await;
+    let rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Widget {{ a, b }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     assert_eq!(field(&rows[0], 1), &CachedValue::Str("A".to_string()));
-    assert_eq!(field(&rows[0], 2), &CachedValue::Str("B".to_string()), "two independent rewrites on the same insert must not interfere with each other");
+    assert_eq!(
+        field(&rows[0], 2),
+        &CachedValue::Str("B".to_string()),
+        "two independent rewrites on the same insert must not interfere with each other"
+    );
 }
 
 #[tokio::test]
@@ -247,16 +407,39 @@ async fn trigger_observes_rewritten_value_not_original() {
     let module = unique_module("live_rw_trigger");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].rewrites = vec![rewrite(1, "'rewritten'")]; // On.Insert
-    widget.triggers = vec![trigger(1, "After", &format!("insert {module}::Log {{ new_name := __new__.name }}"))];
-    let schema = SchemaDescriptor { types: vec![widget, log_type(&module)], ..Default::default() };
+    widget.triggers = vec![trigger(
+        1,
+        "After",
+        &format!("insert {module}::Log {{ new_name := __new__.name }}"),
+    )];
+    let schema = SchemaDescriptor {
+        types: vec![widget, log_type(&module)],
+        ..Default::default()
+    };
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'original' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'original' }}"),
+    )
+    .await;
 
-    let log_rows = rows_of(&pool, &schema, &format!("select {module}::Log {{ new_name }}")).await;
+    let log_rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Log {{ new_name }}"),
+    )
+    .await;
     assert_eq!(log_rows.len(), 1);
-    assert_eq!(field(&log_rows[0], 1), &CachedValue::Str("rewritten".to_string()), "trigger should observe the rewritten value, not the originally-assigned one");
+    assert_eq!(
+        field(&log_rows[0], 1),
+        &CachedValue::Str("rewritten".to_string()),
+        "trigger should observe the rewritten value, not the originally-assigned one"
+    );
 }

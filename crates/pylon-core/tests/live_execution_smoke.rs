@@ -27,11 +27,11 @@
 //! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring the
 //! existing live-DB test pattern in `pylon_core::migrate`'s test module and
 //! `pylon-pgcon`'s own tests — same DSN env var, same default
-//! (`postgresql://postgres:postgres@localhost:5418/pylon_migration_test`, matching
+//! (`postgresql://postgres:postgres@localhost:5432/pylon_live_test`, matching
 //! `pylon-demo`'s `docker-compose.yml`). Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_smoke -- --ignored
 //! ```
 //!
@@ -87,8 +87,15 @@ async fn insert_and_select_round_trip_a_real_value() {
     let pool = test_pool().await;
     pool.batch_execute(&ddl).await.unwrap();
 
-    let insert = query::compile(&format!("insert {module}::Widget {{ name := 'hello' }}"), &schema).unwrap();
-    assert!(insert.param_names.is_empty(), "fixture query intentionally uses no PyQL params");
+    let insert = query::compile(
+        &format!("insert {module}::Widget {{ name := 'hello' }}"),
+        &schema,
+    )
+    .unwrap();
+    assert!(
+        insert.param_names.is_empty(),
+        "fixture query intentionally uses no PyQL params"
+    );
     let affected = pool.execute_typed(&insert.sql, &[]).await.unwrap();
     assert_eq!(affected, 1);
 
@@ -97,8 +104,15 @@ async fn insert_and_select_round_trip_a_real_value() {
         &schema,
     )
     .unwrap();
-    let rows = pool.query_typed(&select.sql, &[], &ExtensionOids::default()).await.unwrap();
-    assert_eq!(rows.len(), 1, "expected exactly one Widget row back, got {rows:?}");
+    let rows = pool
+        .query_typed(&select.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one Widget row back, got {rows:?}"
+    );
     match &rows[0] {
         // A schema-backed object row decodes as a positional `Composite`,
         // not a name-keyed `Object` — position 0 is always the
@@ -106,7 +120,10 @@ async fn insert_and_select_round_trip_a_real_value() {
         // `_decode()`, the `"object"` branch), remaining positions are the
         // selected pointers in shape order.
         CachedValue::Composite(fields) => {
-            assert_eq!(fields.first(), Some(&CachedValue::Str(format!("{module}::Widget"))));
+            assert_eq!(
+                fields.first(),
+                Some(&CachedValue::Str(format!("{module}::Widget")))
+            );
             assert_eq!(fields.get(1), Some(&CachedValue::Str("hello".to_string())));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),

@@ -19,8 +19,8 @@
 
 //! Live-Postgres integration tests for `pylon-client` — same harness
 //! convention as `pylon-core/tests/live_execution_*.rs`: `#[ignore]`d,
-//! run explicitly against a real Postgres (`PYLON_PGCON_TEST_DSN`, default
-//! `postgresql://postgres:postgres@localhost:5418/pylon_migration_test`).
+//! run explicitly against a real Postgres via `PYLON_PGCON_TEST_DSN`
+//! (required — no hardcoded fallback).
 //!
 //! Each test gets its own nanos-suffixed module/schema (mirrors
 //! `pylon-core/tests/common/mod.rs`'s `unique_module`) so nothing needs
@@ -35,7 +35,7 @@ use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 
 fn test_dsn() -> String {
     std::env::var("PYLON_PGCON_TEST_DSN")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
+        .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
 }
 
 fn unique_module(prefix: &str) -> String {

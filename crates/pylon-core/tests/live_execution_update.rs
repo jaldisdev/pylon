@@ -36,7 +36,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_update -- --ignored
 //! ```
 
@@ -81,15 +81,26 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn schema_with_post(module: &str) -> SchemaDescriptor {
-    let person = ty("Person", module, vec![id_prop(), text_prop("name"), int_prop("age")]);
+    let person = ty(
+        "Person",
+        module,
+        vec![id_prop(), text_prop("name"), int_prop("age")],
+    );
     let mut post = ty("Post", module, vec![id_prop(), text_prop("title")]);
     post.links = vec![link("author", &format!("{module}::Person"))];
-    SchemaDescriptor { types: vec![person, post], ..Default::default() }
+    SchemaDescriptor {
+        types: vec![person, post],
+        ..Default::default()
+    }
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap())
+        .await
+        .unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -97,9 +108,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
@@ -138,12 +155,32 @@ async fn update_with_filter_modifies_only_matching_rows() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}"),
+    )
+    .await;
 
-    exec(&pool, &sd, &format!("update {module}::Person filter .name = 'Alice' set {{ age := 99 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("update {module}::Person filter .name = 'Alice' set {{ age := 99 }}"),
+    )
+    .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }} order by .name")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name, age }} order by .name"),
+    )
+    .await;
     assert_eq!(as_i64(field(&rows[0], 2)), 99, "Alice should be updated");
     assert_eq!(as_i64(field(&rows[1], 2)), 40, "Bob must be untouched");
 }
@@ -156,12 +193,26 @@ async fn update_self_referential_expression_reads_the_existing_row_value() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
 
-    exec(&pool, &sd, &format!("update {module}::Person filter .name = 'Alice' set {{ age := .age + 1 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("update {module}::Person filter .name = 'Alice' set {{ age := .age + 1 }}"),
+    )
+    .await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }}")).await;
-    assert_eq!(as_i64(field(&rows[0], 1)), 31, "age must be read-then-incremented, not overwritten blind");
+    assert_eq!(
+        as_i64(field(&rows[0], 1)),
+        31,
+        "age must be read-then-incremented, not overwritten blind"
+    );
 }
 
 #[tokio::test]
@@ -172,8 +223,18 @@ async fn update_replaces_a_single_link() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}"),
+    )
+    .await;
     exec(&pool, &sd, &format!(
         "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
     )).await;
@@ -182,11 +243,20 @@ async fn update_replaces_a_single_link() {
         "update {module}::Post filter .title = 'Hello' set {{ author := (select {module}::Person filter .name = 'Bob') }}"
     )).await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Post {{ author: {{ name }} }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     // Post's shape: [type-tag, author]; author link's own row: [type-tag, name].
     let author = field(&rows[0], 1);
-    assert_eq!(as_str(field(author, 1)), "Bob", "the link should now point at Bob, got {rows:?}");
+    assert_eq!(
+        as_str(field(author, 1)),
+        "Bob",
+        "the link should now point at Bob, got {rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -197,7 +267,12 @@ async fn update_replaces_a_single_link_with_a_nested_insert() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
     exec(&pool, &sd, &format!(
         "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
     )).await;
@@ -210,13 +285,31 @@ async fn update_replaces_a_single_link_with_a_nested_insert() {
          set {{ author := (select (insert {module}::Person {{ name := 'Bob', age := 40 }}) {{ id }}) }}"
     )).await;
 
-    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }} order by .name")).await;
-    assert_eq!(people.len(), 2, "the nested insert must have actually created a new Person row");
+    let people = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name }} order by .name"),
+    )
+    .await;
+    assert_eq!(
+        people.len(),
+        2,
+        "the nested insert must have actually created a new Person row"
+    );
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Post {{ author: {{ name }} }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     let author = field(&rows[0], 1);
-    assert_eq!(as_str(field(author, 1)), "Bob", "the link should now point at the newly-inserted Bob, got {rows:?}");
+    assert_eq!(
+        as_str(field(author, 1)),
+        "Bob",
+        "the link should now point at the newly-inserted Bob, got {rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -227,23 +320,51 @@ async fn update_returns_the_ids_of_the_rows_it_touched() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}"),
+    )
+    .await;
 
     let alice_id = {
-        let rows = rows_of(&pool, &sd, &format!("select {module}::Person filter .name = 'Alice'")).await;
+        let rows = rows_of(
+            &pool,
+            &sd,
+            &format!("select {module}::Person filter .name = 'Alice'"),
+        )
+        .await;
         as_uuid(field(&rows[0], 1))
     };
 
-    let touched = rows_of(&pool, &sd, &format!("update {module}::Person filter .name = 'Alice' set {{ age := 31 }}")).await;
+    let touched = rows_of(
+        &pool,
+        &sd,
+        &format!("update {module}::Person filter .name = 'Alice' set {{ age := 31 }}"),
+    )
+    .await;
     assert_eq!(touched.len(), 1);
     assert_eq!(as_uuid(field(&touched[0], 1)), alice_id);
 
     // A non-matching filter touches (and returns) nothing.
-    let none_touched = rows_of(&pool, &sd, &format!("update {module}::Person filter .name = 'Nobody' set {{ age := 0 }}")).await;
+    let none_touched = rows_of(
+        &pool,
+        &sd,
+        &format!("update {module}::Person filter .name = 'Nobody' set {{ age := 0 }}"),
+    )
+    .await;
     assert!(none_touched.is_empty());
 
-    let ages: HashSet<i64> = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }}")).await
-        .iter().map(|r| as_i64(field(r, 1))).collect();
+    let ages: HashSet<i64> = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }}"))
+        .await
+        .iter()
+        .map(|r| as_i64(field(r, 1)))
+        .collect();
     assert_eq!(ages, HashSet::from([31, 40]));
 }

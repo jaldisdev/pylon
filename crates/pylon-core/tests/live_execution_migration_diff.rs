@@ -33,14 +33,16 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_migration_diff -- --ignored
 //! ```
 
 mod common;
 
 use common::*;
-use pylon_core::diff::{diff_schema_steps, diff_schema_steps_with_renames_and_fills, schema_to_db_state, Verb};
+use pylon_core::diff::{
+    Verb, diff_schema_steps, diff_schema_steps_with_renames_and_fills, schema_to_db_state,
+};
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, SignalEntry, TypeDescriptor};
@@ -97,7 +99,9 @@ async fn phantom_trigger_regression_second_create_reports_zero_changes() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
     for step in &steps {
         for op in step.resolved_ddl(&HashMap::new()) {
             pool.batch_execute(&op.sql).await.unwrap();
@@ -109,13 +113,18 @@ async fn phantom_trigger_regression_second_create_reports_zero_changes() {
     // tip row exists, and the one that broke.
     let baseline = schema_to_db_state(&schema);
     let further = diff_schema_steps(&schema, &baseline, &HashMap::new()).unwrap();
-    assert!(further.is_empty(), "expected zero further migration steps against the offline baseline, got: {further:?}");
+    assert!(
+        further.is_empty(),
+        "expected zero further migration steps against the offline baseline, got: {further:?}"
+    );
 
     // This test's own `zero_changes_against_live_introspection_after_apply`
     // sibling does a *full-database* introspection diff, which would
     // otherwise see this test's leftover schema as "should be dropped" —
     // clean up so tests in this file don't interfere with each other.
-    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;")).await.unwrap();
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -131,7 +140,9 @@ async fn zero_changes_against_live_introspection_after_apply() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
     pool.batch_execute(&ddl).await.unwrap();
 
     // Catches drift the other direction from the offline-baseline scenario
@@ -141,7 +152,9 @@ async fn zero_changes_against_live_introspection_after_apply() {
     // this one runs (see each sibling test's own cleanup at the end).
     assert_zero_further_steps(&pool, &schema).await;
 
-    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;")).await.unwrap();
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -181,10 +194,16 @@ async fn rename_detected_and_applied_survives_real_data() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
     pool.batch_execute(&ddl).await.unwrap();
 
-    let insert = query::compile(&format!("insert {module}::Widget {{ name := 'keep-me' }}"), &v1).unwrap();
+    let insert = query::compile(
+        &format!("insert {module}::Widget {{ name := 'keep-me' }}"),
+        &v1,
+    )
+    .unwrap();
     assert_eq!(pool.execute_typed(&insert.sql, &[]).await.unwrap(), 1);
 
     // v2: same type, renamed Widget -> Gadget, same columns.
@@ -192,8 +211,15 @@ async fn rename_detected_and_applied_survives_real_data() {
     v2.types[0].name = "Gadget".into();
     v2.types[0].table = "Gadget".into();
 
-    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
-    let type_renames = vec![(module.clone(), "Widget".to_string(), module.clone(), "Gadget".to_string())];
+    let live = pylon_core::introspect::introspect_db_state(&pool)
+        .await
+        .unwrap();
+    let type_renames = vec![(
+        module.clone(),
+        "Widget".to_string(),
+        module.clone(),
+        "Gadget".to_string(),
+    )];
 
     // `diff_schema_steps_with_renames_and_fills` only *projects* the rename
     // onto its in-memory `current` copy so the rest of the diff sees no
@@ -202,27 +228,47 @@ async fn rename_detected_and_applied_survives_real_data() {
     // responsibility (mirrors `pylon/cli/commands/migrations.py`'s
     // `_rename_prompt_loop`, which builds this exact statement directly
     // rather than sourcing it from the diff engine's output).
-    pool.batch_execute(&format!(r#"ALTER TABLE "{module}"."Widget" RENAME TO "Gadget";"#)).await.unwrap();
+    pool.batch_execute(&format!(
+        r#"ALTER TABLE "{module}"."Widget" RENAME TO "Gadget";"#
+    ))
+    .await
+    .unwrap();
 
-    let steps = diff_schema_steps_with_renames_and_fills(&v2, &live, &type_renames, &[], &[]).unwrap();
+    let steps =
+        diff_schema_steps_with_renames_and_fills(&v2, &live, &type_renames, &[], &[]).unwrap();
     for step in &steps {
         for op in step.resolved_ddl(&HashMap::new()) {
             pool.batch_execute(&op.sql).await.unwrap();
         }
     }
 
-    let select =
-        query::compile(&format!("select {module}::Gadget {{ name }} filter .name = 'keep-me'"), &v2).unwrap();
-    let rows = pool.query_typed(&select.sql, &[], &ExtensionOids::default()).await.unwrap();
-    assert_eq!(rows.len(), 1, "renamed row should still be there with its original data, got {rows:?}");
+    let select = query::compile(
+        &format!("select {module}::Gadget {{ name }} filter .name = 'keep-me'"),
+        &v2,
+    )
+    .unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "renamed row should still be there with its original data, got {rows:?}"
+    );
     match &rows[0] {
         CachedValue::Composite(fields) => {
-            assert_eq!(fields.get(1), Some(&CachedValue::Str("keep-me".to_string())));
+            assert_eq!(
+                fields.get(1),
+                Some(&CachedValue::Str("keep-me".to_string()))
+            );
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 
-    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;")).await.unwrap();
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -262,10 +308,13 @@ async fn property_type_change_casts_existing_data() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
     pool.batch_execute(&ddl).await.unwrap();
 
-    let insert = query::compile(&format!("insert {module}::Widget {{ code := '42' }}"), &v1).unwrap();
+    let insert =
+        query::compile(&format!("insert {module}::Widget {{ code := '42' }}"), &v1).unwrap();
     assert_eq!(pool.execute_typed(&insert.sql, &[]).await.unwrap(), 1);
 
     // v2: `code` widened from text to int8 — the type-changing-column path
@@ -273,21 +322,37 @@ async fn property_type_change_casts_existing_data() {
     let mut v2 = v1.clone();
     v2.types[0].properties[1].pg_type = "int8".into();
 
-    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    let live = pylon_core::introspect::introspect_db_state(&pool)
+        .await
+        .unwrap();
     let steps = diff_schema_steps(&v2, &live, &HashMap::new()).unwrap();
     let table_step = steps
         .iter()
         .find(|s| s.verb == Verb::Alter && s.object_desc.contains("Widget"))
         .expect("expected an alter step for Widget's type change");
-    assert!(!table_step.required_input.is_empty(), "type change should carry a required_input cast expression");
+    assert!(
+        !table_step.required_input.is_empty(),
+        "type change should carry a required_input cast expression"
+    );
 
     for op in table_step.resolved_ddl(&HashMap::new()) {
         pool.batch_execute(&op.sql).await.unwrap();
     }
 
-    let select = query::compile(&format!("select {module}::Widget {{ code }} filter .code = 42"), &v2).unwrap();
-    let rows = pool.query_typed(&select.sql, &[], &ExtensionOids::default()).await.unwrap();
-    assert_eq!(rows.len(), 1, "existing row should have survived the cast with the correct value, got {rows:?}");
+    let select = query::compile(
+        &format!("select {module}::Widget {{ code }} filter .code = 42"),
+        &v2,
+    )
+    .unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "existing row should have survived the cast with the correct value, got {rows:?}"
+    );
     match &rows[0] {
         CachedValue::Composite(fields) => {
             assert_eq!(fields.get(1), Some(&CachedValue::I64(42)));
@@ -295,5 +360,7 @@ async fn property_type_change_casts_existing_data() {
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 
-    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;")).await.unwrap();
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
 }

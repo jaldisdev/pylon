@@ -34,7 +34,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_delete -- --ignored
 //! ```
 
@@ -79,13 +79,24 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn person_schema(module: &str) -> SchemaDescriptor {
-    let person = ty("Person", module, vec![id_prop(), text_prop("name"), int_prop("age")]);
-    SchemaDescriptor { types: vec![person], ..Default::default() }
+    let person = ty(
+        "Person",
+        module,
+        vec![id_prop(), text_prop("name"), int_prop("age")],
+    );
+    SchemaDescriptor {
+        types: vec![person],
+        ..Default::default()
+    }
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap())
+        .await
+        .unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -93,9 +104,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
@@ -127,13 +144,32 @@ async fn delete_with_filter_removes_only_matching_rows() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Kid', age := 10 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Kid', age := 10 }}"),
+    )
+    .await;
 
-    exec(&pool, &sd, &format!("delete {module}::Person filter .age < 18")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("delete {module}::Person filter .age < 18"),
+    )
+    .await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
-    assert_eq!(rows.len(), 1, "only the matching row should have been deleted, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the matching row should have been deleted, got {rows:?}"
+    );
     assert_eq!(as_str(field(&rows[0], 1)), "Alice");
 }
 
@@ -145,16 +181,33 @@ async fn delete_returns_the_ids_of_the_rows_it_removed() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}"),
+    )
+    .await;
 
     let before = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
     let before_ids: HashSet<[u8; 16]> = before.iter().map(|r| as_uuid(field(r, 1))).collect();
 
     let deleted = rows_of(&pool, &sd, &format!("delete {module}::Person")).await;
-    assert_eq!(deleted.len(), 2, "expected both rows returned from delete, got {deleted:?}");
+    assert_eq!(
+        deleted.len(),
+        2,
+        "expected both rows returned from delete, got {deleted:?}"
+    );
     let deleted_ids: HashSet<[u8; 16]> = deleted.iter().map(|r| as_uuid(field(r, 1))).collect();
-    assert_eq!(deleted_ids, before_ids, "delete's RETURNING ids must match the rows that actually existed");
+    assert_eq!(
+        deleted_ids, before_ids,
+        "delete's RETURNING ids must match the rows that actually existed"
+    );
 
     let after = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
     assert!(after.is_empty(), "both rows should be gone, got {after:?}");
@@ -168,13 +221,27 @@ async fn delete_with_no_matches_is_a_no_op() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
 
-    let deleted = rows_of(&pool, &sd, &format!("delete {module}::Person filter .age > 100")).await;
+    let deleted = rows_of(
+        &pool,
+        &sd,
+        &format!("delete {module}::Person filter .age > 100"),
+    )
+    .await;
     assert!(deleted.is_empty(), "no row should match, got {deleted:?}");
 
     let after = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
-    assert_eq!(after.len(), 1, "the non-matching row must survive, got {after:?}");
+    assert_eq!(
+        after.len(),
+        1,
+        "the non-matching row must survive, got {after:?}"
+    );
 }
 
 #[tokio::test]
@@ -185,12 +252,30 @@ async fn delete_with_no_filter_removes_every_row() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Carol', age := 50 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Carol', age := 50 }}"),
+    )
+    .await;
 
     exec(&pool, &sd, &format!("delete {module}::Person")).await;
 
     let after = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
-    assert!(after.is_empty(), "an unfiltered delete must remove every row, got {after:?}");
+    assert!(
+        after.is_empty(),
+        "an unfiltered delete must remove every row, got {after:?}"
+    );
 }

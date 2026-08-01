@@ -458,13 +458,13 @@ fn decode_row_named(row: &tokio_postgres::Row, ext: &ExtensionOids) -> Result<Ca
 mod tests {
     use super::*;
 
-    /// Real Postgres required — the dockerized demo DB used throughout this
-    /// session (`~/Development/pylon-demo`, `docker compose up`), overridable
-    /// via `PYLON_PGCON_TEST_DSN`. Not run by default (`cargo test -- --ignored`
-    /// to opt in) so the default test run stays hermetic.
+    /// Real Postgres required — `PYLON_PGCON_TEST_DSN` must be set (no
+    /// hardcoded fallback; point it at a disposable database, never a real
+    /// one). Not run by default (`cargo test -- --ignored` to opt in) so
+    /// the default test run stays hermetic.
     fn test_dsn() -> String {
         std::env::var("PYLON_PGCON_TEST_DSN")
-            .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
+            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     #[tokio::test]

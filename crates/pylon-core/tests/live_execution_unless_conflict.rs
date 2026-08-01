@@ -38,7 +38,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_unless_conflict -- --ignored
 //! ```
 
@@ -83,8 +83,15 @@ fn product_schema(module: &str) -> SchemaDescriptor {
     sku.is_exclusive = true;
     let mut stock = text_prop("stock");
     stock.pg_type = "int8".into();
-    let product = ty("Product", module, vec![id_prop(), sku, text_prop("name"), stock]);
-    SchemaDescriptor { types: vec![product], ..Default::default() }
+    let product = ty(
+        "Product",
+        module,
+        vec![id_prop(), sku, text_prop("name"), stock],
+    );
+    SchemaDescriptor {
+        types: vec![product],
+        ..Default::default()
+    }
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -92,9 +99,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
@@ -105,7 +118,9 @@ fn field(row: &CachedValue, i: usize) -> &CachedValue {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -115,17 +130,37 @@ async fn bare_unless_conflict_silently_keeps_the_original_row() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'ABC', name := 'Original', stock := 0 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ sku := 'ABC', name := 'Original', stock := 0 }}"),
+    )
+    .await;
     exec(
         &pool, &sd,
         &format!("insert {module}::Product {{ sku := 'ABC', name := 'Attempted Duplicate', stock := 99 }} unless conflict"),
     ).await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ name }} filter .sku = 'ABC'")).await;
-    assert_eq!(rows.len(), 1, "bare unless conflict must not create a duplicate row, got {rows:?}");
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Original".to_string()), "the original row must be left untouched");
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ name }} filter .sku = 'ABC'"),
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "bare unless conflict must not create a duplicate row, got {rows:?}"
+    );
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::Str("Original".to_string()),
+        "the original row must be left untouched"
+    );
 }
 
 #[tokio::test]
@@ -135,17 +170,32 @@ async fn unless_conflict_on_specific_property_no_ops() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'XYZ', name := 'Original', stock := 0 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ sku := 'XYZ', name := 'Original', stock := 0 }}"),
+    )
+    .await;
     exec(
         &pool, &sd,
         &format!("insert {module}::Product {{ sku := 'XYZ', name := 'Duplicate', stock := 5 }} unless conflict on .sku"),
     ).await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ name }} filter .sku = 'XYZ'")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ name }} filter .sku = 'XYZ'"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Original".to_string()));
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::Str("Original".to_string())
+    );
 }
 
 #[tokio::test]
@@ -155,20 +205,42 @@ async fn unless_conflict_else_update_upserts_in_place() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'DEF', name := 'Original', stock := 0 }}")).await;
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ sku := 'DEF', name := 'Original', stock := 0 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
         &format!(
             "insert {module}::Product {{ sku := 'DEF', name := 'New Name', stock := 0 }} \
              unless conflict on .sku else (update {module}::Product set {{ name := 'New Name' }})"
         ),
-    ).await;
+    )
+    .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ name }} filter .sku = 'DEF'")).await;
-    assert_eq!(rows.len(), 1, "an upsert must update the existing row in place, not create a second one, got {rows:?}");
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("New Name".to_string()), "the ELSE update must have taken effect");
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ name }} filter .sku = 'DEF'"),
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "an upsert must update the existing row in place, not create a second one, got {rows:?}"
+    );
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::Str("New Name".to_string()),
+        "the ELSE update must have taken effect"
+    );
 }
 
 #[tokio::test]
@@ -184,9 +256,16 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'GHI', name := 'Widget', stock := 10 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ sku := 'GHI', name := 'Widget', stock := 10 }}"),
+    )
+    .await;
     // Every "restock" attempt tries to insert with stock=1, but the real
     // effect should be incrementing the *existing* row's stock, not
     // resetting it to (or offsetting from) the attempted insert's own 1.
@@ -200,9 +279,19 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
         ).await;
     }
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ stock }} filter .sku = 'GHI'")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ stock }} filter .sku = 'GHI'"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::I64(13), "stock should have incremented from the existing row's own value each time (10 -> 11 -> 12 -> 13), got {:?}", rows[0]);
+    assert_eq!(
+        field(&rows[0], 1),
+        &CachedValue::I64(13),
+        "stock should have incremented from the existing row's own value each time (10 -> 11 -> 12 -> 13), got {:?}",
+        rows[0]
+    );
 }
 
 #[tokio::test]
@@ -213,13 +302,24 @@ async fn no_conflict_inserts_a_genuinely_new_row() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
     exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'A', name := 'Alpha', stock := 0 }} unless conflict on .sku")).await;
     exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'B', name := 'Beta', stock := 0 }} unless conflict on .sku")).await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ sku }} order by .sku")).await;
-    assert_eq!(rows.len(), 2, "two distinct skus must both be inserted, got {rows:?}");
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ sku }} order by .sku"),
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "two distinct skus must both be inserted, got {rows:?}"
+    );
     assert_eq!(field(&rows[0], 1), &CachedValue::Str("A".to_string()));
     assert_eq!(field(&rows[1], 1), &CachedValue::Str("B".to_string()));
 }
