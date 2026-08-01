@@ -107,7 +107,7 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/app".to_string())
+        std::env::var("PYLON_PGCON_TEST_DSN").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
     }
 
     /// Postgres NOTIFY channels are global to the database, not scoped to a

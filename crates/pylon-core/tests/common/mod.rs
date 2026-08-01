@@ -31,14 +31,18 @@
 #![allow(dead_code)]
 
 use pylon_core::query;
-use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TriggerDescriptor};
+use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor, TriggerDescriptor};
 use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::CachedValue;
 use std::collections::HashMap;
 
+/// Deliberately NOT the `app` database — that's the pylon-demo project's own
+/// database (same docker container, port 5418); a live test wiping/dropping
+/// schemas there would destroy real demo data. `pylon_migration_test` is a
+/// dedicated, disposable database on the same server reserved for test runs.
 pub fn test_dsn() -> String {
     std::env::var("PYLON_PGCON_TEST_DSN")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/app".to_string())
+        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
 }
 
 pub async fn test_pool() -> PgPool {
@@ -140,6 +144,15 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
 /// `pylon_core::ir::compile_trigger_handler`'s own doc comment).
 pub fn trigger(on: u8, timing: &str, handler: &str) -> TriggerDescriptor {
     TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }
+}
+
+/// A mutation `Rewrite` on a `PropertyDescriptor` — `on` is Pylon's `On`
+/// bitmask (1=Insert, 2=Update; a rewrite only ever fires for one event at a
+/// time in practice, unlike `Trigger`'s combinable mask), `handler` a PyQL
+/// expression evaluated in the same `.`-scoped row context a computed
+/// pointer gets (see `Compiler::compile_rewrites`).
+pub fn rewrite(on: u8, handler: &str) -> RewriteEntry {
+    RewriteEntry { on, handler: handler.into() }
 }
 
 /// Diffs `schema` against Postgres's actual live state — the assertion

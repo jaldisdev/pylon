@@ -21,7 +21,7 @@ use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr,
     IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkPointer,
     IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrMultiLinkValueSource, IrNulls,
-    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRowSource, IrScalarPointer,
+    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer,
     IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
     IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
 };
@@ -32,6 +32,25 @@ pub struct SqlOutput {
     pub sql: String,
     pub shape: ShapeDescriptor,
     pub inference_plan: Option<InferencePlan>,
+}
+
+/// Build an UPDATE's `SET` clause fragments (`"col" = expr`, no trailing
+/// comma) from its explicit assignments plus its rewrites, with a rewrite on
+/// a given column overriding — not appending alongside — any explicit
+/// assignment to that same column. Mirrors the INSERT-side `rewrite_cols`
+/// dedup (`ins.assignments` filtered against `ins.rewrites`'s own columns,
+/// present at every INSERT emission site) — every UPDATE emission site
+/// independently lacked the equivalent filtering, so an UPDATE that both
+/// explicitly assigned and had a rewrite declared on the same property
+/// produced two `SET` entries for one column, which Postgres rejects with
+/// "multiple assignments to same column" (confirmed live).
+fn update_set_fragments(assignments: &[(String, IrExpr)], rewrites: &[IrRewrite], indent: &str) -> Vec<String> {
+    let rewrite_cols: std::collections::HashSet<&str> = rewrites.iter().map(|r| r.column.as_str()).collect();
+    assignments.iter()
+        .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+        .map(|(col, expr)| format!("{indent}{} = {}", qi(col), emit_expr(expr)))
+        .chain(rewrites.iter().map(|rw| format!("{indent}{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
+        .collect()
 }
 
 /// Emit the SQL body for a computed global CTE — a plain scalar query with a `value` column.
@@ -303,12 +322,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             // branch, both of which check has_any_multilink before calling
             // this function at all.
             let alias = &upd.target.alias;
-            let mut sets: Vec<String> = upd.assignments.iter()
-                .map(|(col, expr)| format!("    {} = {}", qi(col), emit_expr(expr)))
-                .collect();
-            for rw in &upd.rewrites {
-                sets.push(format!("    {} = {}", qi(&rw.column), emit_expr(&rw.expr)));
-            }
+            let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "    ");
             let mut sql = format!(
                 "    UPDATE {} AS {}\n    SET\n{}",
                 source_ref(&upd.target), qi(alias), sets.join(",\n"),
@@ -410,10 +424,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
 
 fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     let alias = &upd.target.alias;
-    let sets: Vec<String> = upd.assignments.iter()
-        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-        .chain(upd.rewrites.iter().map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
-        .collect();
+    let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
     let col_list = upd.poly_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
 
     let mut cte_parts = vec![];
@@ -518,12 +529,7 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     let mut parts: Vec<String> = vec![];
 
     if has_scalar_changes {
-        let mut sets: Vec<String> = upd.assignments.iter()
-            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-            .collect();
-        for rw in &upd.rewrites {
-            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
-        }
+        let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
@@ -1703,10 +1709,7 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
 
 fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     let alias = &upd.target.alias;
-    let sets: Vec<String> = upd.assignments.iter()
-        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-        .chain(upd.rewrites.iter().map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
-        .collect();
+    let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
 
     let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
     let mut union_parts = vec![];
@@ -1757,12 +1760,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     if !has_any_multilink && upd.enqueue_vector.is_empty() && upd.enqueue_search.is_empty() {
         // No junction changes, no enqueue — plain UPDATE (possibly with user CTE prefix).
-        let mut sets: Vec<String> = upd.assignments.iter()
-            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-            .collect();
-        for rw in &upd.rewrites {
-            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
-        }
+        let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut sql = format!(
             "UPDATE {} AS {}\nSET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
@@ -1777,12 +1775,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     if !has_any_multilink && (!upd.enqueue_vector.is_empty() || !upd.enqueue_search.is_empty()) {
         // No junction changes but need to enqueue — wrap UPDATE in a CTE.
-        let mut sets: Vec<String> = upd.assignments.iter()
-            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-            .collect();
-        for rw in &upd.rewrites {
-            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
-        }
+        let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "    UPDATE {} AS {}\n    SET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
@@ -1821,12 +1814,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // _ids: the target rows (updated or selected).
     if has_scalar_changes {
-        let mut sets: Vec<String> = upd.assignments.iter()
-            .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
-            .collect();
-        for rw in &upd.rewrites {
-            sets.push(format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr)));
-        }
+        let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
             source_ref(&upd.target), qi(alias), sets.join(", "),
@@ -2644,6 +2632,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             sql.push(')');
             sql
         }
+        IrExpr::RawSql(s) => format!("({s})"),
     }
 }
 
@@ -4442,6 +4431,48 @@ mod tests {
         // .name is not being SET, so rewrite sees the current row value.
         assert!(out.sql.contains("lower(\"t0\".\"name\")"),
             "rewrite must use current row value when name is not being SET, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_update_rewrite_overrides_explicit_assignment_to_same_column() {
+        // Regression: every UPDATE emission site independently lacked the
+        // INSERT-side dedup (`rewrite_cols` filtering `ins.assignments`) —
+        // an UPDATE explicitly assigning a column that also has its own
+        // rewrite produced two `SET "col" = ...` entries for the same
+        // column, which Postgres rejects with "multiple assignments to
+        // same column" (confirmed live against a real database).
+        let schema = make_schema_with_rewrite();
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .id = $id SET { name := $name, slug := 'manual' }",
+            &schema,
+        );
+        let set_count = out.sql.matches("\"slug\" =").count();
+        assert_eq!(set_count, 1, "slug must appear exactly once in SET, got:\n{}", out.sql);
+        assert!(!out.sql.contains("'manual'"), "rewrite must override explicit slug assignment, got:\n{}", out.sql);
+        assert!(out.sql.contains("lower("), "rewrite expression must be present, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_insert_rewrite_self_reference_falls_back_to_default_sql() {
+        // Regression: a property with both a Default(...) and an INSERT
+        // rewrite that reads its own value (`.name`) — when the property
+        // isn't explicitly assigned, its self-reference used to compile to
+        // a bare `"t0"."name"` ColumnRef, which has no FROM-clause to
+        // resolve against inside a plain `INSERT ... VALUES (...)`
+        // (confirmed live: "missing FROM-clause entry for table t0").
+        // `.name` must fall back to the property's own `default_sql`
+        // instead — the same value Postgres's column DEFAULT would have
+        // produced.
+        use crate::schema::RewriteEntry;
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        let name_prop = person.properties.iter_mut().find(|p| p.name == "name").unwrap();
+        name_prop.default_sql = Some("'untitled'".into());
+        name_prop.rewrites = vec![RewriteEntry { on: 1, handler: ".name ++ ' (new)'".into() }];
+
+        let out = compile_and_emit_with("INSERT Person { age := 30 }", &schema);
+        assert!(!out.sql.contains("\"t0\""), "must not reference a nonexistent table alias, got:\n{}", out.sql);
+        assert!(out.sql.contains("'untitled'"), "must fall back to the property's own default_sql, got:\n{}", out.sql);
     }
 
     #[test]

@@ -28,8 +28,11 @@ import pytest
 
 
 def live_db_dsn() -> str:
-    """Same env var + default as crates/pylon-core/tests/common/mod.rs's test_dsn()."""
-    return os.environ.get("PYLON_PGCON_TEST_DSN", "postgresql://postgres:postgres@localhost:5418/app")
+    """Same env var + default as crates/pylon-core/tests/common/mod.rs's test_dsn().
+    """
+    return os.environ.get(
+        "PYLON_PGCON_TEST_DSN", "postgresql://postgres:postgres@localhost:5418/pylon_migration_test"
+    )
 
 
 @pytest.fixture

@@ -53,7 +53,7 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/app".to_string())
+        std::env::var("PYLON_PGCON_TEST_DSN").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
     }
 
     async fn test_pool() -> pylon_pgcon::PgPool {

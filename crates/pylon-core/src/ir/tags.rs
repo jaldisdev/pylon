@@ -395,7 +395,8 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
         | IrExpr::EnumLiteral { .. }
         | IrExpr::GlobalParam { .. }
         | IrExpr::GlobalRef { .. }
-        | IrExpr::FnParam { .. } => {}
+        | IrExpr::FnParam { .. }
+        | IrExpr::RawSql(_) => {}
         IrExpr::BinOp(b) => {
             collect_expr(&b.left, tags);
             collect_expr(&b.right, tags);
