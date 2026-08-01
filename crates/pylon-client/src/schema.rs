@@ -53,7 +53,8 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN").unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
+        std::env::var("PYLON_PGCON_TEST_DSN")
+            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     async fn test_pool() -> pylon_pgcon::PgPool {

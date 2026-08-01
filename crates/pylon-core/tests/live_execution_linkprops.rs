@@ -34,7 +34,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_linkprops -- --ignored
 //! ```
 
@@ -97,13 +97,20 @@ fn float_prop(name: &str) -> PropertyDescriptor {
 fn schema(module: &str) -> SchemaDescriptor {
     let product = {
         let mut t = ty("Product", module, vec![id_prop(), text_prop("name")]);
-        t.multilinks = vec![multilink_through("tags", &format!("{module}::Tag"), &format!("{module}::ProductTag"))];
+        t.multilinks = vec![multilink_through(
+            "tags",
+            &format!("{module}::Tag"),
+            &format!("{module}::ProductTag"),
+        )];
         t
     };
     let tag = ty("Tag", module, vec![id_prop(), text_prop("name")]);
     let mut product_tag = ty("ProductTag", module, vec![id_prop(), float_prop("weight")]);
     product_tag.junction = true;
-    SchemaDescriptor { types: vec![product, tag, product_tag], ..Default::default() }
+    SchemaDescriptor {
+        types: vec![product, tag, product_tag],
+        ..Default::default()
+    }
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -111,9 +118,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
@@ -131,7 +144,9 @@ fn as_f64(v: &CachedValue) -> f64 {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -141,24 +156,49 @@ async fn insert_with_link_property_round_trips() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'electronics' }}")).await;
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ name := 'electronics' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
         &format!(
             "insert {module}::Product {{ name := 'Headphones', \
              tags := (select {module}::Tag filter .name = 'electronics') {{ @weight := 1.5 }} }}"
         ),
-    ).await;
+    )
+    .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ tags: {{ name, @weight }} }}")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ tags: {{ name, @weight }} }}"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
-    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
-    let CachedValue::Array(tags) = &shape[1] else { panic!("expected an Array for tags, got {:?}", shape[1]) };
+    let CachedValue::Composite(shape) = &rows[0] else {
+        panic!("expected Composite")
+    };
+    let CachedValue::Array(tags) = &shape[1] else {
+        panic!("expected an Array for tags, got {:?}", shape[1])
+    };
     assert_eq!(tags.len(), 1);
-    assert_eq!(field(&tags[0], 1), &CachedValue::Str("electronics".to_string()));
-    assert!((as_f64(field(&tags[0], 2)) - 1.5).abs() < f64::EPSILON, "expected weight 1.5, got {:?}", tags[0]);
+    assert_eq!(
+        field(&tags[0], 1),
+        &CachedValue::Str("electronics".to_string())
+    );
+    assert!(
+        (as_f64(field(&tags[0], 2)) - 1.5).abs() < f64::EPSILON,
+        "expected weight 1.5, got {:?}",
+        tags[0]
+    );
 }
 
 #[tokio::test]
@@ -171,31 +211,64 @@ async fn append_link_property_upserts_on_reappend() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
-
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'sale' }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ name := 'sale' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ name := 'Widget' }}"),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
         &format!(
             "update {module}::Product set {{ \
              tags += (select {module}::Tag filter .name = 'sale') {{ @weight := 1.0 }} }}"
         ),
-    ).await;
+    )
+    .await;
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!(
             "update {module}::Product set {{ \
              tags += (select {module}::Tag filter .name = 'sale') {{ @weight := 9.0 }} }}"
         ),
-    ).await;
+    )
+    .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ tags: {{ name, @weight }} }}")).await;
-    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
-    let CachedValue::Array(tags) = &shape[1] else { panic!("expected an Array for tags") };
-    assert_eq!(tags.len(), 1, "re-appending the same target must not create a duplicate junction row, got {tags:?}");
-    assert!((as_f64(field(&tags[0], 2)) - 9.0).abs() < f64::EPSILON, "re-append must update the weight in place, got {:?}", tags[0]);
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ tags: {{ name, @weight }} }}"),
+    )
+    .await;
+    let CachedValue::Composite(shape) = &rows[0] else {
+        panic!("expected Composite")
+    };
+    let CachedValue::Array(tags) = &shape[1] else {
+        panic!("expected an Array for tags")
+    };
+    assert_eq!(
+        tags.len(),
+        1,
+        "re-appending the same target must not create a duplicate junction row, got {tags:?}"
+    );
+    assert!(
+        (as_f64(field(&tags[0], 2)) - 9.0).abs() < f64::EPSILON,
+        "re-append must update the weight in place, got {:?}",
+        tags[0]
+    );
 }
 
 #[tokio::test]
@@ -208,29 +281,65 @@ async fn append_union_lands_distinct_values_on_correct_targets() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
-
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'a' }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'b' }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ name := 'a' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ name := 'b' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ name := 'Widget' }}"),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
         &format!(
             "update {module}::Product set {{ tags += \
              (select {module}::Tag filter .name = 'a') {{ @weight := 1.0 }} \
              union (select {module}::Tag filter .name = 'b') {{ @weight := 2.0 }} }}"
         ),
-    ).await;
+    )
+    .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ tags: {{ name, @weight }} order by .name }}")).await;
-    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
-    let CachedValue::Array(tags) = &shape[1] else { panic!("expected an Array for tags") };
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ tags: {{ name, @weight }} order by .name }}"),
+    )
+    .await;
+    let CachedValue::Composite(shape) = &rows[0] else {
+        panic!("expected Composite")
+    };
+    let CachedValue::Array(tags) = &shape[1] else {
+        panic!("expected an Array for tags")
+    };
     assert_eq!(tags.len(), 2);
     assert_eq!(field(&tags[0], 1), &CachedValue::Str("a".to_string()));
-    assert!((as_f64(field(&tags[0], 2)) - 1.0).abs() < f64::EPSILON, "tag 'a' should carry weight 1.0, got {:?}", tags[0]);
+    assert!(
+        (as_f64(field(&tags[0], 2)) - 1.0).abs() < f64::EPSILON,
+        "tag 'a' should carry weight 1.0, got {:?}",
+        tags[0]
+    );
     assert_eq!(field(&tags[1], 1), &CachedValue::Str("b".to_string()));
-    assert!((as_f64(field(&tags[1], 2)) - 2.0).abs() < f64::EPSILON, "tag 'b' should carry weight 2.0, got {:?}", tags[1]);
+    assert!(
+        (as_f64(field(&tags[1], 2)) - 2.0).abs() < f64::EPSILON,
+        "tag 'b' should carry weight 2.0, got {:?}",
+        tags[1]
+    );
 }
 
 #[tokio::test]
@@ -240,10 +349,22 @@ async fn remove_link_clears_the_junction_row() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap())
+        .await
+        .unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'temp' }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ name := 'temp' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ name := 'Widget' }}"),
+    )
+    .await;
     exec(
         &pool, &sd,
         &format!("update {module}::Product set {{ tags += (select {module}::Tag filter .name = 'temp') {{ @weight := 1.0 }} }}"),
@@ -253,12 +374,33 @@ async fn remove_link_clears_the_junction_row() {
         &format!("update {module}::Product set {{ tags -= (select {module}::Tag filter .name = 'temp') }}"),
     ).await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ tags: {{ name }} }}")).await;
-    let CachedValue::Composite(shape) = &rows[0] else { panic!("expected Composite") };
-    let CachedValue::Array(tags) = &shape[1] else { panic!("expected an Array for tags") };
-    assert!(tags.is_empty(), "-= should have removed the junction row entirely, got {tags:?}");
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ tags: {{ name }} }}"),
+    )
+    .await;
+    let CachedValue::Composite(shape) = &rows[0] else {
+        panic!("expected Composite")
+    };
+    let CachedValue::Array(tags) = &shape[1] else {
+        panic!("expected an Array for tags")
+    };
+    assert!(
+        tags.is_empty(),
+        "-= should have removed the junction row entirely, got {tags:?}"
+    );
 
     // The Tag itself must still exist — only the junction row was removed.
-    let tag_rows = rows_of(&pool, &sd, &format!("select {module}::Tag {{ name }} filter .name = 'temp'")).await;
-    assert_eq!(tag_rows.len(), 1, "removing the link must not delete the target Tag row itself");
+    let tag_rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Tag {{ name }} filter .name = 'temp'"),
+    )
+    .await;
+    assert_eq!(
+        tag_rows.len(),
+        1,
+        "removing the link must not delete the target Tag row itself"
+    );
 }

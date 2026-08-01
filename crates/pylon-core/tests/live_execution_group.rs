@@ -35,7 +35,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_group -- --ignored
 //! ```
 
@@ -97,12 +97,19 @@ fn employee_schema(module: &str) -> SchemaDescriptor {
             bool_prop("active"),
         ],
     );
-    SchemaDescriptor { types: vec![employee], ..Default::default() }
+    SchemaDescriptor {
+        types: vec![employee],
+        ..Default::default()
+    }
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap())
+        .await
+        .unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -110,9 +117,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn group_rows(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn group_rows(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn fields(row: &CachedValue) -> &[CachedValue] {
@@ -149,11 +162,21 @@ async fn group_by_single_property_partitions_rows_into_correct_groups() {
     exec(&pool, &sd, &format!("insert {module}::Employee {{ name := 'Carol', department := 'sales', age := 28, active := true }}")).await;
     exec(&pool, &sd, &format!("insert {module}::Employee {{ name := 'Dave', department := 'sales', age := 40, active := true }}")).await;
 
-    let rows = group_rows(&pool, &sd, &format!("group {module}::Employee {{ name }} by .department")).await;
-    assert_eq!(rows.len(), 2, "expected exactly 2 department groups, got {rows:?}");
+    let rows = group_rows(
+        &pool,
+        &sd,
+        &format!("group {module}::Employee {{ name }} by .department"),
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected exactly 2 department groups, got {rows:?}"
+    );
 
     // key=1, grouping=2, elements=3 for a single-key group.
-    let mut by_department: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+    let mut by_department: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
     for row in &rows {
         let f = fields(row);
         let department = as_str(&f[1]).to_string();
@@ -162,11 +185,14 @@ async fn group_by_single_property_partitions_rows_into_correct_groups() {
         assert_eq!(as_str(&grouping[0]), "department");
 
         let elements = as_array(&f[3]);
-        let names: HashSet<String> = elements.iter().map(|el| {
-            let el_fields = fields(el);
-            // element row: [type-tag, name]
-            as_str(&el_fields[1]).to_string()
-        }).collect();
+        let names: HashSet<String> = elements
+            .iter()
+            .map(|el| {
+                let el_fields = fields(el);
+                // element row: [type-tag, name]
+                as_str(&el_fields[1]).to_string()
+            })
+            .collect();
         by_department.insert(department, names);
     }
 
@@ -194,12 +220,19 @@ async fn group_using_computed_alias_buckets_by_derived_value() {
     exec(&pool, &sd, &format!("insert {module}::Employee {{ name := 'Dave', department := 'sales', age := 39, active := true }}")).await;
 
     let rows = group_rows(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("group {module}::Employee {{ name }} using decade := .age // 10 by decade"),
-    ).await;
-    assert_eq!(rows.len(), 2, "expected exactly 2 decade buckets, got {rows:?}");
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected exactly 2 decade buckets, got {rows:?}"
+    );
 
-    let mut by_decade: std::collections::HashMap<i64, HashSet<String>> = std::collections::HashMap::new();
+    let mut by_decade: std::collections::HashMap<i64, HashSet<String>> =
+        std::collections::HashMap::new();
     for row in &rows {
         let f = fields(row);
         let decade = match &f[1] {
@@ -207,10 +240,13 @@ async fn group_using_computed_alias_buckets_by_derived_value() {
             other => panic!("expected I64 decade key, got {other:?}"),
         };
         let elements = as_array(&f[3]);
-        let names: HashSet<String> = elements.iter().map(|el| {
-            let el_fields = fields(el);
-            as_str(&el_fields[1]).to_string()
-        }).collect();
+        let names: HashSet<String> = elements
+            .iter()
+            .map(|el| {
+                let el_fields = fields(el);
+                as_str(&el_fields[1]).to_string()
+            })
+            .collect();
         by_decade.insert(decade, names);
     }
 
@@ -237,9 +273,11 @@ async fn group_by_multiple_keys_produces_composite_grouping() {
     exec(&pool, &sd, &format!("insert {module}::Employee {{ name := 'Carol', department := 'sales', age := 28, active := true }}")).await;
 
     let rows = group_rows(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("group {module}::Employee {{ name }} by .department, .active"),
-    ).await;
+    )
+    .await;
     // Every row has a distinct (department, active) pair, so 3 groups.
     assert_eq!(rows.len(), 3, "expected 3 composite groups, got {rows:?}");
 
@@ -258,7 +296,11 @@ async fn group_by_multiple_keys_produces_composite_grouping() {
         assert_eq!(as_str(&grouping[1]), "active");
 
         let elements = as_array(&f[4]);
-        assert_eq!(elements.len(), 1, "each composite group should have exactly one row here");
+        assert_eq!(
+            elements.len(),
+            1,
+            "each composite group should have exactly one row here"
+        );
         seen.insert((department, active));
     }
 
@@ -282,13 +324,26 @@ async fn group_with_no_explicit_shape_defaults_to_id_only() {
 
     exec(&pool, &sd, &format!("insert {module}::Employee {{ name := 'Alice', department := 'eng', age := 30, active := true }}")).await;
 
-    let rows = group_rows(&pool, &sd, &format!("group {module}::Employee by .department")).await;
+    let rows = group_rows(
+        &pool,
+        &sd,
+        &format!("group {module}::Employee by .department"),
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     let f = fields(&rows[0]);
     let elements = as_array(&f[3]);
     assert_eq!(elements.len(), 1);
     let el_fields = fields(&elements[0]);
     // Implicit shape is `{ id }` only: [type-tag, id] — no `name`/`department`/etc.
-    assert_eq!(el_fields.len(), 2, "expected only [type-tag, id], got {el_fields:?}");
-    assert!(matches!(&el_fields[1], CachedValue::Uuid(_)), "expected id to be a Uuid, got {:?}", el_fields[1]);
+    assert_eq!(
+        el_fields.len(),
+        2,
+        "expected only [type-tag, id], got {el_fields:?}"
+    );
+    assert!(
+        matches!(&el_fields[1], CachedValue::Uuid(_)),
+        "expected id to be a Uuid, got {:?}",
+        el_fields[1]
+    );
 }

@@ -31,18 +31,17 @@
 #![allow(dead_code)]
 
 use pylon_core::query;
-use pylon_core::schema::{LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor, TriggerDescriptor};
+use pylon_core::schema::{
+    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor,
+    TriggerDescriptor,
+};
 use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::CachedValue;
 use std::collections::HashMap;
 
-/// Deliberately NOT the `app` database — that's the pylon-demo project's own
-/// database (same docker container, port 5418); a live test wiping/dropping
-/// schemas there would destroy real demo data. `pylon_migration_test` is a
-/// dedicated, disposable database on the same server reserved for test runs.
 pub fn test_dsn() -> String {
     std::env::var("PYLON_PGCON_TEST_DSN")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5418/pylon_migration_test".to_string())
+        .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
 }
 
 pub async fn test_pool() -> PgPool {
@@ -64,7 +63,10 @@ pub fn unique_module(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}_{nanos}_{seq}")
 }
@@ -140,7 +142,11 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
 /// A multilink backed by an explicit `@pylon.junction` type (`Through[...]`
 /// in the schema DSL) — the junction type itself carries the link
 /// properties, referenced in PyQL via `@propname`.
-pub fn multilink_through(name: &str, target_qname: &str, through_qname: &str) -> MultiLinkDescriptor {
+pub fn multilink_through(
+    name: &str,
+    target_qname: &str,
+    through_qname: &str,
+) -> MultiLinkDescriptor {
     MultiLinkDescriptor {
         name: name.into(),
         target: target_qname.into(),
@@ -158,7 +164,11 @@ pub fn multilink_through(name: &str, target_qname: &str, through_qname: &str) ->
 /// context anchors are legal per `on` — see
 /// `pylon_core::ir::compile_trigger_handler`'s own doc comment).
 pub fn trigger(on: u8, timing: &str, handler: &str) -> TriggerDescriptor {
-    TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }
+    TriggerDescriptor {
+        on,
+        timing: timing.into(),
+        handler: handler.into(),
+    }
 }
 
 /// A mutation `Rewrite` on a `PropertyDescriptor` — `on` is Pylon's `On`
@@ -167,16 +177,24 @@ pub fn trigger(on: u8, timing: &str, handler: &str) -> TriggerDescriptor {
 /// expression evaluated in the same `.`-scoped row context a computed
 /// pointer gets (see `Compiler::compile_rewrites`).
 pub fn rewrite(on: u8, handler: &str) -> RewriteEntry {
-    RewriteEntry { on, handler: handler.into() }
+    RewriteEntry {
+        on,
+        handler: handler.into(),
+    }
 }
 
 /// Diffs `schema` against Postgres's actual live state — the assertion
 /// every "no phantom changes after apply" test needs (see
 /// `live_execution_migration_diff.rs`).
 pub async fn assert_zero_further_steps(pool: &PgPool, schema: &SchemaDescriptor) {
-    let live = pylon_core::introspect::introspect_db_state(pool).await.unwrap();
+    let live = pylon_core::introspect::introspect_db_state(pool)
+        .await
+        .unwrap();
     let steps = pylon_core::diff::diff_schema_steps(schema, &live, &HashMap::new()).unwrap();
-    assert!(steps.is_empty(), "expected zero further migration steps, got: {steps:?}");
+    assert!(
+        steps.is_empty(),
+        "expected zero further migration steps, got: {steps:?}"
+    );
 }
 
 /// Compiles and live-executes a schema-free scalar `select` expression,
@@ -186,8 +204,15 @@ pub async fn assert_zero_further_steps(pool: &PgPool, schema: &SchemaDescriptor)
 pub async fn eval_scalar(pool: &PgPool, expr: &str) -> CachedValue {
     let schema = SchemaDescriptor::default();
     let compiled = query::compile(&format!("select {expr}"), &schema).unwrap();
-    let rows = pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap();
-    assert_eq!(rows.len(), 1, "scalar select should return exactly one row, got {rows:?}");
+    let rows = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "scalar select should return exactly one row, got {rows:?}"
+    );
     match rows.into_iter().next().unwrap() {
         CachedValue::Composite(mut fields) if fields.len() == 1 => fields.remove(0),
         other => panic!("expected a one-element Composite wrapping the scalar, got {other:?}"),

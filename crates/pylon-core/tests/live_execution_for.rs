@@ -37,7 +37,7 @@
 //! other file in this suite. Run with:
 //!
 //! ```text
-//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5418/pylon_migration_test \
+//! PYLON_PGCON_TEST_DSN=postgresql://postgres:postgres@localhost:5432/pylon_live_test \
 //!     cargo test -p pylon-core --test live_execution_for -- --ignored
 //! ```
 
@@ -82,13 +82,24 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn person_schema(module: &str) -> SchemaDescriptor {
-    let person = ty("Person", module, vec![id_prop(), text_prop("name"), int_prop("age")]);
-    SchemaDescriptor { types: vec![person], ..Default::default() }
+    let person = ty(
+        "Person",
+        module,
+        vec![id_prop(), text_prop("name"), int_prop("age")],
+    );
+    SchemaDescriptor {
+        types: vec![person],
+        ..Default::default()
+    }
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
+        .await
+        .unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap())
+        .await
+        .unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -96,9 +107,15 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(
+    pool: &pylon_pgcon::PgPool,
+    sd: &SchemaDescriptor,
+    pyql: &str,
+) -> Vec<CachedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 fn field(row: &CachedValue, i: usize) -> &CachedValue {
@@ -135,8 +152,17 @@ async fn for_loop_bulk_inserts_one_row_per_iterator_value() {
         &format!("for n in {{'Alice', 'Bob', 'Carol'}} union (insert {module}::Person {{ name := n, age := 0 }})"),
     ).await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }} order by .name")).await;
-    assert_eq!(rows.len(), 3, "expected one row per iterator value, got {rows:?}");
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name }} order by .name"),
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected one row per iterator value, got {rows:?}"
+    );
     let names: Vec<&str> = rows.iter().map(|r| as_str(field(r, 1))).collect();
     assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
 }
@@ -154,11 +180,20 @@ async fn for_loop_variable_composes_inside_insert_body_expression() {
     // correctly deep inside a compiled body expression, not only at the
     // top level of a shape assignment.
     exec(
-        &pool, &sd,
-        &format!("for n in {{1, 2, 3}} union (insert {module}::Person {{ name := 'p', age := n * 10 }})"),
-    ).await;
+        &pool,
+        &sd,
+        &format!(
+            "for n in {{1, 2, 3}} union (insert {module}::Person {{ name := 'p', age := n * 10 }})"
+        ),
+    )
+    .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }} order by .age")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ age }} order by .age"),
+    )
+    .await;
     let ages: Vec<i64> = rows.iter().map(|r| as_i64(field(r, 1))).collect();
     assert_eq!(ages, vec![10, 20, 30]);
 }
@@ -171,17 +206,36 @@ async fn for_loop_select_body_cross_joins_lateral_per_iterator_value() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob', age := 65 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Carol', age := 40 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bob', age := 65 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Carol', age := 40 }}"),
+    )
+    .await;
 
     // A SELECT body run once per iterator value, unioning the matches —
     // the `CROSS JOIN LATERAL` path in `emit_for_stmt`, distinct from the
     // bulk-insert path exercised above.
     let rows = rows_of(
-        &pool, &sd,
-        &format!("for age in {{30, 65}} union (select {module}::Person {{ name }} filter .age = age)"),
-    ).await;
+        &pool,
+        &sd,
+        &format!(
+            "for age in {{30, 65}} union (select {module}::Person {{ name }} filter .age = age)"
+        ),
+    )
+    .await;
     let names: HashSet<&str> = rows.iter().map(|r| as_str(field(r, 1))).collect();
     assert_eq!(names, HashSet::from(["Alice", "Bob"]), "got {rows:?}");
 }
@@ -195,10 +249,16 @@ async fn for_loop_with_empty_iterator_set_is_a_no_op() {
     bootstrap(&pool, &sd).await;
 
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("for n in {{}} union (insert {module}::Person {{ name := n, age := 0 }})"),
-    ).await;
+    )
+    .await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
-    assert_eq!(rows.len(), 0, "an empty iterator set must insert nothing, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        0,
+        "an empty iterator set must insert nothing, got {rows:?}"
+    );
 }

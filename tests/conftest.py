@@ -28,11 +28,13 @@ import pytest
 
 
 def live_db_dsn() -> str:
-    """Same env var + default as crates/pylon-core/tests/common/mod.rs's test_dsn().
+    """Same env var as crates/pylon-core/tests/common/mod.rs's test_dsn() — no
+    hardcoded fallback, must be set explicitly.
     """
-    return os.environ.get(
-        "PYLON_PGCON_TEST_DSN", "postgresql://postgres:postgres@localhost:5418/pylon_migration_test"
-    )
+    dsn = os.environ.get("PYLON_PGCON_TEST_DSN")
+    if not dsn:
+        raise RuntimeError("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+    return dsn
 
 
 @pytest.fixture
