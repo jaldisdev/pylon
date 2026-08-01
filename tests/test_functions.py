@@ -138,6 +138,28 @@ class TestReturnTypeConsistency:
         with pytest.raises(pylon_exceptions.SchemaError, match="rewrite handler type mismatch"):
             walk([Person], [], [], [])
 
+    def test_trigger_handler_compiles_passes(self):
+        @pylon.type(module="t", name="Person")
+        class Person:
+            name: pylon.Str
+            pylon.Trigger(on=pylon.On.Insert, timing=pylon.Timing.After, handler="select Person")
+
+        schema = walk([Person], [], [], [])
+        assert schema is not None
+
+    def test_trigger_handler_unknown_field_rejected(self):
+        @pylon.type(module="t", name="Person")
+        class Person:
+            name: pylon.Str
+            pylon.Trigger(
+                on=pylon.On.Insert,
+                timing=pylon.Timing.After,
+                handler="select Person filter .nonexistent_field = 1",
+            )
+
+        with pytest.raises(pylon_exceptions.SchemaError, match="nonexistent_field"):
+            walk([Person], [], [], [])
+
 
 class TestDuplicateFunctionSignature:
     def test_duplicate_signature_rejected(self):
