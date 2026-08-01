@@ -395,6 +395,20 @@ def _to_pg_type(scalar_type: Any) -> str:
     from ._scalars import PG_TYPE_MAP, Scalar, _PylonScalar, SHORTHAND_MAP
     from ._enums import Enum as PylonEnum
 
+    # Every call site (plain property types, computed-pointer types, tuple
+    # members, function params/return types) expects a scalar — an object
+    # type (a @pylon.type/@pylon.interface class) has no business here;
+    # object *references* are Link/MultiLink, an entirely separate code
+    # path. Without this guard, an object type falls through every branch
+    # below to the final `return "text"` fallback, silently — e.g.
+    # `Array[Product]`/`Tuple[Product, str]` would resolve to `text[]`/
+    # `jsonb` with no error at all (confirmed live before this check).
+    if _is_pylon_type(scalar_type):
+        raise SchemaError(
+            f"invalid type {_qualified(_pylon_module_of(scalar_type), _pylon_name_of(scalar_type))!r}: "
+            f"expected a scalar type, got an object type"
+        )
+
     # Built-in Pylon scalar
     if isinstance(scalar_type, type) and issubclass(scalar_type, _PylonScalar):
         return PG_TYPE_MAP.get(scalar_type, "text")
@@ -424,9 +438,18 @@ def _to_pg_type(scalar_type: Any) -> str:
             (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
         return f"__nt__:{mod}::{scalar_type.__name__}"
 
-    # Structural tuple type (pylon.Tuple[...]) → plain jsonb, no registered type to decode into
+    # Structural tuple type (pylon.Tuple[...]) → plain jsonb, no registered type
+    # to decode into. Still resolve each element's own pg_type (discarding the
+    # result) purely so the object-type guard above fires for any element —
+    # this branch would otherwise never look past `TupleAnnotation` itself, so
+    # a `Tuple[Product, str]` used directly as a scalar_type (e.g. a function
+    # param/return annotation) would resolve to "jsonb" with no error, same
+    # bug class as the direct-element case. Recurses naturally for nested
+    # tuples via this same branch.
     from ._pointers import ArrayAnnotation, TupleAnnotation
     if isinstance(scalar_type, TupleAnnotation):
+        for element in scalar_type.elements:
+            _to_pg_type(element.type_)
         return "jsonb"
 
     # Structural array type (pylon.Array[T] or a bare list[T]) → a real
@@ -1206,6 +1229,7 @@ def _build_function_descriptor(
     type_map: dict[str, Any],
     class_to_qname: dict[int, str],
     _core: Any,
+    seen_signatures: dict[tuple[str, str, tuple[str, ...]], Any] | None = None,
 ) -> Any:
     import typing as _typing
 
@@ -1219,6 +1243,7 @@ def _build_function_descriptor(
     # Build parameter descriptors
     sig = __import__("inspect").signature(func)
     params = []
+    param_pg_types = []
     for param_name, param in sig.parameters.items():
         annotation = hints.get(param_name, param.annotation)
         if annotation is __import__("inspect").Parameter.empty:
@@ -1228,6 +1253,17 @@ def _build_function_descriptor(
             )
         pg_type = _param_pg_type(annotation)
         params.append(_core.FunctionParamDescriptor(name=param_name, pg_type=pg_type))
+        param_pg_types.append(pg_type)
+
+    if seen_signatures is not None:
+        sig_key = (config.module, config.name, tuple(param_pg_types))
+        if sig_key in seen_signatures:
+            raise SchemaError(
+                f"Duplicate function signature '{config.module}::{config.name}"
+                f"({', '.join(param_pg_types)})': both "
+                f"{seen_signatures[sig_key]!r} and {func!r}"
+            )
+        seen_signatures[sig_key] = func
 
     # Parse return type
     return_annotation = hints.get("return", __import__("inspect").Parameter.empty)
@@ -1323,8 +1359,9 @@ def walk(
         _build_named_tuple_descriptor(cls, _core) for cls in (named_tuples or [])
     ]
     global_descs = [_build_global_descriptor(g, _core) for g in globals_]
+    seen_fn_signatures: dict[tuple[str, str, tuple[str, ...]], Any] = {}
     fn_descs = [
-        _build_function_descriptor(f, type_map, class_to_qname, _core)
+        _build_function_descriptor(f, type_map, class_to_qname, _core, seen_fn_signatures)
         for f in (functions or [])
     ]
     alias_descs = [
@@ -1332,7 +1369,7 @@ def walk(
         for a in (aliases or [])
     ]
 
-    return _core.SchemaDescriptor(
+    schema = _core.SchemaDescriptor(
         types=type_descs,
         scalars=scalar_descs,
         enums=enum_descs,
@@ -1341,3 +1378,11 @@ def walk(
         functions=fn_descs,
         aliases=alias_descs,
     )
+    # Every function body, computed-pointer expression, and property/link
+    # default gets compiled and its actual produced type checked against its
+    # own declared type — raises pylon.exceptions.SchemaError (wrapping every
+    # mismatch found, not just the first) if anything's off. See
+    # crates/pylon-core/src/validate.rs for the (best-effort, not exhaustive)
+    # scope of what this can detect.
+    _core.validate_schema_types(schema)
+    return schema
