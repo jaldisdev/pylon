@@ -2366,6 +2366,18 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         IrExpr::ColumnRef { alias, column, .. } => {
             if alias.is_empty() {
                 qi(column)
+            } else if alias == "NEW" || alias == "OLD" {
+                // plpgsql's trigger row variables (`ir::compile_trigger_handler`'s
+                // `__new__`/`__old__` anchors) are recognized by the plpgsql
+                // parser as bare, unquoted identifiers — quoting them like an
+                // ordinary table alias (`"NEW"."col"`) turns this into an
+                // *ordinary* SQL column reference instead, which Postgres then
+                // rejects with "missing FROM-clause entry for table NEW" the
+                // moment it appears inside a nested SQL command (e.g. the
+                // VALUES list of an `INSERT` the trigger handler runs) — there's
+                // no real `NEW` table to resolve it against there, only
+                // plpgsql's own row-variable substitution recognizes it.
+                format!("{alias}.{}", qi(column))
             } else {
                 format!("{}.{}", qi(alias), qi(column))
             }

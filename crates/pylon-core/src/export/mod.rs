@@ -44,7 +44,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_unique_indexes(schema, &mut out);
     emit_check_constraints(schema, &mut out);
     emit_plain_indexes(schema, &mut out);
-    emit_triggers(schema, &mut out);
+    emit_triggers(schema, &mut out)?;
     emit_interface_views(schema, &mut out);
     emit_junction_excl_views(schema, &mut out);
     emit_interface_exclusive_triggers(schema, &mut out);
@@ -894,42 +894,124 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
 
 // ── Phase 10: trigger functions + triggers ─────────────────────────────────────
 
-fn emit_triggers(schema: &SchemaDescriptor, out: &mut String) {
+fn emit_triggers(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
+    for info in user_trigger_infos(schema)? {
+        out.push_str(&info.ddl);
+    }
+    Ok(())
+}
+
+/// The correct plpgsql `RETURN` statement for a trigger function, given its
+/// `timing`/`on` — the return value is entirely ignored for an `AFTER`
+/// trigger (`RETURN NULL;` is always safe, and sidesteps `NEW` being
+/// unassigned on a pure `DELETE`, which would otherwise be a runtime error
+/// the moment the trigger fires). A `BEFORE`/`INSTEAD OF` trigger's return
+/// value *is* significant (it's what actually gets persisted/considered
+/// "the operation"), so it must return whichever of `NEW`/`OLD` is defined
+/// for the event that actually fired — `NEW` is never assigned during a
+/// pure `DELETE`, and `OLD` is never assigned during a pure `INSERT`.
+fn trigger_return_statement(timing: &str, on: u8) -> &'static str {
+    if timing == "After" {
+        return "RETURN NULL;";
+    }
+    let has_delete = on & 4 != 0;
+    let has_insert_or_update = on & (1 | 2) != 0;
+    match (has_delete, has_insert_or_update) {
+        (true, true) => "IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;",
+        (true, false) => "RETURN OLD;",
+        _ => "RETURN NEW;",
+    }
+}
+
+/// The stable, hash-derived name a user-declared `Trigger` will get, given
+/// its owning table and its own content — shared by `user_trigger_infos`
+/// (which needs it to build DDL) and `user_trigger_names` (which needs
+/// only the name, not the DDL, and stays infallible because of it).
+fn trigger_ddl_name(table: &str, trig: &crate::schema::TriggerDescriptor) -> String {
+    let hash = fnv(&[table, &trig.on.to_string(), trig.timing.as_str(), trig.handler.as_str()]);
+    format!("{table}_{}", &hash[..12])
+}
+
+/// Just the `(module, table, trigger_name)` every user-declared `Trigger`
+/// should produce — no PyQL compilation, so (unlike `user_trigger_infos`)
+/// this is infallible and cheap enough for `diff::expected_triggers` to
+/// call on every diff/snapshot, not just when a trigger is actually being
+/// added.
+pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if t.abstract_ || t.junction { continue; }
+        for trig in &t.triggers {
+            result.push((t.module.clone(), t.table.clone(), trigger_ddl_name(&t.table, trig)));
+        }
+    }
+    result
+}
+
+/// One `CREATE FUNCTION` + `CREATE TRIGGER` pair per user-declared schema
+/// `Trigger`. Public entry point for `diff/mod.rs`, mirroring
+/// `deletion_policy_trigger_infos`/`signal_trigger_infos` — the single
+/// source of truth both `export_schema` and migration-diff drift detection
+/// consult, so they can't drift apart the way cache/signal triggers once
+/// did (see `diff::expected_triggers`'s own doc comment).
+///
+/// Every statement `query::compile` produces ends in a `RETURNING (...) AS
+/// result` (or is a bare `SELECT`) — required so a normal PyQL caller can
+/// decode a result row, but it means plpgsql refuses to run it as a bare
+/// statement ("query has no destination for result data"). The generated
+/// function declares a throwaway `record` local and appends `INTO
+/// _pylon_trigger_result` to swallow it — a non-`STRICT` `INTO` is fine
+/// with any row count (0, 1, or many), matching "fire and forget" exactly.
+pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTriggerInfo>, PyQLError> {
+    let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction { continue; }
         let table_qname = qn(&t.module, &t.table);
+        let type_name = format!("{}::{}", t.module, t.name);
 
         for trig in &t.triggers {
-            let hash = fnv(&[
-                &t.table,
-                &trig.on.to_string(),
-                trig.timing.as_str(),
-                trig.handler.as_str(),
-            ]);
-            let fname = format!("{}_{}", t.table, &hash[..12]);
+            let fname = trigger_ddl_name(&t.table, trig);
             let fn_qname = qn(&t.module, &fname);
             let events = trigger_events(trig.on);
             let timing = trigger_timing(&trig.timing);
-            let body = trig.handler.trim_end_matches(';');
+            let return_stmt = trigger_return_statement(&trig.timing, trig.on);
 
-            out.push_str(&format!(
-                "CREATE OR REPLACE FUNCTION {}()\n\
+            let body_sql = crate::query::compile_trigger_handler(&trig.handler, &type_name, trig.on, schema)
+                .map_err(|e| {
+                    let msg = format!("error in trigger handler for '{type_name}': {e}");
+                    PyQLError::Fragment(PyQLFragmentError {
+                        message: msg,
+                        context: type_name.clone(),
+                        position: crate::error::Position { line: 0, col: 0 },
+                    })
+                })?;
+            let body_sql = body_sql.trim_end_matches(';');
+
+            let ddl = format!(
+                "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
                  RETURNS trigger LANGUAGE plpgsql AS $$\n\
+                 DECLARE\n\
+                 \t_pylon_trigger_result record;\n\
                  BEGIN\n\
-                 {body};\n\
-                 RETURN NEW;\n\
+                 {body_sql} INTO _pylon_trigger_result;\n\
+                 {return_stmt}\n\
                  END;\n\
-                 $$;\n\n",
-                fn_qname,
-            ));
-            out.push_str(&format!(
-                "CREATE TRIGGER {}\n\
-                 {} {} ON {}\n\
-                 FOR EACH ROW EXECUTE FUNCTION {}();\n\n",
-                qi(&fname), timing, events, table_qname, fn_qname,
-            ));
+                 $$;\n\n\
+                 CREATE OR REPLACE TRIGGER {}\n\
+                 {timing} {events} ON {table_qname}\n\
+                 FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n",
+                qi(&fname),
+            );
+
+            result.push(DeletionTriggerInfo {
+                table_module: t.module.clone(),
+                table_name: t.table.clone(),
+                trigger_name: fname,
+                ddl,
+            });
         }
     }
+    Ok(result)
 }
 
 /// Return `CREATE OR REPLACE VIEW` DDL for every interface type in `schema`.
@@ -1718,6 +1800,108 @@ mod tests {
             out.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""),
             "got:\n{out}"
         );
+    }
+
+    fn trig(on: u8, timing: &str, handler: &str) -> crate::schema::TriggerDescriptor {
+        crate::schema::TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }
+    }
+
+    fn schema_with_trigger(trigger: crate::schema::TriggerDescriptor) -> SchemaDescriptor {
+        let mut t = person_type();
+        t.triggers = vec![trigger];
+        SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![] }
+    }
+
+    #[test]
+    fn test_trigger_new_anchor_resolves_to_new_alias() {
+        // On.Insert = 1
+        let schema = schema_with_trigger(trig(1, "After", "update Person set { age := __new__.age }"));
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("NEW.\"age\""), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_trigger_old_anchor_resolves_to_old_alias() {
+        // On.Delete = 4
+        let schema = schema_with_trigger(trig(4, "After", "update Person set { age := __old__.age }"));
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("OLD.\"age\""), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_trigger_update_can_reference_both_new_and_old() {
+        // On.Update = 2
+        let schema = schema_with_trigger(trig(2, "After", "update Person set { age := __new__.age - __old__.age }"));
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("NEW.\"age\""), "got:\n{ddl}");
+        assert!(ddl.contains("OLD.\"age\""), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_trigger_insert_only_cannot_reference_old() {
+        let schema = schema_with_trigger(trig(1, "After", "update Person set { age := __old__.age }"));
+        let err = export_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("__old__ cannot be used"), "got: {err}");
+    }
+
+    #[test]
+    fn test_trigger_delete_only_cannot_reference_new() {
+        let schema = schema_with_trigger(trig(4, "After", "update Person set { age := __new__.age }"));
+        let err = export_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("__new__ cannot be used"), "got: {err}");
+    }
+
+    #[test]
+    fn test_trigger_combined_insert_update_cannot_reference_old() {
+        // On.Insert | On.Update = 3 — __new__ legal, __old__ still isn't (Gel's mixed_02 case).
+        let ok = schema_with_trigger(trig(3, "After", "update Person set { age := __new__.age }"));
+        assert!(export_schema(&ok).is_ok());
+
+        let bad = schema_with_trigger(trig(3, "After", "update Person set { age := __old__.age }"));
+        let err = export_schema(&bad).unwrap_err();
+        assert!(err.to_string().contains("__old__ cannot be used"), "got: {err}");
+    }
+
+    #[test]
+    fn test_trigger_after_timing_returns_null() {
+        let schema = schema_with_trigger(trig(1, "After", "update Person set { age := __new__.age }"));
+        let ddl = export_schema(&schema).unwrap();
+        assert!(ddl.contains("RETURN NULL;"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_trigger_before_timing_returns_new_or_old_appropriately() {
+        let insert_only = schema_with_trigger(trig(1, "Before", "update Person set { age := __new__.age }"));
+        let ddl = export_schema(&insert_only).unwrap();
+        assert!(ddl.contains("RETURN NEW;"), "insert-only Before should return NEW, got:\n{ddl}");
+
+        let delete_only = schema_with_trigger(trig(4, "Before", "update Person set { age := __old__.age }"));
+        let ddl = export_schema(&delete_only).unwrap();
+        assert!(ddl.contains("RETURN OLD;"), "delete-only Before should return OLD, got:\n{ddl}");
+
+        // On.Insert | On.Delete = 5 — combined with Delete needs the conditional.
+        // Neither anchor is legal for this combination (see
+        // `compile_trigger_handler`'s doc comment), so the handler here
+        // deliberately references neither.
+        let combined = schema_with_trigger(trig(5, "Before", "update Person set { age := 1 }"));
+        let ddl = export_schema(&combined).unwrap();
+        assert!(
+            ddl.contains("IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;"),
+            "got:\n{ddl}"
+        );
+    }
+
+    #[test]
+    fn test_multiple_triggers_get_separate_functions() {
+        let mut t = person_type();
+        t.triggers = vec![
+            trig(1, "After", "update Person set { age := __new__.age }"),
+            trig(4, "Before", "update Person set { age := __old__.age }"),
+        ];
+        let schema = SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![] };
+        let ddl = export_schema(&schema).unwrap();
+        let fn_count = ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"Person_").count();
+        assert_eq!(fn_count, 2, "expected one function per Trigger(...), got:\n{ddl}");
     }
 
     #[test]

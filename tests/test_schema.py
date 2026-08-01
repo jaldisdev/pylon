@@ -902,7 +902,7 @@ class TestTrigger:
         @pylon.type
         class T:
             name: str
-            Trigger(on=On.Insert, timing=Timing.After, handler=".do_something")
+            Trigger(on=On.Insert, timing=Timing.After, handler="insert Log { note := __new__.name }")
 
         assert len(T.__pylon_config__.triggers) == 1
 
@@ -910,18 +910,18 @@ class TestTrigger:
         @pylon.type
         class T:
             name: str
-            Trigger(on=On.Delete, timing=Timing.Before, handler=".cleanup")
+            Trigger(on=On.Delete, timing=Timing.Before, handler="insert Log { note := __old__.name }")
 
         t = T.__pylon_config__.triggers[0]
         assert t.on == On.Delete
         assert t.timing == Timing.Before
-        assert t.handler == ".cleanup"
+        assert t.handler == "insert Log { note := __old__.name }"
 
     def test_trigger_combined_events(self):
         @pylon.type
         class T:
             name: str
-            Trigger(on=On.Insert | On.Update, timing=Timing.After, handler=".expr")
+            Trigger(on=On.Insert | On.Update, timing=Timing.After, handler="insert Log { note := __new__.name }")
 
         t = T.__pylon_config__.triggers[0]
         assert On.Insert in t.on
@@ -932,8 +932,8 @@ class TestTrigger:
         @pylon.type
         class T:
             name: str
-            Trigger(on=On.Insert, timing=Timing.After, handler=".on_insert")
-            Trigger(on=On.Delete, timing=Timing.Before, handler=".on_delete")
+            Trigger(on=On.Insert, timing=Timing.After, handler="insert Log { note := __new__.name }")
+            Trigger(on=On.Delete, timing=Timing.Before, handler="insert Log { note := __old__.name }")
 
         assert len(T.__pylon_config__.triggers) == 2
 
@@ -941,7 +941,7 @@ class TestTrigger:
         @pylon.type
         class T:
             name: str
-            Trigger(on=On.Insert, timing=Timing.After, handler=".expr")
+            Trigger(on=On.Insert, timing=Timing.After, handler="insert Log { note := __new__.name }")
 
         assert len(T.__pylon_config__.constraints) == 0
         assert len(T.__pylon_config__.indexes) == 0
@@ -953,7 +953,7 @@ class TestTrigger:
             slug: str
             Index("name")
             Exclusive(("name", "slug"))
-            Trigger(on=On.Update, timing=Timing.After, handler=".expr")
+            Trigger(on=On.Update, timing=Timing.After, handler="insert Log { note := __new__.name }")
 
         cfg = T.__pylon_config__
         assert len(cfg.indexes) == 1
@@ -964,7 +964,7 @@ class TestTrigger:
         @pylon.type
         class T:
             name: str
-            Trigger(on=On.Insert, timing=Timing.InsteadOf, handler=".expr")
+            Trigger(on=On.Insert, timing=Timing.InsteadOf, handler="insert Log { note := __new__.name }")
 
         assert T.__pylon_config__.triggers[0].timing == Timing.InsteadOf
 

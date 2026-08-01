@@ -261,6 +261,30 @@ pub fn compile_fill_expr(
     Ok(sql::emit_expr(&ir_expr))
 }
 
+/// Compile a schema `Trigger`'s `handler` PyQL statement (e.g. `insert Note
+/// { note := __new__.name }`) to a full SQL statement, for embedding in the
+/// generated plpgsql trigger function body — see `ir::compile_trigger_handler`
+/// for the `__new__`/`__old__` row-context binding rules. `on_mask` is
+/// Pylon's `On` bitmask (1=Insert, 2=Update, 4=Delete), matching
+/// `TriggerDescriptor::on`. Query parameters (`$name`) are rejected, same
+/// rule as `compile_fill_expr` — a trigger handler has no caller to supply
+/// them.
+pub fn compile_trigger_handler(
+    handler: &str,
+    type_name: &str,
+    on_mask: u8,
+    schema: &SchemaDescriptor,
+) -> Result<String, crate::error::PyQLError> {
+    let ir_out = ir::compile_trigger_handler(handler, type_name, on_mask, schema)?;
+    if !ir_out.params.is_empty() {
+        return Err(crate::error::PyQLError::Syntax(crate::error::PyQLSyntaxError {
+            message: "trigger handlers may not contain query parameters".into(),
+            position: crate::error::Position { line: 0, col: 0 },
+        }));
+    }
+    Ok(sql::emit(&ir_out).sql)
+}
+
 /// Compile a PyQL query string to SQL against `schema`, using default
 /// session config (see `ir::SessionConfig`) — for schema-time/test callers
 /// with no live client-supplied config. `compile_with_config` is the real

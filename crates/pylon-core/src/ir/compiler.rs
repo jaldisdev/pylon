@@ -241,6 +241,61 @@ pub fn compile_fn_body(
     Ok(super::IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
 }
 
+/// Compile a schema `Trigger`'s `handler` PyQL statement for DDL emission —
+/// same shape as `compile_fn_body`, but instead of `fn_params` this binds
+/// `__new__`/`__old__` as the inserted/updated/deleted row (see
+/// `Compiler::special_anchors`'s own doc comment), gated by `on_mask`
+/// (Pylon's `On` bitmask: 1=Insert, 2=Update, 4=Delete) exactly like Gel's
+/// own trigger-anchor binding (`edb/schema/triggers.py::
+/// TriggerCommand.compile_expr_field`): `__old__` is bound whenever
+/// `on_mask` does *not* include Insert (so Update-only, Delete-only, and
+/// Update+Delete all get it — but never a mask that includes Insert, even
+/// combined with Update, since a shared trigger function has no old row on
+/// the Insert branch of that combination); `__new__` is bound whenever
+/// `on_mask` does *not* include Delete, by the mirror-image argument. A
+/// mask combining Insert and Delete (with no Update) legally binds
+/// neither. Referencing an anchor that isn't bound is a compile error, not
+/// a runtime NULL.
+pub fn compile_trigger_handler(
+    handler: &str,
+    type_name: &str,
+    on_mask: u8,
+    schema: &SchemaDescriptor,
+) -> Result<super::IrOutput, crate::error::PyQLError> {
+    use crate::parse;
+    use crate::parse::ast::Stmt;
+
+    let ast = parse::parse(handler.trim())?;
+    let mut c = Compiler::new(schema);
+    // The trigger's own type — `__new__`/`__old__` always resolve against
+    // this, regardless of what type happens to be the ambient `td` where
+    // the anchor is textually used (e.g. inside `insert Note { note :=
+    // __new__.name }`, the ambient td at that point is `Note`, not this).
+    let owner_td = c.resolve_type(type_name)?;
+    if on_mask & 4 == 0 {
+        c.special_anchors.insert("__new__".to_string(), (owner_td, "NEW".to_string()));
+    }
+    if on_mask & 1 == 0 {
+        c.special_anchors.insert("__old__".to_string(), (owner_td, "OLD".to_string()));
+    }
+
+    let (ctes, ir) = if let Stmt::With(w) = &ast {
+        let mut cte_defs = vec![];
+        for alias in &w.aliases {
+            let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
+            let cte_type_name = cte_stmt_type(&ir_stmt);
+            c.cte_types.insert(alias.name.clone(), cte_type_name.clone());
+            cte_defs.push(super::IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name: cte_type_name });
+        }
+        let main = c.compile_stmt(&w.stmt)?;
+        (cte_defs, main)
+    } else {
+        (vec![], c.compile_stmt(&ast)?)
+    };
+
+    Ok(super::IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
+}
+
 /// Compile a single PyQL expression in the context of a named type.
 /// Used for schema fragments: computed pointers, rewrite handlers, constraint exprs.
 pub fn compile_expr_in_type(
@@ -303,6 +358,19 @@ struct Compiler<'a> {
     for_vars: HashMap<String, String>,
     /// User-defined function parameters in scope (only set during body compilation).
     fn_params: HashMap<String, String>,
+    /// `__new__`/`__old__` row-context bindings, only set during trigger-handler
+    /// compilation (`compile_trigger_handler`) — maps the anchor name to
+    /// *the trigger's own type* and the table alias its properties/links
+    /// should resolve against (`"NEW"`/`"OLD"`). Stored explicitly (not just
+    /// the alias string) because `__new__.x`/`__old__.x` can appear nested
+    /// inside a sub-statement targeting a *different* type (e.g. `insert Note
+    /// { note := __new__.name }` — the ambient `td` at that point is `Note`,
+    /// not the trigger's own type), so resolution can't rely on whatever
+    /// `td` happens to be in scope where the anchor is used. An anchor not
+    /// legal for the trigger's `on` mask (e.g. `__old__` in an Insert-only
+    /// trigger) is simply absent from this map, and fails resolution the
+    /// same way any other unknown identifier does.
+    special_anchors: HashMap<String, (&'a TypeDescriptor, String)>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
     /// Non-fatal warnings collected during compilation.
@@ -326,6 +394,7 @@ impl<'a> Compiler<'a> {
             cte_free_items: HashMap::new(),
             for_vars: HashMap::new(),
             fn_params: HashMap::new(),
+            special_anchors: HashMap::new(),
             global_ctes: vec![],
             warnings: vec![],
             config,
@@ -5146,6 +5215,35 @@ impl<'a> Compiler<'a> {
                         };
                         let ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
                         return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                    }
+                }
+            }
+            // `__new__.prop` / `__old__.prop` — the inserted/updated/deleted
+            // row a trigger handler is compiled against (see
+            // `compile_trigger_handler`, which populates `special_anchors`
+            // per the trigger's declared `on` events). Same rewrite-and-
+            // recurse trick as the `TypeName.prop` case below, just handing
+            // `compile_path` the anchor's own alias ("NEW"/"OLD") instead
+            // of `td`'s. Outside trigger-handler compilation (or for the
+            // anchor the current trigger's events don't legally bind —
+            // e.g. `__old__` in an Insert-only trigger) `special_anchors`
+            // is empty/missing that entry, so this falls through to the
+            // explicit error below rather than the generic "absolute
+            // paths" message, matching Gel's `__old__`/`__new__ cannot be
+            // used in this expression`.
+            if p.steps.len() > 1 {
+                if let ast::PathStep::Name(root) = &p.steps[0] {
+                    if root == "__new__" || root == "__old__" {
+                        if let Some((anchor_td, anchor_alias)) = self.special_anchors.get(root).cloned() {
+                            let relative = ast::Path { steps: p.steps[1..].to_vec(), partial: true };
+                            return self.compile_path(&relative, anchor_td, &anchor_alias);
+                        }
+                        return Err(PyQLError::Resolution(PyQLResolutionError::UnknownField(
+                            PyQLUnknownFieldError {
+                                message: format!("{root} cannot be used in this expression"),
+                                position: Position { line: 0, col: 0 },
+                            },
+                        )));
                     }
                 }
             }
