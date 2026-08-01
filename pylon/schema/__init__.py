@@ -52,8 +52,8 @@ from ._pointers import (
     Restrict,
     Source,
     Target,
+    Through,
     Tuple,
-    through,
 )
 from ._indexes import Index, SearchBackend, SearchPointer, SearchIndex, SearchMode, SearchWeight, VectorPointer, VectorIndex
 from ._lazy import lazy
@@ -106,7 +106,7 @@ __all__ = [
     "Computed",
     "Tuple",
     "Array",
-    "through",
+    "Through",
     # Deletion policies
     "OnDelete",
     "Target",

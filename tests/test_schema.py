@@ -27,10 +27,10 @@ from pylon.schema import (
     Property,
     Readonly,
     Rewrite,
+    Through,
     Timing,
     Trigger,
     Tuple,
-    through,
 )
 from pylon.schema._pointers import ArrayAnnotation, TupleAnnotation
 from pylon.schema._scalars import PG_TYPE_MAP, SHORTHAND_MAP
@@ -97,7 +97,7 @@ class ProductTag(Auditable):
 
 @pylon.type
 class Catalog:
-    products: MultiLink[Product, through(ProductTag)]
+    products: MultiLink[Product, Through[ProductTag]]
     optional_tags: MultiLink[Tag] | None
 
 

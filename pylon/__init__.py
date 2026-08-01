@@ -77,6 +77,7 @@ from .schema import (
     Source,
     Str,
     Target,
+    Through,
     Tuple,
     Volatility,
     abstract,
@@ -89,7 +90,6 @@ from .schema import (
     named_tuple,
     scalar,
     signal_decorator as signal,
-    through,
     type,  # shadows builtins.type intentionally  # noqa: A001
 )
 
@@ -138,7 +138,7 @@ __all__ = [
     "Property",
     "Tuple",
     "Array",
-    "through",
+    "Through",
     # Schema — deletion policies
     "OnDelete",
     "Target",

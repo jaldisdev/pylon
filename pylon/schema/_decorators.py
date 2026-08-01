@@ -604,7 +604,7 @@ def junction_decorator(
 
         @pylon.type
         class Product:
-            tags: MultiLink[Tag, through(ProductTag)]
+            tags: MultiLink[Tag, Through[ProductTag]]
     """
 
     def _wrap(c: type) -> type:

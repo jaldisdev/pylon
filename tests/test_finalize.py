@@ -306,7 +306,7 @@ class TestLinkResolution:
 
         @pylon.type(module="t", name="CatalogType")
         class CatalogType:
-            items: pylon.MultiLink[ProductType, pylon.through(JunctionType)]
+            items: pylon.MultiLink[ProductType, pylon.Through[JunctionType]]
 
         types = [TagType, ProductType, JunctionType, CatalogType]
         tmap, cid = _build_type_index(types)

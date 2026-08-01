@@ -17,7 +17,7 @@ insert Post {
 }
 ```
 
-Assign a multi-link with a set of subqueries, and set link properties (for a `through=`-junction link) with `@propname`:
+Assign a multi-link with a set of subqueries, and set link properties (for a `Through[...]`-junction link) with `@propname`:
 
 ```pyql
 insert Product {

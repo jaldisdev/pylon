@@ -19,7 +19,7 @@ class Product:
     tags: pylon.MultiLink[Tag]
 ```
 
-With no `through=`, Pylon generates an implicit junction table for you (two-column, source/target FK pair). To attach extra properties to the relationship itself, back it with an explicit [`@pylon.junction`](types.md#junctions-pylonjunction) type instead:
+With no `Through[...]`, Pylon generates an implicit junction table for you (two-column, source/target FK pair). To attach extra properties to the relationship itself, back it with an explicit [`@pylon.junction`](types.md#junctions-pylonjunction) type instead:
 
 ```python
 @pylon.junction
@@ -28,13 +28,13 @@ class ProductTag:
 
 @pylon.type
 class Product:
-    tags: pylon.MultiLink[Tag, pylon.through(ProductTag)]
+    tags: pylon.MultiLink[Tag, pylon.Through[ProductTag]]
 ```
 
-`through()` works on a single `Link` too, for a one-to-one relationship that itself needs properties:
+`Through[...]` works on a single `Link` too, for a one-to-one relationship that itself needs properties:
 
 ```python
-spouse: pylon.Link[Person, pylon.through(Marriage)] | None
+spouse: pylon.Link[Person, pylon.Through[Marriage]] | None
 ```
 
 See [Object types § Junctions](types.md#junctions-pylonjunction) for the junction-type rules (scalar properties only, `source`/`target` reserved, exactly one referencing link).
