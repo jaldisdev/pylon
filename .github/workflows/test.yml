@@ -9,15 +9,94 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
       - name: Run tests
         run: python -m pytest
+
+  live-tests-rust:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pylon_live_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # This must always be the ephemeral service container above, never a
+      # real database — every live test is free to create/drop schemas and
+      # tables here.
+      PYLON_PGCON_TEST_DSN: postgresql://postgres:postgres@localhost:5432/pylon_live_test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust live-Postgres tests
+        # --exclude pylon-py: pyo3's linking needs maturin's own build
+        # config, a plain `cargo build`/`cargo test` can't link it.
+        # --test-threads=1: matches local dev convention for this suite.
+        run: cargo test --workspace --exclude pylon-py -- --ignored --test-threads=1
+
+  live-tests-python:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.13", "3.14"]
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pylon_live_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PYLON_PGCON_TEST_DSN: postgresql://postgres:postgres@localhost:5432/pylon_live_test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run Python live-Postgres tests
+        run: python -m pytest -m live_db
