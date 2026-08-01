@@ -1814,10 +1814,40 @@ mod tests {
 
     #[test]
     fn test_trigger_new_anchor_resolves_to_new_alias() {
-        // On.Insert = 1
+        // On.Insert = 1. Also documents the *non*-recursive boundary: this
+        // handler updates Person (its own type), but the trigger only
+        // fires on Insert, and Update isn't in that mask, so there's no
+        // way this handler's own write could refire it.
         let schema = schema_with_trigger(trig(1, "After", "update Person set { age := __new__.age }"));
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("NEW.\"age\""), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn test_trigger_that_would_refire_itself_is_rejected() {
+        // On.Insert = 1, handler inserts into its own type — every insert
+        // would refire this same trigger, forever.
+        let schema = schema_with_trigger(trig(1, "After", "insert Person { age := __new__.age }"));
+        let err = export_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("is recursive"), "got: {err}");
+    }
+
+    #[test]
+    fn test_recursive_insert_wrapped_in_a_select_shape_is_still_caught() {
+        // `select (insert Person {...}) { age }` — the DML lives in
+        // `IrSelect::dml_source`, not as the top-level statement.
+        let schema = schema_with_trigger(trig(1, "After", "select (insert Person { age := __new__.age }) { age }"));
+        let err = export_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("is recursive"), "got: {err}");
+    }
+
+    #[test]
+    fn test_recursive_check_is_scoped_to_the_triggers_own_events() {
+        // On.Delete = 4, handler *inserts* into its own type — not
+        // recursive, since an insert can never refire a Delete-only
+        // trigger (contrast with the Insert-only case above).
+        let schema = schema_with_trigger(trig(4, "After", "insert Person { age := __old__.age }"));
+        assert!(export_schema(&schema).is_ok());
     }
 
     #[test]
@@ -1830,8 +1860,11 @@ mod tests {
 
     #[test]
     fn test_trigger_update_can_reference_both_new_and_old() {
-        // On.Update = 2
-        let schema = schema_with_trigger(trig(2, "After", "update Person set { age := __new__.age - __old__.age }"));
+        // On.Update = 2 — a schema-bound but DML-free handler (a filter
+        // expression, not `update Person set {...}`, which would be
+        // genuinely self-recursive for an Update-only trigger and get
+        // rejected by the recursion check below).
+        let schema = schema_with_trigger(trig(2, "After", "select Person filter (__new__.age = __old__.age)"));
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("NEW.\"age\""), "got:\n{ddl}");
         assert!(ddl.contains("OLD.\"age\""), "got:\n{ddl}");
@@ -1854,10 +1887,10 @@ mod tests {
     #[test]
     fn test_trigger_combined_insert_update_cannot_reference_old() {
         // On.Insert | On.Update = 3 — __new__ legal, __old__ still isn't (Gel's mixed_02 case).
-        let ok = schema_with_trigger(trig(3, "After", "update Person set { age := __new__.age }"));
+        let ok = schema_with_trigger(trig(3, "After", "select Person filter (__new__.age > 0)"));
         assert!(export_schema(&ok).is_ok());
 
-        let bad = schema_with_trigger(trig(3, "After", "update Person set { age := __old__.age }"));
+        let bad = schema_with_trigger(trig(3, "After", "select Person filter (__old__.age > 0)"));
         let err = export_schema(&bad).unwrap_err();
         assert!(err.to_string().contains("__old__ cannot be used"), "got: {err}");
     }
