@@ -416,6 +416,28 @@ pub fn encode_value(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) -
 }
 
 fn encode_non_null(value: &CachedValue, ty: &Type, out: &mut bytes::BytesMut) -> Result<IsNull> {
+    // A `<std::decimal>$pN` cast makes Postgres report that parameter's
+    // type as `numeric` regardless of which `CachedValue` variant the JSON
+    // request body produced (`I64`/`F64` for a JSON number, `Str` for a
+    // JSON string — `json_to_cached_value` in pylon-server has no visibility
+    // into the target PG type at parse time). Without this, the arms below
+    // write raw int8/float8 bytes or raw UTF-8 text straight into a
+    // numeric-typed slot, which Postgres's binary numeric decoder then reads
+    // as a corrupt header — "invalid sign in external representation" for
+    // I64/F64 (garbage sign field), "insufficient data left in message" for
+    // Str (too few bytes for the header). Route every numeric-ish variant
+    // through the same `rust_decimal` encoding the `Decimal` arm below uses.
+    if *ty == Type::NUMERIC {
+        let decimal: Decimal = match value {
+            CachedValue::Decimal(s) => s.parse()?,
+            CachedValue::Str(s) => s.parse()?,
+            CachedValue::I64(i) => Decimal::from(*i),
+            CachedValue::F64(f) => Decimal::try_from(*f).map_err(|e| Error::message(format!("invalid decimal value: {e}")))?,
+            _ => return Err(Error::message("cannot bind this value as a numeric parameter")),
+        };
+        decimal.to_sql(&Type::NUMERIC, out)?;
+        return Ok(IsNull::No);
+    }
     match value {
         CachedValue::Null => unreachable!("caller already handled NULL"),
         CachedValue::Bool(b) => out.put_u8(*b as u8),
