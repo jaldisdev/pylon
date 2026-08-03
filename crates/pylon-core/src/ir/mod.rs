@@ -226,7 +226,26 @@ pub struct IrSelect {
     pub poly_implementors: Vec<IrPolyImplementor>,
     /// Interface column names used in the UNION ALL branches (e.g. `["id", "email"]`).
     pub poly_columns: Vec<String>,
+    /// Trailing `FOR UPDATE`/`FOR SHARE`/... row-locking clause. Validated
+    /// at compile time (`Compiler::compile_select`) to only ever be `Some`
+    /// on a single schema-bound, non-polymorphic, non-DML-wrapped,
+    /// non-`DISTINCT` row source — the same shape Postgres itself requires
+    /// output rows to map 1:1 to physical table rows for locking to make
+    /// sense.
+    pub lock: Option<IrLockClause>,
 }
+
+#[derive(Debug, Clone)]
+pub struct IrLockClause {
+    pub strength: IrLockStrength,
+    pub wait: IrLockWait,
+}
+
+#[derive(Debug, Clone)]
+pub enum IrLockStrength { Update, NoKeyUpdate, Share, KeyShare }
+
+#[derive(Debug, Clone)]
+pub enum IrLockWait { Block, NoWait, SkipLocked }
 
 /// One SELECT output row's source — either a real schema object (with a
 /// FROM clause and projected column shape) or a free literal expression
@@ -254,6 +273,7 @@ impl IrSelect {
             polymorphic: false,
             poly_implementors: vec![],
             poly_columns: vec![],
+            lock: None,
         }
     }
 }

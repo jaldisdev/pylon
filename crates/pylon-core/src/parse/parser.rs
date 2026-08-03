@@ -206,7 +206,79 @@ impl Parser {
             None
         };
 
-        Ok(Stmt::Select(SelectStmt { result, filter, order_by, offset, limit }))
+        let lock = self.parse_lock_clause()?;
+
+        Ok(Stmt::Select(SelectStmt { result, filter, order_by, offset, limit, lock }))
+    }
+
+    /// `FOR UPDATE|SHARE|NO KEY UPDATE|KEY SHARE [NOWAIT|SKIP LOCKED]` —
+    /// Postgres's own trailing row-locking clause, placed after
+    /// `ORDER BY`/`LIMIT`/`OFFSET`, not right after `WHERE`. `SHARE`/`NO`/
+    /// `KEY`/`NOWAIT`/`SKIP`/`LOCKED` aren't reserved keywords elsewhere in
+    /// PyQL (unlike `FOR`/`UPDATE`, already tokens for the `for`-loop and
+    /// `update` statements), so they're matched case-insensitively off
+    /// `Token::Ident` here rather than added as new lexer keywords — the
+    /// same convention `parse_sort_expr` already uses for `EMPTY`.
+    fn parse_lock_clause(&mut self) -> Result<Option<LockClause>, PyQLSyntaxError> {
+        if !matches!(self.current(), Token::For) {
+            return Ok(None);
+        }
+        self.advance();
+
+        fn ident_eq(tok: &Token, s: &str) -> bool {
+            matches!(tok, Token::Ident(i) if i.eq_ignore_ascii_case(s))
+        }
+
+        let strength = match self.current() {
+            Token::Update => {
+                self.advance();
+                LockStrength::Update
+            }
+            tok if ident_eq(tok, "SHARE") => {
+                self.advance();
+                LockStrength::Share
+            }
+            tok if ident_eq(tok, "NO") => {
+                self.advance();
+                if !ident_eq(self.current(), "KEY") {
+                    return Err(self.err("expected KEY after NO in FOR NO KEY UPDATE"));
+                }
+                self.advance();
+                self.eat(&Token::Update)?;
+                LockStrength::NoKeyUpdate
+            }
+            tok if ident_eq(tok, "KEY") => {
+                self.advance();
+                if !ident_eq(self.current(), "SHARE") {
+                    return Err(self.err("expected SHARE after KEY in FOR KEY SHARE"));
+                }
+                self.advance();
+                LockStrength::KeyShare
+            }
+            _ => {
+                return Err(self.err(
+                    "expected UPDATE, SHARE, NO KEY UPDATE, or KEY SHARE after FOR",
+                ));
+            }
+        };
+
+        let wait = match self.current() {
+            tok if ident_eq(tok, "NOWAIT") => {
+                self.advance();
+                LockWait::NoWait
+            }
+            tok if ident_eq(tok, "SKIP") => {
+                self.advance();
+                if !ident_eq(self.current(), "LOCKED") {
+                    return Err(self.err("expected LOCKED after SKIP"));
+                }
+                self.advance();
+                LockWait::SkipLocked
+            }
+            _ => LockWait::Block,
+        };
+
+        Ok(Some(LockClause { strength, wait }))
     }
 
     fn parse_sort_list(&mut self) -> Result<Vec<SortExpr>, PyQLSyntaxError> {
