@@ -96,6 +96,20 @@ def finalize(
     SchemaDescriptor
         The built descriptor (also installed as the process-level singleton).
 
+    Note
+    ----
+    This installs the schema as currently declared in ``.py`` files on
+    disk — it does not consult the database at all, and is safe to call
+    with no database reachable (needed for e.g. ``pylon migration create``,
+    which must build this to diff against the live DB state in the first
+    place). Once a real ``Client`` connects, ``Client.ensure_connected()``
+    overwrites this singleton with whatever schema the target database was
+    actually last migrated to (see ``pylon.client._install_migrated_schema``)
+    — so a schema change with no physical DDL footprint (e.g. a property's
+    ``readonly`` flag) has no effect on query compilation until a migration
+    applying it is actually run, even though this function already
+    reflects it the moment the file changes.
+
     Raises
     ------
     FileNotFoundError

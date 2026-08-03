@@ -273,6 +273,7 @@ class Client:
             self._ref.pool = await pgcon_connect(dsn, self._config.database.pool_max_size)
             from pylon import cache as _cache
             _cache.init(self._config.cache)
+            await _install_migrated_schema(self._ref.pool)
 
     async def aclose(self) -> None:
         """Close the connection pool and release all resources."""
@@ -875,3 +876,39 @@ def _build_dsn(db: Any) -> str:
     """Construct a DSN string from discrete :class:`~pylon.config.DatabaseConfig` fields."""
     password_part = f":{db.password}" if db.password else ""
     return f"postgresql://{db.user}{password_part}@{db.host}:{db.port}/{db.name}"
+
+
+async def _install_migrated_schema(pool: "PgconPool") -> None:
+    """Installs the *migrated* schema (`_pylon."Schema"`, written by
+    `migration apply`/`watch`) as the process-level singleton every query
+    on this connection compiles against — overriding whatever
+    `pylon.finalize()` built from the current `.py` files.
+
+    This is what makes a parser-only, no-DDL-footprint schema change (e.g.
+    a property's `readonly` flag — enforced only by the Rust compiler
+    consulting `SchemaDescriptor`, never a real Postgres constraint) have
+    no effect on a running app until a migration is actually applied: even
+    though `pylon.finalize()` already installed the *new* declaration at
+    process startup, connecting overwrites it with whatever the database
+    itself was last migrated to. Without this, editing `schema.py` and
+    restarting the process would be enough to change enforcement, with no
+    migration required at all — the same gap `pylon-client` (Rust),
+    `pylon-server`, and `pylon-lsp` were already built not to have.
+
+    A no-op if no migration has ever been applied to this database (a
+    brand-new/unmigrated target — `_pylon."Schema"` doesn't exist yet):
+    whatever `pylon.finalize()` installed is left in place, matching
+    `pylon-lsp`'s own graceful-degradation behavior for the same case.
+    """
+    from pylon._core import SchemaDescriptor, migration_read_schema_snapshot
+    from pylon.exceptions import QueryError
+    from pylon.query import _set_schema
+
+    try:
+        snapshot_json = await migration_read_schema_snapshot(pool)
+    except QueryError as exc:
+        if getattr(exc, "sqlstate", None) == "42P01":  # undefined_table
+            return
+        raise
+    if snapshot_json is not None:
+        _set_schema(SchemaDescriptor.from_json(snapshot_json))

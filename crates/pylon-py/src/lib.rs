@@ -1356,11 +1356,25 @@ impl SchemaDescriptor {
         Ok(PyList::new(py, items)?)
     }
 
-    /// Serialize the full schema to JSON — consumed by `pylon-lsp` (a pure-Rust
-    /// binary with no embedded Python interpreter) so it can run the full
-    /// compiler and surface semantic diagnostics, not just parser errors.
+    /// Serialize the full schema to JSON — the same format written to
+    /// `_pylon."Schema"` by `migration apply`/`watch` (see
+    /// `migration_write_schema_snapshot`) and read back by `from_json`.
     fn to_json(&self) -> PyResult<String> {
         serde_json::to_string(&self.inner)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Deserializes a `SchemaDescriptor` from `to_json`'s own output —
+    /// specifically the JSON text `migration_read_schema_snapshot` fetches
+    /// from `_pylon."Schema"`. This is how a real client installs the
+    /// *migrated* schema as the query-compilation singleton instead of the
+    /// one `pylon.finalize()` built fresh from the current `.py` files —
+    /// see `pylon.finalize()`'s own doc comment for why those two can
+    /// legitimately differ until a migration is applied.
+    #[staticmethod]
+    fn from_json(json: &str) -> PyResult<Self> {
+        serde_json::from_str(json)
+            .map(|inner| Self { inner })
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 }
