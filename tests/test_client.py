@@ -770,7 +770,8 @@ class TestEnsureConnected:
             cfg.cache = CacheConfig(enabled=False)
 
             mock_pool = MagicMock()
-            with patch("pylon._core.pgcon_connect", new=AsyncMock(return_value=mock_pool)) as mock_connect:
+            with patch("pylon._core.pgcon_connect", new=AsyncMock(return_value=mock_pool)) as mock_connect, \
+                 patch("pylon._core.migration_read_schema_snapshot", new=AsyncMock(return_value=None)):
                 client = Client(cfg)
                 await client.ensure_connected()
 
@@ -792,7 +793,8 @@ class TestEnsureConnected:
             cfg.cache = CacheConfig(enabled=False)
 
             mock_pool = MagicMock()
-            with patch("pylon._core.pgcon_connect", new=AsyncMock(return_value=mock_pool)) as mock_connect:
+            with patch("pylon._core.pgcon_connect", new=AsyncMock(return_value=mock_pool)) as mock_connect, \
+                 patch("pylon._core.migration_read_schema_snapshot", new=AsyncMock(return_value=None)):
                 client = Client(cfg)
                 await client.ensure_connected()
                 await client.ensure_connected()

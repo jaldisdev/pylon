@@ -149,6 +149,20 @@ fn migration_write_schema_snapshot<'py>(py: Python<'py>, pool: &PgconPool, snaps
     })
 }
 
+/// Reads the current schema snapshot back — `None` if neither `migration
+/// apply` nor `watch` has ever run against this database. Pair with
+/// `SchemaDescriptor.from_json` to install the *migrated* schema as the
+/// query-compilation singleton (`pylon.query._set_schema`), rather than
+/// trusting whatever `pylon.finalize()` built from the current `.py` files —
+/// see `pylon.finalize()`'s own doc comment for why those can differ.
+#[pyfunction]
+fn migration_read_schema_snapshot<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_migrate::read_schema_snapshot(&pool).await.map_err(migrate_err)
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migration_ensure_tracking_tables, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_tracking, m)?)?;
@@ -158,6 +172,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migration_advisory_lock, m)?)?;
     m.add_function(wrap_pyfunction!(migration_try_advisory_lock, m)?)?;
     m.add_function(wrap_pyfunction!(migration_write_schema_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_read_schema_snapshot, m)?)?;
     m.add_class::<MigrationLock>()?;
     Ok(())
 }
