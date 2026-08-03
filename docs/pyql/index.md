@@ -19,7 +19,7 @@ PyQL is Pylon's query language — compiled to native SQL by `pylon-core`, never
 
 ## Syntax notes
 
-- Statement keywords (`select`, `insert`, `update`, `delete`, `for`, `group`, `with`, `filter`, `order by`, `by`, `union`, `using`) are case-insensitive — `SELECT` and `select` are identical.
+- Statement keywords (`select`, `insert`, `update`, `delete`, `for`, `group`, `with`, `filter`, `order by`, `by`, `union`, `using`, and the `for update`/`share`/`no key update`/`key share`/`nowait`/`skip locked` row-locking clause's own words) are case-insensitive — `SELECT` and `select` are identical.
 - A statement is a single expression tree; there's no statement-separator token needed for a query passed to `Client` (the REPL uses a trailing `;` purely as its own "run now" signal, not part of the language).
 - `#`-prefixed line comments are supported.
 

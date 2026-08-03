@@ -42,6 +42,7 @@ use super::{
     IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
     IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
     VectorEnqueueInfo, SearchEnqueueInfo, TupleCastShape,
+    IrLockClause, IrLockStrength, IrLockWait,
 };
 
 // ── Public entry point ──────────────────────────────────────────────────────────
@@ -214,6 +215,7 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
         order_by: vec![],
         offset: None,
         limit: None,
+        lock: None,
     };
     c.compile_stmt(&Stmt::Select(fake_sel))
 }
@@ -716,6 +718,7 @@ impl<'a> Compiler<'a> {
             },
             offset: outer.offset.clone().or(inner_sel.offset.clone()),
             limit: outer.limit.clone().or(inner_sel.limit.clone()),
+            lock: outer.lock.clone().or(inner_sel.lock.clone()),
         };
 
         let ir = self.compile_stmt(&Stmt::Select(merged))?;
@@ -816,6 +819,7 @@ impl<'a> Compiler<'a> {
             },
             offset: outer.offset.clone().or(inner_sel.offset.clone()),
             limit: outer.limit.clone().or(inner_sel.limit.clone()),
+            lock: outer.lock.clone().or(inner_sel.lock.clone()),
         };
 
         let ir = self.compile_stmt(&Stmt::Select(merged))?;
@@ -912,6 +916,7 @@ impl<'a> Compiler<'a> {
             },
             offset: outer.offset.clone().or(inner_sel.offset.clone()),
             limit: outer.limit.clone().or(inner_sel.limit.clone()),
+            lock: outer.lock.clone().or(inner_sel.lock.clone()),
         };
 
         let _ = distinct; // alias selects honour the outer distinct if applied
@@ -1181,6 +1186,7 @@ impl<'a> Compiler<'a> {
             polymorphic: false,
             poly_implementors: vec![],
             poly_columns: vec![],
+            lock: None,
         }))
     }
 
@@ -1455,6 +1461,7 @@ impl<'a> Compiler<'a> {
                                     order_by: s.order_by.clone(),
                                     offset: s.offset.clone(),
                                     limit: s.limit.clone(),
+                                    lock: s.lock.clone(),
                                 };
                                 return self.compile_select(&synthetic, &synthetic.result, distinct).map(IrStmt::Select);
                             }
@@ -1511,6 +1518,7 @@ impl<'a> Compiler<'a> {
                                     polymorphic: false,
                                     poly_implementors: vec![],
                                     poly_columns: vec![],
+                                    lock: None,
                                 }));
                             }
                         }
@@ -1533,6 +1541,7 @@ impl<'a> Compiler<'a> {
                             polymorphic: false,
                             poly_implementors: vec![],
                             poly_columns: vec![],
+                            lock: None,
                         }));
                     }
                     if !p.partial && p.steps.len() > 1 {
@@ -1575,6 +1584,7 @@ impl<'a> Compiler<'a> {
                                 polymorphic: false,
                                 poly_implementors: vec![],
                                 poly_columns: vec![],
+                                lock: None,
                             }));
                         }
                     }
@@ -1718,6 +1728,7 @@ impl<'a> Compiler<'a> {
             order_by: sel.order_by.clone(),
             offset: sel.offset.clone(),
             limit: sel.limit.clone(),
+            lock: sel.lock.clone(),
         };
         self.compile_select(&synthetic, &synthetic.result, false)
     }
@@ -2696,6 +2707,7 @@ impl<'a> Compiler<'a> {
             polymorphic: false,
             poly_implementors: vec![],
             poly_columns: vec![],
+            lock: None,
         })
     }
 
@@ -2755,9 +2767,54 @@ impl<'a> Compiler<'a> {
             (vec![], vec![])
         };
 
+        // `FOR UPDATE`/`FOR SHARE`/... — only valid when every output row
+        // maps 1:1 to a single physical table row, the same restriction
+        // Postgres itself enforces (it rejects the same combinations with
+        // its own "FOR UPDATE is not allowed with ..." errors). `DISTINCT`
+        // and an interface (polymorphic) target both break that mapping;
+        // `SELECT (INSERT/UPDATE/DELETE …) { ... }` has nothing left to
+        // lock, since the DML already ran by the time this SELECT reads it.
+        let lock = match &sel.lock {
+            None => None,
+            Some(lc) => {
+                if distinct {
+                    return Err(self.type_err(
+                        "FOR UPDATE/SHARE cannot be combined with DISTINCT — Postgres can't \
+                         guarantee the result rows map 1:1 to physical table rows",
+                    ));
+                }
+                if polymorphic {
+                    return Err(self.type_err(
+                        "FOR UPDATE/SHARE cannot be used on an interface type — its rows span \
+                         multiple underlying tables, which a single locking clause can't target",
+                    ));
+                }
+                if dml_source.is_some() {
+                    return Err(self.type_err(
+                        "FOR UPDATE/SHARE cannot be used on SELECT (INSERT/UPDATE/DELETE …) — \
+                         there's nothing left to lock once the DML has already run",
+                    ));
+                }
+                Some(IrLockClause {
+                    strength: match lc.strength {
+                        ast::LockStrength::Update => IrLockStrength::Update,
+                        ast::LockStrength::NoKeyUpdate => IrLockStrength::NoKeyUpdate,
+                        ast::LockStrength::Share => IrLockStrength::Share,
+                        ast::LockStrength::KeyShare => IrLockStrength::KeyShare,
+                    },
+                    wait: match lc.wait {
+                        ast::LockWait::Block => IrLockWait::Block,
+                        ast::LockWait::NoWait => IrLockWait::NoWait,
+                        ast::LockWait::SkipLocked => IrLockWait::SkipLocked,
+                    },
+                })
+            }
+        };
+
         Ok(IrSelect {
             rows: vec![IrRowSource::Bound { source, shape }],
             filter, order_by, offset, limit, distinct, dml_source, polymorphic, poly_implementors, poly_columns,
+            lock,
         })
     }
 
@@ -3639,6 +3696,7 @@ impl<'a> Compiler<'a> {
                     order_by: vec![],
                     offset: None,
                     limit: None,
+                    lock: None,
                 };
                 return match self.compile_stmt(&Stmt::Select(fake_sel))? {
                     IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues {
@@ -4444,6 +4502,7 @@ impl<'a> Compiler<'a> {
             distinct: false,
             dml_source: None,
             polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+            lock: None,
         };
 
         Ok(IrShapePointer::MultiLink(IrMultiLinkPointer {
@@ -4550,6 +4609,7 @@ impl<'a> Compiler<'a> {
             distinct: false,
             dml_source: None,
             polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+            lock: None,
         };
 
         Ok(IrShapePointer::MultiLink(IrMultiLinkPointer {
@@ -4840,6 +4900,7 @@ impl<'a> Compiler<'a> {
                                         order_by: vec![],
                                         offset: None,
                                         limit: None,
+                                        lock: None,
                                     })
                                 } else {
                                     None
@@ -5024,6 +5085,7 @@ impl<'a> Compiler<'a> {
                         let synthetic = ast::SelectStmt {
                             result: (**inner).clone(),
                             filter: None, order_by: vec![], offset: None, limit: None,
+                            lock: None,
                         };
                         let ps = self.compile_expr_as_path_select(&synthetic, inner, &root, false)?;
                         return Ok(IrExpr::PathSubquery(Box::new(ps)));
@@ -5388,6 +5450,7 @@ impl<'a> Compiler<'a> {
                         let synthetic = ast::SelectStmt {
                             result: Expr::Path(full_path.clone()),
                             filter: None, order_by: vec![], offset: None, limit: None,
+                            lock: None,
                         };
                         let ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
                         return Ok(IrExpr::PathSubquery(Box::new(ps)));

@@ -235,6 +235,85 @@ mod tests {
     }
 
     #[test]
+    fn test_select_for_update_defaults_to_blocking() {
+        let stmt = parse("SELECT Person FOR UPDATE").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::Block }));
+    }
+
+    #[test]
+    fn test_select_for_update_skip_locked() {
+        let stmt = parse("SELECT Person FOR UPDATE SKIP LOCKED").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::SkipLocked }));
+    }
+
+    #[test]
+    fn test_select_for_update_nowait() {
+        let stmt = parse("SELECT Person FOR UPDATE NOWAIT").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::NoWait }));
+    }
+
+    #[test]
+    fn test_select_for_share_skip_locked_is_case_insensitive() {
+        let stmt = parse("select Person for share skip locked").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Share, wait: LockWait::SkipLocked }));
+    }
+
+    #[test]
+    fn test_select_for_no_key_update() {
+        let stmt = parse("SELECT Person FOR NO KEY UPDATE").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::NoKeyUpdate, wait: LockWait::Block }));
+    }
+
+    #[test]
+    fn test_select_for_key_share() {
+        let stmt = parse("SELECT Person FOR KEY SHARE").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::KeyShare, wait: LockWait::Block }));
+    }
+
+    #[test]
+    fn test_select_for_update_comes_after_order_by_limit_offset() {
+        let stmt = parse(
+            "SELECT Person { name } ORDER BY .name OFFSET 1 LIMIT 5 FOR UPDATE SKIP LOCKED",
+        ).unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.order_by.len(), 1);
+        assert!(sel.offset.is_some());
+        assert!(sel.limit.is_some());
+        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::SkipLocked }));
+    }
+
+    #[test]
+    fn test_select_with_no_lock_clause_defaults_to_none() {
+        let stmt = parse("SELECT Person").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        assert_eq!(sel.lock, None);
+    }
+
+    #[test]
+    fn test_select_for_garbage_strength_is_a_clear_error() {
+        let err = parse("SELECT Person FOR BOGUS").unwrap_err();
+        assert!(err.message.contains("UPDATE"), "unexpected: {}", err.message);
+    }
+
+    #[test]
+    fn test_select_for_no_without_key_is_a_clear_error() {
+        let err = parse("SELECT Person FOR NO UPDATE").unwrap_err();
+        assert!(err.message.contains("KEY"), "unexpected: {}", err.message);
+    }
+
+    #[test]
+    fn test_select_for_skip_without_locked_is_a_clear_error() {
+        let err = parse("SELECT Person FOR UPDATE SKIP").unwrap_err();
+        assert!(err.message.contains("LOCKED"), "unexpected: {}", err.message);
+    }
+
+    #[test]
     fn test_boolean_operators() {
         let stmt = parse(
             "SELECT Person FILTER .active = true AND .age >= 18 OR .admin = true",

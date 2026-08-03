@@ -79,6 +79,33 @@ pub struct SelectStmt {
     pub order_by: Vec<SortExpr>,
     pub offset: Option<Expr>,
     pub limit: Option<Expr>,
+    /// Trailing `FOR UPDATE`/`FOR SHARE`/... row-locking clause — Postgres's
+    /// own grammar places this last, after `ORDER BY`/`LIMIT`/`OFFSET`, not
+    /// right after `WHERE`.
+    pub lock: Option<LockClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockClause {
+    pub strength: LockStrength,
+    pub wait: LockWait,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockStrength {
+    Update,
+    NoKeyUpdate,
+    Share,
+    KeyShare,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockWait {
+    /// No modifier — the default Postgres behavior of blocking until the
+    /// lock is available.
+    Block,
+    NoWait,
+    SkipLocked,
 }
 
 #[derive(Debug, Clone, PartialEq)]

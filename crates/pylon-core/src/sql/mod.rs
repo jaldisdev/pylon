@@ -24,6 +24,7 @@ use crate::ir::{
     IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer,
     IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
     IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
+    IrLockClause, IrLockStrength, IrLockWait,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, InferencePlan, ShapeDescriptor, ShapeNode};
@@ -266,6 +267,7 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
     append_filter(&mut sql, &sel.filter);
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+    append_lock_clause(&mut sql, &sel.lock);
 
     let root_pointers = prepend_type(shape_pointers);
     SqlOutput {
@@ -2390,6 +2392,28 @@ fn append_offset_limit(sql: &mut String, offset: &Option<IrExpr>, limit: &Option
     }
 }
 
+/// `FOR UPDATE`/`FOR SHARE`/... — Postgres's own grammar places this last,
+/// after `ORDER BY`/`LIMIT`/`OFFSET`, so this must be the final thing
+/// appended to a bound SELECT's SQL. No `OF table_name` — the outer
+/// SELECT's own aliased table is always the only lockable target (nested
+/// shape pointers are correlated subqueries, never part of the outer FROM),
+/// so a bare `FOR UPDATE` already targets exactly the right row(s).
+fn append_lock_clause(sql: &mut String, lock: &Option<IrLockClause>) {
+    let Some(lock) = lock else { return };
+    let strength = match lock.strength {
+        IrLockStrength::Update => "UPDATE",
+        IrLockStrength::NoKeyUpdate => "NO KEY UPDATE",
+        IrLockStrength::Share => "SHARE",
+        IrLockStrength::KeyShare => "KEY SHARE",
+    };
+    sql.push_str(&format!("\nFOR {}", strength));
+    match lock.wait {
+        IrLockWait::Block => {}
+        IrLockWait::NoWait => sql.push_str(" NOWAIT"),
+        IrLockWait::SkipLocked => sql.push_str(" SKIP LOCKED"),
+    }
+}
+
 fn emit_sort_clause(s: &IrSort) -> String {
     let dir = match s.direction {
         IrSortDir::Asc => "ASC",
@@ -3262,6 +3286,112 @@ mod tests {
             &out.shape.root,
             crate::query::ShapeNode::Enum { enum_type, .. } if enum_type == "public::Gender"
         ), "expected Enum-tagged shape, got: {:?}", out.shape.root);
+    }
+
+    // ── FOR UPDATE / FOR SHARE row-locking clause ──────────────────────────────
+
+    #[test]
+    fn test_for_update_defaults_to_blocking() {
+        let out = compile_and_emit("SELECT Person FOR UPDATE");
+        assert!(out.sql.trim_end().ends_with("FOR UPDATE"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_update_skip_locked() {
+        let out = compile_and_emit("SELECT Person FOR UPDATE SKIP LOCKED");
+        assert!(out.sql.trim_end().ends_with("FOR UPDATE SKIP LOCKED"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_update_nowait() {
+        let out = compile_and_emit("SELECT Person FOR UPDATE NOWAIT");
+        assert!(out.sql.trim_end().ends_with("FOR UPDATE NOWAIT"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_no_key_update_skip_locked() {
+        let out = compile_and_emit("SELECT Person FOR NO KEY UPDATE SKIP LOCKED");
+        assert!(out.sql.trim_end().ends_with("FOR NO KEY UPDATE SKIP LOCKED"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_share() {
+        let out = compile_and_emit("SELECT Person FOR SHARE");
+        assert!(out.sql.trim_end().ends_with("FOR SHARE"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_key_share_nowait() {
+        let out = compile_and_emit("SELECT Person FOR KEY SHARE NOWAIT");
+        assert!(out.sql.trim_end().ends_with("FOR KEY SHARE NOWAIT"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_update_comes_after_order_by_limit_offset_in_emitted_sql() {
+        // Postgres's own grammar places the locking clause last — confirm
+        // the emitter matches, not just that all the pieces are present.
+        let out = compile_and_emit(
+            "SELECT Person { name } ORDER BY .name OFFSET 1 LIMIT 5 FOR UPDATE SKIP LOCKED",
+        );
+        let order_pos = out.sql.find("ORDER BY").unwrap();
+        let offset_pos = out.sql.find("OFFSET").unwrap();
+        let limit_pos = out.sql.find("LIMIT").unwrap();
+        let for_pos = out.sql.find("FOR UPDATE").unwrap();
+        assert!(order_pos < offset_pos && offset_pos < limit_pos && limit_pos < for_pos, "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_update_combined_with_distinct_is_rejected() {
+        let ast = parse::parse("SELECT DISTINCT Person FOR UPDATE").expect("parse failed");
+        let err = ir::compile(&ast, &make_schema()).err().expect("expected a compile error");
+        assert!(err.to_string().contains("DISTINCT"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_for_update_combined_with_select_over_insert_is_rejected() {
+        let ast = parse::parse("SELECT (INSERT Person { name := 'Alice' }) { name } FOR UPDATE")
+            .expect("parse failed");
+        let err = ir::compile(&ast, &make_schema()).err().expect("expected a compile error");
+        assert!(err.to_string().contains("INSERT"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_for_update_on_an_interface_type_is_rejected() {
+        fn id_prop() -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: "id".into(), pg_type: "uuid".into(), nullable: false,
+                default_sql: Some("uuidv7()".into()), default_pyql: None, description: None,
+                check_constraints: vec![], is_exclusive: true, is_pk: true, is_readonly: true,
+                rewrites: vec![], tuple_members: None, column_type: None,
+            }
+        }
+        let schema = SchemaDescriptor {
+            types: vec![
+                TypeDescriptor {
+                    name: "Account".into(), module: "default".into(), table: "Account".into(),
+                    abstract_: true, materialized: true, description: None,
+                    parents: vec![], interfaces: vec![],
+                    properties: vec![id_prop()],
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "Individual".into(), module: "default".into(), table: "Individual".into(),
+                    abstract_: false, materialized: true, description: None,
+                    parents: vec![], interfaces: vec!["default::Account".into()],
+                    properties: vec![id_prop()],
+                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
+                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
+                    triggers: vec![], junction: false, signals: vec![],
+                },
+            ],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
+            functions: vec![], aliases: vec![],
+        };
+        let ast = parse::parse("SELECT Account FOR UPDATE").expect("parse failed");
+        let err = ir::compile(&ast, &schema).err().expect("expected a compile error");
+        assert!(err.to_string().contains("interface"), "unexpected: {err}");
     }
 
     #[test]
