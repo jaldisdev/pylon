@@ -123,6 +123,7 @@ def finalize(
     from pylon.config import load_config
     from pylon.schema._globals import collect_all_globals
     from pylon.schema._aliases import collect_module_aliases
+    from pylon.schema._channels import collect_module_channels
     from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot, signals_snapshot
     from pylon.schema._walker import walk
     from pylon.schema._signal_registry import build_index as build_signal_index, _set_index as _set_signal_index
@@ -136,15 +137,18 @@ def finalize(
 
     globals_: list[Any] = collect_all_globals(schema_dir, modules)
 
-    # Collect aliases from every non-private schema file that was imported.
+    # Collect aliases and channels from every non-private schema file that was imported.
     aliases_: list[Any] = []
+    channels_: list[Any] = []
     for py_file in sorted(schema_dir.glob("*.py")):
         stem = py_file.stem
         if not stem.startswith("_") and stem in sys.modules:
             aliases_.extend(collect_module_aliases(sys.modules[stem]))
+            channels_.extend(collect_module_channels(sys.modules[stem]))
     if modules:
         for mod in modules:
             aliases_.extend(collect_module_aliases(mod))
+            channels_.extend(collect_module_channels(mod))
 
     functions = functions_snapshot()
     named_tuples = named_tuples_snapshot()
@@ -158,6 +162,7 @@ def finalize(
         aliases=aliases_,
         named_tuples=named_tuples,
         signals=signals,
+        channels=channels_,
     )
     _set_schema(schema)
     _set_signal_index(build_signal_index(signals))

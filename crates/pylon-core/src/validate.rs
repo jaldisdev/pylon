@@ -323,7 +323,7 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions,
-            aliases: vec![],
+            aliases: vec![], channels: vec![],
         }
     }
 

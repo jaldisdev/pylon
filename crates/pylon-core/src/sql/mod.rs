@@ -3175,7 +3175,7 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -3387,7 +3387,7 @@ mod tests {
                 },
             ],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ast = parse::parse("SELECT Account FOR UPDATE").expect("parse failed");
         let err = ir::compile(&ast, &schema).err().expect("expected a compile error");
@@ -3593,7 +3593,7 @@ mod tests {
                     signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -3685,7 +3685,7 @@ mod tests {
                     signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -3883,7 +3883,7 @@ mod tests {
                     signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -4878,7 +4878,7 @@ mod tests {
                 },
             ],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let out = compile_and_emit_with(
             "UPDATE Account FILTER .email = $email \
@@ -4960,7 +4960,7 @@ mod tests {
                 },
             ],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let out = compile_and_emit_with(
             "SELECT Account { *, [is Individual].* }",
@@ -5909,7 +5909,7 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![],
+            aliases: vec![], channels: vec![],
         };
         let out = compile_and_emit_with("SELECT Person { address }", &schema);
         assert!(out.sql.contains("::jsonb"), "got:\n{}", out.sql);
@@ -5996,7 +5996,7 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![],
+            aliases: vec![], channels: vec![],
         };
         let out = compile_and_emit_with("SELECT Person.address", &schema);
         match &out.shape.root {
@@ -6064,7 +6064,7 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![],
+            aliases: vec![], channels: vec![],
         };
         // Regression: a structural (unnamed) tuple property previously failed
         // path traversal with "'address' is a scalar property, not a link —

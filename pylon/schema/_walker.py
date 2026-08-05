@@ -1157,6 +1157,89 @@ def _build_global_descriptor(g: Any, _core: Any) -> Any:
     )
 
 
+# ── Channel descriptor builder ────────────────────────────────────────────────
+
+
+def _build_channel_descriptor(c: Any, _core: Any) -> Any:
+    from ._channels import wire_name_for_channel
+    from pylon.datatypes import Object as _PylonObject
+
+    wire_name = wire_name_for_channel(c)
+    payload_type = c.payload_type
+
+    # `pylon.Object(doc_id=uuid.UUID, score=float)` — an ad hoc named-field
+    # payload with no backing table. Reuses the exact same `Object` class
+    # query results decode into: the constructor doesn't care whether its
+    # kwarg values are data or types, so this call already produced a real
+    # `Object` instance whose attributes happen to hold type objects —
+    # introspect those back out via `dataclasses.fields`.
+    if isinstance(payload_type, _PylonObject):
+        fields = dataclasses.fields(payload_type)
+        object_fields = [(f.name, _to_pg_type(getattr(payload_type, f.name))) for f in fields]
+        return _core.ChannelDescriptor(
+            name=c.name,
+            module=c.module,
+            wire_name=wire_name,
+            payload_kind="object",
+            payload_object_fields=object_fields,
+            description=c.description,
+        )
+
+    # A registered @pylon.type/@pylon.interface — the whole object is the payload.
+    if isinstance(payload_type, type) and _is_pylon_type(payload_type):
+        type_ref = _qualified(_pylon_module_of(payload_type), _pylon_name_of(payload_type))
+        return _core.ChannelDescriptor(
+            name=c.name,
+            module=c.module,
+            wire_name=wire_name,
+            payload_kind="type",
+            payload_type_ref=type_ref,
+            description=c.description,
+        )
+
+    # Otherwise a plain scalar (str, uuid.UUID, a registered custom scalar, ...).
+    pg_type = _to_pg_type(payload_type)
+    return _core.ChannelDescriptor(
+        name=c.name,
+        module=c.module,
+        wire_name=wire_name,
+        payload_kind="scalar",
+        payload_scalar_pg_type=pg_type,
+        description=c.description,
+    )
+
+
+def _validate_channels(channels: list) -> None:
+    """Cross-schema wire-name uniqueness + reserved-prefix rejection.
+
+    Postgres NOTIFY/LISTEN channels have no schema namespacing at all (a
+    flat, database-wide identifier space) — unlike every other named
+    construct here, a name collision between two Channels in *different*
+    Pylon modules is just as real a conflict as one in the same module, so
+    this checks across the whole schema rather than per-module.
+    """
+    from ._channels import RESERVED_WIRE_NAME_PREFIX, wire_name_for_channel
+
+    seen: dict[str, Any] = {}
+    for c in channels:
+        wire_name = wire_name_for_channel(c)
+        if wire_name.startswith(RESERVED_WIRE_NAME_PREFIX):
+            raise SchemaError(
+                f"Channel {_qualified(c.module, c.name)!r} has wire name {wire_name!r}, "
+                f"which starts with the reserved {RESERVED_WIRE_NAME_PREFIX!r} prefix "
+                f"(used internally by Pylon's own cache/signal/index channels) — "
+                f"pick a different name= or variable name."
+            )
+        if wire_name in seen:
+            other = seen[wire_name]
+            raise SchemaError(
+                f"Duplicate channel wire name {wire_name!r}: "
+                f"both {_qualified(other.module, other.name)!r} and {_qualified(c.module, c.name)!r} "
+                f"resolve to the same PostgreSQL NOTIFY/LISTEN channel."
+            )
+        seen[wire_name] = c
+
+
 # ── Function descriptor builder ───────────────────────────────────────────────
 
 
@@ -1332,6 +1415,7 @@ def walk(
     aliases: list[Any] | None = None,
     named_tuples: list[type] | None = None,
     signals: list[Any] | None = None,
+    channels: list[Any] | None = None,
 ) -> Any:
     """Walk the collected schema and return a pylon._core.SchemaDescriptor.
 
@@ -1367,6 +1451,10 @@ def walk(
     for reg in signals or ():
         signal_ops_by_class[reg.target] = signal_ops_by_class.get(reg.target, 0) | reg.on
 
+    # Phase 4.7 — channel wire-name validation (cross-schema: Postgres
+    # NOTIFY/LISTEN channels have no schema namespacing at all).
+    _validate_channels(channels or [])
+
     # Phase 5+6 — build PyO3 descriptors
     type_descs = [
         _build_type_descriptor(cls, class_to_qname, _core, junction_to_ml, signal_ops_by_class)
@@ -1387,6 +1475,7 @@ def walk(
         _core.AliasDescriptor(name=a.name, module=a.module, expr=a.expr)
         for a in (aliases or [])
     ]
+    channel_descs = [_build_channel_descriptor(c, _core) for c in (channels or [])]
 
     schema = _core.SchemaDescriptor(
         types=type_descs,
@@ -1396,6 +1485,7 @@ def walk(
         globals=global_descs,
         functions=fn_descs,
         aliases=alias_descs,
+        channels=channel_descs,
     )
     # Every function body, computed-pointer expression, and property/link
     # default gets compiled and its actual produced type checked against its

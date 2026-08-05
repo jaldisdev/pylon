@@ -441,3 +441,95 @@ def test_reload_schema_collects_aliases(live_pool, tmp_path, unique_module):
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_channel_addition_is_captured_by_migration_create(live_pool, tmp_path, unique_module):
+    """A `Channel` has zero physical DDL footprint (no table, no column, no
+    catalog object at all — Postgres NOTIFY/LISTEN channels aren't backed by
+    anything) — exactly the kind of change the `schema_content_changed` fix
+    exists to catch. Proves the full CLI flow end to end: a schema whose
+    *only* change is adding a Channel still produces a migration through
+    `create`, and `apply` still syncs `_pylon."Schema"` to include it.
+    """
+    import json
+    import re
+
+    from click.testing import CliRunner
+
+    from conftest import live_db_dsn
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module("live_channel_reload")
+    (tmp_path / "migrations").mkdir()
+    schema_file = tmp_path / "channel_widget_schema.py"
+
+    def write_schema(with_channel: bool) -> None:
+        channel_line = "\nUserUpdates = pylon.Channel(Widget)\n" if with_channel else ""
+        schema_file.write_text(
+            "import pylon.schema as pylon\n\n"
+            f"@pylon.type(module={module!r}, name='Widget')\n"
+            "class Widget:\n"
+            "    name: str\n"
+            f"{channel_line}"
+        )
+
+    write_schema(with_channel=False)
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {"config": config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / "migrations"
+
+    try:
+        # First migration: real DDL (creates the table), no Channel yet.
+        result = runner.invoke(migration.commands["create"], ["--non-interactive"], obj=obj)
+        assert result.exit_code == 0, result.output
+        first_files = sorted(migrations_dir.glob("*.sql"))
+        assert len(first_files) == 1, result.output
+
+        result = runner.invoke(migration.commands["apply"], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        # Add the Channel — zero DDL footprint, so the diff is empty. Before
+        # the schema_content_changed fix this made `create` a silent no-op.
+        write_schema(with_channel=True)
+
+        result = runner.invoke(migration.commands["create"], ["--non-interactive"], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert "No schema changes detected" not in result.output, result.output
+
+        second_files = sorted(migrations_dir.glob("*.sql"))
+        assert len(second_files) == 2, [f.name for f in second_files]
+        new_file = [f for f in second_files if f not in first_files][0]
+        assert "non-DDL schema change" in new_file.read_text()
+
+        result = runner.invoke(migration.commands["apply"], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        async def check() -> None:
+            from pylon._core import migration_read_schema_snapshot
+
+            snapshot_json = await migration_read_schema_snapshot(live_pool)
+            assert snapshot_json is not None
+            snapshot = json.loads(snapshot_json)
+            channel = next(
+                (c for c in snapshot["channels"] if c["name"] == "UserUpdates"),
+                None,
+            )
+            assert channel is not None, snapshot["channels"]
+            assert channel["payload"] == {"Type": f"{module}::Widget"}
+
+        asyncio.run(check())
+    finally:
+        migration_ids = re.findall(r"^-- migration: (\S+)$", "\n".join(f.read_text() for f in migrations_dir.glob("*.sql")), re.MULTILINE)
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())
