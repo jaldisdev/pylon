@@ -530,13 +530,21 @@ def _reload_schema(config):
             )
         importlib.import_module(stem)
 
+    from pylon.schema._aliases import collect_module_aliases
     from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot, signals_snapshot
     types, enums, custom_scalars = snapshot()
     globals_: list = []
+    # `_finalize.finalize()` (the in-process path) has always collected
+    # aliases here too — this reload path (migration create/apply/watch)
+    # never did, so any `Alias` a project declared would silently vanish
+    # from every migration and from `_pylon."Schema"` the moment one was
+    # ever applied, even though `pylon.finalize()` itself saw it fine.
+    aliases_: list = []
     for py_file in sorted(schema_dir.glob("*.py")):
         stem = py_file.stem
         if not stem.startswith("_") and stem in sys.modules:
             globals_.extend(collect_module_globals(sys.modules[stem]))
+            aliases_.extend(collect_module_aliases(sys.modules[stem]))
 
     schema = walk(
         types,
@@ -544,6 +552,7 @@ def _reload_schema(config):
         custom_scalars,
         globals_,
         functions=functions_snapshot(),
+        aliases=aliases_,
         named_tuples=named_tuples_snapshot(),
         signals=signals_snapshot(),
     )

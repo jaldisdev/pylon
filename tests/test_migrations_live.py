@@ -358,3 +358,86 @@ def test_readonly_only_change_is_captured_by_migration_create(live_pool, tmp_pat
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_reload_schema_collects_aliases(live_pool, tmp_path, unique_module):
+    """`_reload_schema()` (used by `migration create`/`apply`/`watch`) never
+    collected `Alias` declarations at all, unlike `pylon.finalize()`'s own
+    schema-building path — so any `Alias` a project declared would silently
+    vanish from every migration and from `_pylon."Schema"` the moment a
+    migration was ever applied through the normal CLI flow, even though
+    `pylon.finalize()` (the in-process path) saw it fine. This proves a
+    single `create` + `apply` now round-trips an Alias into `_pylon."Schema"`.
+    """
+    import json
+    import re
+
+    from click.testing import CliRunner
+
+    from conftest import live_db_dsn
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module("live_alias_reload")
+    (tmp_path / "migrations").mkdir()
+    # A filename distinct from other tests in this file matters here, not
+    # just for tidiness: `_reload_schema` imports by module *name*
+    # (`importlib.import_module(stem)`), and `sys.modules` caches by that
+    # same name regardless of which `tmp_path` it came from — a later test
+    # reusing "widget_schema" would silently get an already-cached stale
+    # module object from an earlier test's different tmp_path instead of
+    # importing this file at all (confirmed while writing this test). Not a
+    # real production concern since a real project's schema_dir is stable
+    # across invocations, but it bites two tests in the same process that
+    # happen to pick the same schema filename.
+    (tmp_path / "alias_widget_schema.py").write_text(
+        "import pylon.schema as pylon\n\n"
+        f"@pylon.type(module={module!r}, name='Widget')\n"
+        "class Widget:\n"
+        "    name: str\n\n"
+        "published_widgets: pylon.Alias[\"select Widget filter .name = 'keep'\"]\n"
+    )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {"config": config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / "migrations"
+
+    try:
+        result = runner.invoke(migration.commands["create"], ["--non-interactive"], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(migration.commands["apply"], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        async def check() -> None:
+            from pylon._core import migration_read_schema_snapshot
+
+            snapshot_json = await migration_read_schema_snapshot(live_pool)
+            assert snapshot_json is not None
+            snapshot = json.loads(snapshot_json)
+            # An Alias's own Pylon module comes from the schema *file's*
+            # module (its filename stem, absent a `__pylon_module__`
+            # override) — not from the `module=` kwarg on any type declared
+            # in it, so this doesn't match `module` (the unique() value used
+            # for Widget's own type-level module).
+            alias = next(
+                (a for a in snapshot["aliases"] if a["name"] == "published_widgets"),
+                None,
+            )
+            assert alias is not None, snapshot["aliases"]
+            assert alias["expr"] == "select Widget filter .name = 'keep'"
+
+        asyncio.run(check())
+    finally:
+        migration_ids = re.findall(r"^-- migration: (\S+)$", "\n".join(f.read_text() for f in migrations_dir.glob("*.sql")), re.MULTILINE)
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())
