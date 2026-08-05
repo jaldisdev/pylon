@@ -6,7 +6,7 @@
 insert Person { name := 'Alice', age := 30 }
 ```
 
-`insert Type { field := expr, ... }`. Every required, non-defaulted property/link needs an assignment; `id` is never assigned (Pylon always generates it) unless the client explicitly opts into `allow_user_specified_id` (see [Client library § with_config](../client.md#with_config)).
+`insert Type { field := expr, ... }`. Every required, non-defaulted property/link needs an assignment; `id` is never assigned (Pylon always generates it) unless the client explicitly opts into `allow_user_specified_id` (see [Python client § with_config](../client/python.md#with_config)).
 
 Assign a link by subquery:
 
@@ -78,4 +78,4 @@ select (update Person filter .id = <uuid>$id set { age := .age + 1 }) { age }
 select (delete Person filter .id = <uuid>$id) { name }
 ```
 
-See [Client library](../client.md) for `execute()` (discard the result entirely) vs. `query`/`query_single` (get it back shaped).
+See [Client libraries](../client/index.md) for `execute()` (discard the result entirely) vs. `query`/`query_single` (get it back shaped).

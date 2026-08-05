@@ -131,7 +131,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`client.query_required_single` compiles the PyQL string to SQL, executes it, and hydrates the result into a real Python object matching your schema class. See [PyQL](pyql/index.md) for the query language itself and [Client library](client.md) for every method `Client` exposes (`query`, `query_single`, `execute`, transactions, `with_config`, `save`).
+`client.query_required_single` compiles the PyQL string to SQL, executes it, and hydrates the result into a real Python object matching your schema class. See [PyQL](pyql/index.md) for the query language itself and [Python client](client/python.md) for every method `Client` exposes (`query`, `query_single`, `execute`, transactions, `with_config`, `save`).
 
 ## Where to next
 

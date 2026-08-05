@@ -18,7 +18,7 @@ current_user: pylon.Global[
 
 Two kinds, distinguished by whether a PyQL expression is given as the second type-subscript argument:
 
-- **Session global** — no expression. Its value is injected per-request from the client (`client.with_globals({"module::name": value})` — see [Client library](../client.md#with_globals)) or, in the REPL, via `set global name := expr;`. Referenced in PyQL as `global name`.
+- **Session global** — no expression. Its value is injected per-request from the client (`client.with_globals({"module::name": value})` — see [Python client § with_globals](../client/python.md#with_globals)) or, in the REPL, via `set global name := expr;`. Referenced in PyQL as `global name`.
 - **Computed global** — a PyQL expression evaluated at query time whenever `global name` is referenced; can select anything, not just a scalar (the example above selects a `User`'s `id`). Not injected by the client at all — there's nothing to inject, the expression *is* the value.
 
 `Global[T]`/`Global[T | None]` follow the same optional-via-union convention as `Property`. A computed global's declared type isn't checked against its expression's actual output today — see the note in [Validation](validation.md#what-isnt-checked).

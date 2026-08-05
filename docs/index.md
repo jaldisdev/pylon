@@ -48,5 +48,5 @@ Built-in functions callable from PyQL, grouped by namespace. See [`stdlib/index.
 - **[`pylon.toml` configuration](config.md)** — every config key, CLI/env/file precedence
 - **[CLI reference](cli.md)** — every `pylon` subcommand and flag
 - **[Migrations](migrations.md)** — the diff-engine workflow in depth
-- **[Client library](client.md)** — the Python `Client`/`AsyncTransaction` API
+- **[Client libraries](client/index.md)** — Python `Client`/`AsyncTransaction`, and the native Rust `pylon-client`
 - **[Server](server.md)** — `pylon-server`, the standalone Rust HTTP server, background workers, deployment
