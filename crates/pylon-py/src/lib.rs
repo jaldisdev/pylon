@@ -1880,6 +1880,22 @@ fn missing_extension_ddl(target: &SchemaDescriptor, current: &DbState) -> Vec<St
     core::diff::missing_extension_ddl(&target.inner, &current.inner)
 }
 
+/// True when `target` differs from `previous` in any way — including
+/// schema semantics with zero physical DDL footprint (`readonly`,
+/// rewrites, computed globals, pub/sub `Channel`s, ...) that
+/// `diff_schema_steps`/`diff_schema_ops`/`missing_extension_ddl` can never
+/// see, since there's no column/constraint/catalog object for those to
+/// introspect. `migration create`/`watch` must treat this as "there is a
+/// change" even when the DDL-step list above comes back empty — otherwise
+/// that class of change can never be migrated at all, not just "doesn't
+/// require" one. `previous=None` (no migration ever applied) compares
+/// against an empty schema. See `core::diff::schema_content_changed`'s own
+/// doc comment for the full rationale.
+#[pyfunction]
+fn schema_content_changed(target: &SchemaDescriptor, previous: Option<&SchemaDescriptor>) -> bool {
+    core::diff::schema_content_changed(&target.inner, previous.map(|p| &p.inner))
+}
+
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
 /// Returns a `DbState` object usable as a diff baseline for `diff_schema_ops` etc.
 #[pyfunction]
@@ -2190,6 +2206,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(schema_to_db_state_json, m)?)?;
     m.add_function(wrap_pyfunction!(missing_extension_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
+    m.add_function(wrap_pyfunction!(schema_content_changed, m)?)?;
     m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;
 
     // Cache

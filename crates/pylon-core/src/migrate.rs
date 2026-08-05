@@ -68,6 +68,11 @@ pub async fn ensure_tracking_tables(pool: &PgPool) -> Result<()> {
             db_state    jsonb       NULL,
             applied_at  timestamptz NULL
         );
+        -- Added after the table above already shipped, so existing
+        -- databases need the column bolted on rather than created fresh —
+        -- ADD COLUMN IF NOT EXISTS makes this safe to run again on a
+        -- table that was CREATE'd (not ALTER'd) before this column existed.
+        ALTER TABLE _pylon."Migrations" ADD COLUMN IF NOT EXISTS schema_state jsonb NULL;
         CREATE TABLE IF NOT EXISTS _pylon."Progress" (
             id          text        PRIMARY KEY,
             step_index  integer     NOT NULL,
@@ -120,24 +125,36 @@ pub async fn read_schema_snapshot(pool: &PgPool) -> Result<Option<String>> {
 
 /// One row of `_pylon."Migrations"` — covers both `apply`'s own tracking
 /// logic (id/onto/applied, for computing the applied tip) and `migration
-/// create`'s diff-baseline lookup (db_state, the JSON snapshot recorded on
-/// the tip row by `apply`). `filename` isn't read — nothing in this
-/// codebase actually consults it once a row exists.
+/// create`'s diff-baseline lookup (db_state and schema_state, the JSON
+/// snapshots recorded on the tip row by `apply`). `filename` isn't read —
+/// nothing in this codebase actually consults it once a row exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackingRow {
     pub id: String,
     pub onto: String,
-    /// The `db_state` JSON snapshot, pre-rendered as text (`db_state::text`)
-    /// rather than decoded as jsonb — callers (`db_state_from_json`) want
-    /// the raw JSON string to re-parse, not an already-decoded value tree.
+    /// The `db_state` JSON snapshot (catalog/DDL-visible shape only),
+    /// pre-rendered as text (`db_state::text`) rather than decoded as
+    /// jsonb — callers (`db_state_from_json`) want the raw JSON string to
+    /// re-parse, not an already-decoded value tree.
     pub db_state: Option<String>,
+    /// The full `SchemaDescriptor` JSON as of this migration (everything
+    /// `db_state` has, plus schema semantics with zero DDL footprint —
+    /// `readonly`, rewrites, `Channel`s, ...). `migration create` diffs
+    /// against *this* (the tip row's own recorded state), not against
+    /// `_pylon."Schema"`, for the same reason `db_state` already does:
+    /// `watch` may have pushed ad hoc changes straight to the live database
+    /// without ever going through `migration create`, and those must still
+    /// show up as a pending change here rather than silently being treated
+    /// as already-baselined. Pre-rendered as text for the same reason as
+    /// `db_state` — re-parse via `SchemaDescriptor.from_json`.
+    pub schema_state: Option<String>,
     pub applied: bool,
 }
 
 pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
     let rows = pool
         .query_typed(
-            r#"SELECT (id, onto, (db_state::text), (applied_at IS NOT NULL)) AS result FROM _pylon."Migrations""#,
+            r#"SELECT (id, onto, (db_state::text), (schema_state::text), (applied_at IS NOT NULL)) AS result FROM _pylon."Migrations""#,
             &[],
             &pylon_pgcon::ExtensionOids::default(),
         )
@@ -146,8 +163,8 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
         .into_iter()
         .filter_map(|row| {
             let CachedValue::Composite(fields) = row else { return None };
-            let [CachedValue::Str(id), CachedValue::Str(onto), db_state, CachedValue::Bool(applied)] =
-                <[CachedValue; 4]>::try_from(fields).ok()?
+            let [CachedValue::Str(id), CachedValue::Str(onto), db_state, schema_state, CachedValue::Bool(applied)] =
+                <[CachedValue; 5]>::try_from(fields).ok()?
             else {
                 return None;
             };
@@ -155,7 +172,11 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
                 CachedValue::Str(s) => Some(s),
                 _ => None,
             };
-            Some(TrackingRow { id, onto, db_state, applied })
+            let schema_state = match schema_state {
+                CachedValue::Str(s) => Some(s),
+                _ => None,
+            };
+            Some(TrackingRow { id, onto, db_state, schema_state, applied })
         })
         .collect())
 }
@@ -533,7 +554,7 @@ mod tests {
     #[ignore]
     async fn applied_tip_is_none_with_no_applied_rows() {
         assert_eq!(applied_tip(&[]), None);
-        let all_pending = vec![TrackingRow { id: "m1a".into(), onto: "initial".into(), db_state: None, applied: false }];
+        let all_pending = vec![TrackingRow { id: "m1a".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: false }];
         assert_eq!(applied_tip(&all_pending), None);
     }
 
@@ -541,9 +562,9 @@ mod tests {
     #[ignore]
     async fn applied_tip_is_the_row_with_no_descendant() {
         let tracking = vec![
-            TrackingRow { id: "m1a".into(), onto: "initial".into(), db_state: None, applied: true },
-            TrackingRow { id: "m1b".into(), onto: "m1a".into(), db_state: None, applied: true },
-            TrackingRow { id: "m1c".into(), onto: "m1b".into(), db_state: None, applied: false }, // not applied yet
+            TrackingRow { id: "m1a".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
+            TrackingRow { id: "m1b".into(), onto: "m1a".into(), db_state: None, schema_state: None, applied: true },
+            TrackingRow { id: "m1c".into(), onto: "m1b".into(), db_state: None, schema_state: None, applied: false }, // not applied yet
         ];
         assert_eq!(applied_tip(&tracking), Some("m1b".to_string()));
     }
@@ -556,9 +577,9 @@ mod tests {
         // must always return the same answer, not one that depends on
         // hash-map iteration order (see the doc comment on `applied_tip`).
         let tracking = vec![
-            TrackingRow { id: "m1zzz".into(), onto: "initial".into(), db_state: None, applied: true },
-            TrackingRow { id: "m1aaa".into(), onto: "initial".into(), db_state: None, applied: true },
-            TrackingRow { id: "m1mmm".into(), onto: "initial".into(), db_state: None, applied: true },
+            TrackingRow { id: "m1zzz".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
+            TrackingRow { id: "m1aaa".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
+            TrackingRow { id: "m1mmm".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
         ];
         for _ in 0..20 {
             assert_eq!(applied_tip(&tracking), Some("m1aaa".to_string()));
@@ -585,6 +606,30 @@ mod tests {
         assert!(row.applied);
         assert_eq!(row.onto, "initial");
         assert_eq!(row.db_state, None, "db_state is only ever set separately, by `migration create`'s own UPDATE");
+        assert_eq!(row.schema_state, None, "schema_state is only ever set separately, by `apply`'s own UPDATE");
+
+        cleanup_migration_row(&pool, &m.id).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn read_tracking_decodes_schema_state_as_raw_json_text() {
+        let pool = test_pool().await;
+        let m = make_migration("initial", &body("SELECT 1;"));
+        record_applied(&pool, &m.id, &m.onto, &m.filename).await.unwrap();
+
+        pool.execute_typed(
+            r#"UPDATE _pylon."Migrations" SET schema_state = $1::jsonb WHERE id = $2"#,
+            &[CachedValue::Str(r#"{"types":[]}"#.to_string()), CachedValue::Str(m.id.clone())],
+        )
+        .await
+        .unwrap();
+
+        let tracking = read_tracking(&pool).await.unwrap();
+        let row = tracking.iter().find(|r| r.id == m.id).unwrap();
+        // Raw text, not a decoded CachedValue::Object tree — `SchemaDescriptor::from_json`
+        // (the pyo3-exposed consumer) re-parses this string itself.
+        assert_eq!(row.schema_state.as_deref(), Some(r#"{"types": []}"#));
 
         cleanup_migration_row(&pool, &m.id).await;
     }
