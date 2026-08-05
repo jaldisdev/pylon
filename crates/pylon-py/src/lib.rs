@@ -1217,6 +1217,43 @@ impl ChannelDescriptor {
 
     #[getter]
     fn description(&self) -> Option<&str> { self.inner.description.as_deref() }
+
+    /// One of `"type"` / `"scalar"` / `"object"` — which of the three
+    /// getters below is populated. Lets Python-side code (e.g.
+    /// `Client.listen()`'s payload decoder) branch on the payload kind
+    /// without needing `ChannelPayload` exposed as its own pyclass.
+    #[getter]
+    fn payload_kind(&self) -> &str {
+        match &self.inner.payload {
+            core::schema::ChannelPayload::Type(_) => "type",
+            core::schema::ChannelPayload::Scalar(_) => "scalar",
+            core::schema::ChannelPayload::Object(_) => "object",
+        }
+    }
+
+    #[getter]
+    fn payload_type_ref(&self) -> Option<&str> {
+        match &self.inner.payload {
+            core::schema::ChannelPayload::Type(qname) => Some(qname),
+            _ => None,
+        }
+    }
+
+    #[getter]
+    fn payload_scalar_pg_type(&self) -> Option<&str> {
+        match &self.inner.payload {
+            core::schema::ChannelPayload::Scalar(pg_type) => Some(pg_type),
+            _ => None,
+        }
+    }
+
+    #[getter]
+    fn payload_object_fields(&self) -> Option<Vec<(String, String)>> {
+        match &self.inner.payload {
+            core::schema::ChannelPayload::Object(fields) => Some(fields.clone()),
+            _ => None,
+        }
+    }
 }
 
 // ── Function descriptors ────────────────────────────────────────────────────────
@@ -1383,6 +1420,17 @@ impl SchemaDescriptor {
     #[getter]
     fn types(&self) -> Vec<TypeDescriptor> {
         self.inner.types.iter().map(|t| TypeDescriptor { inner: t.clone() }).collect()
+    }
+
+    /// Every declared `Channel` — the runtime source of truth for
+    /// `Client.listen()` to resolve a channel name to its wire name and
+    /// payload shape (this is read from the *migrated* schema singleton,
+    /// not the transient Python-side `Channel`/`ChannelDescriptor` objects
+    /// `pylon.schema._channels.collect_module_channels` builds at
+    /// `finalize()` time and discards — see that module's own docs).
+    #[getter]
+    fn channels(&self) -> Vec<ChannelDescriptor> {
+        self.inner.channels.iter().map(|c| ChannelDescriptor { inner: c.clone() }).collect()
     }
 
     #[getter]

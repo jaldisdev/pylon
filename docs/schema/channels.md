@@ -36,6 +36,6 @@ Wire names starting with `pylon_` are rejected outright — that prefix is reser
 
 A `Channel` has no backing table, column, or any other catalog object — `NOTIFY`/`LISTEN` needs nothing created in Postgres ahead of time. This means adding, removing, or renaming a `Channel` produces no DDL at all, but it still needs to be recorded: `pylon migration create` detects this kind of schema-only change (the same mechanism that also covers a bare `Readonly` flip or a new `Rewrite`) and still produces a migration, so the change is properly tracked and reflected once applied — see [Migrations](../migrations.md).
 
-## What's not built yet
+## Sending and receiving
 
-Sending a payload (`notify()`) is covered in [PyQL: globals and functions](../pyql/globals-and-functions.md#notify--notify_raw), including using it from a `Trigger` handler. Receiving payloads (a PyQL `listen`/`unlisten` statement, and a typed `client.listen()` on the Python side) doesn't exist yet.
+Sending a payload (`notify()`) is covered in [PyQL: globals and functions](../pyql/globals-and-functions.md#notify--notify_raw), including using it from a `Trigger` handler. Receiving payloads is a client-library method, not PyQL syntax — see [`Client.listen()`](../client.md#listen) — since a `LISTEN` subscription is inherently a long-lived, per-connection thing, not a query that returns a result set.

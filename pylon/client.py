@@ -420,6 +420,54 @@ class Client:
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         await pool.execute_compiled(compiled, params)
 
+    async def listen(self, channel: str) -> AsyncGenerator[Any, None]:
+        """Listen for `NOTIFY` payloads on a schema-declared `Channel`.
+
+        Opens a dedicated (non-pooled) connection for the lifetime of the
+        returned async generator — a `LISTEN` registration is per-session,
+        so running it on a pooled connection would leak the subscription
+        onto whatever unrelated query later borrows that same connection
+        back out of the pool. The dedicated connection (and the server-side
+        subscription with it) closes automatically once iteration stops —
+        breaking out of the loop, an unhandled exception, or the generator
+        being garbage-collected all drop the last reference to it.
+
+        Yields decoded payloads matching the Channel's own declared shape
+        (see `pylon.schema._channels.decode_channel_payload`): a bare
+        `uuid.UUID` for a Type-shaped channel (the changed row's `id`, not
+        a fetched object — see `docs/schema/channels.md`), the declared
+        scalar's native Python value for a Scalar-shaped channel, or a
+        `pylon.Object` for an Object-shaped channel. A payload that doesn't
+        actually match the declared shape raises
+        :class:`~pylon.exceptions.QueryError` — the loop ends there rather
+        than silently skipping the bad payload.
+
+        *channel* is a bare or `module::name` reference, matching how a
+        schema author already writes it inside a `notify(...)` call.
+
+        Usage::
+
+            async for payload in client.listen("UserUpdates"):
+                print(payload)
+        """
+        from pylon._core import pgcon_listen
+        from pylon.query import _get_schema
+        from pylon.schema._channels import decode_channel_payload, resolve_channel
+
+        schema = _get_schema()
+        ch = resolve_channel(schema, channel)
+
+        dsn = self._config.database.dsn or _build_dsn(self._config.database)
+        dsn = dsn.replace("pylon://", "postgresql://", 1)
+        conn = await pgcon_listen(dsn)
+
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        await conn.add_listener(ch.wire_name, lambda *args: queue.put_nowait(args[-1]))
+
+        while True:
+            raw_payload = await queue.get()
+            yield decode_channel_payload(ch, raw_payload)
+
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
 
