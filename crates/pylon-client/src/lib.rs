@@ -35,12 +35,14 @@ mod client;
 mod decode;
 mod error;
 mod exec;
+mod listen;
 mod schema;
 mod transaction;
 mod value;
 
 pub use client::{Builder, Client, TxFuture};
 pub use error::{Error, Result};
+pub use listen::ChannelListener;
 pub use pylon_cache::CacheStats;
 pub use pylon_value::CachedValue;
 pub use transaction::{Isolation, Transaction};

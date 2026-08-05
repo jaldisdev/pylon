@@ -31,7 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pylon_client::{CachedValue, Client, Isolation, Value};
 use pylon_core::export::export_schema;
-use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
+use pylon_core::schema::{
+    ChannelDescriptor, ChannelPayload, PropertyDescriptor, SchemaDescriptor, TriggerDescriptor, TypeDescriptor,
+};
 
 fn test_dsn() -> String {
     std::env::var("PYLON_PGCON_TEST_DSN")
@@ -67,6 +69,24 @@ fn text_prop(name: &str) -> PropertyDescriptor {
     PropertyDescriptor {
         name: name.into(),
         pg_type: "text".into(),
+        nullable: false,
+        default_sql: None,
+        default_pyql: None,
+        description: None,
+        check_constraints: vec![],
+        is_exclusive: false,
+        is_pk: false,
+        is_readonly: false,
+        rewrites: vec![],
+        tuple_members: None,
+        column_type: None,
+    }
+}
+
+fn float_prop(name: &str) -> PropertyDescriptor {
+    PropertyDescriptor {
+        name: name.into(),
+        pg_type: "float8".into(),
         nullable: false,
         default_sql: None,
         default_pyql: None,
@@ -335,4 +355,149 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     let third = client.query(&query, &[]).await.unwrap();
     let Value::Object(person) = &third[0] else { panic!("expected Object") };
     assert_eq!(person.get("name"), Some(&Value::Str("Mutated".into())));
+}
+
+// ── Client::listen() ────────────────────────────────────────────────────────
+
+/// Waits (up to ~5s) for `listener.recv()` to yield something — a real
+/// `NOTIFY` arrives on the listener's own background task asynchronously,
+/// so this can't assume it's already there the instant the triggering
+/// query returns (same convention `pylon-pgcon`'s own listener tests use).
+async fn recv_with_timeout(listener: &mut pylon_client::ChannelListener) -> pylon_client::Result<Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+        .await
+        .expect("timed out waiting for a notification")
+        .expect("listener closed with no notification")
+}
+
+#[tokio::test]
+#[ignore]
+async fn listen_decodes_a_scalar_channel_payload() {
+    let module = unique_module("live_client_listen_scalar");
+    let mut schema = person_schema(&module);
+    schema.types[0].triggers = vec![TriggerDescriptor {
+        on: 1, // On::Insert
+        timing: "After".into(),
+        handler: "select notify(Pings, __new__.name)".into(),
+    }];
+    schema.channels = vec![ChannelDescriptor {
+        name: "Pings".into(),
+        module: module.clone(),
+        wire_name: format!("{module}__pings"),
+        payload: ChannelPayload::Scalar("text".into()),
+        description: None,
+    }];
+    let client = setup(&schema).await;
+
+    let mut listener = client.listen("Pings").await.unwrap();
+    client
+        .execute(
+            &format!("insert {module}::Person {{ name := <str>$name }}"),
+            &[("name", CachedValue::Str("gadget".into()))],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(recv_with_timeout(&mut listener).await.unwrap(), Value::Str("gadget".to_string()));
+}
+
+#[tokio::test]
+#[ignore]
+async fn listen_decodes_a_type_channel_payload_as_the_rows_id() {
+    let module = unique_module("live_client_listen_type");
+    let mut schema = person_schema(&module);
+    schema.types[0].triggers = vec![TriggerDescriptor {
+        on: 1, // On::Insert
+        timing: "After".into(),
+        handler: "select notify(PersonUpdates, __new__)".into(),
+    }];
+    schema.channels = vec![ChannelDescriptor {
+        name: "PersonUpdates".into(),
+        module: module.clone(),
+        wire_name: format!("{module}__person_updates"),
+        payload: ChannelPayload::Type(format!("{module}::Person")),
+        description: None,
+    }];
+    let client = setup(&schema).await;
+
+    let mut listener = client.listen("PersonUpdates").await.unwrap();
+    client
+        .execute(
+            &format!("insert {module}::Person {{ name := <str>$name }}"),
+            &[("name", CachedValue::Str("gadget".into()))],
+        )
+        .await
+        .unwrap();
+
+    let payload = recv_with_timeout(&mut listener).await.unwrap();
+    let Value::Uuid(id) = payload else { panic!("expected Uuid, got {payload:?}") };
+
+    let rows = client.query(&format!("select {module}::Person {{ id }}"), &[]).await.unwrap();
+    let Value::Object(person) = &rows[0] else { panic!("expected Object") };
+    assert_eq!(person.get("id"), Some(&Value::Uuid(id)));
+}
+
+#[tokio::test]
+#[ignore]
+async fn listen_decodes_an_object_channel_payload() {
+    let module = unique_module("live_client_listen_object");
+    let mut schema = person_schema(&module);
+    schema.types[0].properties.push(float_prop("score"));
+    schema.types[0].triggers = vec![TriggerDescriptor {
+        on: 1, // On::Insert
+        timing: "After".into(),
+        handler: "select notify(PersonReady, { name := __new__.name, score := __new__.score })".into(),
+    }];
+    schema.channels = vec![ChannelDescriptor {
+        name: "PersonReady".into(),
+        module: module.clone(),
+        wire_name: format!("{module}__person_ready"),
+        payload: ChannelPayload::Object(vec![("name".into(), "text".into()), ("score".into(), "float8".into())]),
+        description: None,
+    }];
+    let client = setup(&schema).await;
+
+    let mut listener = client.listen("PersonReady").await.unwrap();
+    client
+        .execute(
+            &format!("insert {module}::Person {{ name := <str>$name, score := <float64>$score }}"),
+            &[("name", CachedValue::Str("gadget".into())), ("score", CachedValue::F64(0.75))],
+        )
+        .await
+        .unwrap();
+
+    let payload = recv_with_timeout(&mut listener).await.unwrap();
+    let Value::Object(obj) = payload else { panic!("expected Object, got {payload:?}") };
+    assert_eq!(obj.get("name"), Some(&Value::Str("gadget".to_string())));
+    assert_eq!(obj.get("score"), Some(&Value::Float64(0.75)));
+}
+
+#[tokio::test]
+#[ignore]
+async fn listen_raises_on_a_malformed_payload() {
+    let module = unique_module("live_client_listen_malformed");
+    let mut schema = person_schema(&module);
+    schema.channels = vec![ChannelDescriptor {
+        name: "Ids".into(),
+        module: module.clone(),
+        wire_name: format!("{module}__ids"),
+        payload: ChannelPayload::Type(format!("{module}::Person")),
+        description: None,
+    }];
+    let client = setup(&schema).await;
+
+    let mut listener = client.listen("Ids").await.unwrap();
+
+    // Bypass notify()'s own compile-time shape validation entirely — a raw
+    // NOTIFY with text that isn't a valid uuid, exactly the kind of
+    // mismatch `listen()` must surface as an error rather than silently
+    // drop.
+    client
+        .raw_connection()
+        .execute_typed(&format!("SELECT pg_notify('{module}__ids', 'not-a-uuid')"), &[])
+        .await
+        .unwrap();
+
+    let err = recv_with_timeout(&mut listener).await.err().expect("expected a malformed-payload error");
+    assert!(matches!(err, pylon_client::Error::MalformedPayload(_)), "got: {err:?}");
 }
