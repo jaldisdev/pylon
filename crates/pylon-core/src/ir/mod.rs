@@ -976,8 +976,8 @@ mod tests {
     #[allow(unused_imports)]
     use super::{IrFreeExpr, IrLiteral};
     use crate::schema::{
-        ComputedDescriptor, GlobalDescriptor, LinkDescriptor, MultiLinkDescriptor,
-        PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        ChannelDescriptor, ChannelPayload, ComputedDescriptor, GlobalDescriptor, LinkDescriptor,
+        MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -1586,6 +1586,159 @@ mod tests {
             is_sequence: true,
         });
         schema
+    }
+
+    fn make_schema_with_channels() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        schema.channels.push(ChannelDescriptor {
+            name: "Pings".into(),
+            module: "default".into(),
+            wire_name: "default__pings".into(),
+            payload: ChannelPayload::Scalar("text".into()),
+            description: None,
+        });
+        schema.channels.push(ChannelDescriptor {
+            name: "SearchReady".into(),
+            module: "default".into(),
+            wire_name: "default__search_ready".into(),
+            payload: ChannelPayload::Object(vec![
+                ("doc_id".into(), "uuid".into()),
+                ("score".into(), "float8".into()),
+            ]),
+            description: None,
+        });
+        schema.channels.push(ChannelDescriptor {
+            name: "PersonUpdates".into(),
+            module: "default".into(),
+            wire_name: "default__person_updates".into(),
+            payload: ChannelPayload::Type("default::Person".into()),
+            description: None,
+        });
+        schema
+    }
+
+    fn compile_notify_expr(query: &str) -> String {
+        let schema = make_schema_with_channels();
+        let ast = parse::parse(query).expect("parse failed");
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        crate::sql::emit_expr(expr)
+    }
+
+    fn notify_compile_err(query: &str) -> String {
+        let schema = make_schema_with_channels();
+        let ast = parse::parse(query).expect("parse failed");
+        format!("{}", super::compile(&ast, &schema).err().expect("expected a compile error"))
+    }
+
+    #[test]
+    fn test_notify_scalar_channel_emits_pg_notify() {
+        let sql = compile_notify_expr("SELECT notify(Pings, 'hello')");
+        assert_eq!(sql, "pg_notify('default__pings', ('hello')::text)", "got: {sql}");
+    }
+
+    #[test]
+    fn test_notify_rejects_unknown_channel() {
+        let err = notify_compile_err("SELECT notify(NoSuchChannel, 'hi')");
+        assert!(err.contains("not a known Channel"), "got: {err}");
+    }
+
+    #[test]
+    fn test_notify_object_channel_emits_jsonb_build_object() {
+        let sql = compile_notify_expr(
+            "SELECT notify(SearchReady, { doc_id := <uuid>'3fa85f64-5717-4562-b3fc-2c963f66afa6', score := 0.5 })",
+        );
+        assert_eq!(
+            sql,
+            "pg_notify('default__search_ready', (jsonb_build_object('doc_id', ('3fa85f64-5717-4562-b3fc-2c963f66afa6')::uuid, 'score', (0.5::float8)))::text)",
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_notify_object_channel_rejects_wrong_fields() {
+        let err = notify_compile_err("SELECT notify(SearchReady, { doc_id := 'x' })");
+        assert!(err.contains("payload fields") && err.contains("don't match"), "got: {err}");
+    }
+
+    #[test]
+    fn test_notify_object_channel_rejects_non_shape_payload() {
+        let err = notify_compile_err("SELECT notify(SearchReady, 'not an object')");
+        assert!(err.contains("free object literal"), "got: {err}");
+    }
+
+    #[test]
+    fn test_notify_type_channel_rejects_arbitrary_payload() {
+        let err = notify_compile_err("SELECT notify(PersonUpdates, 'not an anchor')");
+        assert!(err.contains("__new__ or __old__"), "got: {err}");
+    }
+
+    #[test]
+    fn test_notify_type_channel_via_trigger_new_anchor() {
+        let schema = make_schema_with_channels();
+        let ir_out = super::compile_trigger_handler(
+            "select notify(PersonUpdates, __new__)",
+            "Person",
+            1, // On::Insert — binds __new__ only (on_mask & 4 == 0), no __old__
+            &schema,
+        )
+        .expect("trigger handler compile failed");
+        let IrStmt::Select(sel) = ir_out.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        let sql = crate::sql::emit_expr(expr);
+        assert_eq!(sql, "pg_notify('default__person_updates', (NEW.\"id\")::text)", "got: {sql}");
+    }
+
+    #[test]
+    fn test_notify_scalar_channel_via_trigger_new_property_access() {
+        // A bare `select notify(...)` trigger handler has no type at its own
+        // root, so it compiles as a *free* select — `__new__.name` only
+        // resolves at all because `compile_notify` falls back to a bound
+        // anchor as a stand-in ctx when the ambient one is None (confirmed
+        // live via live_execution_notify.rs before this fallback existed:
+        // it failed with "expression is not valid in free SELECT context").
+        let schema = make_schema_with_channels();
+        let ir_out = super::compile_trigger_handler(
+            "select notify(Pings, __new__.name)",
+            "Person",
+            1, // On::Insert
+            &schema,
+        )
+        .expect("trigger handler compile failed");
+        let IrStmt::Select(sel) = ir_out.stmt else { panic!("expected Select") };
+        let items = free_items(&sel);
+        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        let sql = crate::sql::emit_expr(expr);
+        assert_eq!(sql, "pg_notify('default__pings', (NEW.\"name\")::text)", "got: {sql}");
+    }
+
+    #[test]
+    fn test_notify_type_channel_rejects_bare_reference_outside_trigger() {
+        // __new__ has no binding at all in a plain (non-trigger) compile.
+        let err = notify_compile_err("SELECT notify(PersonUpdates, __new__)");
+        assert!(err.contains("only bound inside a trigger handler"), "got: {err}");
+    }
+
+    #[test]
+    fn test_notify_raw_emits_pg_notify_with_two_args() {
+        let sql = compile_notify_expr("SELECT notify_raw('any_channel', 'raw payload')");
+        assert_eq!(sql, "pg_notify('any_channel', 'raw payload')", "got: {sql}");
+    }
+
+    #[test]
+    fn test_notify_payload_literal_over_cap_rejected() {
+        let huge = "x".repeat(8000);
+        let err = notify_compile_err(&format!("SELECT notify(Pings, '{huge}')"));
+        assert!(err.contains("NOTIFY payload limit"), "got: {err}");
+    }
+
+    #[test]
+    fn test_notify_arity_error() {
+        let err = notify_compile_err("SELECT notify(Pings)");
+        assert!(err.contains("takes exactly 2 arguments"), "got: {err}");
     }
 
     fn compile_seq(query: &str) -> String {
