@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import decimal
 import inspect
+import json
 
 import types as _types
 import uuid
@@ -1382,3 +1383,152 @@ class TestChannel:
 
     def test_reserved_prefix_matches_pylons_own_internal_channels(self):
         assert RESERVED_WIRE_NAME_PREFIX == "pylon_"
+
+
+class TestChannelListenDecoding:
+    """`Client.listen()`'s runtime lookup/decode helpers — pure unit
+    coverage complementing the live end-to-end tests in
+    tests/test_client_live.py (a real trigger firing notify(), a real
+    listener receiving it)."""
+
+    def _core_channel(self, **kwargs):
+        from pylon._core import ChannelDescriptor as CoreChannelDescriptor
+
+        return CoreChannelDescriptor(**kwargs)
+
+    def test_decode_scalar_text_uuid(self):
+        from pylon.schema._channels import _decode_scalar_text
+
+        u = uuid.UUID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        assert _decode_scalar_text(str(u), "uuid") == u
+
+    def test_decode_scalar_text_integers(self):
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("42", "int2") == 42
+        assert _decode_scalar_text("42", "int4") == 42
+        assert _decode_scalar_text("42", "int8") == 42
+
+    def test_decode_scalar_text_floats(self):
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("0.5", "float4") == 0.5
+        assert _decode_scalar_text("0.5", "float8") == 0.5
+
+    def test_decode_scalar_text_numeric_is_decimal(self):
+        import decimal
+
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("123.456", "numeric") == decimal.Decimal("123.456")
+
+    def test_decode_scalar_text_boolean(self):
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("true", "boolean") is True
+        assert _decode_scalar_text("false", "boolean") is False
+
+    def test_decode_scalar_text_datetimes(self):
+        import datetime
+
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("2026-08-05 18:47:59.698038+00", "timestamptz") == datetime.datetime.fromisoformat(
+            "2026-08-05 18:47:59.698038+00:00"
+        )
+        assert _decode_scalar_text("2026-08-05", "date") == datetime.date(2026, 8, 5)
+        assert _decode_scalar_text("18:47:59", "time") == datetime.time(18, 47, 59)
+
+    def test_decode_scalar_text_text_passthrough(self):
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("hello", "text") == "hello"
+
+    def test_decode_scalar_text_unsupported_type_falls_back_to_raw_string(self):
+        from pylon.schema._channels import _decode_scalar_text
+
+        assert _decode_scalar_text("1 day 02:00:00", "interval") == "1 day 02:00:00"
+
+    def test_decode_json_value_passes_through_none_and_non_strings(self):
+        from pylon.schema._channels import _decode_json_value
+
+        assert _decode_json_value(None, "uuid") is None
+        assert _decode_json_value(0.5, "float8") == 0.5
+        assert _decode_json_value(True, "boolean") is True
+
+    def test_decode_json_value_parses_string_encoded_types(self):
+        from pylon.schema._channels import _decode_json_value
+
+        u = uuid.UUID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        assert _decode_json_value(str(u), "uuid") == u
+
+    def test_decode_channel_payload_scalar(self):
+        from pylon.schema._channels import decode_channel_payload
+
+        ch = self._core_channel(name="Pings", module="m", wire_name="m__pings", payload_kind="scalar", payload_scalar_pg_type="text")
+        assert decode_channel_payload(ch, "hello") == "hello"
+
+    def test_decode_channel_payload_type_kind_is_a_uuid(self):
+        from pylon.schema._channels import decode_channel_payload
+
+        ch = self._core_channel(name="X", module="m", wire_name="m__x", payload_kind="type", payload_type_ref="m::Widget")
+        u = uuid.UUID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        assert decode_channel_payload(ch, str(u)) == u
+
+    def test_decode_channel_payload_object(self):
+        from pylon.datatypes import Object as PylonObject
+        from pylon.schema._channels import decode_channel_payload
+
+        ch = self._core_channel(
+            name="SearchReady", module="m", wire_name="m__search_ready", payload_kind="object",
+            payload_object_fields=[("doc_id", "uuid"), ("score", "float8")],
+        )
+        u = uuid.UUID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        payload = decode_channel_payload(ch, json.dumps({"doc_id": str(u), "score": 0.5}))
+        assert isinstance(payload, PylonObject)
+        assert payload.doc_id == u
+        assert payload.score == 0.5
+
+    def test_decode_channel_payload_raises_query_error_on_malformed_uuid(self):
+        from pylon.exceptions import QueryError
+        from pylon.schema._channels import decode_channel_payload
+
+        ch = self._core_channel(name="X", module="m", wire_name="m__x", payload_kind="type", payload_type_ref="m::Widget")
+        with pytest.raises(QueryError, match="doesn't match its declared shape"):
+            decode_channel_payload(ch, "not-a-uuid")
+
+    def test_decode_channel_payload_raises_query_error_on_malformed_json(self):
+        from pylon.exceptions import QueryError
+        from pylon.schema._channels import decode_channel_payload
+
+        ch = self._core_channel(
+            name="SearchReady", module="m", wire_name="m__search_ready", payload_kind="object",
+            payload_object_fields=[("doc_id", "uuid")],
+        )
+        with pytest.raises(QueryError, match="doesn't match its declared shape"):
+            decode_channel_payload(ch, "not json at all")
+
+    def test_resolve_channel_by_bare_name(self):
+        from pylon._core import SchemaDescriptor as CoreSchemaDescriptor
+        from pylon.schema._channels import resolve_channel
+
+        ch = self._core_channel(name="Pings", module="shop", wire_name="shop__pings", payload_kind="scalar", payload_scalar_pg_type="text")
+        schema = CoreSchemaDescriptor(channels=[ch])
+        assert resolve_channel(schema, "Pings").wire_name == "shop__pings"
+
+    def test_resolve_channel_by_qualified_name(self):
+        from pylon._core import SchemaDescriptor as CoreSchemaDescriptor
+        from pylon.schema._channels import resolve_channel
+
+        ch = self._core_channel(name="Pings", module="shop", wire_name="shop__pings", payload_kind="scalar", payload_scalar_pg_type="text")
+        schema = CoreSchemaDescriptor(channels=[ch])
+        assert resolve_channel(schema, "shop::Pings").wire_name == "shop__pings"
+
+    def test_resolve_channel_raises_on_unknown_name(self):
+        from pylon._core import SchemaDescriptor as CoreSchemaDescriptor
+        from pylon.exceptions import QueryError
+        from pylon.schema._channels import resolve_channel
+
+        schema = CoreSchemaDescriptor(channels=[])
+        with pytest.raises(QueryError, match="not a known Channel"):
+            resolve_channel(schema, "NoSuchChannel")

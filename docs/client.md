@@ -70,6 +70,19 @@ await client.save(post)          # UPDATE — only if something actually changed
 
 Accepts any number of `@pylon.type` instances and saves them all in one transaction. An instance that was never hydrated from a query result is `INSERT`ed (its generated `id` is written back onto the object); one that *was* hydrated is diffed against the values it was loaded with and only `UPDATE`d if something changed — an unmodified object is skipped entirely, not re-written as a no-op update.
 
+## `listen`
+
+```python
+async for payload in client.listen("UserUpdates"):
+    print(payload)
+```
+
+Subscribes to a schema-declared [`Channel`](schema/channels.md) and yields decoded `NOTIFY` payloads as an async generator, for as long as you keep iterating. *channel* is a bare or `module::name` reference — the same string you'd pass to [`notify(...)`](pyql/globals-and-functions.md#notify--notify_raw) from PyQL.
+
+Each yielded value matches the Channel's own declared shape: a bare `uuid.UUID` (the changed row's `id`, not a fetched object) for a Type-shaped channel, the declared scalar's native Python value for a Scalar-shaped channel, or a `pylon.Object` for an Object-shaped channel. A payload that doesn't actually match what was declared raises `QueryError` and ends the loop there, rather than being silently dropped.
+
+Unlike every other client method, `listen()` doesn't use the connection pool — `LISTEN` is a per-session subscription, so reusing a pooled connection would leak it onto whatever unrelated query later borrows that connection back out of the pool. Each call opens its own dedicated connection, held for as long as you keep iterating; it closes automatically once you stop (`break`, an exception, or letting the generator get garbage-collected).
+
 ## Transactions
 
 ```python
