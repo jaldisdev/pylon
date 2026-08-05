@@ -37,8 +37,8 @@ select Person filter .id = <uuid>$id
 insert Person { id := <uuid>$id, name := $name }
 ```
 
-(That last example needs `allow_user_specified_id` — see [Client library § with_config](../client.md#with_config); `id` is normally server-generated.)
+(That last example needs `allow_user_specified_id` — see [Python client § with_config](../client/python.md#with_config); `id` is normally server-generated.)
 
 ## Missing/unused parameters are compile errors
 
-Referencing `$name` without supplying it raises `MissingParameterError`; supplying a keyword argument the query never references raises `UnknownParameterError` — both at compile time, not silently ignored. See [Client library § Exceptions](../client.md#exceptions).
+Referencing `$name` without supplying it raises `MissingParameterError`; supplying a keyword argument the query never references raises `UnknownParameterError` — both at compile time, not silently ignored. See [Python client § Exceptions](../client/python.md#exceptions).

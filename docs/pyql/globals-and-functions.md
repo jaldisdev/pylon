@@ -54,7 +54,7 @@ select vector::search(Product, query := $text) { object { name }, distance }
 select vector::search((select Product filter .price < 100), <array<float32>>$vec) { object { name }, distance }
 ```
 
-Similarity search over a [`VectorIndex`](../schema/indexes.md#vectorindex-embeddings). First argument is a type name (searches every indexed row of that type) or a filtered subquery (narrows the candidate set first). Second argument is either a raw embedding vector, or `query := $text` — the *text-overload* form, which has the client embed the text via the configured `[models.*]` provider before the query even reaches Postgres (see `_compile_and_resolve` in [Client library](../client.md)). The result shape is fixed: `{ object { ...fields... }, distance }` — `object`'s sub-shape is an ordinary shape over the target type; `distance` is always emitted, never itself shaped.
+Similarity search over a [`VectorIndex`](../schema/indexes.md#vectorindex-embeddings). First argument is a type name (searches every indexed row of that type) or a filtered subquery (narrows the candidate set first). Second argument is either a raw embedding vector, or `query := $text` — the *text-overload* form, which has the client embed the text via the configured `[models.*]` provider before the query even reaches Postgres (see `_compile_and_resolve` in [Python client](../client/python.md)). The result shape is fixed: `{ object { ...fields... }, distance }` — `object`'s sub-shape is an ordinary shape over the target type; `distance` is always emitted, never itself shaped.
 
 ## `fts::search`
 

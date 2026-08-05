@@ -1,8 +1,8 @@
-# Client library
+# Python client
 
 `pylon.Client` (and its module-level constructor `pylon.create_async_client`) is the Python API for running PyQL against a database — a connection-pooled wrapper around Pylon's native Rust driver (`pgcon`) that compiles PyQL to SQL and hydrates results back into real instances of your `@pylon.type` classes.
 
-Every query method takes a PyQL string, positional args (bound to `$1`, `$2`, ... — see [Parameters](pyql/parameters.md)) or keyword args (bound to `$name`), and is `async`.
+Every query method takes a PyQL string, positional args (bound to `$1`, `$2`, ... — see [Parameters](../pyql/parameters.md)) or keyword args (bound to `$name`), and is `async`.
 
 ## Constructing a client
 
@@ -77,11 +77,13 @@ async for payload in client.listen("UserUpdates"):
     print(payload)
 ```
 
-Subscribes to a schema-declared [`Channel`](schema/channels.md) and yields decoded `NOTIFY` payloads as an async generator, for as long as you keep iterating. *channel* is a bare or `module::name` reference — the same string you'd pass to [`notify(...)`](pyql/globals-and-functions.md#notify--notify_raw) from PyQL.
+Subscribes to a schema-declared [`Channel`](../schema/channels.md) and yields decoded `NOTIFY` payloads as an async generator, for as long as you keep iterating. *channel* is a bare or `module::name` reference — the same string you'd pass to [`notify(...)`](../pyql/globals-and-functions.md#notify--notify_raw) from PyQL.
 
 Each yielded value matches the Channel's own declared shape: a bare `uuid.UUID` (the changed row's `id`, not a fetched object) for a Type-shaped channel, the declared scalar's native Python value for a Scalar-shaped channel, or a `pylon.Object` for an Object-shaped channel. A payload that doesn't actually match what was declared raises `QueryError` and ends the loop there, rather than being silently dropped.
 
 Unlike every other client method, `listen()` doesn't use the connection pool — `LISTEN` is a per-session subscription, so reusing a pooled connection would leak it onto whatever unrelated query later borrows that connection back out of the pool. Each call opens its own dedicated connection, held for as long as you keep iterating; it closes automatically once you stop (`break`, an exception, or letting the generator get garbage-collected).
+
+See the [Rust client's own `listen()`](rust.md#listen) for the equivalent from a Rust process.
 
 ## Transactions
 
@@ -109,7 +111,7 @@ authed = client.with_globals({"default::current_user_id": user_id})
 posts = await authed.query("select Post { title }")   # `global current_user_id` now resolves
 ```
 
-Injects values for [`Global`](schema/globals-and-aliases.md)s referenced via `global name` in a query, keyed by qualified name (`"module::name"`). Repeated calls merge into the previous set of globals rather than replacing it.
+Injects values for [`Global`](../schema/globals-and-aliases.md)s referenced via `global name` in a query, keyed by qualified name (`"module::name"`). Repeated calls merge into the previous set of globals rather than replacing it.
 
 ### `with_config`
 

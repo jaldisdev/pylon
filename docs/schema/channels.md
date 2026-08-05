@@ -22,7 +22,7 @@ SearchReady = pylon.Channel(pylon.Object(doc_id=uuid.UUID, score=float))
 
 - **A registered `@pylon.type`/`@pylon.interface`** — e.g. `pylon.Channel(User)`. `notify()` sends that row's `id`, not the whole object (see [`notify`](../pyql/globals-and-functions.md#notify--notify_raw)); `payload_type` isn't itself constructed, just referenced.
 - **A plain scalar** — e.g. `pylon.Channel(str)`, `pylon.Channel(uuid.UUID)`, or a registered custom scalar. The payload is sent as text.
-- **An ad hoc named-field shape**, via `pylon.Object(...)` — e.g. `pylon.Object(doc_id=uuid.UUID, score=float)`. This reuses the same `pylon.Object` class query results use for free-form shapes (`pylon.Object(name='hello', count=42)`, see [Client library](../client.md)) — here called with *types* as the keyword values instead of data, which the schema builder reads back to derive the payload's field names and types. Every field must be a scalar (same restriction as `Tuple`/`NamedTuple`). `notify()`'s payload for one of these must be a free object literal matching the declared fields exactly: `{ doc_id := .id, score := .relevance }`.
+- **An ad hoc named-field shape**, via `pylon.Object(...)` — e.g. `pylon.Object(doc_id=uuid.UUID, score=float)`. This reuses the same `pylon.Object` class query results use for free-form shapes (`pylon.Object(name='hello', count=42)`, see [Python client](../client/python.md)) — here called with *types* as the keyword values instead of data, which the schema builder reads back to derive the payload's field names and types. Every field must be a scalar (same restriction as `Tuple`/`NamedTuple`). `notify()`'s payload for one of these must be a free object literal matching the declared fields exactly: `{ doc_id := .id, score := .relevance }`.
 
 ## Wire name
 
@@ -38,4 +38,4 @@ A `Channel` has no backing table, column, or any other catalog object — `NOTIF
 
 ## Sending and receiving
 
-Sending a payload (`notify()`) is covered in [PyQL: globals and functions](../pyql/globals-and-functions.md#notify--notify_raw), including using it from a `Trigger` handler. Receiving payloads is a client-library method, not PyQL syntax — see [`Client.listen()`](../client.md#listen) — since a `LISTEN` subscription is inherently a long-lived, per-connection thing, not a query that returns a result set.
+Sending a payload (`notify()`) is covered in [PyQL: globals and functions](../pyql/globals-and-functions.md#notify--notify_raw), including using it from a `Trigger` handler. Receiving payloads is a client-library method, not PyQL syntax — see `Client.listen()` in the [Python](../client/python.md#listen) or [Rust](../client/rust.md#listen) client docs — since a `LISTEN` subscription is inherently a long-lived, per-connection thing, not a query that returns a result set.

@@ -1,13 +1,13 @@
 # PyQL
 
-PyQL is Pylon's query language — compiled to native SQL by `pylon-core`, never executed as an interpreted layer on top of Postgres. A query string goes through `Client.query()`/`execute()`/etc. (see [Client library](../client.md)), or the [`pylon` REPL](../cli.md#pylon-repl)/[`pylon query`](../cli.md#pylon-query) command.
+PyQL is Pylon's query language — compiled to native SQL by `pylon-core`, never executed as an interpreted layer on top of Postgres. A query string goes through `Client.query()`/`execute()`/etc. (see [Client libraries](../client/index.md)), or the [`pylon` REPL](../cli.md#pylon-repl)/[`pylon query`](../cli.md#pylon-query) command.
 
 ## Statements
 
 - [`select`](select.md) — read data, optionally shaping nested links into the result
 - [`insert` / `update` / `delete`](insert-update-delete.md) — mutations
 - [`for` / `group` / `with`](for-group-with.md) — looping, grouping, and named sub-expressions
-- `analyze <stmt>` — run any of the above through `EXPLAIN (ANALYZE, FORMAT JSON)` instead of executing it normally (see [Client library § analyze](../client.md#analyze))
+- `analyze <stmt>` — run any of the above through `EXPLAIN (ANALYZE, FORMAT JSON)` instead of executing it normally (see [Python client § analyze](../client/python.md#analyze))
 
 ## The rest of this reference
 

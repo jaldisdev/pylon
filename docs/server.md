@@ -72,7 +72,7 @@ If your schema has any `@pylon.signal` registrations, you must also run `pylon w
 }
 ```
 
-`params`/`globals`/`config` mirror `Client.query()`'s positional/keyword args, `with_globals()`, and `with_config()` respectively (see [Client library](client.md)).
+`params`/`globals`/`config` mirror `Client.query()`'s positional/keyword args, `with_globals()`, and `with_config()` respectively (see [Client libraries](client/index.md)).
 
 If `[ui].enabled = true` (the default), anything not matching an API route falls through to serving the frontend SPA — embedded into the binary at compile time via `include_dir!`, or from `--static-dir` if given.
 
