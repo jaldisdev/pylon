@@ -254,3 +254,107 @@ def test_phantom_trigger_round_trip_via_python_entrypoints(live_pool, unique_mod
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
     asyncio.run(run())
+
+
+def test_readonly_only_change_is_captured_by_migration_create(live_pool, tmp_path, unique_module):
+    """A schema change with zero physical DDL footprint (flipping `Readonly`
+    on an existing property, here) used to be structurally invisible to
+    `migration create`/`apply`: the diff engine only ever compares against
+    live-catalog introspection, which has nothing to see for a change like
+    this, so it printed "No schema changes detected" and never wrote a
+    migration file at all — not "doesn't need one," genuinely could never
+    produce one. This drives the whole CLI flow (`migration create` twice,
+    `migration apply` twice) end to end against a real database, proving
+    the second `create` now produces a migration and the second `apply`
+    updates `_pylon."Schema"` to reflect the flip.
+    """
+    import json
+    import re
+
+    from click.testing import CliRunner
+
+    from conftest import live_db_dsn
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module("live_content_only")
+    (tmp_path / "migrations").mkdir()
+    schema_file = tmp_path / "widget_schema.py"
+
+    def write_schema(readonly: bool) -> None:
+        constraint = ", pylon.Readonly" if readonly else ""
+        schema_file.write_text(
+            "import pylon.schema as pylon\n\n"
+            f"@pylon.type(module={module!r}, name='Widget')\n"
+            "class Widget:\n"
+            f"    name: pylon.Property[str{constraint}]\n"
+        )
+
+    write_schema(readonly=False)
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {"config": config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / "migrations"
+
+    try:
+        # First migration: real DDL (creates the table). Baseline, not the
+        # behavior under test.
+        result = runner.invoke(migration.commands["create"], ["--non-interactive"], obj=obj)
+        assert result.exit_code == 0, result.output
+        first_files = sorted(migrations_dir.glob("*.sql"))
+        assert len(first_files) == 1, result.output
+
+        result = runner.invoke(migration.commands["apply"], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        # Flip `name` to readonly — the live table's columns don't change at
+        # all, so the DDL diff is empty. Before the fix this made `create`
+        # a silent no-op forever.
+        write_schema(readonly=True)
+
+        result = runner.invoke(migration.commands["create"], ["--non-interactive"], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert "No schema changes detected" not in result.output, result.output
+
+        second_files = sorted(migrations_dir.glob("*.sql"))
+        assert len(second_files) == 2, [f.name for f in second_files]
+        new_file = [f for f in second_files if f not in first_files][0]
+        assert "non-DDL schema change" in new_file.read_text()
+
+        result = runner.invoke(migration.commands["apply"], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        # `_pylon."Schema"` must now reflect the readonly flip — parsed as
+        # raw JSON rather than through the pyo3 SchemaDescriptor object
+        # model, which doesn't expose a `properties` getter.
+        async def check() -> None:
+            from pylon._core import migration_read_schema_snapshot
+
+            snapshot_json = await migration_read_schema_snapshot(live_pool)
+            assert snapshot_json is not None
+            snapshot = json.loads(snapshot_json)
+            widget = next(t for t in snapshot["types"] if t["name"] == "Widget" and t["module"] == module)
+            name_prop = next(p for p in widget["properties"] if p["name"] == "name")
+            assert name_prop["is_readonly"], "readonly-only change never made it into _pylon.\"Schema\""
+
+        asyncio.run(check())
+    finally:
+        # `_pylon."Migrations"` is a shared singleton table across this
+        # whole test DB (same non-isolation concern noted throughout this
+        # file's Rust counterpart) — dropping only the module's own Postgres
+        # schema would leave this test's tracking rows behind, which the
+        # *next* `create`/`apply` run anywhere would immediately trip over
+        # as a "history has diverged" chain conflict against its own empty
+        # on-disk chain.
+        migration_ids = re.findall(r"^-- migration: (\S+)$", "\n".join(f.read_text() for f in migrations_dir.glob("*.sql")), re.MULTILINE)
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())

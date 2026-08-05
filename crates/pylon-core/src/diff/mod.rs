@@ -842,6 +842,50 @@ pub fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> Result<V
     Ok(flatten_ops(diff_inner(target, current, true, &HashMap::new())?))
 }
 
+/// True when `target` differs from `previous` in ANY way at all — not just
+/// the DDL-visible parts `diff_schema_steps`/`diff_schema_ops` can see.
+///
+/// Some schema semantics have zero physical Postgres footprint: a
+/// property/link's `is_readonly` flag, mutation `rewrites`, computed
+/// pointers, session/computed globals, and (once added) pub/sub `Channel`
+/// declarations are all enforced purely by `pylon-core`'s own compiler
+/// consulting `SchemaDescriptor` — there is no column, constraint, or
+/// catalog object for live-database introspection (`DbState`) to ever see,
+/// no matter how they change. Before this function existed, a schema edit
+/// confined to one of these was **structurally invisible** to `migration
+/// create`/`watch`: `diff_schema_steps`/`diff_schema_ops` would report zero
+/// DDL, the CLI would print "No schema changes detected" and exit, and
+/// `_pylon."Schema"` (what every connecting client actually compiles
+/// against — see `pylon.client._install_migrated_schema`) would never be
+/// updated. That's not "changing it doesn't require a migration" (the
+/// intended, documented behavior for e.g. `readonly`) — it's "changing it
+/// can *never* be migrated at all," permanently, until some unrelated
+/// DDL-visible change happens to piggyback one through.
+///
+/// Deliberately does **not** enumerate which fields are DDL-invisible —
+/// that list has already grown twice (`readonly`/rewrites, then `Channel`)
+/// and would silently miss the next one. Instead this compares the two
+/// schemas' full JSON content (the same `serde_json` round-trip already
+/// used for `_pylon."Schema"` storage — see `SchemaDescriptor::to_json`/
+/// `from_json` in `pylon-py`), so *any* field on *any* descriptor —
+/// present now or added later — is covered automatically. Callers combine
+/// this with `diff_schema_steps`/`diff_schema_ops`'s own result: if there
+/// are DDL steps, this check is redundant (a migration is already
+/// happening); it only changes behavior in the previously-broken case,
+/// zero DDL steps but real content drift.
+///
+/// `previous = None` (no migration has ever been applied to this database
+/// yet) compares against an empty `SchemaDescriptor` — matches `target`
+/// only when `target` itself is completely empty.
+pub fn schema_content_changed(target: &SchemaDescriptor, previous: Option<&SchemaDescriptor>) -> bool {
+    let previous = previous.cloned().unwrap_or_default();
+    // `.ok()` + compare-as-Option rather than `.expect()`: a serialization
+    // failure here would be a `serde` bug, not a real difference in schema
+    // content — but crashing `migration create` over it would be worse
+    // than just treating that (should-never-happen) case as "unchanged".
+    serde_json::to_value(target).ok() != serde_json::to_value(&previous).ok()
+}
+
 /// Compute the diff as one `MigrationStep` per logical schema-level question
 /// — for an interactive caller that confirms/rejects one object at a time
 /// instead of a flat DDL dump. `fill_index` marks columns whose NOT NULL
@@ -2692,6 +2736,89 @@ mod tests {
             junction: false,
             signals: vec![],
         }
+    }
+
+    // ── schema_content_changed ──────────────────────────────────────────────
+
+    #[test]
+    fn test_schema_content_changed_detects_a_readonly_only_flip() {
+        // The exact previously-broken case: `is_readonly` has zero DDL
+        // footprint, so `diff_schema_steps`/`diff_schema_ops` alone would
+        // never notice this change at all.
+        let before = simple_type("default", "Person", "Person");
+        let mut after = before.clone();
+        after.properties[1].is_readonly = true; // "name"
+        assert_ne!(before.properties[1].is_readonly, after.properties[1].is_readonly);
+
+        let schema_before = SchemaDescriptor {
+            types: vec![before], scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let schema_after = SchemaDescriptor {
+            types: vec![after], scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        assert!(schema_content_changed(&schema_after, Some(&schema_before)));
+    }
+
+    #[test]
+    fn test_schema_content_changed_detects_a_new_rewrite() {
+        let before = simple_type("default", "Person", "Person");
+        let mut after = before.clone();
+        after.properties[1].rewrites.push(crate::schema::RewriteEntry {
+            on: 1, handler: "str_upper(.name)".into(),
+        });
+
+        let schema_before = SchemaDescriptor {
+            types: vec![before], scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let schema_after = SchemaDescriptor {
+            types: vec![after], scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        assert!(schema_content_changed(&schema_after, Some(&schema_before)));
+    }
+
+    #[test]
+    fn test_schema_content_changed_is_false_for_identical_schemas() {
+        let t = simple_type("default", "Person", "Person");
+        let schema = SchemaDescriptor {
+            types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        let other = schema.clone();
+        assert!(!schema_content_changed(&schema, Some(&other)));
+    }
+
+    #[test]
+    fn test_schema_content_changed_true_against_none_when_target_is_non_empty() {
+        let t = simple_type("default", "Person", "Person");
+        let schema = SchemaDescriptor {
+            types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        assert!(schema_content_changed(&schema, None), "no prior snapshot at all must count as changed");
+    }
+
+    #[test]
+    fn test_schema_content_changed_false_against_none_when_target_is_also_empty() {
+        let schema = SchemaDescriptor::default();
+        assert!(!schema_content_changed(&schema, None));
+    }
+
+    #[test]
+    fn test_schema_content_changed_still_true_when_ddl_visible_things_also_changed() {
+        // A DDL-visible change (a whole new type) must also register —
+        // this function is meant to be OR'd with diff_schema_steps's own
+        // result, not treated as mutually exclusive with it.
+        let schema_before = SchemaDescriptor::default();
+        let schema_after = SchemaDescriptor {
+            types: vec![simple_type("default", "Person", "Person")],
+            scalars: vec![], enums: vec![], named_tuples: vec![],
+            globals: vec![], functions: vec![], aliases: vec![],
+        };
+        assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
 
     #[test]

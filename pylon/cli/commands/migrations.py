@@ -157,7 +157,7 @@ async def _apply(
         lock = await migration_advisory_lock(pool)
 
     try:
-        tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, applied), ...]
+        tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, schema_state, applied), ...]
         applied_tip = migration_applied_tip(tracking)
 
         if not chain:
@@ -189,7 +189,7 @@ async def _apply(
             click.echo("Already up to date.")
             return
 
-        applied_ids = {id_ for id_, _onto, _db_state, _applied in tracking}
+        applied_ids = {id_ for id_, _onto, _db_state, _schema_state, _applied in tracking}
         for m in pending:
             # §12 squash compatibility: if any of this migration's squashed
             # constituent IDs are already in the tracking table, the DB was
@@ -202,14 +202,17 @@ async def _apply(
             await _apply_one(pool, m, dev_mode)
             applied_ids.add(m.id)
 
-        # Store a db_state snapshot on the tip row so the next `migration create`
-        # has a correct baseline without needing to apply pending migrations first.
+        # Store a db_state + schema_state snapshot on the tip row so the next
+        # `migration create` has a correct baseline without needing to apply
+        # pending migrations first. schema_state is the full descriptor
+        # (including schema semantics with zero DDL footprint — readonly,
+        # rewrites, channels, ...) that db_state alone can't represent.
         tip = pending[-1]
         schema = _reload_schema(config)
         db_state_snapshot = schema_to_db_state_json(schema)
         await pool.execute(
-            'UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2',
-            [db_state_snapshot, tip.id],
+            'UPDATE _pylon."Migrations" SET db_state = $1::jsonb, schema_state = $2::jsonb WHERE id = $3',
+            [db_state_snapshot, schema.to_json(), tip.id],
         )
 
         # Update the schema snapshot every client fetches at startup — this
@@ -266,7 +269,7 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
 
     pool = await pgcon_connect(_pg_dsn(config), 2)
     await migration_ensure_tracking_tables(pool)
-    tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, applied), ...]
+    tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, schema_state, applied), ...]
     db_state = await introspect_db_state(pool) if dev_mode else None
 
     applied_tip = migration_applied_tip(tracking)
@@ -300,13 +303,31 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
 
     # dev-mode: report whether watch has applied changes beyond the recorded tip.
     if dev_mode and db_state is not None and not pending:
-        from pylon._core import diff_schema as _core_diff_schema
+        from pylon._core import (
+            diff_schema as _core_diff_schema,
+            schema_content_changed as _core_schema_content_changed,
+            SchemaDescriptor,
+        )
         schema = _reload_schema(config)
         ops = _core_diff_schema(schema, db_state)
-        if ops:
-            click.echo(f"\n⚠  Live database has {len(ops)} change(s) not yet in a migration (watch drift):")
-            for sql in ops:
-                click.echo(f"  {sql.splitlines()[0]}")
+
+        # DDL diffs alone miss schema semantics with zero physical footprint
+        # (readonly, rewrites, channels, ...) — compare full schema content
+        # against the tip row's own recorded schema_state too, so drift in
+        # those constructs is reported here just as reliably as DDL drift.
+        tip_row = next((r for r in tracking if r[0] == applied_tip), None)
+        schema_state_json = tip_row[3] if tip_row else None
+        previous_schema = SchemaDescriptor.from_json(schema_state_json) if schema_state_json is not None else None
+        content_changed = _core_schema_content_changed(schema, previous_schema)
+
+        if ops or content_changed:
+            click.echo("\n⚠  Live database has drift not yet in a migration:")
+            if ops:
+                click.echo(f"  {len(ops)} DDL change(s):")
+                for sql in ops:
+                    click.echo(f"    {sql.splitlines()[0]}")
+            if content_changed:
+                click.echo("  Non-DDL schema change(s) (e.g. readonly/rewrites/channels) not yet recorded.")
             click.echo("\nRun 'pylon migration create' to record them, then 'pylon migration apply --dev-mode'.")
         else:
             click.echo("\nLive database matches compiled schema — no watch drift.")
@@ -411,11 +432,14 @@ async def _watch(ctx: click.Context) -> None:
 async def _sync_once(config) -> None:
     """Recompile schema, introspect DB, diff, apply."""
     from pylon._core import (
+        SchemaDescriptor,
         diff_schema as _diff_schema,
         missing_extension_ddl as _core_missing_extension_ddl,
+        schema_content_changed as _core_schema_content_changed,
         pgcon_connect,
         introspect_db_state,
         migration_ensure_tracking_tables,
+        migration_read_schema_snapshot,
         migration_write_schema_snapshot,
     )
 
@@ -431,25 +455,40 @@ async def _sync_once(config) -> None:
     # rest of the DDL that needs it.
     ops = _core_missing_extension_ddl(schema, db_state) + ops
 
-    if not ops:
+    await migration_ensure_tracking_tables(pool)
+
+    # DDL-visible changes (`ops` above) aren't the whole story: schema
+    # semantics with zero physical DDL footprint (`readonly`, rewrites,
+    # pub/sub `Channel`s, ...) never show up in `ops` no matter what, since
+    # there's no column/constraint/catalog object to introspect and diff
+    # against. Compare full schema content against the last-synced snapshot
+    # too, so a content-only change still results in `_pylon."Schema"`
+    # getting updated instead of silently going unsynced forever.
+    previous_json = await migration_read_schema_snapshot(pool)
+    previous = SchemaDescriptor.from_json(previous_json) if previous_json is not None else None
+    content_changed = _core_schema_content_changed(schema, previous)
+
+    if not ops and not content_changed:
         click.echo("Schema up to date.")
         return
 
-    # One `batch_execute` call — Postgres's simple query protocol wraps the
-    # whole multi-statement blob in an implicit transaction, same atomicity
-    # as the old explicit `async with conn.transaction():`.
-    await pool.batch_execute("\n".join(ops))
+    if ops:
+        # One `batch_execute` call — Postgres's simple query protocol wraps the
+        # whole multi-statement blob in an implicit transaction, same atomicity
+        # as the old explicit `async with conn.transaction():`.
+        await pool.batch_execute("\n".join(ops))
 
-    click.echo(f"Applied {len(ops)} DDL statement(s):")
-    for sql in ops:
-        # Print first line of each statement as a brief summary
-        first_line = sql.splitlines()[0]
-        click.echo(f"  {first_line}")
+        click.echo(f"Applied {len(ops)} DDL statement(s):")
+        for sql in ops:
+            # Print first line of each statement as a brief summary
+            first_line = sql.splitlines()[0]
+            click.echo(f"  {first_line}")
+    else:
+        click.echo("Applied schema changes with no DDL footprint (e.g. readonly/rewrites/channels).")
 
     # A dev-mode sync just changed the live database the same way a real
     # migration would — clients should be able to pick that up immediately
     # too, not just once a formal `migration apply` eventually records it.
-    await migration_ensure_tracking_tables(pool)
     await migration_write_schema_snapshot(pool, schema.to_json())
 
 
@@ -958,9 +997,11 @@ async def _create_from_diff(
         diff_schema_steps_with_renames_and_fills as _core_diff_schema_steps_with_renames_and_fills,
         missing_extension_ddl as _core_missing_extension_ddl,
         detect_fill_required as _core_detect_fill_required,
+        schema_content_changed as _core_schema_content_changed,
         render_migration_file,
         compute_migration_short_id,
         db_state_from_json,
+        SchemaDescriptor,
         pgcon_connect,
         introspect_db_state,
         migration_ensure_tracking_tables,
@@ -982,7 +1023,7 @@ async def _create_from_diff(
 
     pool = await pgcon_connect(_pg_dsn(config), 2)
     await migration_ensure_tracking_tables(pool)
-    tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, applied), ...]
+    tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, schema_state, applied), ...]
     applied_tip = migration_applied_tip(tracking)
     chain_ids = [m.id for m in chain]
 
@@ -1015,6 +1056,17 @@ async def _create_from_diff(
         db_state = db_state_from_json(db_state_json)
     else:
         db_state = await introspect_db_state(pool)
+
+    # Schema semantics with zero physical DDL footprint (readonly, rewrites,
+    # channels, ...) never show up in the DDL diff above no matter what, so
+    # they need their own content comparison against the same tip-row
+    # baseline (not against live `_pylon."Schema"`, for the same reason
+    # db_state above isn't live-introspected: watch may have already pushed
+    # ad hoc changes straight to the database without ever going through
+    # `migration create`, and those must still show up as pending here).
+    schema_state_json = tip_row[3] if tip_row else None
+    previous_schema = SchemaDescriptor.from_json(schema_state_json) if schema_state_json is not None else None
+    content_changed = _core_schema_content_changed(schema, previous_schema)
 
     confirmed_type_renames: list[tuple[str, str, str, str]] = []
     confirmed_col_renames: list[tuple[str, str, str, str]] = []
@@ -1069,15 +1121,29 @@ async def _create_from_diff(
         ops = [(sql, False) for sql in ext_ddl] + ops
 
     if not ops:
-        click.echo("No schema changes detected.")
-        return
+        if content_changed:
+            # A schema change with zero physical DDL footprint (readonly,
+            # rewrites, channels, ...) — there's nothing to diff into a DDL
+            # step, but it still needs a migration file, or it can never be
+            # recorded/applied at all. This isn't a design decision to
+            # confirm/reject (same reasoning as ext_ddl above), so it's
+            # included unconditionally rather than routed through a prompt.
+            # The body carries a content fingerprint so its hash — and
+            # therefore this migration's ID — is unique to the actual
+            # change, not a fixed empty string every such migration would
+            # otherwise collide on.
+            ops = [(_non_ddl_change_marker_sql(schema), False)]
+            click.echo("Non-DDL schema change detected (e.g. readonly/rewrite/channel) — recording a migration with no DDL to sync it.")
+        else:
+            click.echo("No schema changes detected.")
+            return
 
     # Non-interactive mode never got a per-step preview — show one summary
     # before writing, one line per grouped step (not per raw DDL statement,
     # matching the readability the interactive loop already has). Interactive
     # mode already confirmed everything step by step, so there's nothing
     # left to re-display.
-    if not is_interactive and not stop_early:
+    if not is_interactive and not stop_early and steps:
         click.echo(f"\n{len(steps)} change(s):")
         for step in steps:
             snippet = step.python_snippet(schema)
@@ -1111,6 +1177,26 @@ async def _create_from_diff(
 
     (d / filename).write_text(content)
     click.echo(f"\nCreated {filename}")
+
+
+def _non_ddl_change_marker_sql(schema) -> str:
+    """A SQL-comment-only op standing in for a migration with no DDL.
+
+    Used when `schema_content_changed` finds a real change but the DDL diff
+    is empty (readonly/rewrites/channels/... — schema semantics with no
+    physical Postgres footprint). A migration file's ID is the hash of its
+    body, so a literal empty body would make every such migration collide
+    on the same ID; embedding a fingerprint of the resulting schema content
+    keeps each one's ID (and rendered file) unique to its actual change,
+    while still executing as a harmless no-op when applied.
+    """
+    import hashlib
+    content_hash = hashlib.sha256(schema.to_json().encode()).hexdigest()[:16]
+    return (
+        "-- pylon: non-DDL schema change (e.g. readonly/rewrite/channel) — nothing to run.\n"
+        f"-- content fingerprint: {content_hash}\n"
+        "-- Applying this migration re-syncs the stored schema snapshot to match."
+    )
 
 
 def _assemble_migration_body(ops: list[tuple[str, bool]]) -> str:

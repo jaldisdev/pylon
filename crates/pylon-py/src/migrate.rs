@@ -48,26 +48,27 @@ fn migration_ensure_tracking_tables<'py>(py: Python<'py>, pool: &PgconPool) -> P
 }
 
 /// Returns every `_pylon."Migrations"` row as `(id, onto, db_state,
-/// applied)` tuples — `applied` is `applied_at IS NOT NULL`; `db_state` is
-/// the raw JSON snapshot text (or `None`), ready for `db_state_from_json`.
-/// `filename` isn't included — nothing in this codebase reads it once a
-/// row exists.
+/// schema_state, applied)` tuples — `applied` is `applied_at IS NOT NULL`;
+/// `db_state` and `schema_state` are raw JSON snapshot text (or `None`),
+/// ready for `db_state_from_json`/`SchemaDescriptor.from_json`
+/// respectively. `filename` isn't included — nothing in this codebase
+/// reads it once a row exists.
 #[pyfunction]
 fn migration_read_tracking<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let tracking = core_migrate::read_tracking(&pool).await.map_err(migrate_err)?;
-        Ok(tracking.into_iter().map(|r| (r.id, r.onto, r.db_state, r.applied)).collect::<Vec<_>>())
+        Ok(tracking.into_iter().map(|r| (r.id, r.onto, r.db_state, r.schema_state, r.applied)).collect::<Vec<_>>())
     })
 }
 
-/// Computes the tip ID from `(id, onto, db_state, applied)` tracking rows
-/// (the one with no descendant) — a pure function, no I/O.
+/// Computes the tip ID from `(id, onto, db_state, schema_state, applied)`
+/// tracking rows (the one with no descendant) — a pure function, no I/O.
 #[pyfunction]
-fn migration_applied_tip(tracking: Vec<(String, String, Option<String>, bool)>) -> Option<String> {
+fn migration_applied_tip(tracking: Vec<(String, String, Option<String>, Option<String>, bool)>) -> Option<String> {
     let rows: Vec<core_migrate::TrackingRow> = tracking
         .into_iter()
-        .map(|(id, onto, db_state, applied)| core_migrate::TrackingRow { id, onto, db_state, applied })
+        .map(|(id, onto, db_state, schema_state, applied)| core_migrate::TrackingRow { id, onto, db_state, schema_state, applied })
         .collect();
     core_migrate::applied_tip(&rows)
 }
