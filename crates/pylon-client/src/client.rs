@@ -123,6 +123,7 @@ impl Builder {
             Some(CacheSource::Shared(cache)) => Some(cache),
         };
         Ok(Client {
+            dsn: Arc::new(self.dsn),
             pool: Arc::new(pool),
             schema: Arc::new(RwLock::new(schema)),
             globals: Arc::new(HashMap::new()),
@@ -137,6 +138,11 @@ impl Builder {
 /// view of it (mirrors `pylon/client.py`'s own shared-pool-ref pattern).
 #[derive(Clone)]
 pub struct Client {
+    /// Kept around solely for `Client::listen()` — every other method
+    /// operates through `pool`; a `LISTEN` subscription needs its own
+    /// dedicated (non-pooled) connection instead, opened fresh from this
+    /// DSN each time `listen()` is called.
+    dsn: Arc<String>,
     pool: Arc<pylon_pgcon::PgPool>,
     /// Every query method clones this out from behind the lock before
     /// compiling/awaiting anything — a `std::sync::RwLockReadGuard` isn't
@@ -230,6 +236,33 @@ impl Client {
     pub async fn execute(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<()> {
         let schema = self.schema.read().unwrap().clone();
         exec::execute(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+    }
+
+    /// Subscribes to a schema-declared [`Channel`](pylon_core::schema::ChannelDescriptor)
+    /// (bare or `module::name` reference — the same string a schema author
+    /// already writes inside a PyQL `notify(...)` call) and returns a
+    /// [`ChannelListener`] whose `recv()` yields decoded payloads matching
+    /// that Channel's own declared shape: `Value::Uuid` for a Type-shaped
+    /// channel (the changed row's `id`, not a fetched object — see
+    /// `docs/schema/channels.md`), the matching `Value` variant for a
+    /// Scalar-shaped channel, or `Value::Object` for an Object-shaped
+    /// channel. A payload that doesn't match the declared shape comes back
+    /// as `Err(Error::MalformedPayload(_))` from that `recv()` call rather
+    /// than being silently dropped.
+    ///
+    /// Opens its own dedicated (non-pooled) connection, held for the
+    /// returned `ChannelListener`'s lifetime — `LISTEN` is per-session, so
+    /// running it on a pooled connection would leak the subscription onto
+    /// whatever unrelated query later borrows that connection back out of
+    /// the pool. The connection (and the server-side subscription with it)
+    /// closes once the `ChannelListener` is dropped.
+    ///
+    /// Mirrors `pylon/client.py`'s own `Client.listen()` — there, a typed
+    /// async generator; here, a `recv()`-based handle instead, since this
+    /// crate has no `Stream`/async-generator precedent to build on.
+    pub async fn listen(&self, channel: &str) -> Result<crate::ChannelListener> {
+        let schema = self.schema.read().unwrap().clone();
+        crate::listen::listen(&self.dsn, &schema, channel).await
     }
 
     pub async fn query_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {

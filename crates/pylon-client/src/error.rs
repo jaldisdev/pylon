@@ -63,6 +63,15 @@ pub enum Error {
     /// rendered message.
     #[error("cache error: {0}")]
     Cache(String),
+    /// `Client::listen(name)` — no `Channel` declared in the schema matches
+    /// *name* (bare or `module::name`).
+    #[error("'{0}' is not a known Channel")]
+    UnknownChannel(String),
+    /// A `Client::listen()` NOTIFY payload didn't match its Channel's own
+    /// declared shape (bad JSON, a value that doesn't parse as its
+    /// declared scalar type, a missing Object field, ...).
+    #[error("payload doesn't match its declared Channel shape: {0}")]
+    MalformedPayload(String),
 }
 
 impl Error {

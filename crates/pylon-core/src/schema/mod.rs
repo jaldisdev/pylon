@@ -484,3 +484,50 @@ pub struct SchemaDescriptor {
     pub aliases: Vec<AliasDescriptor>,
     pub channels: Vec<ChannelDescriptor>,
 }
+
+impl SchemaDescriptor {
+    /// Find a declared `Channel` by bare or `module::name` reference — the
+    /// single lookup both `notify()` (`ir::compiler::Compiler::resolve_channel`)
+    /// and `pylon-client`'s `Client::listen()` resolve a channel argument
+    /// through, so a schema author's `notify(Foo, ...)` and a client's
+    /// `listen("Foo")` agree on exactly the same name.
+    pub fn find_channel(&self, name: &str) -> Option<&ChannelDescriptor> {
+        self.channels.iter().find(|c| c.name == name || format!("{}::{}", c.module, c.name) == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_with_one_channel() -> SchemaDescriptor {
+        SchemaDescriptor {
+            channels: vec![ChannelDescriptor {
+                name: "Pings".into(),
+                module: "shop".into(),
+                wire_name: "shop__pings".into(),
+                payload: ChannelPayload::Scalar("text".into()),
+                description: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn find_channel_matches_bare_name() {
+        let schema = schema_with_one_channel();
+        assert_eq!(schema.find_channel("Pings").map(|c| c.wire_name.as_str()), Some("shop__pings"));
+    }
+
+    #[test]
+    fn find_channel_matches_qualified_name() {
+        let schema = schema_with_one_channel();
+        assert_eq!(schema.find_channel("shop::Pings").map(|c| c.wire_name.as_str()), Some("shop__pings"));
+    }
+
+    #[test]
+    fn find_channel_returns_none_for_unknown_name() {
+        let schema = schema_with_one_channel();
+        assert!(schema.find_channel("NoSuchChannel").is_none());
+    }
+}

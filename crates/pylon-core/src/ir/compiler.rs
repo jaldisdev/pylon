@@ -998,9 +998,7 @@ impl<'a> Compiler<'a> {
     /// `notify()` to find the declared payload shape its second argument
     /// must match.
     fn resolve_channel(&self, name: &str) -> Option<&'a crate::schema::ChannelDescriptor> {
-        self.schema.channels.iter().find(|c| {
-            c.name == name || format!("{}::{}", c.module, c.name) == name
-        })
+        self.schema.find_channel(name)
     }
 
     /// Resolve a registered custom scalar (`pylon.scalar(..., name=...)` or
