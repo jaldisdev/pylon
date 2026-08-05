@@ -1234,3 +1234,151 @@ class TestGlobal:
     def test_global_descriptor_repr_with_default(self):
         d = GlobalDescriptor(name="x", module="user", scalar_type=pylon.UUID, required=False, default="abc")
         assert "default='abc'" in repr(d)
+
+
+# ---------------------------------------------------------------------------
+# Channels
+# ---------------------------------------------------------------------------
+
+
+from pylon.datatypes import Object as PylonObject
+from pylon.schema._channels import (
+    RESERVED_WIRE_NAME_PREFIX,
+    Channel,
+    ChannelDescriptor,
+    _to_snake_case,
+    collect_module_channels,
+    wire_name_for_channel,
+)
+from pylon.schema._walker import _build_channel_descriptor, _validate_channels
+
+
+@pylon.type(module="shop", name="ChannelUser")
+class ChannelUser:
+    name: str
+
+
+def _make_channels_module(**values) -> _types.ModuleType:
+    m = _types.ModuleType("test_schema_channels")
+    for name, value in values.items():
+        setattr(m, name, value)
+    return m
+
+
+class TestChannel:
+    def test_to_snake_case(self):
+        assert _to_snake_case("UserUpdates") == "user_updates"
+        assert _to_snake_case("SearchReady") == "search_ready"
+        assert _to_snake_case("HTTPResponse") == "http_response"
+        assert _to_snake_case("already_snake") == "already_snake"
+
+    def test_wire_name_default_derivation(self):
+        d = ChannelDescriptor(name="UserUpdates", module="shop", payload_type=str)
+        assert wire_name_for_channel(d) == "shop__user_updates"
+
+    def test_wire_name_override_used_verbatim(self):
+        d = ChannelDescriptor(name="Pings", module="shop", payload_type=str, wire_name_override="custom_ping")
+        assert wire_name_for_channel(d) == "custom_ping"
+
+    def test_collect_bound_channel_value(self):
+        m = _make_channels_module(UserUpdates=Channel(str))
+        result = collect_module_channels(m)
+        assert len(result) == 1
+        d = result[0]
+        assert d.name == "UserUpdates"
+        assert d.payload_type is str
+        assert d.wire_name_override is None
+        assert d.description is None
+
+    def test_collect_with_name_and_description_override(self):
+        m = _make_channels_module(Pings=Channel(str, name="custom_ping", description="heartbeat"))
+        result = collect_module_channels(m)
+        assert result[0].wire_name_override == "custom_ping"
+        assert result[0].description == "heartbeat"
+
+    def test_private_values_skipped(self):
+        m = _make_channels_module(_Private=Channel(str), Public=Channel(str))
+        result = collect_module_channels(m)
+        assert len(result) == 1
+        assert result[0].name == "Public"
+
+    def test_non_channel_values_ignored(self):
+        m = _make_channels_module(some_var="not a channel", Real=Channel(str))
+        result = collect_module_channels(m)
+        assert len(result) == 1
+        assert result[0].name == "Real"
+
+    def test_collect_multiple(self):
+        m = _make_channels_module(A=Channel(str), B=Channel(int))
+        result = collect_module_channels(m)
+        assert {d.name for d in result} == {"A", "B"}
+
+    def test_module_name_inferred_from_dotted_path(self):
+        m = _types.ModuleType("pylon_app.schema.notifications")
+        m.X = Channel(str)
+        result = collect_module_channels(m)
+        assert result[0].module == "notifications"
+
+    def test_pylon_module_override(self):
+        m = _make_channels_module(X=Channel(str))
+        m.__pylon_module__ = "auth"
+        result = collect_module_channels(m)
+        assert result[0].module == "auth"
+
+    def test_empty_module_returns_empty_list(self):
+        m = _make_channels_module()
+        assert collect_module_channels(m) == []
+
+    def test_channel_descriptor_repr(self):
+        d = ChannelDescriptor(name="X", module="shop", payload_type=str)
+        assert "ChannelDescriptor" in repr(d)
+        assert "'X'" in repr(d)
+
+    def test_build_descriptor_scalar_payload(self):
+        d = ChannelDescriptor(name="Pings", module="shop", payload_type=str)
+        from pylon import _core
+        desc = _build_channel_descriptor(d, _core)
+        assert desc.name == "Pings"
+        assert desc.wire_name == "shop__pings"
+
+    def test_build_descriptor_type_payload(self):
+        d = ChannelDescriptor(name="UserUpdates", module="shop", payload_type=ChannelUser)
+        from pylon import _core
+        desc = _build_channel_descriptor(d, _core)
+        assert desc.wire_name == "shop__user_updates"
+
+    def test_build_descriptor_object_payload(self):
+        payload = PylonObject(doc_id=uuid.UUID, score=float)
+        d = ChannelDescriptor(name="SearchReady", module="shop", payload_type=payload)
+        from pylon import _core
+        desc = _build_channel_descriptor(d, _core)
+        assert desc.wire_name == "shop__search_ready"
+
+    def test_build_descriptor_object_payload_rejects_object_type_field(self):
+        payload = PylonObject(user=ChannelUser)
+        d = ChannelDescriptor(name="Bad", module="shop", payload_type=payload)
+        from pylon import _core
+        with pytest.raises(SchemaError):
+            _build_channel_descriptor(d, _core)
+
+    def test_validate_channels_rejects_reserved_prefix(self):
+        d = ChannelDescriptor(name="X", module="shop", payload_type=str, wire_name_override="pylon_cache_invalidate")
+        with pytest.raises(SchemaError, match="reserved"):
+            _validate_channels([d])
+
+    def test_validate_channels_rejects_cross_module_duplicate(self):
+        a = ChannelDescriptor(name="A", module="m1", payload_type=str, wire_name_override="dup")
+        b = ChannelDescriptor(name="B", module="m2", payload_type=str, wire_name_override="dup")
+        with pytest.raises(SchemaError, match="Duplicate channel wire name"):
+            _validate_channels([a, b])
+
+    def test_validate_channels_allows_same_name_different_module(self):
+        a = ChannelDescriptor(name="Updates", module="m1", payload_type=str)
+        b = ChannelDescriptor(name="Updates", module="m2", payload_type=str)
+        _validate_channels([a, b])  # no error — different wire names
+
+    def test_validate_channels_empty_list_ok(self):
+        _validate_channels([])
+
+    def test_reserved_prefix_matches_pylons_own_internal_channels(self):
+        assert RESERVED_WIRE_NAME_PREFIX == "pylon_"

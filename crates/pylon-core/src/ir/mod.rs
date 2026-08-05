@@ -1134,7 +1134,7 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 

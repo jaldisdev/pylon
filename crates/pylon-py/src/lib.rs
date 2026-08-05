@@ -1159,6 +1159,66 @@ impl AliasDescriptor {
     fn expr(&self) -> &str { &self.inner.expr }
 }
 
+// ── Channel descriptor ──────────────────────────────────────────────────────────
+
+#[pyclass(module = "pylon._core", frozen)]
+pub struct ChannelDescriptor {
+    inner: core::schema::ChannelDescriptor,
+}
+
+#[pymethods]
+impl ChannelDescriptor {
+    /// `payload_kind` is one of `"type"` / `"scalar"` / `"object"`, with
+    /// exactly the matching one of `payload_type_ref` / `payload_scalar_pg_type`
+    /// / `payload_object_fields` supplied — mirrors `core::schema::ChannelPayload`'s
+    /// three variants without exposing that enum to Python directly.
+    #[new]
+    #[pyo3(signature = (name, module, wire_name, payload_kind, *, payload_type_ref = None, payload_scalar_pg_type = None, payload_object_fields = None, description = None))]
+    fn new(
+        name: String,
+        module: String,
+        wire_name: String,
+        payload_kind: &str,
+        payload_type_ref: Option<String>,
+        payload_scalar_pg_type: Option<String>,
+        payload_object_fields: Option<Vec<(String, String)>>,
+        description: Option<String>,
+    ) -> PyResult<Self> {
+        let payload = match payload_kind {
+            "type" => core::schema::ChannelPayload::Type(
+                payload_type_ref
+                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("payload_type_ref is required for payload_kind='type'"))?,
+            ),
+            "scalar" => core::schema::ChannelPayload::Scalar(
+                payload_scalar_pg_type
+                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("payload_scalar_pg_type is required for payload_kind='scalar'"))?,
+            ),
+            "object" => core::schema::ChannelPayload::Object(
+                payload_object_fields
+                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("payload_object_fields is required for payload_kind='object'"))?,
+            ),
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown channel payload_kind {other:?}, expected 'type', 'scalar', or 'object'"
+                )))
+            }
+        };
+        Ok(Self { inner: core::schema::ChannelDescriptor { name, module, wire_name, payload, description } })
+    }
+
+    #[getter]
+    fn name(&self) -> &str { &self.inner.name }
+
+    #[getter]
+    fn module(&self) -> &str { &self.inner.module }
+
+    #[getter]
+    fn wire_name(&self) -> &str { &self.inner.wire_name }
+
+    #[getter]
+    fn description(&self) -> Option<&str> { self.inner.description.as_deref() }
+}
+
 // ── Function descriptors ────────────────────────────────────────────────────────
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -1258,7 +1318,7 @@ pub struct SchemaDescriptor {
 #[pymethods]
 impl SchemaDescriptor {
     #[new]
-    #[pyo3(signature = (*, types = None, scalars = None, enums = None, named_tuples = None, globals = None, functions = None, aliases = None))]
+    #[pyo3(signature = (*, types = None, scalars = None, enums = None, named_tuples = None, globals = None, functions = None, aliases = None, channels = None))]
     fn new(
         types: Option<Vec<PyRef<TypeDescriptor>>>,
         scalars: Option<Vec<PyRef<ScalarDescriptor>>>,
@@ -1267,6 +1327,7 @@ impl SchemaDescriptor {
         globals: Option<Vec<PyRef<GlobalDescriptor>>>,
         functions: Option<Vec<PyRef<FunctionDescriptor>>>,
         aliases: Option<Vec<PyRef<AliasDescriptor>>>,
+        channels: Option<Vec<PyRef<ChannelDescriptor>>>,
     ) -> Self {
         Self {
             inner: core::schema::SchemaDescriptor {
@@ -1304,6 +1365,11 @@ impl SchemaDescriptor {
                     .unwrap_or_default()
                     .iter()
                     .map(|a| a.inner.clone())
+                    .collect(),
+                channels: channels
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| c.inner.clone())
                     .collect(),
             },
         }
@@ -2166,6 +2232,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NamedTupleDescriptor>()?;
     m.add_class::<GlobalDescriptor>()?;
     m.add_class::<AliasDescriptor>()?;
+    m.add_class::<ChannelDescriptor>()?;
     m.add_class::<FunctionParamDescriptor>()?;
     m.add_class::<FunctionDescriptor>()?;
     m.add_class::<SchemaDescriptor>()?;

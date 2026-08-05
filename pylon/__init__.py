@@ -56,6 +56,8 @@ from .schema import (
     Float64,
     Alias,
     AliasDescriptor,
+    Channel,
+    ChannelDescriptor,
     Global,
     GlobalDescriptor,
     Index,
@@ -196,6 +198,8 @@ __all__ = [
     # Schema — globals
     "Alias",
     "AliasDescriptor",
+    "Channel",
+    "ChannelDescriptor",
     "Global",
     "GlobalDescriptor",
     "collect_module_globals",

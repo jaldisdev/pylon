@@ -2752,11 +2752,11 @@ mod tests {
 
         let schema_before = SchemaDescriptor {
             types: vec![before], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let schema_after = SchemaDescriptor {
             types: vec![after], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -2771,11 +2771,11 @@ mod tests {
 
         let schema_before = SchemaDescriptor {
             types: vec![before], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let schema_after = SchemaDescriptor {
             types: vec![after], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -2785,7 +2785,7 @@ mod tests {
         let t = simple_type("default", "Person", "Person");
         let schema = SchemaDescriptor {
             types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let other = schema.clone();
         assert!(!schema_content_changed(&schema, Some(&other)));
@@ -2796,7 +2796,7 @@ mod tests {
         let t = simple_type("default", "Person", "Person");
         let schema = SchemaDescriptor {
             types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         assert!(schema_content_changed(&schema, None), "no prior snapshot at all must count as changed");
     }
@@ -2816,7 +2816,27 @@ mod tests {
         let schema_after = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
             scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+        };
+        assert!(schema_content_changed(&schema_after, Some(&schema_before)));
+    }
+
+    #[test]
+    fn test_schema_content_changed_detects_a_new_channel() {
+        // A `Channel` has zero physical DDL footprint — nothing about it
+        // ever shows up in `diff_schema_steps`/`diff_schema_ops`, so its
+        // mere addition is exactly the class of change this function
+        // exists to catch, same as the readonly/rewrite cases above.
+        let schema_before = SchemaDescriptor::default();
+        let schema_after = SchemaDescriptor {
+            channels: vec![crate::schema::ChannelDescriptor {
+                name: "UserUpdates".into(),
+                module: "default".into(),
+                wire_name: "default__user_updates".into(),
+                payload: crate::schema::ChannelPayload::Scalar("text".into()),
+                description: None,
+            }],
+            ..Default::default()
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -2825,7 +2845,7 @@ mod tests {
     fn test_new_schema_and_table() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("catalog", "Product", "Product")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -2853,7 +2873,7 @@ mod tests {
         // migration.
         let schema = SchemaDescriptor {
             types: vec![widget_with_trigger(1, "After", "update Widget set { name := __new__.name }")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -2868,7 +2888,7 @@ mod tests {
         // propose recreating it forever, even with zero real schema changes.
         let schema = SchemaDescriptor {
             types: vec![widget_with_trigger(1, "After", "update Widget set { name := __new__.name }")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let baseline = schema_to_db_state(&schema);
         let steps = diff_schema_steps(&schema, &baseline, &HashMap::new()).unwrap();
@@ -2897,7 +2917,7 @@ mod tests {
         });
         let schema = SchemaDescriptor {
             types: vec![order, simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -2926,7 +2946,7 @@ mod tests {
 
         let schema = SchemaDescriptor {
             types: vec![product, junction, simple_type("default", "Tag", "Tag")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let trigger_count = ops.iter()
@@ -2958,7 +2978,7 @@ mod tests {
 
         SchemaDescriptor {
             types: vec![person, junction],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -3021,7 +3041,7 @@ mod tests {
     fn test_cache_invalidate_trigger_backfilled_on_pre_existing_table() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3049,7 +3069,7 @@ mod tests {
     fn test_cache_invalidate_trigger_not_dropped_when_already_present() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3074,7 +3094,7 @@ mod tests {
     fn test_no_ops_when_in_sync() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3099,7 +3119,7 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("email", "text", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3126,7 +3146,7 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("rating", "int8", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3155,7 +3175,7 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("rating", "int8", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3201,7 +3221,7 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("age", "int8", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3247,7 +3267,7 @@ mod tests {
                 name: "Email".into(), module: "default".into(), base: "Str".into(),
                 pg_type: "text".into(), check_constraints: vec!["value ~ '@'".into()], is_sequence: false,
             }],
-            enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
 
         // The view's own SELECT text never mentions column types, so its
@@ -3305,7 +3325,7 @@ mod tests {
         }
         SchemaDescriptor {
             types,
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -3404,7 +3424,7 @@ mod tests {
                 members: vec!["Active".into(), "Inactive".into()],
             }],
             named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![],
+            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -3414,7 +3434,7 @@ mod tests {
     #[test]
     fn test_drop_table() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3442,7 +3462,7 @@ mod tests {
             dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         // The table already exists in the DB (pre-existing).
         let state = DbState {
@@ -3468,7 +3488,7 @@ mod tests {
     fn test_required_extensions_empty_without_vector_indexes() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Post", "Post")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         assert!(required_extensions(&schema).is_empty());
     }
@@ -3481,7 +3501,7 @@ mod tests {
             index_name: None, pointers: vec!["name".into()], model: "test".into(), metric: "cosine".into(), dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         assert_eq!(required_extensions(&schema), vec!["vector"]);
 
@@ -3504,7 +3524,7 @@ mod tests {
             dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         // Table does NOT exist in the DB → it's new.
         let ops = diff_schema_ops(&schema, &empty_state()).unwrap();
@@ -3527,7 +3547,7 @@ mod tests {
     #[test]
     fn test_new_sequence_creates_sequence_and_domain() {
         let schema = SchemaDescriptor {
-            types: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
@@ -3543,7 +3563,7 @@ mod tests {
     #[test]
     fn test_no_ops_sequence_already_exists() {
         let schema = SchemaDescriptor {
-            types: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
         };
         let state = DbState {
@@ -3559,7 +3579,7 @@ mod tests {
     #[test]
     fn test_drop_removed_sequence() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3582,7 +3602,7 @@ mod tests {
         person.properties.push(prop("age", "int8", true));
         let schema = SchemaDescriptor {
             types: vec![person],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -3621,7 +3641,7 @@ mod tests {
     fn test_diff_schema_steps_new_table_is_one_create_step_including_its_trigger() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("catalog", "Product", "Product")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let steps = diff_schema_steps(&schema, &empty_state(), &HashMap::new()).unwrap();
         let table_steps: Vec<&MigrationStep> = steps.iter()
@@ -3642,7 +3662,7 @@ mod tests {
     fn test_guidance_bans_a_rejected_type_rename_candidate() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Customer", "Customer")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],

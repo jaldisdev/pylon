@@ -229,7 +229,7 @@ mod tests {
         td.properties.push(prop("views", "int8", true));
         let schema = SchemaDescriptor {
             types: vec![td],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let step = type_step(schema.types[0].clone(), Verb::Create);
         let snippet = python_snippet_for_step(&step, &schema).unwrap();
@@ -248,7 +248,7 @@ mod tests {
         td.properties.push(prop("email", "text", false));
         let schema = SchemaDescriptor {
             types: vec![td],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let step = MigrationStep {
             prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
@@ -265,7 +265,7 @@ mod tests {
             types: vec![],
             scalars: vec![],
             enums: vec![EnumDescriptor { name: "Status".into(), module: "default".into(), members: vec!["Active".into(), "Inactive".into()] }],
-            named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let step = MigrationStep {
             prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn renders_a_scalar_function_as_its_pyql_body_not_compiled_sql() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![],
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![], channels: vec![],
             functions: vec![FunctionDescriptor {
                 name: "get_content_type".into(),
                 module: "default".into(),
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn indents_every_line_of_a_multiline_pyql_body() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![],
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![], channels: vec![],
             functions: vec![FunctionDescriptor {
                 name: "get_content_type".into(),
                 module: "default".into(),
@@ -341,7 +341,7 @@ mod tests {
         // calls, to catch a mismatch between the OpKey a real diff pass
         // produces and what this renderer looks up.
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![],
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![], channels: vec![],
             functions: vec![FunctionDescriptor {
                 name: "get_content_type".into(),
                 module: "default".into(),
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn returns_none_for_a_module_step() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         };
         let step = MigrationStep {
             prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],

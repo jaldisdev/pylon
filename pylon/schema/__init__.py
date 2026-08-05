@@ -22,6 +22,7 @@ from ._export import export
 from ._walker import SchemaError
 from ._globals import Global, GlobalDescriptor, collect_module_globals
 from ._aliases import Alias, AliasDescriptor, collect_module_aliases
+from ._channels import Channel, ChannelDescriptor, collect_module_channels
 from ._constraints import (
     Default,
     Description,

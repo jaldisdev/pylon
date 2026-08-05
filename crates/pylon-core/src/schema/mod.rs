@@ -437,6 +437,40 @@ pub struct AliasDescriptor {
     pub expr: String,
 }
 
+// ── Channel descriptor ──────────────────────────────────────────────────────────
+
+/// The shape of a `Channel`'s payload, as declared in the schema DSL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ChannelPayload {
+    /// A registered object type, by its qualified name (e.g. `default::User`) —
+    /// `notify()` sends the object, `listen()` decodes into that type.
+    Type(String),
+    /// A plain scalar's Postgres type (e.g. `text`, `int8`).
+    Scalar(String),
+    /// An ad hoc named-field payload (`pylon.Object(...)`) — field name to
+    /// scalar Postgres type, in declaration order. No backing table; decodes
+    /// client-side into a `pylon.Object` instance.
+    Object(Vec<(String, String)>),
+}
+
+/// A PostgreSQL pub/sub channel (`NOTIFY`/`LISTEN`) declared in the schema.
+/// Has zero physical DDL footprint — nothing here ever produces a DDL step
+/// in `diff_schema_steps`; its mere presence in a schema is exactly the kind
+/// of content-only change `schema_content_changed` exists to catch.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChannelDescriptor {
+    pub name: String,
+    pub module: String,
+    /// The actual PostgreSQL NOTIFY/LISTEN channel identifier. Unlike every
+    /// other named construct in this descriptor, Postgres channels have no
+    /// schema namespacing at all — a flat, database-wide identifier — so
+    /// this is already fully disambiguated (module folded in) by the time
+    /// it gets here; see `pylon.schema._channels.wire_name_for_channel`.
+    pub wire_name: String,
+    pub payload: ChannelPayload,
+    pub description: Option<String>,
+}
+
 // ── Top-level schema ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -448,4 +482,5 @@ pub struct SchemaDescriptor {
     pub globals: Vec<GlobalDescriptor>,
     pub functions: Vec<FunctionDescriptor>,
     pub aliases: Vec<AliasDescriptor>,
+    pub channels: Vec<ChannelDescriptor>,
 }

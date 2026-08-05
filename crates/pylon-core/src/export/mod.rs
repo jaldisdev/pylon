@@ -1816,7 +1816,7 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: fns,
-            aliases: vec![],
+            aliases: vec![], channels: vec![],
         }
     }
 
@@ -1837,7 +1837,7 @@ mod tests {
     fn schema_with_trigger(trigger: crate::schema::TriggerDescriptor) -> SchemaDescriptor {
         let mut t = person_type();
         t.triggers = vec![trigger];
-        SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![] }
+        SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![] }
     }
 
     #[test]
@@ -1959,7 +1959,7 @@ mod tests {
             trig(1, "After", "update Person set { age := __new__.age }"),
             trig(4, "Before", "update Person set { age := __old__.age }"),
         ];
-        let schema = SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![] };
+        let schema = SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![] };
         let ddl = export_schema(&schema).unwrap();
         let fn_count = ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"Person_").count();
         assert_eq!(fn_count, 2, "expected one function per Trigger(...), got:\n{ddl}");
@@ -2048,7 +2048,7 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("CREATE SEQUENCE \"public\".\"OrderNumber_seq\""), "got:\n{}", ddl);
@@ -2094,7 +2094,7 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -2136,7 +2136,7 @@ mod tests {
         account.constraints = vec![]; // interface itself has no table of its own to constrain
         SchemaDescriptor {
             types: vec![account, individual, organization],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![],
+            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
         }
     }
 
@@ -2289,7 +2289,7 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![org_type(module), owner],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("AFTER DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
@@ -2319,7 +2319,7 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![org_type(module), owner],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
 
@@ -2340,7 +2340,7 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![with_signal],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(ddl.contains("AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""), "got:\n{ddl}");
@@ -2378,7 +2378,7 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![with_signal],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -2398,7 +2398,7 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![with_signal],
             scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![],
+            functions: vec![], aliases: vec![], channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(!ddl.contains("IF TG_OP = 'UPDATE'"), "got:\n{ddl}");
