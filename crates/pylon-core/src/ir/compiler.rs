@@ -994,6 +994,15 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// Resolve a `Channel` by name (bare or `module::Name`) — used by
+    /// `notify()` to find the declared payload shape its second argument
+    /// must match.
+    fn resolve_channel(&self, name: &str) -> Option<&'a crate::schema::ChannelDescriptor> {
+        self.schema.channels.iter().find(|c| {
+            c.name == name || format!("{}::{}", c.module, c.name) == name
+        })
+    }
+
     /// Resolve a registered custom scalar (`pylon.scalar(..., name=...)` or
     /// the `@pylon.scalar` decorator form) by name — used to recognize a
     /// cast target as that scalar's own PostgreSQL DOMAIN (see
@@ -4791,6 +4800,17 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FunctionCall(f) => {
+                // notify(Channel, payload) / notify_raw(name, payload) → pg_notify(...).
+                // Works in both free and schema-bound context (unlike sequence_next
+                // below) since a trigger handler's payload needs __new__/__old__,
+                // which only ever resolves schema-bound.
+                if (f.module.is_none() || f.module.as_deref() == Some("std")) && f.name == "notify" {
+                    return self.compile_notify(f, ctx);
+                }
+                if (f.module.is_none() || f.module.as_deref() == Some("std")) && f.name == "notify_raw" {
+                    return self.compile_notify_raw(f, ctx);
+                }
+
                 // sequence_next / sequence_reset: type-ref arg → nextval/setval SQL
                 // (free-only: schema-bound context never special-cased this).
                 if ctx.is_none()
@@ -6741,6 +6761,216 @@ impl<'a> Compiler<'a> {
                 fc.name, arg_name
             ))),
         }
+    }
+
+    // ── Channel notify() helpers ────────────────────────────────────────────────
+
+    /// PostgreSQL's hard per-NOTIFY-payload limit (`NOTIFY_PAYLOAD_MAX_LENGTH`
+    /// in the Postgres source) — a payload at or over this is rejected by the
+    /// server at runtime, always, for every session. Checked here only when
+    /// the payload is a literal string (the one case actually decidable at
+    /// compile time); anything else (a column, a param, an expression) is
+    /// left unchecked, same as every other best-effort check in this module.
+    const NOTIFY_PAYLOAD_MAX_BYTES: usize = 8000;
+
+    /// Compile `notify(Channel, payload)` → `pg_notify('<wire_name>', (<payload>)::text)`.
+    /// The payload's required shape depends on the Channel's declared kind:
+    /// - `Type(qname)`: payload must be the bare `__new__`/`__old__` trigger
+    ///   anchor for that exact type — sends its `.id`, not the whole row (see
+    ///   this function's own restriction: a general object-typed expression
+    ///   isn't supported yet, only the trigger-anchor case).
+    /// - `Scalar(pg_type)`: payload is any expression, best-effort type-checked.
+    /// - `Object(fields)`: payload must be a free object literal (`{ a := .., b := .. }`)
+    ///   whose field names exactly match the declared shape.
+    fn compile_notify(
+        &mut self,
+        fc: &ast::FunctionCall,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<IrExpr, PyQLError> {
+        use crate::parse::ast::{Expr, Path, PathStep};
+
+        if fc.args.len() != 2 {
+            return Err(self.type_err("notify() takes exactly 2 arguments: (Channel, payload)"));
+        }
+
+        let (channel_module, channel_name): (Option<&str>, &str) = match &fc.args[0] {
+            Expr::Path(Path { steps, partial: false }) => match steps.as_slice() {
+                [PathStep::Name(s)] => {
+                    if let Some((m, n)) = s.split_once("::") { (Some(m), n) } else { (None, s.as_str()) }
+                }
+                _ => return Err(self.type_err(
+                    "notify(): first argument must be a Channel name (e.g. OrderEvents or orders::OrderEvents)"
+                )),
+            },
+            _ => return Err(self.type_err(
+                "notify(): first argument must be a Channel name (e.g. OrderEvents or orders::OrderEvents)"
+            )),
+        };
+        let full_channel_name = match channel_module {
+            Some(m) => format!("{m}::{channel_name}"),
+            None => channel_name.to_string(),
+        };
+        let channel = self.resolve_channel(&full_channel_name).ok_or_else(|| {
+            self.type_err(&format!("notify(): '{channel_name}' is not a known Channel"))
+        })?;
+        let wire_name = channel.wire_name.clone();
+        let payload_arg = &fc.args[1];
+
+        // A bare `select notify(...)` trigger handler has no type at its
+        // root, so the top-level statement compiles as a *free* select
+        // (ctx=None) even though `special_anchors` is populated — `__new__`/
+        // `__old__` only resolve through `compile_path`, which is only ever
+        // reached when ctx is `Some(..)` (see `Expr::Path`'s arm above).
+        // Fall back to any bound anchor's (td, alias) as a stand-in ctx so a
+        // Scalar/Object payload like `__new__.name` or `{ a := __new__.x }`
+        // still resolves — `compile_path`'s own `__new__`/`__old__` branch
+        // ignores whatever td/alias ctx carries for those two names anyway,
+        // it only matters for a real property access on some other root.
+        // Cloned out of `special_anchors` (rather than borrowed) so it
+        // doesn't hold an immutable borrow of `self` across the `&mut self`
+        // `compile_expr_ctx` calls below.
+        let anchor_fallback: Option<(&'a TypeDescriptor, String)> =
+            self.special_anchors.values().next().cloned();
+        let ctx = ctx.or_else(|| anchor_fallback.as_ref().map(|(td, alias)| (*td, alias.as_str())));
+
+        let payload_ir = match &channel.payload {
+            crate::schema::ChannelPayload::Type(qname) => {
+                let anchor_name = match payload_arg {
+                    Expr::Path(Path { steps, partial: false }) => match steps.as_slice() {
+                        [PathStep::Name(s)] if s == "__new__" || s == "__old__" => s.as_str(),
+                        _ => return Err(self.type_err(&format!(
+                            "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
+                             must be __new__ or __old__ — only supported inside a trigger handler in this phase"
+                        ))),
+                    },
+                    _ => return Err(self.type_err(&format!(
+                        "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
+                         must be __new__ or __old__ — only supported inside a trigger handler in this phase"
+                    ))),
+                };
+                let (anchor_td, alias) = self.special_anchors.get(anchor_name).cloned().ok_or_else(|| {
+                    self.type_err(&format!(
+                        "notify(): '{anchor_name}' cannot be used here — it's only bound inside a trigger handler"
+                    ))
+                })?;
+                let anchor_qname = format!("{}::{}", anchor_td.module, anchor_td.name);
+                if &anchor_qname != qname {
+                    return Err(self.type_err(&format!(
+                        "notify(): Channel '{full_channel_name}' expects a payload of type '{qname}', got '{anchor_qname}'"
+                    )));
+                }
+                IrExpr::ColumnRef { alias, column: "id".to_string(), pg_type: "uuid".to_string() }
+            }
+            crate::schema::ChannelPayload::Scalar(pg_type) => {
+                let ir = self.compile_expr_ctx(payload_arg, ctx)?;
+                if let Some(actual) = infer_ir_type(&ir) {
+                    if !types_compatible(actual, pg_type) {
+                        return Err(self.type_err(&format!(
+                            "notify(): Channel '{full_channel_name}' expects a payload of type '{expected}', got '{actual_pyql}'",
+                            expected = pg_type_to_pyql(pg_type),
+                            actual_pyql = pg_type_to_pyql(actual),
+                        )));
+                    }
+                }
+                ir
+            }
+            crate::schema::ChannelPayload::Object(declared_fields) => {
+                let Expr::Shape(sh) = payload_arg else {
+                    return Err(self.type_err(&format!(
+                        "notify(): payload for Channel '{full_channel_name}' (an Object channel) must be a free \
+                         object literal, e.g. {{ {} }}",
+                        declared_fields.iter().map(|(n, _)| format!("{n} := ..")).collect::<Vec<_>>().join(", ")
+                    )));
+                };
+                if sh.expr.is_some() {
+                    return Err(self.type_err(&format!(
+                        "notify(): payload for Channel '{full_channel_name}' (an Object channel) must be a free \
+                         object literal, not a shape over a type"
+                    )));
+                }
+                let ir = self.compile_expr_ctx(payload_arg, ctx)?;
+                let IrExpr::NamedTuple { fields, is_free_object: true } = &ir else {
+                    return Err(self.type_err(&format!(
+                        "notify(): payload for Channel '{full_channel_name}' (an Object channel) must be a free object literal"
+                    )));
+                };
+                let declared_names: std::collections::HashSet<&str> =
+                    declared_fields.iter().map(|(n, _)| n.as_str()).collect();
+                let actual_names: std::collections::HashSet<&str> =
+                    fields.iter().map(|(n, _)| n.as_str()).collect();
+                if declared_names != actual_names {
+                    let mut expected: Vec<&str> = declared_names.iter().copied().collect();
+                    expected.sort();
+                    let mut actual: Vec<&str> = actual_names.iter().copied().collect();
+                    actual.sort();
+                    return Err(self.type_err(&format!(
+                        "notify(): payload fields for Channel '{full_channel_name}' don't match — expected {{{}}}, got {{{}}}",
+                        expected.join(", "), actual.join(", ")
+                    )));
+                }
+                for (name, expr) in fields {
+                    let Some((_, declared_pg_type)) = declared_fields.iter().find(|(n, _)| n == name) else { continue };
+                    if let Some(actual) = infer_ir_type(expr) {
+                        if !types_compatible(actual, declared_pg_type) {
+                            return Err(self.type_err(&format!(
+                                "notify(): field '{name}' of Channel '{full_channel_name}' expects type '{expected}', got '{actual_pyql}'",
+                                expected = pg_type_to_pyql(declared_pg_type),
+                                actual_pyql = pg_type_to_pyql(actual),
+                            )));
+                        }
+                    }
+                }
+                ir
+            }
+        };
+
+        if let Expr::Literal(ast::Literal::Str(s)) = payload_arg {
+            if s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES {
+                return Err(self.type_err(&format!(
+                    "notify(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
+                    s.len(), Self::NOTIFY_PAYLOAD_MAX_BYTES
+                )));
+            }
+        }
+
+        let sql = format!("pg_notify('{}', ($1)::text)", wire_name.replace('\'', "''"));
+        Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+            schema: None,
+            name: "pg_notify".to_string(),
+            args: vec![payload_ir],
+            sql_template: Some(sql),
+        }))
+    }
+
+    /// Compile `notify_raw(channel_name, payload)` → `pg_notify($1, $2)` — the
+    /// escape hatch that bypasses Channel resolution and payload-shape
+    /// checking entirely: both arguments are arbitrary text expressions.
+    fn compile_notify_raw(
+        &mut self,
+        fc: &ast::FunctionCall,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<IrExpr, PyQLError> {
+        if fc.args.len() != 2 {
+            return Err(self.type_err("notify_raw() takes exactly 2 arguments: (channel_name, payload)"));
+        }
+        let channel_ir = self.compile_expr_ctx(&fc.args[0], ctx)?;
+        let payload_ir = self.compile_expr_ctx(&fc.args[1], ctx)?;
+
+        if let ast::Expr::Literal(ast::Literal::Str(s)) = &fc.args[1] {
+            if s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES {
+                return Err(self.type_err(&format!(
+                    "notify_raw(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
+                    s.len(), Self::NOTIFY_PAYLOAD_MAX_BYTES
+                )));
+            }
+        }
+
+        Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+            schema: None,
+            name: "pg_notify".to_string(),
+            args: vec![channel_ir, payload_ir],
+            sql_template: None,
+        }))
     }
 
     // ── User-defined function helpers ─────────────────────────────────────────────

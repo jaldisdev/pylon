@@ -22,6 +22,7 @@ The schema DSL — Python classes and decorators that define your data model. Re
 - [Functions](schema/functions.md) — `@pylon.function`
 - [Triggers and rewrites](schema/triggers-and-rewrites.md) — `Trigger`, `Rewrite`
 - [Globals and aliases](schema/globals-and-aliases.md) — `Global`, `Alias`
+- [Channels](schema/channels.md) — `Channel`, PostgreSQL pub/sub (`NOTIFY`/`LISTEN`)
 - [Signals](schema/signals.md) — `@pylon.signal`, post-commit Python callbacks
 - [Schema validation](schema/validation.md) — everything `pylon.finalize()` checks, and why
 

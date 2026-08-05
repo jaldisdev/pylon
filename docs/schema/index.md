@@ -14,6 +14,7 @@ Pylon's schema is ordinary Python: classes decorated with `@pylon.type` (and fri
 - [Functions](functions.md) — `@pylon.function`
 - [Triggers and rewrites](triggers-and-rewrites.md) — `Trigger`, `Rewrite`
 - [Globals and aliases](globals-and-aliases.md) — `Global`, `Alias`
+- [Channels](channels.md) — `Channel`, PostgreSQL pub/sub (`NOTIFY`/`LISTEN`)
 - [Signals](signals.md) — `@pylon.signal`
 - [Validation](validation.md) — everything `pylon.finalize()` checks before your schema is considered valid
 
