@@ -35,7 +35,7 @@ use pylon_core::stdlib::ddl::export_stdlib;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, SignalEntry, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty_with_signal(name: &str, module: &str, on: u8) -> TypeDescriptor {
     TypeDescriptor {
@@ -76,18 +76,18 @@ async fn setup(on: u8) -> (String, SchemaDescriptor, pylon_pgcon::PgPool) {
     (module, schema, pool)
 }
 
-async fn outbox_rows_for(pool: &pylon_pgcon::PgPool, type_name: &str) -> Vec<CachedValue> {
+async fn outbox_rows_for(pool: &pylon_pgcon::PgPool, type_name: &str) -> Vec<DecodedValue> {
     pool.query_typed_named(
         "SELECT type_name, operation, old_row, new_row FROM _pylon.\"SignalOutbox\" WHERE type_name = $1 ORDER BY enqueued_at",
-        &[CachedValue::Str(type_name.to_string())],
+        &[DecodedValue::Str(type_name.to_string())],
         &ExtensionOids::default(),
     )
     .await
     .unwrap()
 }
 
-fn field<'a>(row: &'a CachedValue, name: &str) -> &'a CachedValue {
-    let CachedValue::Object(fields) = row else { panic!("expected Object, got {row:?}") };
+fn field<'a>(row: &'a DecodedValue, name: &str) -> &'a DecodedValue {
+    let DecodedValue::Object(fields) = row else { panic!("expected Object, got {row:?}") };
     fields.iter().find(|(k, _)| k == name).map(|(_, v)| v).unwrap_or_else(|| panic!("no field {name} in {row:?}"))
 }
 
@@ -102,9 +102,9 @@ async fn insert_writes_new_row_only() {
 
     let rows = outbox_rows_for(&pool, &type_name).await;
     assert_eq!(rows.len(), 1, "expected exactly one outbox row, got {rows:?}");
-    assert_eq!(field(&rows[0], "operation"), &CachedValue::Str("INSERT".to_string()));
-    assert_eq!(field(&rows[0], "old_row"), &CachedValue::Null, "old_row must be NULL for an Insert");
-    assert_eq!(field(field(&rows[0], "new_row"), "name"), &CachedValue::Str("Alpha".to_string()));
+    assert_eq!(field(&rows[0], "operation"), &DecodedValue::Str("INSERT".to_string()));
+    assert_eq!(field(&rows[0], "old_row"), &DecodedValue::Null, "old_row must be NULL for an Insert");
+    assert_eq!(field(field(&rows[0], "new_row"), "name"), &DecodedValue::Str("Alpha".to_string()));
 }
 
 #[tokio::test]
@@ -123,9 +123,9 @@ async fn update_writes_both_old_and_new_row() {
 
     let rows = outbox_rows_for(&pool, &type_name).await;
     assert_eq!(rows.len(), 1, "expected exactly one outbox row for the Update, got {rows:?}");
-    assert_eq!(field(&rows[0], "operation"), &CachedValue::Str("UPDATE".to_string()));
-    assert_eq!(field(field(&rows[0], "old_row"), "name"), &CachedValue::Str("Alpha".to_string()));
-    assert_eq!(field(field(&rows[0], "new_row"), "name"), &CachedValue::Str("Beta".to_string()));
+    assert_eq!(field(&rows[0], "operation"), &DecodedValue::Str("UPDATE".to_string()));
+    assert_eq!(field(field(&rows[0], "old_row"), "name"), &DecodedValue::Str("Alpha".to_string()));
+    assert_eq!(field(field(&rows[0], "new_row"), "name"), &DecodedValue::Str("Beta".to_string()));
 }
 
 #[tokio::test]
@@ -143,9 +143,9 @@ async fn delete_writes_old_row_only() {
 
     let rows = outbox_rows_for(&pool, &type_name).await;
     assert_eq!(rows.len(), 1, "expected exactly one outbox row for the Delete, got {rows:?}");
-    assert_eq!(field(&rows[0], "operation"), &CachedValue::Str("DELETE".to_string()));
-    assert_eq!(field(&rows[0], "new_row"), &CachedValue::Null, "new_row must be NULL for a Delete");
-    assert_eq!(field(field(&rows[0], "old_row"), "name"), &CachedValue::Str("Alpha".to_string()));
+    assert_eq!(field(&rows[0], "operation"), &DecodedValue::Str("DELETE".to_string()));
+    assert_eq!(field(&rows[0], "new_row"), &DecodedValue::Null, "new_row must be NULL for a Delete");
+    assert_eq!(field(field(&rows[0], "old_row"), "name"), &DecodedValue::Str("Alpha".to_string()));
 }
 
 #[tokio::test]

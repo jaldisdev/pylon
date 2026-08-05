@@ -49,7 +49,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
@@ -103,16 +103,16 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
@@ -158,7 +158,7 @@ async fn bare_unless_conflict_silently_keeps_the_original_row() {
     );
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("Original".to_string()),
+        &DecodedValue::Str("Original".to_string()),
         "the original row must be left untouched"
     );
 }
@@ -194,7 +194,7 @@ async fn unless_conflict_on_specific_property_no_ops() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("Original".to_string())
+        &DecodedValue::Str("Original".to_string())
     );
 }
 
@@ -238,7 +238,7 @@ async fn unless_conflict_else_update_upserts_in_place() {
     );
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("New Name".to_string()),
+        &DecodedValue::Str("New Name".to_string()),
         "the ELSE update must have taken effect"
     );
 }
@@ -288,7 +288,7 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::I64(13),
+        &DecodedValue::I64(13),
         "stock should have incremented from the existing row's own value each time (10 -> 11 -> 12 -> 13), got {:?}",
         rows[0]
     );
@@ -320,6 +320,6 @@ async fn no_conflict_inserts_a_genuinely_new_row() {
         2,
         "two distinct skus must both be inserted, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("A".to_string()));
-    assert_eq!(field(&rows[1], 1), &CachedValue::Str("B".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("A".to_string()));
+    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("B".to_string()));
 }

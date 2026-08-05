@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 rkyv = { version = "0.8", default-features = false, features = ["std"] }
+uuid = "1"

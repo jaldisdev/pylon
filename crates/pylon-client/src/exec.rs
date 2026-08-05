@@ -29,7 +29,7 @@ use pylon_core::ir::SessionConfig;
 use pylon_core::query::{compile_with_config, CompiledQuery};
 use pylon_core::schema::SchemaDescriptor;
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::decode::decode;
 use crate::error::{Error, Result};
@@ -39,31 +39,31 @@ use crate::value::Value;
 /// open transaction (`PgTransaction`). Kept minimal: just the three
 /// primitives every query method above it is built from.
 pub(crate) trait Executor {
-    async fn run_query(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<Vec<CachedValue>>;
-    async fn run_execute(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<u64>;
-    async fn run_explain(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<String>;
+    async fn run_query(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<Vec<DecodedValue>>;
+    async fn run_execute(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<u64>;
+    async fn run_explain(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<String>;
 }
 
 impl Executor for pylon_pgcon::PgPool {
-    async fn run_query(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<Vec<CachedValue>> {
+    async fn run_query(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<Vec<DecodedValue>> {
         self.query_typed(sql, params, &ExtensionOids::default()).await
     }
-    async fn run_execute(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<u64> {
+    async fn run_execute(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<u64> {
         self.execute_typed(sql, params).await
     }
-    async fn run_explain(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<String> {
+    async fn run_explain(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<String> {
         self.query_explain(sql, params).await
     }
 }
 
 impl Executor for pylon_pgcon::PgTransaction {
-    async fn run_query(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<Vec<CachedValue>> {
+    async fn run_query(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<Vec<DecodedValue>> {
         self.query_typed(sql, params, &ExtensionOids::default()).await
     }
-    async fn run_execute(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<u64> {
+    async fn run_execute(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<u64> {
         self.execute_typed(sql, params).await
     }
-    async fn run_explain(&self, sql: &str, params: &[CachedValue]) -> pylon_pgcon::Result<String> {
+    async fn run_explain(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<String> {
         // `PgTransaction` has no dedicated EXPLAIN helper (`analyze` inside
         // an explicit transaction isn't a scenario the Python client
         // supports either — `Client.analyze` only ever runs on the pool).
@@ -75,24 +75,24 @@ impl Executor for pylon_pgcon::PgTransaction {
 }
 
 /// Compiles `pyql` and resolves its `param_names` into positional
-/// `CachedValue`s — `__global__`-prefixed names are filled from `globals`
+/// `DecodedValue`s — `__global__`-prefixed names are filled from `globals`
 /// (missing = `NULL`, matching `pylon/client.py`'s own `.get(qname)`
 /// default), everything else from `params` (missing = a hard error, unlike
 /// globals — mirrors `client.py:670-678`).
 pub(crate) fn compile_and_bind(
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
-) -> Result<(CompiledQuery, Vec<CachedValue>)> {
+    globals: &HashMap<String, DecodedValue>,
+) -> Result<(CompiledQuery, Vec<DecodedValue>)> {
     let compiled = compile_with_config(pyql, schema, config).map_err(Error::Compile)?;
     let bound = compiled
         .param_names
         .iter()
         .map(|name| {
             if let Some(qname) = name.strip_prefix("__global__") {
-                Ok(globals.get(qname).cloned().unwrap_or(CachedValue::Null))
+                Ok(globals.get(qname).cloned().unwrap_or(DecodedValue::Null))
             } else {
                 params
                     .iter()
@@ -108,10 +108,10 @@ pub(crate) fn compile_and_bind(
 pub(crate) async fn query<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Vec<Value>> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
@@ -130,10 +130,10 @@ pub(crate) async fn query<E: Executor>(
 pub(crate) async fn query_single<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Option<Value>> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
@@ -158,10 +158,10 @@ pub(crate) async fn query_single<E: Executor>(
 pub(crate) async fn query_required_single<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Value> {
     query_single(executor, pyql, params, schema, config, globals, cache)
@@ -172,10 +172,10 @@ pub(crate) async fn query_required_single<E: Executor>(
 pub(crate) async fn execute<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
 ) -> Result<()> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
     executor.run_execute(&compiled.sql, &bound).await.map_err(Error::Db)?;
@@ -190,10 +190,10 @@ pub(crate) async fn execute<E: Executor>(
 pub(crate) async fn query_json<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<String> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
@@ -205,7 +205,7 @@ pub(crate) async fn query_json<E: Executor>(
     let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.sql);
     let rows = executor.run_query(&sql, &bound).await.map_err(Error::Db)?;
     let value = match rows.into_iter().next() {
-        Some(CachedValue::Str(s)) => s,
+        Some(DecodedValue::Str(s)) => s,
         _ => "[]".to_string(),
     };
     if let Some(cache) = cache {
@@ -217,10 +217,10 @@ pub(crate) async fn query_json<E: Executor>(
 pub(crate) async fn query_single_json<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Option<String>> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
@@ -242,7 +242,7 @@ pub(crate) async fn query_single_json<E: Executor>(
     let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.sql);
     let json_rows = executor.run_query(&sql, &bound).await.map_err(Error::Db)?;
     let value = match json_rows.into_iter().next() {
-        Some(CachedValue::Str(s)) => Some(s),
+        Some(DecodedValue::Str(s)) => Some(s),
         _ => None,
     };
     if let Some(cache) = cache {
@@ -254,10 +254,10 @@ pub(crate) async fn query_single_json<E: Executor>(
 pub(crate) async fn query_required_single_json<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<String> {
     query_single_json(executor, pyql, params, schema, config, globals, cache)
@@ -268,10 +268,10 @@ pub(crate) async fn query_required_single_json<E: Executor>(
 pub(crate) async fn analyze<E: Executor>(
     executor: &E,
     pyql: &str,
-    params: &[(&str, CachedValue)],
+    params: &[(&str, DecodedValue)],
     schema: &SchemaDescriptor,
     config: &SessionConfig,
-    globals: &HashMap<String, CachedValue>,
+    globals: &HashMap<String, DecodedValue>,
 ) -> Result<String> {
     // `analyze` is a soft keyword — legal only as a leading statement
     // token — so accept the query with or without it already written,

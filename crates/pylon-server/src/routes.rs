@@ -34,27 +34,27 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
 use pylon_core::ir::SessionConfig;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::json::json_response;
 use crate::state::AppState;
 use crate::to_json::{client_error_payload, value_to_json};
 
-fn json_to_cached_value(v: &serde_json::Value) -> CachedValue {
+fn json_to_cached_value(v: &serde_json::Value) -> DecodedValue {
     match v {
-        serde_json::Value::Null => CachedValue::Null,
-        serde_json::Value::Bool(b) => CachedValue::Bool(*b),
+        serde_json::Value::Null => DecodedValue::Null,
+        serde_json::Value::Bool(b) => DecodedValue::Bool(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                CachedValue::I64(i)
+                DecodedValue::I64(i)
             } else {
-                CachedValue::F64(n.as_f64().unwrap_or(0.0))
+                DecodedValue::F64(n.as_f64().unwrap_or(0.0))
             }
         }
-        serde_json::Value::String(s) => CachedValue::Str(s.clone()),
-        serde_json::Value::Array(items) => CachedValue::Array(items.iter().map(json_to_cached_value).collect()),
+        serde_json::Value::String(s) => DecodedValue::Str(s.clone()),
+        serde_json::Value::Array(items) => DecodedValue::Array(items.iter().map(json_to_cached_value).collect()),
         serde_json::Value::Object(map) => {
-            CachedValue::Object(map.iter().map(|(k, v)| (k.clone(), json_to_cached_value(v))).collect())
+            DecodedValue::Object(map.iter().map(|(k, v)| (k.clone(), json_to_cached_value(v))).collect())
         }
     }
 }
@@ -63,8 +63,8 @@ fn json_to_cached_value(v: &serde_json::Value) -> CachedValue {
 /// shared shape for `/api/query`, `/api/analyze`.
 struct QueryRequest {
     pyql: String,
-    params: Vec<(String, CachedValue)>,
-    globals: Vec<(String, CachedValue)>,
+    params: Vec<(String, DecodedValue)>,
+    globals: Vec<(String, DecodedValue)>,
     config: SessionConfig,
 }
 
@@ -97,7 +97,7 @@ pub async fn handle_query(
     };
     let req = parse_query_request(&body);
     let target = client.with_globals(req.globals).with_config(req.config);
-    let param_refs: Vec<(&str, CachedValue)> = req.params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let param_refs: Vec<(&str, DecodedValue)> = req.params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
     let start = std::time::Instant::now();
     let objects = match target.query(&req.pyql, &param_refs).await {
@@ -128,7 +128,7 @@ pub async fn handle_analyze(
     };
     let req = parse_query_request(&body);
     let target = client.with_globals(req.globals).with_config(req.config);
-    let param_refs: Vec<(&str, CachedValue)> = req.params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let param_refs: Vec<(&str, DecodedValue)> = req.params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
     let start = std::time::Instant::now();
     let coarse_grained = match target.analyze(&req.pyql, &param_refs).await {
@@ -186,7 +186,7 @@ pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Fu
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({"error": e.to_string()})),
     };
     let estimated_objects = match rows.first() {
-        Some(pylon_value::CachedValue::I64(n)) => *n,
+        Some(pylon_value::DecodedValue::I64(n)) => *n,
         _ => 0,
     };
 

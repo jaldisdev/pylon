@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use pylon_core as core;
 use pylon_pgcon::{ExtensionOids, PgListener};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::{Error, Result};
@@ -115,18 +115,18 @@ struct FetchedDoc {
     source_text: String,
 }
 
-fn decode_fetched_doc(value: &CachedValue) -> Result<FetchedDoc> {
-    let CachedValue::Object(fields) = value else {
+fn decode_fetched_doc(value: &DecodedValue) -> Result<FetchedDoc> {
+    let DecodedValue::Object(fields) = value else {
         return Err(Error::Decode("compile_search_index_fetch: expected a named-column row".into()));
     };
     let field = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
     let id = match field("id") {
-        Some(CachedValue::Uuid(b)) => *b,
+        Some(DecodedValue::Uuid(b)) => *b,
         _ => return Err(Error::Decode("compile_search_index_fetch: missing/invalid 'id'".into())),
     };
     let source_text = match field("source_text") {
-        Some(CachedValue::Str(s)) => s.clone(),
-        Some(CachedValue::Null) | None => String::new(),
+        Some(DecodedValue::Str(s)) => s.clone(),
+        Some(DecodedValue::Null) | None => String::new(),
         _ => return Err(Error::Decode("compile_search_index_fetch: invalid 'source_text'".into())),
     };
     Ok(FetchedDoc { id, source_text })
@@ -185,9 +185,9 @@ impl<C: SearchSink + 'static> BatchProcessor for SearchIndexWorker<C> {
                 continue;
             };
 
-            let ids: Vec<CachedValue> = group_rows.iter().map(|r| CachedValue::Uuid(r.object_id)).collect();
+            let ids: Vec<DecodedValue> = group_rows.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
             let raw_records = listener
-                .query_typed_named(&fetch_sql, &[CachedValue::Array(ids)], &ExtensionOids::default())
+                .query_typed_named(&fetch_sql, &[DecodedValue::Array(ids)], &ExtensionOids::default())
                 .await?;
             if raw_records.is_empty() {
                 continue;

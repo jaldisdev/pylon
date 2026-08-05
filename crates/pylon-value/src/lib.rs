@@ -49,7 +49,7 @@ use rkyv::{Archive, Deserialize, Serialize};
     serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator),
     deserialize_bounds(__D::Error: rkyv::rancor::Source),
 )]
-pub enum CachedValue {
+pub enum DecodedValue {
     Null,
     Bool(bool),
     I64(i64),
@@ -57,7 +57,13 @@ pub enum CachedValue {
     Str(String),
     Bytes(Vec<u8>),
     /// Raw 16-byte UUID, matching `QueryParam::Uuid`'s own convention in
-    /// `pylon-core` — avoids pulling in the `uuid` crate for just this.
+    /// `pylon-core`. Stored as raw bytes rather than a `uuid::Uuid` field
+    /// (every consuming crate already re-wraps this in its own richer type
+    /// on the way out — e.g. `pylon-client`'s `Value::Uuid(uuid::Uuid)` —
+    /// so there's no benefit to carrying that type this deep); `uuid` is
+    /// still a dependency of this crate, purely so `From<uuid::Uuid>` below
+    /// can convert into this variant without every caller writing
+    /// `.into_bytes()` by hand.
     Uuid([u8; 16]),
     /// Arbitrary-precision decimal, stored as its canonical string form
     /// (matches how `_pg_decode_numeric` round-trips today) rather than a
@@ -91,14 +97,14 @@ pub enum CachedValue {
     // `omit_bounds` is required on self-referential fields: rkyv's derive
     // otherwise adds a naive `FieldType: Archive` bound per field, which
     // for a directly-recursive type like this overflows trait resolution
-    // (`CachedValue: Archive` requires `Vec<CachedValue>: Archive` requires
-    // `CachedValue: Archive`, forever) — see rkyv's own docs on recursive
+    // (`DecodedValue: Archive` requires `Vec<DecodedValue>: Archive` requires
+    // `DecodedValue: Archive`, forever) — see rkyv's own docs on recursive
     // types.
     /// A genuine Postgres array (`text[]`, `int8[]`, ...) — reconstructed
     /// Python-side as a `list`, matching what asyncpg has always decoded a
     /// Postgres array into. Do not use this for a composite/record's
     /// positional fields; see `Composite`.
-    Array(#[rkyv(omit_bounds)] Vec<CachedValue>),
+    Array(#[rkyv(omit_bounds)] Vec<DecodedValue>),
     /// A positional composite (`record` — a schema object's own field
     /// tuple, or a nested `ROW(...)`), reconstructed Python-side as a
     /// `tuple`, matching `asyncpg.Record`'s own behavior — critically,
@@ -109,11 +115,11 @@ pub enum CachedValue {
     /// indexing first." Using `Array` (→ `list`) here instead silently
     /// breaks that check — a real bug caught by comparing decoded output
     /// against the live asyncpg path on real queries.
-    Composite(#[rkyv(omit_bounds)] Vec<CachedValue>),
+    Composite(#[rkyv(omit_bounds)] Vec<DecodedValue>),
     /// Field name + value pairs, in shape order (not a map — field order is
     /// part of what `ShapeNode` positions describe, and duplicate names
     /// can't happen for a single object's own pointers).
-    Object(#[rkyv(omit_bounds)] Vec<(String, CachedValue)>),
+    Object(#[rkyv(omit_bounds)] Vec<(String, DecodedValue)>),
     /// A PostgreSQL range value (`int8range`, `numrange`, `tsrange`,
     /// `tstzrange`, `daterange`, ...). `lower`/`upper` are `None` for an
     /// unbounded side; `empty == true` means the whole range is empty
@@ -123,13 +129,91 @@ pub enum CachedValue {
     /// variant — it's just an ordered collection of ranges.
     Range {
         #[rkyv(omit_bounds)]
-        lower: Option<Box<CachedValue>>,
+        lower: Option<Box<DecodedValue>>,
         #[rkyv(omit_bounds)]
-        upper: Option<Box<CachedValue>>,
+        upper: Option<Box<DecodedValue>>,
         inc_lower: bool,
         inc_upper: bool,
         empty: bool,
     },
+}
+
+// ── Native-type conversions ──────────────────────────────────────────────────
+//
+// Lets a caller write `"id".into()`/`some_uuid.into()` instead of spelling
+// out `DecodedValue::Uuid(...)` at every query-parameter call site — mirrors
+// `gel_protocol::value::Value`'s own `From<T>` impls (verified against
+// `gel-protocol` 0.9.2's `value.rs`), which exist for exactly this reason:
+// the wrapper enum itself isn't going away (a query parameter/result still
+// has to carry its own runtime type tag), but constructing one shouldn't
+// require spelling out the variant name by hand for the common cases.
+//
+// `i16`/`i32` and `f32` widen into this crate's single `I64`/`F64` variants
+// rather than getting their own — `DecodedValue` has never distinguished
+// integer/float width the way Postgres or Gel's own wire protocol does
+// (every integer column decodes to `I64`, every float column to `F64`
+// already, regardless of the underlying `int2`/`int4`/`int8` or
+// `float4`/`float8` column type), so these conversions just meet that
+// existing convention rather than introduce a new one.
+
+impl From<String> for DecodedValue {
+    fn from(value: String) -> Self {
+        DecodedValue::Str(value)
+    }
+}
+
+impl From<&str> for DecodedValue {
+    fn from(value: &str) -> Self {
+        DecodedValue::Str(value.to_string())
+    }
+}
+
+impl From<bool> for DecodedValue {
+    fn from(value: bool) -> Self {
+        DecodedValue::Bool(value)
+    }
+}
+
+impl From<i16> for DecodedValue {
+    fn from(value: i16) -> Self {
+        DecodedValue::I64(value.into())
+    }
+}
+
+impl From<i32> for DecodedValue {
+    fn from(value: i32) -> Self {
+        DecodedValue::I64(value.into())
+    }
+}
+
+impl From<i64> for DecodedValue {
+    fn from(value: i64) -> Self {
+        DecodedValue::I64(value)
+    }
+}
+
+impl From<f32> for DecodedValue {
+    fn from(value: f32) -> Self {
+        DecodedValue::F64(value.into())
+    }
+}
+
+impl From<f64> for DecodedValue {
+    fn from(value: f64) -> Self {
+        DecodedValue::F64(value)
+    }
+}
+
+impl From<Vec<u8>> for DecodedValue {
+    fn from(value: Vec<u8>) -> Self {
+        DecodedValue::Bytes(value)
+    }
+}
+
+impl From<uuid::Uuid> for DecodedValue {
+    fn from(value: uuid::Uuid) -> Self {
+        DecodedValue::Uuid(value.into_bytes())
+    }
 }
 
 /// One cache entry: the cached rows plus the tags a write to any of which
@@ -138,7 +222,7 @@ pub enum CachedValue {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct CachedEntry {
-    pub rows: Vec<CachedValue>,
+    pub rows: Vec<DecodedValue>,
     pub tags: Vec<String>,
 }
 
@@ -149,24 +233,24 @@ mod tests {
 
     #[test]
     fn round_trips_every_variant() {
-        let value = CachedValue::Object(vec![
-            ("id".into(), CachedValue::Uuid([1; 16])),
-            ("name".into(), CachedValue::Str("Alice".into())),
-            ("age".into(), CachedValue::I64(30)),
-            ("score".into(), CachedValue::F64(1.5)),
-            ("active".into(), CachedValue::Bool(true)),
-            ("balance".into(), CachedValue::Decimal("12.50".into())),
-            ("tags".into(), CachedValue::Array(vec![CachedValue::Str("a".into()), CachedValue::Null])),
-            ("avatar".into(), CachedValue::Bytes(vec![1, 2, 3])),
-            ("point".into(), CachedValue::Composite(vec![CachedValue::F64(1.0), CachedValue::F64(2.0)])),
-            ("span".into(), CachedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }),
-            ("day".into(), CachedValue::Date(9525)),
-            ("clock".into(), CachedValue::Time(3_600_000_000)),
-            ("naive_ts".into(), CachedValue::Timestamp(1_000_000_000)),
-            ("aware_ts".into(), CachedValue::Timestamptz(1_000_000_000)),
-            ("span_range".into(), CachedValue::Range {
-                lower: Some(Box::new(CachedValue::I64(1))),
-                upper: Some(Box::new(CachedValue::I64(10))),
+        let value = DecodedValue::Object(vec![
+            ("id".into(), DecodedValue::Uuid([1; 16])),
+            ("name".into(), DecodedValue::Str("Alice".into())),
+            ("age".into(), DecodedValue::I64(30)),
+            ("score".into(), DecodedValue::F64(1.5)),
+            ("active".into(), DecodedValue::Bool(true)),
+            ("balance".into(), DecodedValue::Decimal("12.50".into())),
+            ("tags".into(), DecodedValue::Array(vec![DecodedValue::Str("a".into()), DecodedValue::Null])),
+            ("avatar".into(), DecodedValue::Bytes(vec![1, 2, 3])),
+            ("point".into(), DecodedValue::Composite(vec![DecodedValue::F64(1.0), DecodedValue::F64(2.0)])),
+            ("span".into(), DecodedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }),
+            ("day".into(), DecodedValue::Date(9525)),
+            ("clock".into(), DecodedValue::Time(3_600_000_000)),
+            ("naive_ts".into(), DecodedValue::Timestamp(1_000_000_000)),
+            ("aware_ts".into(), DecodedValue::Timestamptz(1_000_000_000)),
+            ("span_range".into(), DecodedValue::Range {
+                lower: Some(Box::new(DecodedValue::I64(1))),
+                upper: Some(Box::new(DecodedValue::I64(10))),
                 inc_lower: true,
                 inc_upper: false,
                 empty: false,
@@ -178,15 +262,15 @@ mod tests {
         // `bytecheck`-validated safe `access` API (which this crate opts out
         // of entirely; see the `default-features = false` note in Cargo.toml)
         // isn't needed here.
-        let archived = unsafe { rkyv::access_unchecked::<ArchivedCachedValue>(&bytes) };
-        let decoded: CachedValue = rkyv::deserialize::<CachedValue, Error>(archived).unwrap();
+        let archived = unsafe { rkyv::access_unchecked::<ArchivedDecodedValue>(&bytes) };
+        let decoded: DecodedValue = rkyv::deserialize::<DecodedValue, Error>(archived).unwrap();
         assert_eq!(decoded, value);
     }
 
     #[test]
     fn round_trips_cached_entry() {
         let entry = CachedEntry {
-            rows: vec![CachedValue::I64(1), CachedValue::I64(2)],
+            rows: vec![DecodedValue::I64(1), DecodedValue::I64(2)],
             tags: vec!["public.person".into()],
         };
         let bytes = rkyv::to_bytes::<Error>(&entry).unwrap();
@@ -195,5 +279,51 @@ mod tests {
         let decoded: CachedEntry = rkyv::deserialize::<CachedEntry, Error>(archived).unwrap();
         assert_eq!(decoded.rows, entry.rows);
         assert_eq!(decoded.tags, entry.tags);
+    }
+
+    #[test]
+    fn from_native_string_types() {
+        assert_eq!(DecodedValue::from("hello".to_string()), DecodedValue::Str("hello".into()));
+        assert_eq!(DecodedValue::from("hello"), DecodedValue::Str("hello".into()));
+    }
+
+    #[test]
+    fn from_native_bool() {
+        assert_eq!(DecodedValue::from(true), DecodedValue::Bool(true));
+    }
+
+    #[test]
+    fn from_native_integers_widen_into_i64() {
+        assert_eq!(DecodedValue::from(1i16), DecodedValue::I64(1));
+        assert_eq!(DecodedValue::from(2i32), DecodedValue::I64(2));
+        assert_eq!(DecodedValue::from(3i64), DecodedValue::I64(3));
+    }
+
+    #[test]
+    fn from_native_floats_widen_into_f64() {
+        assert_eq!(DecodedValue::from(1.5f32), DecodedValue::F64(1.5));
+        assert_eq!(DecodedValue::from(2.5f64), DecodedValue::F64(2.5));
+    }
+
+    #[test]
+    fn from_native_bytes() {
+        assert_eq!(DecodedValue::from(vec![1u8, 2, 3]), DecodedValue::Bytes(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn from_native_uuid() {
+        let u = uuid::Uuid::from_bytes([7; 16]);
+        assert_eq!(DecodedValue::from(u), DecodedValue::Uuid([7; 16]));
+    }
+
+    #[test]
+    fn into_conversion_works_at_a_query_param_style_call_site() {
+        // The motivating case: `&[(&str, DecodedValue)]`-shaped params
+        // accepting `.into()` instead of the explicit variant.
+        let params: Vec<(&str, DecodedValue)> =
+            vec![("name", "Ada".into()), ("age", 30i64.into()), ("active", true.into())];
+        assert_eq!(params[0].1, DecodedValue::Str("Ada".into()));
+        assert_eq!(params[1].1, DecodedValue::I64(30));
+        assert_eq!(params[2].1, DecodedValue::Bool(true));
     }
 }

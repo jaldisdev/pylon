@@ -53,7 +53,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{GlobalDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
@@ -114,8 +114,8 @@ async fn rows_with_params(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-    params: &[CachedValue],
-) -> Vec<CachedValue> {
+    params: &[DecodedValue],
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, params, &ExtensionOids::default())
         .await
@@ -126,13 +126,13 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     rows_with_params(pool, sd, pyql, &[]).await
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
@@ -172,7 +172,7 @@ async fn session_global_of_uuid_type_filters_correctly() {
     )
     .await;
     let inserted = rows_of(&pool, &sd, &format!("select {module}::Widget {{ id }}")).await;
-    let CachedValue::Composite(shape) = &inserted[0] else {
+    let DecodedValue::Composite(shape) = &inserted[0] else {
         panic!("expected Composite")
     };
     let viewer_id = shape[1].clone();
@@ -185,7 +185,7 @@ async fn session_global_of_uuid_type_filters_correctly() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -216,7 +216,7 @@ async fn session_global_unbound_is_null() {
         &pool,
         &sd,
         &format!("select {module}::Widget {{ name }} filter .id = global viewer_id"),
-        &[CachedValue::Null],
+        &[DecodedValue::Null],
     )
     .await;
     assert!(
@@ -248,17 +248,17 @@ async fn session_global_of_array_type_resolves_correctly() {
         &pool,
         &sd,
         "select array_join(global tags, ',')",
-        &[CachedValue::Array(vec![
-            CachedValue::Str("a".into()),
-            CachedValue::Str("b".into()),
+        &[DecodedValue::Array(vec![
+            DecodedValue::Str("a".into()),
+            DecodedValue::Str("b".into()),
         ])],
     )
     .await;
     assert_eq!(rows.len(), 1);
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    assert_eq!(shape[0], CachedValue::Str("a,b".to_string()));
+    assert_eq!(shape[0], DecodedValue::Str("a,b".to_string()));
 }
 
 #[tokio::test]
@@ -298,7 +298,7 @@ async fn computed_global_reads_a_session_global_it_references() {
     )
     .await;
     let inserted = rows_of(&pool, &sd, &format!("select {module}::Person {{ id }}")).await;
-    let CachedValue::Composite(shape) = &inserted[0] else {
+    let DecodedValue::Composite(shape) = &inserted[0] else {
         panic!("expected Composite")
     };
     let person_id = shape[1].clone();
@@ -315,5 +315,5 @@ async fn computed_global_reads_a_session_global_it_references() {
         1,
         "computed global should resolve to exactly the referenced Person, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Ada".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Ada".to_string()));
 }

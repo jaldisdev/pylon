@@ -24,7 +24,7 @@
 
 use std::ops::Index;
 
-/// A decoded query result value. One variant per `ShapeNode`/`CachedValue`
+/// A decoded query result value. One variant per `ShapeNode`/`DecodedValue`
 /// kind `decode.rs` knows how to produce — see that module for the walk
 /// that builds these.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,13 +37,13 @@ pub enum Value {
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
     /// Arbitrary-precision decimal, in its canonical string form — matches
-    /// `pylon_value::CachedValue::Decimal`'s own representation, since
+    /// `pylon_value::DecodedValue::Decimal`'s own representation, since
     /// there's no single obviously-correct native Rust decimal type to
     /// commit this generic client to.
     Decimal(String),
     /// A PostgreSQL `interval` (`std::duration` / `cal::relative_duration`)
     /// — kept as its three raw wire components, same reasoning as
-    /// `CachedValue::Interval`.
+    /// `DecodedValue::Interval`.
     Duration { months: i32, days: i32, microseconds: i64 },
     /// Whole days since the PG epoch (2000-01-01). Backs `cal::local_date`.
     Date(i32),

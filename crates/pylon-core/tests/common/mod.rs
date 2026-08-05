@@ -36,7 +36,7 @@ use pylon_core::schema::{
     TriggerDescriptor,
 };
 use pylon_pgcon::{ExtensionOids, PgPool};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use std::collections::HashMap;
 
 pub fn test_dsn() -> String {
@@ -201,7 +201,7 @@ pub async fn assert_zero_further_steps(pool: &PgPool, schema: &SchemaDescriptor)
 /// returning the single wrapped value — a scalar result decodes as a
 /// one-element `Composite` (`SELECT ROW(v) AS result, v FROM (...)`, see
 /// `sql::emit`), not a bare value or a name-keyed `Object`.
-pub async fn eval_scalar(pool: &PgPool, expr: &str) -> CachedValue {
+pub async fn eval_scalar(pool: &PgPool, expr: &str) -> DecodedValue {
     let schema = SchemaDescriptor::default();
     let compiled = query::compile(&format!("select {expr}"), &schema).unwrap();
     let rows = pool
@@ -214,7 +214,7 @@ pub async fn eval_scalar(pool: &PgPool, expr: &str) -> CachedValue {
         "scalar select should return exactly one row, got {rows:?}"
     );
     match rows.into_iter().next().unwrap() {
-        CachedValue::Composite(mut fields) if fields.len() == 1 => fields.remove(0),
+        DecodedValue::Composite(mut fields) if fields.len() == 1 => fields.remove(0),
         other => panic!("expected a one-element Composite wrapping the scalar, got {other:?}"),
     }
 }

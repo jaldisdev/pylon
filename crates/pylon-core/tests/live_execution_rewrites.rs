@@ -45,7 +45,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(
     name: &str,
@@ -89,16 +89,16 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     schema: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
@@ -146,7 +146,7 @@ async fn insert_rewrite_overrides_assigned_value() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("inserted".to_string()),
+        &DecodedValue::Str("inserted".to_string()),
         "insert rewrite should override the assigned value"
     );
 }
@@ -184,7 +184,7 @@ async fn update_rewrite_overrides_assigned_value() {
     .await;
     assert_eq!(
         field(&after_insert[0], 1),
-        &CachedValue::Str("Whiplash".to_string())
+        &DecodedValue::Str("Whiplash".to_string())
     );
 
     exec(
@@ -201,7 +201,7 @@ async fn update_rewrite_overrides_assigned_value() {
     .await;
     assert_eq!(
         field(&after_update[0], 1),
-        &CachedValue::Str("updated".to_string()),
+        &DecodedValue::Str("updated".to_string()),
         "update rewrite should override the assigned value"
     );
 }
@@ -244,12 +244,12 @@ async fn insert_rewrite_applies_to_defaulted_value() {
     assert_eq!(rows.len(), 2);
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("untitled (new)".to_string()),
+        &DecodedValue::Str("untitled (new)".to_string()),
         "rewrite should still apply to the defaulted value"
     );
     assert_eq!(
         field(&rows[1], 1),
-        &CachedValue::Str("Whiplash (new)".to_string())
+        &DecodedValue::Str("Whiplash (new)".to_string())
     );
 }
 
@@ -298,10 +298,10 @@ async fn update_rewrite_references_sibling_property() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("loud".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("loud".to_string()));
     assert_eq!(
         field(&rows[0], 2),
-        &CachedValue::Str("LOUD".to_string()),
+        &DecodedValue::Str("LOUD".to_string()),
         "update rewrite should fire and see the sibling property's new value even though shout wasn't itself assigned"
     );
 }
@@ -347,7 +347,7 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("my-real-name".to_string()),
+        &DecodedValue::Str("my-real-name".to_string()),
         "an insert-only rewrite must not fire on update"
     );
 }
@@ -388,10 +388,10 @@ async fn multiple_rewrites_on_different_properties_do_not_interfere() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("A".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("A".to_string()));
     assert_eq!(
         field(&rows[0], 2),
-        &CachedValue::Str("B".to_string()),
+        &DecodedValue::Str("B".to_string()),
         "two independent rewrites on the same insert must not interfere with each other"
     );
 }
@@ -439,7 +439,7 @@ async fn trigger_observes_rewritten_value_not_original() {
     assert_eq!(log_rows.len(), 1);
     assert_eq!(
         field(&log_rows[0], 1),
-        &CachedValue::Str("rewritten".to_string()),
+        &DecodedValue::Str("rewritten".to_string()),
         "trigger should observe the rewritten value, not the originally-assigned one"
     );
 }

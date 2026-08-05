@@ -47,7 +47,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{AliasDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
@@ -125,16 +125,16 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
@@ -189,8 +189,8 @@ async fn plain_select_uses_the_aliases_own_filter() {
         2,
         "only the two active people should match, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Alice".to_string()));
-    assert_eq!(field(&rows[1], 1), &CachedValue::Str("Carol".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Carol".to_string()));
 }
 
 #[tokio::test]
@@ -225,7 +225,7 @@ async fn outer_filter_ands_with_the_aliases_own_filter() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -249,8 +249,8 @@ async fn outer_order_by_overrides_the_aliases_own_order_by() {
     )
     .await;
     assert_eq!(rows.len(), 2);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Carol".to_string()));
-    assert_eq!(field(&rows[1], 1), &CachedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Carol".to_string()));
+    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -275,7 +275,7 @@ async fn aliases_own_order_and_limit_apply_with_no_outer_override() {
     );
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::Str("Bob".to_string()),
+        &DecodedValue::Str("Bob".to_string()),
         "Bob is the youngest (25)"
     );
 }
@@ -327,6 +327,6 @@ async fn outer_shape_replaces_the_aliases_own_shape() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Bob".to_string()));
-    assert_eq!(field(&rows[0], 2), &CachedValue::I64(25));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Bob".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::I64(25));
 }

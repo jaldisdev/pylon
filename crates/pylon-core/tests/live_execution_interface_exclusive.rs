@@ -67,7 +67,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeConstraint, TypeDescriptor};
 use pylon_pgcon::{ExtensionOids, PgPool};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn exclusive_prop(name: &str, nullable: bool) -> PropertyDescriptor {
     PropertyDescriptor {
@@ -286,7 +286,7 @@ async fn exec(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Result<()
     pool.execute_typed(&compiled.sql, &[]).await.map(|_| ())
 }
 
-async fn rows_of(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
 }
@@ -514,8 +514,8 @@ async fn junction_backed_read_through_the_interface_view_resolves_the_link() {
     ).await.unwrap();
 
     let rows = rows_of(&pool, &schema, &format!("select {module}::Individual {{ name, employer: {{ name }} }}")).await;
-    let CachedValue::Composite(fields) = &rows[0] else { panic!("expected Composite, got {:?}", rows[0]) };
+    let DecodedValue::Composite(fields) = &rows[0] else { panic!("expected Composite, got {:?}", rows[0]) };
     // fields: [type_tag, name, employer] — employer itself: [type_tag, name].
-    let CachedValue::Composite(employer_fields) = &fields[2] else { panic!("expected employer to decode as Composite, got {:?}", fields[2]) };
-    assert_eq!(employer_fields[1], CachedValue::Str("Acme".into()));
+    let DecodedValue::Composite(employer_fields) = &fields[2] else { panic!("expected employer to decode as Composite, got {:?}", fields[2]) };
+    assert_eq!(employer_fields[1], DecodedValue::Str("Acme".into()));
 }

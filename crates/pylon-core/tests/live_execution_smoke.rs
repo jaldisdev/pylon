@@ -46,7 +46,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 /// A single `Widget { id, name }` type — just enough to prove the pipeline
 /// end-to-end before investing in richer fixtures for the other test groups.
@@ -119,12 +119,12 @@ async fn insert_and_select_round_trip_a_real_value() {
         // auto-injected `__type__` discriminator (see `pylon/query.py`'s
         // `_decode()`, the `"object"` branch), remaining positions are the
         // selected pointers in shape order.
-        CachedValue::Composite(fields) => {
+        DecodedValue::Composite(fields) => {
             assert_eq!(
                 fields.first(),
-                Some(&CachedValue::Str(format!("{module}::Widget")))
+                Some(&DecodedValue::Str(format!("{module}::Widget")))
             );
-            assert_eq!(fields.get(1), Some(&CachedValue::Str("hello".to_string())));
+            assert_eq!(fields.get(1), Some(&DecodedValue::Str("hello".to_string())));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }

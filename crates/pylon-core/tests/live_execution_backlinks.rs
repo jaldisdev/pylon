@@ -170,10 +170,10 @@ async fn single_link_sourced_backlink_exists_filter_returns_the_right_orgs() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "expected exactly the 1 Org with a Team backlinked, got {rows:?}");
-    let pylon_value::CachedValue::Composite(fields) = &rows[0] else {
+    let pylon_value::DecodedValue::Composite(fields) = &rows[0] else {
         panic!("expected a Composite-shaped Org row, got {:?}", rows[0]);
     };
-    assert_eq!(fields.get(1), Some(&pylon_value::CachedValue::Str("HasTeam".to_string())));
+    assert_eq!(fields.get(1), Some(&pylon_value::DecodedValue::Str("HasTeam".to_string())));
 }
 
 /// Regression test for gap 1 (see file doc comment) — a self-referential
@@ -216,10 +216,10 @@ async fn multilink_sourced_backlink_exists_filter_returns_the_right_people() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "expected exactly the 1 Person (Bob) listed in someone else's friends, got {rows:?}");
-    let pylon_value::CachedValue::Composite(fields) = &rows[0] else {
+    let pylon_value::DecodedValue::Composite(fields) = &rows[0] else {
         panic!("expected a Composite-shaped Person row, got {:?}", rows[0]);
     };
-    assert_eq!(fields.get(1), Some(&pylon_value::CachedValue::Str("Bob".to_string())));
+    assert_eq!(fields.get(1), Some(&pylon_value::DecodedValue::Str("Bob".to_string())));
 }
 
 /// Regression test for gap 2 (see file doc comment) — the actual "deeply
@@ -260,12 +260,12 @@ async fn nested_single_link_backlink_shape_returns_the_correct_two_level_chain()
     let rows = pool.query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
     assert_eq!(rows.len(), 1, "expected exactly one Org row, got {rows:?}");
 
-    let pylon_value::CachedValue::Composite(org_fields) = &rows[0] else {
+    let pylon_value::DecodedValue::Composite(org_fields) = &rows[0] else {
         panic!("expected a Composite-shaped Org row, got {:?}", rows[0]);
     };
     // [0] = __type__, [1] = name, [2] = teams (an Array of Composite Team rows)
-    assert_eq!(org_fields.get(1), Some(&pylon_value::CachedValue::Str("Acme".to_string())));
-    let pylon_value::CachedValue::Array(teams) = &org_fields[2] else {
+    assert_eq!(org_fields.get(1), Some(&pylon_value::DecodedValue::Str("Acme".to_string())));
+    let pylon_value::DecodedValue::Array(teams) = &org_fields[2] else {
         panic!("expected teams to decode as an Array, got {:?}", org_fields[2]);
     };
     assert_eq!(teams.len(), 2, "Org should have exactly 2 backlinked Teams, got {teams:?}");
@@ -273,10 +273,10 @@ async fn nested_single_link_backlink_shape_returns_the_correct_two_level_chain()
     let mut member_counts: Vec<usize> = teams
         .iter()
         .map(|t| {
-            let pylon_value::CachedValue::Composite(team_fields) = t else {
+            let pylon_value::DecodedValue::Composite(team_fields) = t else {
                 panic!("expected a Composite-shaped Team row, got {t:?}");
             };
-            let pylon_value::CachedValue::Array(members) = &team_fields[2] else {
+            let pylon_value::DecodedValue::Array(members) = &team_fields[2] else {
                 panic!("expected members to decode as an Array, got {:?}", team_fields[2]);
             };
             members.len()
@@ -329,19 +329,19 @@ async fn multilink_sourced_backlink_shape_returns_the_right_followers() {
     .unwrap();
     let rows = pool.query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
     assert_eq!(rows.len(), 1);
-    let pylon_value::CachedValue::Composite(bob_fields) = &rows[0] else {
+    let pylon_value::DecodedValue::Composite(bob_fields) = &rows[0] else {
         panic!("expected a Composite-shaped Person row, got {:?}", rows[0]);
     };
-    let pylon_value::CachedValue::Array(followers) = &bob_fields[2] else {
+    let pylon_value::DecodedValue::Array(followers) = &bob_fields[2] else {
         panic!("expected followers to decode as an Array, got {:?}", bob_fields[2]);
     };
     let mut follower_names: Vec<String> = followers
         .iter()
         .map(|f| {
-            let pylon_value::CachedValue::Composite(fields) = f else {
+            let pylon_value::DecodedValue::Composite(fields) = f else {
                 panic!("expected a Composite-shaped follower row, got {f:?}");
             };
-            let Some(pylon_value::CachedValue::Str(name)) = fields.get(1) else {
+            let Some(pylon_value::DecodedValue::Str(name)) = fields.get(1) else {
                 panic!("expected a Str name at position 1, got {fields:?}");
             };
             name.clone()
@@ -393,34 +393,34 @@ async fn triple_nested_single_link_backlink_shape_returns_the_correct_chain() {
     let rows = pool.query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
     assert_eq!(rows.len(), 1);
 
-    let pylon_value::CachedValue::Composite(org_fields) = &rows[0] else {
+    let pylon_value::DecodedValue::Composite(org_fields) = &rows[0] else {
         panic!("expected a Composite-shaped Org row, got {:?}", rows[0]);
     };
-    let pylon_value::CachedValue::Array(teams) = &org_fields[2] else {
+    let pylon_value::DecodedValue::Array(teams) = &org_fields[2] else {
         panic!("expected teams to decode as an Array, got {:?}", org_fields[2]);
     };
     assert_eq!(teams.len(), 1);
-    let pylon_value::CachedValue::Composite(team_fields) = &teams[0] else {
+    let pylon_value::DecodedValue::Composite(team_fields) = &teams[0] else {
         panic!("expected a Composite-shaped Team row, got {:?}", teams[0]);
     };
-    let pylon_value::CachedValue::Array(members) = &team_fields[2] else {
+    let pylon_value::DecodedValue::Array(members) = &team_fields[2] else {
         panic!("expected members to decode as an Array, got {:?}", team_fields[2]);
     };
     assert_eq!(members.len(), 1);
-    let pylon_value::CachedValue::Composite(member_fields) = &members[0] else {
+    let pylon_value::DecodedValue::Composite(member_fields) = &members[0] else {
         panic!("expected a Composite-shaped Member row, got {:?}", members[0]);
     };
-    assert_eq!(member_fields.get(1), Some(&pylon_value::CachedValue::Str("Ann".to_string())));
-    let pylon_value::CachedValue::Array(tasks) = &member_fields[2] else {
+    assert_eq!(member_fields.get(1), Some(&pylon_value::DecodedValue::Str("Ann".to_string())));
+    let pylon_value::DecodedValue::Array(tasks) = &member_fields[2] else {
         panic!("expected tasks to decode as an Array, got {:?}", member_fields[2]);
     };
     let mut titles: Vec<String> = tasks
         .iter()
         .map(|t| {
-            let pylon_value::CachedValue::Composite(fields) = t else {
+            let pylon_value::DecodedValue::Composite(fields) = t else {
                 panic!("expected a Composite-shaped Task row, got {t:?}");
             };
-            let Some(pylon_value::CachedValue::Str(title)) = fields.get(1) else {
+            let Some(pylon_value::DecodedValue::Str(title)) = fields.get(1) else {
                 panic!("expected a Str title at position 1, got {fields:?}");
             };
             title.clone()

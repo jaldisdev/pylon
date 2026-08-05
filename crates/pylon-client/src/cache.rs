@@ -25,7 +25,7 @@
 //! see `exec.rs` for where these are actually called from.
 
 use pylon_core::query::CompiledQuery;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
 
@@ -38,7 +38,7 @@ fn map_err<E: std::fmt::Display>(e: E) -> Error {
 /// `"json_single"`, a raw JSON string) never collide on the same
 /// underlying SQL+params — mirrors `pylon/cache.py::_cache_key`'s
 /// `f"{kind}\x00{compiled.sql}"` prefix.
-fn cache_key(kind: &str, sql: &str, params: &[CachedValue]) -> Result<String> {
+fn cache_key(kind: &str, sql: &str, params: &[DecodedValue]) -> Result<String> {
     pylon_cache::cache_key(&format!("{kind}\0{sql}"), params).map_err(map_err)
 }
 
@@ -46,8 +46,8 @@ fn cache_key(kind: &str, sql: &str, params: &[CachedValue]) -> Result<String> {
 pub(crate) fn get_rows(
     cache: &pylon_cache::Cache,
     compiled: &CompiledQuery,
-    params: &[CachedValue],
-) -> Result<Option<Vec<CachedValue>>> {
+    params: &[DecodedValue],
+) -> Result<Option<Vec<DecodedValue>>> {
     let key = cache_key("rows", &compiled.sql, params)?;
     Ok(cache.get(&key).map_err(map_err)?.map(|entry| entry.rows))
 }
@@ -59,8 +59,8 @@ pub(crate) fn get_rows(
 pub(crate) fn put_rows(
     cache: &pylon_cache::Cache,
     compiled: &CompiledQuery,
-    params: &[CachedValue],
-    rows: &[CachedValue],
+    params: &[DecodedValue],
+    rows: &[DecodedValue],
 ) -> Result<()> {
     if compiled.tags.is_empty() {
         return Ok(());
@@ -77,14 +77,14 @@ pub(crate) fn get_json(
     cache: &pylon_cache::Cache,
     kind: &str,
     compiled: &CompiledQuery,
-    params: &[CachedValue],
+    params: &[DecodedValue],
 ) -> Result<Option<Option<String>>> {
     let key = cache_key(kind, &compiled.sql, params)?;
     let Some(entry) = cache.get(&key).map_err(map_err)? else {
         return Ok(None);
     };
     Ok(Some(match entry.rows.into_iter().next() {
-        Some(CachedValue::Str(s)) => Some(s),
+        Some(DecodedValue::Str(s)) => Some(s),
         _ => None,
     }))
 }
@@ -96,14 +96,14 @@ pub(crate) fn put_json(
     cache: &pylon_cache::Cache,
     kind: &str,
     compiled: &CompiledQuery,
-    params: &[CachedValue],
+    params: &[DecodedValue],
     value: Option<&str>,
 ) -> Result<()> {
     if compiled.tags.is_empty() {
         return Ok(());
     }
     let key = cache_key(kind, &compiled.sql, params)?;
-    let rows = value.map(|v| vec![CachedValue::Str(v.to_string())]).unwrap_or_default();
+    let rows = value.map(|v| vec![DecodedValue::Str(v.to_string())]).unwrap_or_default();
     cache.put(&key, rows, compiled.tags.clone()).map_err(map_err)
 }
 
@@ -136,15 +136,15 @@ mod tests {
         let compiled = compiled_with_tags("select 1", &["public.person"]);
         assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), None);
 
-        put_rows(&cache, &compiled, &[], &[CachedValue::I64(1)]).unwrap();
-        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![CachedValue::I64(1)]));
+        put_rows(&cache, &compiled, &[], &[DecodedValue::I64(1)]).unwrap();
+        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![DecodedValue::I64(1)]));
     }
 
     #[test]
     fn no_tags_means_put_is_a_no_op() {
         let (_dir, cache) = open_temp();
         let compiled = compiled_with_tags("select 1", &[]);
-        put_rows(&cache, &compiled, &[], &[CachedValue::I64(1)]).unwrap();
+        put_rows(&cache, &compiled, &[], &[DecodedValue::I64(1)]).unwrap();
         assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), None);
     }
 
@@ -152,10 +152,10 @@ mod tests {
     fn rows_and_json_kinds_do_not_collide_on_the_same_sql() {
         let (_dir, cache) = open_temp();
         let compiled = compiled_with_tags("select 1", &["public.person"]);
-        put_rows(&cache, &compiled, &[], &[CachedValue::I64(1)]).unwrap();
+        put_rows(&cache, &compiled, &[], &[DecodedValue::I64(1)]).unwrap();
         put_json(&cache, "json_all", &compiled, &[], Some("[1]")).unwrap();
 
-        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![CachedValue::I64(1)]));
+        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![DecodedValue::I64(1)]));
         assert_eq!(get_json(&cache, "json_all", &compiled, &[]).unwrap(), Some(Some("[1]".to_string())));
         // A different kind namespace for the same SQL is a genuine miss.
         assert_eq!(get_json(&cache, "json_single", &compiled, &[]).unwrap(), None);

@@ -132,7 +132,7 @@ mod tests {
         // LMDB refuses a second `Env::open` on the same path within one
         // process, so this is the only handle a test can safely use once
         // the worker is alive (see `CacheInvalidationWorker::cache`).
-        worker.cache().put("k1", vec![pylon_value::CachedValue::I64(1)], vec![tag.clone()]).unwrap();
+        worker.cache().put("k1", vec![pylon_value::DecodedValue::I64(1)], vec![tag.clone()]).unwrap();
         assert!(worker.cache().get("k1").unwrap().is_some());
 
         let notifier = pylon_pgcon::PgPool::connect(&test_dsn(), 1).await.unwrap();
@@ -158,7 +158,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10).await.unwrap();
         let tag = unique_tag("cache_worker_test_untouched");
-        worker.cache().put("k1", vec![pylon_value::CachedValue::I64(1)], vec![tag]).unwrap();
+        worker.cache().put("k1", vec![pylon_value::DecodedValue::I64(1)], vec![tag]).unwrap();
 
         let notifier = pylon_pgcon::PgPool::connect(&test_dsn(), 1).await.unwrap();
         notifier.query_raw("NOTIFY pylon_cache_invalidate, 'public.other_table'").await.unwrap();
