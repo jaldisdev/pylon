@@ -29,7 +29,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pylon_client::{CachedValue, Client, Isolation, Value};
+use pylon_client::{DecodedValue, Client, Isolation, Value};
 use pylon_core::export::export_schema;
 use pylon_core::schema::{
     ChannelDescriptor, ChannelPayload, PropertyDescriptor, SchemaDescriptor, TriggerDescriptor, TypeDescriptor,
@@ -190,7 +190,7 @@ async fn query_and_execute_round_trip() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name }}"),
-            &[("name", CachedValue::Str("Alice".into()))],
+            &[("name", DecodedValue::Str("Alice".into()))],
         )
         .await
         .unwrap();
@@ -213,14 +213,14 @@ async fn query_single_enforces_cardinality() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name }}"),
-            &[("name", CachedValue::Str("Bob".into()))],
+            &[("name", DecodedValue::Str("Bob".into()))],
         )
         .await
         .unwrap();
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name }}"),
-            &[("name", CachedValue::Str("Carol".into()))],
+            &[("name", DecodedValue::Str("Carol".into()))],
         )
         .await
         .unwrap();
@@ -244,7 +244,7 @@ async fn globals_fill_the_dunder_global_param_slot() {
     let module = schema.types[0].module.clone();
     let client = setup(&schema).await;
 
-    let authed = client.with_globals([(format!("{module}::viewer_name"), CachedValue::Str("Dave".into()))]);
+    let authed = client.with_globals([(format!("{module}::viewer_name"), DecodedValue::Str("Dave".into()))]);
     let rows = authed.query("select global viewer_name", &[]).await.unwrap();
     assert_eq!(rows, vec![Value::Str("Dave".into())]);
 
@@ -265,7 +265,7 @@ async fn transaction_commits_on_success() {
             Box::pin(async move {
                 tx.execute(
                     &format!("insert {module}::Person {{ name := <str>$name }}"),
-                    &[("name", CachedValue::Str("Erin".into()))],
+                    &[("name", DecodedValue::Str("Erin".into()))],
                 )
                 .await
             })
@@ -291,7 +291,7 @@ async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors
             Box::pin(async move {
                 tx.execute(
                     &format!("insert {module}::Person {{ name := <str>$name }}"),
-                    &[("name", CachedValue::Str("Frank".into()))],
+                    &[("name", DecodedValue::Str("Frank".into()))],
                 )
                 .await?;
                 // An unknown link name is a compile error — not retriable —
@@ -318,7 +318,7 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name }}"),
-            &[("name", CachedValue::Str("Alice".into()))],
+            &[("name", DecodedValue::Str("Alice".into()))],
         )
         .await
         .unwrap();
@@ -393,7 +393,7 @@ async fn listen_decodes_a_scalar_channel_payload() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name }}"),
-            &[("name", CachedValue::Str("gadget".into()))],
+            &[("name", DecodedValue::Str("gadget".into()))],
         )
         .await
         .unwrap();
@@ -424,7 +424,7 @@ async fn listen_decodes_a_type_channel_payload_as_the_rows_id() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name }}"),
-            &[("name", CachedValue::Str("gadget".into()))],
+            &[("name", DecodedValue::Str("gadget".into()))],
         )
         .await
         .unwrap();
@@ -461,7 +461,7 @@ async fn listen_decodes_an_object_channel_payload() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name, score := <float64>$score }}"),
-            &[("name", CachedValue::Str("gadget".into())), ("score", CachedValue::F64(0.75))],
+            &[("name", DecodedValue::Str("gadget".into())), ("score", DecodedValue::F64(0.75))],
         )
         .await
         .unwrap();

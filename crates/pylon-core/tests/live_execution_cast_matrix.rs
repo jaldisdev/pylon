@@ -31,22 +31,22 @@
 mod common;
 
 use common::*;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 #[tokio::test]
 #[ignore]
 async fn mixed_int_and_float_arithmetic_returns_the_correct_value() {
     let pool = test_pool().await;
-    assert_eq!(eval_scalar(&pool, "<int16>1 + <float32>2.0").await, CachedValue::F64(3.0));
-    assert_eq!(eval_scalar(&pool, "<float64>1.5 + <int64>2").await, CachedValue::F64(3.5));
+    assert_eq!(eval_scalar(&pool, "<int16>1 + <float32>2.0").await, DecodedValue::F64(3.0));
+    assert_eq!(eval_scalar(&pool, "<float64>1.5 + <int64>2").await, DecodedValue::F64(3.5));
 }
 
 #[tokio::test]
 #[ignore]
 async fn mixed_int_and_decimal_arithmetic_returns_the_correct_value() {
     let pool = test_pool().await;
-    assert_eq!(eval_scalar(&pool, "<int64>1 + <decimal>2.5").await, CachedValue::Decimal("3.5".to_string()));
-    assert_eq!(eval_scalar(&pool, "<decimal>10 - <int16>3").await, CachedValue::Decimal("7".to_string()));
+    assert_eq!(eval_scalar(&pool, "<int64>1 + <decimal>2.5").await, DecodedValue::Decimal("3.5".to_string()));
+    assert_eq!(eval_scalar(&pool, "<decimal>10 - <int16>3").await, DecodedValue::Decimal("7".to_string()));
 }
 
 #[tokio::test]
@@ -55,6 +55,6 @@ async fn same_family_arithmetic_still_returns_the_correct_value() {
     // Guards against the fix accidentally changing behavior for the
     // already-working same-family cases (int-int, float-float).
     let pool = test_pool().await;
-    assert_eq!(eval_scalar(&pool, "<int16>1 + <int64>2").await, CachedValue::I64(3));
-    assert_eq!(eval_scalar(&pool, "<float32>1.5 + <float64>2.5").await, CachedValue::F64(4.0));
+    assert_eq!(eval_scalar(&pool, "<int16>1 + <int64>2").await, DecodedValue::I64(3));
+    assert_eq!(eval_scalar(&pool, "<float32>1.5 + <float64>2.5").await, DecodedValue::F64(4.0));
 }

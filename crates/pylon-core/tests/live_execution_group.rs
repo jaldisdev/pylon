@@ -46,7 +46,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use std::collections::HashSet;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
@@ -121,30 +121,30 @@ async fn group_rows(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn fields(row: &CachedValue) -> &[CachedValue] {
+fn fields(row: &DecodedValue) -> &[DecodedValue] {
     match row {
-        CachedValue::Composite(fields) => fields,
+        DecodedValue::Composite(fields) => fields,
         other => panic!("expected a Composite-shaped group row, got {other:?}"),
     }
 }
 
-fn as_str(v: &CachedValue) -> &str {
+fn as_str(v: &DecodedValue) -> &str {
     match v {
-        CachedValue::Str(s) => s,
+        DecodedValue::Str(s) => s,
         other => panic!("expected Str, got {other:?}"),
     }
 }
 
-fn as_array(v: &CachedValue) -> &[CachedValue] {
+fn as_array(v: &DecodedValue) -> &[DecodedValue] {
     match v {
-        CachedValue::Array(items) => items,
+        DecodedValue::Array(items) => items,
         other => panic!("expected Array, got {other:?}"),
     }
 }
@@ -236,7 +236,7 @@ async fn group_using_computed_alias_buckets_by_derived_value() {
     for row in &rows {
         let f = fields(row);
         let decade = match &f[1] {
-            CachedValue::I64(n) => *n,
+            DecodedValue::I64(n) => *n,
             other => panic!("expected I64 decade key, got {other:?}"),
         };
         let elements = as_array(&f[3]);
@@ -287,7 +287,7 @@ async fn group_by_multiple_keys_produces_composite_grouping() {
         let f = fields(row);
         let department = as_str(&f[1]).to_string();
         let active = match &f[2] {
-            CachedValue::Bool(b) => *b,
+            DecodedValue::Bool(b) => *b,
             other => panic!("expected Bool active key, got {other:?}"),
         };
         let grouping = as_array(&f[3]);
@@ -342,7 +342,7 @@ async fn group_with_no_explicit_shape_defaults_to_id_only() {
         "expected only [type-tag, id], got {el_fields:?}"
     );
     assert!(
-        matches!(&el_fields[1], CachedValue::Uuid(_)),
+        matches!(&el_fields[1], DecodedValue::Uuid(_)),
         "expected id to be a Uuid, got {:?}",
         el_fields[1]
     );

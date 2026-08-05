@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pylon_pgcon::{ExtensionOids, PgListener};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
 
@@ -130,19 +130,19 @@ async fn drain_once<P: BatchProcessor>(listener: &PgListener, batch_size: i64, p
             break;
         }
         let short_batch = rows.len() < batch_size as usize;
-        let ids: Vec<CachedValue> = rows.iter().map(|r| CachedValue::Uuid(r.id)).collect();
+        let ids: Vec<DecodedValue> = rows.iter().map(|r| DecodedValue::Uuid(r.id)).collect();
 
         match processor.process_batch(listener, &rows).await {
             Ok(()) => {
                 crate::metrics::JOBS_PROCESSED.with_label_values(&[processor.index_kind()]).inc_by(rows.len() as u64);
-                if let Err(e) = listener.execute_typed(MARK_DONE_SQL, &[CachedValue::Array(ids)]).await {
+                if let Err(e) = listener.execute_typed(MARK_DONE_SQL, &[DecodedValue::Array(ids)]).await {
                     eprintln!("IndexWorker({}): mark_done failed: {e}", processor.index_kind());
                 }
             }
             Err(e) => {
                 crate::metrics::JOBS_FAILED.with_label_values(&[processor.index_kind()]).inc_by(rows.len() as u64);
                 eprintln!("IndexWorker({}): batch failed, scheduling retry: {e}", processor.index_kind());
-                if let Err(e) = listener.execute_typed(MARK_FAILED_SQL, &[CachedValue::Array(ids)]).await {
+                if let Err(e) = listener.execute_typed(MARK_FAILED_SQL, &[DecodedValue::Array(ids)]).await {
                     eprintln!("IndexWorker({}): mark_failed failed: {e}", processor.index_kind());
                 }
             }
@@ -158,34 +158,34 @@ async fn claim_batch(listener: &PgListener, index_kind: &str, limit: i64) -> Res
     let rows = listener
         .query_typed_named(
             CLAIM_BATCH_SQL,
-            &[CachedValue::Str(index_kind.to_string()), CachedValue::I64(limit)],
+            &[DecodedValue::Str(index_kind.to_string()), DecodedValue::I64(limit)],
             &ExtensionOids::default(),
         )
         .await?;
     rows.iter().map(decode_claimed_row).collect()
 }
 
-fn decode_claimed_row(value: &CachedValue) -> Result<ClaimedRow> {
-    let CachedValue::Object(fields) = value else {
+fn decode_claimed_row(value: &DecodedValue) -> Result<ClaimedRow> {
+    let DecodedValue::Object(fields) = value else {
         return Err(Error::Decode("claim_batch: expected a named-column row".into()));
     };
     let field = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
 
     let id = match field("id") {
-        Some(CachedValue::Uuid(b)) => *b,
+        Some(DecodedValue::Uuid(b)) => *b,
         _ => return Err(Error::Decode("claim_batch: missing/invalid 'id'".into())),
     };
     let object_id = match field("object_id") {
-        Some(CachedValue::Uuid(b)) => *b,
+        Some(DecodedValue::Uuid(b)) => *b,
         _ => return Err(Error::Decode("claim_batch: missing/invalid 'object_id'".into())),
     };
     let type_name = match field("type_name") {
-        Some(CachedValue::Str(s)) => s.clone(),
+        Some(DecodedValue::Str(s)) => s.clone(),
         _ => return Err(Error::Decode("claim_batch: missing/invalid 'type_name'".into())),
     };
     let index_name = match field("index_name") {
-        Some(CachedValue::Str(s)) => Some(s.clone()),
-        Some(CachedValue::Null) | None => None,
+        Some(DecodedValue::Str(s)) => Some(s.clone()),
+        Some(DecodedValue::Null) | None => None,
         _ => return Err(Error::Decode("claim_batch: invalid 'index_name'".into())),
     };
 

@@ -141,18 +141,30 @@ async def _first_payload(gen, trigger: "asyncio.Future | None" = None, *, timeou
     """Start consuming *gen*, run *trigger* (if given) once the listener has
     had a moment to register, and return the first yielded payload.
 
-    `Client.listen()`'s `add_listener()` call must complete (registering the
-    subscription on Postgres's side) before the row that fires `notify()` is
-    inserted, or the notification would be sent before anyone was listening
-    for it and simply never arrive — hence the sleep before running
-    *trigger*, mirroring `pgcon`'s own listener tests' same concern. 0.5s
-    rather than a shorter margin: seen flake under full-suite load (a lot of
-    other tests' connections/DB activity competing for scheduling) with a
-    smaller value, where the trigger fired before LISTEN had actually
-    registered server-side.
+    `client.listen()` is an async *generator* — calling it builds a
+    generator object but runs none of its body (including the
+    `add_listener()` call that actually registers `LISTEN` with Postgres)
+    until something first drives it via `__anext__()`/`async for`. Handing
+    `gen.__anext__()` to `asyncio.create_task()` only *schedules* that; it
+    doesn't run any of it synchronously. So there's no way to know from out
+    here that the subscription is actually registered server-side other
+    than giving the task enough real wall-clock time to reach its first
+    `await queue.get()` — if the trigger fires first, the notification is
+    sent before anyone's listening and never arrives at all.
+
+    A fixed sleep here is inherently a race, just an increasingly generous
+    one — 0.1s flaked under full-suite load, then 0.5s *still* flaked on a
+    heavily loaded machine (confirmed live, not theoretical, both times).
+    There's no clean way to observe "has that other connection's LISTEN
+    actually registered" from out here — Postgres doesn't expose another
+    backend's subscriptions — so this is a wider margin, not a different
+    strategy: 2s is generous enough that a real regression (the
+    subscription genuinely never arriving) still fails loudly via the
+    `wait_for` timeout below, while comfortably covering normal scheduling
+    jitter under load.
     """
     task = asyncio.create_task(gen.__anext__())
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(2.0)
     if trigger is not None:
         await trigger
     return await asyncio.wait_for(task, timeout=timeout)
@@ -337,8 +349,25 @@ def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
         async def send_bad_payload():
             await live_pool.execute(f"SELECT pg_notify('{wire_name}', 'not-a-uuid')", [])
 
+        # A plain `_first_payload()` call here is retried below rather than
+        # given a single attempt — unlike the other listen tests in this
+        # file, `send_bad_payload()` has no state of its own to worry about
+        # duplicating, so a stray timeout (the listener's `add_listener()`
+        # genuinely not having registered by the time `_first_payload`'s own
+        # margin ran out, under heavy concurrent load) can just be retried
+        # outright instead of failing the test.
+        last_timeout: asyncio.TimeoutError | None = None
         with pytest.raises(QueryError, match="doesn't match its declared shape"):
-            await _first_payload(client.listen("Ids"), send_bad_payload())
+            for attempt in range(3):
+                try:
+                    await _first_payload(client.listen("Ids"), send_bad_payload())
+                except asyncio.TimeoutError as exc:
+                    last_timeout = exc
+                    continue
+                else:
+                    break
+            else:
+                raise last_timeout
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')

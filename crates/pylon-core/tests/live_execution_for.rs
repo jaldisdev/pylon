@@ -48,7 +48,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use std::collections::HashSet;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
@@ -111,30 +111,30 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
 
-fn as_str(v: &CachedValue) -> &str {
+fn as_str(v: &DecodedValue) -> &str {
     match v {
-        CachedValue::Str(s) => s,
+        DecodedValue::Str(s) => s,
         other => panic!("expected Str, got {other:?}"),
     }
 }
 
-fn as_i64(v: &CachedValue) -> i64 {
+fn as_i64(v: &DecodedValue) -> i64 {
     match v {
-        CachedValue::I64(n) => *n,
+        DecodedValue::I64(n) => *n,
         other => panic!("expected I64, got {other:?}"),
     }
 }

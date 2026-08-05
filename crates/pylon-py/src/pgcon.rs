@@ -18,10 +18,10 @@
 //
 
 //! pyo3 async bindings over `pylon-pgcon` — the real query/execute
-//! surface. Parameters convert Python -> `CachedValue` synchronously,
+//! surface. Parameters convert Python -> `DecodedValue` synchronously,
 //! before entering the async block (the GIL is already held there, at the
 //! top of a `#[pyfunction]` call); results convert the other way only
-//! *after* the future resolves, via `PyCachedValue`'s `IntoPyObject` impl,
+//! *after* the future resolves, via `PyDecodedValue`'s `IntoPyObject` impl,
 //! which `pyo3_async_runtimes::tokio::future_into_py` calls once it has
 //! re-acquired the GIL — so no Python object ever needs to cross the
 //! `.await` inside these futures.
@@ -33,7 +33,7 @@ use pyo3::prelude::*;
 use tokio::sync::Mutex as AsyncMutex;
 
 use pylon_pgcon::{ExtensionOids, PgListener, PgPool, PgTransaction};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::pgvalue::{cached_to_py, py_to_cached};
 use crate::{CompiledQuery, PylonPgconError};
@@ -233,14 +233,14 @@ fn pgcon_connect_err(err: pylon_pgcon::Error) -> PyErr {
     })
 }
 
-/// Wraps a `CachedValue` so it can be returned from an async future body
+/// Wraps a `DecodedValue` so it can be returned from an async future body
 /// and converted to a Python object by `future_into_py` after the GIL is
 /// reacquired — the same job `cached_to_py` does, just reachable through
 /// `IntoPyObject` instead of called directly (orphan rules mean we can't
-/// impl `IntoPyObject` for `pylon_value::CachedValue` itself here).
-pub(crate) struct PyCachedValue(pub(crate) CachedValue);
+/// impl `IntoPyObject` for `pylon_value::DecodedValue` itself here).
+pub(crate) struct PyDecodedValue(pub(crate) DecodedValue);
 
-impl<'py> IntoPyObject<'py> for PyCachedValue {
+impl<'py> IntoPyObject<'py> for PyDecodedValue {
     type Target = PyAny;
     type Output = Bound<'py, PyAny>;
     type Error = PyErr;
@@ -274,7 +274,7 @@ impl PgconPool {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -287,7 +287,7 @@ impl PgconPool {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = pool.query_typed_named(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -306,7 +306,7 @@ impl PgconPool {
             let result = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await;
             pylon_workers::metrics::record_query_result(&result);
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -324,7 +324,7 @@ impl PgconPool {
             let result = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await;
             pylon_workers::metrics::record_query_result(&result);
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -339,7 +339,7 @@ impl PgconPool {
             let result = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await;
             pylon_workers::metrics::record_query_result(&result);
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -453,7 +453,7 @@ impl PgconTransaction {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
             let rows = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -479,7 +479,7 @@ impl PgconTransaction {
             let result = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await;
             pylon_workers::metrics::record_query_result(&result);
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -508,7 +508,7 @@ impl PgconTransaction {
             let result = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await;
             pylon_workers::metrics::record_query_result(&result);
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -523,7 +523,7 @@ impl PgconTransaction {
             let result = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await;
             pylon_workers::metrics::record_query_result(&result);
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
@@ -608,7 +608,7 @@ impl PgconListener {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = inner.query_typed_named(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyCachedValue).collect::<Vec<_>>())
+            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 }

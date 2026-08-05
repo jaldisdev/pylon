@@ -28,7 +28,7 @@
 
 use crate::migration::{parse_steps, verify_integrity, MigrationFile};
 use pylon_pgcon::{PgPool, PgTransaction};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
@@ -101,7 +101,7 @@ pub async fn write_schema_snapshot(pool: &PgPool, snapshot_json: &str) -> Result
     pool.execute_typed(
         r#"INSERT INTO _pylon."Schema" (singleton, snapshot, updated_at) VALUES (true, $1::jsonb, now())
            ON CONFLICT (singleton) DO UPDATE SET snapshot = $1::jsonb, updated_at = now()"#,
-        &[CachedValue::Str(snapshot_json.to_string())],
+        &[DecodedValue::Str(snapshot_json.to_string())],
     )
     .await?;
     Ok(())
@@ -118,7 +118,7 @@ pub async fn read_schema_snapshot(pool: &PgPool) -> Result<Option<String>> {
         )
         .await?;
     Ok(match rows.into_iter().next() {
-        Some(CachedValue::Str(s)) => Some(s),
+        Some(DecodedValue::Str(s)) => Some(s),
         _ => None,
     })
 }
@@ -162,18 +162,18 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
     Ok(rows
         .into_iter()
         .filter_map(|row| {
-            let CachedValue::Composite(fields) = row else { return None };
-            let [CachedValue::Str(id), CachedValue::Str(onto), db_state, schema_state, CachedValue::Bool(applied)] =
-                <[CachedValue; 5]>::try_from(fields).ok()?
+            let DecodedValue::Composite(fields) = row else { return None };
+            let [DecodedValue::Str(id), DecodedValue::Str(onto), db_state, schema_state, DecodedValue::Bool(applied)] =
+                <[DecodedValue; 5]>::try_from(fields).ok()?
             else {
                 return None;
             };
             let db_state = match db_state {
-                CachedValue::Str(s) => Some(s),
+                DecodedValue::Str(s) => Some(s),
                 _ => None,
             };
             let schema_state = match schema_state {
-                CachedValue::Str(s) => Some(s),
+                DecodedValue::Str(s) => Some(s),
                 _ => None,
             };
             Some(TrackingRow { id, onto, db_state, schema_state, applied })
@@ -230,7 +230,7 @@ pub async fn try_advisory_lock(pool: &PgPool) -> Result<Option<pylon_pgcon::PgCo
             &pylon_pgcon::ExtensionOids::default(),
         )
         .await?;
-    Ok(if matches!(rows.first(), Some(CachedValue::Bool(true))) { Some(conn) } else { None })
+    Ok(if matches!(rows.first(), Some(DecodedValue::Bool(true))) { Some(conn) } else { None })
 }
 
 pub async fn advisory_unlock(conn: pylon_pgcon::PgConnection) -> Result<()> {
@@ -244,8 +244,8 @@ const RECORD_APPLIED_SQL: &str = r#"
     ON CONFLICT (id) DO UPDATE SET applied_at = now()
 "#;
 
-fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<CachedValue> {
-    vec![CachedValue::Str(id.to_string()), CachedValue::Str(onto.to_string()), CachedValue::Str(filename.to_string())]
+fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<DecodedValue> {
+    vec![DecodedValue::Str(id.to_string()), DecodedValue::Str(onto.to_string()), DecodedValue::Str(filename.to_string())]
 }
 
 /// Records a migration as applied without running its DDL — used both by
@@ -267,12 +267,12 @@ async fn read_progress(pool: &PgPool, id: &str) -> Result<Option<i64>> {
     let rows = pool
         .query_typed(
             r#"SELECT (step_index) AS result FROM _pylon."Progress" WHERE id = $1"#,
-            &[CachedValue::Str(id.to_string())],
+            &[DecodedValue::Str(id.to_string())],
             &pylon_pgcon::ExtensionOids::default(),
         )
         .await?;
     Ok(match rows.into_iter().next() {
-        Some(CachedValue::I64(n)) => Some(n),
+        Some(DecodedValue::I64(n)) => Some(n),
         _ => None,
     })
 }
@@ -281,19 +281,19 @@ async fn record_progress(pool: &PgPool, id: &str, step_index: i64) -> Result<()>
     pool.execute_typed(
         r#"INSERT INTO _pylon."Progress" (id, step_index) VALUES ($1, $2)
            ON CONFLICT (id) DO UPDATE SET step_index = $2, updated_at = now()"#,
-        &[CachedValue::Str(id.to_string()), CachedValue::I64(step_index)],
+        &[DecodedValue::Str(id.to_string()), DecodedValue::I64(step_index)],
     )
     .await?;
     Ok(())
 }
 
 async fn delete_progress(pool: &PgPool, id: &str) -> Result<()> {
-    pool.execute_typed(r#"DELETE FROM _pylon."Progress" WHERE id = $1"#, &[CachedValue::Str(id.to_string())]).await?;
+    pool.execute_typed(r#"DELETE FROM _pylon."Progress" WHERE id = $1"#, &[DecodedValue::Str(id.to_string())]).await?;
     Ok(())
 }
 
 async fn delete_progress_in_tx(tx: &PgTransaction, id: &str) -> Result<()> {
-    tx.execute_typed(r#"DELETE FROM _pylon."Progress" WHERE id = $1"#, &[CachedValue::Str(id.to_string())]).await?;
+    tx.execute_typed(r#"DELETE FROM _pylon."Progress" WHERE id = $1"#, &[DecodedValue::Str(id.to_string())]).await?;
     Ok(())
 }
 
@@ -307,7 +307,7 @@ async fn drop_invalid_concurrent_index(pool: &PgPool, sql: &str) -> Result<()> {
         .query_typed(
             "SELECT (1) AS result FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
              WHERE c.relname = $1 AND NOT i.indisvalid",
-            &[CachedValue::Str(index_name.clone())],
+            &[DecodedValue::Str(index_name.clone())],
             &pylon_pgcon::ExtensionOids::default(),
         )
         .await?;
@@ -510,7 +510,7 @@ mod tests {
     async fn cleanup_migration_row(pool: &PgPool, id: &str) {
         pool.execute_typed(
             r#"DELETE FROM _pylon."Migrations" WHERE id = $1"#,
-            &[CachedValue::Str(id.to_string())],
+            &[DecodedValue::Str(id.to_string())],
         )
         .await
         .unwrap();
@@ -620,14 +620,14 @@ mod tests {
 
         pool.execute_typed(
             r#"UPDATE _pylon."Migrations" SET schema_state = $1::jsonb WHERE id = $2"#,
-            &[CachedValue::Str(r#"{"types":[]}"#.to_string()), CachedValue::Str(m.id.clone())],
+            &[DecodedValue::Str(r#"{"types":[]}"#.to_string()), DecodedValue::Str(m.id.clone())],
         )
         .await
         .unwrap();
 
         let tracking = read_tracking(&pool).await.unwrap();
         let row = tracking.iter().find(|r| r.id == m.id).unwrap();
-        // Raw text, not a decoded CachedValue::Object tree — `SchemaDescriptor::from_json`
+        // Raw text, not a decoded DecodedValue::Object tree — `SchemaDescriptor::from_json`
         // (the pyo3-exposed consumer) re-parses this string itself.
         assert_eq!(row.schema_state.as_deref(), Some(r#"{"types": []}"#));
 
@@ -643,14 +643,14 @@ mod tests {
 
         pool.execute_typed(
             r#"UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2"#,
-            &[CachedValue::Str(r#"{"schemas":["default"]}"#.to_string()), CachedValue::Str(m.id.clone())],
+            &[DecodedValue::Str(r#"{"schemas":["default"]}"#.to_string()), DecodedValue::Str(m.id.clone())],
         )
         .await
         .unwrap();
 
         let tracking = read_tracking(&pool).await.unwrap();
         let row = tracking.iter().find(|r| r.id == m.id).unwrap();
-        // Raw text, not a decoded CachedValue::Object tree — `db_state_from_json`
+        // Raw text, not a decoded DecodedValue::Object tree — `db_state_from_json`
         // (the pyo3-exposed consumer) re-parses this string itself.
         assert_eq!(row.db_state.as_deref(), Some(r#"{"schemas": ["default"]}"#));
 
@@ -677,7 +677,7 @@ mod tests {
         }
 
         let progress =
-            pool.query_typed(r#"SELECT (1) AS result FROM _pylon."Progress" WHERE id = $1"#, &[CachedValue::Str(m.id.clone())], &pylon_pgcon::ExtensionOids::default())
+            pool.query_typed(r#"SELECT (1) AS result FROM _pylon."Progress" WHERE id = $1"#, &[DecodedValue::Str(m.id.clone())], &pylon_pgcon::ExtensionOids::default())
                 .await
                 .unwrap();
         assert!(progress.is_empty(), "progress row must be cleared after a successful multi-step apply");

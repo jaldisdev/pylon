@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use pylon_core::ir::SessionConfig;
 use pylon_core::schema::SchemaDescriptor;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
 use crate::exec;
@@ -150,7 +150,7 @@ pub struct Client {
     /// resulting future non-`Send` (fatal for `Client::transaction`'s boxed
     /// futures, and a footgun on a multi-threaded runtime generally).
     schema: Arc<RwLock<SchemaDescriptor>>,
-    globals: Arc<HashMap<String, CachedValue>>,
+    globals: Arc<HashMap<String, DecodedValue>>,
     config: SessionConfig,
     /// `None` unless `Builder::cache` was called — read-through caching is
     /// opt-in. Shared across `with_globals`/`with_config` clones, same as
@@ -178,7 +178,7 @@ impl Client {
     /// Returns a client view that injects `globals` into every query,
     /// keyed by qualified name (`"module::name"`) — sharing the same
     /// connection pool. Mirrors `pylon/client.py:287-304`.
-    pub fn with_globals(&self, globals: impl IntoIterator<Item = (String, CachedValue)>) -> Client {
+    pub fn with_globals(&self, globals: impl IntoIterator<Item = (String, DecodedValue)>) -> Client {
         let mut merged = (*self.globals).clone();
         merged.extend(globals);
         Client { globals: Arc::new(merged), ..self.clone() }
@@ -214,18 +214,18 @@ impl Client {
         self.cache.clone()
     }
 
-    pub async fn query(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Vec<Value>> {
+    pub async fn query(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
         exec::query(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref()).await
     }
 
-    pub async fn query_single(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Option<Value>> {
+    pub async fn query_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<Value>> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_single(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref())
             .await
     }
 
-    pub async fn query_required_single(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Value> {
+    pub async fn query_required_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Value> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_required_single(
             &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
@@ -233,7 +233,7 @@ impl Client {
         .await
     }
 
-    pub async fn execute(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<()> {
+    pub async fn execute(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<()> {
         let schema = self.schema.read().unwrap().clone();
         exec::execute(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
     }
@@ -265,13 +265,13 @@ impl Client {
         crate::listen::listen(&self.dsn, &schema, channel).await
     }
 
-    pub async fn query_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
+    pub async fn query_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_json(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref())
             .await
     }
 
-    pub async fn query_single_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<Option<String>> {
+    pub async fn query_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<String>> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_single_json(
             &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
@@ -279,7 +279,7 @@ impl Client {
         .await
     }
 
-    pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
+    pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_required_single_json(
             &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
@@ -309,7 +309,7 @@ impl Client {
     /// returns a query plan grouped by the query's own shape instead of raw
     /// SQL relation names. `pyql` doesn't need the leading `analyze`
     /// keyword already written. Mirrors `pylon/client.py:461-480`.
-    pub async fn analyze(&self, pyql: &str, params: &[(&str, CachedValue)]) -> Result<String> {
+    pub async fn analyze(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
         exec::analyze(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
     }
@@ -325,10 +325,10 @@ impl Client {
     /// budget. Any other error rolls back and propagates immediately.
     ///
     /// ```no_run
-    /// # use pylon_client::CachedValue;
+    /// # use pylon_client::DecodedValue;
     /// # async fn go(client: pylon_client::Client) -> pylon_client::Result<()> {
     /// client.transaction(pylon_client::Isolation::Serializable, |tx| Box::pin(async move {
-    ///     tx.execute("insert Person { name := <str>$name }", &[("name", CachedValue::Str("Bob".into()))]).await
+    ///     tx.execute("insert Person { name := <str>$name }", &[("name", DecodedValue::Str("Bob".into()))]).await
     /// })).await?;
     /// # Ok(()) }
     /// ```

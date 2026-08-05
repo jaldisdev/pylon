@@ -46,7 +46,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{DeleteAction, DeleteSide, MultiLinkDescriptor, OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(
     name: &str,
@@ -212,7 +212,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str)
 /// inspection (e.g. checking a multilink shape's array length to confirm
 /// junction-row cleanup, without needing to query the junction table
 /// directly via raw SQL).
-async fn rows_of(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<CachedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
 }
@@ -251,9 +251,9 @@ async fn single_link_allow_sets_the_fk_null_on_target_delete() {
 
     let teams = rows_of(&pool, &schema, &format!("select {module}::TeamSetNull {{ name, org: {{ name }} }} filter .name = 'Alpha'")).await;
     assert_eq!(teams.len(), 1, "the Team itself must survive an Allow (SET NULL) target delete");
-    let CachedValue::Composite(fields) = &teams[0] else { panic!("expected Composite, got {:?}", teams[0]) };
+    let DecodedValue::Composite(fields) = &teams[0] else { panic!("expected Composite, got {:?}", teams[0]) };
     // [0] = __type__, [1] = name, [2] = org (nested Composite, or Null since the FK is now NULL)
-    assert_eq!(fields.get(2), Some(&CachedValue::Null), "org link should have been set NULL, got {:?}", fields.get(2));
+    assert_eq!(fields.get(2), Some(&DecodedValue::Null), "org link should have been set NULL, got {:?}", fields.get(2));
 }
 
 #[tokio::test]
@@ -372,8 +372,8 @@ async fn multilink_allow_removes_the_junction_row_on_target_delete() {
 
     let products = rows_of(&pool, &schema, &format!("select {module}::ProductAllow {{ name, tags: {{ name }} }} filter .name = 'Widget'")).await;
     assert_eq!(products.len(), 1, "the Product itself must survive an Allow target delete");
-    let CachedValue::Composite(fields) = &products[0] else { panic!("expected Composite, got {:?}", products[0]) };
-    let CachedValue::Array(tags) = &fields[2] else { panic!("expected tags to decode as an Array, got {:?}", fields[2]) };
+    let DecodedValue::Composite(fields) = &products[0] else { panic!("expected Composite, got {:?}", products[0]) };
+    let DecodedValue::Array(tags) = &fields[2] else { panic!("expected tags to decode as an Array, got {:?}", fields[2]) };
     assert_eq!(tags.len(), 0, "the junction row must be gone, leaving an empty tags array");
 }
 

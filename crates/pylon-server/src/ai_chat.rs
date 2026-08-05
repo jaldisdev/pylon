@@ -53,7 +53,7 @@ use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
 use pylon_core::schema::{SchemaDescriptor, VectorIndexDescriptor};
 use pylon_providers::{AnthropicProvider, Message, OpenAiProvider};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::config::{ApiStyle, ModelPurpose};
 use crate::json::json_response;
@@ -203,11 +203,11 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
     let pyql = format!(
         "select vector::search({search_target}, query := <str>$queryText{index_clause}) {{ object {{ {shape} }}, distance }} order by .distance limit 5"
     );
-    let mut params: Vec<(&str, CachedValue)> = vec![
-        ("__deferred_vec__", CachedValue::Array(embedding.iter().map(|f| CachedValue::F64(*f as f64)).collect())),
+    let mut params: Vec<(&str, DecodedValue)> = vec![
+        ("__deferred_vec__", DecodedValue::Array(embedding.iter().map(|f| DecodedValue::F64(*f as f64)).collect())),
     ];
     if let Some(idx) = &index_name {
-        params.push(("indexName", CachedValue::Str(idx.clone())));
+        params.push(("indexName", DecodedValue::Str(idx.clone())));
     }
 
     let objects = match client.query(&pyql, &params).await {

@@ -46,11 +46,11 @@ pub enum Error {
     /// A `text`/`varchar`/`bpchar` field's bytes weren't valid UTF-8.
     #[error(transparent)]
     Utf8(#[from] std::str::Utf8Error),
-    /// A jsonb field's bytes weren't valid JSON, or a `CachedValue::Object`
+    /// A jsonb field's bytes weren't valid JSON, or a `DecodedValue::Object`
     /// being bound as a jsonb parameter failed to serialize.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    /// A `CachedValue::Decimal`'s string form wasn't a valid decimal.
+    /// A `DecodedValue::Decimal`'s string form wasn't a valid decimal.
     #[error(transparent)]
     Decimal(#[from] rust_decimal::Error),
     /// Everything else: DSN parse failures, the "cannot bind a composite

@@ -32,7 +32,7 @@
 use crate::error::Result;
 use crate::wire::ExtensionOids;
 use crate::{execute_typed_on, query_typed_named_on, query_typed_on};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use tokio_postgres::AsyncMessage;
 
 pub use tokio_postgres::Notification;
@@ -82,19 +82,19 @@ impl PgListener {
         Ok(())
     }
 
-    pub async fn query_typed(&self, sql: &str, params: &[CachedValue], ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
+    pub async fn query_typed(&self, sql: &str, params: &[DecodedValue], ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
         query_typed_on(&self.client, sql, params, ext).await
     }
 
     /// Like `query_typed`, but decodes every column of every row by name
-    /// (`CachedValue::Object`) instead of assuming column 0 is the whole
+    /// (`DecodedValue::Object`) instead of assuming column 0 is the whole
     /// result — for hand-written queries with several named columns a
     /// caller accesses by name, matching `asyncpg.Record`'s behavior.
-    pub async fn query_typed_named(&self, sql: &str, params: &[CachedValue], ext: &ExtensionOids) -> Result<Vec<CachedValue>> {
+    pub async fn query_typed_named(&self, sql: &str, params: &[DecodedValue], ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
         query_typed_named_on(&self.client, sql, params, ext).await
     }
 
-    pub async fn execute_typed(&self, sql: &str, params: &[CachedValue]) -> Result<u64> {
+    pub async fn execute_typed(&self, sql: &str, params: &[DecodedValue]) -> Result<u64> {
         execute_typed_on(&self.client, sql, params).await
     }
 }
@@ -207,14 +207,14 @@ mod tests {
         let listener = PgListener::connect(&test_dsn(), |_n| {}).await.unwrap();
         listener.execute_typed("CREATE TEMP TABLE pgcon_listener_query_test (id int8)", &[]).await.unwrap();
         listener
-            .execute_typed("INSERT INTO pgcon_listener_query_test (id) VALUES ($1::int8)", &[CachedValue::I64(7)])
+            .execute_typed("INSERT INTO pgcon_listener_query_test (id) VALUES ($1::int8)", &[DecodedValue::I64(7)])
             .await
             .unwrap();
         let rows = listener
             .query_typed("SELECT (id) AS result FROM pgcon_listener_query_test", &[], &ExtensionOids::default())
             .await
             .unwrap();
-        assert_eq!(rows, vec![CachedValue::I64(7)]);
+        assert_eq!(rows, vec![DecodedValue::I64(7)]);
     }
 
     #[tokio::test]
@@ -227,17 +227,17 @@ mod tests {
         let rows = listener
             .query_typed_named(
                 "SELECT $1::int8 AS id, $2::text AS type_name, $3::text AS index_name",
-                &[CachedValue::I64(42), CachedValue::Str("default::Product".to_string()), CachedValue::Null],
+                &[DecodedValue::I64(42), DecodedValue::Str("default::Product".to_string()), DecodedValue::Null],
                 &ExtensionOids::default(),
             )
             .await
             .unwrap();
         assert_eq!(
             rows,
-            vec![CachedValue::Object(vec![
-                ("id".to_string(), CachedValue::I64(42)),
-                ("type_name".to_string(), CachedValue::Str("default::Product".to_string())),
-                ("index_name".to_string(), CachedValue::Null),
+            vec![DecodedValue::Object(vec![
+                ("id".to_string(), DecodedValue::I64(42)),
+                ("type_name".to_string(), DecodedValue::Str("default::Product".to_string())),
+                ("index_name".to_string(), DecodedValue::Null),
             ])]
         );
     }

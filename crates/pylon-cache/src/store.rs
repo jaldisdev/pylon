@@ -34,18 +34,18 @@ use heed::{Database, DatabaseFlags, Env, EnvOpenOptions};
 use rkyv::rancor::Error as RkyvError;
 use sha2::{Digest, Sha256};
 
-use pylon_value::{ArchivedCachedEntry, CachedEntry, CachedValue};
+use pylon_value::{ArchivedCachedEntry, CachedEntry, DecodedValue};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Bump this whenever `CachedValue`'s rkyv binary layout changes in a way
+/// Bump this whenever `DecodedValue`'s rkyv binary layout changes in a way
 /// that isn't safely re-readable under the new layout — adding, removing,
 /// or reordering an enum variant (rkyv discriminants are positional by
 /// default), changing a field's type, etc. `Cache::open` wipes the whole
 /// environment on a version mismatch rather than risk silently misdecoding
 /// bytes written under an older layout.
 ///
-/// This constant exists because of a real incident: `CachedValue::Interval`/
+/// This constant exists because of a real incident: `DecodedValue::Interval`/
 /// `Date`/`Time`/`Timestamp`/`Timestamptz` were inserted *between*
 /// `Decimal` and `Array` (rather than appended at the end), which shifted
 /// every later variant's discriminant — an `Array` entry written by an
@@ -61,7 +61,7 @@ const CACHE_FORMAT_VERSION: &[u8] = b"2";
 /// layer plan's key-simplification note: `compiled.sql` is already a
 /// canonical, whitespace-insensitive form, so hashing it directly (rather
 /// than a separately normalized AST) is both simpler and precise.
-pub fn cache_key(sql: &str, params: &[CachedValue]) -> Result<String> {
+pub fn cache_key(sql: &str, params: &[DecodedValue]) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
     for param in params {
@@ -142,7 +142,7 @@ impl Cache {
         Ok(Some(entry))
     }
 
-    pub fn put(&self, key: &str, rows: Vec<CachedValue>, tags: Vec<String>) -> Result<()> {
+    pub fn put(&self, key: &str, rows: Vec<DecodedValue>, tags: Vec<String>) -> Result<()> {
         let entry = CachedEntry { rows, tags: tags.clone() };
         let bytes = rkyv::to_bytes::<RkyvError>(&entry)?;
 
@@ -217,14 +217,14 @@ mod tests {
 
     #[test]
     fn reopening_with_a_different_format_version_wipes_stale_entries() {
-        // Regression: CachedValue variants inserted mid-enum shift every
+        // Regression: DecodedValue variants inserted mid-enum shift every
         // later variant's rkyv discriminant, so a stale cache directory
         // written under an older layout must never be trusted as-is — it
         // needs to be wiped, not silently misdecoded.
         let dir = tempfile::tempdir().unwrap();
         {
             let cache = Cache::open(dir.path(), 10).unwrap();
-            cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+            cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
             assert!(cache.get("key1").unwrap().is_some());
         }
         // Simulate a cache directory written under a different format
@@ -247,7 +247,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let cache = Cache::open(dir.path(), 10).unwrap();
-            cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+            cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
         }
         let cache = Cache::open(dir.path(), 10).unwrap();
         assert!(cache.get("key1").unwrap().is_some());
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn put_then_get_round_trips() {
         let (_dir, cache) = open_temp();
-        let rows = vec![CachedValue::I64(1), CachedValue::Str("hi".into())];
+        let rows = vec![DecodedValue::I64(1), DecodedValue::Str("hi".into())];
         cache.put("key1", rows.clone(), vec!["public.person".into()]).unwrap();
 
         let entry = cache.get("key1").unwrap().expect("entry present");
@@ -273,9 +273,9 @@ mod tests {
     #[test]
     fn invalidate_evicts_all_entries_sharing_a_tag() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
-        cache.put("key2", vec![CachedValue::I64(2)], vec!["public.person".into(), "public.pet".into()]).unwrap();
-        cache.put("key3", vec![CachedValue::I64(3)], vec!["public.pet".into()]).unwrap();
+        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache.put("key2", vec![DecodedValue::I64(2)], vec!["public.person".into(), "public.pet".into()]).unwrap();
+        cache.put("key3", vec![DecodedValue::I64(3)], vec!["public.pet".into()]).unwrap();
 
         cache.invalidate(&["public.person".to_string()]).unwrap();
 
@@ -287,16 +287,16 @@ mod tests {
     #[test]
     fn invalidate_unknown_tag_is_a_no_op() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
         cache.invalidate(&["public.nonexistent".to_string()]).unwrap();
         assert!(cache.get("key1").unwrap().is_some());
     }
 
     #[test]
     fn cache_key_is_stable_and_sensitive_to_params() {
-        let k1 = cache_key("select 1", &[CachedValue::I64(1)]).unwrap();
-        let k2 = cache_key("select 1", &[CachedValue::I64(1)]).unwrap();
-        let k3 = cache_key("select 1", &[CachedValue::I64(2)]).unwrap();
+        let k1 = cache_key("select 1", &[DecodedValue::I64(1)]).unwrap();
+        let k2 = cache_key("select 1", &[DecodedValue::I64(1)]).unwrap();
+        let k3 = cache_key("select 1", &[DecodedValue::I64(2)]).unwrap();
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
     }
@@ -311,8 +311,8 @@ mod tests {
     #[test]
     fn stat_reports_entry_count_and_nonzero_used_bytes_after_put() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
-        cache.put("key2", vec![CachedValue::I64(2)], vec!["public.pet".into()]).unwrap();
+        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache.put("key2", vec![DecodedValue::I64(2)], vec!["public.pet".into()]).unwrap();
 
         let stats = cache.stat().unwrap();
         assert_eq!(stats.entry_count, 2);
@@ -322,8 +322,8 @@ mod tests {
     #[test]
     fn clear_removes_all_entries_and_tags() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![CachedValue::I64(1)], vec!["public.person".into()]).unwrap();
-        cache.put("key2", vec![CachedValue::I64(2)], vec!["public.pet".into()]).unwrap();
+        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache.put("key2", vec![DecodedValue::I64(2)], vec!["public.pet".into()]).unwrap();
 
         cache.clear().unwrap();
 

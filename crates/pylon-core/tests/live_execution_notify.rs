@@ -169,7 +169,7 @@ async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
     wait_until(|| !received.lock().unwrap().is_empty()).await;
 
     // Cast id -> text inline in the shape so the query hands back a plain
-    // string directly, rather than a raw CachedValue::Uuid([u8; 16]) this
+    // string directly, rather than a raw DecodedValue::Uuid([u8; 16]) this
     // test binary has no dependency available to format back into the
     // dashed textual form the NOTIFY payload itself carries.
     let rows = query::compile(
@@ -183,7 +183,7 @@ async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
     // matching this suite's own convention (see live_execution_triggers.rs's
     // `field(&rows[0], 1)` for its own single-field shapes).
     let inserted_id_text = field(&ids[0], 1);
-    let pylon_value::CachedValue::Str(inserted_id_text) = inserted_id_text else {
+    let pylon_value::DecodedValue::Str(inserted_id_text) = inserted_id_text else {
         panic!("expected str, got {inserted_id_text:?}")
     };
 
@@ -191,9 +191,9 @@ async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
     assert_eq!(got, vec![inserted_id_text.clone()]);
 }
 
-fn field(row: &pylon_value::CachedValue, i: usize) -> &pylon_value::CachedValue {
+fn field(row: &pylon_value::DecodedValue, i: usize) -> &pylon_value::DecodedValue {
     match row {
-        pylon_value::CachedValue::Composite(fields) => fields.get(i).unwrap_or(&pylon_value::CachedValue::Null),
+        pylon_value::DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&pylon_value::DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }

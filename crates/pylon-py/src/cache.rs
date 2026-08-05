@@ -20,7 +20,7 @@
 //! pyo3 bindings over `pylon-cache`.
 //!
 //! Thin glue only: encode/decode between Python's already-asyncpg-decoded
-//! `record["result"]` values and `pylon_cache::CachedValue`, plus a single
+//! `record["result"]` values and `pylon_cache::DecodedValue`, plus a single
 //! process-global `Cache` handle. No shape/type knowledge is needed here —
 //! the cache stores a structural mirror of whatever Python value it was
 //! given and hands back an equivalent one, and the *existing* `_decode()`/

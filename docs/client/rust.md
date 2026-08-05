@@ -29,24 +29,24 @@ Optional: `.cache(path, max_size_mb)` (or `.cache_handle(existing)` to attach to
 | `analyze(pyql, params)` | `Result<String>` — same `EXPLAIN`-based plan the Python client's `analyze()` returns |
 
 ```rust
-use pylon_client::CachedValue;
+let some_id: uuid::Uuid = /* ... */;
 
 let people = client.query("select Person { name, age }", &[]).await?;
 let person = client.query_single(
     "select Person filter .id = <uuid>$id",
-    &[("id", CachedValue::Uuid(some_id))],
+    &[("id", some_id.into())],
 ).await?;
 client.execute(
-    "update Person filter .id = <uuid>$id set { age := .age + 1 }",
-    &[("id", CachedValue::Uuid(some_id))],
+    "update Person filter .id = <uuid>$id set { age := .age + 1, name := $name }",
+    &[("id", some_id.into()), ("name", "Ada".into())],
 ).await?;
 ```
 
-`params` is `&[(&str, CachedValue)]` — named, bound the same way `$name` args work on the Python side (see [Parameters](../pyql/parameters.md)).
+`params` is `&[(&str, DecodedValue)]` — named, bound the same way `$name` args work on the Python side (see [Parameters](../pyql/parameters.md)). The second element of each tuple accepts `.into()` for every native type `DecodedValue` has a `From` impl for — `String`/`&str`, `bool`, `i16`/`i32`/`i64`, `f32`/`f64`, `Vec<u8>`, `uuid::Uuid` — so a call site rarely has to spell out the variant name explicitly. Fall back to the explicit `DecodedValue::Variant(...)` form for anything without one (`Decimal`, `Date`/`Time`/`Timestamp`, `Range`, ...).
 
 ### `Value`/`Object` — the generic result type
 
-Every result decodes into `pylon_client::Value`, a single enum with one variant per shape: `Null`, `Bool`, `Int64`, `Float64`, `Str`, `Bytes`, `Uuid`, `Decimal` (kept as its canonical string form — no single obviously-correct native Rust decimal type to commit this client to), `Duration`/`Date`/`Time`/`Timestamp`/`Timestamptz` (PG-epoch-relative wire representations, matching `pylon_value::CachedValue`'s own), `Range`, `Array`, `Tuple`, `Object`, `Enum { type_name, value }`, `Group` (a `group` statement's result), `VectorSearch`/`FtsSearch` (`{ object, distance }`/`{ object, score }`).
+Every result decodes into `pylon_client::Value`, a single enum with one variant per shape: `Null`, `Bool`, `Int64`, `Float64`, `Str`, `Bytes`, `Uuid`, `Decimal` (kept as its canonical string form — no single obviously-correct native Rust decimal type to commit this client to), `Duration`/`Date`/`Time`/`Timestamp`/`Timestamptz` (PG-epoch-relative wire representations, matching `pylon_value::DecodedValue`'s own), `Range`, `Array`, `Tuple`, `Object`, `Enum { type_name, value }`, `Group` (a `group` statement's result), `VectorSearch`/`FtsSearch` (`{ object, distance }`/`{ object, score }`).
 
 `Value::Object` wraps a field-name-indexed `Object` — a schema object, a free object literal (`select { a := 1 }`), and a named tuple all decode into this same shape:
 
@@ -61,7 +61,7 @@ person.type_name();   // Some("default::Person") — None for a free object/unre
 
 ```rust
 client.transaction(pylon_client::Isolation::Serializable, |tx| Box::pin(async move {
-    tx.execute("insert Person { name := <str>$name }", &[("name", CachedValue::Str("Bob".into()))]).await
+    tx.execute("insert Person { name := <str>$name }", &[("name", "Bob".into())]).await
 })).await?;
 ```
 

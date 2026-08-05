@@ -47,7 +47,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, SignalEntry, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use std::collections::HashMap;
 
 /// A `Widget { id, name }` type plus a self-referential `related` multilink
@@ -257,10 +257,10 @@ async fn rename_detected_and_applied_survives_real_data() {
         "renamed row should still be there with its original data, got {rows:?}"
     );
     match &rows[0] {
-        CachedValue::Composite(fields) => {
+        DecodedValue::Composite(fields) => {
             assert_eq!(
                 fields.get(1),
-                Some(&CachedValue::Str("keep-me".to_string()))
+                Some(&DecodedValue::Str("keep-me".to_string()))
             );
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
@@ -354,8 +354,8 @@ async fn property_type_change_casts_existing_data() {
         "existing row should have survived the cast with the correct value, got {rows:?}"
     );
     match &rows[0] {
-        CachedValue::Composite(fields) => {
-            assert_eq!(fields.get(1), Some(&CachedValue::I64(42)));
+        DecodedValue::Composite(fields) => {
+            assert_eq!(fields.get(1), Some(&DecodedValue::I64(42)));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }

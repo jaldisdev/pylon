@@ -38,7 +38,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 use std::collections::HashMap;
 
 fn ty(
@@ -88,16 +88,16 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     schema: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
@@ -151,7 +151,7 @@ async fn insert_writes_to_another_type() {
         1,
         "trigger should have written exactly one Log row, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("gadget".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("gadget".to_string()));
 }
 
 #[tokio::test]
@@ -200,7 +200,7 @@ async fn delete_reads_old_row() {
         1,
         "trigger should have captured the pre-delete name, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("doomed".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("doomed".to_string()));
 }
 
 #[tokio::test]
@@ -249,8 +249,8 @@ async fn update_reads_both_old_and_new() {
         1,
         "trigger should have captured both old and new names, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("before".to_string()));
-    assert_eq!(field(&rows[0], 2), &CachedValue::Str("after".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("before".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("after".to_string()));
 }
 
 #[tokio::test]
@@ -414,7 +414,7 @@ async fn trigger_updates_a_linked_row_of_another_type() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
-        &CachedValue::I64(99),
+        &DecodedValue::I64(99),
         "trigger should have updated the linked Purchase's total"
     );
 }

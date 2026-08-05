@@ -52,7 +52,7 @@ use pylon_core::schema::{
     TypeDescriptor,
 };
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
@@ -100,7 +100,7 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -111,17 +111,17 @@ async fn rows_with_params(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-    params: &[CachedValue],
-) -> Vec<CachedValue> {
+    params: &[DecodedValue],
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, params, &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
@@ -165,10 +165,10 @@ async fn scalar_function_computes_correctly() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Decimal(s) = &shape[0] else {
+    let DecodedValue::Decimal(s) = &shape[0] else {
         panic!("expected Decimal, got {:?}", shape[0])
     };
     assert_eq!(s.parse::<f64>().unwrap(), 75.0, "got {s}");
@@ -217,7 +217,7 @@ async fn object_set_returning_function_filters_correctly() {
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::adults() {{ name }}")).await;
     assert_eq!(rows.len(), 1, "only the adult should match, got {rows:?}");
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -273,7 +273,7 @@ async fn function_composes_inside_a_larger_query() {
         1,
         "only Alice (age 30 -> double 60) should match, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &CachedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -311,16 +311,16 @@ async fn overload_resolution_by_argument_count() {
     bootstrap(&pool, &sd).await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::greet('Alice')")).await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    assert_eq!(shape[0], CachedValue::Str("Hello, Alice".to_string()));
+    assert_eq!(shape[0], DecodedValue::Str("Hello, Alice".to_string()));
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::greet('Hi', 'Bob')")).await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    assert_eq!(shape[0], CachedValue::Str("Hi, Bob".to_string()));
+    assert_eq!(shape[0], DecodedValue::Str("Hi, Bob".to_string()));
 }
 
 #[tokio::test]
@@ -356,15 +356,15 @@ async fn function_call_argument_gets_cast_to_the_declared_param_type() {
         &sd,
         &format!("select {module}::discount_price($0, $1)"),
         &[
-            CachedValue::Decimal("200".to_string()),
-            CachedValue::Decimal("50".to_string()),
+            DecodedValue::Decimal("200".to_string()),
+            DecodedValue::Decimal("50".to_string()),
         ],
     )
     .await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Decimal(s) = &shape[0] else {
+    let DecodedValue::Decimal(s) = &shape[0] else {
         panic!("expected Decimal, got {:?}", shape[0])
     };
     assert_eq!(s.parse::<f64>().unwrap(), 100.0, "got {s}");
@@ -399,13 +399,13 @@ async fn function_call_mixes_a_bound_parameter_and_a_literal_argument() {
         &pool,
         &sd,
         &format!("select {module}::discount_price($0, 25)"),
-        &[CachedValue::Decimal("100".to_string())],
+        &[DecodedValue::Decimal("100".to_string())],
     )
     .await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Decimal(s) = &shape[0] else {
+    let DecodedValue::Decimal(s) = &shape[0] else {
         panic!("expected Decimal, got {:?}", shape[0])
     };
     assert_eq!(s.parse::<f64>().unwrap(), 75.0, "got {s}");
@@ -442,8 +442,8 @@ async fn function_call_composed_as_an_argument_to_another_function_call() {
         &format!("select {module}::double({module}::double(3))"),
     )
     .await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    assert_eq!(shape[0], CachedValue::I64(12));
+    assert_eq!(shape[0], DecodedValue::I64(12));
 }

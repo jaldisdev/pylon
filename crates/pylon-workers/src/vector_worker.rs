@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use pylon_core as core;
 use pylon_pgcon::{ExtensionOids, PgListener};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
 use crate::index_worker::{BatchProcessor, ClaimedRow};
@@ -92,18 +92,18 @@ struct FetchedRow {
     source_text: String,
 }
 
-fn decode_fetched_row(value: &CachedValue) -> Result<FetchedRow> {
-    let CachedValue::Object(fields) = value else {
+fn decode_fetched_row(value: &DecodedValue) -> Result<FetchedRow> {
+    let DecodedValue::Object(fields) = value else {
         return Err(Error::Decode("compile_index_fetch: expected a named-column row".into()));
     };
     let field = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
     let id = match field("id") {
-        Some(CachedValue::Uuid(b)) => *b,
+        Some(DecodedValue::Uuid(b)) => *b,
         _ => return Err(Error::Decode("compile_index_fetch: missing/invalid 'id'".into())),
     };
     let source_text = match field("source_text") {
-        Some(CachedValue::Str(s)) => s.clone(),
-        Some(CachedValue::Null) | None => String::new(),
+        Some(DecodedValue::Str(s)) => s.clone(),
+        Some(DecodedValue::Null) | None => String::new(),
         _ => return Err(Error::Decode("compile_index_fetch: invalid 'source_text'".into())),
     };
     Ok(FetchedRow { id, source_text })
@@ -131,9 +131,9 @@ impl BatchProcessor for VectorIndexWorker {
                 continue;
             };
 
-            let ids: Vec<CachedValue> = group_rows.iter().map(|r| CachedValue::Uuid(r.object_id)).collect();
+            let ids: Vec<DecodedValue> = group_rows.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
             let raw_records = listener
-                .query_typed_named(fetch_sql, &[CachedValue::Array(ids)], &ExtensionOids::default())
+                .query_typed_named(fetch_sql, &[DecodedValue::Array(ids)], &ExtensionOids::default())
                 .await?;
             if raw_records.is_empty() {
                 continue;
@@ -161,8 +161,8 @@ impl BatchProcessor for VectorIndexWorker {
                 // instead, since that was the only thing asyncpg's Python
                 // API could bind for a type it had no codec for; Rust
                 // doesn't have that constraint.
-                let cached_vec = CachedValue::Array(vec.iter().map(|f| CachedValue::F64(*f as f64)).collect());
-                listener.execute_typed(&write_sql, &[CachedValue::Uuid(record.id), cached_vec]).await?;
+                let cached_vec = DecodedValue::Array(vec.iter().map(|f| DecodedValue::F64(*f as f64)).collect());
+                listener.execute_typed(&write_sql, &[DecodedValue::Uuid(record.id), cached_vec]).await?;
             }
         }
         Ok(())

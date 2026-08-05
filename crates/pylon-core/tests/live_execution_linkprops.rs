@@ -45,7 +45,7 @@ use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
@@ -122,23 +122,23 @@ async fn rows_of(
     pool: &pylon_pgcon::PgPool,
     sd: &SchemaDescriptor,
     pyql: &str,
-) -> Vec<CachedValue> {
+) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .unwrap()
 }
 
-fn field(row: &CachedValue, i: usize) -> &CachedValue {
+fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
     match row {
-        CachedValue::Composite(fields) => fields.get(i).unwrap_or(&CachedValue::Null),
+        DecodedValue::Composite(fields) => fields.get(i).unwrap_or(&DecodedValue::Null),
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
 
-fn as_f64(v: &CachedValue) -> f64 {
+fn as_f64(v: &DecodedValue) -> f64 {
     match v {
-        CachedValue::F64(n) => *n,
+        DecodedValue::F64(n) => *n,
         other => panic!("expected a float, got {other:?}"),
     }
 }
@@ -183,16 +183,16 @@ async fn insert_with_link_property_round_trips() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[1] else {
         panic!("expected an Array for tags, got {:?}", shape[1])
     };
     assert_eq!(tags.len(), 1);
     assert_eq!(
         field(&tags[0], 1),
-        &CachedValue::Str("electronics".to_string())
+        &DecodedValue::Str("electronics".to_string())
     );
     assert!(
         (as_f64(field(&tags[0], 2)) - 1.5).abs() < f64::EPSILON,
@@ -253,10 +253,10 @@ async fn append_link_property_upserts_on_reappend() {
         &format!("select {module}::Product {{ tags: {{ name, @weight }} }}"),
     )
     .await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[1] else {
         panic!("expected an Array for tags")
     };
     assert_eq!(
@@ -321,20 +321,20 @@ async fn append_union_lands_distinct_values_on_correct_targets() {
         &format!("select {module}::Product {{ tags: {{ name, @weight }} order by .name }}"),
     )
     .await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[1] else {
         panic!("expected an Array for tags")
     };
     assert_eq!(tags.len(), 2);
-    assert_eq!(field(&tags[0], 1), &CachedValue::Str("a".to_string()));
+    assert_eq!(field(&tags[0], 1), &DecodedValue::Str("a".to_string()));
     assert!(
         (as_f64(field(&tags[0], 2)) - 1.0).abs() < f64::EPSILON,
         "tag 'a' should carry weight 1.0, got {:?}",
         tags[0]
     );
-    assert_eq!(field(&tags[1], 1), &CachedValue::Str("b".to_string()));
+    assert_eq!(field(&tags[1], 1), &DecodedValue::Str("b".to_string()));
     assert!(
         (as_f64(field(&tags[1], 2)) - 2.0).abs() < f64::EPSILON,
         "tag 'b' should carry weight 2.0, got {:?}",
@@ -380,10 +380,10 @@ async fn remove_link_clears_the_junction_row() {
         &format!("select {module}::Product {{ tags: {{ name }} }}"),
     )
     .await;
-    let CachedValue::Composite(shape) = &rows[0] else {
+    let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let CachedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[1] else {
         panic!("expected an Array for tags")
     };
     assert!(

@@ -33,7 +33,7 @@
 
 use crate::diff::{DbColumn, DbDomain, DbEnum, DbForeignKey, DbIndex, DbSequence, DbState, DbTable, DbView, DbFunction};
 use pylon_pgcon::{ExtensionOids, PgPool};
-use pylon_value::CachedValue;
+use pylon_value::DecodedValue;
 
 pub type Result<T> = std::result::Result<T, pylon_pgcon::Error>;
 
@@ -48,8 +48,8 @@ fn pg_to_module(schema: &str) -> String {
     if schema == "public" { "default".to_string() } else { schema.to_string() }
 }
 
-fn exclude_param(excludes: &[&str]) -> CachedValue {
-    CachedValue::Array(excludes.iter().map(|s| CachedValue::Str((*s).to_string())).collect())
+fn exclude_param(excludes: &[&str]) -> DecodedValue {
+    DecodedValue::Array(excludes.iter().map(|s| DecodedValue::Str((*s).to_string())).collect())
 }
 
 fn ddl_hash(text: &str) -> String {
@@ -57,38 +57,38 @@ fn ddl_hash(text: &str) -> String {
     hex::encode(&Sha256::digest(text.as_bytes())[..8])
 }
 
-async fn query(pool: &PgPool, sql: &str, params: &[CachedValue]) -> Result<Vec<CachedValue>> {
+async fn query(pool: &PgPool, sql: &str, params: &[DecodedValue]) -> Result<Vec<DecodedValue>> {
     pool.query_typed(sql, params, &ExtensionOids::default()).await
 }
 
-/// Destructures a `CachedValue::Composite`'s fields into a fixed-size
+/// Destructures a `DecodedValue::Composite`'s fields into a fixed-size
 /// array, or `None` if the row's shape doesn't match — defensive, should
 /// never actually happen for these hand-written queries.
-fn fields<const N: usize>(row: CachedValue) -> Option<[CachedValue; N]> {
+fn fields<const N: usize>(row: DecodedValue) -> Option<[DecodedValue; N]> {
     match row {
-        CachedValue::Composite(fields) => fields.try_into().ok(),
+        DecodedValue::Composite(fields) => fields.try_into().ok(),
         _ => None,
     }
 }
 
-fn as_str(v: CachedValue) -> Option<String> {
+fn as_str(v: DecodedValue) -> Option<String> {
     match v {
-        CachedValue::Str(s) => Some(s),
+        DecodedValue::Str(s) => Some(s),
         _ => None,
     }
 }
 
-fn as_bool(v: CachedValue) -> Option<bool> {
+fn as_bool(v: DecodedValue) -> Option<bool> {
     match v {
-        CachedValue::Bool(b) => Some(b),
+        DecodedValue::Bool(b) => Some(b),
         _ => None,
     }
 }
 
-fn as_opt_str(v: CachedValue) -> Option<String> {
+fn as_opt_str(v: DecodedValue) -> Option<String> {
     match v {
-        CachedValue::Null => None,
-        CachedValue::Str(s) => Some(s),
+        DecodedValue::Null => None,
+        DecodedValue::Str(s) => Some(s),
         _ => None,
     }
 }
@@ -278,7 +278,7 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
         let module = pg_to_module(&pg_schema);
 
         let mut columns = Vec::new();
-        for col in query(pool, COLUMNS_SQL, &[CachedValue::Str(pg_schema.clone()), CachedValue::Str(name.clone())]).await? {
+        for col in query(pool, COLUMNS_SQL, &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())]).await? {
             let Some([attname, pg_type, nullable, is_generated, column_default]) = fields::<5>(col) else { continue };
             let (Some(attname), Some(pg_type), Some(nullable), Some(is_generated)) =
                 (as_str(attname), as_str(pg_type), as_bool(nullable), as_bool(is_generated))
@@ -289,7 +289,7 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
         }
 
         let mut foreign_keys = Vec::new();
-        for fk in query(pool, FKS_SQL, &[CachedValue::Str(pg_schema.clone()), CachedValue::Str(name.clone())]).await? {
+        for fk in query(pool, FKS_SQL, &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())]).await? {
             let Some([conname, attname, ref_schema, ref_table]) = fields::<4>(fk) else { continue };
             let (Some(conname), Some(attname), Some(ref_schema), Some(ref_table)) =
                 (as_str(conname), as_str(attname), as_str(ref_schema), as_str(ref_table))
@@ -305,7 +305,7 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
         }
 
         let mut indexes = Vec::new();
-        for idx in query(pool, INDEXES_SQL, &[CachedValue::Str(pg_schema.clone()), CachedValue::Str(name.clone())]).await? {
+        for idx in query(pool, INDEXES_SQL, &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())]).await? {
             let Some([relname, is_unique, amname]) = fields::<3>(idx) else { continue };
             let (Some(relname), Some(is_unique), Some(amname)) = (as_str(relname), as_bool(is_unique), as_str(amname)) else {
                 continue;
