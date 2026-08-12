@@ -43,12 +43,12 @@ class OpenSearchClient:
         auth: tuple[str, str] | None = None,
         timeout: float = 10.0,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
+        self._base_url = base_url.rstrip('/')
         self._auth = auth
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
 
-    async def __aenter__(self) -> "OpenSearchClient":
+    async def __aenter__(self) -> OpenSearchClient:
         self._client = httpx.AsyncClient(
             auth=self._auth,
             timeout=self._timeout,
@@ -62,7 +62,7 @@ class OpenSearchClient:
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            raise RuntimeError("OpenSearchClient must be used as an async context manager")
+            raise RuntimeError('OpenSearchClient must be used as an async context manager')
         return self._client
 
     async def search(
@@ -75,21 +75,21 @@ class OpenSearchClient:
     ) -> list[tuple[str, float]]:
         """Full-text search; returns ``[(id, score)]`` ordered by relevance."""
         body: dict[str, Any] = {
-            "query": {
-                "multi_match": {
-                    "query": query_text,
-                    "fields": fields or ["*"],
-                    "type": "best_fields",
+            'query': {
+                'multi_match': {
+                    'query': query_text,
+                    'fields': fields or ['*'],
+                    'type': 'best_fields',
                 }
             },
-            "_source": False,
-            "size": size,
+            '_source': False,
+            'size': size,
         }
-        url = f"{self._base_url}/{index}/_search"
+        url = f'{self._base_url}/{index}/_search'
         resp = await self._http().post(url, json=body)
         resp.raise_for_status()
-        hits = resp.json()["hits"]["hits"]
-        return [(h["_id"], h["_score"]) for h in hits]
+        hits = resp.json()['hits']['hits']
+        return [(h['_id'], h['_score']) for h in hits]
 
     async def index_document(
         self,
@@ -98,13 +98,13 @@ class OpenSearchClient:
         fields: dict[str, Any],
     ) -> None:
         """Upsert a document into the OpenSearch index."""
-        url = f"{self._base_url}/{index}/_doc/{doc_id}"
+        url = f'{self._base_url}/{index}/_doc/{doc_id}'
         resp = await self._http().put(url, json=fields)
         resp.raise_for_status()
 
     async def delete_document(self, index: str, doc_id: str) -> None:
         """Remove a document from the OpenSearch index (no-op if not found)."""
-        url = f"{self._base_url}/{index}/_doc/{doc_id}"
+        url = f'{self._base_url}/{index}/_doc/{doc_id}'
         resp = await self._http().delete(url)
         if resp.status_code != 404:
             resp.raise_for_status()
@@ -115,13 +115,13 @@ class OpenSearchClient:
         mappings: dict[str, Any] | None = None,
     ) -> None:
         """Create the OpenSearch index if it does not already exist."""
-        url = f"{self._base_url}/{index}"
+        url = f'{self._base_url}/{index}'
         body: dict[str, Any] = {}
         if mappings:
-            body["mappings"] = mappings
+            body['mappings'] = mappings
         resp = await self._http().put(url, json=body)
         if resp.status_code == 400:
             data = resp.json()
-            if "resource_already_exists_exception" in data.get("error", {}).get("type", ""):
+            if 'resource_already_exists_exception' in data.get('error', {}).get('type', ''):
                 return
         resp.raise_for_status()

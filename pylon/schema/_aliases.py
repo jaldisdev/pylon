@@ -25,17 +25,15 @@ from typing import Any
 
 
 class AliasAnnotation:
-    __slots__ = ("expr",)
+    __slots__ = ('expr',)
 
     def __init__(self, expr: str) -> None:
         if not isinstance(expr, str):
-            raise TypeError(
-                f"Alias expression must be a string literal, got {type(expr).__name__!r}"
-            )
+            raise TypeError(f'Alias expression must be a string literal, got {type(expr).__name__!r}')
         self.expr = expr
 
     def __repr__(self) -> str:
-        return f"AliasAnnotation({self.expr!r})"
+        return f'AliasAnnotation({self.expr!r})'
 
 
 class Alias:
@@ -61,15 +59,15 @@ class AliasDescriptor:
     expr: str
 
     def __repr__(self) -> str:
-        return f"AliasDescriptor({self.name!r}, module={self.module!r}, expr={self.expr!r})"
+        return f'AliasDescriptor({self.name!r}, module={self.module!r}, expr={self.expr!r})'
 
 
 def _infer_module_name(module: Any) -> str:
-    override = getattr(module, "__pylon_module__", None)
+    override = getattr(module, '__pylon_module__', None)
     if isinstance(override, str):
         return override
-    module_path = getattr(module, "__name__", "default")
-    return module_path.rpartition(".")[-1] or module_path
+    module_path = getattr(module, '__name__', 'default')
+    return module_path.rpartition('.')[-1] or module_path
 
 
 def collect_module_aliases(module: Any) -> list[AliasDescriptor]:
@@ -77,12 +75,12 @@ def collect_module_aliases(module: Any) -> list[AliasDescriptor]:
     try:
         hints = typing.get_type_hints(module)
     except Exception:
-        hints = dict(getattr(module, "__annotations__", {}))
+        hints = dict(getattr(module, '__annotations__', {}))
 
     module_name = _infer_module_name(module)
     result: list[AliasDescriptor] = []
     for name, annotation in hints.items():
-        if name.startswith("_"):
+        if name.startswith('_'):
             continue
         if not isinstance(annotation, AliasAnnotation):
             continue

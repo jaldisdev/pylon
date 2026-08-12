@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-NOTIFY_CHANNEL = "pylon_cache_invalidate"
+NOTIFY_CHANNEL = 'pylon_cache_invalidate'
 
 _enabled = False
 
@@ -54,8 +54,8 @@ def _resolve_set_name_for_tag(tag: str) -> str | None:
     from pylon.query import _get_schema
 
     for t in _get_schema().types:
-        pg_schema = "public" if t.module == "default" else t.module
-        if f"{pg_schema}.{t.table}" == tag:
+        pg_schema = 'public' if t.module == 'default' else t.module
+        if f'{pg_schema}.{t.table}' == tag:
             return t.name
     return None
 
@@ -82,7 +82,7 @@ def _cache_key(compiled: CompiledQuery, params: list[Any], *, kind: str) -> str:
     `*_json` methods) never collide on the same key."""
     from pylon._core import cache_key
 
-    return cache_key(f"{kind}\x00{compiled.sql}", list(params))
+    return cache_key(f'{kind}\x00{compiled.sql}', list(params))
 
 
 def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list[Any] | None:
@@ -96,11 +96,11 @@ def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list
         return None
     from pylon._core import cache_get
 
-    key = _cache_key(compiled, params, kind="rows")
+    key = _cache_key(compiled, params, kind='rows')
     rows = cache_get(key)
     if rows is None:
         return None
-    return [{"result": row} for row in rows]
+    return [{'result': row} for row in rows]
 
 
 def put(compiled: CompiledQuery, params: list[Any], records: list[Any], config: CacheConfig) -> None:
@@ -114,14 +114,12 @@ def put(compiled: CompiledQuery, params: list[Any], records: list[Any], config: 
         return
     from pylon._core import cache_put
 
-    key = _cache_key(compiled, params, kind="rows")
-    rows = [record["result"] for record in records]
+    key = _cache_key(compiled, params, kind='rows')
+    rows = [record['result'] for record in records]
     cache_put(key, list(compiled.tags), rows)
 
 
-def get_json(
-    compiled: CompiledQuery, params: list[Any], config: CacheConfig, *, kind: str
-) -> tuple[bool, str | None]:
+def get_json(compiled: CompiledQuery, params: list[Any], config: CacheConfig, *, kind: str) -> tuple[bool, str | None]:
     """Returns ``(hit, value)`` for the JSON-string-returning query methods
     (`query_json`/`query_single_json`). ``hit`` distinguishes a genuine
     cache hit from a miss independently of ``value``, since
@@ -142,9 +140,7 @@ def get_json(
     return True, (rows[0] if rows else None)
 
 
-def put_json(
-    compiled: CompiledQuery, params: list[Any], value: str | None, config: CacheConfig, *, kind: str
-) -> None:
+def put_json(compiled: CompiledQuery, params: list[Any], value: str | None, config: CacheConfig, *, kind: str) -> None:
     """Counterpart to `get_json` — stores *value* (or nothing, for a
     legitimately-empty `query_single_json` result) under a key namespaced
     by *kind*. No-op if caching is disabled or the query has no tags."""
@@ -180,5 +176,12 @@ def clear() -> None:
 
 
 __all__ = [
-    "NOTIFY_CHANNEL", "init", "get", "put", "get_json", "put_json", "stat", "clear",
+    'NOTIFY_CHANNEL',
+    'clear',
+    'get',
+    'get_json',
+    'init',
+    'put',
+    'put_json',
+    'stat',
 ]

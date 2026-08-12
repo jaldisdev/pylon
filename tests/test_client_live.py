@@ -46,16 +46,17 @@ import pytest
 
 import pylon.schema as pylon
 from pylon.schema import Property, Readonly
-from pylon.schema._registry import clear as clear_registry, snapshot
+from pylon.schema._registry import clear as clear_registry
+from pylon.schema._registry import snapshot
 from pylon.schema._walker import walk
 
 pytestmark = pytest.mark.live_db
 
 
 def _dsn() -> str:
-    dsn = os.environ.get("PYLON_PGCON_TEST_DSN")
+    dsn = os.environ.get('PYLON_PGCON_TEST_DSN')
     if not dsn:
-        raise RuntimeError("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        raise RuntimeError('PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests')
     return dsn
 
 
@@ -65,18 +66,19 @@ def _build_schema(types, enums, scalars, channels=None):
 
 def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, unique_module):
     from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
     from pylon.exceptions import QueryError
     from pylon.query import _set_schema
 
-    module = unique_module("live_readonly_gap")
+    module = unique_module('live_readonly_gap')
     cfg = Config(database=DatabaseConfig(dsn=_dsn()))
 
     async def run():
         clear_registry()
 
-        @pylon.type(module=module, name="Widget")
+        @pylon.type(module=module, name='Widget')
         class WidgetV1:
             name: str
 
@@ -98,7 +100,7 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
         # migration snapshot (no `migration apply` has run against this).
         clear_registry()
 
-        @pylon.type(module=module, name="Widget")
+        @pylon.type(module=module, name='Widget')
         class WidgetV2:
             name: Property[str, Readonly]
 
@@ -128,7 +130,7 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
         # the same update must be rejected.
         client3 = Client(cfg)
         await client3.ensure_connected()
-        with pytest.raises(QueryError, match="read-only"):
+        with pytest.raises(QueryError, match='read-only'):
             await client3.execute(f"update {module}::Widget set {{ name := 'fourth' }}")
         await client3.aclose()
 
@@ -137,7 +139,7 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
     asyncio.run(run())
 
 
-async def _first_payload(gen, trigger: "asyncio.Future | None" = None, *, timeout: float = 10.0):
+async def _first_payload(gen, trigger: asyncio.Future | None = None, *, timeout: float = 10.0):
     """Start consuming *gen*, run *trigger* (if given) once the listener has
     had a moment to register, and return the first yielded payload.
 
@@ -172,23 +174,24 @@ async def _first_payload(gen, trigger: "asyncio.Future | None" = None, *, timeou
 
 def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
     from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
     from pylon.schema._channels import Channel, collect_module_channels
     from pylon.schema._triggers import On, Timing, Trigger
 
-    module = unique_module("live_listen_scalar")
+    module = unique_module('live_listen_scalar')
     cfg = Config(database=DatabaseConfig(dsn=_dsn()))
 
     async def run():
         clear_registry()
 
-        @pylon.type(module=module, name="Widget")
+        @pylon.type(module=module, name='Widget')
         class Widget:
             name: str
-            Trigger(on=On.Insert, timing=Timing.After, handler="select notify(Pings, __new__.name)")
+            Trigger(on=On.Insert, timing=Timing.After, handler='select notify(Pings, __new__.name)')
 
-        channels_module = _types.ModuleType("live_listen_scalar_channels")
+        channels_module = _types.ModuleType('live_listen_scalar_channels')
         channels_module.__pylon_module__ = module
         channels_module.Pings = Channel(str)
         channels = collect_module_channels(channels_module)
@@ -202,10 +205,10 @@ def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
         await client.ensure_connected()
 
         payload = await _first_payload(
-            client.listen("Pings"),
+            client.listen('Pings'),
             client.execute(f"insert {module}::Widget {{ name := 'gadget' }}"),
         )
-        assert payload == "gadget"
+        assert payload == 'gadget'
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
@@ -217,23 +220,24 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
     import uuid
 
     from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
     from pylon.schema._channels import Channel, collect_module_channels
     from pylon.schema._triggers import On, Timing, Trigger
 
-    module = unique_module("live_listen_type")
+    module = unique_module('live_listen_type')
     cfg = Config(database=DatabaseConfig(dsn=_dsn()))
 
     async def run():
         clear_registry()
 
-        @pylon.type(module=module, name="Widget")
+        @pylon.type(module=module, name='Widget')
         class Widget:
             name: str
-            Trigger(on=On.Insert, timing=Timing.After, handler="select notify(WidgetUpdates, __new__)")
+            Trigger(on=On.Insert, timing=Timing.After, handler='select notify(WidgetUpdates, __new__)')
 
-        channels_module = _types.ModuleType("live_listen_type_channels")
+        channels_module = _types.ModuleType('live_listen_type_channels')
         channels_module.__pylon_module__ = module
         channels_module.WidgetUpdates = Channel(Widget)
         channels = collect_module_channels(channels_module)
@@ -247,7 +251,7 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
         await client.ensure_connected()
 
         payload = await _first_payload(
-            client.listen("WidgetUpdates"),
+            client.listen('WidgetUpdates'),
             client.execute(f"insert {module}::Widget {{ name := 'gadget' }}"),
         )
         assert isinstance(payload, uuid.UUID)
@@ -263,29 +267,30 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
 
 def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
     from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
     from pylon.datatypes import Object as PylonObject
     from pylon.schema._channels import Channel, collect_module_channels
     from pylon.schema._triggers import On, Timing, Trigger
 
-    module = unique_module("live_listen_object")
+    module = unique_module('live_listen_object')
     cfg = Config(database=DatabaseConfig(dsn=_dsn()))
 
     async def run():
         clear_registry()
 
-        @pylon.type(module=module, name="Widget")
+        @pylon.type(module=module, name='Widget')
         class Widget:
             name: str
             score: float
             Trigger(
                 on=On.Insert,
                 timing=Timing.After,
-                handler="select notify(WidgetReady, { name := __new__.name, score := __new__.score })",
+                handler='select notify(WidgetReady, { name := __new__.name, score := __new__.score })',
             )
 
-        channels_module = _types.ModuleType("live_listen_object_channels")
+        channels_module = _types.ModuleType('live_listen_object_channels')
         channels_module.__pylon_module__ = module
         channels_module.WidgetReady = Channel(PylonObject(name=str, score=float))
         channels = collect_module_channels(channels_module)
@@ -299,11 +304,11 @@ def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
         await client.ensure_connected()
 
         payload = await _first_payload(
-            client.listen("WidgetReady"),
+            client.listen('WidgetReady'),
             client.execute(f"insert {module}::Widget {{ name := 'gadget', score := 0.75 }}"),
         )
         assert isinstance(payload, PylonObject)
-        assert payload.name == "gadget"
+        assert payload.name == 'gadget'
         assert payload.score == 0.75
 
         await client.aclose()
@@ -314,24 +319,25 @@ def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
 
 def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
     from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
     from pylon.exceptions import QueryError
     from pylon.schema._channels import Channel, collect_module_channels, wire_name_for_channel
 
-    module = unique_module("live_listen_malformed")
+    module = unique_module('live_listen_malformed')
     cfg = Config(database=DatabaseConfig(dsn=_dsn()))
 
     async def run():
         clear_registry()
 
-        @pylon.type(module=module, name="Widget")
+        @pylon.type(module=module, name='Widget')
         class Widget:
             name: str
 
-        channels_module = _types.ModuleType("live_listen_malformed_channels")
+        channels_module = _types.ModuleType('live_listen_malformed_channels')
         channels_module.__pylon_module__ = module
-        channels_module.Ids = Channel(__import__("uuid").UUID)
+        channels_module.Ids = Channel(__import__('uuid').UUID)
         channels = collect_module_channels(channels_module)
         wire_name = wire_name_for_channel(channels[0])
 
@@ -358,10 +364,10 @@ def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
         # outright instead of failing the test.
         last_timeout: asyncio.TimeoutError | None = None
         with pytest.raises(QueryError, match="doesn't match its declared shape"):
-            for attempt in range(3):
+            for _attempt in range(3):
                 try:
-                    await _first_payload(client.listen("Ids"), send_bad_payload())
-                except asyncio.TimeoutError as exc:
+                    await _first_payload(client.listen('Ids'), send_bad_payload())
+                except TimeoutError as exc:
                     last_timeout = exc
                     continue
                 else:

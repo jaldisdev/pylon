@@ -17,7 +17,7 @@
 # limitations under the License.
 #
 
-from .opensearch import OpenSearchClient
 from .meilisearch import MeilisearchClient
+from .opensearch import OpenSearchClient
 
-__all__ = ["OpenSearchClient", "MeilisearchClient"]
+__all__ = ['MeilisearchClient', 'OpenSearchClient']

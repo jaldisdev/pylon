@@ -17,13 +17,14 @@
 # limitations under the License.
 #
 
+import contextlib
 import threading
 
 _local = threading.local()
 
 
 def _list() -> list[object]:
-    if not hasattr(_local, "items"):
+    if not hasattr(_local, 'items'):
         _local.items = []
     return _local.items
 
@@ -35,10 +36,8 @@ def register(expr: object) -> None:
 
 def unregister(expr: object) -> None:
     """Remove expr from the pending list; no-op if not present."""
-    try:
+    with contextlib.suppress(ValueError):
         _list().remove(expr)
-    except ValueError:
-        pass
 
 
 def drain() -> list[object]:

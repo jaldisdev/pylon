@@ -102,6 +102,7 @@ class Bytes(_PylonScalar):
 
 class Sequence(_PylonScalar):
     """Marker for auto-incrementing sequence scalars (backed by a PostgreSQL SEQUENCE + DOMAIN)."""
+
     pass
 
 
@@ -121,23 +122,23 @@ SHORTHAND_MAP: dict[type, type[_PylonScalar]] = {
 
 # Pylon scalar → PostgreSQL type name; consumed by the DDL generator.
 PG_TYPE_MAP: dict[type[_PylonScalar], str] = {
-    Str: "text",
-    Int16: "int2",
-    Int32: "int4",
-    Int64: "int8",
-    Float32: "float4",
-    Float64: "float8",
-    Decimal: "numeric",
-    Bool: "boolean",
-    DateTime: "timestamptz",
-    LocalDateTime: "timestamp",
-    LocalDate: "date",
-    LocalTime: "time",
-    Duration: "interval",
-    UUID: "uuid",
-    JSON: "jsonb",
-    Bytes: "bytea",
-    Sequence: "int8",
+    Str: 'text',
+    Int16: 'int2',
+    Int32: 'int4',
+    Int64: 'int8',
+    Float32: 'float4',
+    Float64: 'float8',
+    Decimal: 'numeric',
+    Bool: 'boolean',
+    DateTime: 'timestamptz',
+    LocalDateTime: 'timestamp',
+    LocalDate: 'date',
+    LocalTime: 'time',
+    Duration: 'interval',
+    UUID: 'uuid',
+    JSON: 'jsonb',
+    Bytes: 'bytea',
+    Sequence: 'int8',
 }
 
 
@@ -227,24 +228,24 @@ def scalar(
             def to_db(value: Email) -> str: ...
     """
     if constraints or name is not None:
-        caller_module = module or sys._getframe(1).f_globals.get("__name__", "default")
+        caller_module = module or sys._getframe(1).f_globals.get('__name__', 'default')
         cls = type(
-            name or "_AnonymousScalar",
+            name or '_AnonymousScalar',
             (Scalar,),
             {
-                "__pylon_base__": base_type,
-                "__pylon_constraints__": constraints,
-                "__module__": caller_module,
+                '__pylon_base__': base_type,
+                '__pylon_constraints__': constraints,
+                '__module__': caller_module,
             },
         )
         if name is not None:
             defining = sys.modules.get(caller_module)
-            override = getattr(defining, "__pylon_module__", None) if defining else None
+            override = getattr(defining, '__pylon_module__', None) if defining else None
             cls.__pylon_module__ = (
-                override if isinstance(override, str)
-                else (caller_module or "default").rpartition(".")[-1] or "default"
+                override if isinstance(override, str) else (caller_module or 'default').rpartition('.')[-1] or 'default'
             )
             from . import _registry
+
             _registry.register_scalar(cls)
         return cls
 
@@ -252,6 +253,7 @@ def scalar(
         cls.__pylon_base__ = base_type
         cls.__pylon_constraints__ = ()
         from . import _registry
+
         _registry.register_scalar(cls)
         return cls
 

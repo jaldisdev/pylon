@@ -30,30 +30,30 @@ class _PointerConstraint:
 
 
 class _NowType:
-    _inst: "_NowType | None" = None
+    _inst: _NowType | None = None
 
-    def __new__(cls) -> "_NowType":
+    def __new__(cls) -> _NowType:
         if cls._inst is None:
             cls._inst = super().__new__(cls)
         return cls._inst
 
     def __repr__(self) -> str:
-        return "Now"
+        return 'Now'
 
 
 Now = _NowType()
 
 
 class _SequenceNextType:
-    _inst: "_SequenceNextType | None" = None
+    _inst: _SequenceNextType | None = None
 
-    def __new__(cls) -> "_SequenceNextType":
+    def __new__(cls) -> _SequenceNextType:
         if cls._inst is None:
             cls._inst = super().__new__(cls)
         return cls._inst
 
     def __repr__(self) -> str:
-        return "SequenceNext"
+        return 'SequenceNext'
 
 
 SequenceNext = _SequenceNextType()
@@ -71,7 +71,7 @@ class Default(_PointerConstraint):
         self.sentinel = sentinel
 
     def __repr__(self) -> str:
-        return f"Default({self.sentinel!r})"
+        return f'Default({self.sentinel!r})'
 
 
 # ── Pointer-level constraints ───────────────────────────────────────────────────
@@ -84,7 +84,7 @@ class OneOf(_PointerConstraint):
         self.values = values
 
     def __repr__(self) -> str:
-        return f"OneOf({', '.join(repr(v) for v in self.values)})"
+        return f'OneOf({", ".join(repr(v) for v in self.values)})'
 
 
 class MaxValue(_PointerConstraint):
@@ -94,7 +94,7 @@ class MaxValue(_PointerConstraint):
         self.value = value
 
     def __repr__(self) -> str:
-        return f"MaxValue({self.value!r})"
+        return f'MaxValue({self.value!r})'
 
 
 class MaxExValue(_PointerConstraint):
@@ -104,7 +104,7 @@ class MaxExValue(_PointerConstraint):
         self.value = value
 
     def __repr__(self) -> str:
-        return f"MaxExValue({self.value!r})"
+        return f'MaxExValue({self.value!r})'
 
 
 class MinValue(_PointerConstraint):
@@ -114,7 +114,7 @@ class MinValue(_PointerConstraint):
         self.value = value
 
     def __repr__(self) -> str:
-        return f"MinValue({self.value!r})"
+        return f'MinValue({self.value!r})'
 
 
 class MinExValue(_PointerConstraint):
@@ -124,7 +124,7 @@ class MinExValue(_PointerConstraint):
         self.value = value
 
     def __repr__(self) -> str:
-        return f"MinExValue({self.value!r})"
+        return f'MinExValue({self.value!r})'
 
 
 class MaxLen(_PointerConstraint):
@@ -134,7 +134,7 @@ class MaxLen(_PointerConstraint):
         self.length = length
 
     def __repr__(self) -> str:
-        return f"MaxLen({self.length!r})"
+        return f'MaxLen({self.length!r})'
 
 
 class MinLen(_PointerConstraint):
@@ -144,7 +144,7 @@ class MinLen(_PointerConstraint):
         self.length = length
 
     def __repr__(self) -> str:
-        return f"MinLen({self.length!r})"
+        return f'MinLen({self.length!r})'
 
 
 class Regexp(_PointerConstraint):
@@ -154,7 +154,7 @@ class Regexp(_PointerConstraint):
         self.pattern = pattern
 
     def __repr__(self) -> str:
-        return f"Regexp({self.pattern!r})"
+        return f'Regexp({self.pattern!r})'
 
 
 # ── Dual-use: pointer annotation or class-body type description ────────────────
@@ -183,7 +183,7 @@ class Description(_PointerConstraint):
         _collector.register(self)
 
     def __repr__(self) -> str:
-        return f"Description({self.text!r})"
+        return f'Description({self.text!r})'
 
 
 # ── Constraints with both pointer-level and class-body forms ───────────────────
@@ -221,8 +221,8 @@ class Exclusive(_PointerConstraint):
     def __repr__(self) -> str:
         parts = [repr(self.pointers)]
         if self.unless is not None:
-            parts.append(f"unless={self.unless!r}")
-        return f"Exclusive({', '.join(parts)})"
+            parts.append(f'unless={self.unless!r}')
+        return f'Exclusive({", ".join(parts)})'
 
 
 class Readonly(_PointerConstraint):
@@ -250,4 +250,4 @@ class Expression(_PointerConstraint):
         _collector.register(self)
 
     def __repr__(self) -> str:
-        return f"Expression({self.expr!r})"
+        return f'Expression({self.expr!r})'

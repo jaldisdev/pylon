@@ -53,26 +53,26 @@ class _Node:
 
     __slots__ = ()
 
-    def _cmp(self, op: str, other: Any) -> "_Compare":
+    def _cmp(self, op: str, other: Any) -> _Compare:
         return _Compare(self, op, _as_node(other))
 
-    def __eq__(self, other: Any) -> "_Compare":  # type: ignore[override]
-        return self._cmp("=", other)
+    def __eq__(self, other: Any) -> _Compare:  # type: ignore[override]
+        return self._cmp('=', other)
 
-    def __ne__(self, other: Any) -> "_Compare":  # type: ignore[override]
-        return self._cmp("!=", other)
+    def __ne__(self, other: Any) -> _Compare:  # type: ignore[override]
+        return self._cmp('!=', other)
 
-    def __lt__(self, other: Any) -> "_Compare":
-        return self._cmp("<", other)
+    def __lt__(self, other: Any) -> _Compare:
+        return self._cmp('<', other)
 
-    def __le__(self, other: Any) -> "_Compare":
-        return self._cmp("<=", other)
+    def __le__(self, other: Any) -> _Compare:
+        return self._cmp('<=', other)
 
-    def __gt__(self, other: Any) -> "_Compare":
-        return self._cmp(">", other)
+    def __gt__(self, other: Any) -> _Compare:
+        return self._cmp('>', other)
 
-    def __ge__(self, other: Any) -> "_Compare":
-        return self._cmp(">=", other)
+    def __ge__(self, other: Any) -> _Compare:
+        return self._cmp('>=', other)
 
     def __hash__(self) -> int:
         # __eq__ is overloaded to build an expression rather than compare,
@@ -80,28 +80,27 @@ class _Node:
         # explicitly — identity hashing is fine, these are throwaway proxies.
         return object.__hash__(self)
 
-    def __and__(self, other: Any) -> "_BoolOp":
+    def __and__(self, other: Any) -> _BoolOp:
         if not isinstance(other, _Node):
             return NotImplemented
-        return _BoolOp("and", self, other)
+        return _BoolOp('and', self, other)
 
-    def __or__(self, other: Any) -> "_BoolOp":
+    def __or__(self, other: Any) -> _BoolOp:
         if not isinstance(other, _Node):
             return NotImplemented
-        return _BoolOp("or", self, other)
+        return _BoolOp('or', self, other)
 
-    def __invert__(self) -> "_Not":
+    def __invert__(self) -> _Not:
         return _Not(self)
 
     def __bool__(self) -> bool:
         raise TypeError(
-            "cannot use a Pylon filter expression in a boolean context "
-            "(if/and/or/not) — use & / | / ~ instead"
+            'cannot use a Pylon filter expression in a boolean context (if/and/or/not) — use & / | / ~ instead'
         )
 
 
 class _Literal(_Node):
-    __slots__ = ("value",)
+    __slots__ = ('value',)
 
     def __init__(self, value: Any) -> None:
         self.value = value
@@ -111,19 +110,19 @@ class _FieldPath(_Node):
     """A `.a.b.c`-style relative path — also the proxy object passed into a
     `.filter(lambda u: ...)` callable (the root path, with no segments)."""
 
-    __slots__ = ("segments",)
+    __slots__ = ('segments',)
 
     def __init__(self, segments: list[str]) -> None:
         self.segments = segments
 
-    def __getattr__(self, name: str) -> "_FieldPath":
-        if name.startswith("_"):
+    def __getattr__(self, name: str) -> _FieldPath:
+        if name.startswith('_'):
             raise AttributeError(name)
         return _FieldPath([*self.segments, name])
 
 
 class _Compare(_Node):
-    __slots__ = ("left", "op", "right")
+    __slots__ = ('left', 'op', 'right')
 
     def __init__(self, left: _Node, op: str, right: _Node) -> None:
         self.left = left
@@ -132,7 +131,7 @@ class _Compare(_Node):
 
 
 class _BoolOp(_Node):
-    __slots__ = ("op", "left", "right")
+    __slots__ = ('left', 'op', 'right')
 
     def __init__(self, op: str, left: _Node, right: _Node) -> None:
         self.op = op
@@ -141,14 +140,14 @@ class _BoolOp(_Node):
 
 
 class _Not(_Node):
-    __slots__ = ("operand",)
+    __slots__ = ('operand',)
 
     def __init__(self, operand: _Node) -> None:
         self.operand = operand
 
 
 class _FuncCall(_Node):
-    __slots__ = ("module", "name", "args")
+    __slots__ = ('args', 'module', 'name')
 
     def __init__(self, module: str | None, name: str, args: list[_Node]) -> None:
         self.module = module
@@ -171,23 +170,23 @@ def _as_node(value: Any) -> _Node:
 # `std.ilike(...)`-style — this is purely a surface-syntax choice on the
 # renderer's part, not a claim that PyQL exposes them as real functions.
 _INFIX_ALIASES = {
-    "ilike": "ilike",
-    "like": "like",
-    "not_ilike": "not ilike",
-    "not_like": "not like",
-    "in_": "in",
-    "not_in": "not in",
+    'ilike': 'ilike',
+    'like': 'like',
+    'not_ilike': 'not ilike',
+    'not_like': 'not like',
+    'in_': 'in',
+    'not_in': 'not in',
 }
 
 
 class _FuncNamespace:
-    __slots__ = ("_module",)
+    __slots__ = ('_module',)
 
     def __init__(self, module: str) -> None:
         self._module = module
 
     def __getattr__(self, name: str):
-        if name.startswith("_"):
+        if name.startswith('_'):
             raise AttributeError(name)
         infix = _INFIX_ALIASES.get(name)
 
@@ -197,7 +196,7 @@ class _FuncNamespace:
                 if len(nodes) != 2:
                     raise TypeError(
                         f"{self._module}.{name}(...) renders as the infix '{infix}' "
-                        f"operator and takes exactly 2 arguments, got {len(nodes)}"
+                        f'operator and takes exactly 2 arguments, got {len(nodes)}'
                     )
                 return _Compare(nodes[0], infix, nodes[1])
             return _FuncCall(self._module, name, nodes)
@@ -205,9 +204,9 @@ class _FuncNamespace:
         return _call
 
 
-std = _FuncNamespace("std")
-math = _FuncNamespace("math")
-cal = _FuncNamespace("cal")
+std = _FuncNamespace('std')
+math = _FuncNamespace('math')
+cal = _FuncNamespace('cal')
 
 
 # ── Rendering: expression tree → PyQL text + params ──────────────────────────
@@ -227,27 +226,27 @@ def render_expr(node: _Node) -> tuple[str, dict[str, Any]]:
 def _render(node: _Node, params: dict[str, Any], counter: list[int]) -> str:
     if isinstance(node, _FieldPath):
         if not node.segments:
-            raise InterfaceError("filter expression references the whole object, not a field")
-        return "." + ".".join(node.segments)
+            raise InterfaceError('filter expression references the whole object, not a field')
+        return '.' + '.'.join(node.segments)
     if isinstance(node, _Literal):
-        name = f"__mq_p{counter[0]}"
+        name = f'__mq_p{counter[0]}'
         counter[0] += 1
         params[name] = node.value
-        return f"${name}"
+        return f'${name}'
     if isinstance(node, _Compare):
-        return f"{_render(node.left, params, counter)} {node.op} {_render(node.right, params, counter)}"
+        return f'{_render(node.left, params, counter)} {node.op} {_render(node.right, params, counter)}'
     if isinstance(node, _BoolOp):
         # Unconditionally parenthesize both sides — this is generated text,
         # never shown to a user, so there's no cost to over-parenthesizing
         # and it sidesteps any precedence bugs entirely.
-        return f"({_render(node.left, params, counter)}) {node.op} ({_render(node.right, params, counter)})"
+        return f'({_render(node.left, params, counter)}) {node.op} ({_render(node.right, params, counter)})'
     if isinstance(node, _Not):
-        return f"not ({_render(node.operand, params, counter)})"
+        return f'not ({_render(node.operand, params, counter)})'
     if isinstance(node, _FuncCall):
-        args_text = ", ".join(_render(a, params, counter) for a in node.args)
-        prefix = f"{node.module}::" if node.module else ""
-        return f"{prefix}{node.name}({args_text})"
-    raise TypeError(f"unsupported filter expression node: {node!r}")
+        args_text = ', '.join(_render(a, params, counter) for a in node.args)
+        prefix = f'{node.module}::' if node.module else ''
+        return f'{prefix}{node.name}({args_text})'
+    raise TypeError(f'unsupported filter expression node: {node!r}')
 
 
 # ── ModelSet: a chainable, unexecuted query against one type ────────────────
@@ -257,37 +256,37 @@ class ModelSet:
     """A model class plus an optional filter expression — returned by
     `Model.filter(...)`, consumed by `Client.query`/`Client.execute`."""
 
-    __slots__ = ("model", "_expr", "_delete")
+    __slots__ = ('_delete', '_expr', 'model')
 
     def __init__(self, model: type, expr: _Node | None = None, delete: bool = False) -> None:
         self.model = model
         self._expr = expr
         self._delete = delete
 
-    def filter(self, *args: Any, **kwargs: Any) -> "ModelSet":
+    def filter(self, *args: Any, **kwargs: Any) -> ModelSet:
         if self._delete:
-            raise InterfaceError("cannot call .filter() on an already-built delete query")
+            raise InterfaceError('cannot call .filter() on an already-built delete query')
         expr = self._expr
         for fn in args:
             if not callable(fn):
-                raise TypeError(f".filter() positional arguments must be callables, got {type(fn).__name__}")
+                raise TypeError(f'.filter() positional arguments must be callables, got {type(fn).__name__}')
             result = fn(_FieldPath([]))
             if not isinstance(result, _Node):
                 raise TypeError(
-                    ".filter() lambda must return a filter expression built from comparisons/"
-                    f"&/|/~/std.*(...), got {type(result).__name__}"
+                    '.filter() lambda must return a filter expression built from comparisons/'
+                    f'&/|/~/std.*(...), got {type(result).__name__}'
                 )
-            expr = result if expr is None else _BoolOp("and", expr, result)
+            expr = result if expr is None else _BoolOp('and', expr, result)
         for field_name, value in kwargs.items():
-            cond = _Compare(_FieldPath([field_name]), "=", _as_node(value))
-            expr = cond if expr is None else _BoolOp("and", expr, cond)
+            cond = _Compare(_FieldPath([field_name]), '=', _as_node(value))
+            expr = cond if expr is None else _BoolOp('and', expr, cond)
         return ModelSet(self.model, expr, self._delete)
 
-    def delete(self) -> "ModelSet":
+    def delete(self) -> ModelSet:
         if self._expr is None:
             raise InterfaceError(
-                "refusing to build an unfiltered delete — call .filter(...) first "
-                "(this guards against accidentally deleting an entire table)"
+                'refusing to build an unfiltered delete — call .filter(...) first '
+                '(this guards against accidentally deleting an entire table)'
             )
         return ModelSet(self.model, self._expr, delete=True)
 
@@ -303,13 +302,13 @@ def filter_classmethod(cls: type, *args: Any, **kwargs: Any) -> ModelSet:
 
 def _qualified_type_name(model: type) -> str:
     cfg = model.__pylon_config__
-    return f"{cfg.module}::{cfg.name}"
+    return f'{cfg.module}::{cfg.name}'
 
 
 def _default_shape(model: type) -> str:
     cfg = model.__pylon_config__
-    fields = [name for name, meta in cfg.pointers.items() if meta.kind == "property"]
-    return ", ".join(fields)
+    fields = [name for name, meta in cfg.pointers.items() if meta.kind == 'property']
+    return ', '.join(fields)
 
 
 def render_select(ms: ModelSet) -> tuple[str, dict[str, Any]]:
@@ -317,22 +316,22 @@ def render_select(ms: ModelSet) -> tuple[str, dict[str, Any]]:
     shape = _default_shape(ms.model)
     if ms._expr is not None:
         filter_text, params = render_expr(ms._expr)
-        return f"select {type_name} {{ {shape} }} filter {filter_text}", params
-    return f"select {type_name} {{ {shape} }}", {}
+        return f'select {type_name} {{ {shape} }} filter {filter_text}', params
+    return f'select {type_name} {{ {shape} }}', {}
 
 
 def render_delete(ms: ModelSet) -> tuple[str, dict[str, Any]]:
     type_name = _qualified_type_name(ms.model)
-    assert ms._expr is not None, "ModelSet.delete() already guards against a missing filter"
+    assert ms._expr is not None, 'ModelSet.delete() already guards against a missing filter'
     filter_text, params = render_expr(ms._expr)
-    return f"delete {type_name} filter {filter_text}", params
+    return f'delete {type_name} filter {filter_text}', params
 
 
 def render(obj: Any) -> tuple[str, dict[str, Any]] | None:
     """Converts a bare `@pylon.type` class or a `ModelSet` into PyQL text +
     params, or returns `None` if `obj` isn't something this module knows how
     to render (the caller should fall back to its own "not a str" error)."""
-    if isinstance(obj, type) and hasattr(obj, "__pylon_config__"):
+    if isinstance(obj, type) and hasattr(obj, '__pylon_config__'):
         return render_select(ModelSet(obj))
     if isinstance(obj, ModelSet):
         return render_delete(obj) if obj._delete else render_select(obj)
@@ -354,21 +353,21 @@ def prepare_save(obj: Any) -> tuple[str, dict[str, Any]] | None:
     diffed against its `__pylon_saved__` shadow) for `obj`, or returns
     `None` if a hydrated instance has no changed fields (a no-op save)."""
     cfg = type(obj).__pylon_config__
-    type_name = f"{cfg.module}::{cfg.name}"
-    saved = obj.__dict__.get("__pylon_saved__")
+    type_name = f'{cfg.module}::{cfg.name}'
+    saved = obj.__dict__.get('__pylon_saved__')
     params: dict[str, Any] = {}
     counter = [0]
 
     def _param(value: Any) -> str:
-        name = f"__mq_s{counter[0]}"
+        name = f'__mq_s{counter[0]}'
         counter[0] += 1
         params[name] = value
-        return f"${name}"
+        return f'${name}'
 
     if saved is None:
         assignments = []
         for name, meta in cfg.pointers.items():
-            if meta.kind != "property" or name not in obj.__dict__:
+            if meta.kind != 'property' or name not in obj.__dict__:
                 continue
             value = obj.__dict__[name]
             # A field left at its Python-side default (None) is
@@ -379,23 +378,23 @@ def prepare_save(obj: Any) -> tuple[str, dict[str, Any]] | None:
             # the column is simply omitted and stays NULL either way.
             if value is None:
                 continue
-            assignments.append(f"{name} := {_param(value)}")
+            assignments.append(f'{name} := {_param(value)}')
         if not assignments:
-            raise InterfaceError(f"cannot save a new {type_name} instance with no fields set")
-        return f"insert {type_name} {{ {', '.join(assignments)} }}", params
+            raise InterfaceError(f'cannot save a new {type_name} instance with no fields set')
+        return f'insert {type_name} {{ {", ".join(assignments)} }}', params
 
     assignments = []
     for name, meta in cfg.pointers.items():
-        if meta.kind != "property" or meta.is_readonly or name not in obj.__dict__:
+        if meta.kind != 'property' or meta.is_readonly or name not in obj.__dict__:
             continue
         current = obj.__dict__[name]
         if current == saved.get(name, _UNSET):
             continue
-        assignments.append(f"{name} := {_param(current)}")
+        assignments.append(f'{name} := {_param(current)}')
     if not assignments:
         return None
-    pid = obj.__dict__.get("id")
+    pid = obj.__dict__.get('id')
     if pid is None:
-        raise InterfaceError(f"cannot update {type_name}: instance has no id")
+        raise InterfaceError(f'cannot update {type_name}: instance has no id')
     id_param = _param(pid)
-    return f"update {type_name} filter .id = {id_param} set {{ {', '.join(assignments)} }}", params
+    return f'update {type_name} filter .id = {id_param} set {{ {", ".join(assignments)} }}', params

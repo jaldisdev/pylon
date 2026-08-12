@@ -29,7 +29,7 @@ from ._constraints import Description
 
 
 class _Side:
-    __slots__ = ("name",)
+    __slots__ = ('name',)
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -39,7 +39,7 @@ class _Side:
 
 
 class _Action:
-    __slots__ = ("name",)
+    __slots__ = ('name',)
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -48,15 +48,15 @@ class _Action:
         return self.name
 
 
-Target = _Side("Target")
-Source = _Side("Source")
+Target = _Side('Target')
+Source = _Side('Source')
 
-Allow = _Action("Allow")
-Restrict = _Action("Restrict")
-DeferredRestrict = _Action("DeferredRestrict")
-DeleteSource = _Action("DeleteSource")
-DeleteTarget = _Action("DeleteTarget")
-DeleteTargetIfOrphan = _Action("DeleteTargetIfOrphan")
+Allow = _Action('Allow')
+Restrict = _Action('Restrict')
+DeferredRestrict = _Action('DeferredRestrict')
+DeleteSource = _Action('DeleteSource')
+DeleteTarget = _Action('DeleteTarget')
+DeleteTargetIfOrphan = _Action('DeleteTargetIfOrphan')
 
 
 class OnDelete:
@@ -68,14 +68,14 @@ class OnDelete:
         messages: MultiLink[Message, OnDelete(Source, DeleteTargetIfOrphan)]
     """
 
-    __slots__ = ("side", "action")
+    __slots__ = ('action', 'side')
 
     def __init__(self, side: _Side, action: _Action) -> None:
         self.side = side
         self.action = action
 
     def __repr__(self) -> str:
-        return f"OnDelete({self.side!r}, {self.action!r})"
+        return f'OnDelete({self.side!r}, {self.action!r})'
 
 
 # ── Annotation result types ────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ class OnDelete:
 
 
 class PropertyAnnotation:
-    __slots__ = ("scalar_type", "constraints")
+    __slots__ = ('constraints', 'scalar_type')
 
     def __init__(self, scalar_type: Any, constraints: list[Any]) -> None:
         self.scalar_type = scalar_type
@@ -98,11 +98,11 @@ class PropertyAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return f"PropertyAnnotation({self.scalar_type!r}, {self.constraints!r})"
+        return f'PropertyAnnotation({self.scalar_type!r}, {self.constraints!r})'
 
 
 class LinkAnnotation:
-    __slots__ = ("target_type", "constraints", "on_delete", "through_type")
+    __slots__ = ('constraints', 'on_delete', 'target_type', 'through_type')
 
     def __init__(
         self,
@@ -122,15 +122,13 @@ class LinkAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return f"LinkAnnotation({self.target_type!r}, {self.constraints!r}, through={self.through_type!r})"
+        return f'LinkAnnotation({self.target_type!r}, {self.constraints!r}, through={self.through_type!r})'
 
 
 class MultiLinkAnnotation:
-    __slots__ = ("target_type", "through_type", "on_delete")
+    __slots__ = ('on_delete', 'target_type', 'through_type')
 
-    def __init__(
-        self, target_type: Any, through_type: Any = None, on_delete: list[OnDelete] | None = None
-    ) -> None:
+    def __init__(self, target_type: Any, through_type: Any = None, on_delete: list[OnDelete] | None = None) -> None:
         self.target_type = target_type
         self.through_type = through_type
         self.on_delete = on_delete or []
@@ -141,13 +139,11 @@ class MultiLinkAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return (
-            f"MultiLinkAnnotation({self.target_type!r}, through={self.through_type!r})"
-        )
+        return f'MultiLinkAnnotation({self.target_type!r}, through={self.through_type!r})'
 
 
 class ComputedAnnotation:
-    __slots__ = ("return_type", "expression")
+    __slots__ = ('expression', 'return_type')
 
     def __init__(self, return_type: Any, expression: str) -> None:
         self.return_type = return_type
@@ -159,7 +155,7 @@ class ComputedAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return f"ComputedAnnotation({self.return_type!r}, {self.expression!r})"
+        return f'ComputedAnnotation({self.return_type!r}, {self.expression!r})'
 
 
 # ── Through ────────────────────────────────────────────────────────────────────
@@ -175,17 +171,17 @@ class Through:
         spouse: Link[Person, Through[Marriage]] | None
     """
 
-    __slots__ = ("type_",)
+    __slots__ = ('type_',)
 
     def __init__(self, type_: Any) -> None:
         self.type_ = type_
 
     @classmethod
-    def __class_getitem__(cls, type_: Any) -> "Through":
+    def __class_getitem__(cls, type_: Any) -> Through:
         return cls(type_)
 
     def __repr__(self) -> str:
-        return f"Through[{self.type_!r}]"
+        return f'Through[{self.type_!r}]'
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -291,14 +287,14 @@ class MultiLink:
 class TupleElement:
     """One member of a structural tuple type: `(name, type)` or a bare type."""
 
-    __slots__ = ("name", "type_")
+    __slots__ = ('name', 'type_')
 
     def __init__(self, name: str | None, type_: Any) -> None:
         self.name = name
         self.type_ = type_
 
     def __repr__(self) -> str:
-        return f"TupleElement({self.name!r}, {self.type_!r})"
+        return f'TupleElement({self.name!r}, {self.type_!r})'
 
 
 class TupleAnnotation:
@@ -311,7 +307,7 @@ class TupleAnnotation:
         shape: Tuple[("origin", Tuple[("x", Float64), ("y", Float64)]), ("size", Float64)]
     """
 
-    __slots__ = ("elements",)
+    __slots__ = ('elements',)
 
     def __init__(self, elements: list[TupleElement]) -> None:
         self.elements = elements
@@ -322,7 +318,7 @@ class TupleAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return f"TupleAnnotation({self.elements!r})"
+        return f'TupleAnnotation({self.elements!r})'
 
 
 class Tuple:
@@ -338,12 +334,7 @@ class Tuple:
     @classmethod
     def __class_getitem__(cls, params: Any) -> TupleAnnotation:
         def _is_named_item(p: Any) -> bool:
-            return (
-                isinstance(p, tuple)
-                and len(p) == 2
-                and isinstance(p[0], str)
-                and not isinstance(p[1], str)
-            )
+            return isinstance(p, tuple) and len(p) == 2 and isinstance(p[0], str) and not isinstance(p[1], str)
 
         if _is_named_item(params):
             # Tuple[("name", Type)] — a single named element. Python's subscript
@@ -356,14 +347,11 @@ class Tuple:
         elif not isinstance(params, tuple):
             params = (params,)
         if not params:
-            raise TypeError("Tuple[...] requires at least one element")
+            raise TypeError('Tuple[...] requires at least one element')
 
         named_flags = [_is_named_item(p) for p in params]
         if any(named_flags) and not all(named_flags):
-            raise TypeError(
-                "Tuple[...] elements must be all named ('name', Type) or all "
-                "unnamed Type, not mixed"
-            )
+            raise TypeError("Tuple[...] elements must be all named ('name', Type) or all unnamed Type, not mixed")
 
         if all(named_flags):
             elements = [TupleElement(name=p[0], type_=p[1]) for p in params]
@@ -382,7 +370,7 @@ class ArrayAnnotation:
         scores: Array[Int64]
     """
 
-    __slots__ = ("element",)
+    __slots__ = ('element',)
 
     def __init__(self, element: Any) -> None:
         self.element = element
@@ -393,7 +381,7 @@ class ArrayAnnotation:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return f"ArrayAnnotation({self.element!r})"
+        return f'ArrayAnnotation({self.element!r})'
 
 
 class Array:
@@ -411,7 +399,7 @@ class Array:
     @classmethod
     def __class_getitem__(cls, element: Any) -> ArrayAnnotation:
         if isinstance(element, ArrayAnnotation):
-            raise TypeError("Array[Array[...]] is not supported; arrays must be one-dimensional")
+            raise TypeError('Array[Array[...]] is not supported; arrays must be one-dimensional')
         return ArrayAnnotation(element=element)
 
 
@@ -431,14 +419,8 @@ class Computed:
     @classmethod
     def __class_getitem__(cls, params: Any) -> ComputedAnnotation:
         if not isinstance(params, tuple) or len(params) != 2:
-            raise TypeError(
-                "Computed requires exactly two parameters: "
-                'Computed[return_type, "pyql_expression"]'
-            )
+            raise TypeError('Computed requires exactly two parameters: Computed[return_type, "pyql_expression"]')
         return_type, expression = params
         if not isinstance(expression, str):
-            raise TypeError(
-                f"Computed expression must be a string literal, "
-                f"got {type(expression).__name__!r}"
-            )
+            raise TypeError(f'Computed expression must be a string literal, got {type(expression).__name__!r}')
         return ComputedAnnotation(return_type=return_type, expression=expression)

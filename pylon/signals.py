@@ -34,6 +34,7 @@ needed here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -65,7 +66,7 @@ SET status = CASE WHEN attempts >= 5 THEN 'Failed' ELSE 'Pending' END,
 WHERE id = $1
 """
 
-_OPERATION_TO_ON = {"INSERT": On.Insert, "UPDATE": On.Update, "DELETE": On.Delete}
+_OPERATION_TO_ON = {'INSERT': On.Insert, 'UPDATE': On.Update, 'DELETE': On.Delete}
 
 
 def _qualified_type_registry() -> dict[str, type]:
@@ -76,7 +77,7 @@ def _qualified_type_registry() -> dict[str, type]:
     from pylon.schema._registry import snapshot
 
     types, _enums, _custom_scalars = snapshot()
-    return {f"{t.__pylon_config__.module}::{t.__name__}": t for t in types}
+    return {f'{t.__pylon_config__.module}::{t.__name__}': t for t in types}
 
 
 def _hydrate(cls: type, row: dict[str, Any] | None) -> Any:
@@ -94,26 +95,25 @@ def _hydrate(cls: type, row: dict[str, Any] | None) -> Any:
     if row is None:
         return None
     cfg = cls.__pylon_config__
-    uuid_keys = {"id"} | {f"{name}_id" for name in cfg.pointers if cfg.pointers[name].kind == "link"}
+    uuid_keys = {'id'} | {f'{name}_id' for name in cfg.pointers if cfg.pointers[name].kind == 'link'}
     obj = object.__new__(cls)
-    obj.__dict__.update({
-        key: uuid.UUID(value) if key in uuid_keys and isinstance(value, str) else value
-        for key, value in row.items()
-    })
+    obj.__dict__.update(
+        {key: uuid.UUID(value) if key in uuid_keys and isinstance(value, str) else value for key, value in row.items()}
+    )
     return obj
 
 
 async def _process_row(row: dict[str, Any], type_registry: dict[str, type]) -> None:
-    type_name = row["type_name"]
-    on = _OPERATION_TO_ON.get(row["operation"])
+    type_name = row['type_name']
+    on = _OPERATION_TO_ON.get(row['operation'])
     cls = type_registry.get(type_name)
     if on is None or cls is None:
         # A signal was removed (or its target type renamed/dropped) after
         # this row was already queued but before the DDL/trigger caught
         # up — nothing to dispatch to; drop it rather than retry forever.
         return
-    old = _hydrate(cls, row["old_row"])
-    new = _hydrate(cls, row["new_row"])
+    old = _hydrate(cls, row['old_row'])
+    new = _hydrate(cls, row['new_row'])
     for handler in handlers_for(type_name, on):
         await handler(old, new)
 
@@ -128,7 +128,7 @@ async def run_signal_dispatcher(dsn: str, *, batch_size: int = 50, poll_interval
     """
     conn = await pgcon_listen(dsn)
     woken = asyncio.Event()
-    await conn.add_listener("pylon_signal_queue", lambda *_args: woken.set())
+    await conn.add_listener('pylon_signal_queue', lambda *_args: woken.set())
 
     while True:
         drained_any = False
@@ -141,17 +141,15 @@ async def run_signal_dispatcher(dsn: str, *, batch_size: int = 50, poll_interval
             for row in claimed:
                 try:
                     await _process_row(row, type_registry)
-                except Exception as exc:  # noqa: BLE001 - one bad handler must not kill the loop
-                    print(f"pylon.signals: handler failed for {row['type_name']} {row['operation']}: {exc}")
-                    await conn.execute(_MARK_FAILED_SQL, [row["id"]])
+                except Exception as exc:
+                    print(f'pylon.signals: handler failed for {row["type_name"]} {row["operation"]}: {exc}')
+                    await conn.execute(_MARK_FAILED_SQL, [row['id']])
                 else:
-                    await conn.execute(_MARK_DONE_SQL, [row["id"]])
+                    await conn.execute(_MARK_DONE_SQL, [row['id']])
             if len(claimed) < batch_size:
                 break
 
         if not drained_any:
             woken.clear()
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(woken.wait(), timeout=poll_interval)
-            except asyncio.TimeoutError:
-                pass

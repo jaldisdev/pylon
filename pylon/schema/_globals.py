@@ -45,7 +45,7 @@ def _unwrap_optional(annotation: Any) -> tuple[bool, Any]:
 
 
 class GlobalAnnotation:
-    __slots__ = ("scalar_type", "required", "computed_expr")
+    __slots__ = ('computed_expr', 'required', 'scalar_type')
 
     def __init__(self, scalar_type: Any, required: bool, computed_expr: str | None = None) -> None:
         self.scalar_type = scalar_type
@@ -53,7 +53,7 @@ class GlobalAnnotation:
         self.computed_expr = computed_expr
 
     def __repr__(self) -> str:
-        return f"GlobalAnnotation({self.scalar_type!r}, required={self.required})"
+        return f'GlobalAnnotation({self.scalar_type!r}, required={self.required})'
 
 
 class Global:
@@ -74,10 +74,7 @@ class Global:
         if isinstance(params, tuple) and len(params) == 2:
             type_param, expr = params
             if not isinstance(expr, str):
-                raise TypeError(
-                    f"Global computed expression must be a string literal, "
-                    f"got {type(expr).__name__!r}"
-                )
+                raise TypeError(f'Global computed expression must be a string literal, got {type(expr).__name__!r}')
             nullable, scalar_type = _unwrap_optional(type_param)
             return GlobalAnnotation(scalar_type=scalar_type, required=not nullable, computed_expr=expr)
         nullable, scalar_type = _unwrap_optional(params)
@@ -96,19 +93,19 @@ class GlobalDescriptor:
     computed_expr: str | None = None
 
     def __repr__(self) -> str:
-        default_part = "" if self.default is MISSING else f", default={self.default!r}"
+        default_part = '' if self.default is MISSING else f', default={self.default!r}'
         return (
-            f"GlobalDescriptor({self.name!r}, module={self.module!r}, "
-            f"scalar_type={self.scalar_type!r}, required={self.required}{default_part})"
+            f'GlobalDescriptor({self.name!r}, module={self.module!r}, '
+            f'scalar_type={self.scalar_type!r}, required={self.required}{default_part})'
         )
 
 
 def _infer_module_name(module: Any) -> str:
-    override = getattr(module, "__pylon_module__", None)
+    override = getattr(module, '__pylon_module__', None)
     if isinstance(override, str):
         return override
-    module_path = getattr(module, "__name__", "default")
-    return module_path.rpartition(".")[-1] or module_path
+    module_path = getattr(module, '__name__', 'default')
+    return module_path.rpartition('.')[-1] or module_path
 
 
 def collect_module_globals(module: Any) -> list[GlobalDescriptor]:
@@ -121,12 +118,12 @@ def collect_module_globals(module: Any) -> list[GlobalDescriptor]:
     try:
         hints = typing.get_type_hints(module)
     except Exception:
-        hints = dict(getattr(module, "__annotations__", {}))
+        hints = dict(getattr(module, '__annotations__', {}))
 
     module_name = _infer_module_name(module)
     result: list[GlobalDescriptor] = []
     for name, annotation in hints.items():
-        if name.startswith("_"):
+        if name.startswith('_'):
             continue
         if not isinstance(annotation, GlobalAnnotation):
             continue
@@ -155,9 +152,9 @@ def collect_all_globals(schema_dir: Path, modules: list[Any] | None = None) -> l
     handler (which needs the real, structured type to render a proper
     typeName string for non-scalar globals — see _global_type_text)."""
     result: list[GlobalDescriptor] = []
-    for py_file in sorted(schema_dir.glob("*.py")):
+    for py_file in sorted(schema_dir.glob('*.py')):
         stem = py_file.stem
-        if not stem.startswith("_") and stem in sys.modules:
+        if not stem.startswith('_') and stem in sys.modules:
             result.extend(collect_module_globals(sys.modules[stem]))
     if modules:
         for mod in modules:

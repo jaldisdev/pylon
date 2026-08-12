@@ -43,8 +43,8 @@ class ConfigOptionSpec:
 
 CONFIG_OPTIONS: list[ConfigOptionSpec] = [
     ConfigOptionSpec(
-        name="allow_user_specified_id",
-        type_name="bool",
+        name='allow_user_specified_id',
+        type_name='bool',
         default=False,
     ),
 ]

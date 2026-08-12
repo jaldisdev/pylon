@@ -30,6 +30,11 @@ import importlib
 import typing
 from typing import Any
 
+# Safe at module scope despite the walker/functions cycle noted in
+# `_functions.py`: that module only reaches back into `_walker` from inside a
+# function body, so nothing here runs during its import.
+from ._functions import Volatility
+
 MISSING = dataclasses.MISSING
 
 # ── Error type ─────────────────────────────────────────────────────────────────
@@ -43,7 +48,7 @@ class SchemaError(Exception):
 
 
 def _qualified(module: str, name: str) -> str:
-    return f"{module}::{name}"
+    return f'{module}::{name}'
 
 
 def _pylon_module_of(cls: type) -> str:
@@ -55,7 +60,7 @@ def _pylon_name_of(cls: type) -> str:
 
 
 def _is_pylon_type(cls: type) -> bool:
-    return hasattr(cls, "__pylon_config__")
+    return hasattr(cls, '__pylon_config__')
 
 
 # ── Type index ─────────────────────────────────────────────────────────────────
@@ -72,10 +77,7 @@ def _build_type_index(
         cfg = cls.__pylon_config__
         qname = _qualified(cfg.module, cfg.name)
         if qname in type_map:
-            raise SchemaError(
-                f"Duplicate type name {qname!r}: "
-                f"both {type_map[qname]!r} and {cls!r}"
-            )
+            raise SchemaError(f'Duplicate type name {qname!r}: both {type_map[qname]!r} and {cls!r}')
         type_map[qname] = cls
         class_to_qname[id(cls)] = qname
 
@@ -87,21 +89,20 @@ def _build_type_index(
 
 def _import_from_lazy(module_path: str, class_name: str, anchor_cls: type) -> type | None:
     """Import a class by resolving a relative module path from anchor_cls.__module__."""
-    anchor = anchor_cls.__module__ or ""
+    anchor = anchor_cls.__module__ or ''
     try:
-        if module_path.startswith("."):
-            level = len(module_path) - len(module_path.lstrip("."))
-            relative_name = module_path.lstrip(".")
-            parts = anchor.split(".")
+        if module_path.startswith('.'):
+            level = len(module_path) - len(module_path.lstrip('.'))
+            relative_name = module_path.lstrip('.')
+            parts = anchor.split('.')
             if level > len(parts):
                 raise SchemaError(
-                    f"Relative import {module_path!r} ascends above the package root "
-                    f"(anchor: {anchor!r})"
+                    f'Relative import {module_path!r} ascends above the package root (anchor: {anchor!r})'
                 )
             base_parts = parts[:-level] if level else parts
-            full_module = ".".join(base_parts)
+            full_module = '.'.join(base_parts)
             if relative_name:
-                full_module = f"{full_module}.{relative_name}" if full_module else relative_name
+                full_module = f'{full_module}.{relative_name}' if full_module else relative_name
         else:
             full_module = module_path
 
@@ -109,8 +110,7 @@ def _import_from_lazy(module_path: str, class_name: str, anchor_cls: type) -> ty
         return getattr(mod, class_name, None)
     except ImportError as exc:
         raise SchemaError(
-            f"Cannot resolve lazy ref: failed to import {module_path!r} "
-            f"relative to {anchor!r}: {exc}"
+            f'Cannot resolve lazy ref: failed to import {module_path!r} relative to {anchor!r}: {exc}'
         ) from exc
 
 
@@ -133,16 +133,13 @@ def _resolve_target(
             resolved = _import_from_lazy(lazy_markers[0].module_path, inner, source_cls)
             if resolved is None or not _is_pylon_type(resolved):
                 raise SchemaError(
-                    f"{label}: lazy ref {inner!r} from {lazy_markers[0].module_path!r} "
-                    f"did not resolve to a Pylon type"
+                    f'{label}: lazy ref {inner!r} from {lazy_markers[0].module_path!r} did not resolve to a Pylon type'
                 )
             target = resolved
         elif isinstance(inner, type):
             target = inner
         else:
-            raise SchemaError(
-                f"{label}: unresolvable Annotated type {target!r}"
-            )
+            raise SchemaError(f'{label}: unresolvable Annotated type {target!r}')
 
     if isinstance(target, type):
         cls_id = id(target)
@@ -154,27 +151,24 @@ def _resolve_target(
             if qname in type_map:
                 return qname
             raise SchemaError(
-                f"{label}: target type {target.__name__!r} has a "
-                f"__pylon_config__ but was not collected by the registry — "
-                f"did you import its module before calling pylon.finalize()?"
+                f'{label}: target type {target.__name__!r} has a '
+                f'__pylon_config__ but was not collected by the registry — '
+                f'did you import its module before calling pylon.finalize()?'
             )
-        raise SchemaError(
-            f"{label}: {target!r} is not a Pylon type (no __pylon_config__)"
-        )
+        raise SchemaError(f'{label}: {target!r} is not a Pylon type (no __pylon_config__)')
 
     if isinstance(target, str):
         # Unqualified name lookup: accept the unique match or error on ambiguity.
-        matches = [qn for qn in type_map if qn.endswith(f"::{target}") or qn == target]
+        matches = [qn for qn in type_map if qn.endswith(f'::{target}') or qn == target]
         if len(matches) == 1:
             return matches[0]
         if len(matches) == 0:
-            raise SchemaError(f"{label}: type {target!r} not found in schema")
+            raise SchemaError(f'{label}: type {target!r} not found in schema')
         raise SchemaError(
-            f"{label}: ambiguous type name {target!r} — "
-            f"matches {matches!r}; use the qualified form 'module::Name'"
+            f"{label}: ambiguous type name {target!r} — matches {matches!r}; use the qualified form 'module::Name'"
         )
 
-    raise SchemaError(f"{label}: cannot resolve link target {target!r}")
+    raise SchemaError(f'{label}: cannot resolve link target {target!r}')
 
 
 def _resolve_links(
@@ -186,16 +180,12 @@ def _resolve_links(
     for cls in types:
         cfg = cls.__pylon_config__
         for pointer_name, meta in cfg.pointers.items():
-            if meta.kind in ("link", "multilink") and meta.link_target is not None:
-                label = f"{cfg.module}::{cfg.name}.{pointer_name} link_target"
-                meta.link_target = _resolve_target(
-                    meta.link_target, cls, class_to_qname, type_map, label
-                )
-            if meta.kind in ("link", "multilink") and meta.through is not None:
-                label = f"{cfg.module}::{cfg.name}.{pointer_name} through"
-                meta.through = _resolve_target(
-                    meta.through, cls, class_to_qname, type_map, label
-                )
+            if meta.kind in ('link', 'multilink') and meta.link_target is not None:
+                label = f'{cfg.module}::{cfg.name}.{pointer_name} link_target'
+                meta.link_target = _resolve_target(meta.link_target, cls, class_to_qname, type_map, label)
+            if meta.kind in ('link', 'multilink') and meta.through is not None:
+                label = f'{cfg.module}::{cfg.name}.{pointer_name} through'
+                meta.through = _resolve_target(meta.through, cls, class_to_qname, type_map, label)
 
 
 # ── Cycle detection ────────────────────────────────────────────────────────────
@@ -217,7 +207,7 @@ def _detect_required_link_cycles(
         src_qname = class_to_qname[id(cls)]
         targets: set[str] = set()
         for meta in cfg.pointers.values():
-            if meta.kind == "link" and not meta.nullable and isinstance(meta.link_target, str):
+            if meta.kind == 'link' and not meta.nullable and isinstance(meta.link_target, str):
                 targets.add(meta.link_target)
         adj[src_qname] = targets
 
@@ -234,10 +224,9 @@ def _detect_required_link_cycles(
                 continue  # not in schema (external ref?)
             if color[nb] == GRAY:
                 cycle_start = path.index(nb)
-                cycle = " → ".join(path[cycle_start:] + [nb])
+                cycle = ' → '.join([*path[cycle_start:], nb])
                 raise SchemaError(
-                    f"Required-link cycle detected: {cycle}. "
-                    "Make at least one link in the cycle nullable to break it."
+                    f'Required-link cycle detected: {cycle}. Make at least one link in the cycle nullable to break it.'
                 )
             if color[nb] == WHITE:
                 dfs(nb)
@@ -269,7 +258,7 @@ def _validate_junctions(
     for cls in types:
         cfg = cls.__pylon_config__
         for fn, meta in cfg.pointers.items():
-            if meta.kind not in ("link", "multilink") or meta.through is None:
+            if meta.kind not in ('link', 'multilink') or meta.through is None:
                 continue
             through_qname = meta.through  # already resolved to a qname string
             through_cls = next(
@@ -286,10 +275,10 @@ def _validate_junctions(
             if through_qname in junction_to_pointer:
                 other_src_table, other_pointer = junction_to_pointer[through_qname]
                 raise SchemaError(
-                    f"Junction type {through_qname!r} is referenced by more than one "
-                    f"link: {other_src_table!r}.{other_pointer!r} and "
-                    f"{src_qname!r}.{fn!r}. Each junction type may only be used by "
-                    f"a single link or multi-link."
+                    f'Junction type {through_qname!r} is referenced by more than one '
+                    f'link: {other_src_table!r}.{other_pointer!r} and '
+                    f'{src_qname!r}.{fn!r}. Each junction type may only be used by '
+                    f'a single link or multi-link.'
                 )
             junction_to_pointer[through_qname] = (cfg.table, fn)
 
@@ -301,9 +290,9 @@ def _validate_junctions(
         qname = class_to_qname[id(cls)]
         if qname not in junction_to_pointer:
             raise SchemaError(
-                f"Junction type {qname!r} is not referenced by any link or multi-link. "
+                f'Junction type {qname!r} is not referenced by any link or multi-link. '
                 f"Junction types must be used as the 'through' parameter of exactly "
-                f"one link or multi-link pointer."
+                f'one link or multi-link pointer.'
             )
 
     return junction_to_pointer
@@ -334,15 +323,15 @@ def _validate_interfaces(
             for pointer_name, imeta in bcfg.pointers.items():
                 if pointer_name not in effective:
                     raise SchemaError(
-                        f"{cfg.module}::{cfg.name} does not satisfy interface "
-                        f"{bcfg.module}::{bcfg.name}: missing pointer {pointer_name!r}"
+                        f'{cfg.module}::{cfg.name} does not satisfy interface '
+                        f'{bcfg.module}::{bcfg.name}: missing pointer {pointer_name!r}'
                     )
                 # Kind must match
                 cmeta = effective[pointer_name]
                 if cmeta.kind != imeta.kind:
                     raise SchemaError(
-                        f"{cfg.module}::{cfg.name}.{pointer_name}: interface expects "
-                        f"kind={imeta.kind!r}, got kind={cmeta.kind!r}"
+                        f'{cfg.module}::{cfg.name}.{pointer_name}: interface expects '
+                        f'kind={imeta.kind!r}, got kind={cmeta.kind!r}'
                     )
 
 
@@ -407,12 +396,12 @@ def _collect_inherited_cit(cls: type) -> tuple[list[Any], list[Any], list[Any]]:
 
 
 def _pg_schema(module: str) -> str:
-    return "public" if module == "default" else module
+    return 'public' if module == 'default' else module
 
 
 def _to_pg_type(scalar_type: Any) -> str:
-    from ._scalars import PG_TYPE_MAP, Scalar, _PylonScalar, SHORTHAND_MAP
     from ._enums import Enum as PylonEnum
+    from ._scalars import PG_TYPE_MAP, SHORTHAND_MAP, Scalar, _PylonScalar
 
     # Every call site (plain property types, computed-pointer types, tuple
     # members, function params/return types) expects a scalar — an object
@@ -424,18 +413,18 @@ def _to_pg_type(scalar_type: Any) -> str:
     # `jsonb` with no error at all (confirmed live before this check).
     if _is_pylon_type(scalar_type):
         raise SchemaError(
-            f"invalid type {_qualified(_pylon_module_of(scalar_type), _pylon_name_of(scalar_type))!r}: "
-            f"expected a scalar type, got an object type"
+            f'invalid type {_qualified(_pylon_module_of(scalar_type), _pylon_name_of(scalar_type))!r}: '
+            f'expected a scalar type, got an object type'
         )
 
     # Built-in Pylon scalar
     if isinstance(scalar_type, type) and issubclass(scalar_type, _PylonScalar):
-        return PG_TYPE_MAP.get(scalar_type, "text")
+        return PG_TYPE_MAP.get(scalar_type, 'text')
 
     # Python shorthand (should already be resolved by _annotation_to_meta, but
     # handle defensively)
     if scalar_type in SHORTHAND_MAP:
-        return PG_TYPE_MAP.get(SHORTHAND_MAP[scalar_type], "text")
+        return PG_TYPE_MAP.get(SHORTHAND_MAP[scalar_type], 'text')
 
     # Custom named scalar (decorator or functional form): every read/write/
     # cast/comparison site relies on `pg_type` being a plain base type (see
@@ -445,17 +434,21 @@ def _to_pg_type(scalar_type: Any) -> str:
     # `_domain_type_ref`/`PropertyDescriptor.column_type`, consulted only
     # for the column's DDL type.
     if isinstance(scalar_type, type) and issubclass(scalar_type, Scalar):
-        base = getattr(scalar_type, "__pylon_base__", None)
+        base = getattr(scalar_type, '__pylon_base__', None)
         if base and issubclass(base, _PylonScalar):
-            return PG_TYPE_MAP.get(base, "text")
-        return "text"
+            return PG_TYPE_MAP.get(base, 'text')
+        return 'text'
 
     # Named tuple type → jsonb with type marker
     from ._named_tuples import NamedTuple as PylonNamedTuple
+
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonNamedTuple):
-        mod = getattr(scalar_type, "__pylon_module__", None) or \
-            (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
-        return f"__nt__:{mod}::{scalar_type.__name__}"
+        mod = (
+            getattr(scalar_type, '__pylon_module__', None)
+            or (scalar_type.__module__ or 'default').rpartition('.')[-1]
+            or 'default'
+        )
+        return f'__nt__:{mod}::{scalar_type.__name__}'
 
     # Structural tuple type (pylon.Tuple[...]) → plain jsonb, no registered type
     # to decode into. Still resolve each element's own pg_type (discarding the
@@ -466,10 +459,11 @@ def _to_pg_type(scalar_type: Any) -> str:
     # bug class as the direct-element case. Recurses naturally for nested
     # tuples via this same branch.
     from ._pointers import ArrayAnnotation, TupleAnnotation
+
     if isinstance(scalar_type, TupleAnnotation):
         for element in scalar_type.elements:
             _to_pg_type(element.type_)
-        return "jsonb"
+        return 'jsonb'
 
     # Structural array type (pylon.Array[T] or a bare list[T]) → a real
     # Postgres array of the element's own pg_type, never jsonb — arrays
@@ -477,13 +471,18 @@ def _to_pg_type(scalar_type: Any) -> str:
     # resolve_cast_pg_type on the Rust side, which follows the same rule
     # for `<array<T>>` casts).
     if isinstance(scalar_type, ArrayAnnotation):
-        return f"{_to_pg_type(scalar_type.element)}[]"
+        return f'{_to_pg_type(scalar_type.element)}[]'
 
     # Enum type → schema-qualified PostgreSQL ENUM type reference
     if isinstance(scalar_type, type) and issubclass(scalar_type, PylonEnum):
-        mod = getattr(scalar_type, "__pylon_module__", None) or \
-            (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
-        return f'"{_pg_schema(mod).replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
+        mod = (
+            getattr(scalar_type, '__pylon_module__', None)
+            or (scalar_type.__module__ or 'default').rpartition('.')[-1]
+            or 'default'
+        )
+        return (
+            f'"{_pg_schema(mod).replace(chr(34), chr(34) * 2)}"."{scalar_type.__name__.replace(chr(34), chr(34) * 2)}"'
+        )
 
     # Generic Python types (list[str], dict, etc.) → jsonb
     origin = typing.get_origin(scalar_type)
@@ -491,13 +490,13 @@ def _to_pg_type(scalar_type: Any) -> str:
         args = typing.get_args(scalar_type)
         if args:
             elem_pg = _to_pg_type(SHORTHAND_MAP.get(args[0], args[0]))
-            if not elem_pg.startswith("jsonb"):
-                return f"{elem_pg}[]"
-        return "jsonb"
+            if not elem_pg.startswith('jsonb'):
+                return f'{elem_pg}[]'
+        return 'jsonb'
     if origin in (dict, set):
-        return "jsonb"
+        return 'jsonb'
 
-    return "text"
+    return 'text'
 
 
 def _domain_type_ref(scalar_type: Any) -> str | None:
@@ -517,12 +516,13 @@ def _domain_type_ref(scalar_type: Any) -> str | None:
     if not (isinstance(scalar_type, type) and issubclass(scalar_type, Scalar)):
         return None
     from . import _registry
+
     if scalar_type not in _registry.snapshot()[2]:
         return None
-    mod = getattr(scalar_type, "__pylon_module__", None) or (
-        (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+    mod = getattr(scalar_type, '__pylon_module__', None) or (
+        (scalar_type.__module__ or 'default').rpartition('.')[-1] or 'default'
     )
-    return f'"{_pg_schema(mod).replace(chr(34), chr(34)*2)}"."{scalar_type.__name__.replace(chr(34), chr(34)*2)}"'
+    return f'"{_pg_schema(mod).replace(chr(34), chr(34) * 2)}"."{scalar_type.__name__.replace(chr(34), chr(34) * 2)}"'
 
 
 # Canonical PyQL-style type names for every built-in Pylon scalar marker
@@ -530,23 +530,23 @@ def _domain_type_ref(scalar_type: Any) -> str | None:
 # type-name table (duplicated here rather than imported: schema-descriptor
 # construction needs to work with zero server-layer involvement).
 _PYQL_TYPE_NAME_BY_CLASS = {
-    "Str": "std::str",
-    "Int16": "std::int16",
-    "Int32": "std::int32",
-    "Int64": "std::int64",
-    "Float32": "std::float32",
-    "Float64": "std::float64",
-    "Decimal": "std::decimal",
-    "Bool": "std::bool",
-    "DateTime": "std::datetime",
-    "LocalDateTime": "cal::local_datetime",
-    "LocalDate": "cal::local_date",
-    "LocalTime": "cal::local_time",
-    "Duration": "std::duration",
-    "UUID": "std::uuid",
-    "JSON": "std::json",
-    "Bytes": "std::bytes",
-    "Sequence": "std::int64",  # sequences are backed by int64
+    'Str': 'std::str',
+    'Int16': 'std::int16',
+    'Int32': 'std::int32',
+    'Int64': 'std::int64',
+    'Float32': 'std::float32',
+    'Float64': 'std::float64',
+    'Decimal': 'std::decimal',
+    'Bool': 'std::bool',
+    'DateTime': 'std::datetime',
+    'LocalDateTime': 'cal::local_datetime',
+    'LocalDate': 'cal::local_date',
+    'LocalTime': 'cal::local_time',
+    'Duration': 'std::duration',
+    'UUID': 'std::uuid',
+    'JSON': 'std::json',
+    'Bytes': 'std::bytes',
+    'Sequence': 'std::int64',  # sequences are backed by int64
 }
 
 
@@ -575,29 +575,29 @@ def _pyql_type_name(scalar_type: Any) -> str | None:
             elem_text = _pyql_type_name(e.type_)
             if elem_text is None:
                 return None
-            parts.append(elem_text if positional else f"{e.name}: {elem_text}")
-        return f"tuple<{', '.join(parts)}>"
+            parts.append(elem_text if positional else f'{e.name}: {elem_text}')
+        return f'tuple<{", ".join(parts)}>'
     if isinstance(scalar_type, ArrayAnnotation):
         elem_text = _pyql_type_name(scalar_type.element)
-        return f"array<{elem_text}>" if elem_text is not None else None
+        return f'array<{elem_text}>' if elem_text is not None else None
     if typing.get_origin(scalar_type) is list and typing.get_args(scalar_type):
         element = SHORTHAND_MAP.get(typing.get_args(scalar_type)[0], typing.get_args(scalar_type)[0])
         elem_text = _pyql_type_name(element)
-        return f"array<{elem_text}>" if elem_text is not None else None
-    if isinstance(scalar_type, type) and (issubclass(scalar_type, PylonEnum) or issubclass(scalar_type, PylonNamedTuple)):
-        mod = getattr(scalar_type, "__pylon_module__", None) or (
-            (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+        return f'array<{elem_text}>' if elem_text is not None else None
+    if isinstance(scalar_type, type) and issubclass(scalar_type, (PylonEnum, PylonNamedTuple)):
+        mod = getattr(scalar_type, '__pylon_module__', None) or (
+            (scalar_type.__module__ or 'default').rpartition('.')[-1] or 'default'
         )
-        return f"{mod}::{scalar_type.__name__}"
+        return f'{mod}::{scalar_type.__name__}'
     if isinstance(scalar_type, type):
         builtin_name = _PYQL_TYPE_NAME_BY_CLASS.get(scalar_type.__name__)
         if builtin_name:
             return builtin_name
-        if hasattr(scalar_type, "__pylon_base__"):
-            mod = getattr(scalar_type, "__pylon_module__", None) or (
-                (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+        if hasattr(scalar_type, '__pylon_base__'):
+            mod = getattr(scalar_type, '__pylon_module__', None) or (
+                (scalar_type.__module__ or 'default').rpartition('.')[-1] or 'default'
             )
-            return f"{mod}::{scalar_type.__name__}"
+            return f'{mod}::{scalar_type.__name__}'
         # A real `@pylon.type`-decorated schema type (e.g. a computed
         # global like `current_user: Global[Person | None, "select ..."]`)
         # — reuses this file's own `_is_pylon_type`/`_pylon_module_of`/
@@ -611,7 +611,7 @@ def _pyql_type_name(scalar_type: Any) -> str | None:
 
 def _scalar_type_name(scalar_type: Any) -> str:
     """Return a short human-readable name for the scalar type (for Rust ScalarDescriptor.base)."""
-    if hasattr(scalar_type, "__name__"):
+    if hasattr(scalar_type, '__name__'):
         return scalar_type.__name__
     return repr(scalar_type)
 
@@ -624,7 +624,7 @@ def _python_value_to_sql(value: Any) -> str | None:
     import uuid as _uuid
 
     if isinstance(value, bool):
-        return "true" if value else "false"
+        return 'true' if value else 'false'
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -641,22 +641,23 @@ def _python_value_to_sql(value: Any) -> str | None:
 def _make_default_sql(meta: Any) -> str | None:
     """Return a SQL literal/expression for the property's default, or None."""
     import decimal as _decimal
+
     from ._constraints import Default, _NowType, _SequenceNextType
 
     for c in meta.constraints:
         if isinstance(c, Default):
             s = c.sentinel
             if isinstance(s, _NowType):
-                return "now()"
+                return 'now()'
             if isinstance(s, _SequenceNextType):
                 return None  # handled separately in _make_property_desc
             if isinstance(s, str):
                 return None  # PyQL expression — handled by _make_default_pyql
             if s is None:
-                return "NULL"
+                return 'NULL'
             # bool must be checked before int (bool is a subclass of int)
             if isinstance(s, bool):
-                return "true" if s else "false"
+                return 'true' if s else 'false'
             if isinstance(s, (int, float, _decimal.Decimal)):
                 return str(s)
             return None  # unknown sentinel
@@ -669,7 +670,7 @@ def _make_default_sql(meta: Any) -> str | None:
 
 def _make_default_pyql(meta: Any) -> str | None:
     """Return a PyQL expression string from Default(str), or None."""
-    from ._constraints import Default, _SequenceNextType, _NowType
+    from ._constraints import Default
 
     for c in meta.constraints:
         if isinstance(c, Default) and isinstance(c.sentinel, str):
@@ -705,25 +706,23 @@ def _field_checks_and_exclusive(
         if c is Exclusive:
             is_exclusive = True
         elif isinstance(c, MinValue):
-            checks.append(f"{col} >= {c.value!r}")
+            checks.append(f'{col} >= {c.value!r}')
         elif isinstance(c, MaxValue):
-            checks.append(f"{col} <= {c.value!r}")
+            checks.append(f'{col} <= {c.value!r}')
         elif isinstance(c, MinExValue):
-            checks.append(f"{col} > {c.value!r}")
+            checks.append(f'{col} > {c.value!r}')
         elif isinstance(c, MaxExValue):
-            checks.append(f"{col} < {c.value!r}")
+            checks.append(f'{col} < {c.value!r}')
         elif isinstance(c, MaxLen):
-            checks.append(f"char_length({col}) <= {c.length!r}")
+            checks.append(f'char_length({col}) <= {c.length!r}')
         elif isinstance(c, MinLen):
-            checks.append(f"char_length({col}) >= {c.length!r}")
+            checks.append(f'char_length({col}) >= {c.length!r}')
         elif isinstance(c, Regexp):
             escaped = c.pattern.replace("'", "''")
             checks.append(f"{col} ~ '{escaped}'")
         elif isinstance(c, OneOf):
-            literals = ", ".join(
-                "'" + str(v).replace("'", "''") + "'" for v in c.values
-            )
-            checks.append(f"{col} IN ({literals})")
+            literals = ', '.join("'" + str(v).replace("'", "''") + "'" for v in c.values)
+            checks.append(f'{col} IN ({literals})')
 
     return checks, is_exclusive
 
@@ -733,16 +732,17 @@ def _field_checks_and_exclusive(
 
 def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
     from ._constraints import Default, _SequenceNextType
-    from ._scalars import UUID, Scalar as PylonScalar
+    from ._scalars import UUID
+    from ._scalars import Scalar as PylonScalar
 
-    is_pk = name == "id" and meta.scalar_type is UUID
+    is_pk = name == 'id' and meta.scalar_type is UUID
     if is_pk:
         id_default_pyql = _make_default_pyql(meta)
         return _core.PropertyDescriptor(
-            name="id",
-            pg_type="uuid",
+            name='id',
+            pg_type='uuid',
             nullable=False,
-            default_sql=None if id_default_pyql else "uuidv7()",
+            default_sql=None if id_default_pyql else 'uuidv7()',
             default_pyql=id_default_pyql,
             description=meta.description,
             check_constraints=[],
@@ -763,10 +763,8 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
     combined_constraints = list(meta.constraints)
     scalar_type = meta.scalar_type
     if domain_type is None and isinstance(scalar_type, type) and issubclass(scalar_type, PylonScalar):
-        combined_constraints.extend(getattr(scalar_type, "__pylon_constraints__", ()))
-    checks, is_exclusive = _field_checks_and_exclusive(
-        type("_m", (), {"constraints": combined_constraints})(), name
-    )
+        combined_constraints.extend(getattr(scalar_type, '__pylon_constraints__', ()))
+    checks, is_exclusive = _field_checks_and_exclusive(type('_m', (), {'constraints': combined_constraints})(), name)
 
     # SequenceNext default: generate nextval('"module"."Name_seq"')
     default_sql = None
@@ -774,10 +772,10 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
         if isinstance(c, Default) and isinstance(c.sentinel, _SequenceNextType):
             scalar_type = meta.scalar_type
             if isinstance(scalar_type, type) and issubclass(scalar_type, PylonScalar):
-                mod = getattr(scalar_type, "__pylon_module__", None) or (
-                    (scalar_type.__module__ or "default").rpartition(".")[-1] or "default"
+                mod = getattr(scalar_type, '__pylon_module__', None) or (
+                    (scalar_type.__module__ or 'default').rpartition('.')[-1] or 'default'
                 )
-                seq_name = f"{scalar_type.__name__}_seq"
+                seq_name = f'{scalar_type.__name__}_seq'
                 default_sql = f"""nextval('"{_pg_schema(mod)}"."{seq_name}"')"""
             break
     default_pyql = None
@@ -786,12 +784,10 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
     if default_sql is None:
         default_pyql = _make_default_pyql(meta)
 
-    rewrites = [
-        _core.RewriteEntry(on=int(r.on), handler=r.handler)
-        for r in meta.rewrites
-    ]
+    rewrites = [_core.RewriteEntry(on=int(r.on), handler=r.handler) for r in meta.rewrites]
 
     from ._pointers import TupleAnnotation
+
     tuple_members = (
         [_build_tuple_member(e.name, e.type_, _core) for e in meta.scalar_type.elements]
         if isinstance(meta.scalar_type, TupleAnnotation)
@@ -823,10 +819,7 @@ def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
     from ._constraints import Exclusive
 
     is_exclusive = any(c is Exclusive for c in meta.constraints)
-    rewrites = [
-        _core.RewriteEntry(on=int(r.on), handler=r.handler)
-        for r in meta.rewrites
-    ]
+    rewrites = [_core.RewriteEntry(on=int(r.on), handler=r.handler) for r in meta.rewrites]
     return _core.LinkDescriptor(
         name=name,
         target=meta.link_target,  # already a qualified string
@@ -845,7 +838,7 @@ def _make_multilink_desc(name: str, meta: Any, _core: Any) -> Any:
     return _core.MultiLinkDescriptor(
         name=name,
         target=meta.link_target,  # already a qualified string
-        through=meta.through,      # already a qualified string or None
+        through=meta.through,  # already a qualified string or None
         nullable=meta.nullable,
         default_pyql=_make_default_pyql(meta),
         description=meta.description,
@@ -884,18 +877,16 @@ def _make_index_desc(idx: Any, _core: Any) -> Any:
 
 
 def _resolve_vector_pointer(ref: str, type_name: str, valid_pointers: set[str]) -> str:
-    if "." in ref:
-        prefix, pointer = ref.rsplit(".", 1)
+    if '.' in ref:
+        prefix, pointer = ref.rsplit('.', 1)
         if prefix != type_name:
             raise SchemaError(
-                f"VectorPointer {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
+                f'VectorPointer {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}'
             )
     else:
         pointer = ref
     if pointer not in valid_pointers:
-        raise SchemaError(
-            f"VectorPointer {ref!r}: pointer {pointer!r} not found on type {type_name!r}"
-        )
+        raise SchemaError(f'VectorPointer {ref!r}: pointer {pointer!r} not found on type {type_name!r}')
     return pointer
 
 
@@ -911,18 +902,16 @@ def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_pointers:
 
 
 def _resolve_search_pointer(ref: str, type_name: str, valid_pointers: set[str]) -> str:
-    if "." in ref:
-        prefix, pointer = ref.rsplit(".", 1)
+    if '.' in ref:
+        prefix, pointer = ref.rsplit('.', 1)
         if prefix != type_name:
             raise SchemaError(
-                f"SearchPointer {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}"
+                f'SearchPointer {ref!r}: type prefix {prefix!r} does not match enclosing type {type_name!r}'
             )
     else:
         pointer = ref
     if pointer not in valid_pointers:
-        raise SchemaError(
-            f"SearchPointer {ref!r}: pointer {pointer!r} not found on type {type_name!r}"
-        )
+        raise SchemaError(f'SearchPointer {ref!r}: pointer {pointer!r} not found on type {type_name!r}')
     return pointer
 
 
@@ -977,41 +966,31 @@ def _build_type_descriptor(
     computed: list[Any] = []
 
     for pointer_name, meta in effective.items():
-        if meta.kind == "property":
+        if meta.kind == 'property':
             properties.append(_make_property_desc(pointer_name, meta, _core))
-        elif meta.kind == "link":
+        elif meta.kind == 'link':
             links.append(_make_link_desc(pointer_name, meta, _core))
-        elif meta.kind == "multilink":
+        elif meta.kind == 'multilink':
             multilinks.append(_make_multilink_desc(pointer_name, meta, _core))
-        elif meta.kind == "computed":
+        elif meta.kind == 'computed':
             computed.append(_make_computed_desc(pointer_name, meta, _core))
 
     # Merge in class-level C/I/T from abstract non-materialized parents.
-    inherited_constraints, inherited_indexes, inherited_triggers = (
-        _collect_inherited_cit(cls)
-    )
+    inherited_constraints, inherited_indexes, inherited_triggers = _collect_inherited_cit(cls)
     all_constraints = inherited_constraints + list(cfg.constraints)
     all_indexes = inherited_indexes + list(cfg.indexes)
     all_triggers = inherited_triggers + list(cfg.triggers)
 
-    exclusive_constraints = [
-        _make_exclusive_constraint(c, _core)
-        for c in all_constraints
-        if isinstance(c, Exclusive)
-    ]
+    exclusive_constraints = [_make_exclusive_constraint(c, _core) for c in all_constraints if isinstance(c, Exclusive)]
     expression_constraints = [
-        _make_expression_constraint(c, _core)
-        for c in all_constraints
-        if isinstance(c, Expression)
+        _make_expression_constraint(c, _core) for c in all_constraints if isinstance(c, Expression)
     ]
     index_descs = [_make_index_desc(idx, _core) for idx in all_indexes]
     vector_index_descs = [
-        _make_vector_index_desc(vi, _core, cfg.name, set(effective.keys()))
-        for vi in cfg.vector_indexes
+        _make_vector_index_desc(vi, _core, cfg.name, set(effective.keys())) for vi in cfg.vector_indexes
     ]
     search_index_descs = [
-        _make_search_index_desc(si, _core, cfg.name, set(effective.keys()))
-        for si in cfg.search_indexes
+        _make_search_index_desc(si, _core, cfg.name, set(effective.keys())) for si in cfg.search_indexes
     ]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
 
@@ -1025,7 +1004,7 @@ def _build_type_descriptor(
     if cfg.junction and junction_to_ml is not None:
         qname = _qualified(cfg.module, cfg.name)
         source_table, ml_name = junction_to_ml.get(qname, (cfg.table, cfg.name))
-        actual_table = f"{source_table}.{ml_name}"
+        actual_table = f'{source_table}.{ml_name}'
     else:
         actual_table = cfg.table
 
@@ -1057,23 +1036,22 @@ def _build_type_descriptor(
 
 
 def _build_scalar_descriptor(cls: type, _core: Any) -> Any:
-    from ._scalars import PG_TYPE_MAP, Sequence as SequenceScalar, _PylonScalar
+    from ._scalars import PG_TYPE_MAP
+    from ._scalars import Sequence as SequenceScalar
 
-    base_cls = getattr(cls, "__pylon_base__", None)
-    base_name = base_cls.__name__ if base_cls else "Str"
-    pg_type = PG_TYPE_MAP.get(base_cls, "text") if base_cls else "text"
+    base_cls = getattr(cls, '__pylon_base__', None)
+    base_name = base_cls.__name__ if base_cls else 'Str'
+    pg_type = PG_TYPE_MAP.get(base_cls, 'text') if base_cls else 'text'
     is_sequence = isinstance(base_cls, type) and issubclass(base_cls, SequenceScalar)
 
     # Inline constraints on the scalar itself (from @pylon.scalar(Str, MinValue(0)))
-    scalar_constraints = getattr(cls, "__pylon_constraints__", ())
+    scalar_constraints = getattr(cls, '__pylon_constraints__', ())
     checks, _ = _field_checks_and_exclusive(
-        type("_m", (), {"constraints": list(scalar_constraints), "rewrites": []})(),
-        "value",  # conventional name inside DOMAIN CHECK
+        type('_m', (), {'constraints': list(scalar_constraints), 'rewrites': []})(),
+        'value',  # conventional name inside DOMAIN CHECK
     )
 
-    module = getattr(cls, "__pylon_module__", None) or (
-        (cls.__module__ or "default").rpartition(".")[-1] or "default"
-    )
+    module = getattr(cls, '__pylon_module__', None) or ((cls.__module__ or 'default').rpartition('.')[-1] or 'default')
 
     return _core.ScalarDescriptor(
         name=cls.__name__,
@@ -1086,9 +1064,7 @@ def _build_scalar_descriptor(cls: type, _core: Any) -> Any:
 
 
 def _build_enum_descriptor(cls: type, _core: Any) -> Any:
-    module = getattr(cls, "__pylon_module__", None) or (
-        (cls.__module__ or "default").rpartition(".")[-1] or "default"
-    )
+    module = getattr(cls, '__pylon_module__', None) or ((cls.__module__ or 'default').rpartition('.')[-1] or 'default')
     members = [m.name for m in cls]
     return _core.EnumDescriptor(name=cls.__name__, module=module, members=members)
 
@@ -1099,37 +1075,32 @@ def _build_tuple_member(name: str | None, annotation: Any, _core: Any) -> Any:
     TupleAnnotation (pylon.Tuple[...]). Shared by nominal named-tuple
     dataclass fields and structural pylon.Tuple[...] elements; recurses for a
     nested tuple member."""
-    from ._named_tuples import NamedTuple as PylonNamedTuple
     from ._enums import Enum as PylonEnum
+    from ._named_tuples import NamedTuple as PylonNamedTuple
     from ._pointers import TupleAnnotation
 
     if isinstance(annotation, TupleAnnotation):
         members = [_build_tuple_member(e.name, e.type_, _core) for e in annotation.elements]
-        return _core.TupleMember(name, "tuple", members=members)
+        return _core.TupleMember(name, 'tuple', members=members)
 
     if isinstance(annotation, type) and issubclass(annotation, PylonNamedTuple):
-        mod = getattr(annotation, "__pylon_module__", None) or (
-            (annotation.__module__ or "default").rpartition(".")[-1] or "default"
+        mod = getattr(annotation, '__pylon_module__', None) or (
+            (annotation.__module__ or 'default').rpartition('.')[-1] or 'default'
         )
-        return _core.TupleMember(name, "namedTuple", module=mod, type_name=annotation.__name__)
+        return _core.TupleMember(name, 'namedTuple', module=mod, type_name=annotation.__name__)
 
     if isinstance(annotation, type) and issubclass(annotation, PylonEnum):
-        mod = getattr(annotation, "__pylon_module__", None) or (
-            (annotation.__module__ or "default").rpartition(".")[-1] or "default"
+        mod = getattr(annotation, '__pylon_module__', None) or (
+            (annotation.__module__ or 'default').rpartition('.')[-1] or 'default'
         )
-        return _core.TupleMember(name, "enum", module=mod, type_name=annotation.__name__)
+        return _core.TupleMember(name, 'enum', module=mod, type_name=annotation.__name__)
 
-    return _core.TupleMember(name, "scalar", pg_type=_to_pg_type(annotation))
+    return _core.TupleMember(name, 'scalar', pg_type=_to_pg_type(annotation))
 
 
 def _build_named_tuple_descriptor(cls: type, _core: Any) -> Any:
-    module = getattr(cls, "__pylon_module__", None) or (
-        (cls.__module__ or "default").rpartition(".")[-1] or "default"
-    )
-    members = [
-        _build_tuple_member(name, annotation, _core)
-        for name, annotation in cls.__annotations__.items()
-    ]
+    module = getattr(cls, '__pylon_module__', None) or ((cls.__module__ or 'default').rpartition('.')[-1] or 'default')
+    members = [_build_tuple_member(name, annotation, _core) for name, annotation in cls.__annotations__.items()]
     return _core.NamedTupleDescriptor(name=cls.__name__, module=module, members=members)
 
 
@@ -1141,7 +1112,7 @@ def _build_global_descriptor(g: Any, _core: Any) -> Any:
     # `_pyql_type_name` genuinely can't classify the value at all (should
     # not happen in practice — every real global scalar_type is one of the
     # cases it covers).
-    scalar_type_name = _pyql_type_name(g.scalar_type) or getattr(g.scalar_type, "__name__", repr(g.scalar_type))
+    scalar_type_name = _pyql_type_name(g.scalar_type) or getattr(g.scalar_type, '__name__', repr(g.scalar_type))
 
     default_expr: str | None = None
     if g.default is not MISSING:
@@ -1161,8 +1132,9 @@ def _build_global_descriptor(g: Any, _core: Any) -> Any:
 
 
 def _build_channel_descriptor(c: Any, _core: Any) -> Any:
-    from ._channels import wire_name_for_channel
     from pylon.datatypes import Object as _PylonObject
+
+    from ._channels import wire_name_for_channel
 
     wire_name = wire_name_for_channel(c)
     payload_type = c.payload_type
@@ -1180,7 +1152,7 @@ def _build_channel_descriptor(c: Any, _core: Any) -> Any:
             name=c.name,
             module=c.module,
             wire_name=wire_name,
-            payload_kind="object",
+            payload_kind='object',
             payload_object_fields=object_fields,
             description=c.description,
         )
@@ -1192,7 +1164,7 @@ def _build_channel_descriptor(c: Any, _core: Any) -> Any:
             name=c.name,
             module=c.module,
             wire_name=wire_name,
-            payload_kind="type",
+            payload_kind='type',
             payload_type_ref=type_ref,
             description=c.description,
         )
@@ -1203,7 +1175,7 @@ def _build_channel_descriptor(c: Any, _core: Any) -> Any:
         name=c.name,
         module=c.module,
         wire_name=wire_name,
-        payload_kind="scalar",
+        payload_kind='scalar',
         payload_scalar_pg_type=pg_type,
         description=c.description,
     )
@@ -1225,17 +1197,17 @@ def _validate_channels(channels: list) -> None:
         wire_name = wire_name_for_channel(c)
         if wire_name.startswith(RESERVED_WIRE_NAME_PREFIX):
             raise SchemaError(
-                f"Channel {_qualified(c.module, c.name)!r} has wire name {wire_name!r}, "
-                f"which starts with the reserved {RESERVED_WIRE_NAME_PREFIX!r} prefix "
+                f'Channel {_qualified(c.module, c.name)!r} has wire name {wire_name!r}, '
+                f'which starts with the reserved {RESERVED_WIRE_NAME_PREFIX!r} prefix '
                 f"(used internally by Pylon's own cache/signal/index channels) — "
-                f"pick a different name= or variable name."
+                f'pick a different name= or variable name.'
             )
         if wire_name in seen:
             other = seen[wire_name]
             raise SchemaError(
-                f"Duplicate channel wire name {wire_name!r}: "
-                f"both {_qualified(other.module, other.name)!r} and {_qualified(c.module, c.name)!r} "
-                f"resolve to the same PostgreSQL NOTIFY/LISTEN channel."
+                f'Duplicate channel wire name {wire_name!r}: '
+                f'both {_qualified(other.module, other.name)!r} and {_qualified(c.module, c.name)!r} '
+                f'resolve to the same PostgreSQL NOTIFY/LISTEN channel.'
             )
         seen[wire_name] = c
 
@@ -1254,7 +1226,6 @@ def _parse_return_annotation(
     qualified type name like 'default::Account' (for object returns).
     """
     import typing as _typing
-    from ._lazy import _Lazy
 
     is_set = False
     is_object = False
@@ -1286,9 +1257,9 @@ def _parse_return_annotation(
         annotation = a_args[0]
 
     # Check if this is a Pylon object type
-    if isinstance(annotation, type) and hasattr(annotation, "__pylon_config__"):
+    if isinstance(annotation, type) and hasattr(annotation, '__pylon_config__'):
         cfg = annotation.__pylon_config__
-        qname = f"{cfg.module}::{cfg.name}"
+        qname = f'{cfg.module}::{cfg.name}'
         is_object = True
         is_polymorphic = cfg.abstract and cfg.materialized
         return qname, is_object, is_set, is_polymorphic
@@ -1311,6 +1282,7 @@ def _parse_return_annotation(
 def _param_pg_type(annotation: Any) -> str:
     """Resolve a parameter type annotation to a PostgreSQL type string."""
     import typing as _typing
+
     # Unwrap Optional
     origin = _typing.get_origin(annotation)
     if origin is _typing.Union:
@@ -1321,8 +1293,8 @@ def _param_pg_type(annotation: Any) -> str:
     if _typing.get_origin(annotation) is _typing.Annotated:
         annotation = _typing.get_args(annotation)[0]
     # Object types: use uuid (FK-like param)
-    if isinstance(annotation, type) and hasattr(annotation, "__pylon_config__"):
-        return "uuid"
+    if isinstance(annotation, type) and hasattr(annotation, '__pylon_config__'):
+        return 'uuid'
     return _to_pg_type(annotation)
 
 
@@ -1340,18 +1312,17 @@ def _build_function_descriptor(
     try:
         hints = _typing.get_type_hints(func, include_extras=True)
     except Exception:
-        hints = getattr(func, "__annotations__", {})
+        hints = getattr(func, '__annotations__', {})
 
     # Build parameter descriptors
-    sig = __import__("inspect").signature(func)
+    sig = __import__('inspect').signature(func)
     params = []
     param_pg_types = []
     for param_name, param in sig.parameters.items():
         annotation = hints.get(param_name, param.annotation)
-        if annotation is __import__("inspect").Parameter.empty:
+        if annotation is __import__('inspect').Parameter.empty:
             raise SchemaError(
-                f"function '{config.module}::{config.name}' parameter '{param_name}' "
-                f"has no type annotation"
+                f"function '{config.module}::{config.name}' parameter '{param_name}' has no type annotation"
             )
         pg_type = _param_pg_type(annotation)
         params.append(_core.FunctionParamDescriptor(name=param_name, pg_type=pg_type))
@@ -1363,25 +1334,23 @@ def _build_function_descriptor(
             raise SchemaError(
                 f"Duplicate function signature '{config.module}::{config.name}"
                 f"({', '.join(param_pg_types)})': both "
-                f"{seen_signatures[sig_key]!r} and {func!r}"
+                f'{seen_signatures[sig_key]!r} and {func!r}'
             )
         seen_signatures[sig_key] = func
 
     # Parse return type
-    return_annotation = hints.get("return", __import__("inspect").Parameter.empty)
-    if return_annotation is __import__("inspect").Parameter.empty:
-        raise SchemaError(
-            f"function '{config.module}::{config.name}' has no return type annotation"
-        )
-    return_pg_type, return_is_object, return_is_set, return_is_polymorphic = (
-        _parse_return_annotation(return_annotation, type_map, class_to_qname)
+    return_annotation = hints.get('return', __import__('inspect').Parameter.empty)
+    if return_annotation is __import__('inspect').Parameter.empty:
+        raise SchemaError(f"function '{config.module}::{config.name}' has no return type annotation")
+    return_pg_type, return_is_object, return_is_set, return_is_polymorphic = _parse_return_annotation(
+        return_annotation, type_map, class_to_qname
     )
 
     if return_is_object and not return_is_set:
         raise SchemaError(
             f"function '{config.module}::{config.name}': object-returning functions must "
-            f"annotate the return type as set[T], not a bare T — single-object returns "
-            f"are not supported"
+            f'annotate the return type as set[T], not a bare T — single-object returns '
+            f'are not supported'
         )
 
     volatility = config.volatility or Volatility.Volatile
@@ -1397,10 +1366,6 @@ def _build_function_descriptor(
         return_is_polymorphic=return_is_polymorphic,
         volatility=volatility,
     )
-
-
-# Import Volatility for use in walker
-from ._functions import Volatility
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -1457,24 +1422,17 @@ def walk(
 
     # Phase 5+6 — build PyO3 descriptors
     type_descs = [
-        _build_type_descriptor(cls, class_to_qname, _core, junction_to_ml, signal_ops_by_class)
-        for cls in types
+        _build_type_descriptor(cls, class_to_qname, _core, junction_to_ml, signal_ops_by_class) for cls in types
     ]
     scalar_descs = [_build_scalar_descriptor(cls, _core) for cls in custom_scalars]
     enum_descs = [_build_enum_descriptor(cls, _core) for cls in enums]
-    named_tuple_descs = [
-        _build_named_tuple_descriptor(cls, _core) for cls in (named_tuples or [])
-    ]
+    named_tuple_descs = [_build_named_tuple_descriptor(cls, _core) for cls in (named_tuples or [])]
     global_descs = [_build_global_descriptor(g, _core) for g in globals_]
     seen_fn_signatures: dict[tuple[str, str, tuple[str, ...]], Any] = {}
     fn_descs = [
-        _build_function_descriptor(f, type_map, class_to_qname, _core, seen_fn_signatures)
-        for f in (functions or [])
+        _build_function_descriptor(f, type_map, class_to_qname, _core, seen_fn_signatures) for f in (functions or [])
     ]
-    alias_descs = [
-        _core.AliasDescriptor(name=a.name, module=a.module, expr=a.expr)
-        for a in (aliases or [])
-    ]
+    alias_descs = [_core.AliasDescriptor(name=a.name, module=a.module, expr=a.expr) for a in (aliases or [])]
     channel_descs = [_build_channel_descriptor(c, _core) for c in (channels or [])]
 
     schema = _core.SchemaDescriptor(

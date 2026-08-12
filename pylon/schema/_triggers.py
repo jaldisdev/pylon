@@ -20,11 +20,12 @@
 from __future__ import annotations
 
 import enum
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from . import _collector
 
-_F = TypeVar("_F", bound=Callable[..., Any])
+_F = TypeVar('_F', bound=Callable[..., Any])
 
 
 class On(enum.IntFlag):
@@ -43,9 +44,9 @@ class On(enum.IntFlag):
 class Timing(enum.Enum):
     """When a trigger fires relative to the mutation event."""
 
-    Before = "Before"
-    After = "After"
-    InsteadOf = "InsteadOf"
+    Before = 'Before'
+    After = 'After'
+    InsteadOf = 'InsteadOf'
 
 
 class Trigger:
@@ -76,7 +77,7 @@ class Trigger:
         _collector.register(self)
 
     def __repr__(self) -> str:
-        return f"Trigger(on={self.on!r}, timing={self.timing!r}, handler={self.handler!r})"
+        return f'Trigger(on={self.on!r}, timing={self.timing!r}, handler={self.handler!r})'
 
 
 class Rewrite:
@@ -99,12 +100,10 @@ class Rewrite:
         self.handler = handler
 
     def __repr__(self) -> str:
-        return f"Rewrite({self.on!r}, {self.handler!r})"
+        return f'Rewrite({self.on!r}, {self.handler!r})'
 
 
-def signal(
-    target: type, *, on: On = On.Insert | On.Update | On.Delete
-) -> Callable[[_F], _F]:
+def signal(target: type, *, on: On = On.Insert | On.Update | On.Delete) -> Callable[[_F], _F]:
     """Register an async handler that fires after a mutation on `target` commits.
 
     Usage::
@@ -122,13 +121,12 @@ def signal(
     Handlers run asynchronously, after the transaction that triggered them
     has already committed, not inline with the mutation.
     """
-    if not hasattr(target, "__pylon_config__"):
-        raise TypeError(
-            f"pylon.signal target must be a @pylon.type-decorated class, got {target!r}"
-        )
+    if not hasattr(target, '__pylon_config__'):
+        raise TypeError(f'pylon.signal target must be a @pylon.type-decorated class, got {target!r}')
 
     def decorator(func: _F) -> _F:
         from ._registry import SignalRegistration, register_signal
+
         register_signal(SignalRegistration(target=target, on=int(on), handler=func))
         return func
 

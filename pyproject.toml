@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.1.1"]
+dev = ["pytest>=9.1.1", "ruff>=0.16"]
 
 [project.scripts]
 pylon = 'pylon.cli:main'
@@ -34,3 +34,48 @@ module-name = "pylon._core"
 testpaths = ["tests"]
 markers = ["live_db: requires a real Postgres reachable via PYLON_PGCON_TEST_DSN (opt-in)"]
 addopts = "-m 'not live_db'"
+
+[tool.ruff]
+line-length = 120
+# Tied to `requires-python` above, not to the newest interpreter we run on:
+# target-version governs which modernizations ruff is allowed to apply, and
+# the CI matrix still builds and tests against 3.13. Raising this to py314
+# would let ruff rewrite code into syntax that breaks the 3.13 job.
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pylon's schema DSL puts non-type expressions inside annotation subscripts:
+# `pylon.Tuple[("r", pylon.Int16), ...]` names tuple fields with string
+# labels, and `pylon.Computed[pylon.Str, ".name"]` carries a PyQL fragment as
+# its second argument. Ruff parses both as forward annotations and reports the
+# labels as undefined names (F821) and the PyQL fragment as a syntax error
+# (F722). UP037 is the dangerous one: it "removes redundant quotes" from those
+# labels, silently turning the string `"r"` into the name `r` and changing what
+# the DSL builds. Scoped to the three test modules that exercise that syntax
+# rather than disabled globally, so a genuine undefined name elsewhere still
+# fails.
+"tests/test_finalize.py" = ["F821", "UP037"]
+"tests/test_functions.py" = ["F722", "UP037"]
+# RUF012: a Pylon schema class declares its default *in* the class body
+# (`tags_list: list[str] = []`), which is the DSL's own syntax for a default,
+# not an accidentally-shared mutable class attribute.
+"tests/test_schema.py" = ["F821", "F722", "UP037", "RUF012"]
+# UP007: every hit here is `return typing.Union[self, type(None)]` inside a
+# pointer's own `__or__`. That is a runtime type construction, not an
+# annotation — rewriting it to `self | type(None)` would re-enter `__or__` and
+# recurse forever.
+"pylon/schema/_pointers.py" = ["UP007"]
+# UP042: `class Enum(str, enum.Enum)` cannot become `enum.StrEnum` — the
+# mixin form's `str()` is load-bearing for how enum members are rendered into
+# SQL, and StrEnum changes it.
+"pylon/schema/_enums.py" = ["UP042"]
+# RUF063: the `__dict__["__annotations__"]` read is the pre-3.14 fallback and
+# is deliberately *own* annotations only; `inspect.get_annotations` walks the
+# MRO and would pull in inherited ones.
+"pylon/schema/_decorators.py" = ["RUF063"]
+
+[tool.ruff.format]
+quote-style = "single"

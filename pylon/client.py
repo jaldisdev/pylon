@@ -60,16 +60,14 @@ class AsyncTransaction:
     inspects this flag in ``__anext__`` to decide whether to loop again.
     """
 
-    def __init__(self, tx: "PgconTransaction") -> None:
+    def __init__(self, tx: PgconTransaction) -> None:
         self._tx = tx
         self._retry_exc: Exception | None = None
 
-    async def __aenter__(self) -> "AsyncTransaction":
+    async def __aenter__(self) -> AsyncTransaction:
         return self
 
-    async def __aexit__(
-        self, exc_type: type | None, exc: BaseException | None, tb: object
-    ) -> bool:
+    async def __aexit__(self, exc_type: type | None, exc: BaseException | None, tb: object) -> bool:
         if exc_type is None:
             # Happy path — attempt commit. `self._tx.commit()` already
             # raises the correctly-mapped `pylon.exceptions.*` instance
@@ -96,25 +94,23 @@ class AsyncTransaction:
         """Execute *pyql* and return all results as a list."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
-        return _hydrate([{"result": row} for row in rows], compiled)
+        return _hydrate([{'result': row} for row in rows], compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
         if len(rows) > 1:
-            raise ResultCardinalityError(
-                f"query_single expected at most one result, got {len(rows)}."
-            )
+            raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
         if not rows:
             return None
-        return _hydrate([{"result": row} for row in rows], compiled)[0]
+        return _hydrate([{'result': row} for row in rows], compiled)[0]
 
     async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Return exactly one result; raise if the set is empty or has >1 row."""
         result = await self.query_single(pyql, *args, **kwargs)
         if result is None:
-            raise NoDataError("query_required_single returned an empty result set.")
+            raise NoDataError('query_required_single returned an empty result set.')
         return result
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
@@ -129,16 +125,14 @@ class AsyncTransaction:
         """
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled_json_agg(compiled, params)
-        return rows[0] if rows else "[]"
+        return rows[0] if rows else '[]'
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
         if len(rows) > 1:
-            raise ResultCardinalityError(
-                f"query_single_json expected at most one result, got {len(rows)}."
-            )
+            raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:
             return None
         json_rows = await self._tx.query_compiled_row_to_json(compiled, params)
@@ -148,9 +142,7 @@ class AsyncTransaction:
         """Return exactly one result as a JSON string; raise if the set is empty."""
         result = await self.query_single_json(pyql, *args, **kwargs)
         if result is None:
-            raise NoDataError(
-                "query_required_single_json returned an empty result set."
-            )
+            raise NoDataError('query_required_single_json returned an empty result set.')
         return result
 
 
@@ -173,14 +165,14 @@ class RetryingTransaction:
     Do not construct directly — use ``client.transaction()``.
     """
 
-    def __init__(self, pool: "PgconPool", *, attempts: int, isolation: str) -> None:
+    def __init__(self, pool: PgconPool, *, attempts: int, isolation: str) -> None:
         self._pool = pool
         self._attempts = attempts
         self._isolation = isolation
         self._attempt = 0
         self._prev_tx: AsyncTransaction | None = None
 
-    def __aiter__(self) -> "RetryingTransaction":
+    def __aiter__(self) -> RetryingTransaction:
         return self
 
     async def __anext__(self) -> AsyncTransaction:
@@ -214,15 +206,16 @@ class RetryingTransaction:
 # statement token only; `Client.analyze()` mirrors that by accepting a query
 # with or without it already written, rather than requiring callers to
 # remember to type it themselves.
-_ANALYZE_PREFIX_RE = re.compile(r"(?is)^analyze\b")
+_ANALYZE_PREFIX_RE = re.compile(r'(?is)^analyze\b')
 
 
 class _PoolRef:
     """Shared mutable pool holder so Client.with_globals() siblings stay in sync."""
-    __slots__ = ("pool", "lock")
+
+    __slots__ = ('lock', 'pool')
 
     def __init__(self) -> None:
-        self.pool: "PgconPool | None" = None
+        self.pool: PgconPool | None = None
         self.lock = asyncio.Lock()
 
 
@@ -259,7 +252,7 @@ class Client:
                 return
             dsn = self._config.database.dsn or _build_dsn(self._config.database)
             # Swap the pylon:// scheme for postgresql:// if present.
-            dsn = dsn.replace("pylon://", "postgresql://", 1)
+            dsn = dsn.replace('pylon://', 'postgresql://', 1)
             # `pgcon_connect` already raises the correctly-mapped
             # `ConnectionFailedError`/`ConnectionTimeoutError` itself (see
             # `pgcon_connect_err` in `pgcon.rs`) — no try/except needed here
@@ -270,8 +263,10 @@ class Client:
             # accepted/validated on `DatabaseConfig` for config-surface
             # compatibility, just not enforced at the connection layer.
             from pylon._core import pgcon_connect
+
             self._ref.pool = await pgcon_connect(dsn, self._config.database.pool_max_size)
             from pylon import cache as _cache
+
             _cache.init(self._config.cache)
             await _install_migrated_schema(self._ref.pool)
 
@@ -282,7 +277,7 @@ class Client:
                 self._ref.pool = None
 
     # Support ``async with Client(config) as client:``
-    async def __aenter__(self) -> "Client":
+    async def __aenter__(self) -> Client:
         await self.ensure_connected()
         return self
 
@@ -293,18 +288,16 @@ class Client:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _require_pool(self) -> "PgconPool":
+    def _require_pool(self) -> PgconPool:
         if self._ref.pool is None:
-            raise ClientConnectionClosedError(
-                "Client is not connected. Call await client.ensure_connected() first."
-            )
+            raise ClientConnectionClosedError('Client is not connected. Call await client.ensure_connected() first.')
         return self._ref.pool
 
     # ------------------------------------------------------------------
     # Query interface
     # ------------------------------------------------------------------
 
-    def with_globals(self, globals_: dict[str, Any]) -> "Client":
+    def with_globals(self, globals_: dict[str, Any]) -> Client:
         """Return a client view that injects *globals_* into every query.
 
         The returned client shares the same connection pool.  Globals are
@@ -323,7 +316,7 @@ class Client:
         c._config_options = self._config_options
         return c
 
-    def with_config(self, options: dict[str, Any]) -> "Client":
+    def with_config(self, options: dict[str, Any]) -> Client:
         """Return a client view that applies session config *options* to every query.
 
         The returned client shares the same connection pool. See
@@ -356,6 +349,7 @@ class Client:
             _emit_warnings(compiled)
 
         from pylon import cache as _cache
+
         cached = _cache.get(compiled, params, self._config.cache)
         if cached is not None:
             return _hydrate(cached, compiled)
@@ -364,7 +358,7 @@ class Client:
         # `pylon.exceptions.*` instance on failure (see `pgcon_err` in
         # `pgcon.rs`) — no exception translation needed here.
         rows = await pool.query_compiled(compiled, params)
-        records = [{"result": row} for row in rows]
+        records = [{'result': row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
         return _hydrate(records, compiled)
 
@@ -382,22 +376,19 @@ class Client:
             _emit_warnings(compiled)
 
         from pylon import cache as _cache
+
         cached = _cache.get(compiled, params, self._config.cache)
         if cached is not None:
             if len(cached) > 1:
-                raise ResultCardinalityError(
-                    f"query_single expected at most one result, got {len(cached)}."
-                )
+                raise ResultCardinalityError(f'query_single expected at most one result, got {len(cached)}.')
             if not cached:
                 return None
             return _hydrate(cached, compiled)[0]
 
         rows = await pool.query_compiled(compiled, params)
         if len(rows) > 1:
-            raise ResultCardinalityError(
-                f"query_single expected at most one result, got {len(rows)}."
-            )
-        records = [{"result": row} for row in rows]
+            raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
+        records = [{'result': row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
         if not records:
             return None
@@ -411,7 +402,7 @@ class Client:
         """
         result = await self.query_single(pyql, *args, **kwargs)
         if result is None:
-            raise NoDataError("query_required_single returned an empty result set.")
+            raise NoDataError('query_required_single returned an empty result set.')
         return result
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
@@ -420,7 +411,7 @@ class Client:
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         await pool.execute_compiled(compiled, params)
 
-    async def listen(self, channel: str) -> AsyncGenerator[Any, None]:
+    async def listen(self, channel: str) -> AsyncGenerator[Any]:
         """Listen for `NOTIFY` payloads on a schema-declared `Channel`.
 
         Opens a dedicated (non-pooled) connection for the lifetime of the
@@ -458,7 +449,7 @@ class Client:
         ch = resolve_channel(schema, channel)
 
         dsn = self._config.database.dsn or _build_dsn(self._config.database)
-        dsn = dsn.replace("pylon://", "postgresql://", 1)
+        dsn = dsn.replace('pylon://', 'postgresql://', 1)
         conn = await pgcon_listen(dsn)
 
         queue: asyncio.Queue[str] = asyncio.Queue()
@@ -477,13 +468,14 @@ class Client:
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
         from pylon import cache as _cache
-        hit, cached = _cache.get_json(compiled, params, self._config.cache, kind="json_all")
+
+        hit, cached = _cache.get_json(compiled, params, self._config.cache, kind='json_all')
         if hit:
-            return cached if cached is not None else "[]"
+            return cached if cached is not None else '[]'
 
         rows = await pool.query_compiled_json_agg(compiled, params)
-        value = rows[0] if rows else "[]"
-        _cache.put_json(compiled, params, value, self._config.cache, kind="json_all")
+        value = rows[0] if rows else '[]'
+        _cache.put_json(compiled, params, value, self._config.cache, kind='json_all')
         return value
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
@@ -496,21 +488,20 @@ class Client:
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
         from pylon import cache as _cache
-        hit, cached = _cache.get_json(compiled, params, self._config.cache, kind="json_single")
+
+        hit, cached = _cache.get_json(compiled, params, self._config.cache, kind='json_single')
         if hit:
             return cached
 
         rows = await pool.query_compiled(compiled, params)
         if len(rows) > 1:
-            raise ResultCardinalityError(
-                f"query_single_json expected at most one result, got {len(rows)}."
-            )
+            raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:
-            _cache.put_json(compiled, params, None, self._config.cache, kind="json_single")
+            _cache.put_json(compiled, params, None, self._config.cache, kind='json_single')
             return None
         json_rows = await pool.query_compiled_row_to_json(compiled, params)
         value = json_rows[0] if json_rows else None
-        _cache.put_json(compiled, params, value, self._config.cache, kind="json_single")
+        _cache.put_json(compiled, params, value, self._config.cache, kind='json_single')
         return value
 
     async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
@@ -521,9 +512,7 @@ class Client:
         """
         result = await self.query_single_json(pyql, *args, **kwargs)
         if result is None:
-            raise NoDataError(
-                "query_required_single_json returned an empty result set."
-            )
+            raise NoDataError('query_required_single_json returned an empty result set.')
         return result
 
     async def analyze(self, pyql: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -540,7 +529,7 @@ class Client:
         ``children`` (each a ``{"name": ..., "node": {...}}`` entry).
         """
         pool = self._require_pool()
-        normalized = pyql if _ANALYZE_PREFIX_RE.match(pyql.lstrip()) else f"analyze {pyql}"
+        normalized = pyql if _ANALYZE_PREFIX_RE.match(pyql.lstrip()) else f'analyze {pyql}'
         compiled, params = await _compile_and_resolve(
             normalized, _merge_args(args, kwargs), self._config, self._globals, self._config_options
         )
@@ -559,6 +548,7 @@ class Client:
         `pylon.modelquery.prepare_save` for the diffing/rendering logic.
         """
         from pylon import modelquery
+
         # The `__pylon_saved__` shadow is only refreshed once the whole
         # transaction has actually committed (after the retry loop below
         # exits normally) — refreshing it per-statement, inside the loop,
@@ -573,7 +563,7 @@ class Client:
                     if prepared is None:
                         continue
                     pyql, params = prepared
-                    is_new = "__pylon_saved__" not in obj.__dict__
+                    is_new = '__pylon_saved__' not in obj.__dict__
                     if is_new:
                         result = await tx.query_single(pyql, **params)
                         obj.id = result.id
@@ -581,10 +571,10 @@ class Client:
                         await tx.execute(pyql, **params)
         for obj in objs:
             cfg = type(obj).__pylon_config__
-            obj.__dict__["__pylon_saved__"] = {
+            obj.__dict__['__pylon_saved__'] = {
                 name: obj.__dict__[name]
                 for name, meta in cfg.pointers.items()
-                if meta.kind == "property" and name in obj.__dict__
+                if meta.kind == 'property' and name in obj.__dict__
             }
 
     # ------------------------------------------------------------------
@@ -595,7 +585,7 @@ class Client:
         self,
         *,
         attempts: int = 3,
-        isolation: str = "serializable",
+        isolation: str = 'serializable',
     ) -> RetryingTransaction:
         """Return an async iterator that drives a retrying transaction loop.
 
@@ -623,17 +613,15 @@ class Client:
                     ...
         """
         if attempts < 1:
-            raise InterfaceError("attempts must be >= 1.")
-        return RetryingTransaction(
-            self._require_pool(), attempts=attempts, isolation=isolation
-        )
+            raise InterfaceError('attempts must be >= 1.')
+        return RetryingTransaction(self._require_pool(), attempts=attempts, isolation=isolation)
 
     # ------------------------------------------------------------------
     # Raw access (escape hatch)
     # ------------------------------------------------------------------
 
     @asynccontextmanager
-    async def raw_connection(self) -> AsyncGenerator["PgconPool", None]:
+    async def raw_connection(self) -> AsyncGenerator[PgconPool]:
         """Yield the underlying pgcon pool handle for queries outside PyQL.
 
         Use sparingly — this bypasses the transpiler entirely. Exposes
@@ -651,10 +639,10 @@ class Client:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
-        state = "connected" if self._ref.pool is not None else "disconnected"
+        state = 'connected' if self._ref.pool is not None else 'disconnected'
         db = self._config.database
-        target = db.dsn or f"{db.host}:{db.port}/{db.name}"
-        return f"<Client [{state}] {target}>"
+        target = db.dsn or f'{db.host}:{db.port}/{db.name}'
+        return f'<Client [{state}] {target}>'
 
 
 # ---------------------------------------------------------------------------
@@ -681,8 +669,9 @@ def create_async_client(config: Config | None = None) -> Client:
 # ---------------------------------------------------------------------------
 
 
-def _emit_warnings(compiled: "CompiledQuery") -> None:
+def _emit_warnings(compiled: CompiledQuery) -> None:
     import warnings as _warnings
+
     for msg in compiled.warnings():
         _warnings.warn(msg, stacklevel=4)
 
@@ -701,10 +690,10 @@ def _record_compile(success: bool) -> None:
 async def _compile_and_resolve(
     pyql: str,
     kwargs: dict[str, Any],
-    config: "Config",
+    config: Config,
     globals_: dict[str, Any] | None = None,
     config_options: dict[str, Any] | None = None,
-) -> tuple["CompiledQuery", list[Any]]:
+) -> tuple[CompiledQuery, list[Any]]:
     """Compile PyQL and, for OpenSearch-backed queries, perform the HTTP phase first.
 
     Returns ``(compiled, params)`` ready for ``pool.query_compiled``/
@@ -714,10 +703,11 @@ async def _compile_and_resolve(
     """
     pyql, kwargs = _normalize_pyql_source(pyql, kwargs)
     from pylon.query import compile as _pyql_compile
+
     try:
         compiled = _pyql_compile(
             pyql,
-            allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
+            allow_user_specified_id=bool((config_options or {}).get('allow_user_specified_id', False)),
         )
     except PylonError:
         _record_compile(False)
@@ -737,78 +727,79 @@ async def _compile_and_resolve(
         try:
             params: list[Any] = []
             for name in compiled.param_names:
-                if name.startswith("__global__"):
-                    qname = name[len("__global__"):]
+                if name.startswith('__global__'):
+                    qname = name[len('__global__') :]
                     params.append((globals_ or {}).get(qname))
                 else:
                     params.append(kwargs[name])
         except KeyError as exc:
-            raise InterfaceError(f"Missing query parameter: {exc}") from exc
+            raise InterfaceError(f'Missing query parameter: {exc}') from exc
         return compiled, params
 
     query_text = _resolve_query_text(plan, kwargs)
 
-    if plan["kind"] == "search":
+    if plan['kind'] == 'search':
         # fts::search deferred path — fetch (id, score) pairs, inject as array params.
-        search_cfg = config.search_registry.get("default")
+        search_cfg = config.search_registry.get('default')
         if search_cfg is None:
-            raise InterfaceError(
-                "fts::search requires [search] config in pylon.toml"
-            )
-        base_url = f"http://{search_cfg.host}:{search_cfg.port}"
-        size = plan["size"] or 100
-        if plan["backend"] == "meilisearch":
+            raise InterfaceError('fts::search requires [search] config in pylon.toml')
+        base_url = f'http://{search_cfg.host}:{search_cfg.port}'
+        size = plan['size'] or 100
+        if plan['backend'] == 'meilisearch':
             from pylon.search.meilisearch import MeilisearchClient
+
             async with MeilisearchClient(base_url, api_key=search_cfg.api_key) as client:
-                hits = await client.search(plan["index_name"], query_text or "", size=size)
+                hits = await client.search(plan['index_name'], query_text or '', size=size)
         else:
             from pylon.search.opensearch import OpenSearchClient
+
             auth = (search_cfg.user, search_cfg.password) if search_cfg.user else None
             async with OpenSearchClient(base_url, auth=auth) as client:
-                hits = await client.search(plan["index_name"], query_text or "", size=size)
+                hits = await client.search(plan['index_name'], query_text or '', size=size)
         ids = [h[0] for h in hits]
         scores = [h[1] for h in hits]
-        extra = {"__deferred_ids__": ids, "__deferred_scores__": scores}
+        extra = {'__deferred_ids__': ids, '__deferred_scores__': scores}
 
     else:
         # vector::search text overload — embed the query text (via Rust's
         # pylon-providers HTTP client), inject as __deferred_vec__.
-        model_cfg = _resolve_model_config(plan["model_name"], config)
+        model_cfg = _resolve_model_config(plan['model_name'], config)
         from pylon._core import embed_text
+
         vector = await embed_text(
-            model_cfg.api_style, model_cfg.api_url, model_cfg.model, query_text or "",
+            model_cfg.api_style,
+            model_cfg.api_url,
+            model_cfg.model,
+            query_text or '',
             api_key=model_cfg.secret,
         )
-        extra = {"__deferred_vec__": vector}
+        extra = {'__deferred_vec__': vector}
 
     params = [extra[name] for name in compiled.param_names]
     return compiled, params
 
 
 def _resolve_query_text(plan: dict, kwargs: dict) -> str | None:
-    query_text: str | None = plan["query_literal"]
+    query_text: str | None = plan['query_literal']
     if query_text is None:
-        param_name = plan["query_param_name"]
+        param_name = plan['query_param_name']
         query_text = kwargs.get(param_name) if param_name else None
         if query_text is None and param_name:
             raise InterfaceError(f"Missing query parameter '{param_name}'")
     return query_text
 
 
-def _resolve_model_config(model_name: str, config: "Config"):
+def _resolve_model_config(model_name: str, config: Config):
     from pylon.config import ModelConfig
+
     models = config.models
     if models is None:
-        raise InterfaceError(
-            "vector::search with text query requires [models] config in pylon.toml"
-        )
+        raise InterfaceError('vector::search with text query requires [models] config in pylon.toml')
     if isinstance(models, ModelConfig):
         return models
     cfg = models.get(model_name)
     if cfg is None:
-        raise InterfaceError(
-            f"vector::search: no model config found for '{model_name}' in pylon.toml"
-        )
+        raise InterfaceError(f"vector::search: no model config found for '{model_name}' in pylon.toml")
     return cfg
 
 
@@ -829,9 +820,10 @@ def _normalize_pyql_source(pyql: Any, kwargs: dict[str, Any]) -> tuple[str, dict
     if isinstance(pyql, str):
         return pyql, kwargs
     from pylon import modelquery
+
     rendered = modelquery.render(pyql)
     if rendered is None:
-        raise InterfaceError(f"PyQL query must be a str, got {type(pyql).__name__!r}.")
+        raise InterfaceError(f'PyQL query must be a str, got {type(pyql).__name__!r}.')
     text, extra_params = rendered
     return text, {**kwargs, **extra_params}
 
@@ -841,7 +833,7 @@ def _compile_and_bind(
     kwargs: dict[str, Any],
     globals_: dict[str, Any] | None = None,
     config_options: dict[str, Any] | None = None,
-) -> tuple["CompiledQuery", list[Any]]:
+) -> tuple[CompiledQuery, list[Any]]:
     """Compile PyQL and resolve positional params — never reads ``compiled.sql``.
 
     Returns ``(compiled, params)`` ready for ``pool.query_compiled``/
@@ -857,7 +849,7 @@ def _compile_and_bind(
     try:
         compiled = _pyql_compile(
             pyql,
-            allow_user_specified_id=bool((config_options or {}).get("allow_user_specified_id", False)),
+            allow_user_specified_id=bool((config_options or {}).get('allow_user_specified_id', False)),
         )
     except PylonError:
         _record_compile(False)
@@ -870,13 +862,13 @@ def _compile_and_bind(
     try:
         params: list[Any] = []
         for name in compiled.param_names:
-            if name.startswith("__global__"):
-                qname = name[len("__global__"):]
+            if name.startswith('__global__'):
+                qname = name[len('__global__') :]
                 params.append((globals_ or {}).get(qname))
             else:
                 params.append(kwargs[name])
     except KeyError as exc:
-        raise InterfaceError(f"Missing query parameter: {exc}") from exc
+        raise InterfaceError(f'Missing query parameter: {exc}') from exc
     return compiled, params
 
 
@@ -885,7 +877,7 @@ def _transpile(
     kwargs: dict[str, Any],
     globals_: dict[str, Any] | None = None,
     config_options: dict[str, Any] | None = None,
-) -> tuple[str, list[Any], "CompiledQuery"]:
+) -> tuple[str, list[Any], CompiledQuery]:
     """Compile PyQL to SQL text — only for the JSON-wrapping paths
     (``query_json``/``query_single_json``), which still string-wrap raw SQL
     in Python until a later phase moves that wrapping into Rust too.
@@ -897,7 +889,7 @@ def _transpile(
     return compiled.sql, params, compiled
 
 
-def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
+def _hydrate(records: list[Any], compiled: CompiledQuery) -> list[Any]:
     """Decode ``{"result": ...}``-wrapped rows into Python dataclass instances."""
     from pylon.query import _get_schema, deserialize
     from pylon.schema import schema_snapshot
@@ -910,23 +902,22 @@ def _hydrate(records: list[Any], compiled: "CompiledQuery") -> list[Any]:
     types, enums, _ = schema_snapshot()
     registry: dict[str, type] = {t.__name__: t for t in types}
     for nt in named_tuples_snapshot():
-        mod = getattr(nt, "__pylon_module__", "default")
-        registry[f"{mod}::{nt.__name__}"] = nt
+        mod = getattr(nt, '__pylon_module__', 'default')
+        registry[f'{mod}::{nt.__name__}'] = nt
     for en in enums:
-        mod = getattr(en, "__pylon_module__", None) or \
-            (en.__module__ or "default").rpartition(".")[-1] or "default"
+        mod = getattr(en, '__pylon_module__', None) or (en.__module__ or 'default').rpartition('.')[-1] or 'default'
         registry[en.__name__] = en
-        registry[f"{mod}::{en.__name__}"] = en
+        registry[f'{mod}::{en.__name__}'] = en
     return deserialize(records, compiled, registry)
 
 
 def _build_dsn(db: Any) -> str:
     """Construct a DSN string from discrete :class:`~pylon.config.DatabaseConfig` fields."""
-    password_part = f":{db.password}" if db.password else ""
-    return f"postgresql://{db.user}{password_part}@{db.host}:{db.port}/{db.name}"
+    password_part = f':{db.password}' if db.password else ''
+    return f'postgresql://{db.user}{password_part}@{db.host}:{db.port}/{db.name}'
 
 
-async def _install_migrated_schema(pool: "PgconPool") -> None:
+async def _install_migrated_schema(pool: PgconPool) -> None:
     """Installs the *migrated* schema (`_pylon."Schema"`, written by
     `migration apply`/`watch`) as the process-level singleton every query
     on this connection compiles against — overriding whatever
@@ -955,7 +946,7 @@ async def _install_migrated_schema(pool: "PgconPool") -> None:
     try:
         snapshot_json = await migration_read_schema_snapshot(pool)
     except QueryError as exc:
-        if getattr(exc, "sqlstate", None) == "42P01":  # undefined_table
+        if getattr(exc, 'sqlstate', None) == '42P01':  # undefined_table
             return
         raise
     if snapshot_json is not None:

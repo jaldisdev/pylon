@@ -30,6 +30,8 @@ from typing import Any
 
 from . import _collector
 from ._constraints import Default, Description, Exclusive, Expression, Readonly
+from ._indexes import Index, SearchIndex, VectorIndex
+from ._meta import MISSING, PointerMeta, PylonConfig
 from ._pointers import (
     ArrayAnnotation,
     ComputedAnnotation,
@@ -38,13 +40,10 @@ from ._pointers import (
     PropertyAnnotation,
     TupleAnnotation,
 )
-from ._indexes import Index, SearchIndex, VectorIndex
-from ._triggers import Rewrite, Trigger
-from ._meta import MISSING, PointerMeta, PylonConfig
 from ._scalars import SHORTHAND_MAP
-from ._scalars import UUID as PylonUUID
+from ._triggers import Rewrite, Trigger
 
-_PASCAL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_PASCAL_RE = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
 
 
 # ── PEP 649 / Python 3.14 compatible annotation access ───────────────────────
@@ -59,9 +58,10 @@ def _get_own_annotations(cls: type) -> dict[str, Any]:
     """Return cls's own annotations dict (not inherited), forcing evaluation."""
     try:
         import annotationlib  # Python 3.14+
+
         return annotationlib.get_annotations(cls, format=annotationlib.Format.VALUE)
     except ImportError:
-        return dict(cls.__dict__.get("__annotations__") or {})
+        return dict(cls.__dict__.get('__annotations__') or {})
 
 
 # ── Optional unwrapping ────────────────────────────────────────────────────────
@@ -126,19 +126,16 @@ def _annotation_to_meta(
     cls_default: Any,
 ) -> PointerMeta:
     if isinstance(annotation, PropertyAnnotation):
-        description = next(
-            (c.text for c in annotation.constraints if isinstance(c, Description)), None
-        )
+        description = next((c.text for c in annotation.constraints if isinstance(c, Description)), None)
         rewrites = [c for c in annotation.constraints if isinstance(c, Rewrite)]
         is_readonly = any(c is Readonly for c in annotation.constraints)
         constraints = [
-            c for c in annotation.constraints
-            if not isinstance(c, (Description, Rewrite)) and c is not Readonly
+            c for c in annotation.constraints if not isinstance(c, (Description, Rewrite)) and c is not Readonly
         ]
         default, factory = _resolve_default(cls_default, annotation.constraints)
         return PointerMeta(
             name=name,
-            kind="property",
+            kind='property',
             scalar_type=annotation.scalar_type,
             nullable=nullable,
             constraints=constraints,
@@ -150,18 +147,15 @@ def _annotation_to_meta(
         )
 
     if isinstance(annotation, LinkAnnotation):
-        description = next(
-            (c.text for c in annotation.constraints if isinstance(c, Description)), None
-        )
+        description = next((c.text for c in annotation.constraints if isinstance(c, Description)), None)
         rewrites = [c for c in annotation.constraints if isinstance(c, Rewrite)]
         is_readonly = any(c is Readonly for c in annotation.constraints)
         constraints = [
-            c for c in annotation.constraints
-            if not isinstance(c, (Description, Rewrite)) and c is not Readonly
+            c for c in annotation.constraints if not isinstance(c, (Description, Rewrite)) and c is not Readonly
         ]
         return PointerMeta(
             name=name,
-            kind="link",
+            kind='link',
             scalar_type=None,
             nullable=nullable,
             constraints=constraints,
@@ -178,7 +172,7 @@ def _annotation_to_meta(
     if isinstance(annotation, MultiLinkAnnotation):
         return PointerMeta(
             name=name,
-            kind="multilink",
+            kind='multilink',
             scalar_type=None,
             nullable=nullable,
             constraints=[],
@@ -193,7 +187,7 @@ def _annotation_to_meta(
         default, factory = _resolve_default(cls_default, [])
         return PointerMeta(
             name=name,
-            kind="property",
+            kind='property',
             scalar_type=annotation,
             nullable=nullable,
             constraints=[],
@@ -205,7 +199,7 @@ def _annotation_to_meta(
         default, factory = _resolve_default(cls_default, [])
         return PointerMeta(
             name=name,
-            kind="property",
+            kind='property',
             scalar_type=annotation,
             nullable=nullable,
             constraints=[],
@@ -221,16 +215,14 @@ def _annotation_to_meta(
     if typing.get_origin(annotation) is list:
         args = typing.get_args(annotation)
         if not args:
-            raise TypeError("list[...] property annotation requires an element type, e.g. list[str]")
+            raise TypeError('list[...] property annotation requires an element type, e.g. list[str]')
         element = SHORTHAND_MAP.get(args[0], args[0])
         if typing.get_origin(element) is list or isinstance(element, ArrayAnnotation):
-            raise TypeError(
-                "nested arrays are not supported (list[list[...]]); arrays must be one-dimensional"
-            )
+            raise TypeError('nested arrays are not supported (list[list[...]]); arrays must be one-dimensional')
         default, factory = _resolve_default(cls_default, [])
         return PointerMeta(
             name=name,
-            kind="property",
+            kind='property',
             scalar_type=ArrayAnnotation(element=element),
             nullable=nullable,
             constraints=[],
@@ -241,7 +233,7 @@ def _annotation_to_meta(
     if isinstance(annotation, ComputedAnnotation):
         return PointerMeta(
             name=name,
-            kind="computed",
+            kind='computed',
             scalar_type=annotation.return_type,
             nullable=True,
             constraints=[],
@@ -255,7 +247,7 @@ def _annotation_to_meta(
     default, factory = _resolve_default(cls_default, [])
     return PointerMeta(
         name=name,
-        kind="property",
+        kind='property',
         scalar_type=scalar_type,
         nullable=nullable,
         constraints=[],
@@ -274,20 +266,19 @@ def _inject_repr(cls: type) -> None:
     (e.g. ``default::Person {id: UUID('...'), name: 'Alice', age: {}}``).
     Only attributes actually present in __dict__ are shown (partial shapes).
     """
+
     def __repr__(self) -> str:
-        cfg = getattr(type(self), "__pylon_config__", None)
-        qname = (
-            f"{cfg.module}::{cfg.name}" if cfg else type(self).__name__
-        )
-        pylon_type = vars(self).get("__pylon_type__")
+        cfg = getattr(type(self), '__pylon_config__', None)
+        qname = f'{cfg.module}::{cfg.name}' if cfg else type(self).__name__
+        pylon_type = vars(self).get('__pylon_type__')
         if pylon_type:
             qname = pylon_type
-        pairs = ", ".join(
-            f"{k}={{}}" if v is None else f"{k}={v!r}"
+        pairs = ', '.join(
+            f'{k}={{}}' if v is None else f'{k}={v!r}'
             for k, v in vars(self).items()
-            if k not in ("__pylon_type__", "__pylon_saved__")
+            if k not in ('__pylon_type__', '__pylon_saved__')
         )
-        return f"{qname} {{{pairs}}}"
+        return f'{qname} {{{pairs}}}'
 
     cls.__repr__ = __repr__  # type: ignore[method-assign]
 
@@ -303,6 +294,7 @@ def _inject_query_methods(cls: type, *, abstract: bool, junction: bool) -> None:
     if abstract or junction:
         return
     from pylon import modelquery
+
     cls.filter = classmethod(modelquery.filter_classmethod)
 
 
@@ -315,11 +307,11 @@ def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None
     attribute.
     """
     for name, meta in pointer_metas.items():
-        if meta.kind == "computed":
+        if meta.kind == 'computed':
             setattr(cls, name, dataclasses.field(init=False, default=None))
             continue
 
-        if meta.kind == "multilink":
+        if meta.kind == 'multilink':
             # Always an empty list at construction time; the query populates it.
             setattr(cls, name, dataclasses.field(default_factory=list))
             continue
@@ -353,11 +345,11 @@ def _infer_module(cls: type) -> str:
     """
     defining = sys.modules.get(cls.__module__)
     if defining is not None:
-        override = getattr(defining, "__pylon_module__", None)
+        override = getattr(defining, '__pylon_module__', None)
         if isinstance(override, str):
             return override
-    module_path = cls.__module__ or "default"
-    return module_path.rpartition(".")[-1] or module_path
+    module_path = cls.__module__ or 'default'
+    return module_path.rpartition('.')[-1] or module_path
 
 
 def _to_table_name(type_name: str) -> str:
@@ -374,10 +366,7 @@ def _to_table_name(type_name: str) -> str:
 
 
 def _has_pylon_base(cls: type) -> bool:
-    for base in cls.__mro__[1:]:
-        if hasattr(base, "__pylon_config__"):
-            return True
-    return False
+    return any(hasattr(base, '__pylon_config__') for base in cls.__mro__[1:])
 
 
 def _inject_id(cls: type) -> None:
@@ -387,7 +376,7 @@ def _inject_id(cls: type) -> None:
     it is None. Query results always carry a populated id.
     """
     existing = _get_own_annotations(cls)
-    cls.__annotations__ = {"id": uuid.UUID | None} | existing
+    cls.__annotations__ = {'id': uuid.UUID | None} | existing
 
 
 # ── Annotation collection ──────────────────────────────────────────────────────
@@ -440,22 +429,18 @@ def _build_type(
     default_vi = [vi for vi in class_vector_indexes if vi.index_name is None]
     if len(default_vi) > 1:
         raise ValueError(
-            f"Type {cls.__name__!r}: at most one bare (default) VectorIndex is allowed; "
-            f"assign additional indexes to named attributes."
+            f'Type {cls.__name__!r}: at most one bare (default) VectorIndex is allowed; '
+            f'assign additional indexes to named attributes.'
         )
     default_si = [si for si in class_search_indexes if si.index_name is None]
     if len(default_si) > 1:
         raise ValueError(
-            f"Type {cls.__name__!r}: at most one bare (default) SearchIndex is allowed; "
-            f"assign additional indexes to named attributes."
+            f'Type {cls.__name__!r}: at most one bare (default) SearchIndex is allowed; '
+            f'assign additional indexes to named attributes.'
         )
     class_desc_exprs = [e for e in exprs if isinstance(e, Description)]
 
-    description = (
-        class_desc_exprs[0].text
-        if class_desc_exprs
-        else ((cls.__doc__ or "").strip() or None)
-    )
+    description = class_desc_exprs[0].text if class_desc_exprs else ((cls.__doc__ or '').strip() or None)
 
     # Inject the id property when no parent Pylon type already provides one.
     if not _has_pylon_base(cls):
@@ -465,20 +450,20 @@ def _build_type(
 
     pointer_metas: dict[str, PointerMeta] = {}
     for pointer_name, annotation in annotations.items():
-        if pointer_name.startswith("_"):
+        if pointer_name.startswith('_'):
             continue
-        if junction and pointer_name in ("source", "target"):
+        if junction and pointer_name in ('source', 'target'):
             raise ValueError(
                 f"Junction type {cls.__name__!r}: 'source' and 'target' are reserved "
-                f"names — they are injected automatically by Pylon."
+                f'names — they are injected automatically by Pylon.'
             )
         nullable, inner = _unwrap_optional(annotation)
         cls_default = cls.__dict__.get(pointer_name, MISSING)
         meta = _annotation_to_meta(pointer_name, inner, nullable, cls_default)
-        if junction and meta.kind != "property":
+        if junction and meta.kind != 'property':
             raise ValueError(
-                f"Junction type {cls.__name__!r}: pointer {pointer_name!r} is a "
-                f"{meta.kind!r}; junction types only support scalar properties."
+                f'Junction type {cls.__name__!r}: pointer {pointer_name!r} is a '
+                f'{meta.kind!r}; junction types only support scalar properties.'
             )
         pointer_metas[pointer_name] = meta
 
@@ -508,6 +493,7 @@ def _build_type(
     )
 
     from . import _registry
+
     _registry.register_type(cls)
 
     return cls
@@ -568,9 +554,7 @@ def abstract_decorator(
     """
 
     def _wrap(c: type) -> type:
-        return _build_type(
-            c, abstract=True, materialized=False, module=module, name=name
-        )
+        return _build_type(c, abstract=True, materialized=False, module=module, name=name)
 
     return _wrap(cls) if cls is not None else _wrap
 
@@ -594,9 +578,7 @@ def interface_decorator(
     """
 
     def _wrap(c: type) -> type:
-        return _build_type(
-            c, abstract=True, materialized=True, module=module, name=name
-        )
+        return _build_type(c, abstract=True, materialized=True, module=module, name=name)
 
     return _wrap(cls) if cls is not None else _wrap
 
@@ -627,8 +609,6 @@ def junction_decorator(
     """
 
     def _wrap(c: type) -> type:
-        return _build_type(
-            c, abstract=False, materialized=True, junction=True, module=module, name=name
-        )
+        return _build_type(c, abstract=False, materialized=True, junction=True, module=module, name=name)
 
     return _wrap(cls) if cls is not None else _wrap

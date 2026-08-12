@@ -31,10 +31,10 @@ import warnings
 
 
 class _Color:
-    BLUE = ""
-    FAIL = ""
-    ENDC = ""
-    BOLD = ""
+    BLUE = ''
+    FAIL = ''
+    ENDC = ''
+    BOLD = ''
 
 
 def _get_color() -> _Color:
@@ -43,20 +43,20 @@ def _get_color() -> _Color:
         _COLOR = _Color()
         try:
             use = {
-                "default": lambda: os.isatty(2),
-                "auto": lambda: os.isatty(2),
-                "enabled": True,
-                "disabled": False,
-            }[os.getenv("PYLON_COLOR_OUTPUT", "default")]
+                'default': lambda: os.isatty(2),
+                'auto': lambda: os.isatty(2),
+                'enabled': True,
+                'disabled': False,
+            }[os.getenv('PYLON_COLOR_OUTPUT', 'default')]
             if callable(use):
                 use = use()
         except (KeyError, Exception):
             use = False
         if use:
-            _COLOR.BLUE = "\033[94m"
-            _COLOR.FAIL = "\033[91m"
-            _COLOR.ENDC = "\033[0m"
-            _COLOR.BOLD = "\033[1m"
+            _COLOR.BLUE = '\033[94m'
+            _COLOR.FAIL = '\033[91m'
+            _COLOR.ENDC = '\033[0m'
+            _COLOR.BOLD = '\033[1m'
     return _COLOR
 
 
@@ -64,13 +64,13 @@ _COLOR: _Color | None = None
 
 try:
     _SHOW_HINT = {
-        "default": True,
-        "enabled": True,
-        "disabled": False,
-    }[os.getenv("PYLON_ERROR_HINT", "default")]
+        'default': True,
+        'enabled': True,
+        'disabled': False,
+    }[os.getenv('PYLON_ERROR_HINT', 'default')]
 except KeyError:
     warnings.warn(
-        "PYLON_ERROR_HINT must be one of: default, enabled, disabled",
+        'PYLON_ERROR_HINT must be one of: default, enabled, disabled',
         stacklevel=1,
     )
     _SHOW_HINT = False
@@ -115,26 +115,26 @@ class PylonError(Exception):
     def _read_str(self, key: int, default: str | None = None) -> str | None:
         val = self._attrs.get(key)
         if isinstance(val, bytes):
-            return val.decode("utf-8")
+            return val.decode('utf-8')
         if val is not None:
             return str(val)
         return default
 
     @property
     def _position_start(self) -> int:
-        return int(self._read_str(_FIELD_CHARACTER_START, "-1"))  # type: ignore[arg-type]
+        return int(self._read_str(_FIELD_CHARACTER_START, '-1'))  # type: ignore[arg-type]
 
     @property
     def _position_end(self) -> int:
-        return int(self._read_str(_FIELD_CHARACTER_END, "-1"))  # type: ignore[arg-type]
+        return int(self._read_str(_FIELD_CHARACTER_END, '-1'))  # type: ignore[arg-type]
 
     @property
     def _line(self) -> int:
-        return int(self._read_str(_FIELD_LINE_START, "-1"))  # type: ignore[arg-type]
+        return int(self._read_str(_FIELD_LINE_START, '-1'))  # type: ignore[arg-type]
 
     @property
     def _col(self) -> int:
-        return int(self._read_str(_FIELD_COLUMN_START, "-1"))  # type: ignore[arg-type]
+        return int(self._read_str(_FIELD_COLUMN_START, '-1'))  # type: ignore[arg-type]
 
     @property
     def _hint(self) -> str | None:
@@ -160,7 +160,7 @@ class PylonError(Exception):
         col: int = -1,
         hint: str | None = None,
         details: str | None = None,
-    ) -> "PylonError":
+    ) -> PylonError:
         exc = cls(message)
         exc._query = query
         if position_start >= 0:
@@ -190,19 +190,18 @@ class PylonError(Exception):
                     self._query,
                     self._position_start,
                     max(1, self._position_end - self._position_start),
-                    self._line if self._line > 0 else "?",
-                    self._col if self._col > 0 else "?",
-                    self._hint or "error",
+                    self._line if self._line > 0 else '?',
+                    self._col if self._col > 0 else '?',
+                    self._hint or 'error',
                     self._details,
                 )
             except Exception:
-                return "".join(
+                return ''.join(
                     (
                         msg,
                         os.linesep,
                         os.linesep,
-                        "During formatting of the above exception, "
-                        "another exception occurred:",
+                        'During formatting of the above exception, another exception occurred:',
                         os.linesep,
                         os.linesep,
                         traceback.format_exc(),
@@ -228,12 +227,12 @@ def _format_error(
 ) -> str:
     c = _get_color()
     rv = io.StringIO()
-    rv.write(f"{c.BOLD}{msg}{c.ENDC}{os.linesep}")
+    rv.write(f'{c.BOLD}{msg}{c.ENDC}{os.linesep}')
 
     lines = query.splitlines(keepends=True)
     num_len = len(str(len(lines)))
-    rv.write(f"{c.BLUE}{'':>{num_len}} ┌─{c.ENDC} query:{line}:{col}{os.linesep}")
-    rv.write(f"{c.BLUE}{'':>{num_len}} │ {c.ENDC}{os.linesep}")
+    rv.write(f'{c.BLUE}{"":>{num_len}} ┌─{c.ENDC} query:{line}:{col}{os.linesep}')
+    rv.write(f'{c.BLUE}{"":>{num_len}} │ {c.ENDC}{os.linesep}')
 
     for num, ln in enumerate(lines):
         length = len(ln)
@@ -247,51 +246,38 @@ def _format_error(
             first_half = repr(ln[:start])[1:-1]
             ln = ln[start:]
             length -= start
-            rv.write(f"{c.BLUE}{num + 1:>{num_len}} │   {c.ENDC}{first_half}")
+            rv.write(f'{c.BLUE}{num + 1:>{num_len}} │   {c.ENDC}{first_half}')
             start = _unicode_width(first_half)
         else:
-            rv.write(f"{c.BLUE}{num + 1:>{num_len}} │ {c.FAIL}│ {c.ENDC}")
+            rv.write(f'{c.BLUE}{num + 1:>{num_len}} │ {c.FAIL}│ {c.ENDC}')
 
         if offset > length:
             ln = repr(ln)[1:-1]
-            rv.write(f"{c.FAIL}{ln}{c.ENDC}{os.linesep}")
+            rv.write(f'{c.FAIL}{ln}{c.ENDC}{os.linesep}')
             if start >= 0:
-                rv.write(
-                    f"{c.BLUE}{'':>{num_len}} │ "
-                    f"{c.FAIL}╭─{'─' * start}^{c.ENDC}{os.linesep}"
-                )
+                rv.write(f'{c.BLUE}{"":>{num_len}} │ {c.FAIL}╭─{"─" * start}^{c.ENDC}{os.linesep}')
             offset -= length
             start = -1
         else:
             first_half = repr(ln[:offset])[1:-1]
             rest = repr(ln[offset:])[1:-1]
-            rv.write(f"{c.FAIL}{first_half}{c.ENDC}{rest}{os.linesep}")
+            rv.write(f'{c.FAIL}{first_half}{c.ENDC}{rest}{os.linesep}')
             size = _unicode_width(first_half)
             if start >= 0:
-                rv.write(
-                    f"{c.BLUE}{'':>{num_len}} │   {' ' * start}"
-                    f"{c.FAIL}{'^' * size} {hint}{c.ENDC}"
-                )
+                rv.write(f'{c.BLUE}{"":>{num_len}} │   {" " * start}{c.FAIL}{"^" * size} {hint}{c.ENDC}')
             else:
-                rv.write(
-                    f"{c.BLUE}{'':>{num_len}} │ "
-                    f"{c.FAIL}╰─{'─' * (size - 1)}^ {hint}{c.ENDC}"
-                )
+                rv.write(f'{c.BLUE}{"":>{num_len}} │ {c.FAIL}╰─{"─" * (size - 1)}^ {hint}{c.ENDC}')
             break
 
     if details:
-        rv.write(f"{os.linesep}Details: {details}")
+        rv.write(f'{os.linesep}Details: {details}')
 
     return rv.getvalue()
 
 
 def _unicode_width(text: str) -> int:
     return sum(
-        0
-        if unicodedata.category(c) in ("Mn", "Cf")
-        else 2
-        if unicodedata.east_asian_width(c) == "W"
-        else 1
+        0 if unicodedata.category(c) in ('Mn', 'Cf') else 2 if unicodedata.east_asian_width(c) == 'W' else 1
         for c in text
     )
 
@@ -318,7 +304,7 @@ class InterfaceError(ClientError):
 # ---------------------------------------------------------------------------
 
 
-class ConnectionError(PylonError):  # noqa: A001
+class ConnectionError(PylonError):
     """Base for all connection-level failures."""
 
 
