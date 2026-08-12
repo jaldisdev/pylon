@@ -326,6 +326,19 @@ async fn delete_progress(pool: &PgPool, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Same upsert as `record_progress`, but on an open transaction so a step's
+/// DDL and the progress row that claims it commit together — see
+/// `apply_one`'s own note on why that atomicity matters.
+async fn record_progress_in_tx(tx: &PgTransaction, id: &str, step_index: i64) -> Result<()> {
+    tx.execute_typed(
+        r#"INSERT INTO _pylon."Progress" (id, step_index) VALUES ($1, $2)
+           ON CONFLICT (id) DO UPDATE SET step_index = $2, updated_at = now()"#,
+        &[DecodedValue::Str(id.to_string()), DecodedValue::I64(step_index)],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn delete_progress_in_tx(tx: &PgTransaction, id: &str) -> Result<()> {
     tx.execute_typed(
         r#"DELETE FROM _pylon."Progress" WHERE id = $1"#,
@@ -396,11 +409,21 @@ const DEV_SAVEPOINT: &str = "pylon_dev";
 
 /// Applies one migration's steps in order, resuming from recorded progress
 /// if a prior run failed mid-migration. Verifies `m`'s integrity first
-/// (re-hashes the body against its header ID), matching `_apply_one`'s own
-/// `verify_migration(m)` call. `dev_mode` runs each transactional step
-/// inside a savepoint and swallows "already exists" errors (structure
-/// `watch` already applied), matching `_apply_one`'s nested-transaction
-/// rebase behavior exactly.
+/// (re-hashes the body against its header ID).
+///
+/// `_pylon."Progress".step_index` is the index of the last step that
+/// **completed**, so a resume starts at `step_index + 1`. For a transactional
+/// step the progress row is written inside that step's own transaction, so
+/// the two commit together — a crash mid-step rolls both back and the step is
+/// retried rather than skipped. A non-transactional step (`CREATE INDEX
+/// CONCURRENTLY`) has no transaction to join, so it records progress
+/// immediately afterwards; a crash in that window just re-runs the step, and
+/// `drop_invalid_concurrent_index` clears the half-built index first.
+///
+/// `dev_mode` rebases onto a database `watch` has already partly changed: it
+/// runs each *statement* in its own savepoint and skips the individual ones
+/// that fail with "already exists", leaving the rest of the step to apply
+/// normally.
 pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Result<()> {
     verify_integrity(m)?;
 
@@ -417,22 +440,13 @@ pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Resu
             continue;
         }
 
-        if multi_step {
-            record_progress(pool, &m.id, step_idx as i64).await?;
-        }
-
         let is_last = step_idx == steps.len() - 1;
 
         if *transactional {
             let tx = pool.begin_default().await?;
 
             let step_result = if dev_mode {
-                tx.savepoint(DEV_SAVEPOINT).await?;
-                match tx.batch_execute(sql).await {
-                    Ok(()) => tx.release_savepoint(DEV_SAVEPOINT).await,
-                    Err(e) if is_duplicate_object_error(&e) => tx.rollback_to_savepoint(DEV_SAVEPOINT).await,
-                    Err(e) => Err(e),
-                }
+                apply_statements_rebasing(&tx, sql).await
             } else {
                 tx.batch_execute(sql).await
             };
@@ -447,6 +461,8 @@ pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Resu
                 if multi_step {
                     delete_progress_in_tx(&tx, &m.id).await?;
                 }
+            } else if multi_step {
+                record_progress_in_tx(&tx, &m.id, step_idx as i64).await?;
             }
             tx.commit().await?;
         } else {
@@ -457,10 +473,30 @@ pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Resu
                 if multi_step {
                     delete_progress(pool, &m.id).await?;
                 }
+            } else if multi_step {
+                record_progress(pool, &m.id, step_idx as i64).await?;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Runs one step's statements inside `tx`, each wrapped in its own savepoint,
+/// skipping any that fail because the object already exists.
+///
+/// The savepoint has to be per statement rather than per step: rolling the
+/// whole step back on the first duplicate would undo the statements before it
+/// *and* skip the ones after it, while still reporting the step as applied.
+async fn apply_statements_rebasing(tx: &PgTransaction, sql: &str) -> std::result::Result<(), pylon_pgcon::Error> {
+    for stmt in crate::migration::split_statements(sql) {
+        tx.savepoint(DEV_SAVEPOINT).await?;
+        match tx.batch_execute(&stmt).await {
+            Ok(()) => tx.release_savepoint(DEV_SAVEPOINT).await?,
+            Err(e) if is_duplicate_object_error(&e) => tx.rollback_to_savepoint(DEV_SAVEPOINT).await?,
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 
@@ -835,6 +871,126 @@ mod tests {
             .await;
         assert!(rows.is_ok(), "step 1 should have run");
 
+        cleanup_migration_row(&pool, &m.id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn apply_one_does_not_skip_the_step_it_failed_on_when_resumed() {
+        let pool = test_pool().await;
+        let t0 = unique_table_name("migrate_crash_step0");
+        let t1 = unique_table_name("migrate_crash_step1");
+        let t2 = unique_table_name("migrate_crash_step2");
+
+        // Step 1 fails on the first run because `t1` doesn't exist yet. The
+        // point of the test is what the *second* run does with step 1: it
+        // must retry it, not treat it as already done.
+        let m = make_migration(
+            "initial",
+            &format!(
+                "\nCREATE TABLE {t0} (id int8);\n\
+                 -- pylon:step\n\
+                 INSERT INTO {t1} (id) VALUES (1);\n\
+                 -- pylon:step\n\
+                 CREATE TABLE {t2} (id int8);\n"
+            ),
+        );
+
+        let first = apply_one(&pool, &m, false).await;
+        assert!(first.is_err(), "step 1 should have failed on the first run");
+
+        // Progress must name step 0 — the last step that actually committed.
+        // Recording step 1 here is the bug: it would make the retry resume at
+        // step 2 and skip the INSERT forever.
+        assert_eq!(
+            read_progress(&pool, &m.id).await.unwrap(),
+            Some(0),
+            "progress must record the last *completed* step, not the one being attempted"
+        );
+
+        // Make step 1 able to succeed, then resume.
+        pool.batch_execute(&format!("CREATE TABLE {t1} (id int8);"))
+            .await
+            .unwrap();
+        apply_one(&pool, &m, false).await.unwrap();
+
+        let rows = pool
+            .query_typed(
+                &format!("SELECT (count(*)) AS result FROM {t1}"),
+                &[],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.first(),
+            Some(&DecodedValue::I64(1)),
+            "step 1 must have been retried on resume, not skipped"
+        );
+
+        let t2_rows = pool
+            .query_typed(
+                &format!("SELECT (1) AS result FROM {t2}"),
+                &[],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await;
+        assert!(t2_rows.is_ok(), "step 2 should have run after the resumed step 1");
+
+        for t in [&t0, &t1, &t2] {
+            pool.batch_execute(&format!("DROP TABLE IF EXISTS {t}")).await.unwrap();
+        }
+        cleanup_migration_row(&pool, &m.id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn apply_one_dev_mode_skips_only_the_duplicate_statement_in_a_step() {
+        let pool = test_pool().await;
+        let before = unique_table_name("migrate_rebase_before");
+        let existing = unique_table_name("migrate_rebase_existing");
+        let after = unique_table_name("migrate_rebase_after");
+
+        // `watch` already created the middle table out of band.
+        pool.batch_execute(&format!("CREATE TABLE {existing} (id int8);"))
+            .await
+            .unwrap();
+
+        // One step, three statements, only the middle one already applied.
+        let m = make_migration(
+            "initial",
+            &body(&format!(
+                "CREATE TABLE {before} (id int8);\n\
+                 CREATE TABLE {existing} (id int8);\n\
+                 CREATE TABLE {after} (id int8);"
+            )),
+        );
+
+        apply_one(&pool, &m, true).await.unwrap();
+
+        // Rolling back the whole step on the duplicate would drop `before`
+        // and never reach `after`, while still recording the migration as
+        // applied — the failure this test exists to catch.
+        for t in [&before, &after] {
+            let rows = pool
+                .query_typed(
+                    &format!("SELECT (1) AS result FROM {t}"),
+                    &[],
+                    &pylon_pgcon::ExtensionOids::default(),
+                )
+                .await;
+            assert!(
+                rows.is_ok(),
+                "table {t} should exist — only the duplicate statement may be skipped"
+            );
+        }
+
+        let tracking = read_tracking(&pool).await.unwrap();
+        assert!(tracking.iter().any(|r| r.id == m.id && r.applied));
+
+        for t in [&before, &existing, &after] {
+            pool.batch_execute(&format!("DROP TABLE IF EXISTS {t}")).await.unwrap();
+        }
         cleanup_migration_row(&pool, &m.id).await;
     }
 
