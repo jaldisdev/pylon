@@ -23,15 +23,10 @@
 //! only in which HTTP client they call), so this is one generic
 //! `SearchIndexWorker<C>` instead of two near-duplicate types.
 //!
-//! Note: `ClaimedRow` (see `index_worker.rs`) has no `operation` field —
-//! `CLAIM_BATCH_SQL`'s `RETURNING` clause never surfaces the
-//! `_pylon."IndexOutbox".operation` column. The Python workers already
-//! have this gap (`row.get("operation", "index")` always defaults to
-//! `"index"` since the key is never present), so their `"delete"` branch
-//! is unreachable dead code today — this port carries the same limitation
-//! forward rather than fixing something out of scope for a straight port.
-//! `SearchSink::delete_document` is still implemented and reachable once
-//! `operation` support is added to the claim path.
+//! A batch is split by `ClaimedRow::operation` before anything else runs:
+//! a delete can't go through the fetch path, because the object no longer
+//! exists in Postgres and the fetch would simply return no row for it —
+//! leaving its document in the search index indefinitely.
 
 use std::collections::HashMap;
 
@@ -53,7 +48,6 @@ pub trait SearchSink: Send + Sync {
         doc_id: &str,
         fields: &HashMap<String, String>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
-    #[allow(dead_code)] // see module doc — unreachable until `operation` is threaded through claim_batch
     fn delete_document(&self, index: &str, doc_id: &str) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
@@ -218,11 +212,26 @@ impl<C: SearchSink + 'static> BatchProcessor for SearchIndexWorker<C> {
         for ((type_name, index_name), group_rows) in groups {
             let search_index = deferred_index_name(&type_name, index_name.as_deref());
 
+            // Deletes are handled first and separately: the object is gone
+            // from Postgres, so the fetch below would return nothing for it
+            // and the document would be left behind in the search index.
+            let (deletes, upserts): (Vec<&ClaimedRow>, Vec<&ClaimedRow>) = group_rows
+                .iter()
+                .partition(|r| r.operation == crate::index_worker::Operation::Delete);
+            for row in &deletes {
+                self.client
+                    .delete_document(&search_index, &format_uuid(&row.object_id))
+                    .await?;
+            }
+            if upserts.is_empty() {
+                continue;
+            }
+
             let Some(fetch_sql) = self.ensure_fetch_sql(&type_name, index_name.as_deref()).await else {
                 continue;
             };
 
-            let ids: Vec<DecodedValue> = group_rows.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
+            let ids: Vec<DecodedValue> = upserts.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
             let raw_records = listener
                 .query_typed_named(&fetch_sql, &[DecodedValue::Array(ids)], listener.types())
                 .await?;

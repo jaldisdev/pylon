@@ -278,3 +278,117 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
     except Exception as exc:
         _print_error('worker crashed', str(exc))
         sys.exit(1)
+
+
+# ── Failed-row inspection and requeue ─────────────────────────────────────────
+#
+# A row that exhausts `MAX_ATTEMPTS` is parked as `Failed` and no worker will
+# ever claim it again. Without these two commands the only way to see or
+# recover that work is hand-written SQL against `_pylon."IndexOutbox"`.
+
+_FAILED_LIST_SQL = """
+SELECT (id::text, index_kind::text, type_name, coalesce(index_name, ''), operation,
+        attempts, enqueued_at::text) AS result
+FROM _pylon."IndexOutbox"
+WHERE status = 'Failed'
+ORDER BY enqueued_at
+LIMIT $1
+"""
+
+_FAILED_COUNT_SQL = """
+SELECT (index_kind::text, count(*)) AS result
+FROM _pylon."IndexOutbox"
+WHERE status = 'Failed'
+GROUP BY index_kind
+ORDER BY index_kind
+"""
+
+_REQUEUE_SQL = """
+UPDATE _pylon."IndexOutbox"
+SET status = 'Pending', attempts = 0, next_attempt = NULL, claimed_at = NULL
+WHERE status = 'Failed'
+  AND ($1 = '' OR index_kind::text = $1)
+"""
+
+
+def _dsn_from(config) -> str:
+    db = config.database
+    if db.dsn:
+        return db.dsn.replace('pylon://', 'postgresql://', 1)
+    pw = f':{db.password}' if db.password else ''
+    return f'postgresql://{db.user}{pw}@{db.host}:{db.port}/{db.name}'
+
+
+@worker.command()
+@click.option('--limit', default=50, show_default=True, help='Maximum number of rows to list.')
+@requires_config
+@click.pass_context
+def failed(ctx: click.Context, limit: int) -> None:
+    """List IndexOutbox rows that exhausted every retry.
+
+    These are terminal: no worker will claim them again until they are
+    requeued with `pylon worker retry`.
+    """
+    config = ctx.obj['config']
+
+    async def run() -> None:
+        from pylon._core import pgcon_connect
+
+        pool = await pgcon_connect(_dsn_from(config), 2)
+        counts = await pool.query(_FAILED_COUNT_SQL, [])
+        if not counts:
+            click.echo('No failed rows.')
+            return
+
+        total = sum(row[1] for row in counts)
+        summary = ', '.join(f'{row[0]}: {row[1]}' for row in counts)
+        click.echo(f'{total} failed row(s) — {summary}\n')
+
+        rows = await pool.query(_FAILED_LIST_SQL, [limit])
+        header = f'{"INDEX KIND":<14}{"TYPE":<28}{"INDEX":<16}{"OP":<8}{"TRIES":<7}ENQUEUED'
+        click.echo(header)
+        click.echo('-' * len(header))
+        for row in rows:
+            _id, kind, type_name, index_name, operation, attempts, enqueued = row
+            click.echo(f'{kind:<14}{type_name:<28}{index_name or "-":<16}{operation:<8}{attempts:<7}{enqueued}')
+        if total > limit:
+            click.echo(f'\n... {total - limit} more (raise --limit to see them)')
+        click.echo("\nRequeue with 'pylon worker retry'.")
+
+    asyncio.run(run())
+
+
+@worker.command()
+@click.option('--index-kind', default=None, help='Only requeue this kind (Vector, OpenSearch, Meilisearch).')
+@click.option('--yes', is_flag=True, default=False, help='Skip the confirmation prompt.')
+@requires_config
+@click.pass_context
+def retry(ctx: click.Context, index_kind: str | None, yes: bool) -> None:
+    """Requeue failed IndexOutbox rows so workers pick them up again.
+
+    Resets `attempts` and clears the backoff, putting each row back to
+    Pending. Fix whatever made them fail first — otherwise they will simply
+    burn through their retries again.
+    """
+    config = ctx.obj['config']
+
+    async def run() -> None:
+        from pylon._core import pgcon_connect
+
+        pool = await pgcon_connect(_dsn_from(config), 2)
+        counts = await pool.query(_FAILED_COUNT_SQL, [])
+        if index_kind:
+            counts = [row for row in counts if row[0] == index_kind]
+        if not counts:
+            click.echo('No failed rows to requeue.')
+            return
+
+        total = sum(row[1] for row in counts)
+        scope = f' for {index_kind}' if index_kind else ''
+        if not yes:
+            click.confirm(f'Requeue {total} failed row(s){scope}?', abort=True)
+
+        await pool.execute(_REQUEUE_SQL, [index_kind or ''])
+        click.echo(f'Requeued {total} row(s){scope}.')
+
+    asyncio.run(run())

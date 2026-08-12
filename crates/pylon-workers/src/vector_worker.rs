@@ -141,7 +141,19 @@ impl BatchProcessor for VectorIndexWorker {
                 continue;
             };
 
-            let ids: Vec<DecodedValue> = group_rows.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
+            // A vector index stores its embedding in a column on the object's
+            // own row, so a delete needs no work here — the row went away and
+            // took the embedding with it. Skipping explicitly (rather than
+            // letting the fetch come back empty) avoids paying for an
+            // embedding call on an object that no longer exists.
+            let ids: Vec<DecodedValue> = group_rows
+                .iter()
+                .filter(|r| r.operation != crate::index_worker::Operation::Delete)
+                .map(|r| DecodedValue::Uuid(r.object_id))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
             let raw_records = listener
                 .query_typed_named(fetch_sql, &[DecodedValue::Array(ids)], listener.types())
                 .await?;

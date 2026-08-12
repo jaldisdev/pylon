@@ -58,11 +58,20 @@ RETURNING id, type_name, operation, old_row, new_row, attempts
 
 _MARK_DONE_SQL = 'DELETE FROM _pylon."SignalOutbox" WHERE id = $1'
 
-_MARK_FAILED_SQL = """
+#: Attempts allowed before a row is parked as ``Failed``. Kept in step with
+#: ``MAX_ATTEMPTS`` in ``crates/pylon-workers/src/index_worker.rs`` — the two
+#: outboxes retry on the same schedule.
+MAX_ATTEMPTS = 5
+
+#: ``attempts + 1`` is the count including the failure being recorded, so the
+#: fifth failure is the terminal one. Comparing the pre-update ``attempts``
+#: instead would silently allow a sixth. Backoff still keys off the pre-update
+#: value: 30s, 60s, 120s, 240s, then capped.
+_MARK_FAILED_SQL = f"""
 UPDATE _pylon."SignalOutbox"
-SET status = CASE WHEN attempts >= 5 THEN 'Failed' ELSE 'Pending' END,
+SET status = CASE WHEN attempts + 1 >= {MAX_ATTEMPTS} THEN 'Failed' ELSE 'Pending' END,
     attempts = attempts + 1,
-    next_attempt = now() + (30 * 2 ^ LEAST(attempts, 4) || ' seconds')::interval
+    next_attempt = now() + (30 * 2 ^ LEAST(attempts, 3) || ' seconds')::interval
 WHERE id = $1
 """
 
