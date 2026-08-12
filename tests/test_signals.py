@@ -30,7 +30,8 @@ import uuid
 import pytest
 
 import pylon
-from pylon.schema._registry import clear as clear_registry, signals_snapshot
+from pylon.schema._registry import clear as clear_registry
+from pylon.schema._registry import signals_snapshot
 from pylon.schema._triggers import On
 
 
@@ -45,11 +46,11 @@ class TestSignalDecorator:
         class NotAPylonType:
             pass
 
-        with pytest.raises(TypeError, match="pylon.signal target must be a @pylon.type-decorated class"):
+        with pytest.raises(TypeError, match=r'pylon\.signal target must be a @pylon\.type-decorated class'):
             pylon.signal(NotAPylonType)
 
     def test_registers_with_default_on_mask(self):
-        @pylon.type(module="sigtest", name="Widget")
+        @pylon.type(module='sigtest', name='Widget')
         class Widget:
             name: str
 
@@ -63,7 +64,7 @@ class TestSignalDecorator:
         assert reg.handler is handler
 
     def test_registers_with_explicit_on_mask(self):
-        @pylon.type(module="sigtest", name="Widget2")
+        @pylon.type(module='sigtest', name='Widget2')
         class Widget2:
             name: str
 
@@ -76,7 +77,7 @@ class TestSignalDecorator:
         assert not (reg.on & int(On.Update))
 
     def test_decorator_returns_the_function_unchanged(self):
-        @pylon.type(module="sigtest", name="Widget3")
+        @pylon.type(module='sigtest', name='Widget3')
         class Widget3:
             name: str
 
@@ -87,7 +88,7 @@ class TestSignalDecorator:
         assert decorated is handler
 
     def test_multiple_handlers_on_same_type_all_registered(self):
-        @pylon.type(module="sigtest", name="Widget4")
+        @pylon.type(module='sigtest', name='Widget4')
         class Widget4:
             name: str
 
@@ -106,10 +107,10 @@ class TestSignalDecorator:
 
 class TestSignalRegistryIndex:
     def test_build_index_groups_by_type_and_operation(self):
-        from pylon.schema._signal_registry import build_index
         from pylon.schema._registry import SignalRegistration
+        from pylon.schema._signal_registry import build_index
 
-        @pylon.type(module="sigtest", name="Order")
+        @pylon.type(module='sigtest', name='Order')
         class Order:
             name: str
 
@@ -125,7 +126,7 @@ class TestSignalRegistryIndex:
         ]
         index = build_index(regs)
 
-        qname = f"{Order.__pylon_config__.module}::{Order.__name__}"
+        qname = f'{Order.__pylon_config__.module}::{Order.__name__}'
         assert set(index[qname][On.Insert]) == {on_insert, on_insert_and_delete}
         assert index[qname][On.Delete] == [on_insert_and_delete]
         assert On.Update not in index[qname]
@@ -133,14 +134,14 @@ class TestSignalRegistryIndex:
     def test_handlers_for_unknown_type_returns_empty(self):
         from pylon.schema._signal_registry import handlers_for
 
-        assert handlers_for("nonexistent::Type", On.Insert) == []
+        assert handlers_for('nonexistent::Type', On.Insert) == []
 
 
 class TestHydrate:
     def test_none_row_yields_none(self):
         from pylon.signals import _hydrate
 
-        @pylon.type(module="sigtest", name="Hydrated1")
+        @pylon.type(module='sigtest', name='Hydrated1')
         class Hydrated1:
             name: str
 
@@ -149,45 +150,45 @@ class TestHydrate:
     def test_hydrates_properties_and_coerces_id_to_uuid(self):
         from pylon.signals import _hydrate
 
-        @pylon.type(module="sigtest", name="Hydrated2")
+        @pylon.type(module='sigtest', name='Hydrated2')
         class Hydrated2:
             name: str
 
         row_id = str(uuid.uuid4())
-        obj = _hydrate(Hydrated2, {"id": row_id, "name": "Alpha"})
+        obj = _hydrate(Hydrated2, {'id': row_id, 'name': 'Alpha'})
 
         assert isinstance(obj, Hydrated2)
         assert obj.id == uuid.UUID(row_id)
-        assert obj.name == "Alpha"
+        assert obj.name == 'Alpha'
 
     def test_hydrates_single_link_fk_column_as_uuid_not_resolved_object(self):
         from pylon.signals import _hydrate
 
-        @pylon.type(module="sigtest", name="Org1")
+        @pylon.type(module='sigtest', name='Org1')
         class Org1:
             name: str
 
-        @pylon.type(module="sigtest", name="Person1")
+        @pylon.type(module='sigtest', name='Person1')
         class Person1:
             name: str
             org: pylon.Link[Org1]
 
         org_id = str(uuid.uuid4())
         person_id = str(uuid.uuid4())
-        obj = _hydrate(Person1, {"id": person_id, "name": "Bob", "org_id": org_id})
+        obj = _hydrate(Person1, {'id': person_id, 'name': 'Bob', 'org_id': org_id})
 
         assert obj.org_id == uuid.UUID(org_id)
-        assert not hasattr(obj, "org")
+        assert not hasattr(obj, 'org')
 
     def test_bypasses_init(self):
         from pylon.signals import _hydrate
 
-        @pylon.type(module="sigtest", name="Hydrated3")
+        @pylon.type(module='sigtest', name='Hydrated3')
         class Hydrated3:
             name: str
 
             def __init__(self, *args, **kwargs):
-                raise AssertionError("hydration must not call __init__")
+                raise AssertionError('hydration must not call __init__')
 
-        obj = _hydrate(Hydrated3, {"id": str(uuid.uuid4()), "name": "X"})
-        assert obj.name == "X"
+        obj = _hydrate(Hydrated3, {'id': str(uuid.uuid4()), 'name': 'X'})
+        assert obj.name == 'X'

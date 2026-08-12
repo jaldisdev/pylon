@@ -56,17 +56,18 @@ def enum_decorator(*members: str) -> Any:
         # Infer and attach the pylon module name (same logic as _decorators._infer_module).
         defining = sys.modules.get(cls.__module__)
         if defining is not None:
-            override = getattr(defining, "__pylon_module__", None)
+            override = getattr(defining, '__pylon_module__', None)
             pylon_module: str = (
                 override
                 if isinstance(override, str)
-                else (cls.__module__ or "default").rpartition(".")[-1] or "default"
+                else (cls.__module__ or 'default').rpartition('.')[-1] or 'default'
             )
         else:
-            pylon_module = (cls.__module__ or "default").rpartition(".")[-1] or "default"
+            pylon_module = (cls.__module__ or 'default').rpartition('.')[-1] or 'default'
         new_enum.__pylon_module__ = pylon_module  # type: ignore[attr-defined]
 
         from . import _registry
+
         _registry.register_enum(new_enum)
         return new_enum
 

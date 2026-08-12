@@ -50,12 +50,12 @@ class Range:
 
     def __repr__(self) -> str:
         if self.empty:
-            return "Range(empty=True)"
-        lo = "" if self.lower is None else repr(self.lower)
-        hi = "" if self.upper is None else repr(self.upper)
-        open_b = "[" if self.inc_lower else "("
-        close_b = "]" if self.inc_upper else ")"
-        return f"Range({open_b}{lo}, {hi}{close_b})"
+            return 'Range(empty=True)'
+        lo = '' if self.lower is None else repr(self.lower)
+        hi = '' if self.upper is None else repr(self.upper)
+        open_b = '[' if self.inc_lower else '('
+        close_b = ']' if self.inc_upper else ')'
+        return f'Range({open_b}{lo}, {hi}{close_b})'
 
 
 class Object:
@@ -72,12 +72,12 @@ class Object:
         isinstance(result, Object)      # True
     """
 
-    def __new__(cls, **kwargs: Any) -> "Object":
+    def __new__(cls, **kwargs: Any) -> 'Object':
         if cls is Object:
             field_names = tuple(kwargs.keys())
             if field_names not in _object_class_cache:
                 _object_class_cache[field_names] = dataclasses.make_dataclass(
-                    "Object",
+                    'Object',
                     [(name, Any) for name in field_names],
                     bases=(Object,),
                 )
@@ -105,14 +105,14 @@ class NamedTupleValue(tuple):
 
     _fields: tuple[str, ...] = ()
 
-    def __new__(cls, **kwargs: Any) -> "NamedTupleValue":
+    def __new__(cls, **kwargs: Any) -> 'NamedTupleValue':
         if cls is NamedTupleValue:
             field_names = tuple(kwargs.keys())
             if field_names not in _named_tuple_value_cache:
                 _named_tuple_value_cache[field_names] = type(
-                    "NamedTupleValue",
+                    'NamedTupleValue',
                     (NamedTupleValue,),
-                    {"_fields": field_names},
+                    {'_fields': field_names},
                 )
             cls = _named_tuple_value_cache[field_names]
             return tuple.__new__(cls, kwargs.values())
@@ -125,5 +125,5 @@ class NamedTupleValue(tuple):
             raise AttributeError(name) from None
 
     def __repr__(self) -> str:
-        members = ", ".join(f"{name} := {value!r}" for name, value in zip(self._fields, self))
-        return f"({members})"
+        members = ', '.join(f'{name} := {value!r}' for name, value in zip(self._fields, self, strict=False))
+        return f'({members})'

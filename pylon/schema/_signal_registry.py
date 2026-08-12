@@ -30,7 +30,8 @@ this index by whatever process ends up dispatching signals (see
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ._triggers import On
 
@@ -50,7 +51,7 @@ def build_index(registrations: list[Any]) -> dict[str, dict[On, list[Callable[..
     index: dict[str, dict[On, list[Callable[..., Any]]]] = {}
     for reg in registrations:
         cfg = reg.target.__pylon_config__
-        qname = f"{cfg.module}::{cfg.name}"
+        qname = f'{cfg.module}::{cfg.name}'
         by_op = index.setdefault(qname, {})
         for flag in On:
             if reg.on & flag:

@@ -27,21 +27,21 @@ from typing import Any
 
 
 class Volatility:
-    Immutable = "immutable"
-    Stable = "stable"
-    Volatile = "volatile"
-    Modifying = "volatile"  # PostgreSQL maps this to VOLATILE
+    Immutable = 'immutable'
+    Stable = 'stable'
+    Volatile = 'volatile'
+    Modifying = 'volatile'  # PostgreSQL maps this to VOLATILE
 
 
 _VALID_VOLATILITIES = {Volatility.Immutable, Volatility.Stable, Volatility.Volatile}
 
 
 class Language:
-    PyQL = "pyql"
+    PyQL = 'pyql'
 
 
 class _PylonFunctionConfig:
-    __slots__ = ("func", "name", "module", "language", "volatility", "body")
+    __slots__ = ('body', 'func', 'language', 'module', 'name', 'volatility')
 
     def __init__(
         self,
@@ -56,17 +56,17 @@ class _PylonFunctionConfig:
         self.module = module or _infer_module(func)
         self.language = language
         self.volatility = volatility
-        self.body = inspect.getdoc(func) or ""
+        self.body = inspect.getdoc(func) or ''
 
 
 def _infer_module(func: Any) -> str:
-    defining = sys.modules.get(func.__module__ or "")
+    defining = sys.modules.get(func.__module__ or '')
     if defining is not None:
-        override = getattr(defining, "__pylon_module__", None)
+        override = getattr(defining, '__pylon_module__', None)
         if isinstance(override, str):
             return override
-    module_path = func.__module__ or "default"
-    return module_path.rpartition(".")[-1] or module_path
+    module_path = func.__module__ or 'default'
+    return module_path.rpartition('.')[-1] or module_path
 
 
 def function(
@@ -103,21 +103,21 @@ def function(
             language=language,
             volatility=volatility,
         )
-        qname = f"{config.module}::{config.name}"
+        qname = f'{config.module}::{config.name}'
 
         if volatility is not None and volatility not in _VALID_VOLATILITIES:
             raise SchemaError(
-                f"function {qname!r}: invalid volatility {volatility!r}, expected one "
+                f'function {qname!r}: invalid volatility {volatility!r}, expected one '
                 f"of 'immutable', 'stable', 'volatile'"
             )
         if language != Language.PyQL:
             raise SchemaError(
-                f"function {qname!r}: invalid language {language!r}, only "
-                f"{Language.PyQL!r} is currently supported"
+                f'function {qname!r}: invalid language {language!r}, only {Language.PyQL!r} is currently supported'
             )
 
         func.__pylon_function__ = config
         from ._registry import register_function
+
         register_function(func)
         return func
 

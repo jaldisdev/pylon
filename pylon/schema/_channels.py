@@ -23,7 +23,7 @@ import dataclasses
 import re
 from typing import Any
 
-RESERVED_WIRE_NAME_PREFIX = "pylon_"
+RESERVED_WIRE_NAME_PREFIX = 'pylon_'
 """Every Postgres channel Pylon's own internals ever LISTEN/NOTIFY on
 (`pylon_index_queue`, `pylon_signal_queue`, `pylon_cache_invalidate` — see
 `crates/pylon-core/src/stdlib/ddl.rs`) starts with this. A user `Channel`
@@ -77,12 +77,12 @@ class ChannelDescriptor:
     wire_name_override: str | None = None
 
     def __repr__(self) -> str:
-        return f"ChannelDescriptor({self.name!r}, module={self.module!r}, payload_type={self.payload_type!r})"
+        return f'ChannelDescriptor({self.name!r}, module={self.module!r}, payload_type={self.payload_type!r})'
 
 
 def _to_snake_case(name: str) -> str:
-    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+    s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
 
 
 def wire_name_for_channel(c: ChannelDescriptor) -> str:
@@ -95,15 +95,15 @@ def wire_name_for_channel(c: ChannelDescriptor) -> str:
     """
     if c.wire_name_override is not None:
         return c.wire_name_override
-    return f"{c.module}__{_to_snake_case(c.name)}"
+    return f'{c.module}__{_to_snake_case(c.name)}'
 
 
 def _infer_module_name(module: Any) -> str:
-    override = getattr(module, "__pylon_module__", None)
+    override = getattr(module, '__pylon_module__', None)
     if isinstance(override, str):
         return override
-    module_path = getattr(module, "__name__", "default")
-    return module_path.rpartition(".")[-1] or module_path
+    module_path = getattr(module, '__name__', 'default')
+    return module_path.rpartition('.')[-1] or module_path
 
 
 def collect_module_channels(module: Any) -> list[ChannelDescriptor]:
@@ -116,7 +116,7 @@ def collect_module_channels(module: Any) -> list[ChannelDescriptor]:
     module_name = _infer_module_name(module)
     result: list[ChannelDescriptor] = []
     for name, value in vars(module).items():
-        if name.startswith("_"):
+        if name.startswith('_'):
             continue
         if not isinstance(value, Channel):
             continue
@@ -155,9 +155,9 @@ def resolve_channel(schema: Any, name: str) -> Any:
     from pylon.exceptions import QueryError
 
     for channel in schema.channels:
-        if channel.name == name or f"{channel.module}::{channel.name}" == name:
+        if channel.name == name or f'{channel.module}::{channel.name}' == name:
             return channel
-    raise QueryError(f"listen(): {name!r} is not a known Channel")
+    raise QueryError(f'listen(): {name!r} is not a known Channel')
 
 
 def decode_channel_payload(channel: Any, raw_payload: str) -> Any:
@@ -183,9 +183,9 @@ def decode_channel_payload(channel: Any, raw_payload: str) -> Any:
     from pylon.exceptions import QueryError
 
     try:
-        if channel.payload_kind == "type":
-            return _decode_scalar_text(raw_payload, "uuid")
-        if channel.payload_kind == "scalar":
+        if channel.payload_kind == 'type':
+            return _decode_scalar_text(raw_payload, 'uuid')
+        if channel.payload_kind == 'scalar':
             return _decode_scalar_text(raw_payload, channel.payload_scalar_pg_type)
         # "object"
         import json
@@ -218,21 +218,21 @@ def _decode_scalar_text(text: str, pg_type: str) -> Any:
     import decimal
     import uuid as _uuid
 
-    if pg_type == "uuid":
+    if pg_type == 'uuid':
         return _uuid.UUID(text)
-    if pg_type in ("int2", "int4", "int8"):
+    if pg_type in ('int2', 'int4', 'int8'):
         return int(text)
-    if pg_type in ("float4", "float8"):
+    if pg_type in ('float4', 'float8'):
         return float(text)
-    if pg_type == "numeric":
+    if pg_type == 'numeric':
         return decimal.Decimal(text)
-    if pg_type == "boolean":
-        return text in ("true", "t")
-    if pg_type == "timestamptz" or pg_type == "timestamp":
+    if pg_type == 'boolean':
+        return text in ('true', 't')
+    if pg_type == 'timestamptz' or pg_type == 'timestamp':
         return datetime.datetime.fromisoformat(text)
-    if pg_type == "date":
+    if pg_type == 'date':
         return datetime.date.fromisoformat(text)
-    if pg_type == "time":
+    if pg_type == 'time':
         return datetime.time.fromisoformat(text)
     # text, jsonb (sent as its own text representation, not re-parsed),
     # interval, bytea, and anything else: raw string.

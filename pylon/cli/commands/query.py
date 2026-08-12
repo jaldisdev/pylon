@@ -37,14 +37,14 @@ from ..banner import print_banner
 
 # Regex that matches `set global name := expression` (case-insensitive SET/GLOBAL)
 _SET_GLOBAL_RE = re.compile(
-    r"^set\s+global\s+([\w:]+)\s*:=\s*(.+)$",
+    r'^set\s+global\s+([\w:]+)\s*:=\s*(.+)$',
     re.IGNORECASE | re.DOTALL,
 )
 
 # Soft keyword, same convention as pylon-core's own parser (see
 # parse/parser.rs's at_analyze_keyword) — only recognized as the leading
 # token, "analyze" stays a legal identifier everywhere else.
-_ANALYZE_PREFIX_RE = re.compile(r"^analyze\b", re.IGNORECASE)
+_ANALYZE_PREFIX_RE = re.compile(r'^analyze\b', re.IGNORECASE)
 
 
 # --- parameter prompting -------------------------------------------------------
@@ -55,13 +55,13 @@ def _find_cast_type(pyql: str, name: str) -> str | None:
     query text, e.g. `<str>$var` -> "str". Only the first occurrence is
     used — good enough for prompt display and coercion, not a full type
     checker (mirrors pylon-ui's extractParams.ts fallback)."""
-    pattern = r"<\s*(?:optional\s+)?([\w:]+)\s*>\s*\$" + re.escape(name) + r"(?!\w)"
+    pattern = r'<\s*(?:optional\s+)?([\w:]+)\s*>\s*\$' + re.escape(name) + r'(?!\w)'
     m = re.search(pattern, pyql)
     return m.group(1) if m else None
 
 
 def _short_cast_type(cast_type: str | None) -> str | None:
-    return cast_type.rsplit("::", 1)[-1] if cast_type else None
+    return cast_type.rsplit('::', 1)[-1] if cast_type else None
 
 
 def _coerce_param_value(raw: str, cast_type: str | None) -> Any:
@@ -69,14 +69,15 @@ def _coerce_param_value(raw: str, cast_type: str | None) -> Any:
     common scalar cases, same scope as pylon-ui's coerceParamValue. str/uuid/
     datetime/duration/bytes/anything unrecognized: passed through as-is."""
     match _short_cast_type(cast_type):
-        case "int16" | "int32" | "int64":
+        case 'int16' | 'int32' | 'int64':
             return int(raw)
-        case "float32" | "float64" | "decimal":
+        case 'float32' | 'float64' | 'decimal':
             return float(raw)
-        case "bool":
-            return raw.strip().lower() == "true"
-        case "json":
+        case 'bool':
+            return raw.strip().lower() == 'true'
+        case 'json':
             import json
+
             return json.loads(raw)
         case _:
             return raw
@@ -93,23 +94,23 @@ async def _prompt_for_params(pyql: str, names: list[str]) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     for name in names:
         cast_type = _find_cast_type(pyql, name)
-        label = f"<{cast_type}>${name}" if cast_type else f"${name}"
-        raw = await value_session.prompt_async(f"Parameter {label}: ")
+        label = f'<{cast_type}>${name}' if cast_type else f'${name}'
+        raw = await value_session.prompt_async(f'Parameter {label}: ')
         kwargs[name] = _coerce_param_value(raw, cast_type)
     return kwargs
 
 
 # --- colours ------------------------------------------------------------------
 
-_INFO_COLOR = "\x1b[38;2;136;120;168m"  # #8878A8
-_BOLD_RED = "\x1b[1;31m"
-_RED = "\x1b[38;5;208m"  # type names
-_YELLOW = "\x1b[38;5;178m"  # keys and UUIDs
-_GREEN = "\x1b[38;5;107m"  # string values
-_BLUE = "\x1b[38;2;96;135;176m"  # outer braces (#6087B0)
-_BOLD_WHITE = "\x1b[1;37m"
-_DIM = "\x1b[2m"
-_RESET = "\x1b[0m"
+_INFO_COLOR = '\x1b[38;2;136;120;168m'  # #8878A8
+_BOLD_RED = '\x1b[1;31m'
+_RED = '\x1b[38;5;208m'  # type names
+_YELLOW = '\x1b[38;5;178m'  # keys and UUIDs
+_GREEN = '\x1b[38;5;107m'  # string values
+_BLUE = '\x1b[38;2;96;135;176m'  # outer braces (#6087B0)
+_BOLD_WHITE = '\x1b[1;37m'
+_DIM = '\x1b[2m'
+_RESET = '\x1b[0m'
 
 
 # --- help text ----------------------------------------------------------------
@@ -132,10 +133,10 @@ def _make_bindings() -> KeyBindings:
         buf = event.current_buffer
         text = buf.text.strip()
         at_end = buf.cursor_position == len(buf.text)
-        if at_end and (text.endswith(";") or text.startswith("\\")):
+        if at_end and (text.endswith(';') or text.startswith('\\')):
             buf.validate_and_handle()
         else:
-            buf.insert_text("\n")
+            buf.insert_text('\n')
 
     return kb
 
@@ -144,9 +145,9 @@ def _make_bindings() -> KeyBindings:
 
 
 def _history_path(project_name: str | None) -> Path:
-    history_dir = Path.home() / ".pylon" / "history"
+    history_dir = Path.home() / '.pylon' / 'history'
     history_dir.mkdir(parents=True, exist_ok=True)
-    name = project_name or "default"
+    name = project_name or 'default'
     return history_dir / name
 
 
@@ -159,10 +160,10 @@ def repl(*, as_json: bool = False, project_name: str | None = None) -> None:
     try:
         pylon.finalize()
     except Exception as e:
-        click.echo(f"{_BOLD_RED}error:{_RESET} could not load schema: {e}", err=True)
+        click.echo(f'{_BOLD_RED}error:{_RESET} could not load schema: {e}', err=True)
         return
 
-    print_banner(info_line="Type \\help for help, \\quit to quit.")
+    print_banner(info_line='Type \\help for help, \\quit to quit.')
 
     asyncio.run(_async_repl(as_json=as_json, project_name=project_name))
 
@@ -171,7 +172,7 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
     session: PromptSession[str] = PromptSession(
         multiline=True,
         key_bindings=_make_bindings(),
-        prompt_continuation="",
+        prompt_continuation='',
         history=FileHistory(str(_history_path(project_name))),
     )
 
@@ -181,10 +182,10 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
     async with create_async_client() as client:
         while True:
             try:
-                text = await session.prompt_async("pylon> ")
+                text = await session.prompt_async('pylon> ')
             except KeyboardInterrupt:
                 click.echo()
-                click.echo(f"{_INFO_COLOR}Use \\quit or Ctrl-D to exit.{_RESET}")
+                click.echo(f'{_INFO_COLOR}Use \\quit or Ctrl-D to exit.{_RESET}')
                 continue
             except EOFError:
                 click.echo()
@@ -192,13 +193,13 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
 
             stripped = text.strip()
 
-            if stripped == r"\quit":
+            if stripped == r'\quit':
                 break
-            elif stripped == r"\help":
+            elif stripped == r'\help':
                 click.echo(_HELP_TEXT)
                 continue
 
-            pyql = stripped.rstrip(";").strip()
+            pyql = stripped.rstrip(';').strip()
             if not pyql:
                 continue
 
@@ -223,29 +224,33 @@ async def _handle_set_global(
     # Resolve unqualified name to module::name using schema globals
     try:
         schema = _get_schema()
-        gs = {g["name"]: g["qualified_name"] for g in schema.globals()}
-        qualified = gs.get(name) or (name if "::" in name else None)
+        gs = {g['name']: g['qualified_name'] for g in schema.globals()}
+        qualified = gs.get(name) or (name if '::' in name else None)
         if qualified is None:
-            click.echo(f"{_BOLD_RED}error:{_RESET} unknown global {name!r}")
+            click.echo(f'{_BOLD_RED}error:{_RESET} unknown global {name!r}')
             return
     except Exception:
-        qualified = name if "::" in name else f"default::{name}"
+        qualified = name if '::' in name else f'default::{name}'
 
     try:
-        results = await client.query(f"select {expression}")
+        results = await client.query(f'select {expression}')
     except Exception as e:
         click.echo(_format_exception(e))
         return
 
     value = results[0] if results else None
     session_globals[qualified] = value
-    click.echo(f"{_INFO_COLOR}OK — {qualified} = {_value(value)}{_RESET}")
+    click.echo(f'{_INFO_COLOR}OK — {qualified} = {_value(value)}{_RESET}')
 
 
 async def _execute(
-    client, pyql: str, *, as_json: bool, repl: bool = True,
+    client,
+    pyql: str,
+    *,
+    as_json: bool,
+    repl: bool = True,
     globals_: dict[str, Any] | None = None,
-    session: "PromptSession[str] | None" = None,
+    session: 'PromptSession[str] | None' = None,
 ) -> None:
     """Transpile and execute a single PyQL statement, printing the result."""
     from pylon.client import _compile_and_resolve, _hydrate
@@ -255,7 +260,7 @@ async def _execute(
     if session is not None:
         try:
             probe = _pyql_compile(pyql)
-            missing = [n for n in probe.param_names if not n.startswith("__")]
+            missing = [n for n in probe.param_names if not n.startswith('__')]
             if missing:
                 kwargs = await _prompt_for_params(pyql, missing)
         except Exception as e:
@@ -270,6 +275,7 @@ async def _execute(
             return
         if as_json:
             import json as _json
+
             click.echo(_json.dumps(coarse_grained))
         else:
             click.echo(_format_analyze_result(pyql, coarse_grained))
@@ -285,97 +291,92 @@ async def _execute(
     try:
         compiled, params = await _compile_and_resolve(pyql, kwargs, client._config, globals_)
         for w in compiled.warnings():
-            click.echo(f"{_YELLOW}warning:{_RESET} {w}", err=True)
+            click.echo(f'{_YELLOW}warning:{_RESET} {w}', err=True)
         # `pool.query` already raises the correctly-mapped
         # `pylon.exceptions.*` instance on failure — no translation needed.
         rows = await client._require_pool().query_compiled(compiled, params)
-        records = [{"result": row} for row in rows]
+        records = [{'result': row} for row in rows]
         results = _hydrate(records, compiled)
     except Exception as e:
         click.echo(_format_exception(e))
         return
 
     shape = compiled.shape
-    shape_kind = shape.get("kind", "object")
+    shape_kind = shape.get('kind', 'object')
 
     # Free scalar: plain values like int, str, bool, and array literals.
     # "enum" is a bare enum-typed scalar (e.g. `select Person.gender;`) —
     # _value() already formats an Enum member correctly (just its name);
     # without this it fell through to the generic object/tuple tail below,
     # which used str(obj) and printed Python's default "ClassName.member".
-    if shape_kind in ("scalar", "raw_scalar", "enum"):
+    if shape_kind in ('scalar', 'raw_scalar', 'enum'):
         items = [_value(obj) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # JSON scalar: value decoded from jsonb, display as Json("...")
-    if shape_kind == "json_scalar":
+    if shape_kind == 'json_scalar':
         import json as _json
+
         def _json_display(v: object) -> str:
             escaped = _json.dumps(v).replace('"', '\\"')
-            return f"Json({_brace(chr(34))}{escaped}{_brace(chr(34))})"
+            return f'Json({_brace(chr(34))}{escaped}{_brace(chr(34))})'
+
         items = [_json_display(obj) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # Anonymous tuple: (1, 'hello')
-    if shape_kind == "tuple":
+    if shape_kind == 'tuple':
         items = [_format_tuple(obj) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # Named tuple: (x := val, y := val)
-    if shape_kind == "named_tuple":
+    if shape_kind == 'named_tuple':
         items = [_format_named_tuple(obj) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # Vector search result: { object, distance }
-    if shape_kind == "vector_search":
+    if shape_kind == 'vector_search':
         depth = 1 if repl else 0
         items = [_format_vector_search_row(obj, depth) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # Full-text search result: { object, score }
-    if shape_kind == "fts_search":
+    if shape_kind == 'fts_search':
         depth = 1 if repl else 0
         items = [_format_fts_search_row(obj, depth) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # Group result: free objects with key / grouping / elements
-    if shape_kind == "group":
+    if shape_kind == 'group':
         max_width = shutil.get_terminal_size((100, 24)).columns
         depth = 1 if repl else 0
         items = [_format_group_row(obj, depth, max_width) for obj in results]
-        click.echo(_format_set(items) if repl else "\n".join(items))
+        click.echo(_format_set(items) if repl else '\n'.join(items))
         return
 
     # Schema object or free object
     # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
-    selected = {
-        p["name"] for p in shape.get("pointers", [])
-        if not (p["name"] == "__type__" and p["position"] == 0)
-    }
-    type_name = shape.get("type_name") or ""
+    selected = {p['name'] for p in shape.get('pointers', []) if not (p['name'] == '__type__' and p['position'] == 0)}
+    type_name = shape.get('type_name') or ''
 
     display = []
     for obj in results:
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            d = {
-                k: v
-                for k, v in vars(obj).items()
-                if k in selected
-            }
+            d = {k: v for k, v in vars(obj).items() if k in selected}
             # __display_type__ is the internal sentinel used as the type label in _format_results.
             # Keeping it separate from __type__ lets an explicit `__type__` pointer show in the output.
-            d["__display_type__"] = vars(obj).get("__pylon_type__") or type_name or type(obj).__name__
+            d['__display_type__'] = vars(obj).get('__pylon_type__') or type_name or type(obj).__name__
         elif isinstance(obj, dict):
             d = {k: v for k, v in obj.items() if k in selected}
-            d["__display_type__"] = type_name
+            d['__display_type__'] = type_name
         else:
-            d = {"__display_type__": type(obj).__name__, "value": str(obj)}
+            d = {'__display_type__': type(obj).__name__, 'value': str(obj)}
         display.append(d)
     click.echo(_format_results(display, wrap=repl))
 
@@ -383,10 +384,9 @@ async def _execute(
 # --- one-shot query command ---------------------------------------------------
 
 
-@click.command("query")
-@click.argument("pyql_query")
-@click.option("--json", "as_json", is_flag=True, default=False,
-              help="Return results as JSON.")
+@click.command('query')
+@click.argument('pyql_query')
+@click.option('--json', 'as_json', is_flag=True, default=False, help='Return results as JSON.')
 def query_cmd(pyql_query: str, as_json: bool) -> None:
     """Execute a single PyQL query and print the result.
 
@@ -397,10 +397,10 @@ def query_cmd(pyql_query: str, as_json: bool) -> None:
     try:
         pylon.finalize()
     except Exception as e:
-        click.echo(f"{_BOLD_RED}error:{_RESET} could not load schema: {e}", err=True)
-        raise SystemExit(1)
+        click.echo(f'{_BOLD_RED}error:{_RESET} could not load schema: {e}', err=True)
+        raise SystemExit(1) from e
 
-    pyql = pyql_query.rstrip(";").strip()
+    pyql = pyql_query.rstrip(';').strip()
 
     async def run() -> None:
         async with create_async_client() as client:
@@ -413,24 +413,22 @@ def query_cmd(pyql_query: str, as_json: bool) -> None:
 
 
 _PG_TO_PYQL = {
-    "timestamp with time zone": "datetime",
-    "time without time zone": "time",
-    "double precision": "float64",
-    "character varying": "str",
-    "smallint": "int16",
-    "integer": "int32",
-    "bigint": "int64",
-    "boolean": "bool",
-    "numeric": "decimal",
-    "bytea": "bytes",
-    "jsonb": "json",
-    "text": "str",
-    "real": "float32",
+    'timestamp with time zone': 'datetime',
+    'time without time zone': 'time',
+    'double precision': 'float64',
+    'character varying': 'str',
+    'smallint': 'int16',
+    'integer': 'int32',
+    'bigint': 'int64',
+    'boolean': 'bool',
+    'numeric': 'decimal',
+    'bytea': 'bytes',
+    'jsonb': 'json',
+    'text': 'str',
+    'real': 'float32',
 }
 
-_PG_TYPE_RE = re.compile(
-    r"\b(" + "|".join(re.escape(k) for k in sorted(_PG_TO_PYQL, key=len, reverse=True)) + r")\b"
-)
+_PG_TYPE_RE = re.compile(r'\b(' + '|'.join(re.escape(k) for k in sorted(_PG_TO_PYQL, key=len, reverse=True)) + r')\b')
 
 
 def _translate_pg_types(msg: str) -> str:
@@ -444,7 +442,7 @@ def _format_exception(e: BaseException) -> str:
     prefixes the actual exception class (`InvalidQueryError`,
     `UnknownLinkError`, ...) instead of the previous generic literal
     "error:" text, which discarded which kind of error it was."""
-    return f"{_BOLD_RED}{type(e).__name__}:{_RESET} {_translate_pg_types(str(e))}"
+    return f'{_BOLD_RED}{type(e).__name__}:{_RESET} {_translate_pg_types(str(e))}'
 
 
 # --- analyze result formatting --------------------------------------------------
@@ -455,11 +453,11 @@ def _format_exception(e: BaseException) -> str:
 # JSON dict `Client.analyze()` returns (pylon-core's `CoarseGrainedNode`,
 # camelCase-free — its own field names, e.g. `marker_offset`, are used as-is).
 
-_CIRCLED_DIGITS = ["➊", "➋", "➌", "➍", "➎", "➏", "➐", "➑", "➒", "➓"]
+_CIRCLED_DIGITS = ['➊', '➋', '➌', '➍', '➎', '➏', '➐', '➑', '➒', '➓']
 
 
 def _analyze_marker(n: int) -> str:
-    return _CIRCLED_DIGITS[n - 1] if n <= len(_CIRCLED_DIGITS) else f"({n})"
+    return _CIRCLED_DIGITS[n - 1] if n <= len(_CIRCLED_DIGITS) else f'({n})'
 
 
 def _flatten_analyze_tree(root: dict) -> list[dict]:
@@ -471,57 +469,54 @@ def _flatten_analyze_tree(root: dict) -> list[dict]:
 
     def walk(node: dict) -> None:
         all_nodes.append(node)
-        for child in node.get("children", []):
-            walk(child["node"])
+        for child in node.get('children', []):
+            walk(child['node'])
 
     walk(root)
 
-    with_offset = [n for n in all_nodes if n.get("marker_offset") is not None]
-    without_offset = [n for n in all_nodes if n.get("marker_offset") is None]
-    with_offset.sort(key=lambda n: n["marker_offset"])
+    with_offset = [n for n in all_nodes if n.get('marker_offset') is not None]
+    without_offset = [n for n in all_nodes if n.get('marker_offset') is None]
+    with_offset.sort(key=lambda n: n['marker_offset'])
     return with_offset + without_offset
 
 
 def _analyze_total_time(node: dict) -> float:
     """Matches explainVis/state.ts's own convention: total time across every
     loop iteration, not one iteration's average."""
-    cost = node["cost"]
-    if cost.get("actual_total_time") is None:
+    cost = node['cost']
+    if cost.get('actual_total_time') is None:
         return 0.0
-    return cost["actual_total_time"] * (cost.get("actual_loops") or 1)
+    return cost['actual_total_time'] * (cost.get('actual_loops') or 1)
 
 
 def _annotate_analyze_query(query: str, markers: list[str], nodes: list[dict]) -> str:
     """Inserts each row's marker text at its own marker_offset inside
     `query` — highest offset first, so an earlier insertion never shifts a
     not-yet-processed later offset out of place."""
-    pairs = [(m, n) for m, n in zip(markers, nodes) if n.get("marker_offset") is not None]
-    pairs.sort(key=lambda pair: pair[1]["marker_offset"], reverse=True)
+    pairs = [(m, n) for m, n in zip(markers, nodes, strict=False) if n.get('marker_offset') is not None]
+    pairs.sort(key=lambda pair: pair[1]['marker_offset'], reverse=True)
     text = query
     for m, n in pairs:
-        offset = n["marker_offset"]
-        text = text[:offset] + m + "  " + text[offset:]
+        offset = n['marker_offset']
+        text = text[:offset] + m + '  ' + text[offset:]
     return text
 
 
 def _format_analyze_result(query: str, root: dict) -> str:
     nodes = _flatten_analyze_tree(root)
     markers = [_analyze_marker(i + 1) for i in range(len(nodes))]
-    labels = [
-        "root" if n["path"] == "root" else "." + n["path"].rsplit(".", 1)[-1]
-        for n in nodes
-    ]
+    labels = ['root' if n['path'] == 'root' else '.' + n['path'].rsplit('.', 1)[-1] for n in nodes]
     label_cells = [
-        (m + " " + label) if n["path"] == "root" else ("╰──" + m + " " + label)
-        for m, label, n in zip(markers, labels, nodes)
+        (m + ' ' + label) if n['path'] == 'root' else ('╰──' + m + ' ' + label)
+        for m, label, n in zip(markers, labels, nodes, strict=False)
     ]
 
-    time_cells = ["Time"] + [f"{_analyze_total_time(n):.1f}" for n in nodes]
-    cost_cells = ["Cost"] + [f"{n['cost']['total_cost']:.2f}" for n in nodes]
-    loops_cells = ["Loops"] + [f"{n['cost'].get('actual_loops') or 0:.1f}" for n in nodes]
-    rows_cells = ["Rows"] + [f"{n['cost'].get('actual_rows') or 0:.1f}" for n in nodes]
-    width_cells = ["Width"] + [str(n["cost"]["plan_width"]) for n in nodes]
-    relations_cells = ["Relations"] + [", ".join(n["relations"]) for n in nodes]
+    time_cells = ['Time'] + [f'{_analyze_total_time(n):.1f}' for n in nodes]
+    cost_cells = ['Cost'] + [f'{n["cost"]["total_cost"]:.2f}' for n in nodes]
+    loops_cells = ['Loops'] + [f'{n["cost"].get("actual_loops") or 0:.1f}' for n in nodes]
+    rows_cells = ['Rows'] + [f'{n["cost"].get("actual_rows") or 0:.1f}' for n in nodes]
+    width_cells = ['Width'] + [str(n['cost']['plan_width']) for n in nodes]
+    relations_cells = ['Relations'] + [', '.join(n['relations']) for n in nodes]
 
     label_width = max([0, *(len(c) for c in label_cells)])
     time_width = max(len(c) for c in time_cells)
@@ -531,55 +526,58 @@ def _format_analyze_result(query: str, root: dict) -> str:
     width_width = max(len(c) for c in width_cells)
 
     def render_line(label: str, i: int) -> str:
-        return " ".join([
-            label.ljust(label_width),
-            "│",
-            time_cells[i].rjust(time_width),
-            cost_cells[i].rjust(cost_width),
-            loops_cells[i].rjust(loops_width),
-            rows_cells[i].rjust(rows_width),
-            width_cells[i].rjust(width_width),
-            "│",
-            relations_cells[i],
-        ])
+        return ' '.join(
+            [
+                label.ljust(label_width),
+                '│',
+                time_cells[i].rjust(time_width),
+                cost_cells[i].rjust(cost_width),
+                loops_cells[i].rjust(loops_width),
+                rows_cells[i].rjust(rows_width),
+                width_cells[i].rjust(width_width),
+                '│',
+                relations_cells[i],
+            ]
+        )
 
-    header = render_line("", 0)
+    header = render_line('', 0)
     data_lines = [render_line(label_cells[i], i + 1) for i in range(len(nodes))]
 
-    title = " Coarse-grained Query Plan "
+    title = ' Coarse-grained Query Plan '
     dashes = max(0, len(header) - len(title))
-    title_line = "─" * ((dashes + 1) // 2) + title + "─" * (dashes // 2)
+    title_line = '─' * ((dashes + 1) // 2) + title + '─' * (dashes // 2)
 
-    annotated = _annotate_analyze_query(query, markers, nodes) + ";"
+    annotated = _annotate_analyze_query(query, markers, nodes) + ';'
 
-    return "\n".join([annotated, "", title_line, header, *data_lines])
+    return '\n'.join([annotated, '', title_line, header, *data_lines])
 
 
 def _type(s: str) -> str:
-    return f"{_RED}{s}{_RESET}"
+    return f'{_RED}{s}{_RESET}'
 
 
 def _key(s: str) -> str:
-    return f"{_YELLOW}{s}{_RESET}"
+    return f'{_YELLOW}{s}{_RESET}'
 
 
 def _brace(s: str) -> str:
-    return f"{_BLUE}{s}{_RESET}"
+    return f'{_BLUE}{s}{_RESET}'
 
 
 def _value(v: object) -> str:
     import decimal as _decimal_mod
     import enum as _enum_mod
+
     if isinstance(v, _enum_mod.Enum):
         # `default::Gender.Male` — module resolved the same way schema
         # build time does (_walker._build_enum_descriptor): an explicit
         # __pylon_module__ class attribute, else the last segment of the
         # class's own __module__.
         cls = type(v)
-        module = getattr(cls, "__pylon_module__", None) or (
-            (cls.__module__ or "default").rpartition(".")[-1] or "default"
+        module = getattr(cls, '__pylon_module__', None) or (
+            (cls.__module__ or 'default').rpartition('.')[-1] or 'default'
         )
-        return f"{_RED}{module}::{cls.__name__}.{v.name}{_RESET}"
+        return f'{_RED}{module}::{cls.__name__}.{v.name}{_RESET}'
     if isinstance(v, _decimal_mod.Decimal):
         # Always at least one fractional digit (never bare "1399", which
         # reads as an int) and a trailing "n" marking it decimal, not float.
@@ -590,60 +588,58 @@ def _value(v: object) -> str:
         text = format(v.normalize(), 'f')
         if '.' not in text:
             text += '.0'
-        return f"{text}n"
+        return f'{text}n'
     if isinstance(v, str):
         if _is_uuid(v):
-            return f"{_YELLOW}{v}{_RESET}"
+            return f'{_YELLOW}{v}{_RESET}'
         return f"{_GREEN}'{v}'{_RESET}"
     if isinstance(v, bool):
-        return f"{_YELLOW}{str(v).lower()}{_RESET}"
+        return f'{_YELLOW}{str(v).lower()}{_RESET}'
     if v is None:
-        return f"{_brace('{')}{_brace('}')}"
+        return f'{_brace("{")}{_brace("}")}'
     if isinstance(v, list):
         from pylon.datatypes import PylonSet
-        inner = ", ".join(_value(item) for item in v)
+
+        inner = ', '.join(_value(item) for item in v)
         if isinstance(v, PylonSet):
-            return f"{_brace('{')}{inner}{_brace('}')}"
-        return f"{_brace('[')}{inner}{_brace(']')}"
+            return f'{_brace("{")}{inner}{_brace("}")}'
+        return f'{_brace("[")}{inner}{_brace("]")}'
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
         from pylon.schema._named_tuples import NamedTuple as PylonNamedTuple
+
         if isinstance(v, PylonNamedTuple):
             return _format_named_tuple(v)
-        qname = vars(v).get("__pylon_type__") or type(v).__name__
-        pairs = ", ".join(
-            f"{_key(k)}: {_value(val)}"
-            for k, val in vars(v).items()
-            if not k.startswith("__pylon_")
-        )
-        return f"{_type(qname)} {_brace('{')}{pairs}{_brace('}')}"
+        qname = vars(v).get('__pylon_type__') or type(v).__name__
+        pairs = ', '.join(f'{_key(k)}: {_value(val)}' for k, val in vars(v).items() if not k.startswith('__pylon_'))
+        return f'{_type(qname)} {_brace("{")}{pairs}{_brace("}")}'
     if isinstance(v, dict):
-        pairs = ", ".join(f"{_key(k)}: {_value(val)}" for k, val in v.items())
-        return f"{_brace('{')}{pairs}{_brace('}')}"
+        pairs = ', '.join(f'{_key(k)}: {_value(val)}' for k, val in v.items())
+        return f'{_brace("{")}{pairs}{_brace("}")}'
     return str(v)
 
 
 def _format_named_tuple(v: object) -> str:
     """Display a named tuple as default::Point (x := val, y := val)."""
     if v is None:
-        return f"{_brace('{')}{_brace('}')}"
+        return f'{_brace("{")}{_brace("}")}'
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
-        mod = getattr(type(v), "__pylon_module__", None)
-        qname = f"{mod}::{type(v).__name__}" if mod else type(v).__name__
-        pointers = {k: val for k, val in vars(v).items() if not k.startswith("__pylon_")}
+        mod = getattr(type(v), '__pylon_module__', None)
+        qname = f'{mod}::{type(v).__name__}' if mod else type(v).__name__
+        pointers = {k: val for k, val in vars(v).items() if not k.startswith('__pylon_')}
     elif isinstance(v, dict):
-        qname = ""
+        qname = ''
         pointers = v
     else:
         return str(v)
-    prefix = f"{_type(qname)} " if qname else ""
-    pairs = ", ".join(f"{_key(k)} := {_value(val)}" for k, val in pointers.items())
-    return f"{prefix}({pairs})"
+    prefix = f'{_type(qname)} ' if qname else ''
+    pairs = ', '.join(f'{_key(k)} := {_value(val)}' for k, val in pointers.items())
+    return f'{prefix}({pairs})'
 
 
 def _is_uuid(s: str) -> bool:
     return bool(
         re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
             s,
             re.IGNORECASE,
         )
@@ -660,12 +656,13 @@ def _visual_len(s: str) -> int:
 def _pformat_value(v: object, depth: int, max_width: int) -> str:
     """Pretty-print a value, recursively expanding objects that are too wide."""
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
-        qname = vars(v).get("__pylon_type__") or type(v).__name__
-        pointers = {k: val for k, val in vars(v).items() if not k.startswith("__pylon_")}
+        qname = vars(v).get('__pylon_type__') or type(v).__name__
+        pointers = {k: val for k, val in vars(v).items() if not k.startswith('__pylon_')}
         return _pformat_object(qname, pointers, depth, max_width)
     if isinstance(v, dict):
-        return _pformat_object("", v, depth, max_width)
+        return _pformat_object('', v, depth, max_width)
     from pylon.datatypes import PylonSet
+
     if isinstance(v, PylonSet):
         elem_strs = [_pformat_value(e, depth + 1, max_width) for e in v]
         return _format_set(elem_strs)
@@ -674,32 +671,32 @@ def _pformat_value(v: object, depth: int, max_width: int) -> str:
 
 def _pformat_object(type_name: str, pointers: dict, depth: int, max_width: int) -> str:
     """Format an object as single-line if it fits, otherwise expand to multi-line."""
-    prefix = f"{_type(type_name)} " if type_name else ""
-    pairs_compact = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in pointers.items())
-    compact = f"{prefix}{_brace('{')}{pairs_compact}{_brace('}')}"
+    prefix = f'{_type(type_name)} ' if type_name else ''
+    pairs_compact = ', '.join(f'{_key(k)}: {_value(v)}' for k, v in pointers.items())
+    compact = f'{prefix}{_brace("{")}{pairs_compact}{_brace("}")}'
     if _visual_len(compact) <= max_width - depth * 2:
         return compact
-    indent = "  " * (depth + 1)
-    closing = "  " * depth
-    pointer_strs = [f"{_key(k)}: {_pformat_value(v, depth + 1, max_width)}" for k, v in pointers.items()]
-    inner = f",\n{indent}".join(pointer_strs)
-    return f"{prefix}{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
+    indent = '  ' * (depth + 1)
+    closing = '  ' * depth
+    pointer_strs = [f'{_key(k)}: {_pformat_value(v, depth + 1, max_width)}' for k, v in pointers.items()]
+    inner = f',\n{indent}'.join(pointer_strs)
+    return f'{prefix}{_brace("{")}\n{indent}{inner}\n{closing}{_brace("}")}'
 
 
 def _format_group_row(obj: dict, depth: int, max_width: int) -> str:
     """Format a GROUP result row: key as free object, grouping as set, elements as set."""
-    key_pairs = ", ".join(f"{_key(k)}: {_value(v)}" for k, v in obj.get("key", {}).items())
-    key_str = f"{_brace('{')}{key_pairs}{_brace('}')}"
+    key_pairs = ', '.join(f'{_key(k)}: {_value(v)}' for k, v in obj.get('key', {}).items())
+    key_str = f'{_brace("{")}{key_pairs}{_brace("}")}'
 
-    grouping_items = [f"{_GREEN}'{name}'{_RESET}" for name in sorted(obj.get("grouping", []))]
+    grouping_items = [f"{_GREEN}'{name}'{_RESET}" for name in sorted(obj.get('grouping', []))]
     grouping_str = _format_set(grouping_items)
 
-    elements = obj.get("elements", [])
+    elements = obj.get('elements', [])
     if dataclasses and elements and dataclasses.is_dataclass(elements[0]):
         elem_strs = [
             _pformat_object(
-                vars(e).get("__pylon_type__") or type(e).__name__,
-                {k: v for k, v in vars(e).items() if not k.startswith("__pylon_")},
+                vars(e).get('__pylon_type__') or type(e).__name__,
+                {k: v for k, v in vars(e).items() if not k.startswith('__pylon_')},
                 depth + 2,
                 max_width,
             )
@@ -710,108 +707,105 @@ def _format_group_row(obj: dict, depth: int, max_width: int) -> str:
     elements_str = _format_set(elem_strs)
 
     parts = {
-        "key": key_str,
-        "grouping": grouping_str,
-        "elements": elements_str,
+        'key': key_str,
+        'grouping': grouping_str,
+        'elements': elements_str,
     }
-    indent = "  " * (depth + 1)
-    closing = "  " * depth
-    inner = f",\n{indent}".join(f"{_key(k)}: {v}" for k, v in parts.items())
-    return f"{_brace('{')}\n{indent}{inner}\n{closing}{_brace('}')}"
+    indent = '  ' * (depth + 1)
+    closing = '  ' * depth
+    inner = f',\n{indent}'.join(f'{_key(k)}: {v}' for k, v in parts.items())
+    return f'{_brace("{")}\n{indent}{inner}\n{closing}{_brace("}")}'
 
 
 def _format_vector_search_row(obj: dict, depth: int) -> str:
     """Format a vector::search result row: { object: …, distance: … }."""
     import dataclasses as _dc
-    obj_val = obj.get("object")
-    dist_val = obj.get("distance")
+
+    obj_val = obj.get('object')
+    dist_val = obj.get('distance')
     if obj_val is not None and _dc.is_dataclass(obj_val) and not isinstance(obj_val, type):
-        type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
+        type_label = getattr(obj_val, '__pylon_type__', type(obj_val).__name__)
         obj_str = _pformat_object(
             type_label,
-            {k: v for k, v in vars(obj_val).items() if not k.startswith("__pylon_")},
+            {k: v for k, v in vars(obj_val).items() if not k.startswith('__pylon_')},
             depth + 1,
             shutil.get_terminal_size((100, 24)).columns,
         )
     else:
         obj_str = _value(obj_val)
-    indent = "  " * (depth + 1)
-    closing = "  " * depth
+    indent = '  ' * (depth + 1)
+    closing = '  ' * depth
     return (
-        f"{_brace('{')}\n"
-        f"{indent}{_key('object')}: {obj_str},\n"
-        f"{indent}{_key('distance')}: {_value(dist_val)}\n"
-        f"{closing}{_brace('}')}"
+        f'{_brace("{")}\n'
+        f'{indent}{_key("object")}: {obj_str},\n'
+        f'{indent}{_key("distance")}: {_value(dist_val)}\n'
+        f'{closing}{_brace("}")}'
     )
 
 
 def _format_fts_search_row(obj: dict, depth: int) -> str:
     """Format a fts::search result row: { object: …, score: … }."""
     import dataclasses as _dc
-    obj_val = obj.get("object")
-    score_val = obj.get("score")
+
+    obj_val = obj.get('object')
+    score_val = obj.get('score')
     if obj_val is not None and _dc.is_dataclass(obj_val) and not isinstance(obj_val, type):
-        type_label = getattr(obj_val, "__pylon_type__", type(obj_val).__name__)
+        type_label = getattr(obj_val, '__pylon_type__', type(obj_val).__name__)
         obj_str = _pformat_object(
             type_label,
-            {k: v for k, v in vars(obj_val).items() if not k.startswith("__pylon_")},
+            {k: v for k, v in vars(obj_val).items() if not k.startswith('__pylon_')},
             depth + 1,
             shutil.get_terminal_size((100, 24)).columns,
         )
     else:
         obj_str = _value(obj_val)
-    indent = "  " * (depth + 1)
-    closing = "  " * depth
+    indent = '  ' * (depth + 1)
+    closing = '  ' * depth
     return (
-        f"{_brace('{')}\n"
-        f"{indent}{_key('object')}: {obj_str},\n"
-        f"{indent}{_key('score')}: {_value(score_val)}\n"
-        f"{closing}{_brace('}')}"
+        f'{_brace("{")}\n'
+        f'{indent}{_key("object")}: {obj_str},\n'
+        f'{indent}{_key("score")}: {_value(score_val)}\n'
+        f'{closing}{_brace("}")}'
     )
 
 
 def _format_tuple(t: tuple) -> str:
-    return "(" + ", ".join(_value(v) for v in t) + ")"
+    return '(' + ', '.join(_value(v) for v in t) + ')'
 
 
 def _format_set(items: list[str]) -> str:
     """Render a set of pre-formatted value strings."""
     if not items:
-        return _brace("{}")
+        return _brace('{}')
     if len(items) == 1:
         item = items[0]
         if '\n' in item:
-            return f"{_brace('{')}\n  {item}\n{_brace('}')}"
-        return f"{_brace('{')}{item}{_brace('}')}"
-    inner = ",\n  ".join(items)
-    return f"{_brace('{')}\n  {inner}\n{_brace('}')}"
+            return f'{_brace("{")}\n  {item}\n{_brace("}")}'
+        return f'{_brace("{")}{item}{_brace("}")}'
+    inner = ',\n  '.join(items)
+    return f'{_brace("{")}\n  {inner}\n{_brace("}")}'
 
 
 def _format_results(results: list[dict], *, wrap: bool = True) -> str:
     """Render a list of result objects in coloured output."""
     max_width = shutil.get_terminal_size((100, 24)).columns
     if not results:
-        return _brace("{}") if wrap else ""
+        return _brace('{}') if wrap else ''
 
     depth = 1 if wrap else 0
-    formatted = [
-        _pformat_object(obj.pop("__display_type__", ""), obj, depth, max_width)
-        for obj in results
-    ]
+    formatted = [_pformat_object(obj.pop('__display_type__', ''), obj, depth, max_width) for obj in results]
 
     if not wrap:
-        return "\n".join(formatted)
+        return '\n'.join(formatted)
 
-    lines = [_brace("{")]
+    lines = [_brace('{')]
     for item in formatted:
-        lines.append(f"  {item},")
-    lines.append(_brace("}"))
-    return "\n".join(lines)
+        lines.append(f'  {item},')
+    lines.append(_brace('}'))
+    return '\n'.join(lines)
 
 
-def format_error(
-    error_type: str, message: str, source: str, line: int, col: int
-) -> str:
+def format_error(error_type: str, message: str, source: str, line: int, col: int) -> str:
     """Render a query error in coloured output.
 
     Args:
@@ -821,19 +815,19 @@ def format_error(
         line:       1-based line number where the error occurred.
         col:        1-based column number where the error starts.
     """
-    token_match = re.match(r"[\w:]+", source[col - 1 :])
+    token_match = re.match(r'[\w:]+', source[col - 1 :])
     span = len(token_match.group()) if token_match else 1
-    carets = "^" * span
+    carets = '^' * span
 
     line_num = str(line)
     gutter = len(line_num)
 
     lines = [
-        f"{_BOLD_RED}error: {error_type}:{_RESET} {_BOLD_WHITE}{message}{_RESET}",
-        f"  {_DIM}\u250c\u2500 <query>:{line}:{col}{_RESET}",
-        f"",
-        f"  {_DIM}{line_num}{_RESET}  \u2502  {source}",
-        f"  {' ' * gutter}     {_BOLD_RED}{carets} error{_RESET}",
-        f"",
+        f'{_BOLD_RED}error: {error_type}:{_RESET} {_BOLD_WHITE}{message}{_RESET}',
+        f'  {_DIM}\u250c\u2500 <query>:{line}:{col}{_RESET}',
+        '',
+        f'  {_DIM}{line_num}{_RESET}  \u2502  {source}',
+        f'  {" " * gutter}     {_BOLD_RED}{carets} error{_RESET}',
+        '',
     ]
-    return "\n".join(lines)
+    return '\n'.join(lines)

@@ -22,12 +22,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 from click.testing import CliRunner
 
 from pylon.cli.commands.migrations import _next_seq, _pg_dsn
-from pylon.config import DatabaseConfig, ProjectConfig, Config
-
+from pylon.config import Config, DatabaseConfig, ProjectConfig
 
 # ---------------------------------------------------------------------------
 # _next_seq

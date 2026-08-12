@@ -31,9 +31,9 @@ def live_db_dsn() -> str:
     """Same env var as crates/pylon-core/tests/common/mod.rs's test_dsn() — no
     hardcoded fallback, must be set explicitly.
     """
-    dsn = os.environ.get("PYLON_PGCON_TEST_DSN")
+    dsn = os.environ.get('PYLON_PGCON_TEST_DSN')
     if not dsn:
-        raise RuntimeError("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        raise RuntimeError('PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests')
     return dsn
 
 
@@ -74,6 +74,6 @@ def unique_module():
     """
 
     def _make(prefix: str) -> str:
-        return f"{prefix}_{time.time_ns()}_{next(_module_counter)}"
+        return f'{prefix}_{time.time_ns()}_{next(_module_counter)}'
 
     return _make

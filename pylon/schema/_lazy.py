@@ -28,13 +28,13 @@ class _Lazy:
     import anchor.
     """
 
-    __slots__ = ("module_path",)
+    __slots__ = ('module_path',)
 
     def __init__(self, module_path: str) -> None:
         self.module_path = module_path
 
     def __repr__(self) -> str:
-        return f"pylon.lazy({self.module_path!r})"
+        return f'pylon.lazy({self.module_path!r})'
 
 
 def lazy(module_path: str) -> _Lazy:

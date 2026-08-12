@@ -25,7 +25,7 @@ from typing import Literal
 from . import _collector
 
 # Characters that distinguish a PyQL expression from a bare pointer name.
-_EXPR_CHARS = frozenset("(). +-*/<>=!|&")
+_EXPR_CHARS = frozenset('(). +-*/<>=!|&')
 
 
 def _is_expression(value: str) -> bool:
@@ -63,11 +63,11 @@ class Index:
     def __repr__(self) -> str:
         parts = [repr(self.pointer)]
         if self.unless is not None:
-            parts.append(f"unless={self.unless!r}")
-        return f"Index({', '.join(parts)})"
+            parts.append(f'unless={self.unless!r}')
+        return f'Index({", ".join(parts)})'
 
 
-Metric = Literal["cosine", "euclidean", "inner_product"]
+Metric = Literal['cosine', 'euclidean', 'inner_product']
 
 
 class VectorPointer:
@@ -84,7 +84,7 @@ class VectorPointer:
         self.ref = ref
 
     def __repr__(self) -> str:
-        return f"VectorPointer({self.ref!r})"
+        return f'VectorPointer({self.ref!r})'
 
 
 class VectorIndex:
@@ -124,7 +124,7 @@ class VectorIndex:
         pointers: list[VectorPointer],
         model: str,
         *,
-        metric: Metric = "cosine",
+        metric: Metric = 'cosine',
         dimensions: int = 1024,
     ) -> None:
         self.index_name = None
@@ -138,32 +138,32 @@ class VectorIndex:
         self.index_name = name
 
     def __repr__(self) -> str:
-        parts = [f"pointers={self._vector_pointers!r}", f"model={self.model!r}"]
+        parts = [f'pointers={self._vector_pointers!r}', f'model={self.model!r}']
         if self.index_name is not None:
-            parts.append(f"index_name={self.index_name!r}")
-        return f"VectorIndex({', '.join(parts)})"
+            parts.append(f'index_name={self.index_name!r}')
+        return f'VectorIndex({", ".join(parts)})'
 
 
 # ── SearchIndex ────────────────────────────────────────────────────────────────
 
 
 class SearchBackend(Enum):
-    Postgres = "Postgres"
-    OpenSearch = "OpenSearch"
-    Meilisearch = "Meilisearch"
+    Postgres = 'Postgres'
+    OpenSearch = 'OpenSearch'
+    Meilisearch = 'Meilisearch'
 
 
 class SearchWeight(Enum):
-    A = "A"
-    B = "B"
-    C = "C"
-    D = "D"
+    A = 'A'
+    B = 'B'
+    C = 'C'
+    D = 'D'
 
 
 class SearchMode(Enum):
-    BestFields = "BestFields"
-    Phrase = "Phrase"
-    PhrasePrefix = "PhrasePrefix"
+    BestFields = 'BestFields'
+    Phrase = 'Phrase'
+    PhrasePrefix = 'PhrasePrefix'
 
 
 class SearchPointer:
@@ -181,7 +181,7 @@ class SearchPointer:
         self.weight_category = weight_category
 
     def __repr__(self) -> str:
-        return f"SearchPointer({self.ref!r}, weight_category={self.weight_category!r})"
+        return f'SearchPointer({self.ref!r}, weight_category={self.weight_category!r})'
 
 
 class SearchIndex:
@@ -230,7 +230,7 @@ class SearchIndex:
         self.index_name = name
 
     def __repr__(self) -> str:
-        parts = [f"backend={self.backend!r}", f"pointers={self._search_pointers!r}"]
+        parts = [f'backend={self.backend!r}', f'pointers={self._search_pointers!r}']
         if self.index_name is not None:
-            parts.append(f"index_name={self.index_name!r}")
-        return f"SearchIndex({', '.join(parts)})"
+            parts.append(f'index_name={self.index_name!r}')
+        return f'SearchIndex({", ".join(parts)})'

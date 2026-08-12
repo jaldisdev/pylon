@@ -37,5 +37,6 @@ def export(*, schema: SchemaDescriptor | None = None) -> str:
 
     if schema is None:
         from pylon.query import _get_schema
+
         schema = _get_schema()
     return _core_export_schema(schema)

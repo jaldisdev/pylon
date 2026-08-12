@@ -20,12 +20,10 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
-
-import tomllib
-
 
 # ---------------------------------------------------------------------------
 # ProjectConfig
@@ -72,20 +70,15 @@ class DatabaseConfig:
 
     def __post_init__(self) -> None:
         if self.dsn is None:
-            missing = [
-                k for k in ("host", "port", "name", "user") if getattr(self, k) is None
-            ]
+            missing = [k for k in ('host', 'port', 'name', 'user') if getattr(self, k) is None]
             if missing:
                 raise ValueError(
-                    f"DatabaseConfig: missing required fields when dsn is not "
-                    f"provided: {', '.join(missing)}"
+                    f'DatabaseConfig: missing required fields when dsn is not provided: {", ".join(missing)}'
                 )
         if self.pool_min_size < 1:
-            raise ValueError("DatabaseConfig: pool_min_size must be >= 1.")
+            raise ValueError('DatabaseConfig: pool_min_size must be >= 1.')
         if self.pool_max_size < self.pool_min_size:
-            raise ValueError(
-                "DatabaseConfig: pool_max_size must be >= pool_min_size."
-            )
+            raise ValueError('DatabaseConfig: pool_max_size must be >= pool_min_size.')
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +92,7 @@ class SearchConfig:
 
     host: str
     port: int
-    backend: Literal["opensearch", "meilisearch"] = "opensearch"
+    backend: Literal['opensearch', 'meilisearch'] = 'opensearch'
     # OpenSearch: HTTP basic auth
     user: str | None = None
     password: str | None = None
@@ -117,7 +110,7 @@ class ModelConfig:
     """Model provider connection for embedding generation, vector index
     population, or chat completions (see *purpose*)."""
 
-    api_style: Literal["openai", "anthropic"]
+    api_style: Literal['openai', 'anthropic']
     api_url: str
     model: str
     client_id: str | None = None
@@ -125,7 +118,7 @@ class ModelConfig:
     # "embedding" models are selected by name from a VectorIndex declaration
     # (pylon.VectorIndex(..., model="...")) and never user-facing at query
     # time. "chat" models are the ones the AI tab's Model select offers.
-    purpose: Literal["embedding", "chat"] = "embedding"
+    purpose: Literal['embedding', 'chat'] = 'embedding'
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +133,7 @@ class WebserverConfig:
     Applies regardless of what's mounted on it (``/api``, ``/metrics``, the SPA).
     """
 
-    host: str = "localhost"
+    host: str = 'localhost'
     port: int = 5656
 
 
@@ -203,9 +196,9 @@ class CacheConfig:
     """
 
     enabled: bool = False
-    backend: Literal["lmdb"] = "lmdb"
+    backend: Literal['lmdb'] = 'lmdb'
     max_size_mb: int = 1024
-    path: Path = field(default_factory=lambda: Path(".pylon/cache"))
+    path: Path = field(default_factory=lambda: Path('.pylon/cache'))
     sets: CacheSetRegistry = field(default_factory=dict)
 
 
@@ -253,7 +246,7 @@ class Config:
             case None:
                 return {}
             case SearchConfig() as s:
-                return {"default": s}
+                return {'default': s}
             case dict() as d:
                 return d
 
@@ -264,7 +257,7 @@ class Config:
             case None:
                 return {}
             case ModelConfig() as m:
-                return {"default": m}
+                return {'default': m}
             case dict() as d:
                 return d
 
@@ -273,7 +266,7 @@ class Config:
 # TOML loader
 # ---------------------------------------------------------------------------
 
-_FILENAME = "pylon.toml"
+_FILENAME = 'pylon.toml'
 
 
 def _find_toml(start: Path) -> Path:
@@ -282,14 +275,10 @@ def _find_toml(start: Path) -> Path:
         candidate = directory / _FILENAME
         if candidate.is_file():
             return candidate
-    raise FileNotFoundError(
-        f"Could not locate {_FILENAME!r} in {start} or any parent directory."
-    )
+    raise FileNotFoundError(f'Could not locate {_FILENAME!r} in {start} or any parent directory.')
 
 
-def _resolve_secret(
-    raw: dict[str, object], secret_key: str, env_key: str
-) -> str | None:
+def _resolve_secret(raw: dict[str, object], secret_key: str, env_key: str) -> str | None:
     """Return the direct value or the env-var expansion, preferring direct."""
     if direct := raw.get(secret_key):
         return str(direct)
@@ -299,16 +288,16 @@ def _resolve_secret(
 
 
 def _build_database(raw: dict[str, object]) -> DatabaseConfig:
-    pool_min = int(raw.get("pool_min_size", 2))  # type: ignore[arg-type]
-    pool_max = int(raw.get("pool_max_size", 10))  # type: ignore[arg-type]
-    if dsn := raw.get("dsn"):
+    pool_min = int(raw.get('pool_min_size', 2))  # type: ignore[arg-type]
+    pool_max = int(raw.get('pool_max_size', 10))  # type: ignore[arg-type]
+    if dsn := raw.get('dsn'):
         return DatabaseConfig(dsn=str(dsn), pool_min_size=pool_min, pool_max_size=pool_max)
-    password = _resolve_secret(raw, "password", "password_env")
+    password = _resolve_secret(raw, 'password', 'password_env')
     return DatabaseConfig(
-        host=str(raw["host"]),
-        port=int(raw["port"]),  # type: ignore[arg-type]
-        name=str(raw["name"]),
-        user=str(raw["user"]),
+        host=str(raw['host']),
+        port=int(raw['port']),  # type: ignore[arg-type]
+        name=str(raw['name']),
+        user=str(raw['user']),
         password=password,
         pool_min_size=pool_min,
         pool_max_size=pool_max,
@@ -316,15 +305,15 @@ def _build_database(raw: dict[str, object]) -> DatabaseConfig:
 
 
 def _build_search(raw: dict[str, object]) -> SearchConfig:
-    password = _resolve_secret(raw, "password", "password_env")
-    api_key = _resolve_secret(raw, "api_key", "api_key_env")
-    user_val = raw.get("user")
-    backend_val = raw.get("backend", "opensearch")
-    if backend_val not in ("opensearch", "meilisearch"):
+    password = _resolve_secret(raw, 'password', 'password_env')
+    api_key = _resolve_secret(raw, 'api_key', 'api_key_env')
+    user_val = raw.get('user')
+    backend_val = raw.get('backend', 'opensearch')
+    if backend_val not in ('opensearch', 'meilisearch'):
         raise ValueError(f"SearchConfig: backend must be 'opensearch' or 'meilisearch', got {backend_val!r}")
     return SearchConfig(
-        host=str(raw["host"]),
-        port=int(raw["port"]),  # type: ignore[arg-type]
+        host=str(raw['host']),
+        port=int(raw['port']),  # type: ignore[arg-type]
         backend=backend_val,  # type: ignore[arg-type]
         user=str(user_val) if user_val is not None else None,
         password=password,
@@ -334,8 +323,8 @@ def _build_search(raw: dict[str, object]) -> SearchConfig:
 
 def _build_cache_set(raw: dict[str, object]) -> CacheSetConfig:
     kwargs: dict[str, object] = {}
-    if "enabled" in raw:
-        kwargs["enabled"] = bool(raw["enabled"])
+    if 'enabled' in raw:
+        kwargs['enabled'] = bool(raw['enabled'])
     return CacheSetConfig(**kwargs)
 
 
@@ -345,27 +334,25 @@ def _resolve_cache_path(raw_path: str | None, toml_path: Path) -> Path:
     ``pylon.toml`` if not already absolute. Defaults to ``.pylon/cache``
     next to ``pylon.toml`` when unset.
     """
-    expanded = Path(raw_path).expanduser() if raw_path else Path(".pylon/cache")
+    expanded = Path(raw_path).expanduser() if raw_path else Path('.pylon/cache')
     if expanded.is_absolute():
         return expanded
     return (toml_path.parent / expanded).resolve()
 
 
 def _build_model(raw: dict[str, object]) -> ModelConfig:
-    api_style = raw["api_style"]
-    if api_style not in ("openai", "anthropic"):
-        raise ValueError(
-            f"ModelConfig: api_style must be 'openai' or 'anthropic', got {api_style!r}"
-        )
-    purpose = raw.get("purpose", "embedding")
-    if purpose not in ("embedding", "chat"):
+    api_style = raw['api_style']
+    if api_style not in ('openai', 'anthropic'):
+        raise ValueError(f"ModelConfig: api_style must be 'openai' or 'anthropic', got {api_style!r}")
+    purpose = raw.get('purpose', 'embedding')
+    if purpose not in ('embedding', 'chat'):
         raise ValueError(f"ModelConfig: purpose must be 'embedding' or 'chat', got {purpose!r}")
-    secret = _resolve_secret(raw, "secret", "secret_env")
-    client_id_val = raw.get("client_id")
+    secret = _resolve_secret(raw, 'secret', 'secret_env')
+    client_id_val = raw.get('client_id')
     return ModelConfig(
         api_style=api_style,  # type: ignore[arg-type]
-        api_url=str(raw["api_url"]),
-        model=str(raw["model"]),
+        api_url=str(raw['api_url']),
+        model=str(raw['model']),
         client_id=str(client_id_val) if client_id_val is not None else None,
         secret=secret,
         purpose=purpose,  # type: ignore[arg-type]
@@ -374,18 +361,16 @@ def _build_model(raw: dict[str, object]) -> ModelConfig:
 
 # Keys that are reserved TOML table names and must not be treated as branch/
 # connection names when iterating a section for sub-tables.
-_RESERVED_TOP_LEVEL = frozenset({"project", "database", "search", "models"})
+_RESERVED_TOP_LEVEL = frozenset({'project', 'database', 'search', 'models'})
 
 # Known scalar keys in each section — sub-tables within a section are named
 # connections/branches.
 _DATABASE_SCALAR_KEYS = frozenset(
-    {"dsn", "host", "port", "name", "user", "password", "password_env", "pool_min_size", "pool_max_size"}
+    {'dsn', 'host', 'port', 'name', 'user', 'password', 'password_env', 'pool_min_size', 'pool_max_size'}
 )
-_SEARCH_SCALAR_KEYS = frozenset({"host", "port", "user", "password", "password_env"})
-_MODELS_SCALAR_KEYS = frozenset(
-    {"api_style", "api_url", "model", "client_id", "secret", "secret_env", "purpose"}
-)
-_CACHE_SCALAR_KEYS = frozenset({"enabled", "backend", "max_size_mb", "path"})
+_SEARCH_SCALAR_KEYS = frozenset({'host', 'port', 'user', 'password', 'password_env'})
+_MODELS_SCALAR_KEYS = frozenset({'api_style', 'api_url', 'model', 'client_id', 'secret', 'secret_env', 'purpose'})
+_CACHE_SCALAR_KEYS = frozenset({'enabled', 'backend', 'max_size_mb', 'path'})
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -419,15 +404,15 @@ def load_config(path: str | Path | None = None) -> Config:
     """
     toml_path = _find_toml(Path(path).resolve() if path else Path.cwd())
 
-    with toml_path.open("rb") as fh:
+    with toml_path.open('rb') as fh:
         raw: dict[str, object] = tomllib.load(fh)
 
     # ------------------------------------------------------------------
     # [database]
     # ------------------------------------------------------------------
-    raw_db = raw.get("database")
+    raw_db = raw.get('database')
     if not isinstance(raw_db, dict):
-        raise KeyError("pylon.toml: required section [database] is missing or invalid.")
+        raise KeyError('pylon.toml: required section [database] is missing or invalid.')
 
     # Extract only scalar keys for the base config; sub-tables are named connections.
     base_db_raw = {k: v for k, v in raw_db.items() if k in _DATABASE_SCALAR_KEYS}
@@ -435,7 +420,7 @@ def load_config(path: str | Path | None = None) -> Config:
 
     # Build the named-connections registry.  "default" is always the base block;
     # each sub-table is a sparse override (inherits unset keys from the base).
-    connections: dict[str, DatabaseConfig] = {"default": database}
+    connections: dict[str, DatabaseConfig] = {'default': database}
     for key, value in raw_db.items():
         if key in _DATABASE_SCALAR_KEYS or not isinstance(value, dict):
             continue
@@ -446,16 +431,14 @@ def load_config(path: str | Path | None = None) -> Config:
     # [search]
     # ------------------------------------------------------------------
     search: SearchConfig | SearchRegistry | None = None
-    raw_search = raw.get("search")
+    raw_search = raw.get('search')
 
     if isinstance(raw_search, dict):
-        base_search_raw = {
-            k: v for k, v in raw_search.items() if k in _SEARCH_SCALAR_KEYS
-        }
+        base_search_raw = {k: v for k, v in raw_search.items() if k in _SEARCH_SCALAR_KEYS}
         registry: SearchRegistry = {}
 
         if base_search_raw:
-            registry["default"] = _build_search(base_search_raw)
+            registry['default'] = _build_search(base_search_raw)
 
         for key, value in raw_search.items():
             if key in _SEARCH_SCALAR_KEYS:
@@ -472,16 +455,14 @@ def load_config(path: str | Path | None = None) -> Config:
     # [models]
     # ------------------------------------------------------------------
     models: ModelConfig | ModelRegistry | None = None
-    raw_models = raw.get("models")
+    raw_models = raw.get('models')
 
     if isinstance(raw_models, dict):
-        base_models_raw = {
-            k: v for k, v in raw_models.items() if k in _MODELS_SCALAR_KEYS
-        }
+        base_models_raw = {k: v for k, v in raw_models.items() if k in _MODELS_SCALAR_KEYS}
         model_registry: ModelRegistry = {}
 
         if base_models_raw:
-            model_registry["default"] = _build_model(base_models_raw)
+            model_registry['default'] = _build_model(base_models_raw)
 
         for key, value in raw_models.items():
             if key in _MODELS_SCALAR_KEYS:
@@ -494,17 +475,17 @@ def load_config(path: str | Path | None = None) -> Config:
     # ------------------------------------------------------------------
     # [project]
     # ------------------------------------------------------------------
-    raw_project = raw.get("project")
+    raw_project = raw.get('project')
     if not isinstance(raw_project, dict):
-        raise KeyError("pylon.toml: required section [project] is missing or invalid.")
+        raise KeyError('pylon.toml: required section [project] is missing or invalid.')
 
-    schema_dir_raw = raw_project.get("schema-dir")
+    schema_dir_raw = raw_project.get('schema-dir')
     if not schema_dir_raw:
         raise KeyError("pylon.toml: [project] requires 'schema-dir'.")
 
     schema_dir = (toml_path.parent / str(schema_dir_raw)).resolve()
-    name_raw = raw_project.get("name")
-    pyql_raw = raw_project.get("pyql")
+    name_raw = raw_project.get('name')
+    pyql_raw = raw_project.get('pyql')
     project = ProjectConfig(
         schema_dir=schema_dir,
         name=str(name_raw) if name_raw is not None else None,
@@ -519,50 +500,48 @@ def load_config(path: str | Path | None = None) -> Config:
     # with plain descriptors, not the default values) for the dataclass default
     # to apply.
     webserver_kwargs: dict[str, object] = {}
-    if isinstance(raw_webserver := raw.get("webserver"), dict):
-        if "host" in raw_webserver:
-            webserver_kwargs["host"] = str(raw_webserver["host"])
-        if "port" in raw_webserver:
-            webserver_kwargs["port"] = int(raw_webserver["port"])  # type: ignore[arg-type]
+    if isinstance(raw_webserver := raw.get('webserver'), dict):
+        if 'host' in raw_webserver:
+            webserver_kwargs['host'] = str(raw_webserver['host'])
+        if 'port' in raw_webserver:
+            webserver_kwargs['port'] = int(raw_webserver['port'])  # type: ignore[arg-type]
     webserver = WebserverConfig(**webserver_kwargs)
 
     ui_kwargs: dict[str, object] = {}
-    if isinstance(raw_ui := raw.get("ui"), dict) and "enabled" in raw_ui:
-        ui_kwargs["enabled"] = bool(raw_ui["enabled"])
+    if isinstance(raw_ui := raw.get('ui'), dict) and 'enabled' in raw_ui:
+        ui_kwargs['enabled'] = bool(raw_ui['enabled'])
     ui = UiConfig(**ui_kwargs)
 
     metrics_kwargs: dict[str, object] = {}
-    if isinstance(raw_metrics := raw.get("metrics"), dict) and "enabled" in raw_metrics:
-        metrics_kwargs["enabled"] = bool(raw_metrics["enabled"])
+    if isinstance(raw_metrics := raw.get('metrics'), dict) and 'enabled' in raw_metrics:
+        metrics_kwargs['enabled'] = bool(raw_metrics['enabled'])
     metrics = MetricsConfig(**metrics_kwargs)
 
     # ------------------------------------------------------------------
     # [cache]
     # ------------------------------------------------------------------
     cache_kwargs: dict[str, object] = {}
-    raw_cache = raw.get("cache")
+    raw_cache = raw.get('cache')
     raw_cache_path = None
     if isinstance(raw_cache, dict):
-        if "enabled" in raw_cache:
-            cache_kwargs["enabled"] = bool(raw_cache["enabled"])
-        if "backend" in raw_cache:
-            backend_val = raw_cache["backend"]
-            if backend_val != "lmdb":
+        if 'enabled' in raw_cache:
+            cache_kwargs['enabled'] = bool(raw_cache['enabled'])
+        if 'backend' in raw_cache:
+            backend_val = raw_cache['backend']
+            if backend_val != 'lmdb':
                 raise ValueError(f"CacheConfig: backend must be 'lmdb', got {backend_val!r}")
-            cache_kwargs["backend"] = backend_val
-        if "max_size_mb" in raw_cache:
-            cache_kwargs["max_size_mb"] = int(raw_cache["max_size_mb"])  # type: ignore[arg-type]
-        if "path" in raw_cache:
-            raw_cache_path = str(raw_cache["path"])
+            cache_kwargs['backend'] = backend_val
+        if 'max_size_mb' in raw_cache:
+            cache_kwargs['max_size_mb'] = int(raw_cache['max_size_mb'])  # type: ignore[arg-type]
+        if 'path' in raw_cache:
+            raw_cache_path = str(raw_cache['path'])
 
-        raw_sets = raw_cache.get("sets")
+        raw_sets = raw_cache.get('sets')
         if isinstance(raw_sets, dict):
-            cache_kwargs["sets"] = {
-                name: _build_cache_set(value)
-                for name, value in raw_sets.items()
-                if isinstance(value, dict)
+            cache_kwargs['sets'] = {
+                name: _build_cache_set(value) for name, value in raw_sets.items() if isinstance(value, dict)
             }
-    cache_kwargs["path"] = _resolve_cache_path(raw_cache_path, toml_path)
+    cache_kwargs['path'] = _resolve_cache_path(raw_cache_path, toml_path)
     cache = CacheConfig(**cache_kwargs)
 
     return Config(
@@ -580,14 +559,14 @@ def load_config(path: str | Path | None = None) -> Config:
 
 
 __all__ = [
-    "Config",
-    "ProjectConfig",
-    "DatabaseConfig",
-    "SearchConfig",
-    "ModelConfig",
-    "WebserverConfig",
-    "UiConfig",
-    "CacheConfig",
-    "CacheSetConfig",
-    "load_config",
+    'CacheConfig',
+    'CacheSetConfig',
+    'Config',
+    'DatabaseConfig',
+    'ModelConfig',
+    'ProjectConfig',
+    'SearchConfig',
+    'UiConfig',
+    'WebserverConfig',
+    'load_config',
 ]

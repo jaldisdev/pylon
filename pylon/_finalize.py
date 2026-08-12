@@ -41,9 +41,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pylon._core import SchemaDescriptor
 
-RESERVED_MODULE_NAMES: frozenset[str] = frozenset({
-    "public", "pg_catalog", "information_schema", "pg_toast",
-})
+RESERVED_MODULE_NAMES: frozenset[str] = frozenset(
+    {
+        'public',
+        'pg_catalog',
+        'information_schema',
+        'pg_toast',
+    }
+)
 
 
 def _import_schema_dir(schema_dir: Path) -> None:
@@ -59,14 +64,14 @@ def _import_schema_dir(schema_dir: Path) -> None:
         sys.path.insert(0, schema_dir_str)
 
     # Sort so __init__.py (if present) loads before sibling files.
-    for py_file in sorted(schema_dir.glob("*.py")):
+    for py_file in sorted(schema_dir.glob('*.py')):
         stem = py_file.stem
-        if stem.startswith("_"):
+        if stem.startswith('_'):
             continue
         if stem in RESERVED_MODULE_NAMES:
             raise ValueError(
                 f"'{stem}.py' is not a valid module name: '{stem}' is a reserved "
-                f"PostgreSQL schema name. Use a different name."
+                f'PostgreSQL schema name. Use a different name.'
             )
         if stem not in sys.modules:
             importlib.import_module(stem)
@@ -76,7 +81,7 @@ def finalize(
     *,
     config: str | Path | None = None,
     modules: list[Any] | None = None,
-) -> "SchemaDescriptor":
+) -> SchemaDescriptor:
     """Walk the schema registry and build the process-level SchemaDescriptor.
 
     Reads ``pylon.toml`` (walking up from the current directory unless *config*
@@ -121,13 +126,14 @@ def finalize(
         link targets, required-link cycles, interface non-conformance.
     """
     from pylon.config import load_config
-    from pylon.schema._globals import collect_all_globals
+    from pylon.query import _set_schema
     from pylon.schema._aliases import collect_module_aliases
     from pylon.schema._channels import collect_module_channels
-    from pylon.schema._registry import snapshot, functions_snapshot, named_tuples_snapshot, signals_snapshot
+    from pylon.schema._globals import collect_all_globals
+    from pylon.schema._registry import functions_snapshot, named_tuples_snapshot, signals_snapshot, snapshot
+    from pylon.schema._signal_registry import _set_index as _set_signal_index
+    from pylon.schema._signal_registry import build_index as build_signal_index
     from pylon.schema._walker import walk
-    from pylon.schema._signal_registry import build_index as build_signal_index, _set_index as _set_signal_index
-    from pylon.query import _set_schema
 
     cfg = load_config(config)
     schema_dir = cfg.project.schema_dir  # type: ignore[union-attr]
@@ -140,9 +146,9 @@ def finalize(
     # Collect aliases and channels from every non-private schema file that was imported.
     aliases_: list[Any] = []
     channels_: list[Any] = []
-    for py_file in sorted(schema_dir.glob("*.py")):
+    for py_file in sorted(schema_dir.glob('*.py')):
         stem = py_file.stem
-        if not stem.startswith("_") and stem in sys.modules:
+        if not stem.startswith('_') and stem in sys.modules:
             aliases_.extend(collect_module_aliases(sys.modules[stem]))
             channels_.extend(collect_module_channels(sys.modules[stem]))
     if modules:
