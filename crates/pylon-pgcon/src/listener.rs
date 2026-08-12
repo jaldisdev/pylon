@@ -44,6 +44,7 @@ pub use tokio_postgres::Notification;
 /// they're constructed with today.
 pub struct PgListener {
     client: tokio_postgres::Client,
+    types: ExtensionOids,
 }
 
 impl PgListener {
@@ -69,7 +70,14 @@ impl PgListener {
                 }
             }
         });
-        Ok(Self { client })
+        let types = crate::discover_types(&client).await?;
+        Ok(Self { client, types })
+    }
+
+    /// The type OIDs discovered for this database when the listener
+    /// connected — see `PgPool::types`.
+    pub fn types(&self) -> &ExtensionOids {
+        &self.types
     }
 
     pub async fn listen(&self, channel: &str) -> Result<()> {

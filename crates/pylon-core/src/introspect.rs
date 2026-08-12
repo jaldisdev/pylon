@@ -34,7 +34,7 @@
 use crate::diff::{
     DbColumn, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence, DbState, DbTable, DbView,
 };
-use pylon_pgcon::{ExtensionOids, PgPool};
+use pylon_pgcon::PgPool;
 use pylon_value::DecodedValue;
 
 pub type Result<T> = std::result::Result<T, pylon_pgcon::Error>;
@@ -64,7 +64,7 @@ fn ddl_hash(text: &str) -> String {
 }
 
 async fn query(pool: &PgPool, sql: &str, params: &[DecodedValue]) -> Result<Vec<DecodedValue>> {
-    pool.query_typed(sql, params, &ExtensionOids::default()).await
+    pool.query_typed(sql, params, pool.types()).await
 }
 
 /// Destructures a `DecodedValue::Composite`'s fields into a fixed-size

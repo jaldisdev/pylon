@@ -114,7 +114,7 @@ pub async fn read_schema_snapshot(pool: &PgPool) -> Result<Option<String>> {
         .query_typed(
             r#"SELECT (snapshot::text) AS result FROM _pylon."Schema" WHERE singleton"#,
             &[],
-            &pylon_pgcon::ExtensionOids::default(),
+            pool.types(),
         )
         .await?;
     Ok(match rows.into_iter().next() {
@@ -156,7 +156,7 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
         .query_typed(
             r#"SELECT (id, onto, (db_state::text), (schema_state::text), (applied_at IS NOT NULL)) AS result FROM _pylon."Migrations""#,
             &[],
-            &pylon_pgcon::ExtensionOids::default(),
+            pool.types(),
         )
         .await?;
     Ok(rows
@@ -246,7 +246,7 @@ pub async fn try_advisory_lock(pool: &PgPool) -> Result<Option<pylon_pgcon::PgCo
         .query_typed(
             &format!("SELECT (pg_try_advisory_lock({ADVISORY_LOCK_KEY})) AS result"),
             &[],
-            &pylon_pgcon::ExtensionOids::default(),
+            pool.types(),
         )
         .await?;
     Ok(if matches!(rows.first(), Some(DecodedValue::Bool(true))) {
@@ -298,7 +298,7 @@ async fn read_progress(pool: &PgPool, id: &str) -> Result<Option<i64>> {
         .query_typed(
             r#"SELECT (step_index) AS result FROM _pylon."Progress" WHERE id = $1"#,
             &[DecodedValue::Str(id.to_string())],
-            &pylon_pgcon::ExtensionOids::default(),
+            pool.types(),
         )
         .await?;
     Ok(match rows.into_iter().next() {
@@ -361,7 +361,7 @@ async fn drop_invalid_concurrent_index(pool: &PgPool, sql: &str) -> Result<()> {
             "SELECT (1) AS result FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
              WHERE c.relname = $1 AND NOT i.indisvalid",
             &[DecodedValue::Str(index_name.clone())],
-            &pylon_pgcon::ExtensionOids::default(),
+            pool.types(),
         )
         .await?;
     if !rows.is_empty() {

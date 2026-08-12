@@ -88,6 +88,7 @@ impl postgres_types::ToSql for BoundParam<'_> {
 #[derive(Clone, Debug)]
 pub struct PgPool {
     pool: deadpool_postgres::Pool,
+    types: ExtensionOids,
 }
 
 /// Snapshot of a pool's connection accounting — deadpool's own `Status`,
@@ -128,8 +129,30 @@ impl PgPool {
             .create_timeout(Some(std::time::Duration::from_secs(10)))
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .build()?;
-        let _ = pool.get().await?;
-        Ok(Self { pool })
+        let client = pool.get().await?;
+        // Same round trip that proves the pool can connect also classifies
+        // this database's enum/domain/extension type OIDs, which are
+        // assigned locally and so can't be known statically.
+        let types = discover_types(&client).await?;
+        drop(client);
+        Ok(Self { pool, types })
+    }
+
+    /// The type OIDs discovered for this database when the pool connected.
+    /// Pass this to `query_typed`/`query_composite` rather than
+    /// `ExtensionOids::default()` — without it, a `vector`, enum, or domain
+    /// column has no decoder.
+    pub fn types(&self) -> &ExtensionOids {
+        &self.types
+    }
+
+    /// Re-runs type discovery. Needed after a migration creates an enum,
+    /// domain, or extension type, since the registry is a connect-time
+    /// snapshot and a pool normally outlives a migration.
+    pub async fn refresh_types(&mut self) -> Result<()> {
+        let client = self.pool.get().await?;
+        self.types = discover_types(&client).await?;
+        Ok(())
     }
 
     /// Current connection accounting — for the Prometheus gauge sampler
@@ -231,7 +254,10 @@ impl PgPool {
             other => return Err(Error::message(format!("unknown isolation level: {other:?}"))),
         };
         client.batch_execute(&format!("BEGIN ISOLATION LEVEL {level}")).await?;
-        Ok(PgTransaction { client })
+        Ok(PgTransaction {
+            client,
+            types: self.types.clone(),
+        })
     }
 
     /// Starts a transaction with no explicit isolation level — whatever
@@ -242,7 +268,10 @@ impl PgPool {
     pub async fn begin_default(&self) -> Result<PgTransaction> {
         let client = self.pool.get().await?;
         client.batch_execute("BEGIN").await?;
-        Ok(PgTransaction { client })
+        Ok(PgTransaction {
+            client,
+            types: self.types.clone(),
+        })
     }
 
     /// Runs `sql` via the simple query protocol — no bind parameters, but
@@ -269,7 +298,10 @@ impl PgPool {
     /// work, since each call may checkout a different pooled connection.
     pub async fn connection(&self) -> Result<PgConnection> {
         let client = self.pool.get().await?;
-        Ok(PgConnection { client })
+        Ok(PgConnection {
+            client,
+            types: self.types.clone(),
+        })
     }
 }
 
@@ -278,9 +310,15 @@ impl PgPool {
 #[derive(Debug)]
 pub struct PgConnection {
     client: deadpool_postgres::Object,
+    types: ExtensionOids,
 }
 
 impl PgConnection {
+    /// The type OIDs discovered when the owning pool connected.
+    pub fn types(&self) -> &ExtensionOids {
+        &self.types
+    }
+
     pub async fn query_typed(
         &self,
         sql: &str,
@@ -381,9 +419,15 @@ pub(crate) async fn query_explain_on(
 #[derive(Debug)]
 pub struct PgTransaction {
     client: deadpool_postgres::Object,
+    types: ExtensionOids,
 }
 
 impl PgTransaction {
+    /// The type OIDs discovered when the owning pool connected.
+    pub fn types(&self) -> &ExtensionOids {
+        &self.types
+    }
+
     pub async fn query_typed(
         &self,
         sql: &str,
@@ -458,6 +502,20 @@ impl PgTransaction {
 /// direct `row.try_get::<_, RawBytes>(0)` errors on a null column; going
 /// through `Option<RawBytes>` (which `postgres_types` implements generically
 /// for any `T: FromSql`, yielding `None` for SQL NULL) avoids that.
+/// Runs `wire::TYPE_DISCOVERY_SQL` on `client` and builds the registry from
+/// it. Shared by `PgPool::connect` and `PgListener::connect` so a pooled
+/// connection and a dedicated listener classify types identically.
+pub(crate) async fn discover_types(client: &tokio_postgres::Client) -> Result<ExtensionOids> {
+    let rows = client.query(wire::TYPE_DISCOVERY_SQL, &[]).await?;
+    Ok(ExtensionOids::from_discovery_rows(rows.iter().map(|r| {
+        let oid: i64 = r.get(0);
+        let typtype: String = r.get(1);
+        let base_oid: i64 = r.get(2);
+        let typname: String = r.get(3);
+        (oid as u32, typtype, base_oid as u32, typname)
+    })))
+}
+
 fn decode_result_column(row: &tokio_postgres::Row, ext: &ExtensionOids) -> Result<DecodedValue> {
     let oid = row.columns()[0].type_().oid();
     match row.try_get::<_, Option<RawBytes>>(0)? {
@@ -687,6 +745,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, vec![DecodedValue::Str("a".to_string())]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn decodes_a_real_pgvector_value_through_connect_time_discovery() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        if pool.query_raw("CREATE EXTENSION IF NOT EXISTS vector").await.is_err() {
+            eprintln!("skipping: pgvector not installable on this server");
+            return;
+        }
+        // The extension may have been created after this pool connected.
+        let mut pool = pool;
+        pool.refresh_types().await.unwrap();
+        assert!(
+            pool.types().vector.is_some(),
+            "discovery should have found the vector OID"
+        );
+
+        // Nested in a record, exactly as pylon-core emits every result.
+        let rows = pool
+            .query_composite("SELECT ('doc', '[1.5,2.5]'::vector) AS result", pool.types())
+            .await
+            .unwrap();
+
+        let DecodedValue::Composite(fields) = &rows[0] else {
+            panic!("expected Composite, got {:?}", rows[0])
+        };
+        assert_eq!(fields[0], DecodedValue::Str("doc".to_string()));
+        assert_eq!(
+            fields[1],
+            DecodedValue::Array(vec![DecodedValue::F64(1.5), DecodedValue::F64(2.5)]),
+            "a vector must decode to its floats, not to mojibake or an error"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn decodes_a_real_enum_and_domain_through_connect_time_discovery() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw(
+            "DO $$ BEGIN CREATE TYPE pgcon_disc_enum AS ENUM ('x', 'y'); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        )
+        .await
+        .ok();
+        pool.query_raw(
+            "DO $$ BEGIN CREATE DOMAIN pgcon_disc_domain AS int8 CHECK (VALUE > 0); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        )
+        .await
+        .ok();
+
+        let mut pool = pool;
+        pool.refresh_types().await.unwrap();
+
+        // Neither is ::text-cast here, so both arrive with their real
+        // database-assigned OID and can only decode via the registry.
+        let rows = pool
+            .query_composite(
+                "SELECT ('x'::pgcon_disc_enum, 42::pgcon_disc_domain) AS result",
+                pool.types(),
+            )
+            .await
+            .unwrap();
+
+        let DecodedValue::Composite(fields) = &rows[0] else {
+            panic!("expected Composite, got {:?}", rows[0])
+        };
+        assert_eq!(fields[0], DecodedValue::Str("x".to_string()));
+        assert_eq!(
+            fields[1],
+            DecodedValue::I64(42),
+            "a domain must decode as its base type, not as text"
+        );
     }
 
     // ── query_typed: bound-parameter round trips against real Postgres ──

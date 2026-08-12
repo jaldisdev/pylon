@@ -50,10 +50,9 @@ pub type Result<T> = crate::Result<T>;
 
 // Fixed, well-known OIDs (see `pg_type.h` / `SELECT oid, typname FROM
 // pg_type`) — stable across every Postgres install, unlike extension types
-// (`vector`, PostGIS geometry/geography) whose OIDs are assigned at
-// `CREATE EXTENSION` time and must be discovered per-database at connect
-// time (see `ExtensionOids`, threaded through by the caller once known —
-// not yet wired to a live discovery query in this phase).
+// (`vector`, PostGIS geometry/geography), enums, and domains, whose OIDs are
+// assigned by the local database and are discovered per-connection instead
+// (see `ExtensionOids` and `TYPE_DISCOVERY_SQL`).
 const OID_BOOL: u32 = 16;
 const OID_BYTEA: u32 = 17;
 const OID_INT8: u32 = 20;
@@ -74,6 +73,14 @@ const OID_INTERVAL: u32 = 1186;
 const OID_UUID: u32 = 2950;
 const OID_RECORD: u32 = 2249;
 const OID_RECORD_ARRAY: u32 = 2287;
+/// The pseudo-type Postgres reports for a literal it never had to resolve to
+/// a concrete type — `SELECT ('doc', ...)` inside a row constructor, for
+/// instance. Its wire format is the value's text representation, so it
+/// decodes exactly like `text`.
+const OID_UNKNOWN: u32 = 705;
+/// `name`, used by the catalogs (`pg_type.typname` and friends). Text-shaped
+/// on the wire, and reachable through the introspection queries.
+const OID_NAME: u32 = 19;
 
 const OID_BOOL_ARRAY: u32 = 1000;
 const OID_BYTEA_ARRAY: u32 = 1001;
@@ -122,15 +129,62 @@ fn range_element_oid(oid: u32) -> Option<u32> {
     }
 }
 
-/// Extension type OIDs, assigned per-database at `CREATE EXTENSION` time —
-/// discovered once at connect time (mirroring `_setup_codecs`'s runtime
-/// `pg_type` lookup for `vector` today) and threaded through decode calls.
-/// Not yet populated by a live discovery query in this phase; defaults to
-/// "no extension types known," under which those OIDs fall through to the
-/// generic text-fallback case exactly like any other unrecognized OID.
+/// Per-database type OIDs, discovered once at connect time and threaded
+/// through decode calls.
+///
+/// Everything in here is assigned by the local database rather than fixed by
+/// `pg_type.h`: extension types get their OID at `CREATE EXTENSION` time,
+/// and enums and domains get theirs when the migration that declares them
+/// runs. The constants at the top of this module cover the built-in types
+/// whose OIDs are stable everywhere; this covers the rest.
+///
+/// `Default` means "nothing discovered yet", under which any OID not in the
+/// built-in set is an `Error::UnknownTypeOid` rather than a guess — see
+/// `decode_value`.
 #[derive(Debug, Clone, Default)]
 pub struct ExtensionOids {
+    /// pgvector's `vector` type, if the extension is installed.
     pub vector: Option<u32>,
+    /// Every enum type OID. Postgres sends an enum's binary value as its
+    /// label text, so these decode as `Str`.
+    pub enums: std::collections::HashSet<u32>,
+    /// Domain OID to the OID of the type it wraps. A domain's wire format is
+    /// its base type's, so these decode by recursing on the base.
+    pub domains: std::collections::HashMap<u32, u32>,
+}
+
+/// One round trip that classifies every non-builtin type in the database:
+/// the `vector` extension type, all enums, and all domains with the base
+/// type each resolves to.
+pub(crate) const TYPE_DISCOVERY_SQL: &str = "\
+SELECT t.oid::int8, t.typtype::text, COALESCE(b.oid, 0)::int8, t.typname::text \
+FROM pg_type t \
+LEFT JOIN pg_type b ON b.oid = t.typbasetype \
+WHERE t.typtype IN ('e', 'd') OR t.typname = 'vector'";
+
+impl ExtensionOids {
+    /// Builds a registry from `TYPE_DISCOVERY_SQL`'s rows, given as
+    /// `(oid, typtype, base_oid, typname)`.
+    pub(crate) fn from_discovery_rows(rows: impl IntoIterator<Item = (u32, String, u32, String)>) -> Self {
+        let mut out = Self::default();
+        for (oid, typtype, base_oid, typname) in rows {
+            match typtype.as_str() {
+                "e" => {
+                    out.enums.insert(oid);
+                }
+                "d" if base_oid != 0 => {
+                    out.domains.insert(oid, base_oid);
+                }
+                _ => {}
+            }
+            // `vector` is a base type (typtype 'b'), so it only matches the
+            // name arm of the discovery query.
+            if typname == "vector" {
+                out.vector = Some(oid);
+            }
+        }
+        out
+    }
 }
 
 /// Decodes one field's raw buffer (already length-stripped, matching what
@@ -151,7 +205,9 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Decode
         OID_INT8 => Ok(DecodedValue::I64(i64::from_be_bytes(data.try_into()?))),
         OID_FLOAT4 => Ok(DecodedValue::F64(f32::from_be_bytes(data.try_into()?) as f64)),
         OID_FLOAT8 => Ok(DecodedValue::F64(f64::from_be_bytes(data.try_into()?))),
-        OID_TEXT | OID_VARCHAR | OID_BPCHAR => Ok(DecodedValue::Str(std::str::from_utf8(data)?.to_string())),
+        OID_TEXT | OID_VARCHAR | OID_BPCHAR | OID_UNKNOWN | OID_NAME => {
+            Ok(DecodedValue::Str(std::str::from_utf8(data)?.to_string()))
+        }
         OID_UUID => {
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(data);
@@ -175,11 +231,17 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Decode
         }
         OID_INT4MULTIRANGE | OID_INT8MULTIRANGE | OID_NUMMULTIRANGE | OID_TSMULTIRANGE | OID_TSTZMULTIRANGE
         | OID_DATEMULTIRANGE => decode_multirange(data, range_element_oid(oid).expect("multirange OID"), ext),
-        // Enums, domains, and other extension/text-compatible custom types
-        // (schema-qualified enums are always emitted `::text`-cast by
-        // pylon-core — see `sql/mod.rs::emit_scalar` — so their runtime
-        // OID, unknown to us statically, never needs a dedicated case).
-        _ => Ok(DecodedValue::Str(std::str::from_utf8(data)?.to_string())),
+        // Everything past this point has a database-assigned OID, so it can
+        // only be resolved through the registry discovered at connect time.
+        _ if ext.enums.contains(&oid) => {
+            // An enum's binary representation is its label, as text.
+            Ok(DecodedValue::Str(std::str::from_utf8(data)?.to_string()))
+        }
+        _ => match ext.domains.get(&oid) {
+            // A domain is a constrained alias: same wire format as its base.
+            Some(&base_oid) => decode_value(base_oid, data, ext),
+            None => Err(Error::UnknownTypeOid { oid }),
+        },
     }
 }
 
@@ -971,14 +1033,85 @@ mod tests {
     }
 
     #[test]
-    fn decodes_unrecognized_oid_as_text_fallback() {
-        // Enums/domains — always ::text-cast by pylon-core's SQL emission,
-        // so their real (unknown-to-us) OID never actually reaches here in
-        // practice, but the fallback must still behave like plain text.
+    fn errors_on_an_oid_no_rule_or_discovery_covers() {
+        // The old behaviour here was to decode the raw binary as UTF-8 text,
+        // which silently produced mojibake for every non-text type whose OID
+        // isn't a builtin (`vector` above all). An unclassified OID is now an
+        // error rather than a guess.
+        let err = decode_value(999_999, &[0xff, 0xfe], &no_ext()).unwrap_err();
+        assert!(matches!(err, Error::UnknownTypeOid { oid: 999_999 }), "got {err:?}");
+    }
+
+    #[test]
+    fn decodes_a_discovered_enum_oid_as_its_label_text() {
+        let ext = ExtensionOids {
+            enums: std::collections::HashSet::from([50_001]),
+            ..Default::default()
+        };
         assert_eq!(
-            decode_value(999_999, "Active".as_bytes(), &no_ext()).unwrap(),
+            decode_value(50_001, "Active".as_bytes(), &ext).unwrap(),
             DecodedValue::Str("Active".to_string())
         );
+    }
+
+    #[test]
+    fn decodes_a_discovered_domain_through_its_base_type() {
+        // A domain over int8 has to decode as int8, not as text — the old
+        // fallback would have run UTF-8 validation over these eight bytes.
+        let ext = ExtensionOids {
+            domains: std::collections::HashMap::from([(50_002, OID_INT8)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_value(50_002, &7i64.to_be_bytes(), &ext).unwrap(),
+            DecodedValue::I64(7)
+        );
+    }
+
+    #[test]
+    fn discovery_rows_populate_vector_enums_and_domains() {
+        let ext = ExtensionOids::from_discovery_rows([
+            (50_000, "b".to_string(), 0, "vector".to_string()),
+            (50_001, "e".to_string(), 0, "status".to_string()),
+            (50_002, "d".to_string(), OID_INT8, "positive_int".to_string()),
+            // A domain with no resolvable base is skipped rather than
+            // recorded as pointing at OID 0.
+            (50_003, "d".to_string(), 0, "broken".to_string()),
+        ]);
+        assert_eq!(ext.vector, Some(50_000));
+        assert!(ext.enums.contains(&50_001));
+        assert_eq!(ext.domains.get(&50_002), Some(&OID_INT8));
+        assert!(!ext.domains.contains_key(&50_003));
+    }
+
+    #[test]
+    fn a_vector_inside_a_record_decodes_when_discovery_ran() {
+        // The real C-4 shape: pylon-core wraps every result in `SELECT (...)
+        // AS result`, so a vector value arrives nested in a record and is
+        // decoded through `decode_record`'s own per-field OID dispatch.
+        let mut vec_bytes = 2u16.to_be_bytes().to_vec();
+        vec_bytes.extend_from_slice(&0u16.to_be_bytes());
+        vec_bytes.extend_from_slice(&1.5f32.to_be_bytes());
+        vec_bytes.extend_from_slice(&2.5f32.to_be_bytes());
+        let rec = encode_record(&[(OID_TEXT, Some(b"doc")), (50_000, Some(&vec_bytes))]);
+
+        let ext = ExtensionOids {
+            vector: Some(50_000),
+            ..Default::default()
+        };
+        let decoded = decode_value(OID_RECORD, &rec, &ext).unwrap();
+        let DecodedValue::Composite(fields) = decoded else {
+            panic!("expected Composite, got {decoded:?}")
+        };
+        assert_eq!(fields[0], DecodedValue::Str("doc".to_string()));
+        assert_eq!(
+            fields[1],
+            DecodedValue::Array(vec![DecodedValue::F64(1.5), DecodedValue::F64(2.5)])
+        );
+
+        // Without discovery the same bytes must fail loudly, not silently.
+        let err = decode_value(OID_RECORD, &rec, &no_ext()).unwrap_err();
+        assert!(matches!(err, Error::UnknownTypeOid { oid: 50_000 }), "got {err:?}");
     }
 
     /// Builds the Postgres binary `numeric` wire format by hand: `u16
@@ -1186,7 +1319,10 @@ mod tests {
         data.extend_from_slice(&1.5f32.to_be_bytes());
         data.extend_from_slice(&2.5f32.to_be_bytes());
 
-        let ext = ExtensionOids { vector: Some(50_000) };
+        let ext = ExtensionOids {
+            vector: Some(50_000),
+            ..Default::default()
+        };
         let decoded = decode_value(50_000, &data, &ext).unwrap();
         assert_eq!(
             decoded,
@@ -1195,13 +1331,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_oid_without_vector_extension_falls_back_to_text() {
-        // Same OID as the vector test above, but with no extension OID
-        // configured — must not be misinterpreted as vector binary data.
-        assert_eq!(
-            decode_value(50_000, "some-domain-value".as_bytes(), &no_ext()).unwrap(),
-            DecodedValue::Str("some-domain-value".to_string())
-        );
+    fn unknown_oid_without_vector_extension_is_an_error_not_a_guess() {
+        // Same OID as the vector test above, but with nothing discovered —
+        // it must neither be read as vector binary data nor blindly
+        // stringified, since which of those is right is exactly what
+        // discovery exists to establish.
+        let err = decode_value(50_000, "some-domain-value".as_bytes(), &no_ext()).unwrap_err();
+        assert!(matches!(err, Error::UnknownTypeOid { oid: 50_000 }), "got {err:?}");
     }
 
     #[test]
