@@ -82,11 +82,7 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn person_schema(module: &str) -> SchemaDescriptor {
-    let person = ty(
-        "Person",
-        module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     SchemaDescriptor {
         types: vec![person],
         ..Default::default()
@@ -94,12 +90,8 @@ fn person_schema(module: &str) -> SchemaDescriptor {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -107,11 +99,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -148,9 +136,11 @@ async fn for_loop_bulk_inserts_one_row_per_iterator_value() {
     bootstrap(&pool, &sd).await;
 
     exec(
-        &pool, &sd,
+        &pool,
+        &sd,
         &format!("for n in {{'Alice', 'Bob', 'Carol'}} union (insert {module}::Person {{ name := n, age := 0 }})"),
-    ).await;
+    )
+    .await;
 
     let rows = rows_of(
         &pool,
@@ -158,11 +148,7 @@ async fn for_loop_bulk_inserts_one_row_per_iterator_value() {
         &format!("select {module}::Person {{ name }} order by .name"),
     )
     .await;
-    assert_eq!(
-        rows.len(),
-        3,
-        "expected one row per iterator value, got {rows:?}"
-    );
+    assert_eq!(rows.len(), 3, "expected one row per iterator value, got {rows:?}");
     let names: Vec<&str> = rows.iter().map(|r| as_str(field(r, 1))).collect();
     assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
 }
@@ -182,18 +168,11 @@ async fn for_loop_variable_composes_inside_insert_body_expression() {
     exec(
         &pool,
         &sd,
-        &format!(
-            "for n in {{1, 2, 3}} union (insert {module}::Person {{ name := 'p', age := n * 10 }})"
-        ),
+        &format!("for n in {{1, 2, 3}} union (insert {module}::Person {{ name := 'p', age := n * 10 }})"),
     )
     .await;
 
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Person {{ age }} order by .age"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }} order by .age")).await;
     let ages: Vec<i64> = rows.iter().map(|r| as_i64(field(r, 1))).collect();
     assert_eq!(ages, vec![10, 20, 30]);
 }
@@ -231,9 +210,7 @@ async fn for_loop_select_body_cross_joins_lateral_per_iterator_value() {
     let rows = rows_of(
         &pool,
         &sd,
-        &format!(
-            "for age in {{30, 65}} union (select {module}::Person {{ name }} filter .age = age)"
-        ),
+        &format!("for age in {{30, 65}} union (select {module}::Person {{ name }} filter .age = age)"),
     )
     .await;
     let names: HashSet<&str> = rows.iter().map(|r| as_str(field(r, 1))).collect();
@@ -256,9 +233,5 @@ async fn for_loop_with_empty_iterator_set_is_a_no_op() {
     .await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
-    assert_eq!(
-        rows.len(),
-        0,
-        "an empty iterator set must insert nothing, got {rows:?}"
-    );
+    assert_eq!(rows.len(), 0, "an empty iterator set must insert nothing, got {rows:?}");
 }

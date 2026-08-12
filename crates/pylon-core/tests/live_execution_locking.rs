@@ -84,8 +84,15 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn job_schema(module: &str) -> SchemaDescriptor {
-    let job = ty("Job", module, vec![id_prop(), text_prop("status"), int_prop("priority")]);
-    SchemaDescriptor { types: vec![job], ..Default::default() }
+    let job = ty(
+        "Job",
+        module,
+        vec![id_prop(), text_prop("status"), int_prop("priority")],
+    );
+    SchemaDescriptor {
+        types: vec![job],
+        ..Default::default()
+    }
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
@@ -120,8 +127,18 @@ async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Job {{ status := 'pending', priority := 1 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Job {{ status := 'pending', priority := 2 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Job {{ status := 'pending', priority := 1 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Job {{ status := 'pending', priority := 2 }}"),
+    )
+    .await;
 
     // The classic job-queue dequeue query: claim the next pending job,
     // skipping anything another worker already has locked.
@@ -131,26 +148,45 @@ async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
              order by .priority asc limit 1 for update skip locked"
         ),
         &sd,
-    ).unwrap().sql;
+    )
+    .unwrap()
+    .sql;
 
     let tx1 = pool.begin_default().await.unwrap();
-    let rows1 = tx1.query_typed(&pick_sql, &[], &ExtensionOids::default()).await.unwrap();
+    let rows1 = tx1
+        .query_typed(&pick_sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
     assert_eq!(rows1.len(), 1);
-    assert_eq!(as_i64(field(&rows1[0], 1)), 1, "tx1 should have claimed the lowest-priority pending job");
+    assert_eq!(
+        as_i64(field(&rows1[0], 1)),
+        1,
+        "tx1 should have claimed the lowest-priority pending job"
+    );
 
     // tx1 deliberately has not committed yet — its lock on priority-1 is
     // still held. A second, concurrent transaction running the exact same
     // "claim the next pending job" query must skip that locked row rather
     // than blocking on it, and pick the other pending job instead.
     let tx2 = pool.begin_default().await.unwrap();
-    let rows2 = tx2.query_typed(&pick_sql, &[], &ExtensionOids::default()).await.unwrap();
+    let rows2 = tx2
+        .query_typed(&pick_sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
     assert_eq!(rows2.len(), 1);
-    assert_eq!(as_i64(field(&rows2[0], 1)), 2, "tx2 must skip tx1's locked row and claim the other one");
+    assert_eq!(
+        as_i64(field(&rows2[0], 1)),
+        2,
+        "tx2 must skip tx1's locked row and claim the other one"
+    );
 
     // A third transaction now has nothing left to claim — both pending
     // jobs are locked (one by each open transaction).
     let tx3 = pool.begin_default().await.unwrap();
-    let rows3 = tx3.query_typed(&pick_sql, &[], &ExtensionOids::default()).await.unwrap();
+    let rows3 = tx3
+        .query_typed(&pick_sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
     assert!(rows3.is_empty(), "both pending jobs are already locked, got {rows3:?}");
     tx3.commit().await.unwrap();
 
@@ -166,26 +202,41 @@ async fn nowait_fails_immediately_instead_of_blocking_on_a_locked_row() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Job {{ status := 'pending', priority := 1 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Job {{ status := 'pending', priority := 1 }}"),
+    )
+    .await;
 
     let claim_sql = query::compile(
         &format!("select {module}::Job {{ priority }} filter .status = 'pending' for update"),
         &sd,
-    ).unwrap().sql;
+    )
+    .unwrap()
+    .sql;
     let claim_nowait_sql = query::compile(
         &format!("select {module}::Job {{ priority }} filter .status = 'pending' for update nowait"),
         &sd,
-    ).unwrap().sql;
+    )
+    .unwrap()
+    .sql;
 
     let tx1 = pool.begin_default().await.unwrap();
-    let rows1 = tx1.query_typed(&claim_sql, &[], &ExtensionOids::default()).await.unwrap();
+    let rows1 = tx1
+        .query_typed(&claim_sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
     assert_eq!(rows1.len(), 1, "tx1 should have locked the only pending job");
 
     // tx1 still holds the lock — a concurrent NOWAIT claim on the same row
     // must fail right away with Postgres's own lock_not_available error,
     // not block waiting for tx1 to finish.
     let tx2 = pool.begin_default().await.unwrap();
-    let err = tx2.query_typed(&claim_nowait_sql, &[], &ExtensionOids::default()).await.unwrap_err();
+    let err = tx2
+        .query_typed(&claim_nowait_sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap_err();
     assert_eq!(
         err.sqlstate(),
         Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),

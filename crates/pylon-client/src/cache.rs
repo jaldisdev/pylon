@@ -103,7 +103,9 @@ pub(crate) fn put_json(
         return Ok(());
     }
     let key = cache_key(kind, &compiled.sql, params)?;
-    let rows = value.map(|v| vec![DecodedValue::Str(v.to_string())]).unwrap_or_default();
+    let rows = value
+        .map(|v| vec![DecodedValue::Str(v.to_string())])
+        .unwrap_or_default();
     cache.put(&key, rows, compiled.tags.clone()).map_err(map_err)
 }
 
@@ -122,7 +124,9 @@ mod tests {
             sql: sql.to_string(),
             param_names: vec![],
             params: vec![],
-            shape: pylon_core::query::ShapeDescriptor { root: pylon_core::query::ShapeNode::RawScalar },
+            shape: pylon_core::query::ShapeDescriptor {
+                root: pylon_core::query::ShapeNode::RawScalar,
+            },
             warnings: vec![],
             inference_plan: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
@@ -137,7 +141,10 @@ mod tests {
         assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), None);
 
         put_rows(&cache, &compiled, &[], &[DecodedValue::I64(1)]).unwrap();
-        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![DecodedValue::I64(1)]));
+        assert_eq!(
+            get_rows(&cache, &compiled, &[]).unwrap(),
+            Some(vec![DecodedValue::I64(1)])
+        );
     }
 
     #[test]
@@ -155,8 +162,14 @@ mod tests {
         put_rows(&cache, &compiled, &[], &[DecodedValue::I64(1)]).unwrap();
         put_json(&cache, "json_all", &compiled, &[], Some("[1]")).unwrap();
 
-        assert_eq!(get_rows(&cache, &compiled, &[]).unwrap(), Some(vec![DecodedValue::I64(1)]));
-        assert_eq!(get_json(&cache, "json_all", &compiled, &[]).unwrap(), Some(Some("[1]".to_string())));
+        assert_eq!(
+            get_rows(&cache, &compiled, &[]).unwrap(),
+            Some(vec![DecodedValue::I64(1)])
+        );
+        assert_eq!(
+            get_json(&cache, "json_all", &compiled, &[]).unwrap(),
+            Some(Some("[1]".to_string()))
+        );
         // A different kind namespace for the same SQL is a genuine miss.
         assert_eq!(get_json(&cache, "json_single", &compiled, &[]).unwrap(), None);
     }

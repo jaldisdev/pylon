@@ -34,8 +34,8 @@ pub use compiler::compile_scalar_default;
 pub use compiler::compile_scalar_default_typed;
 pub use compiler::compile_trigger_handler;
 pub use compiler::compile_with_config;
-pub use compiler::pg_type_to_pyql;
 pub(crate) use compiler::infer_ir_type;
+pub use compiler::pg_type_to_pyql;
 pub(crate) use compiler::types_compatible;
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
@@ -131,11 +131,24 @@ pub struct IrPathSelect {
 #[derive(Debug, Clone)]
 pub enum IrPathJoin {
     /// Traverse a single (FK) link.
-    Single { source_alias: String, fk_col: String, target: IrSource },
+    Single {
+        source_alias: String,
+        fk_col: String,
+        target: IrSource,
+    },
     /// Traverse a multi-link via a junction table.
-    Multi { source_alias: String, junction_alias: String, join: IrMultiLinkJoin, target: IrSource },
+    Multi {
+        source_alias: String,
+        junction_alias: String,
+        join: IrMultiLinkJoin,
+        target: IrSource,
+    },
     /// Reverse of a single FK link: find owner rows whose FK column points to the current row.
-    BacklinkSingle { source_alias: String, fk_col: String, target: IrSource },
+    BacklinkSingle {
+        source_alias: String,
+        fk_col: String,
+        target: IrSource,
+    },
     /// Reverse of a multi-link: traverse the junction table in reverse.
     BacklinkMulti {
         source_alias: String,
@@ -161,7 +174,11 @@ pub enum IrPathResult {
     /// that isn't a bare tuple-typed property reference.
     Scalar(IrExpr, Option<TupleCastShape>),
     /// Final step is a link — return the linked objects with the given shape.
-    Object { alias: String, type_name: String, shape: Vec<IrShapePointer> },
+    Object {
+        alias: String,
+        type_name: String,
+        shape: Vec<IrShapePointer>,
+    },
 }
 
 // ── FREE ROW EXPRESSIONS (set literals, tuples, free objects) ───────────────────
@@ -242,10 +259,19 @@ pub struct IrLockClause {
 }
 
 #[derive(Debug, Clone)]
-pub enum IrLockStrength { Update, NoKeyUpdate, Share, KeyShare }
+pub enum IrLockStrength {
+    Update,
+    NoKeyUpdate,
+    Share,
+    KeyShare,
+}
 
 #[derive(Debug, Clone)]
-pub enum IrLockWait { Block, NoWait, SkipLocked }
+pub enum IrLockWait {
+    Block,
+    NoWait,
+    SkipLocked,
+}
 
 /// One SELECT output row's source — either a real schema object (with a
 /// FROM clause and projected column shape) or a free literal expression
@@ -254,7 +280,10 @@ pub enum IrLockWait { Block, NoWait, SkipLocked }
 /// reimplemented twice, independently, and drifting) before this merge.
 #[derive(Debug, Clone)]
 pub enum IrRowSource {
-    Bound { source: IrSource, shape: Vec<IrShapePointer> },
+    Bound {
+        source: IrSource,
+        shape: Vec<IrShapePointer>,
+    },
     Free(IrFreeExpr),
 }
 
@@ -631,9 +660,15 @@ pub struct IrDelete {
 #[derive(Debug, Clone)]
 pub enum IrExpr {
     /// A resolved column reference, e.g. `t0.name`.
-    ColumnRef { alias: String, column: String, pg_type: String },
+    ColumnRef {
+        alias: String,
+        column: String,
+        pg_type: String,
+    },
     /// A positional query parameter `$N` (0-based index internally).
-    Param { index: usize },
+    Param {
+        index: usize,
+    },
     Literal(IrLiteral),
     BinOp(Box<IrBinOp>),
     UnaryOp(Box<IrUnaryOp>),
@@ -648,29 +683,47 @@ pub enum IrExpr {
     Null,
     /// An aggregate function applied to an inline set literal `fn({e1, e2, ...})`.
     /// Emits: `(SELECT fn_name(v) FROM (SELECT e1 UNION ALL ...) AS _set(v))`
-    AggOverSet { fn_name: String, schema: Option<String>, elems: Vec<IrExpr> },
+    AggOverSet {
+        fn_name: String,
+        schema: Option<String>,
+        elems: Vec<IrExpr>,
+    },
     /// An aggregate function applied to a full SELECT query: `count(Person)` or `count((select Person))`.
     /// Emits: `(SELECT fn_name(*) FROM (inner) _agg)`
-    AggOverQuery { fn_name: String, inner: Box<IrSelect> },
+    AggOverQuery {
+        fn_name: String,
+        inner: Box<IrSelect>,
+    },
     /// A reference to a named CTE used in expression context.
     /// `scalar = true`  → emits `(SELECT "result" FROM "cte_name")`
     /// `scalar = false` → emits `(SELECT "id"     FROM "cte_name")`
-    CteRef { name: String, scalar: bool },
+    CteRef {
+        name: String,
+        scalar: bool,
+    },
     /// A single-field access on a WITH-bound free object: `with x := { a
     /// := 1 } select x.a`. The CTE body exposes each free-object field as
     /// its own named column (alongside the whole-object `result` column
     /// `CtePassthrough`/`CteRef` use) so this can reference it directly
     /// rather than reconstructing/decoding the opaque `result` composite.
     /// Emits `(SELECT "field" FROM "name")`.
-    CteFieldRef { name: String, field: String },
+    CteFieldRef {
+        name: String,
+        field: String,
+    },
     /// Reference to the current for-loop iterator variable.
     /// Emits `"_for_{name}"."v"`.
-    ForVar { name: String },
+    ForVar {
+        name: String,
+    },
     /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
     /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
     ArrayFromSelect(Box<IrArraySource>),
     /// An enum member access: `default::Gender.Female` → `'Female'::"default"."Gender"`.
-    EnumLiteral { pg_type: String, variant: String },
+    EnumLiteral {
+        pg_type: String,
+        variant: String,
+    },
     /// Named tuple construction: `(x := 1.0, y := 2.0)` → `jsonb_build_object('x', 1.0, 'y', 2.0)`.
     /// `is_free_object` is true when this actually came from `{ x := 1.0 }`
     /// (curly-brace shape syntax, no subject) rather than `(x := 1.0)`
@@ -678,21 +731,39 @@ pub enum IrExpr {
     /// the frontend needs to know which one it was to render an expandable
     /// `Object {x: 1.0}` vs a `(x := 1.0)` literal display correctly (see
     /// ShapeNode::NamedTuple's own is_free_object).
-    NamedTuple { fields: Vec<(String, IrExpr)>, is_free_object: bool },
+    NamedTuple {
+        fields: Vec<(String, IrExpr)>,
+        is_free_object: bool,
+    },
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
     Tuple(Vec<IrExpr>),
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.
-    GlobalParam { index: usize, pg_type: String },
+    GlobalParam {
+        index: usize,
+        pg_type: String,
+    },
     /// Computed global reference: emits `(SELECT "value" FROM "cte_name")`.
-    GlobalRef { cte_name: String },
+    GlobalRef {
+        cte_name: String,
+    },
     /// Index access `expr[i]`: `substr(expr, i+1, 1)` for strings/bytes, `(expr)[i+1]` for arrays.
-    Subscript { expr: Box<IrExpr>, index: Box<IrExpr>, is_array: bool },
+    Subscript {
+        expr: Box<IrExpr>,
+        index: Box<IrExpr>,
+        is_array: bool,
+    },
     /// Named tuple / jsonb field access: `(expr)->'field'` (returns jsonb).
-    JsonbField { expr: Box<IrExpr>, field: String },
+    JsonbField {
+        expr: Box<IrExpr>,
+        field: String,
+    },
     /// Positional tuple index into a jsonb array: `(expr)->index` (returns jsonb).
     /// Runtime fallback for `.N` tuple indexing when `expr` isn't a literal
     /// tuple constant-foldable at compile time (e.g. a $param or cast result).
-    JsonbIndex { expr: Box<IrExpr>, index: usize },
+    JsonbIndex {
+        expr: Box<IrExpr>,
+        index: usize,
+    },
     /// Slice access `expr[lower:upper]`: `substr` for strings/bytes, PG subscript for arrays.
     Slice {
         expr: Box<IrExpr>,
@@ -705,7 +776,10 @@ pub enum IrExpr {
     PathSubquery(Box<IrPathSelect>),
     /// A named parameter reference inside a user-defined function body.
     /// Emitted as a double-quoted SQL identifier: `"param_name"`.
-    FnParam { name: String, pg_type: String },
+    FnParam {
+        name: String,
+        pg_type: String,
+    },
     /// Verbatim SQL text, emitted parenthesized exactly as given. Never
     /// produced by ordinary PyQL compilation — only used to substitute an
     /// INSERT rewrite's self-reference (`.name`) to a property that has no
@@ -891,10 +965,16 @@ pub struct IrSort {
 }
 
 #[derive(Debug, Clone)]
-pub enum IrSortDir { Asc, Desc }
+pub enum IrSortDir {
+    Asc,
+    Desc,
+}
 
 #[derive(Debug, Clone)]
-pub enum IrNulls { First, Last }
+pub enum IrNulls {
+    First,
+    Last,
+}
 
 // ── Compiled output ──────────────────────────────────────────────────────────────
 
@@ -941,7 +1021,10 @@ pub struct IrComputedGlobalCte {
 #[derive(Debug, Clone)]
 pub enum IrGlobalCte {
     Session(IrSessionGlobalCte),
-    Computed(IrComputedGlobalCte),
+    /// Boxed: a computed global carries a whole compiled sub-select and is
+    /// ~8x the size of a session global, and these live in a `Vec` where the
+    /// session variant is the common case.
+    Computed(Box<IrComputedGlobalCte>),
 }
 
 impl IrGlobalCte {
@@ -972,12 +1055,12 @@ pub struct IrOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse;
     #[allow(unused_imports)]
     use super::{IrFreeExpr, IrLiteral};
+    use crate::parse;
     use crate::schema::{
-        ChannelDescriptor, ChannelPayload, ComputedDescriptor, GlobalDescriptor, LinkDescriptor,
-        MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        ChannelDescriptor, ChannelPayload, ComputedDescriptor, GlobalDescriptor, LinkDescriptor, MultiLinkDescriptor,
+        PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -998,40 +1081,46 @@ mod tests {
                             pg_type: "uuid".into(),
                             nullable: false,
                             default_sql: Some("uuidv7()".into()),
-                        default_pyql: None,
+                            default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: true,
                             is_pk: true,
                             is_readonly: true,
                             rewrites: vec![],
-                        tuple_members: None, column_type: None, },
+                            tuple_members: None,
+                            column_type: None,
+                        },
                         PropertyDescriptor {
                             name: "name".into(),
                             pg_type: "text".into(),
                             nullable: false,
                             default_sql: None,
-                        default_pyql: None,
+                            default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        tuple_members: None, column_type: None, },
+                            tuple_members: None,
+                            column_type: None,
+                        },
                         PropertyDescriptor {
                             name: "age".into(),
                             pg_type: "int8".into(),
                             nullable: true,
                             default_sql: None,
-                        default_pyql: None,
+                            default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        tuple_members: None, column_type: None, },
+                            tuple_members: None,
+                            column_type: None,
+                        },
                     ],
                     links: vec![LinkDescriptor {
                         name: "company".into(),
@@ -1084,7 +1173,9 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    tuple_members: None, column_type: None, }],
+                        tuple_members: None,
+                        column_type: None,
+                    }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -1117,7 +1208,9 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    tuple_members: None, column_type: None, }],
+                        tuple_members: None,
+                        column_type: None,
+                    }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -1134,7 +1227,9 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -1157,10 +1252,13 @@ mod tests {
     /// Extract the free-row items from a `SELECT` — panics if any row is
     /// schema-bound, which is what free-select tests expect.
     fn free_items(sel: &IrSelect) -> Vec<&IrFreeExpr> {
-        sel.rows.iter().map(|r| match r {
-            IrRowSource::Free(item) => item,
-            IrRowSource::Bound { .. } => panic!("expected a free row"),
-        }).collect()
+        sel.rows
+            .iter()
+            .map(|r| match r {
+                IrRowSource::Free(item) => item,
+                IrRowSource::Bound { .. } => panic!("expected a free row"),
+            })
+            .collect()
     }
 
     #[test]
@@ -1188,9 +1286,13 @@ mod tests {
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         let (_, shape) = bound(&sel);
         assert_eq!(shape.len(), 2);
-        let IrShapePointer::SingleLink(link) = &shape[1] else { panic!("expected SingleLink") };
+        let IrShapePointer::SingleLink(link) = &shape[1] else {
+            panic!("expected SingleLink")
+        };
         assert_eq!(link.alias, "company");
-        let IrSingleLinkCorrelation::Fk { fk_column, .. } = &link.correlation else { panic!("expected Fk correlation") };
+        let IrSingleLinkCorrelation::Fk { fk_column, .. } = &link.correlation else {
+            panic!("expected Fk correlation")
+        };
         assert_eq!(fk_column, "company_id");
         assert_eq!(bound(&link.subquery).0.table, "company");
     }
@@ -1200,10 +1302,14 @@ mod tests {
         let ir = compile("SELECT Person { name, posts { title } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         let (_, shape) = bound(&sel);
-        let IrShapePointer::MultiLink(ml) = &shape[1] else { panic!("expected MultiLink") };
+        let IrShapePointer::MultiLink(ml) = &shape[1] else {
+            panic!("expected MultiLink")
+        };
         assert_eq!(ml.alias, "posts");
         assert_eq!(bound(&ml.subquery).0.table, "post");
-        let IrMultiLinkJoin::Standard { junction_table, .. } = &ml.join else { panic!() };
+        let IrMultiLinkJoin::Standard { junction_table, .. } = &ml.join else {
+            panic!()
+        };
         assert_eq!(junction_table, "person.posts");
     }
 
@@ -1223,10 +1329,15 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT {1, 2, 3}").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
         assert_eq!(items.len(), 3);
-        assert!(matches!(items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(1)))));
+        assert!(matches!(
+            items[0],
+            IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(1)))
+        ));
     }
 
     #[test]
@@ -1234,10 +1345,14 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT { foo := 'bar', n := 42 }").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
         assert_eq!(items.len(), 1);
-        let IrFreeExpr::FreeObject(fields) = &items[0] else { panic!("expected FreeObject") };
+        let IrFreeExpr::FreeObject(fields) = &items[0] else {
+            panic!("expected FreeObject")
+        };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].0, "foo");
         assert_eq!(fields[1].0, "n");
@@ -1248,7 +1363,9 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT (1, 'hello')").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], IrFreeExpr::Tuple(_)));
@@ -1259,10 +1376,15 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT 42").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
         assert_eq!(items.len(), 1);
-        assert!(matches!(items[0], IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(42)))));
+        assert!(matches!(
+            items[0],
+            IrFreeExpr::Scalar(IrExpr::Literal(IrLiteral::Int(42)))
+        ));
     }
 
     #[test]
@@ -1270,7 +1392,9 @@ mod tests {
         let schema = make_schema();
         let ast = parse::parse("SELECT str_lower('HELLO')").unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
         assert!(matches!(items[0], IrFreeExpr::Scalar(IrExpr::FunctionCall(_))));
     }
@@ -1288,7 +1412,10 @@ mod tests {
         let ast = parse::parse("SELECT Person FILTER .id = 'not-a-uuid'").unwrap();
         let err = super::compile(&ast, &schema).err().expect("expected type error");
         let msg = err.to_string();
-        assert!(msg.contains("std::uuid") && msg.contains("std::str"), "unexpected: {msg}");
+        assert!(
+            msg.contains("std::uuid") && msg.contains("std::str"),
+            "unexpected: {msg}"
+        );
     }
 
     #[test]
@@ -1297,7 +1424,10 @@ mod tests {
         let ast = parse::parse("SELECT Person FILTER .name = 42").unwrap();
         let err = super::compile(&ast, &schema).err().expect("expected type error");
         let msg = err.to_string();
-        assert!(msg.contains("std::str") && msg.contains("std::int64"), "unexpected: {msg}");
+        assert!(
+            msg.contains("std::str") && msg.contains("std::int64"),
+            "unexpected: {msg}"
+        );
     }
 
     #[test]
@@ -1339,9 +1469,12 @@ mod tests {
                  company := (select (insert Company { name := 'Acme' }) { id }), \
                  posts += (SELECT Post FILTER .title = $t) \
              }",
-        ).unwrap();
+        )
+        .unwrap();
         let ir = super::compile(&ast, &schema).unwrap();
-        let IrStmt::Update(upd) = ir.stmt else { panic!("expected Update") };
+        let IrStmt::Update(upd) = ir.stmt else {
+            panic!("expected Update")
+        };
         assert_eq!(upd.nested_ctes.len(), 1);
         assert_eq!(upd.multi_link_appends.len(), 1);
     }
@@ -1390,7 +1523,11 @@ mod tests {
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         // upper_name should compile to a Computed shape pointer
         let (_, shape) = bound(&sel);
-        assert!(shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "upper_name")));
+        assert!(
+            shape
+                .iter()
+                .any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "upper_name"))
+        );
     }
 
     #[test]
@@ -1400,7 +1537,11 @@ mod tests {
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         let (_, shape) = bound(&sel);
-        assert!(shape.iter().any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "x")));
+        assert!(
+            shape
+                .iter()
+                .any(|f| matches!(f, IrShapePointer::Computed(c) if c.alias == "x"))
+        );
     }
 
     #[test]
@@ -1412,10 +1553,13 @@ mod tests {
         let ir = compile("SELECT Person { post_count := count(.posts) }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         let (_, shape) = bound(&sel);
-        let computed = shape.iter().find_map(|f| match f {
-            IrShapePointer::Computed(c) if c.alias == "post_count" => Some(c),
-            _ => None,
-        }).expect("expected post_count computed pointer");
+        let computed = shape
+            .iter()
+            .find_map(|f| match f {
+                IrShapePointer::Computed(c) if c.alias == "post_count" => Some(c),
+                _ => None,
+            })
+            .expect("expected post_count computed pointer");
         assert!(matches!(computed.expr, IrExpr::AggOverQuery { .. }));
     }
 
@@ -1494,7 +1638,9 @@ mod tests {
         });
         let ast = parse::parse("SELECT global current_user.id").unwrap();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::PathSelect(sel) = ir.stmt else { panic!("expected a path select, not a free select") };
+        let IrStmt::PathSelect(sel) = ir.stmt else {
+            panic!("expected a path select, not a free select")
+        };
         assert_eq!(sel.root.type_name, "default::Person");
     }
 
@@ -1507,7 +1653,9 @@ mod tests {
         let ast = parse::parse("SELECT (SELECT default::Person FILTER .age > 20).name").unwrap();
         let schema = make_schema();
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::PathSelect(sel) = ir.stmt else { panic!("expected a path select, not a free select") };
+        let IrStmt::PathSelect(sel) = ir.stmt else {
+            panic!("expected a path select, not a free select")
+        };
         assert_eq!(sel.root.type_name, "default::Person");
     }
 
@@ -1621,16 +1769,23 @@ mod tests {
         let schema = make_schema_with_channels();
         let ast = parse::parse(query).expect("parse failed");
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
-        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        let IrFreeExpr::Scalar(expr) = items[0] else {
+            panic!("expected scalar")
+        };
         crate::sql::emit_expr(expr)
     }
 
     fn notify_compile_err(query: &str) -> String {
         let schema = make_schema_with_channels();
         let ast = parse::parse(query).expect("parse failed");
-        format!("{}", super::compile(&ast, &schema).err().expect("expected a compile error"))
+        format!(
+            "{}",
+            super::compile(&ast, &schema).err().expect("expected a compile error")
+        )
     }
 
     #[test]
@@ -1660,7 +1815,10 @@ mod tests {
     #[test]
     fn test_notify_object_channel_rejects_wrong_fields() {
         let err = notify_compile_err("SELECT notify(SearchReady, { doc_id := 'x' })");
-        assert!(err.contains("payload fields") && err.contains("don't match"), "got: {err}");
+        assert!(
+            err.contains("payload fields") && err.contains("don't match"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1685,11 +1843,18 @@ mod tests {
             &schema,
         )
         .expect("trigger handler compile failed");
-        let IrStmt::Select(sel) = ir_out.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir_out.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
-        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        let IrFreeExpr::Scalar(expr) = items[0] else {
+            panic!("expected scalar")
+        };
         let sql = crate::sql::emit_expr(expr);
-        assert_eq!(sql, "pg_notify('default__person_updates', (NEW.\"id\")::text)", "got: {sql}");
+        assert_eq!(
+            sql, "pg_notify('default__person_updates', (NEW.\"id\")::text)",
+            "got: {sql}"
+        );
     }
 
     #[test]
@@ -1708,9 +1873,13 @@ mod tests {
             &schema,
         )
         .expect("trigger handler compile failed");
-        let IrStmt::Select(sel) = ir_out.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir_out.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
-        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        let IrFreeExpr::Scalar(expr) = items[0] else {
+            panic!("expected scalar")
+        };
         let sql = crate::sql::emit_expr(expr);
         assert_eq!(sql, "pg_notify('default__pings', (NEW.\"name\")::text)", "got: {sql}");
     }
@@ -1745,9 +1914,13 @@ mod tests {
         let schema = make_schema_with_sequence();
         let ast = parse::parse(query).expect("parse failed");
         let ir = super::compile(&ast, &schema).expect("IR compile failed");
-        let IrStmt::Select(sel) = ir.stmt else { panic!("expected Select") };
+        let IrStmt::Select(sel) = ir.stmt else {
+            panic!("expected Select")
+        };
         let items = free_items(&sel);
-        let IrFreeExpr::Scalar(expr) = items[0] else { panic!("expected scalar") };
+        let IrFreeExpr::Scalar(expr) = items[0] else {
+            panic!("expected scalar")
+        };
         crate::sql::emit_expr(expr)
     }
 
@@ -1766,7 +1939,10 @@ mod tests {
     #[test]
     fn test_sequence_reset_with_val_emits_setval() {
         let sql = compile_seq("SELECT sequence_reset(OrderNumber, 1000)");
-        assert_eq!(sql, r#"setval('"default"."OrderNumber_seq"', 1000, true)"#, "got: {sql}");
+        assert_eq!(
+            sql, r#"setval('"default"."OrderNumber_seq"', 1000, true)"#,
+            "got: {sql}"
+        );
     }
 
     #[test]
@@ -1836,7 +2012,10 @@ mod tests {
         let sql = crate::sql::emit(&ir).sql;
         assert!(sql.contains("\"name\""), "expected name pointer, got: {sql}");
         assert!(sql.contains("\"age\""), "expected age pointer, got: {sql}");
-        assert!(sql.contains("ORDER BY") && sql.contains("LIMIT"), "alias's own order/limit must still apply, got: {sql}");
+        assert!(
+            sql.contains("ORDER BY") && sql.contains("LIMIT"),
+            "alias's own order/limit must still apply, got: {sql}"
+        );
     }
 
     #[test]

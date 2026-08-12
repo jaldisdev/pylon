@@ -40,7 +40,7 @@ pub mod workers;
 pub use pylon_config::config;
 pub use pylon_config::error;
 
-pub use config::{load_config, load_config_at, Config};
+pub use config::{Config, load_config, load_config_at};
 pub use error::{Error, Result};
 pub use server::run;
 pub use workers::WorkerToggles;

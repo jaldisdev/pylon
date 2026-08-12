@@ -1,0 +1,5 @@
+# Matches the codebase's existing house style rather than rustfmt's 100-column
+# default: p95 of existing lines is ~93 columns, but the tail (long `use`
+# groups, wide match arms, SQL string literals) sits around 120. Picking 120
+# keeps `cargo fmt` from reflowing code that was deliberately written wide.
+max_width = 120

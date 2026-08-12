@@ -47,7 +47,12 @@ use crate::search_clients::{MeilisearchClient, OpenSearchClient};
 /// Adapts `MeilisearchClient`/`OpenSearchClient`'s slightly different
 /// constructors into one shape `SearchIndexWorker` can drive generically.
 pub trait SearchSink: Send + Sync {
-    fn index_document(&self, index: &str, doc_id: &str, fields: &HashMap<String, String>) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn index_document(
+        &self,
+        index: &str,
+        doc_id: &str,
+        fields: &HashMap<String, String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
     #[allow(dead_code)] // see module doc — unreachable until `operation` is threaded through claim_batch
     fn delete_document(&self, index: &str, doc_id: &str) -> impl std::future::Future<Output = Result<()>> + Send;
 }
@@ -81,8 +86,16 @@ fn deferred_index_name(type_name: &str, index_name: Option<&str>) -> String {
 }
 
 /// Mirrors `..._search_index_pointers`.
-fn search_index_pointers(schema: &core::schema::SchemaDescriptor, type_name: &str, index_name: Option<&str>) -> Vec<String> {
-    let Some(td) = schema.types.iter().find(|t| format!("{}::{}", t.module, t.name) == type_name) else {
+fn search_index_pointers(
+    schema: &core::schema::SchemaDescriptor,
+    type_name: &str,
+    index_name: Option<&str>,
+) -> Vec<String> {
+    let Some(td) = schema
+        .types
+        .iter()
+        .find(|t| format!("{}::{}", t.module, t.name) == type_name)
+    else {
         return Vec::new();
     };
     let Some(si) = td.search_indexes.iter().find(|s| s.index_name.as_deref() == index_name) else {
@@ -107,7 +120,14 @@ fn split_source_text(pointer_names: &[String], source_text: &str) -> HashMap<Str
 
 fn format_uuid(bytes: &[u8; 16]) -> String {
     let hex = hex::encode(bytes);
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 struct FetchedDoc {
@@ -117,7 +137,9 @@ struct FetchedDoc {
 
 fn decode_fetched_doc(value: &DecodedValue) -> Result<FetchedDoc> {
     let DecodedValue::Object(fields) = value else {
-        return Err(Error::Decode("compile_search_index_fetch: expected a named-column row".into()));
+        return Err(Error::Decode(
+            "compile_search_index_fetch: expected a named-column row".into(),
+        ));
     };
     let field = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
     let id = match field("id") {
@@ -127,7 +149,11 @@ fn decode_fetched_doc(value: &DecodedValue) -> Result<FetchedDoc> {
     let source_text = match field("source_text") {
         Some(DecodedValue::Str(s)) => s.clone(),
         Some(DecodedValue::Null) | None => String::new(),
-        _ => return Err(Error::Decode("compile_search_index_fetch: invalid 'source_text'".into())),
+        _ => {
+            return Err(Error::Decode(
+                "compile_search_index_fetch: invalid 'source_text'".into(),
+            ));
+        }
     };
     Ok(FetchedDoc { id, source_text })
 }
@@ -141,7 +167,12 @@ pub struct SearchIndexWorker<C: SearchSink> {
 
 impl<C: SearchSink> SearchIndexWorker<C> {
     pub fn new(schema: core::schema::SchemaDescriptor, client: C, index_kind: &'static str) -> Self {
-        Self { schema, client, index_kind, fetch_sql: AsyncMutex::new(HashMap::new()) }
+        Self {
+            schema,
+            client,
+            index_kind,
+            fetch_sql: AsyncMutex::new(HashMap::new()),
+        }
     }
 
     /// Mirrors `_ensure_fetch_sql` — lazily compiled and cached per
@@ -160,7 +191,10 @@ impl<C: SearchSink> SearchIndexWorker<C> {
                 Some(sql)
             }
             Err(_) => {
-                eprintln!("{}IndexWorker: cannot compile fetch SQL for ({type_name}, {index_name:?})", self.index_kind);
+                eprintln!(
+                    "{}IndexWorker: cannot compile fetch SQL for ({type_name}, {index_name:?})",
+                    self.index_kind
+                );
                 None
             }
         }
@@ -175,7 +209,10 @@ impl<C: SearchSink + 'static> BatchProcessor for SearchIndexWorker<C> {
     async fn process_batch(&self, listener: &PgListener, rows: &[ClaimedRow]) -> Result<()> {
         let mut groups: HashMap<(String, Option<String>), Vec<&ClaimedRow>> = HashMap::new();
         for r in rows {
-            groups.entry((r.type_name.clone(), r.index_name.clone())).or_default().push(r);
+            groups
+                .entry((r.type_name.clone(), r.index_name.clone()))
+                .or_default()
+                .push(r);
         }
 
         for ((type_name, index_name), group_rows) in groups {

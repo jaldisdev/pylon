@@ -361,12 +361,22 @@ pub struct EnumDescriptor {
 /// types instead of an opaque dict/list.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TupleMemberKind {
-    Scalar { pg_type: String },
-    Enum { module: String, name: String },
+    Scalar {
+        pg_type: String,
+    },
+    Enum {
+        module: String,
+        name: String,
+    },
     /// A member typed as a registered `@pylon.named_tuple` class.
-    NamedTuple { module: String, name: String },
+    NamedTuple {
+        module: String,
+        name: String,
+    },
     /// A member typed as a nested structural `pylon.Tuple[...]`.
-    Tuple { members: Vec<TupleMemberDescriptor> },
+    Tuple {
+        members: Vec<TupleMemberDescriptor>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -492,7 +502,9 @@ impl SchemaDescriptor {
     /// through, so a schema author's `notify(Foo, ...)` and a client's
     /// `listen("Foo")` agree on exactly the same name.
     pub fn find_channel(&self, name: &str) -> Option<&ChannelDescriptor> {
-        self.channels.iter().find(|c| c.name == name || format!("{}::{}", c.module, c.name) == name)
+        self.channels
+            .iter()
+            .find(|c| c.name == name || format!("{}::{}", c.module, c.name) == name)
     }
 }
 
@@ -516,13 +528,19 @@ mod tests {
     #[test]
     fn find_channel_matches_bare_name() {
         let schema = schema_with_one_channel();
-        assert_eq!(schema.find_channel("Pings").map(|c| c.wire_name.as_str()), Some("shop__pings"));
+        assert_eq!(
+            schema.find_channel("Pings").map(|c| c.wire_name.as_str()),
+            Some("shop__pings")
+        );
     }
 
     #[test]
     fn find_channel_matches_qualified_name() {
         let schema = schema_with_one_channel();
-        assert_eq!(schema.find_channel("shop::Pings").map(|c| c.wire_name.as_str()), Some("shop__pings"));
+        assert_eq!(
+            schema.find_channel("shop::Pings").map(|c| c.wire_name.as_str()),
+            Some("shop__pings")
+        );
     }
 
     #[test]

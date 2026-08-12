@@ -17,9 +17,9 @@
 // limitations under the License.
 //
 
-use pyo3::prelude::*;
-use pyo3::PyTypeInfo;
 use pylon_core as core;
+use pyo3::PyTypeInfo;
+use pyo3::prelude::*;
 use std::collections::HashMap;
 
 mod cache;
@@ -67,9 +67,11 @@ impl OnDeletePolicy {
         let side = match side {
             "Target" => core::schema::DeleteSide::Target,
             "Source" => core::schema::DeleteSide::Source,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown deletion side: {side:?}; expected 'Target' or 'Source'")
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown deletion side: {side:?}; expected 'Target' or 'Source'"
+                )));
+            }
         };
         let action = match action {
             "Allow" => core::schema::DeleteAction::Allow,
@@ -78,11 +80,15 @@ impl OnDeletePolicy {
             "DeleteSource" => core::schema::DeleteAction::DeleteSource,
             "DeleteTarget" => core::schema::DeleteAction::DeleteTarget,
             "DeleteTargetIfOrphan" => core::schema::DeleteAction::DeleteTargetIfOrphan,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown deletion action: {action:?}")
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown deletion action: {action:?}"
+                )));
+            }
         };
-        Ok(Self { inner: core::schema::OnDeletePolicy { side, action } })
+        Ok(Self {
+            inner: core::schema::OnDeletePolicy { side, action },
+        })
     }
 
     #[getter]
@@ -213,10 +219,12 @@ impl TupleMember {
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unknown TupleMember kind '{other}' (expected scalar/enum/namedTuple/tuple)"
-                )))
+                )));
             }
         };
-        Ok(Self { inner: core::schema::TupleMemberDescriptor { name, kind } })
+        Ok(Self {
+            inner: core::schema::TupleMemberDescriptor { name, kind },
+        })
     }
 
     #[getter]
@@ -278,13 +286,8 @@ impl PropertyDescriptor {
                 is_exclusive,
                 is_pk,
                 is_readonly,
-                rewrites: rewrites
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|r| r.inner.clone())
-                    .collect(),
-                tuple_members: tuple_members
-                    .map(|ms| ms.iter().map(|m| m.inner.clone()).collect()),
+                rewrites: rewrites.unwrap_or_default().iter().map(|r| r.inner.clone()).collect(),
+                tuple_members: tuple_members.map(|ms| ms.iter().map(|m| m.inner.clone()).collect()),
                 column_type,
             },
         }
@@ -384,16 +387,8 @@ impl LinkDescriptor {
                 description,
                 is_exclusive,
                 is_readonly,
-                rewrites: rewrites
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|r| r.inner.clone())
-                    .collect(),
-                on_delete: on_delete
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|p| p.inner.clone())
-                    .collect(),
+                rewrites: rewrites.unwrap_or_default().iter().map(|r| r.inner.clone()).collect(),
+                on_delete: on_delete.unwrap_or_default().iter().map(|p| p.inner.clone()).collect(),
             },
         }
     }
@@ -469,11 +464,7 @@ impl MultiLinkDescriptor {
                 nullable,
                 default_pyql,
                 description,
-                on_delete: on_delete
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|p| p.inner.clone())
-                    .collect(),
+                on_delete: on_delete.unwrap_or_default().iter().map(|p| p.inner.clone()).collect(),
             },
         }
     }
@@ -556,12 +547,7 @@ impl IndexDescriptor {
         unique = false,
         unless = None
     ))]
-    fn new(
-        pointers: Vec<String>,
-        expression: Option<String>,
-        unique: bool,
-        unless: Option<String>,
-    ) -> Self {
+    fn new(pointers: Vec<String>, expression: Option<String>, unique: bool, unless: Option<String>) -> Self {
         Self {
             inner: core::schema::IndexDescriptor {
                 pointers,
@@ -602,13 +588,7 @@ pub struct VectorIndexDescriptor {
 impl VectorIndexDescriptor {
     #[new]
     #[pyo3(signature = (pointers, model, metric, dimensions, *, index_name = None))]
-    fn new(
-        pointers: Vec<String>,
-        model: String,
-        metric: String,
-        dimensions: u32,
-        index_name: Option<String>,
-    ) -> Self {
+    fn new(pointers: Vec<String>, model: String, metric: String, dimensions: u32, index_name: Option<String>) -> Self {
         Self {
             inner: core::schema::VectorIndexDescriptor {
                 index_name,
@@ -621,17 +601,29 @@ impl VectorIndexDescriptor {
     }
 
     #[getter]
-    fn index_name(&self) -> Option<&str> { self.inner.index_name.as_deref() }
+    fn index_name(&self) -> Option<&str> {
+        self.inner.index_name.as_deref()
+    }
     #[getter]
-    fn pointers(&self) -> Vec<String> { self.inner.pointers.clone() }
+    fn pointers(&self) -> Vec<String> {
+        self.inner.pointers.clone()
+    }
     #[getter]
-    fn model(&self) -> &str { &self.inner.model }
+    fn model(&self) -> &str {
+        &self.inner.model
+    }
     #[getter]
-    fn metric(&self) -> &str { &self.inner.metric }
+    fn metric(&self) -> &str {
+        &self.inner.metric
+    }
     #[getter]
-    fn dimensions(&self) -> u32 { self.inner.dimensions }
+    fn dimensions(&self) -> u32 {
+        self.inner.dimensions
+    }
     #[getter]
-    fn column_name(&self) -> String { self.inner.column_name() }
+    fn column_name(&self) -> String {
+        self.inner.column_name()
+    }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -649,12 +641,18 @@ impl SearchPointerDescriptor {
             "D" => core::schema::SearchWeight::D,
             _ => core::schema::SearchWeight::A,
         };
-        Self { inner: core::schema::SearchPointerDescriptor { name, weight: w } }
+        Self {
+            inner: core::schema::SearchPointerDescriptor { name, weight: w },
+        }
     }
     #[getter]
-    fn name(&self) -> &str { &self.inner.name }
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
     #[getter]
-    fn weight(&self) -> &str { self.inner.weight.as_str() }
+    fn weight(&self) -> &str {
+        self.inner.weight.as_str()
+    }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -666,11 +664,7 @@ pub struct SearchIndexDescriptor {
 impl SearchIndexDescriptor {
     #[new]
     #[pyo3(signature = (backend, pointers, *, index_name = None))]
-    fn new(
-        backend: String,
-        pointers: Vec<PyRef<SearchPointerDescriptor>>,
-        index_name: Option<String>,
-    ) -> Self {
+    fn new(backend: String, pointers: Vec<PyRef<SearchPointerDescriptor>>, index_name: Option<String>) -> Self {
         let b = match backend.as_str() {
             "OpenSearch" => core::schema::SearchBackend::OpenSearch,
             "Meilisearch" => core::schema::SearchBackend::Meilisearch,
@@ -694,12 +688,20 @@ impl SearchIndexDescriptor {
     }
     #[getter]
     fn pointers(&self) -> Vec<SearchPointerDescriptor> {
-        self.inner.pointers.iter().map(|f| SearchPointerDescriptor { inner: f.clone() }).collect()
+        self.inner
+            .pointers
+            .iter()
+            .map(|f| SearchPointerDescriptor { inner: f.clone() })
+            .collect()
     }
     #[getter]
-    fn index_name(&self) -> Option<&str> { self.inner.index_name.as_deref() }
+    fn index_name(&self) -> Option<&str> {
+        self.inner.index_name.as_deref()
+    }
     #[getter]
-    fn column_name(&self) -> String { self.inner.column_name() }
+    fn column_name(&self) -> String {
+        self.inner.column_name()
+    }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -868,11 +870,7 @@ impl TypeDescriptor {
                 multilinks: multilinks.iter().map(|m| m.inner.clone()).collect(),
                 computed: computed.iter().map(|c| c.inner.clone()).collect(),
                 constraints,
-                indexes: indexes
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|i| i.inner.clone())
-                    .collect(),
+                indexes: indexes.unwrap_or_default().iter().map(|i| i.inner.clone()).collect(),
                 vector_indexes: vector_indexes
                     .unwrap_or_default()
                     .iter()
@@ -883,16 +881,8 @@ impl TypeDescriptor {
                     .iter()
                     .map(|s| s.inner.clone())
                     .collect(),
-                triggers: triggers
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|t| t.inner.clone())
-                    .collect(),
-                signals: signals
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|s| s.inner.clone())
-                    .collect(),
+                triggers: triggers.unwrap_or_default().iter().map(|t| t.inner.clone()).collect(),
+                signals: signals.unwrap_or_default().iter().map(|s| s.inner.clone()).collect(),
             },
         }
     }
@@ -944,17 +934,29 @@ impl TypeDescriptor {
 
     #[getter]
     fn multilinks(&self) -> Vec<MultiLinkDescriptor> {
-        self.inner.multilinks.iter().map(|m| MultiLinkDescriptor { inner: m.clone() }).collect()
+        self.inner
+            .multilinks
+            .iter()
+            .map(|m| MultiLinkDescriptor { inner: m.clone() })
+            .collect()
     }
 
     #[getter]
     fn vector_indexes(&self) -> Vec<VectorIndexDescriptor> {
-        self.inner.vector_indexes.iter().map(|v| VectorIndexDescriptor { inner: v.clone() }).collect()
+        self.inner
+            .vector_indexes
+            .iter()
+            .map(|v| VectorIndexDescriptor { inner: v.clone() })
+            .collect()
     }
 
     #[getter]
     fn search_indexes(&self) -> Vec<SearchIndexDescriptor> {
-        self.inner.search_indexes.iter().map(|s| SearchIndexDescriptor { inner: s.clone() }).collect()
+        self.inner
+            .search_indexes
+            .iter()
+            .map(|s| SearchIndexDescriptor { inner: s.clone() })
+            .collect()
     }
 }
 
@@ -1146,17 +1148,25 @@ pub struct AliasDescriptor {
 impl AliasDescriptor {
     #[new]
     fn new(name: String, module: String, expr: String) -> Self {
-        Self { inner: core::schema::AliasDescriptor { name, module, expr } }
+        Self {
+            inner: core::schema::AliasDescriptor { name, module, expr },
+        }
     }
 
     #[getter]
-    fn name(&self) -> &str { &self.inner.name }
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
 
     #[getter]
-    fn module(&self) -> &str { &self.inner.module }
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
 
     #[getter]
-    fn expr(&self) -> &str { &self.inner.expr }
+    fn expr(&self) -> &str {
+        &self.inner.expr
+    }
 }
 
 // ── Channel descriptor ──────────────────────────────────────────────────────────
@@ -1185,38 +1195,51 @@ impl ChannelDescriptor {
         description: Option<String>,
     ) -> PyResult<Self> {
         let payload = match payload_kind {
-            "type" => core::schema::ChannelPayload::Type(
-                payload_type_ref
-                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("payload_type_ref is required for payload_kind='type'"))?,
-            ),
-            "scalar" => core::schema::ChannelPayload::Scalar(
-                payload_scalar_pg_type
-                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("payload_scalar_pg_type is required for payload_kind='scalar'"))?,
-            ),
-            "object" => core::schema::ChannelPayload::Object(
-                payload_object_fields
-                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("payload_object_fields is required for payload_kind='object'"))?,
-            ),
+            "type" => core::schema::ChannelPayload::Type(payload_type_ref.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("payload_type_ref is required for payload_kind='type'")
+            })?),
+            "scalar" => core::schema::ChannelPayload::Scalar(payload_scalar_pg_type.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("payload_scalar_pg_type is required for payload_kind='scalar'")
+            })?),
+            "object" => core::schema::ChannelPayload::Object(payload_object_fields.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("payload_object_fields is required for payload_kind='object'")
+            })?),
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unknown channel payload_kind {other:?}, expected 'type', 'scalar', or 'object'"
-                )))
+                )));
             }
         };
-        Ok(Self { inner: core::schema::ChannelDescriptor { name, module, wire_name, payload, description } })
+        Ok(Self {
+            inner: core::schema::ChannelDescriptor {
+                name,
+                module,
+                wire_name,
+                payload,
+                description,
+            },
+        })
     }
 
     #[getter]
-    fn name(&self) -> &str { &self.inner.name }
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
 
     #[getter]
-    fn module(&self) -> &str { &self.inner.module }
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
 
     #[getter]
-    fn wire_name(&self) -> &str { &self.inner.wire_name }
+    fn wire_name(&self) -> &str {
+        &self.inner.wire_name
+    }
 
     #[getter]
-    fn description(&self) -> Option<&str> { self.inner.description.as_deref() }
+    fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
 
     /// One of `"type"` / `"scalar"` / `"object"` — which of the three
     /// getters below is populated. Lets Python-side code (e.g.
@@ -1267,14 +1290,20 @@ pub struct FunctionParamDescriptor {
 impl FunctionParamDescriptor {
     #[new]
     fn new(name: String, pg_type: String) -> Self {
-        Self { inner: core::schema::FunctionParamDescriptor { name, pg_type } }
+        Self {
+            inner: core::schema::FunctionParamDescriptor { name, pg_type },
+        }
     }
 
     #[getter]
-    fn name(&self) -> &str { &self.inner.name }
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
 
     #[getter]
-    fn pg_type(&self) -> &str { &self.inner.pg_type }
+    fn pg_type(&self) -> &str {
+        &self.inner.pg_type
+    }
 }
 
 #[pyclass(module = "pylon._core", frozen)]
@@ -1324,25 +1353,39 @@ impl FunctionDescriptor {
     }
 
     #[getter]
-    fn name(&self) -> &str { &self.inner.name }
+    fn name(&self) -> &str {
+        &self.inner.name
+    }
 
     #[getter]
-    fn module(&self) -> &str { &self.inner.module }
+    fn module(&self) -> &str {
+        &self.inner.module
+    }
 
     #[getter]
-    fn return_pg_type(&self) -> &str { &self.inner.return_pg_type }
+    fn return_pg_type(&self) -> &str {
+        &self.inner.return_pg_type
+    }
 
     #[getter]
-    fn return_is_object(&self) -> bool { self.inner.return_is_object }
+    fn return_is_object(&self) -> bool {
+        self.inner.return_is_object
+    }
 
     #[getter]
-    fn return_is_set(&self) -> bool { self.inner.return_is_set }
+    fn return_is_set(&self) -> bool {
+        self.inner.return_is_set
+    }
 
     #[getter]
-    fn volatility(&self) -> &str { &self.inner.volatility }
+    fn volatility(&self) -> &str {
+        &self.inner.volatility
+    }
 
     #[getter]
-    fn body(&self) -> &str { &self.inner.body }
+    fn body(&self) -> &str {
+        &self.inner.body
+    }
 }
 
 /// Opaque Rust value built by the Python schema registry. Treat as immutable;
@@ -1368,46 +1411,18 @@ impl SchemaDescriptor {
     ) -> Self {
         Self {
             inner: core::schema::SchemaDescriptor {
-                types: types
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|t| t.inner.clone())
-                    .collect(),
-                scalars: scalars
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|s| s.inner.clone())
-                    .collect(),
-                enums: enums
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|e| e.inner.clone())
-                    .collect(),
+                types: types.unwrap_or_default().iter().map(|t| t.inner.clone()).collect(),
+                scalars: scalars.unwrap_or_default().iter().map(|s| s.inner.clone()).collect(),
+                enums: enums.unwrap_or_default().iter().map(|e| e.inner.clone()).collect(),
                 named_tuples: named_tuples
                     .unwrap_or_default()
                     .iter()
                     .map(|n| n.inner.clone())
                     .collect(),
-                globals: globals
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|g| g.inner.clone())
-                    .collect(),
-                functions: functions
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|f| f.inner.clone())
-                    .collect(),
-                aliases: aliases
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|a| a.inner.clone())
-                    .collect(),
-                channels: channels
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|c| c.inner.clone())
-                    .collect(),
+                globals: globals.unwrap_or_default().iter().map(|g| g.inner.clone()).collect(),
+                functions: functions.unwrap_or_default().iter().map(|f| f.inner.clone()).collect(),
+                aliases: aliases.unwrap_or_default().iter().map(|a| a.inner.clone()).collect(),
+                channels: channels.unwrap_or_default().iter().map(|c| c.inner.clone()).collect(),
             },
         }
     }
@@ -1419,7 +1434,11 @@ impl SchemaDescriptor {
 
     #[getter]
     fn types(&self) -> Vec<TypeDescriptor> {
-        self.inner.types.iter().map(|t| TypeDescriptor { inner: t.clone() }).collect()
+        self.inner
+            .types
+            .iter()
+            .map(|t| TypeDescriptor { inner: t.clone() })
+            .collect()
     }
 
     /// Every declared `Channel` — the runtime source of truth for
@@ -1430,7 +1449,11 @@ impl SchemaDescriptor {
     /// `finalize()` time and discards — see that module's own docs).
     #[getter]
     fn channels(&self) -> Vec<ChannelDescriptor> {
-        self.inner.channels.iter().map(|c| ChannelDescriptor { inner: c.clone() }).collect()
+        self.inner
+            .channels
+            .iter()
+            .map(|c| ChannelDescriptor { inner: c.clone() })
+            .collect()
     }
 
     #[getter]
@@ -1457,16 +1480,21 @@ impl SchemaDescriptor {
     /// Each dict has keys: name, module, qualified_name, scalar_type, required, computed.
     fn globals<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
         use pyo3::types::{PyDict, PyList};
-        let items: Vec<_> = self.inner.globals.iter().map(|g| -> PyResult<_> {
-            let d = PyDict::new(py);
-            d.set_item("name", &g.name)?;
-            d.set_item("module", &g.module)?;
-            d.set_item("qualified_name", format!("{}::{}", g.module, g.name))?;
-            d.set_item("scalar_type", &g.scalar_type)?;
-            d.set_item("required", g.required)?;
-            d.set_item("computed", g.computed_expr.is_some())?;
-            Ok(d)
-        }).collect::<PyResult<_>>()?;
+        let items: Vec<_> = self
+            .inner
+            .globals
+            .iter()
+            .map(|g| -> PyResult<_> {
+                let d = PyDict::new(py);
+                d.set_item("name", &g.name)?;
+                d.set_item("module", &g.module)?;
+                d.set_item("qualified_name", format!("{}::{}", g.module, g.name))?;
+                d.set_item("scalar_type", &g.scalar_type)?;
+                d.set_item("required", g.required)?;
+                d.set_item("computed", g.computed_expr.is_some())?;
+                Ok(d)
+            })
+            .collect::<PyResult<_>>()?;
         Ok(PyList::new(py, items)?)
     }
 
@@ -1474,8 +1502,7 @@ impl SchemaDescriptor {
     /// `_pylon."Schema"` by `migration apply`/`watch` (see
     /// `migration_write_schema_snapshot`) and read back by `from_json`.
     fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.inner)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        serde_json::to_string(&self.inner).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Deserializes a `SchemaDescriptor` from `to_json`'s own output —
@@ -1543,11 +1570,17 @@ impl CompiledQuery {
     /// or `None` for pure-SQL queries. The dict always has a `"kind"` key: `"search"` or `"embedding"`.
     #[getter]
     fn inference_plan<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
-        use pyo3::types::PyDict;
         use core::query::InferencePlan;
+        use pyo3::types::PyDict;
         match &self.inner.inference_plan {
             None => Ok(py.None().into_bound(py)),
-            Some(InferencePlan::Search { backend, index_name, query_param_name, query_literal, size }) => {
+            Some(InferencePlan::Search {
+                backend,
+                index_name,
+                query_param_name,
+                query_literal,
+                size,
+            }) => {
                 let d = PyDict::new(py);
                 d.set_item("kind", "search")?;
                 d.set_item("backend", backend)?;
@@ -1557,7 +1590,13 @@ impl CompiledQuery {
                 d.set_item("size", size)?;
                 Ok(d.into_any())
             }
-            Some(InferencePlan::Embedding { model_name, type_name, index_name, query_param_name, query_literal }) => {
+            Some(InferencePlan::Embedding {
+                model_name,
+                type_name,
+                index_name,
+                query_param_name,
+                query_literal,
+            }) => {
                 let d = PyDict::new(py);
                 d.set_item("kind", "embedding")?;
                 d.set_item("model_name", model_name)?;
@@ -1576,7 +1615,9 @@ impl CompiledQuery {
 #[pyfunction]
 #[pyo3(signature = (query, schema, *, allow_user_specified_id = false))]
 fn compile(query: &str, schema: &SchemaDescriptor, allow_user_specified_id: bool) -> PyResult<CompiledQuery> {
-    let config = core::ir::SessionConfig { allow_user_specified_id };
+    let config = core::ir::SessionConfig {
+        allow_user_specified_id,
+    };
     core::query::compile_with_config(query, &schema.inner, &config)
         .map(|q| CompiledQuery { inner: q })
         .map_err(|e| pyql_err(e, Some(query)))
@@ -1636,13 +1677,34 @@ struct MigrationFile {
 
 #[pymethods]
 impl MigrationFile {
-    #[getter] fn id(&self) -> &str { &self.inner.id }
-    #[getter] fn onto(&self) -> &str { &self.inner.onto }
-    #[getter] fn filename(&self) -> &str { &self.inner.filename }
-    #[getter] fn body(&self) -> &str { &self.inner.body }
-    #[getter] fn short_id(&self) -> &str { self.inner.short_id() }
-    #[getter] fn is_first(&self) -> bool { self.inner.is_first() }
-    #[getter] fn squashed(&self) -> Vec<String> { self.inner.squashed.clone() }
+    #[getter]
+    fn id(&self) -> &str {
+        &self.inner.id
+    }
+    #[getter]
+    fn onto(&self) -> &str {
+        &self.inner.onto
+    }
+    #[getter]
+    fn filename(&self) -> &str {
+        &self.inner.filename
+    }
+    #[getter]
+    fn body(&self) -> &str {
+        &self.inner.body
+    }
+    #[getter]
+    fn short_id(&self) -> &str {
+        self.inner.short_id()
+    }
+    #[getter]
+    fn is_first(&self) -> bool {
+        self.inner.is_first()
+    }
+    #[getter]
+    fn squashed(&self) -> Vec<String> {
+        self.inner.squashed.clone()
+    }
 }
 
 /// Parse a migration file's content. `filename` is for error messages only.
@@ -1652,7 +1714,6 @@ fn parse_migration(content: &str, filename: &str) -> PyResult<MigrationFile> {
         .map(|inner| MigrationFile { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
-
 
 /// Validate a list of migration files form a single unbroken chain.
 /// Returns them in chain order (oldest first).
@@ -1698,14 +1759,12 @@ pub struct DbState {
     pub(crate) inner: core::diff::DbState,
 }
 
-
 /// Compute ordered DDL SQL statements to bring `current` in sync with `target`.
 /// Returns a list of SQL strings; empty when nothing needs to change.
 /// All index creation uses plain (non-CONCURRENTLY) form — suitable for watch mode.
 #[pyfunction]
 fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<String>> {
-    core::diff::diff_schema(&target.inner, &current.inner)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    core::diff::diff_schema(&target.inner, &current.inner).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 /// Compute ordered DDL ops with non-transactional markers for migration file creation.
@@ -1740,7 +1799,16 @@ fn detect_type_renames(
 ) -> Vec<(String, String, String, String, String, f64)> {
     core::diff::detect_type_renames(&target.inner, &current.inner, &guidance.inner)
         .into_iter()
-        .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table, c.new_type_name, c.confidence))
+        .map(|c| {
+            (
+                c.old_module,
+                c.old_table,
+                c.new_module,
+                c.new_table,
+                c.new_type_name,
+                c.confidence,
+            )
+        })
         .collect()
 }
 
@@ -1771,11 +1839,15 @@ pub struct Guidance {
 impl Guidance {
     #[new]
     fn new() -> Self {
-        Self { inner: core::diff::Guidance::default() }
+        Self {
+            inner: core::diff::Guidance::default(),
+        }
     }
 
     fn ban_type_rename(&mut self, old_module: String, old_table: String, new_module: String, new_table: String) {
-        self.inner.banned_type_renames.insert((old_module, old_table, new_module, new_table));
+        self.inner
+            .banned_type_renames
+            .insert((old_module, old_table, new_module, new_table));
     }
 
     fn ban_col_rename(&mut self, module: String, table: String, old_col: String, new_col: String) {
@@ -1813,7 +1885,11 @@ impl MigrationStep {
     /// resolved via `resolved_ddl` before executing.
     #[getter]
     fn ddl(&self) -> Vec<(String, bool)> {
-        self.inner.ddl.iter().map(|op| (op.sql.clone(), op.non_transactional)).collect()
+        self.inner
+            .ddl
+            .iter()
+            .map(|op| (op.sql.clone(), op.non_transactional))
+            .collect()
     }
 
     /// List of (placeholder, prompt, default_expr, type_name) tuples — one
@@ -1822,8 +1898,17 @@ impl MigrationStep {
     /// directly usable. Empty for the common case.
     #[getter]
     fn required_input(&self) -> Vec<(String, String, String, String)> {
-        self.inner.required_input.iter()
-            .map(|r| (r.placeholder.clone(), r.prompt.clone(), r.default_expr.clone(), r.type_name.clone()))
+        self.inner
+            .required_input
+            .iter()
+            .map(|r| {
+                (
+                    r.placeholder.clone(),
+                    r.prompt.clone(),
+                    r.default_expr.clone(),
+                    r.type_name.clone(),
+                )
+            })
             .collect()
     }
 
@@ -1853,7 +1938,10 @@ impl MigrationStep {
             core::diff::OpKey::Scalar(m, n) | core::diff::OpKey::Function(m, n) | core::diff::OpKey::View(m, n) => {
                 Some(format!("{m}::{n}"))
             }
-            core::diff::OpKey::Table(m, table) => schema.inner.types.iter()
+            core::diff::OpKey::Table(m, table) => schema
+                .inner
+                .types
+                .iter()
                 .find(|t| &t.module == m && &t.table == table)
                 .map(|t| format!("{}::{}", t.module, t.name)),
         }
@@ -1865,8 +1953,13 @@ impl MigrationStep {
     /// implementor even though the interface's own DDL (a view selecting
     /// from its implementors) must still be assembled afterward.
     fn implements(&self, schema: &SchemaDescriptor) -> Vec<String> {
-        let core::diff::OpKey::Table(m, table) = &self.inner.op_key else { return vec![] };
-        schema.inner.types.iter()
+        let core::diff::OpKey::Table(m, table) = &self.inner.op_key else {
+            return vec![];
+        };
+        schema
+            .inner
+            .types
+            .iter()
             .find(|t| &t.module == m && &t.table == table)
             .map(|t| t.interfaces.clone())
             .unwrap_or_default()
@@ -1877,7 +1970,11 @@ impl MigrationStep {
     /// `default_expr`. Returns (sql, non_transactional) tuples, same shape
     /// as `ddl`.
     fn resolved_ddl(&self, overrides: HashMap<String, String>) -> Vec<(String, bool)> {
-        self.inner.resolved_ddl(&overrides).into_iter().map(|op| (op.sql, op.non_transactional)).collect()
+        self.inner
+            .resolved_ddl(&overrides)
+            .into_iter()
+            .map(|op| (op.sql, op.non_transactional))
+            .collect()
     }
 
     /// Best-effort "equivalent Python schema declaration" for this step's
@@ -1904,7 +2001,11 @@ fn diff_schema_steps_with_renames_and_fills(
     fills: Vec<(String, String, String, String)>,
 ) -> PyResult<Vec<MigrationStep>> {
     core::diff::diff_schema_steps_with_renames_and_fills(
-        &target.inner, &current.inner, &type_renames, &col_renames, &fills,
+        &target.inner,
+        &current.inner,
+        &type_renames,
+        &col_renames,
+        &fills,
     )
     .map(|steps| steps.into_iter().map(|inner| MigrationStep { inner }).collect())
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
@@ -1932,11 +2033,7 @@ fn diff_schema_ops_with_renames(
 /// Raises `PyQLError` on syntax, type, or resolution failures.
 /// Raises `PyQLSyntaxError` if the expression contains query parameters ($name).
 #[pyfunction]
-fn compile_fill_expr(
-    type_name: &str,
-    expr_str: &str,
-    schema: &SchemaDescriptor,
-) -> PyResult<String> {
+fn compile_fill_expr(type_name: &str, expr_str: &str, schema: &SchemaDescriptor) -> PyResult<String> {
     core::query::compile_fill_expr(type_name, expr_str, &schema.inner).map_err(|e| pyql_err(e, Some(expr_str)))
 }
 
@@ -1950,7 +2047,17 @@ fn detect_fill_required(
 ) -> Vec<(String, String, String, String, String, bool, Option<String>)> {
     core::diff::detect_fill_required(&target.inner, &current.inner)
         .into_iter()
-        .map(|f| (f.module, f.table, f.column, f.pg_type, f.type_name, f.is_new_column, f.default_sql))
+        .map(|f| {
+            (
+                f.module,
+                f.table,
+                f.column,
+                f.pg_type,
+                f.type_name,
+                f.is_new_column,
+                f.default_sql,
+            )
+        })
         .collect()
 }
 
@@ -1968,7 +2075,11 @@ fn diff_schema_ops_with_renames_and_fills(
     fills: Vec<(String, String, String, String)>,
 ) -> PyResult<Vec<(String, bool)>> {
     core::diff::diff_schema_ops_with_renames_and_fills(
-        &target.inner, &current.inner, &type_renames, &col_renames, &fills,
+        &target.inner,
+        &current.inner,
+        &type_renames,
+        &col_renames,
+        &fills,
     )
     .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
@@ -2034,8 +2145,8 @@ fn json_member_to_py<'py>(
     py: Python<'py>,
     member: &core::query::JsonMember,
 ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
-    use pyo3::types::{PyDict, PyList};
     use core::query::JsonMemberKind;
+    use pyo3::types::{PyDict, PyList};
 
     let d = PyDict::new(py);
     d.set_item("key", member.key.as_deref())?;
@@ -2052,7 +2163,10 @@ fn json_member_to_py<'py>(
             d.set_item("type_name", type_name.as_deref())?;
             let py_members = PyList::new(
                 py,
-                members.iter().map(|m| json_member_to_py(py, m)).collect::<PyResult<Vec<_>>>()?,
+                members
+                    .iter()
+                    .map(|m| json_member_to_py(py, m))
+                    .collect::<PyResult<Vec<_>>>()?,
             )?;
             d.set_item("members", py_members)?;
         }
@@ -2064,8 +2178,8 @@ fn shape_node_to_py<'py>(
     py: Python<'py>,
     node: &core::query::ShapeNode,
 ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
-    use pyo3::types::{PyDict, PyList};
     use core::query::{Cardinality, ShapeNode};
+    use pyo3::types::{PyDict, PyList};
 
     let d = PyDict::new(py);
     match node {
@@ -2074,23 +2188,39 @@ fn shape_node_to_py<'py>(
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
         }
-        ShapeNode::Object { name, type_name, position, cardinality, pointers } => {
+        ShapeNode::Object {
+            name,
+            type_name,
+            position,
+            cardinality,
+            pointers,
+        } => {
             d.set_item("kind", "object")?;
             d.set_item("name", name.as_str())?;
             d.set_item("type_name", type_name.as_deref())?;
             d.set_item("position", position)?;
-            d.set_item("cardinality", match cardinality {
-                Cardinality::Required => "required",
-                Cardinality::Optional => "optional",
-                Cardinality::Many    => "many",
-            })?;
+            d.set_item(
+                "cardinality",
+                match cardinality {
+                    Cardinality::Required => "required",
+                    Cardinality::Optional => "optional",
+                    Cardinality::Many => "many",
+                },
+            )?;
             let py_pointers = PyList::new(
                 py,
-                pointers.iter().map(|f| shape_node_to_py(py, f)).collect::<PyResult<Vec<_>>>()?,
+                pointers
+                    .iter()
+                    .map(|f| shape_node_to_py(py, f))
+                    .collect::<PyResult<Vec<_>>>()?,
             )?;
             d.set_item("pointers", py_pointers)?;
         }
-        ShapeNode::Array { name, position, element } => {
+        ShapeNode::Array {
+            name,
+            position,
+            element,
+        } => {
             d.set_item("kind", "array")?;
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
@@ -2101,7 +2231,10 @@ fn shape_node_to_py<'py>(
             d.set_item("position", position)?;
             let py_elems = PyList::new(
                 py,
-                elements.iter().map(|e| shape_node_to_py(py, e)).collect::<PyResult<Vec<_>>>()?,
+                elements
+                    .iter()
+                    .map(|e| shape_node_to_py(py, e))
+                    .collect::<PyResult<Vec<_>>>()?,
             )?;
             d.set_item("elements", py_elems)?;
         }
@@ -2111,7 +2244,13 @@ fn shape_node_to_py<'py>(
         ShapeNode::JsonScalar => {
             d.set_item("kind", "json_scalar")?;
         }
-        ShapeNode::NamedTuple { name, position, type_name, members, is_free_object } => {
+        ShapeNode::NamedTuple {
+            name,
+            position,
+            type_name,
+            members,
+            is_free_object,
+        } => {
             d.set_item("kind", "named_tuple")?;
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
@@ -2121,37 +2260,59 @@ fn shape_node_to_py<'py>(
                 Some(ms) => {
                     let py_members = PyList::new(
                         py,
-                        ms.iter().map(|m| json_member_to_py(py, m)).collect::<PyResult<Vec<_>>>()?,
+                        ms.iter()
+                            .map(|m| json_member_to_py(py, m))
+                            .collect::<PyResult<Vec<_>>>()?,
                     )?;
                     d.set_item("members", py_members)?;
                 }
                 None => d.set_item("members", py.None())?,
             }
         }
-        ShapeNode::Enum { name, position, enum_type } => {
+        ShapeNode::Enum {
+            name,
+            position,
+            enum_type,
+        } => {
             d.set_item("kind", "enum")?;
             d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
             d.set_item("enum_type", enum_type.as_str())?;
         }
-        ShapeNode::Group { key_nodes, grouping_position, elements_position, element } => {
+        ShapeNode::Group {
+            key_nodes,
+            grouping_position,
+            elements_position,
+            element,
+        } => {
             d.set_item("kind", "group")?;
             let py_key_nodes = PyList::new(
                 py,
-                key_nodes.iter().map(|n| shape_node_to_py(py, n)).collect::<PyResult<Vec<_>>>()?,
+                key_nodes
+                    .iter()
+                    .map(|n| shape_node_to_py(py, n))
+                    .collect::<PyResult<Vec<_>>>()?,
             )?;
             d.set_item("key_nodes", py_key_nodes)?;
             d.set_item("grouping_position", grouping_position)?;
             d.set_item("elements_position", elements_position)?;
             d.set_item("element", shape_node_to_py(py, element)?)?;
         }
-        ShapeNode::VectorSearch { object_position, distance_position, object_node } => {
+        ShapeNode::VectorSearch {
+            object_position,
+            distance_position,
+            object_node,
+        } => {
             d.set_item("kind", "vector_search")?;
             d.set_item("object_position", object_position)?;
             d.set_item("distance_position", distance_position)?;
             d.set_item("object_node", shape_node_to_py(py, object_node)?)?;
         }
-        ShapeNode::FtsSearch { object_position, rank_position, object_node } => {
+        ShapeNode::FtsSearch {
+            object_position,
+            rank_position,
+            object_node,
+        } => {
             d.set_item("kind", "fts_search")?;
             d.set_item("object_position", object_position)?;
             d.set_item("rank_position", rank_position)?;
@@ -2217,7 +2378,12 @@ fn pyql_err(err: core::error::PyQLError, query: Option<&str>) -> PyErr {
     construct_pylon_error(class_name, message, query, position)
 }
 
-fn construct_pylon_error(class_name: &str, message: &str, query: Option<&str>, position: &core::error::Position) -> PyErr {
+fn construct_pylon_error(
+    class_name: &str,
+    message: &str,
+    query: Option<&str>,
+    position: &core::error::Position,
+) -> PyErr {
     Python::attach(|py| {
         let result: PyResult<PyErr> = (|| {
             let module = py.import("pylon.exceptions")?;

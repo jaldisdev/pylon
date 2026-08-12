@@ -17,9 +17,9 @@
 // limitations under the License.
 //
 
-use std::sync::{OnceLock, RwLock};
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::sync::{OnceLock, RwLock};
 
 use crate::analyze::ShapePathAlias;
 use crate::error::PyQLError;
@@ -36,9 +36,7 @@ const CACHE_CAPACITY: usize = 1024;
 static QUERY_CACHE: OnceLock<RwLock<LruCache<(String, ir::SessionConfig), CompiledQuery>>> = OnceLock::new();
 
 fn query_cache() -> &'static RwLock<LruCache<(String, ir::SessionConfig), CompiledQuery>> {
-    QUERY_CACHE.get_or_init(|| {
-        RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()))
-    })
+    QUERY_CACHE.get_or_init(|| RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())))
 }
 
 /// Discard all cached compiled queries. Call when the schema is reloaded.
@@ -85,10 +83,7 @@ pub enum ShapeNode {
         element: Box<ShapeNode>,
     },
     /// Anonymous positional tuple decoded to a Python tuple. No type name — no registry lookup.
-    Tuple {
-        position: usize,
-        elements: Vec<ShapeNode>,
-    },
+    Tuple { position: usize, elements: Vec<ShapeNode> },
     /// Named tuple decoded from jsonb. When `type_name` is Some, hydrated to the registered class.
     /// `members` carries the full per-member decode plan when statically known (a registered
     /// NamedTupleDescriptor's members, a structural `pylon.Tuple[...]` property's tuple_members,
@@ -172,7 +167,10 @@ pub enum JsonMemberKind {
     /// dataclass when present (nominal); `None` decodes to a plain tuple
     /// (all-positional members) or a dynamically-built dataclass (named,
     /// unregistered structural).
-    Tuple { type_name: Option<String>, members: Vec<JsonMember> },
+    Tuple {
+        type_name: Option<String>,
+        members: Vec<JsonMember>,
+    },
 }
 
 /// Opaque handle to the output shape of a compiled query.
@@ -335,7 +333,11 @@ pub fn compile_with_config(
     Ok(compiled)
 }
 
-fn compile_uncached(query: &str, schema: &SchemaDescriptor, config: &ir::SessionConfig) -> Result<CompiledQuery, PyQLError> {
+fn compile_uncached(
+    query: &str,
+    schema: &SchemaDescriptor,
+    config: &ir::SessionConfig,
+) -> Result<CompiledQuery, PyQLError> {
     let ast = parse::parse(query)?;
     let is_analyze = matches!(ast, parse::Stmt::Analyze(_));
     let ir_out = ir::compile_with_config(&ast, schema, config)?;
@@ -412,7 +414,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -428,7 +431,9 @@ mod tests {
         let schema = make_schema();
         let query = "analyze select Person { id }";
         let compiled = compile(query, &schema).unwrap();
-        let paths = compiled.analyze_paths.expect("analyze query should populate analyze_paths");
+        let paths = compiled
+            .analyze_paths
+            .expect("analyze query should populate analyze_paths");
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].path, "root");
         let offset = paths[0].marker_offset.expect("root path should carry a marker offset");

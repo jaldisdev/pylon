@@ -129,7 +129,10 @@ pub struct WebserverConfig {
 
 impl Default for WebserverConfig {
     fn default() -> Self {
-        Self { host: "localhost".to_string(), port: 5656 }
+        Self {
+            host: "localhost".to_string(),
+            port: 5656,
+        }
     }
 }
 
@@ -174,7 +177,13 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { enabled: false, backend: "lmdb".to_string(), max_size_mb: 1024, path: PathBuf::new(), sets: HashMap::new() }
+        Self {
+            enabled: false,
+            backend: "lmdb".to_string(),
+            max_size_mb: 1024,
+            path: PathBuf::new(),
+            sets: HashMap::new(),
+        }
     }
 }
 
@@ -209,10 +218,36 @@ impl Config {
     }
 }
 
-const DATABASE_SCALAR_KEYS: &[&str] =
-    &["dsn", "host", "port", "name", "user", "password", "password_env", "pool_min_size", "pool_max_size"];
-const SEARCH_SCALAR_KEYS: &[&str] = &["host", "port", "backend", "user", "password", "password_env", "api_key", "api_key_env"];
-const MODELS_SCALAR_KEYS: &[&str] = &["api_style", "api_url", "model", "client_id", "secret", "secret_env", "purpose"];
+const DATABASE_SCALAR_KEYS: &[&str] = &[
+    "dsn",
+    "host",
+    "port",
+    "name",
+    "user",
+    "password",
+    "password_env",
+    "pool_min_size",
+    "pool_max_size",
+];
+const SEARCH_SCALAR_KEYS: &[&str] = &[
+    "host",
+    "port",
+    "backend",
+    "user",
+    "password",
+    "password_env",
+    "api_key",
+    "api_key_env",
+];
+const MODELS_SCALAR_KEYS: &[&str] = &[
+    "api_style",
+    "api_url",
+    "model",
+    "client_id",
+    "secret",
+    "secret_env",
+    "purpose",
+];
 
 fn get_str(t: &Table, key: &str) -> Option<String> {
     t.get(key).and_then(|v| v.as_str()).map(str::to_string)
@@ -227,7 +262,10 @@ fn get_bool(t: &Table, key: &str) -> Option<bool> {
 }
 
 fn scalar_subset(t: &Table, keys: &[&str]) -> Table {
-    t.iter().filter(|(k, _)| keys.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+    t.iter()
+        .filter(|(k, _)| keys.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 fn merged_with(base: &Table, overrides: &Table) -> Table {
@@ -256,7 +294,10 @@ fn build_database(raw: &Table) -> Result<DatabaseConfig> {
     let (host, port, name, user, password) = if dsn.is_some() {
         (None, None, None, None, None)
     } else {
-        let missing: Vec<&str> = ["host", "port", "name", "user"].into_iter().filter(|k| raw.get(*k).is_none()).collect();
+        let missing: Vec<&str> = ["host", "port", "name", "user"]
+            .into_iter()
+            .filter(|k| raw.get(*k).is_none())
+            .collect();
         if !missing.is_empty() {
             return Err(Error::Invalid(format!(
                 "DatabaseConfig: missing required fields when dsn is not provided: {}",
@@ -264,17 +305,36 @@ fn build_database(raw: &Table) -> Result<DatabaseConfig> {
             )));
         }
         let password = resolve_secret(raw, "password", "password_env");
-        (get_str(raw, "host"), get_int(raw, "port").map(|p| p as u16), get_str(raw, "name"), get_str(raw, "user"), password)
+        (
+            get_str(raw, "host"),
+            get_int(raw, "port").map(|p| p as u16),
+            get_str(raw, "name"),
+            get_str(raw, "user"),
+            password,
+        )
     };
 
     if pool_min_size < 1 {
-        return Err(Error::Invalid("DatabaseConfig: pool_min_size must be >= 1.".to_string()));
+        return Err(Error::Invalid(
+            "DatabaseConfig: pool_min_size must be >= 1.".to_string(),
+        ));
     }
     if pool_max_size < pool_min_size {
-        return Err(Error::Invalid("DatabaseConfig: pool_max_size must be >= pool_min_size.".to_string()));
+        return Err(Error::Invalid(
+            "DatabaseConfig: pool_max_size must be >= pool_min_size.".to_string(),
+        ));
     }
 
-    Ok(DatabaseConfig { dsn, host, port, name, user, password, pool_min_size, pool_max_size })
+    Ok(DatabaseConfig {
+        dsn,
+        host,
+        port,
+        name,
+        user,
+        password,
+        pool_min_size,
+        pool_max_size,
+    })
 }
 
 fn build_search(raw: &Table) -> Result<SearchConfig> {
@@ -284,12 +344,27 @@ fn build_search(raw: &Table) -> Result<SearchConfig> {
         "opensearch" => SearchServiceBackend::OpenSearch,
         "meilisearch" => SearchServiceBackend::Meilisearch,
         other => {
-            return Err(Error::Invalid(format!("SearchConfig: backend must be 'opensearch' or 'meilisearch', got {other:?}")))
+            return Err(Error::Invalid(format!(
+                "SearchConfig: backend must be 'opensearch' or 'meilisearch', got {other:?}"
+            )));
         }
     };
-    let host = get_str(raw, "host").ok_or(Error::MissingField { section: "search", field: "host" })?;
-    let port = get_int(raw, "port").ok_or(Error::MissingField { section: "search", field: "port" })? as u16;
-    Ok(SearchConfig { host, port, backend, user: get_str(raw, "user"), password, api_key })
+    let host = get_str(raw, "host").ok_or(Error::MissingField {
+        section: "search",
+        field: "host",
+    })?;
+    let port = get_int(raw, "port").ok_or(Error::MissingField {
+        section: "search",
+        field: "port",
+    })? as u16;
+    Ok(SearchConfig {
+        host,
+        port,
+        backend,
+        user: get_str(raw, "user"),
+        password,
+        api_key,
+    })
 }
 
 fn build_model(raw: &Table) -> Result<ModelConfig> {
@@ -297,22 +372,43 @@ fn build_model(raw: &Table) -> Result<ModelConfig> {
         Some("openai") => ApiStyle::OpenAi,
         Some("anthropic") => ApiStyle::Anthropic,
         other => {
-            return Err(Error::Invalid(format!("ModelConfig: api_style must be 'openai' or 'anthropic', got {other:?}")))
+            return Err(Error::Invalid(format!(
+                "ModelConfig: api_style must be 'openai' or 'anthropic', got {other:?}"
+            )));
         }
     };
     let purpose = match get_str(raw, "purpose").as_deref().unwrap_or("embedding") {
         "embedding" => ModelPurpose::Embedding,
         "chat" => ModelPurpose::Chat,
-        other => return Err(Error::Invalid(format!("ModelConfig: purpose must be 'embedding' or 'chat', got {other:?}"))),
+        other => {
+            return Err(Error::Invalid(format!(
+                "ModelConfig: purpose must be 'embedding' or 'chat', got {other:?}"
+            )));
+        }
     };
     let secret = resolve_secret(raw, "secret", "secret_env");
-    let api_url = get_str(raw, "api_url").ok_or(Error::MissingField { section: "models", field: "api_url" })?;
-    let model = get_str(raw, "model").ok_or(Error::MissingField { section: "models", field: "model" })?;
-    Ok(ModelConfig { api_style, api_url, model, client_id: get_str(raw, "client_id"), secret, purpose })
+    let api_url = get_str(raw, "api_url").ok_or(Error::MissingField {
+        section: "models",
+        field: "api_url",
+    })?;
+    let model = get_str(raw, "model").ok_or(Error::MissingField {
+        section: "models",
+        field: "model",
+    })?;
+    Ok(ModelConfig {
+        api_style,
+        api_url,
+        model,
+        client_id: get_str(raw, "client_id"),
+        secret,
+        purpose,
+    })
 }
 
 fn build_cache_set(raw: &Table) -> CacheSetConfig {
-    CacheSetConfig { enabled: get_bool(raw, "enabled").unwrap_or(true) }
+    CacheSetConfig {
+        enabled: get_bool(raw, "enabled").unwrap_or(true),
+    }
 }
 
 /// `~` expansion for `[cache].path` only — matches `Path.expanduser()`,
@@ -322,10 +418,10 @@ fn expand_tilde(input: &str) -> PathBuf {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);
         }
-    } else if input == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
-        }
+    } else if input == "~"
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(input)
 }
@@ -378,7 +474,10 @@ fn find_toml(start: &Path) -> Result<PathBuf> {
 pub fn load_config(start_dir: Option<&Path>) -> Result<Config> {
     let start = match start_dir {
         Some(p) => p.to_path_buf(),
-        None => std::env::current_dir().map_err(|e| Error::Io { path: PathBuf::from("."), source: e })?,
+        None => std::env::current_dir().map_err(|e| Error::Io {
+            path: PathBuf::from("."),
+            source: e,
+        })?,
     };
     let toml_path = find_toml(&start)?;
     parse_config_file(toml_path)
@@ -392,11 +491,20 @@ pub fn load_config_at(toml_path: &Path) -> Result<Config> {
 }
 
 fn parse_config_file(toml_path: PathBuf) -> Result<Config> {
-    let text = std::fs::read_to_string(&toml_path).map_err(|e| Error::Io { path: toml_path.clone(), source: e })?;
-    let raw: Table = text.parse().map_err(|e| Error::TomlParse { path: toml_path.clone(), source: e })?;
+    let text = std::fs::read_to_string(&toml_path).map_err(|e| Error::Io {
+        path: toml_path.clone(),
+        source: e,
+    })?;
+    let raw: Table = text.parse().map_err(|e| Error::TomlParse {
+        path: toml_path.clone(),
+        source: e,
+    })?;
 
     // ── [database] ──────────────────────────────────────────────────────
-    let raw_db = raw.get("database").and_then(|v| v.as_table()).ok_or(Error::MissingSection("database"))?;
+    let raw_db = raw
+        .get("database")
+        .and_then(|v| v.as_table())
+        .ok_or(Error::MissingSection("database"))?;
     let base_db_raw = scalar_subset(raw_db, DATABASE_SCALAR_KEYS);
     let database = build_database(&base_db_raw)?;
 
@@ -446,9 +554,14 @@ fn parse_config_file(toml_path: PathBuf) -> Result<Config> {
     }
 
     // ── [project] ────────────────────────────────────────────────────────
-    let raw_project = raw.get("project").and_then(|v| v.as_table()).ok_or(Error::MissingSection("project"))?;
-    let schema_dir_raw =
-        get_str(raw_project, "schema-dir").ok_or(Error::MissingField { section: "project", field: "schema-dir" })?;
+    let raw_project = raw
+        .get("project")
+        .and_then(|v| v.as_table())
+        .ok_or(Error::MissingSection("project"))?;
+    let schema_dir_raw = get_str(raw_project, "schema-dir").ok_or(Error::MissingField {
+        section: "project",
+        field: "schema-dir",
+    })?;
     let toml_dir = toml_path.parent().unwrap_or_else(|| Path::new("."));
     let project = ProjectConfig {
         schema_dir: lexical_normalize(&toml_dir.join(schema_dir_raw)),
@@ -457,20 +570,27 @@ fn parse_config_file(toml_path: PathBuf) -> Result<Config> {
     };
 
     // ── [webserver] / [ui] / [metrics] ──────────────────────────────────
-    let webserver = raw.get("webserver").and_then(|v| v.as_table()).map_or_else(WebserverConfig::default, |t| {
-        WebserverConfig {
+    let webserver = raw
+        .get("webserver")
+        .and_then(|v| v.as_table())
+        .map_or_else(WebserverConfig::default, |t| WebserverConfig {
             host: get_str(t, "host").unwrap_or_else(|| WebserverConfig::default().host),
-            port: get_int(t, "port").map(|p| p as u16).unwrap_or_else(|| WebserverConfig::default().port),
-        }
-    });
+            port: get_int(t, "port")
+                .map(|p| p as u16)
+                .unwrap_or_else(|| WebserverConfig::default().port),
+        });
     let ui = raw
         .get("ui")
         .and_then(|v| v.as_table())
-        .map_or(UiConfig::default(), |t| UiConfig { enabled: get_bool(t, "enabled").unwrap_or(true) });
+        .map_or(UiConfig::default(), |t| UiConfig {
+            enabled: get_bool(t, "enabled").unwrap_or(true),
+        });
     let metrics = raw
         .get("metrics")
         .and_then(|v| v.as_table())
-        .map_or(MetricsConfig::default(), |t| MetricsConfig { enabled: get_bool(t, "enabled").unwrap_or(false) });
+        .map_or(MetricsConfig::default(), |t| MetricsConfig {
+            enabled: get_bool(t, "enabled").unwrap_or(false),
+        });
 
     // ── [cache] ──────────────────────────────────────────────────────────
     let mut cache = CacheConfig::default();
@@ -481,7 +601,9 @@ fn parse_config_file(toml_path: PathBuf) -> Result<Config> {
         }
         if let Some(v) = get_str(rc, "backend") {
             if v != "lmdb" {
-                return Err(Error::Invalid(format!("CacheConfig: backend must be 'lmdb', got {v:?}")));
+                return Err(Error::Invalid(format!(
+                    "CacheConfig: backend must be 'lmdb', got {v:?}"
+                )));
             }
             cache.backend = v;
         }
@@ -490,12 +612,26 @@ fn parse_config_file(toml_path: PathBuf) -> Result<Config> {
         }
         raw_cache_path = get_str(rc, "path");
         if let Some(sets_table) = rc.get("sets").and_then(|v| v.as_table()) {
-            cache.sets = sets_table.iter().filter_map(|(k, v)| v.as_table().map(|t| (k.clone(), build_cache_set(t)))).collect();
+            cache.sets = sets_table
+                .iter()
+                .filter_map(|(k, v)| v.as_table().map(|t| (k.clone(), build_cache_set(t))))
+                .collect();
         }
     }
     cache.path = resolve_cache_path(raw_cache_path.as_deref(), &toml_path);
 
-    Ok(Config { database, project, search, models, connections, webserver, ui, metrics, cache, toml_path })
+    Ok(Config {
+        database,
+        project,
+        search,
+        models,
+        connections,
+        webserver,
+        ui,
+        metrics,
+        cache,
+        toml_path,
+    })
 }
 
 #[cfg(test)]
@@ -726,7 +862,7 @@ mod tests {
         );
         let config = load_config(Some(&dir.0)).unwrap();
         assert_eq!(config.webserver, WebserverConfig::default());
-        assert_eq!(config.ui.enabled, true);
-        assert_eq!(config.metrics.enabled, false);
+        assert!(config.ui.enabled);
+        assert!(!config.metrics.enabled);
     }
 }

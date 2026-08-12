@@ -151,9 +151,7 @@ async fn single_link_sourced_backlink_exists_filter_returns_the_right_orgs() {
     for stmt in [
         format!("insert {module}::Org {{ name := 'HasTeam' }}"),
         format!("insert {module}::Org {{ name := 'NoTeam' }}"),
-        format!(
-            "insert {module}::Team {{ name := 'Alpha', org := (select {module}::Org filter .name = 'HasTeam') }}"
-        ),
+        format!("insert {module}::Team {{ name := 'Alpha', org := (select {module}::Org filter .name = 'HasTeam') }}"),
     ] {
         let compiled = query::compile(&stmt, &schema).unwrap();
         pool.execute_typed(&compiled.sql, &[]).await.unwrap();
@@ -169,11 +167,18 @@ async fn single_link_sourced_backlink_exists_filter_returns_the_right_orgs() {
         .query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default())
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1, "expected exactly the 1 Org with a Team backlinked, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly the 1 Org with a Team backlinked, got {rows:?}"
+    );
     let pylon_value::DecodedValue::Composite(fields) = &rows[0] else {
         panic!("expected a Composite-shaped Org row, got {:?}", rows[0]);
     };
-    assert_eq!(fields.get(1), Some(&pylon_value::DecodedValue::Str("HasTeam".to_string())));
+    assert_eq!(
+        fields.get(1),
+        Some(&pylon_value::DecodedValue::Str("HasTeam".to_string()))
+    );
 }
 
 /// Regression test for gap 1 (see file doc comment) — a self-referential
@@ -215,7 +220,11 @@ async fn multilink_sourced_backlink_exists_filter_returns_the_right_people() {
         .query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default())
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1, "expected exactly the 1 Person (Bob) listed in someone else's friends, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly the 1 Person (Bob) listed in someone else's friends, got {rows:?}"
+    );
     let pylon_value::DecodedValue::Composite(fields) = &rows[0] else {
         panic!("expected a Composite-shaped Person row, got {:?}", rows[0]);
     };
@@ -257,18 +266,28 @@ async fn nested_single_link_backlink_shape_returns_the_correct_two_level_chain()
         &schema,
     )
     .unwrap();
-    let rows = pool.query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1, "expected exactly one Org row, got {rows:?}");
 
     let pylon_value::DecodedValue::Composite(org_fields) = &rows[0] else {
         panic!("expected a Composite-shaped Org row, got {:?}", rows[0]);
     };
     // [0] = __type__, [1] = name, [2] = teams (an Array of Composite Team rows)
-    assert_eq!(org_fields.get(1), Some(&pylon_value::DecodedValue::Str("Acme".to_string())));
+    assert_eq!(
+        org_fields.get(1),
+        Some(&pylon_value::DecodedValue::Str("Acme".to_string()))
+    );
     let pylon_value::DecodedValue::Array(teams) = &org_fields[2] else {
         panic!("expected teams to decode as an Array, got {:?}", org_fields[2]);
     };
-    assert_eq!(teams.len(), 2, "Org should have exactly 2 backlinked Teams, got {teams:?}");
+    assert_eq!(
+        teams.len(),
+        2,
+        "Org should have exactly 2 backlinked Teams, got {teams:?}"
+    );
 
     let mut member_counts: Vec<usize> = teams
         .iter()
@@ -283,7 +302,11 @@ async fn nested_single_link_backlink_shape_returns_the_correct_two_level_chain()
         })
         .collect();
     member_counts.sort();
-    assert_eq!(member_counts, vec![1, 2], "Alpha should have 2 members, Beta should have 1, got {member_counts:?}");
+    assert_eq!(
+        member_counts,
+        vec![1, 2],
+        "Alpha should have 2 members, Beta should have 1, got {member_counts:?}"
+    );
 }
 
 /// Same idea as the two-level Org/Team/Member test, but sourced from a
@@ -327,7 +350,10 @@ async fn multilink_sourced_backlink_shape_returns_the_right_followers() {
         &schema,
     )
     .unwrap();
-    let rows = pool.query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     let pylon_value::DecodedValue::Composite(bob_fields) = &rows[0] else {
         panic!("expected a Composite-shaped Person row, got {:?}", rows[0]);
@@ -367,8 +393,12 @@ async fn triple_nested_single_link_backlink_shape_returns_the_correct_chain() {
         format!("insert {module}::Org {{ name := 'Acme' }}"),
         format!("insert {module}::Team {{ name := 'Alpha', org := (select {module}::Org filter .name = 'Acme') }}"),
         format!("insert {module}::Member {{ name := 'Ann', team := (select {module}::Team filter .name = 'Alpha') }}"),
-        format!("insert {module}::Task {{ title := 'Ship it', assignee := (select {module}::Member filter .name = 'Ann') }}"),
-        format!("insert {module}::Task {{ title := 'Review PR', assignee := (select {module}::Member filter .name = 'Ann') }}"),
+        format!(
+            "insert {module}::Task {{ title := 'Ship it', assignee := (select {module}::Member filter .name = 'Ann') }}"
+        ),
+        format!(
+            "insert {module}::Task {{ title := 'Review PR', assignee := (select {module}::Member filter .name = 'Ann') }}"
+        ),
     ] {
         let compiled = query::compile(&stmt, &schema).unwrap();
         pool.execute_typed(&compiled.sql, &[]).await.unwrap();
@@ -390,7 +420,10 @@ async fn triple_nested_single_link_backlink_shape_returns_the_correct_chain() {
         &schema,
     )
     .unwrap();
-    let rows = pool.query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
 
     let pylon_value::DecodedValue::Composite(org_fields) = &rows[0] else {
@@ -410,7 +443,10 @@ async fn triple_nested_single_link_backlink_shape_returns_the_correct_chain() {
     let pylon_value::DecodedValue::Composite(member_fields) = &members[0] else {
         panic!("expected a Composite-shaped Member row, got {:?}", members[0]);
     };
-    assert_eq!(member_fields.get(1), Some(&pylon_value::DecodedValue::Str("Ann".to_string())));
+    assert_eq!(
+        member_fields.get(1),
+        Some(&pylon_value::DecodedValue::Str("Ann".to_string()))
+    );
     let pylon_value::DecodedValue::Array(tasks) = &member_fields[2] else {
         panic!("expected tasks to decode as an Array, got {:?}", member_fields[2]);
     };

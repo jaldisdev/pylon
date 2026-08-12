@@ -50,11 +50,17 @@ use crate::workers::WorkerToggles;
 /// otherwise served from the assets embedded into the binary at compile
 /// time (see `static_files::STATIC_DIR`) — `None` is the common case.
 pub fn run(config: Config, static_dir: Option<PathBuf>, worker_toggles: WorkerToggles, no_http: bool) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| Error::Invalid(format!("failed to start Tokio runtime: {e}")))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| Error::Invalid(format!("failed to start Tokio runtime: {e}")))?;
     rt.block_on(serve(config, static_dir, worker_toggles, no_http))
 }
 
-async fn serve(config: Config, static_dir: Option<PathBuf>, worker_toggles: WorkerToggles, no_http: bool) -> Result<()> {
+async fn serve(
+    config: Config,
+    static_dir: Option<PathBuf>,
+    worker_toggles: WorkerToggles,
+    no_http: bool,
+) -> Result<()> {
     let addr = format!("{}:{}", config.webserver.host, config.webserver.port);
     let state = Arc::new(AppState::new(config, static_dir)?);
 
@@ -73,9 +79,13 @@ async fn serve(config: Config, static_dir: Option<PathBuf>, worker_toggles: Work
         .map_err(|e| Error::Invalid(format!("failed to connect base [database] connection: {e}")))?
         .ok_or_else(|| Error::Invalid("no [database] connection configured".to_string()))?;
     let worker_handles = match state.config.connections.get("default") {
-        Some(db) => {
-            crate::workers::spawn(&main_client.schema(), &state.config, &db.dsn_string(), state.cache.clone(), worker_toggles)
-        }
+        Some(db) => crate::workers::spawn(
+            &main_client.schema(),
+            &state.config,
+            &db.dsn_string(),
+            state.cache.clone(),
+            worker_toggles,
+        ),
         None => Vec::new(),
     };
 
@@ -85,7 +95,9 @@ async fn serve(config: Config, static_dir: Option<PathBuf>, worker_toggles: Work
     // `--disable-*-worker`, which keeps HTTP but skips specific workers).
     if no_http {
         eprintln!("pylon-server: HTTP server disabled (--no-http); running workers only");
-        tokio::signal::ctrl_c().await.map_err(|e| Error::Invalid(format!("failed to listen for ctrl-c: {e}")))?;
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|e| Error::Invalid(format!("failed to listen for ctrl-c: {e}")))?;
         eprintln!("pylon-server: shutting down");
         for handle in &worker_handles {
             handle.abort();
@@ -140,7 +152,7 @@ async fn serve(config: Config, static_dir: Option<PathBuf>, worker_toggles: Work
 /// have no connection segment to split off at all.
 fn split_connection_path(path: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() < 4 || parts[0] != "" || parts[1] != "api" || parts[2].is_empty() {
+    if parts.len() < 4 || !parts[0].is_empty() || parts[1] != "api" || parts[2].is_empty() {
         return None;
     }
     Some((parts[2].to_string(), format!("/{}", parts[3..].join("/"))))
@@ -183,19 +195,25 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
         if method == Method::POST && rest == "/query" {
             return match crate::json::read_json_body(req).await {
                 Ok(body) => crate::routes::handle_query(state.clone(), &connection, body).await,
-                Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
+                Err(e) => {
+                    crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()}))
+                }
             };
         }
         if method == Method::POST && rest == "/analyze" {
             return match crate::json::read_json_body(req).await {
                 Ok(body) => crate::routes::handle_analyze(state.clone(), &connection, body).await,
-                Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
+                Err(e) => {
+                    crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()}))
+                }
             };
         }
         if method == Method::POST && rest == "/ai/chat" {
             return match crate::json::read_json_body(req).await {
                 Ok(body) => crate::ai_chat::handle_ai_chat(state.clone(), &connection, body).await,
-                Err(e) => crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()})),
+                Err(e) => {
+                    crate::json::json_response(StatusCode::BAD_REQUEST, &serde_json::json!({"error": e.to_string()}))
+                }
             };
         }
     }

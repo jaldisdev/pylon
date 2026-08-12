@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 
 use pylon_core::ir::SessionConfig;
-use pylon_core::query::{compile_with_config, CompiledQuery};
+use pylon_core::query::{CompiledQuery, compile_with_config};
 use pylon_core::schema::SchemaDescriptor;
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
@@ -115,10 +115,10 @@ pub(crate) async fn query<E: Executor>(
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Vec<Value>> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
-    if let Some(cache) = cache {
-        if let Some(rows) = crate::cache::get_rows(cache, &compiled, &bound)? {
-            return Ok(rows.iter().map(|row| decode(&compiled.shape.root, row)).collect());
-        }
+    if let Some(cache) = cache
+        && let Some(rows) = crate::cache::get_rows(cache, &compiled, &bound)?
+    {
+        return Ok(rows.iter().map(|row| decode(&compiled.shape.root, row)).collect());
     }
     let rows = executor.run_query(&compiled.sql, &bound).await.map_err(Error::Db)?;
     if let Some(cache) = cache {
@@ -137,13 +137,13 @@ pub(crate) async fn query_single<E: Executor>(
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Option<Value>> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
-    if let Some(cache) = cache {
-        if let Some(rows) = crate::cache::get_rows(cache, &compiled, &bound)? {
-            if rows.len() > 1 {
-                return Err(Error::ResultCardinality { got: rows.len() });
-            }
-            return Ok(rows.first().map(|row| decode(&compiled.shape.root, row)));
+    if let Some(cache) = cache
+        && let Some(rows) = crate::cache::get_rows(cache, &compiled, &bound)?
+    {
+        if rows.len() > 1 {
+            return Err(Error::ResultCardinality { got: rows.len() });
         }
+        return Ok(rows.first().map(|row| decode(&compiled.shape.root, row)));
     }
     let rows = executor.run_query(&compiled.sql, &bound).await.map_err(Error::Db)?;
     if rows.len() > 1 {
@@ -197,10 +197,10 @@ pub(crate) async fn query_json<E: Executor>(
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<String> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
-    if let Some(cache) = cache {
-        if let Some(value) = crate::cache::get_json(cache, "json_all", &compiled, &bound)? {
-            return Ok(value.unwrap_or_else(|| "[]".to_string()));
-        }
+    if let Some(cache) = cache
+        && let Some(value) = crate::cache::get_json(cache, "json_all", &compiled, &bound)?
+    {
+        return Ok(value.unwrap_or_else(|| "[]".to_string()));
     }
     let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.sql);
     let rows = executor.run_query(&sql, &bound).await.map_err(Error::Db)?;
@@ -224,10 +224,10 @@ pub(crate) async fn query_single_json<E: Executor>(
     cache: Option<&pylon_cache::Cache>,
 ) -> Result<Option<String>> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
-    if let Some(cache) = cache {
-        if let Some(value) = crate::cache::get_json(cache, "json_single", &compiled, &bound)? {
-            return Ok(value);
-        }
+    if let Some(cache) = cache
+        && let Some(value) = crate::cache::get_json(cache, "json_single", &compiled, &bound)?
+    {
+        return Ok(value);
     }
     let rows = executor.run_query(&compiled.sql, &bound).await.map_err(Error::Db)?;
     if rows.len() > 1 {

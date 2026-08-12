@@ -19,8 +19,7 @@
 
 use pylon_core::query::compile;
 use pylon_core::schema::{
-    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor,
-    TypeDescriptor,
+    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor, TypeDescriptor,
 };
 
 fn main() {
@@ -48,7 +47,8 @@ fn main() {
                         is_pk: true,
                         is_readonly: true,
                         rewrites: vec![],
-                        tuple_members: None, column_type: None,
+                        tuple_members: None,
+                        column_type: None,
                     },
                     PropertyDescriptor {
                         name: "name".into(),
@@ -62,7 +62,8 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None, column_type: None,
+                        tuple_members: None,
+                        column_type: None,
                     },
                     PropertyDescriptor {
                         name: "age".into(),
@@ -76,7 +77,8 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None, column_type: None,
+                        tuple_members: None,
+                        column_type: None,
                     },
                     PropertyDescriptor {
                         name: "slug".into(),
@@ -90,10 +92,17 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![
-                            RewriteEntry { on: 1, handler: "str_lower(.name)".into() },
-                            RewriteEntry { on: 2, handler: "str_lower(.name)".into() },
+                            RewriteEntry {
+                                on: 1,
+                                handler: "str_lower(.name)".into(),
+                            },
+                            RewriteEntry {
+                                on: 2,
+                                handler: "str_lower(.name)".into(),
+                            },
                         ],
-                        tuple_members: None, column_type: None,
+                        tuple_members: None,
+                        column_type: None,
                     },
                 ],
                 links: vec![LinkDescriptor {
@@ -140,14 +149,15 @@ fn main() {
                     pg_type: "text".into(),
                     nullable: false,
                     default_sql: None,
-                        default_pyql: None,
+                    default_pyql: None,
                     description: None,
                     check_constraints: vec![],
                     is_exclusive: false,
                     is_pk: false,
                     is_readonly: false,
                     rewrites: vec![],
-                    tuple_members: None, column_type: None,
+                    tuple_members: None,
+                    column_type: None,
                 }],
                 links: vec![],
                 multilinks: vec![],
@@ -182,7 +192,8 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None, column_type: None,
+                        tuple_members: None,
+                        column_type: None,
                     },
                     PropertyDescriptor {
                         name: "body".into(),
@@ -196,7 +207,8 @@ fn main() {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                        tuple_members: None, column_type: None,
+                        tuple_members: None,
+                        column_type: None,
                     },
                 ],
                 links: vec![],
@@ -225,10 +237,7 @@ fn main() {
             "SELECT with shape + filter + limit",
             "SELECT Person { name, age } FILTER .age > $min_age ORDER BY .name ASC LIMIT 10",
         ),
-        (
-            "SELECT with single link",
-            "SELECT Person { name, company { name } }",
-        ),
+        ("SELECT with single link", "SELECT Person { name, company { name } }"),
         (
             "SELECT with multi-link",
             "SELECT Person { name, posts { title, body } }",
@@ -249,10 +258,7 @@ fn main() {
             "SELECT over UPDATE (explicit shape)",
             "SELECT (UPDATE Person FILTER .id = $id SET { name := $name }) { id, name }",
         ),
-        (
-            "DELETE bare (returns id only)",
-            "DELETE Person FILTER .name = $name",
-        ),
+        ("DELETE bare (returns id only)", "DELETE Person FILTER .name = $name"),
         (
             "SELECT over DELETE (explicit shape)",
             "SELECT (DELETE Person FILTER .id = $id) { id, name }",

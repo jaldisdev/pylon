@@ -36,7 +36,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pylon_core::schema::{SchemaDescriptor, SearchBackend};
-use pylon_workers::{CacheInvalidationWorker, MeilisearchClient, OpenSearchClient, ProviderConfig, SearchIndexWorker, VectorIndexWorker};
+use pylon_workers::{
+    CacheInvalidationWorker, MeilisearchClient, OpenSearchClient, ProviderConfig, SearchIndexWorker, VectorIndexWorker,
+};
 
 use crate::config::{ApiStyle, Config};
 
@@ -104,10 +106,16 @@ pub fn spawn(
     if toggles.search == Some(false) {
         eprintln!("pylon-server: search index workers disabled (--disable-search-worker)");
     } else {
-        let want_opensearch =
-            schema.types.iter().any(|t| t.search_indexes.iter().any(|si| si.backend == SearchBackend::OpenSearch));
-        let want_meilisearch =
-            schema.types.iter().any(|t| t.search_indexes.iter().any(|si| si.backend == SearchBackend::Meilisearch));
+        let want_opensearch = schema.types.iter().any(|t| {
+            t.search_indexes
+                .iter()
+                .any(|si| si.backend == SearchBackend::OpenSearch)
+        });
+        let want_meilisearch = schema.types.iter().any(|t| {
+            t.search_indexes
+                .iter()
+                .any(|si| si.backend == SearchBackend::Meilisearch)
+        });
 
         if want_opensearch {
             match config.search.get("default") {
@@ -155,7 +163,10 @@ pub fn spawn(
         }
     } else if let Some(cache) = cache {
         let dsn = dsn.to_string();
-        eprintln!("pylon-server: CacheInvalidationWorker started (shared cache)  channel={}", pylon_workers::CACHE_NOTIFY_CHANNEL);
+        eprintln!(
+            "pylon-server: CacheInvalidationWorker started (shared cache)  channel={}",
+            pylon_workers::CACHE_NOTIFY_CHANNEL
+        );
         handles.push(tokio::spawn(async move {
             match CacheInvalidationWorker::connect_with_cache(&dsn, cache).await {
                 Ok(worker) => worker.run().await,

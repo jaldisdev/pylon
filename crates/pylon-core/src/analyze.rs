@@ -62,20 +62,36 @@ pub fn collect_shape_path_aliases(stmt: &IrStmt) -> Vec<ShapePathAlias> {
     match stmt {
         IrStmt::Select(sel) => collect_select(sel, ROOT_PATH, None, &mut out),
         IrStmt::Insert(ins) => {
-            out.push(ShapePathAlias { sql_alias: ins.target.alias.clone(), path: ROOT_PATH.to_string(), marker_offset: None });
+            out.push(ShapePathAlias {
+                sql_alias: ins.target.alias.clone(),
+                path: ROOT_PATH.to_string(),
+                marker_offset: None,
+            });
             collect_shape(&ins.returning, ROOT_PATH, &mut out);
         }
         IrStmt::Update(upd) => {
-            out.push(ShapePathAlias { sql_alias: upd.target.alias.clone(), path: ROOT_PATH.to_string(), marker_offset: None });
+            out.push(ShapePathAlias {
+                sql_alias: upd.target.alias.clone(),
+                path: ROOT_PATH.to_string(),
+                marker_offset: None,
+            });
             collect_shape(&upd.returning, ROOT_PATH, &mut out);
         }
         IrStmt::Delete(del) => {
-            out.push(ShapePathAlias { sql_alias: del.target.alias.clone(), path: ROOT_PATH.to_string(), marker_offset: None });
+            out.push(ShapePathAlias {
+                sql_alias: del.target.alias.clone(),
+                path: ROOT_PATH.to_string(),
+                marker_offset: None,
+            });
             collect_shape(&del.returning, ROOT_PATH, &mut out);
         }
         IrStmt::Group(g) => {
             let IrGroup { source, shape, .. } = g;
-            out.push(ShapePathAlias { sql_alias: source.alias.clone(), path: ROOT_PATH.to_string(), marker_offset: None });
+            out.push(ShapePathAlias {
+                sql_alias: source.alias.clone(),
+                path: ROOT_PATH.to_string(),
+                marker_offset: None,
+            });
             collect_shape(shape, ROOT_PATH, &mut out);
         }
         IrStmt::PathSelect(_)
@@ -114,7 +130,11 @@ pub fn root_marker_offset(stmt: &crate::parse::Stmt) -> Option<usize> {
 fn collect_select(sel: &IrSelect, path: &str, marker_offset: Option<usize>, out: &mut Vec<ShapePathAlias>) {
     for row in &sel.rows {
         if let IrRowSource::Bound { source, shape } = row {
-            out.push(ShapePathAlias { sql_alias: source.alias.clone(), path: path.to_string(), marker_offset });
+            out.push(ShapePathAlias {
+                sql_alias: source.alias.clone(),
+                path: path.to_string(),
+                marker_offset,
+            });
             collect_shape(shape, path, out);
         }
         // IrRowSource::Free (set/tuple/free-object literal): no relation
@@ -251,14 +271,21 @@ pub struct ChildEntry {
 /// shape breakdown — see `collect_shape_path_aliases`) still produces a
 /// single root node; it just never gains any pointer children.
 pub fn build_coarse_grained(raw_json: &str, path_aliases: &[ShapePathAlias]) -> Result<CoarseGrainedNode, String> {
-    let roots: Vec<RawExplainRoot> = serde_json::from_str(raw_json)
-        .map_err(|e| format!("malformed EXPLAIN (FORMAT JSON) output: {e}"))?;
-    let root = roots.into_iter().next().ok_or_else(|| "EXPLAIN produced no plan".to_string())?;
+    let roots: Vec<RawExplainRoot> =
+        serde_json::from_str(raw_json).map_err(|e| format!("malformed EXPLAIN (FORMAT JSON) output: {e}"))?;
+    let root = roots
+        .into_iter()
+        .next()
+        .ok_or_else(|| "EXPLAIN produced no plan".to_string())?;
 
-    let alias_to_path: HashMap<&str, &str> =
-        path_aliases.iter().map(|p| (p.sql_alias.as_str(), p.path.as_str())).collect();
-    let path_to_marker: HashMap<&str, Option<usize>> =
-        path_aliases.iter().map(|p| (p.path.as_str(), p.marker_offset)).collect();
+    let alias_to_path: HashMap<&str, &str> = path_aliases
+        .iter()
+        .map(|p| (p.sql_alias.as_str(), p.path.as_str()))
+        .collect();
+    let path_to_marker: HashMap<&str, Option<usize>> = path_aliases
+        .iter()
+        .map(|p| (p.path.as_str(), p.marker_offset))
+        .collect();
 
     Ok(build_node(&root.plan, ROOT_PATH, &alias_to_path, &path_to_marker))
 }
@@ -272,9 +299,23 @@ fn build_node(
     let mut relations = Vec::new();
     let mut seen_relations = std::collections::HashSet::new();
     let mut children = Vec::new();
-    collect_plan_nodes(raw, path, alias_to_path, &mut relations, &mut seen_relations, &mut children, path_to_marker);
+    collect_plan_nodes(
+        raw,
+        path,
+        alias_to_path,
+        &mut relations,
+        &mut seen_relations,
+        &mut children,
+        path_to_marker,
+    );
     let marker_offset = path_to_marker.get(path).copied().flatten();
-    CoarseGrainedNode { path: path.to_string(), marker_offset, relations, cost: PlanCost::from(raw), children }
+    CoarseGrainedNode {
+        path: path.to_string(),
+        marker_offset,
+        relations,
+        cost: PlanCost::from(raw),
+        children,
+    }
 }
 
 /// Walk `raw`'s own subtree, folding nodes into `relations`/this level's
@@ -302,18 +343,29 @@ fn collect_plan_nodes(
     children: &mut Vec<ChildEntry>,
     path_to_marker: &HashMap<&str, Option<usize>>,
 ) {
-    if let Some(rel) = &raw.relation_name {
-        if seen_relations.insert(rel.clone()) {
-            relations.push(rel.clone());
-        }
+    if let Some(rel) = &raw.relation_name
+        && seen_relations.insert(rel.clone())
+    {
+        relations.push(rel.clone());
     }
     for child in &raw.plans {
         match resolve_subtree_path(child, alias_to_path) {
             Some(child_path) if child_path != path => {
                 let name = child_path.rsplit('.').next().unwrap_or(child_path).to_string();
-                children.push(ChildEntry { name, node: build_node(child, child_path, alias_to_path, path_to_marker) });
+                children.push(ChildEntry {
+                    name,
+                    node: build_node(child, child_path, alias_to_path, path_to_marker),
+                });
             }
-            _ => collect_plan_nodes(child, path, alias_to_path, relations, seen_relations, children, path_to_marker),
+            _ => collect_plan_nodes(
+                child,
+                path,
+                alias_to_path,
+                relations,
+                seen_relations,
+                children,
+                path_to_marker,
+            ),
         }
     }
 }
@@ -329,7 +381,9 @@ fn resolve_subtree_path<'a>(node: &RawPlanNode, alias_to_path: &HashMap<&str, &'
     if let Some(path) = node.alias.as_deref().and_then(|a| alias_to_path.get(a).copied()) {
         return Some(path);
     }
-    node.plans.iter().find_map(|child| resolve_subtree_path(child, alias_to_path))
+    node.plans
+        .iter()
+        .find_map(|child| resolve_subtree_path(child, alias_to_path))
 }
 
 #[cfg(test)]
@@ -444,7 +498,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -487,7 +542,9 @@ mod tests {
         let ir = compile(query);
         let paths = collect_shape_path_aliases(&ir.stmt);
         let villains = paths.iter().find(|p| p.path == "root.villains").unwrap();
-        let offset = villains.marker_offset.expect("villains path should carry a marker offset");
+        let offset = villains
+            .marker_offset
+            .expect("villains path should carry a marker offset");
         assert_eq!(&query[offset..offset + "villains".len()], "villains");
     }
 
@@ -499,7 +556,10 @@ mod tests {
         // execution (see ir::compiler's `Stmt::Analyze` arm).
         let wrapped = compile("analyze select Hero { name, villains: { name } }");
         let bare = compile("select Hero { name, villains: { name } }");
-        assert_eq!(collect_shape_path_aliases(&wrapped.stmt).len(), collect_shape_path_aliases(&bare.stmt).len());
+        assert_eq!(
+            collect_shape_path_aliases(&wrapped.stmt).len(),
+            collect_shape_path_aliases(&bare.stmt).len()
+        );
     }
 
     // ── build_coarse_grained ─────────────────────────────────────────────────
@@ -584,7 +644,12 @@ mod tests {
         let ir = compile("select Hero { name, villains: { name } }");
         let paths = collect_shape_path_aliases(&ir.stmt);
         let root_alias = paths.iter().find(|p| p.path == "root").unwrap().sql_alias.clone();
-        let villains_alias = paths.iter().find(|p| p.path == "root.villains").unwrap().sql_alias.clone();
+        let villains_alias = paths
+            .iter()
+            .find(|p| p.path == "root.villains")
+            .unwrap()
+            .sql_alias
+            .clone();
 
         let raw_json = explain_json_fixture(&root_alias, &villains_alias);
         let tree = build_coarse_grained(&raw_json, &paths).unwrap();
@@ -594,14 +659,20 @@ mod tests {
         assert_eq!(tree.cost.total_cost, 12.5);
         assert_eq!(tree.children.len(), 1);
 
-        let ChildEntry { name, node: villains_node } = &tree.children[0];
+        let ChildEntry {
+            name,
+            node: villains_node,
+        } = &tree.children[0];
         assert_eq!(name, "villains");
         assert_eq!(villains_node.path, "root.villains");
         // Both the junction table ("hero.villains", alias "hv" — never in
         // the alias map, see resolve_subtree_path's doc comment) and the
         // target table ("villain") roll up into this same path's relations,
         // since the whole Nested Loop subtree resolves to "root.villains".
-        assert_eq!(villains_node.relations, vec!["hero.villains".to_string(), "villain".to_string()]);
+        assert_eq!(
+            villains_node.relations,
+            vec!["hero.villains".to_string(), "villain".to_string()]
+        );
         // Cost is the Nested Loop's own (the top of this path's subtree),
         // not the inner villain scan's — see resolve_subtree_path.
         assert_eq!(villains_node.cost.total_cost, 8.2);
@@ -621,7 +692,12 @@ mod tests {
             root.marker_offset = root_marker_offset(&ast);
         }
         let root_alias = paths.iter().find(|p| p.path == "root").unwrap().sql_alias.clone();
-        let villains_alias = paths.iter().find(|p| p.path == "root.villains").unwrap().sql_alias.clone();
+        let villains_alias = paths
+            .iter()
+            .find(|p| p.path == "root.villains")
+            .unwrap()
+            .sql_alias
+            .clone();
 
         let raw_json = explain_json_fixture(&root_alias, &villains_alias);
         let tree = build_coarse_grained(&raw_json, &paths).unwrap();
@@ -629,7 +705,10 @@ mod tests {
         let root_offset = tree.marker_offset.expect("root should carry a marker offset");
         assert_eq!(&query[root_offset..root_offset + "Hero".len()], "Hero");
 
-        let villains_offset = tree.children[0].node.marker_offset.expect("villains should carry a marker offset");
+        let villains_offset = tree.children[0]
+            .node
+            .marker_offset
+            .expect("villains should carry a marker offset");
         assert_eq!(&query[villains_offset..villains_offset + "villains".len()], "villains");
     }
 

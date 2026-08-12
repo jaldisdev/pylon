@@ -88,13 +88,21 @@ fn split_module_name(pylon_type: &str) -> (&str, &str) {
 /// actually matched on (not an arbitrary object dump), and its `model`
 /// (a `[models.*]` registry key, not a raw provider model string) says
 /// which embedding model to run the query text through.
-fn resolve_vector_index(schema: &SchemaDescriptor, pylon_type: &str, index_name: Option<&str>) -> Option<VectorIndexDescriptor> {
+fn resolve_vector_index(
+    schema: &SchemaDescriptor,
+    pylon_type: &str,
+    index_name: Option<&str>,
+) -> Option<VectorIndexDescriptor> {
     let (module, name) = split_module_name(pylon_type);
     schema
         .types
         .iter()
         .find(|t| t.module == module && t.name == name)
-        .and_then(|t| t.vector_indexes.iter().find(|vi| vi.index_name.as_deref() == index_name))
+        .and_then(|t| {
+            t.vector_indexes
+                .iter()
+                .find(|vi| vi.index_name.as_deref() == index_name)
+        })
         .cloned()
 }
 
@@ -129,7 +137,7 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
             return json_response(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({"error": format!("No connection named {connection:?}")}),
-            )
+            );
         }
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     };
@@ -137,11 +145,24 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
     let model_name = body.get("modelName").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let pylon_type = body.get("pylonType").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let index_name = body.get("indexName").and_then(|v| v.as_str()).map(str::to_string);
-    let context_query = body.get("contextQuery").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    let context_query = body
+        .get("contextQuery")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let history: Vec<&serde_json::Value> = body.get("history").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
+    let history: Vec<&serde_json::Value> = body
+        .get("history")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
 
-    let Some(model_cfg) = state.config.models.get(&model_name).filter(|m| m.purpose == ModelPurpose::Chat) else {
+    let Some(model_cfg) = state
+        .config
+        .models
+        .get(&model_name)
+        .filter(|m| m.purpose == ModelPurpose::Chat)
+    else {
         return json_response(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"error": format!("'{model_name}' is not a configured chat model")}),
@@ -169,19 +190,32 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
     };
     let embedding: Vec<f32> = match embedding_model_cfg.api_style {
         ApiStyle::Anthropic => {
-            return json_response(StatusCode::BAD_GATEWAY, &serde_json::json!({"error": "AnthropicProvider does not support embeddings"}))
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                &serde_json::json!({"error": "AnthropicProvider does not support embeddings"}),
+            );
         }
         ApiStyle::OpenAi => {
-            let provider = match OpenAiProvider::new(&embedding_model_cfg.api_url, &embedding_model_cfg.model, embedding_model_cfg.secret.as_deref()) {
+            let provider = match OpenAiProvider::new(
+                &embedding_model_cfg.api_url,
+                &embedding_model_cfg.model,
+                embedding_model_cfg.secret.as_deref(),
+            ) {
                 Ok(p) => p,
                 Err(e) => {
-                    return json_response(StatusCode::BAD_GATEWAY, &serde_json::json!({"error": format!("embedding request failed: {e}")}))
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        &serde_json::json!({"error": format!("embedding request failed: {e}")}),
+                    );
                 }
             };
             match provider.embed_batch(std::slice::from_ref(&message)).await {
                 Ok(mut batch) => batch.pop().unwrap_or_default(),
                 Err(e) => {
-                    return json_response(StatusCode::BAD_GATEWAY, &serde_json::json!({"error": format!("embedding request failed: {e}")}))
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        &serde_json::json!({"error": format!("embedding request failed: {e}")}),
+                    );
                 }
             }
         }
@@ -195,7 +229,11 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
     // `asgi.py::_handle_ai_chat`'s existing behavior (not a regression
     // introduced by this port) — fixing it is compiler-level work, out of
     // scope here.
-    let index_clause = if index_name.is_some() { ", index_name := <str>$indexName" } else { "" };
+    let index_clause = if index_name.is_some() {
+        ", index_name := <str>$indexName"
+    } else {
+        ""
+    };
     let search_target = match &context_query {
         Some(q) => format!("({q})"),
         None => pylon_type.clone(),
@@ -203,9 +241,10 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
     let pyql = format!(
         "select vector::search({search_target}, query := <str>$queryText{index_clause}) {{ object {{ {shape} }}, distance }} order by .distance limit 5"
     );
-    let mut params: Vec<(&str, DecodedValue)> = vec![
-        ("__deferred_vec__", DecodedValue::Array(embedding.iter().map(|f| DecodedValue::F64(*f as f64)).collect())),
-    ];
+    let mut params: Vec<(&str, DecodedValue)> = vec![(
+        "__deferred_vec__",
+        DecodedValue::Array(embedding.iter().map(|f| DecodedValue::F64(*f as f64)).collect()),
+    )];
     if let Some(idx) = &index_name {
         params.push(("indexName", DecodedValue::Str(idx.clone())));
     }
@@ -222,34 +261,51 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
         .iter()
         .map(|r| {
             let object = &r["object"];
-            let line = index_pointers.iter().map(|p| json_display(&object[p.as_str()])).collect::<Vec<_>>().join(". ");
+            let line = index_pointers
+                .iter()
+                .map(|p| json_display(&object[p.as_str()]))
+                .collect::<Vec<_>>()
+                .join(". ");
             format!("- {line}")
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    let mut messages = vec![Message { role: "system".to_string(), content: DEFAULT_PROMPT_SYSTEM.replace("{context}", &context) }];
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: DEFAULT_PROMPT_SYSTEM.replace("{context}", &context),
+    }];
     for h in &history {
         let role = h.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let content = h.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         messages.push(Message { role, content });
     }
-    messages.push(Message { role: "user".to_string(), content: DEFAULT_PROMPT_USER.replace("{query}", &message) });
+    messages.push(Message {
+        role: "user".to_string(),
+        content: DEFAULT_PROMPT_USER.replace("{query}", &message),
+    });
 
     let chat_result = match model_cfg.api_style {
-        ApiStyle::OpenAi => match OpenAiProvider::new(&model_cfg.api_url, &model_cfg.model, model_cfg.secret.as_deref()) {
-            Ok(p) => p.chat(&messages).await,
-            Err(e) => Err(e),
-        },
-        ApiStyle::Anthropic => match AnthropicProvider::new(&model_cfg.api_url, &model_cfg.model, model_cfg.secret.as_deref()) {
-            Ok(p) => p.chat(&messages).await,
-            Err(e) => Err(e),
-        },
+        ApiStyle::OpenAi => {
+            match OpenAiProvider::new(&model_cfg.api_url, &model_cfg.model, model_cfg.secret.as_deref()) {
+                Ok(p) => p.chat(&messages).await,
+                Err(e) => Err(e),
+            }
+        }
+        ApiStyle::Anthropic => {
+            match AnthropicProvider::new(&model_cfg.api_url, &model_cfg.model, model_cfg.secret.as_deref()) {
+                Ok(p) => p.chat(&messages).await,
+                Err(e) => Err(e),
+            }
+        }
     };
     let reply = match chat_result {
         Ok(r) => r,
         Err(e) => {
-            return json_response(StatusCode::BAD_GATEWAY, &serde_json::json!({"error": format!("chat model request failed: {e}")}))
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                &serde_json::json!({"error": format!("chat model request failed: {e}")}),
+            );
         }
     };
 

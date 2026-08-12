@@ -97,15 +97,17 @@ async fn poll_loop(workspace_root: PathBuf, shared: Arc<Mutex<Option<SchemaDescr
     let mut last_json: Option<String> = None;
     loop {
         match pylon_core::migrate::read_schema_snapshot(&pool).await {
-            Ok(Some(json)) if last_json.as_ref() != Some(&json) => match serde_json::from_str::<SchemaDescriptor>(&json) {
-                Ok(schema) => {
-                    *shared.lock().unwrap() = Some(schema);
-                    pylon_core::query::clear_query_cache();
-                    eprintln!("pylon-lsp: loaded schema snapshot from the database");
-                    last_json = Some(json);
+            Ok(Some(json)) if last_json.as_ref() != Some(&json) => {
+                match serde_json::from_str::<SchemaDescriptor>(&json) {
+                    Ok(schema) => {
+                        *shared.lock().unwrap() = Some(schema);
+                        pylon_core::query::clear_query_cache();
+                        eprintln!("pylon-lsp: loaded schema snapshot from the database");
+                        last_json = Some(json);
+                    }
+                    Err(err) => eprintln!("pylon-lsp: failed to parse schema snapshot: {err}"),
                 }
-                Err(err) => eprintln!("pylon-lsp: failed to parse schema snapshot: {err}"),
-            },
+            }
             Ok(_) => {} // unchanged, or no snapshot written yet
             Err(err) => eprintln!("pylon-lsp: schema poll failed: {err}"),
         }
@@ -114,7 +116,11 @@ async fn poll_loop(workspace_root: PathBuf, shared: Arc<Mutex<Option<SchemaDescr
 }
 
 fn resolve_dsn(workspace_root: &std::path::Path) -> Result<String, String> {
-    let config = pylon_config::config::load_config(Some(workspace_root)).map_err(|e| format!("failed to load pylon.toml: {e}"))?;
-    let db = config.connections.get("default").ok_or_else(|| "no [database] configured in pylon.toml".to_string())?;
+    let config = pylon_config::config::load_config(Some(workspace_root))
+        .map_err(|e| format!("failed to load pylon.toml: {e}"))?;
+    let db = config
+        .connections
+        .get("default")
+        .ok_or_else(|| "no [database] configured in pylon.toml".to_string())?;
     Ok(db.dsn_string())
 }

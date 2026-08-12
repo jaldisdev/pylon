@@ -35,13 +35,11 @@ use std::path::PathBuf;
 
 use lsp_server::{Connection, Message, Notification as LspNotification};
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification,
-    PublishDiagnostics,
+    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification, PublishDiagnostics,
 };
 use lsp_types::{
-    Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, PublishDiagnosticsParams, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
+    PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 
 use schema::SchemaState;
@@ -93,12 +91,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 3 <= bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -106,10 +105,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn main_loop(
-    connection: &Connection,
-    schema_state: &SchemaState,
-) -> Result<(), Box<dyn Error + Sync + Send>> {
+fn main_loop(connection: &Connection, schema_state: &SchemaState) -> Result<(), Box<dyn Error + Sync + Send>> {
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
@@ -181,7 +177,11 @@ fn send_diagnostics(
     uri: Uri,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let params = PublishDiagnosticsParams { uri, diagnostics, version: None };
+    let params = PublishDiagnosticsParams {
+        uri,
+        diagnostics,
+        version: None,
+    };
     let notification = LspNotification {
         method: PublishDiagnostics::METHOD.to_string(),
         params: serde_json::to_value(&params)?,

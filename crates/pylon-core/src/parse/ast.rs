@@ -163,17 +163,33 @@ pub enum Expr {
     /// A global variable reference: `global name` or `global module::name`.
     Global(String),
     /// Index access: `expr[i]` (0-based).
-    Index { expr: Box<Expr>, index: Box<Expr> },
+    Index {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// Slice access: `expr[lower:upper]` (0-based, either bound may be absent).
-    Slice { expr: Box<Expr>, lower: Option<Box<Expr>>, upper: Option<Box<Expr>> },
+    Slice {
+        expr: Box<Expr>,
+        lower: Option<Box<Expr>>,
+        upper: Option<Box<Expr>>,
+    },
     /// Named tuple field access on a non-path expression: `(name := 'a', age := 1).name`.
-    FieldAccess { expr: Box<Expr>, field: String },
+    FieldAccess {
+        expr: Box<Expr>,
+        field: String,
+    },
     /// Positional tuple element on a non-path expression: `(1, 3.14, 'red').2`.
-    TupleIndex { expr: Box<Expr>, index: usize },
+    TupleIndex {
+        expr: Box<Expr>,
+        index: usize,
+    },
     /// `detached expr` — evaluate `expr` independently of the current implicit scope.
     Detached(Box<Expr>),
     /// `expr is TypeName` — runtime type check; returns bool.
-    TypeIs { expr: Box<Expr>, ty: TypeExpr },
+    TypeIs {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+    },
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────────
@@ -223,10 +239,16 @@ pub struct ObjectRef {
 
 impl ObjectRef {
     pub fn unqualified(name: impl Into<String>) -> Self {
-        ObjectRef { module: None, name: name.into() }
+        ObjectRef {
+            module: None,
+            name: name.into(),
+        }
     }
     pub fn qualified(module: impl Into<String>, name: impl Into<String>) -> Self {
-        ObjectRef { module: Some(module.into()), name: name.into() }
+        ObjectRef {
+            module: Some(module.into()),
+            name: name.into(),
+        }
     }
 }
 
@@ -292,7 +314,10 @@ pub struct ShapeElement {
 impl ShapeElement {
     pub fn splat(kind: Splat) -> Self {
         ShapeElement {
-            path: Path { steps: vec![], partial: true },
+            path: Path {
+                steps: vec![],
+                partial: true,
+            },
             splat: Some(kind),
             nested: None,
             compexpr: None,
@@ -345,15 +370,29 @@ pub enum BinOpKind {
 impl std::fmt::Display for BinOpKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Add => "+", Self::Sub => "-", Self::Mul => "*",
-            Self::Div => "/", Self::FloorDiv => "//", Self::Mod => "%",
-            Self::Pow => "^", Self::Eq => "=", Self::Ne => "!=",
-            Self::Lt => "<", Self::Le => "<=", Self::Gt => ">", Self::Ge => ">=",
-            Self::And => "and", Self::Or => "or",
-            Self::Like => "like", Self::Ilike => "ilike",
-            Self::NotLike => "not like", Self::NotIlike => "not ilike",
-            Self::In => "in", Self::NotIn => "not in",
-            Self::Coalesce => "??", Self::Concat => "++",
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::FloorDiv => "//",
+            Self::Mod => "%",
+            Self::Pow => "^",
+            Self::Eq => "=",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::And => "and",
+            Self::Or => "or",
+            Self::Like => "like",
+            Self::Ilike => "ilike",
+            Self::NotLike => "not like",
+            Self::NotIlike => "not ilike",
+            Self::In => "in",
+            Self::NotIn => "not in",
+            Self::Coalesce => "??",
+            Self::Concat => "++",
         })
     }
 }
@@ -416,7 +455,10 @@ impl TypeExpr {
     /// Convenience constructor for the common unqualified-name case (matches the
     /// old plain-struct call sites before `TypeExpr` became an enum).
     pub fn named(module: Option<String>, name: impl Into<String>) -> Self {
-        TypeExpr::Named { module, name: name.into() }
+        TypeExpr::Named {
+            module,
+            name: name.into(),
+        }
     }
 
     /// `(module, name)` for a `Named` type expr; `None` for `Tuple`/`Array` —

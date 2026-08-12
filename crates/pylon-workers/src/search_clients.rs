@@ -31,7 +31,10 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 fn client(timeout: Duration, headers: reqwest::header::HeaderMap) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder().timeout(timeout).default_headers(headers).build()?)
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .default_headers(headers)
+        .build()?)
 }
 
 pub struct MeilisearchClient {
@@ -45,10 +48,14 @@ impl MeilisearchClient {
         if let Some(key) = api_key {
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).map_err(|e| Error::Decode(e.to_string()))?,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map_err(|e| Error::Decode(e.to_string()))?,
             );
         }
-        Ok(Self { http: client(timeout, headers)?, base_url: base_url.trim_end_matches('/').to_string() })
+        Ok(Self {
+            http: client(timeout, headers)?,
+            base_url: base_url.trim_end_matches('/').to_string(),
+        })
     }
 
     /// Full-text query; returns `[(id, score)]` ordered by relevance.
@@ -119,14 +126,24 @@ impl OpenSearchClient {
             let encoded = base64_encode(credentials.as_bytes());
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}")).map_err(|e| Error::Decode(e.to_string()))?,
+                reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}"))
+                    .map_err(|e| Error::Decode(e.to_string()))?,
             );
         }
-        Ok(Self { http: client(timeout, headers)?, base_url: base_url.trim_end_matches('/').to_string() })
+        Ok(Self {
+            http: client(timeout, headers)?,
+            base_url: base_url.trim_end_matches('/').to_string(),
+        })
     }
 
     /// Full-text query; returns `[(id, score)]` ordered by relevance.
-    pub async fn search(&self, index: &str, query_text: &str, fields: Option<&[String]>, size: usize) -> Result<Vec<(String, f64)>> {
+    pub async fn search(
+        &self,
+        index: &str,
+        query_text: &str,
+        fields: Option<&[String]>,
+        size: usize,
+    ) -> Result<Vec<(String, f64)>> {
         let url = format!("{}/{index}/_search", self.base_url);
         let fields = fields.map(|f| f.to_vec()).unwrap_or_else(|| vec!["*".to_string()]);
         let body = serde_json::json!({
@@ -197,8 +214,16 @@ fn base64_encode(data: &[u8]) -> String {
         let b2 = chunk.get(2).copied();
         out.push(ALPHABET[(b0 >> 2) as usize] as char);
         out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
-        out.push(if let Some(b1) = b1 { ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char } else { '=' });
-        out.push(if let Some(b2) = b2 { ALPHABET[(b2 & 0x3f) as usize] as char } else { '=' });
+        out.push(if let Some(b1) = b1 {
+            ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if let Some(b2) = b2 {
+            ALPHABET[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

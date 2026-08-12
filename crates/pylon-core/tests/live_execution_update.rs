@@ -81,11 +81,7 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn schema_with_post(module: &str) -> SchemaDescriptor {
-    let person = ty(
-        "Person",
-        module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     let mut post = ty("Post", module, vec![id_prop(), text_prop("title")]);
     post.links = vec![link("author", &format!("{module}::Person"))];
     SchemaDescriptor {
@@ -95,12 +91,8 @@ fn schema_with_post(module: &str) -> SchemaDescriptor {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -108,11 +100,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -235,20 +223,20 @@ async fn update_replaces_a_single_link() {
         &format!("insert {module}::Person {{ name := 'Bob', age := 40 }}"),
     )
     .await;
-    exec(&pool, &sd, &format!(
-        "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
-    )).await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
+        ),
+    )
+    .await;
 
     exec(&pool, &sd, &format!(
         "update {module}::Post filter .title = 'Hello' set {{ author := (select {module}::Person filter .name = 'Bob') }}"
     )).await;
 
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Post {{ author: {{ name }} }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
     assert_eq!(rows.len(), 1);
     // Post's shape: [type-tag, author]; author link's own row: [type-tag, name].
     let author = field(&rows[0], 1);
@@ -273,17 +261,27 @@ async fn update_replaces_a_single_link_with_a_nested_insert() {
         &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
     )
     .await;
-    exec(&pool, &sd, &format!(
-        "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
-    )).await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
+        ),
+    )
+    .await;
 
     // The link value is sourced from a brand-new row, not an existing one —
     // exercises `IrUpdate::nested_ctes`' WITH-CTE hoisting (`Compiler::
     // compile_update`), not just `compile_insert`'s.
-    exec(&pool, &sd, &format!(
-        "update {module}::Post filter .title = 'Hello' \
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "update {module}::Post filter .title = 'Hello' \
          set {{ author := (select (insert {module}::Person {{ name := 'Bob', age := 40 }}) {{ id }}) }}"
-    )).await;
+        ),
+    )
+    .await;
 
     let people = rows_of(
         &pool,
@@ -297,12 +295,7 @@ async fn update_replaces_a_single_link_with_a_nested_insert() {
         "the nested insert must have actually created a new Person row"
     );
 
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Post {{ author: {{ name }} }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
     assert_eq!(rows.len(), 1);
     let author = field(&rows[0], 1);
     assert_eq!(
@@ -334,12 +327,7 @@ async fn update_returns_the_ids_of_the_rows_it_touched() {
     .await;
 
     let alice_id = {
-        let rows = rows_of(
-            &pool,
-            &sd,
-            &format!("select {module}::Person filter .name = 'Alice'"),
-        )
-        .await;
+        let rows = rows_of(&pool, &sd, &format!("select {module}::Person filter .name = 'Alice'")).await;
         as_uuid(field(&rows[0], 1))
     };
 

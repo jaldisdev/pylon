@@ -78,16 +78,24 @@ impl CacheInvalidationWorker {
         let cache_for_listener = cache.clone();
         let listener = PgListener::connect(dsn, move |n| {
             match cache_for_listener.invalidate(&[n.payload().to_string()]) {
-                Ok(()) => crate::metrics::CACHE_INVALIDATIONS.with_label_values(&["success"]).inc(),
+                Ok(()) => crate::metrics::CACHE_INVALIDATIONS
+                    .with_label_values(&["success"])
+                    .inc(),
                 Err(e) => {
                     crate::metrics::CACHE_INVALIDATIONS.with_label_values(&["error"]).inc();
-                    eprintln!("CacheInvalidationWorker: eviction failed for tag {:?}: {e}", n.payload());
+                    eprintln!(
+                        "CacheInvalidationWorker: eviction failed for tag {:?}: {e}",
+                        n.payload()
+                    );
                 }
             }
         })
         .await?;
         listener.listen(NOTIFY_CHANNEL).await?;
-        Ok(Self { _listener: listener, cache })
+        Ok(Self {
+            _listener: listener,
+            cache,
+        })
     }
 
     pub fn cache(&self) -> &Cache {
@@ -107,8 +115,7 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN")
-            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     /// Postgres NOTIFY channels are global to the database, not scoped to a
@@ -119,24 +126,38 @@ mod tests {
     /// nanosecond-timestamp-suffixed tag keeps each test's NOTIFY isolated,
     /// the same pattern used elsewhere in this codebase's real-DB tests.
     fn unique_tag(prefix: &str) -> String {
-        format!("{prefix}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
+        format!(
+            "{prefix}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     }
 
     #[tokio::test]
     #[ignore]
     async fn a_notify_on_the_channel_evicts_the_tagged_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10).await.unwrap();
+        let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10)
+            .await
+            .unwrap();
         let tag = unique_tag("cache_worker_test_evict");
         // Seed one cache entry tagged `tag` via the worker's own handle —
         // LMDB refuses a second `Env::open` on the same path within one
         // process, so this is the only handle a test can safely use once
         // the worker is alive (see `CacheInvalidationWorker::cache`).
-        worker.cache().put("k1", vec![pylon_value::DecodedValue::I64(1)], vec![tag.clone()]).unwrap();
+        worker
+            .cache()
+            .put("k1", vec![pylon_value::DecodedValue::I64(1)], vec![tag.clone()])
+            .unwrap();
         assert!(worker.cache().get("k1").unwrap().is_some());
 
         let notifier = pylon_pgcon::PgPool::connect(&test_dsn(), 1).await.unwrap();
-        notifier.query_raw(&format!("NOTIFY pylon_cache_invalidate, '{tag}'")).await.unwrap();
+        notifier
+            .query_raw(&format!("NOTIFY pylon_cache_invalidate, '{tag}'"))
+            .await
+            .unwrap();
 
         // Eviction happens on the notification callback, asynchronously
         // relative to this test — poll briefly instead of assuming it's
@@ -156,12 +177,20 @@ mod tests {
     #[ignore]
     async fn a_notify_on_an_unrelated_tag_leaves_the_entry_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10).await.unwrap();
+        let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10)
+            .await
+            .unwrap();
         let tag = unique_tag("cache_worker_test_untouched");
-        worker.cache().put("k1", vec![pylon_value::DecodedValue::I64(1)], vec![tag]).unwrap();
+        worker
+            .cache()
+            .put("k1", vec![pylon_value::DecodedValue::I64(1)], vec![tag])
+            .unwrap();
 
         let notifier = pylon_pgcon::PgPool::connect(&test_dsn(), 1).await.unwrap();
-        notifier.query_raw("NOTIFY pylon_cache_invalidate, 'public.other_table'").await.unwrap();
+        notifier
+            .query_raw("NOTIFY pylon_cache_invalidate, 'public.other_table'")
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         assert!(worker.cache().get("k1").unwrap().is_some());

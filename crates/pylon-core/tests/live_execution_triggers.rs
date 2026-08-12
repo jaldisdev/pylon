@@ -41,11 +41,7 @@ use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
 use std::collections::HashMap;
 
-fn ty(
-    name: &str,
-    module: &str,
-    properties: Vec<pylon_core::schema::PropertyDescriptor>,
-) -> TypeDescriptor {
+fn ty(name: &str, module: &str, properties: Vec<pylon_core::schema::PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
         name: name.into(),
         module: module.into(),
@@ -84,11 +80,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str)
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    schema: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -106,9 +98,7 @@ fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
 /// tables, ...) — every concrete table gets an unconditional
 /// `pylon_cache_invalidate` trigger, which references that function.
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
 }
 
 #[tokio::test]
@@ -129,9 +119,7 @@ async fn insert_writes_to_another_type() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -172,9 +160,7 @@ async fn delete_reads_old_row() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -221,9 +207,7 @@ async fn update_reads_both_old_and_new() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -274,11 +258,7 @@ async fn multiple_independent_triggers_all_fire() {
             "After",
             &format!("insert {module}::Log {{ old_name := __old__.name }}"),
         ), // Update|Delete
-        trigger(
-            7,
-            "After",
-            &format!("insert {module}::Log {{ new_name := 'touched' }}"),
-        ), // Insert|Update|Delete
+        trigger(7, "After", &format!("insert {module}::Log {{ new_name := 'touched' }}")), // Insert|Update|Delete
     ];
     let schema = SchemaDescriptor {
         types: vec![widget, log_type(&module)],
@@ -287,28 +267,16 @@ async fn multiple_independent_triggers_all_fire() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &schema,
-        &format!("insert {module}::Widget {{ name := 'w1' }}"),
-    )
-    .await; // fires trigger 1 + 3
+    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'w1' }}")).await; // fires trigger 1 + 3
     exec(
         &pool,
         &schema,
         &format!("update {module}::Widget filter .name = 'w1' set {{ name := 'w2' }}"),
     )
     .await; // fires trigger 2 + 3
-    exec(
-        &pool,
-        &schema,
-        &format!("delete {module}::Widget filter .name = 'w2'"),
-    )
-    .await; // fires trigger 2 + 3
+    exec(&pool, &schema, &format!("delete {module}::Widget filter .name = 'w2'")).await; // fires trigger 2 + 3
 
     let touched = rows_of(
         &pool,
@@ -379,9 +347,7 @@ async fn trigger_updates_a_linked_row_of_another_type() {
     item.triggers = vec![trigger(
         1, // On.Insert
         "After",
-        &format!(
-            "update {module}::Purchase filter .id = __new__.parent set {{ total := __new__.value }}"
-        ),
+        &format!("update {module}::Purchase filter .id = __new__.parent set {{ total := __new__.value }}"),
     )];
     let schema = SchemaDescriptor {
         types: vec![purchase, item],
@@ -390,27 +356,17 @@ async fn trigger_updates_a_linked_row_of_another_type() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
+    exec(&pool, &schema, &format!("insert {module}::Purchase {{ total := 0 }}")).await;
     exec(
         &pool,
         &schema,
-        &format!("insert {module}::Purchase {{ total := 0 }}"),
-    )
-    .await;
-    exec(
-        &pool, &schema,
         &format!("insert {module}::LineItem {{ parent := (select {module}::Purchase limit 1), value := 99 }}"),
-    ).await;
-
-    let rows = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Purchase {{ total }}"),
     )
     .await;
+
+    let rows = rows_of(&pool, &schema, &format!("select {module}::Purchase {{ total }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
@@ -446,9 +402,7 @@ async fn trigger_chaining_across_types() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -504,9 +458,7 @@ async fn before_trigger_does_not_block_the_operation_it_fires_on() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,

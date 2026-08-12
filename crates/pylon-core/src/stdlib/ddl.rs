@@ -97,9 +97,7 @@ fn pg_params(params: &[Param]) -> String {
         .enumerate()
         .map(|(i, p)| {
             let arr_ty = match &p.ty {
-                PylonType::Any | PylonType::AnyOrderable | PylonType::AnyPoint => {
-                    "anyarray".into()
-                }
+                PylonType::Any | PylonType::AnyOrderable | PylonType::AnyPoint => "anyarray".into(),
                 other => format!("{}[]", pg_type(other)),
             };
             if p.variadic && i == last {
@@ -345,7 +343,10 @@ mod tests {
         assert!(ddl.contains("_pylon.to_bool"), "to_bool missing");
         assert!(ddl.contains("_pylon.enumerate"), "enumerate missing");
         assert!(ddl.contains("_pylon.datetime_get"), "datetime_get missing");
-        assert!(!ddl.contains("_pylon.range("), "range must not be installed (TranspilerIntrinsic)");
+        assert!(
+            !ddl.contains("_pylon.range("),
+            "range must not be installed (TranspilerIntrinsic)"
+        );
         assert!(!ddl.contains("_pylon.multirange("), "multirange must not be installed");
         eprintln!("export_stdlib: {} PylonFunction overloads installed", fn_count);
     }

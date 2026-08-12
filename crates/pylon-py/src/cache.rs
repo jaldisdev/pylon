@@ -32,10 +32,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use pylon_cache::{cache_key as cache_key_impl, Cache};
+use pylon_cache::{Cache, cache_key as cache_key_impl};
 
-use crate::pgvalue::{cached_to_py, py_to_cached};
 use crate::PylonCacheError;
+use crate::pgvalue::{cached_to_py, py_to_cached};
 
 static PYLON_CACHE: OnceLock<RwLock<Option<Arc<Cache>>>> = OnceLock::new();
 
@@ -74,9 +74,13 @@ fn cache_init(path: &str, max_size_mb: usize) -> PyResult<()> {
 #[pyfunction]
 fn cache_get<'py>(py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyList>>> {
     let guard = cache_slot().read().unwrap();
-    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
     let Some(entry) = cache.get(key).map_err(cache_err)? else {
-        pylon_workers::metrics::CACHE_REQUESTS.with_label_values(&["miss"]).inc();
+        pylon_workers::metrics::CACHE_REQUESTS
+            .with_label_values(&["miss"])
+            .inc();
         return Ok(None);
     };
     pylon_workers::metrics::CACHE_REQUESTS.with_label_values(&["hit"]).inc();
@@ -94,7 +98,9 @@ fn cache_get<'py>(py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyLi
 fn cache_put(key: &str, tags: Vec<String>, rows: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
     let rows = rows.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
     let guard = cache_slot().read().unwrap();
-    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
     cache.put(key, rows, tags).map_err(cache_err)
 }
 
@@ -102,7 +108,9 @@ fn cache_put(key: &str, tags: Vec<String>, rows: Vec<Bound<'_, PyAny>>) -> PyRes
 #[pyfunction]
 fn cache_invalidate(tags: Vec<String>) -> PyResult<()> {
     let guard = cache_slot().read().unwrap();
-    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
     cache.invalidate(&tags).map_err(cache_err)
 }
 
@@ -120,7 +128,9 @@ fn cache_key(sql: &str, params: Vec<Bound<'_, PyAny>>) -> PyResult<String> {
 #[pyfunction]
 fn cache_stat<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     let guard = cache_slot().read().unwrap();
-    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
     let stats = cache.stat().map_err(cache_err)?;
     let d = PyDict::new(py);
     d.set_item("entry_count", stats.entry_count)?;
@@ -132,7 +142,9 @@ fn cache_stat<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
 #[pyfunction]
 fn cache_clear() -> PyResult<()> {
     let guard = cache_slot().read().unwrap();
-    let cache = guard.as_ref().ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| PylonCacheError::new_err("cache not initialized; call cache_init() first"))?;
     cache.clear().map_err(cache_err)
 }
 

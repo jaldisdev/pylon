@@ -47,11 +47,7 @@ use pylon_core::schema::{SchemaDescriptor, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
 
-fn ty(
-    name: &str,
-    module: &str,
-    properties: Vec<pylon_core::schema::PropertyDescriptor>,
-) -> TypeDescriptor {
+fn ty(name: &str, module: &str, properties: Vec<pylon_core::schema::PropertyDescriptor>) -> TypeDescriptor {
     TypeDescriptor {
         name: name.into(),
         module: module.into(),
@@ -85,11 +81,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str)
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    schema: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -107,9 +99,7 @@ fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
 /// tables, ...) — every concrete table gets an unconditional
 /// `pylon_cache_invalidate` trigger, which references that function.
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
 }
 
 #[tokio::test]
@@ -126,9 +116,7 @@ async fn insert_rewrite_overrides_assigned_value() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -137,12 +125,7 @@ async fn insert_rewrite_overrides_assigned_value() {
     )
     .await;
 
-    let rows = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Widget {{ name }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
@@ -165,9 +148,7 @@ async fn update_rewrite_overrides_assigned_value() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -176,16 +157,8 @@ async fn update_rewrite_overrides_assigned_value() {
     )
     .await;
     // Insert rewrite is not declared, so the insert itself is unaffected.
-    let after_insert = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Widget {{ name }}"),
-    )
-    .await;
-    assert_eq!(
-        field(&after_insert[0], 1),
-        &DecodedValue::Str("Whiplash".to_string())
-    );
+    let after_insert = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
+    assert_eq!(field(&after_insert[0], 1), &DecodedValue::Str("Whiplash".to_string()));
 
     exec(
         &pool,
@@ -193,12 +166,7 @@ async fn update_rewrite_overrides_assigned_value() {
         &format!("update {module}::Widget set {{ name := 'The Godfather' }}"),
     )
     .await;
-    let after_update = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Widget {{ name }}"),
-    )
-    .await;
+    let after_update = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
     assert_eq!(
         field(&after_update[0], 1),
         &DecodedValue::Str("updated".to_string()),
@@ -223,9 +191,7 @@ async fn insert_rewrite_applies_to_defaulted_value() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -247,10 +213,7 @@ async fn insert_rewrite_applies_to_defaulted_value() {
         &DecodedValue::Str("untitled (new)".to_string()),
         "rewrite should still apply to the defaulted value"
     );
-    assert_eq!(
-        field(&rows[1], 1),
-        &DecodedValue::Str("Whiplash (new)".to_string())
-    );
+    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Whiplash (new)".to_string()));
 }
 
 #[tokio::test]
@@ -274,9 +237,7 @@ async fn update_rewrite_references_sibling_property() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -291,12 +252,7 @@ async fn update_rewrite_references_sibling_property() {
     )
     .await; // shout not mentioned
 
-    let rows = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Widget {{ name, shout }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name, shout }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(field(&rows[0], 1), &DecodedValue::Str("loud".to_string()));
     assert_eq!(
@@ -321,9 +277,7 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -338,12 +292,7 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
     )
     .await;
 
-    let rows = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Widget {{ name }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         field(&rows[0], 1),
@@ -356,11 +305,7 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
 #[ignore]
 async fn multiple_rewrites_on_different_properties_do_not_interfere() {
     let module = unique_module("live_rw_multi");
-    let mut widget = ty(
-        "Widget",
-        &module,
-        vec![id_prop(), text_prop("a"), text_prop("b")],
-    );
+    let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("a"), text_prop("b")]);
     widget.properties[1].rewrites = vec![rewrite(1, "'A'")];
     widget.properties[2].rewrites = vec![rewrite(1, "'B'")];
     let schema = SchemaDescriptor {
@@ -370,9 +315,7 @@ async fn multiple_rewrites_on_different_properties_do_not_interfere() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -381,12 +324,7 @@ async fn multiple_rewrites_on_different_properties_do_not_interfere() {
     )
     .await;
 
-    let rows = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Widget {{ a, b }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ a, b }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(field(&rows[0], 1), &DecodedValue::Str("A".to_string()));
     assert_eq!(
@@ -419,9 +357,7 @@ async fn trigger_observes_rewritten_value_not_original() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&schema).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -430,12 +366,7 @@ async fn trigger_observes_rewritten_value_not_original() {
     )
     .await;
 
-    let log_rows = rows_of(
-        &pool,
-        &schema,
-        &format!("select {module}::Log {{ new_name }}"),
-    )
-    .await;
+    let log_rows = rows_of(&pool, &schema, &format!("select {module}::Log {{ new_name }}")).await;
     assert_eq!(log_rows.len(), 1);
     assert_eq!(
         field(&log_rows[0], 1),

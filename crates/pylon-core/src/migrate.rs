@@ -26,7 +26,7 @@
 //! backfill special case, `click.echo` progress output) stays in Python —
 //! this module is the part that's actually "migration execution."
 
-use crate::migration::{parse_steps, verify_integrity, MigrationFile};
+use crate::migration::{MigrationFile, parse_steps, verify_integrity};
 use pylon_pgcon::{PgPool, PgTransaction};
 use pylon_value::DecodedValue;
 
@@ -162,9 +162,16 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
     Ok(rows
         .into_iter()
         .filter_map(|row| {
-            let DecodedValue::Composite(fields) = row else { return None };
-            let [DecodedValue::Str(id), DecodedValue::Str(onto), db_state, schema_state, DecodedValue::Bool(applied)] =
-                <[DecodedValue; 5]>::try_from(fields).ok()?
+            let DecodedValue::Composite(fields) = row else {
+                return None;
+            };
+            let [
+                DecodedValue::Str(id),
+                DecodedValue::Str(onto),
+                db_state,
+                schema_state,
+                DecodedValue::Bool(applied),
+            ] = <[DecodedValue; 5]>::try_from(fields).ok()?
             else {
                 return None;
             };
@@ -176,7 +183,13 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
                 DecodedValue::Str(s) => Some(s),
                 _ => None,
             };
-            Some(TrackingRow { id, onto, db_state, schema_state, applied })
+            Some(TrackingRow {
+                id,
+                onto,
+                db_state,
+                schema_state,
+                applied,
+            })
         })
         .collect())
 }
@@ -201,7 +214,12 @@ pub fn applied_tip(tracking: &[TrackingRow]) -> Option<String> {
         return None;
     }
     let onto_targets: std::collections::HashSet<&str> = applied.iter().map(|r| r.onto.as_str()).collect();
-    applied.iter().filter(|r| !onto_targets.contains(r.id.as_str())).map(|r| r.id.as_str()).min().map(|s| s.to_string())
+    applied
+        .iter()
+        .filter(|r| !onto_targets.contains(r.id.as_str()))
+        .map(|r| r.id.as_str())
+        .min()
+        .map(|s| s.to_string())
 }
 
 /// Blocks until the advisory lock is acquired (`pg_advisory_lock`), on a
@@ -214,7 +232,8 @@ pub fn applied_tip(tracking: &[TrackingRow]) -> Option<String> {
 /// the lock held until that specific connection eventually closes.
 pub async fn advisory_lock(pool: &PgPool) -> Result<pylon_pgcon::PgConnection> {
     let conn = pool.connection().await?;
-    conn.batch_execute(&format!("SELECT pg_advisory_lock({ADVISORY_LOCK_KEY})")).await?;
+    conn.batch_execute(&format!("SELECT pg_advisory_lock({ADVISORY_LOCK_KEY})"))
+        .await?;
     Ok(conn)
 }
 
@@ -230,11 +249,16 @@ pub async fn try_advisory_lock(pool: &PgPool) -> Result<Option<pylon_pgcon::PgCo
             &pylon_pgcon::ExtensionOids::default(),
         )
         .await?;
-    Ok(if matches!(rows.first(), Some(DecodedValue::Bool(true))) { Some(conn) } else { None })
+    Ok(if matches!(rows.first(), Some(DecodedValue::Bool(true))) {
+        Some(conn)
+    } else {
+        None
+    })
 }
 
 pub async fn advisory_unlock(conn: pylon_pgcon::PgConnection) -> Result<()> {
-    conn.batch_execute(&format!("SELECT pg_advisory_unlock({ADVISORY_LOCK_KEY})")).await?;
+    conn.batch_execute(&format!("SELECT pg_advisory_unlock({ADVISORY_LOCK_KEY})"))
+        .await?;
     Ok(())
 }
 
@@ -245,7 +269,11 @@ const RECORD_APPLIED_SQL: &str = r#"
 "#;
 
 fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<DecodedValue> {
-    vec![DecodedValue::Str(id.to_string()), DecodedValue::Str(onto.to_string()), DecodedValue::Str(filename.to_string())]
+    vec![
+        DecodedValue::Str(id.to_string()),
+        DecodedValue::Str(onto.to_string()),
+        DecodedValue::Str(filename.to_string()),
+    ]
 }
 
 /// Records a migration as applied without running its DDL — used both by
@@ -254,12 +282,14 @@ fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<DecodedVal
 /// constituent IDs are already applied under the old chain: no DDL to run,
 /// just mark it applied so future `apply` runs see it as done).
 pub async fn record_applied(pool: &PgPool, id: &str, onto: &str, filename: &str) -> Result<()> {
-    pool.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename)).await?;
+    pool.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename))
+        .await?;
     Ok(())
 }
 
 async fn record_applied_in_tx(tx: &PgTransaction, id: &str, onto: &str, filename: &str) -> Result<()> {
-    tx.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename)).await?;
+    tx.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename))
+        .await?;
     Ok(())
 }
 
@@ -288,12 +318,20 @@ async fn record_progress(pool: &PgPool, id: &str, step_index: i64) -> Result<()>
 }
 
 async fn delete_progress(pool: &PgPool, id: &str) -> Result<()> {
-    pool.execute_typed(r#"DELETE FROM _pylon."Progress" WHERE id = $1"#, &[DecodedValue::Str(id.to_string())]).await?;
+    pool.execute_typed(
+        r#"DELETE FROM _pylon."Progress" WHERE id = $1"#,
+        &[DecodedValue::Str(id.to_string())],
+    )
+    .await?;
     Ok(())
 }
 
 async fn delete_progress_in_tx(tx: &PgTransaction, id: &str) -> Result<()> {
-    tx.execute_typed(r#"DELETE FROM _pylon."Progress" WHERE id = $1"#, &[DecodedValue::Str(id.to_string())]).await?;
+    tx.execute_typed(
+        r#"DELETE FROM _pylon."Progress" WHERE id = $1"#,
+        &[DecodedValue::Str(id.to_string())],
+    )
+    .await?;
     Ok(())
 }
 
@@ -302,7 +340,9 @@ async fn delete_progress_in_tx(tx: &PgTransaction, id: &str) -> Result<()> {
 /// errors partway leaves an unusable index rather than rolling back, since
 /// it can't run inside a transaction).
 async fn drop_invalid_concurrent_index(pool: &PgPool, sql: &str) -> Result<()> {
-    let Some(index_name) = concurrent_index_name(sql) else { return Ok(()) };
+    let Some(index_name) = concurrent_index_name(sql) else {
+        return Ok(());
+    };
     let rows = pool
         .query_typed(
             "SELECT (1) AS result FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
@@ -312,7 +352,8 @@ async fn drop_invalid_concurrent_index(pool: &PgPool, sql: &str) -> Result<()> {
         )
         .await?;
     if !rows.is_empty() {
-        pool.batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS \"{index_name}\"")).await?;
+        pool.batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS \"{index_name}\""))
+            .await?;
     }
     Ok(())
 }
@@ -344,12 +385,11 @@ fn concurrent_index_name(sql: &str) -> Option<String> {
         next = tokens.next()?;
     }
     let after_quote = next.strip_prefix('"').unwrap_or(next);
-    let name: String = after_quote.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    let name: String = after_quote
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 const DEV_SAVEPOINT: &str = "pylon_dev";
@@ -454,7 +494,10 @@ mod concurrent_index_name_tests {
 
     #[test]
     fn is_case_insensitive() {
-        assert_eq!(concurrent_index_name("create index concurrently idx_x on t (c);"), Some("idx_x".to_string()));
+        assert_eq!(
+            concurrent_index_name("create index concurrently idx_x on t (c);"),
+            Some("idx_x".to_string())
+        );
     }
 
     #[test]
@@ -470,8 +513,7 @@ mod tests {
     use crate::migration::render_file;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN")
-            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     async fn test_pool() -> PgPool {
@@ -534,13 +576,20 @@ mod tests {
         let pool = test_pool().await;
         let previous = read_schema_snapshot(&pool).await.unwrap();
 
-        write_schema_snapshot(&pool, r#"{"probe": "schema_snapshot_round_trips"}"#).await.unwrap();
+        write_schema_snapshot(&pool, r#"{"probe": "schema_snapshot_round_trips"}"#)
+            .await
+            .unwrap();
         let read_back = read_schema_snapshot(&pool).await.unwrap();
-        assert_eq!(read_back.as_deref(), Some(r#"{"probe": "schema_snapshot_round_trips"}"#));
+        assert_eq!(
+            read_back.as_deref(),
+            Some(r#"{"probe": "schema_snapshot_round_trips"}"#)
+        );
 
         // Upsert overwrites in place, so a second write must still round-trip
         // (not silently keep the first value).
-        write_schema_snapshot(&pool, r#"{"probe": "second_write"}"#).await.unwrap();
+        write_schema_snapshot(&pool, r#"{"probe": "second_write"}"#)
+            .await
+            .unwrap();
         let read_back_2 = read_schema_snapshot(&pool).await.unwrap();
         assert_eq!(read_back_2.as_deref(), Some(r#"{"probe": "second_write"}"#));
 
@@ -554,7 +603,13 @@ mod tests {
     #[ignore]
     async fn applied_tip_is_none_with_no_applied_rows() {
         assert_eq!(applied_tip(&[]), None);
-        let all_pending = vec![TrackingRow { id: "m1a".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: false }];
+        let all_pending = vec![TrackingRow {
+            id: "m1a".into(),
+            onto: "initial".into(),
+            db_state: None,
+            schema_state: None,
+            applied: false,
+        }];
         assert_eq!(applied_tip(&all_pending), None);
     }
 
@@ -562,9 +617,27 @@ mod tests {
     #[ignore]
     async fn applied_tip_is_the_row_with_no_descendant() {
         let tracking = vec![
-            TrackingRow { id: "m1a".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
-            TrackingRow { id: "m1b".into(), onto: "m1a".into(), db_state: None, schema_state: None, applied: true },
-            TrackingRow { id: "m1c".into(), onto: "m1b".into(), db_state: None, schema_state: None, applied: false }, // not applied yet
+            TrackingRow {
+                id: "m1a".into(),
+                onto: "initial".into(),
+                db_state: None,
+                schema_state: None,
+                applied: true,
+            },
+            TrackingRow {
+                id: "m1b".into(),
+                onto: "m1a".into(),
+                db_state: None,
+                schema_state: None,
+                applied: true,
+            },
+            TrackingRow {
+                id: "m1c".into(),
+                onto: "m1b".into(),
+                db_state: None,
+                schema_state: None,
+                applied: false,
+            }, // not applied yet
         ];
         assert_eq!(applied_tip(&tracking), Some("m1b".to_string()));
     }
@@ -577,9 +650,27 @@ mod tests {
         // must always return the same answer, not one that depends on
         // hash-map iteration order (see the doc comment on `applied_tip`).
         let tracking = vec![
-            TrackingRow { id: "m1zzz".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
-            TrackingRow { id: "m1aaa".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
-            TrackingRow { id: "m1mmm".into(), onto: "initial".into(), db_state: None, schema_state: None, applied: true },
+            TrackingRow {
+                id: "m1zzz".into(),
+                onto: "initial".into(),
+                db_state: None,
+                schema_state: None,
+                applied: true,
+            },
+            TrackingRow {
+                id: "m1aaa".into(),
+                onto: "initial".into(),
+                db_state: None,
+                schema_state: None,
+                applied: true,
+            },
+            TrackingRow {
+                id: "m1mmm".into(),
+                onto: "initial".into(),
+                db_state: None,
+                schema_state: None,
+                applied: true,
+            },
         ];
         for _ in 0..20 {
             assert_eq!(applied_tip(&tracking), Some("m1aaa".to_string()));
@@ -596,17 +687,31 @@ mod tests {
         apply_one(&pool, &m, false).await.unwrap();
 
         // DDL actually ran.
-        let rows =
-            pool.query_typed(&format!("SELECT (1) AS result FROM {table}"), &[], &pylon_pgcon::ExtensionOids::default()).await;
+        let rows = pool
+            .query_typed(
+                &format!("SELECT (1) AS result FROM {table}"),
+                &[],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await;
         assert!(rows.is_ok(), "table should exist after apply_one");
 
         // Tracking row recorded.
         let tracking = read_tracking(&pool).await.unwrap();
-        let row = tracking.iter().find(|r| r.id == m.id).expect("tracking row for this migration");
+        let row = tracking
+            .iter()
+            .find(|r| r.id == m.id)
+            .expect("tracking row for this migration");
         assert!(row.applied);
         assert_eq!(row.onto, "initial");
-        assert_eq!(row.db_state, None, "db_state is only ever set separately, by `migration create`'s own UPDATE");
-        assert_eq!(row.schema_state, None, "schema_state is only ever set separately, by `apply`'s own UPDATE");
+        assert_eq!(
+            row.db_state, None,
+            "db_state is only ever set separately, by `migration create`'s own UPDATE"
+        );
+        assert_eq!(
+            row.schema_state, None,
+            "schema_state is only ever set separately, by `apply`'s own UPDATE"
+        );
 
         cleanup_migration_row(&pool, &m.id).await;
     }
@@ -620,7 +725,10 @@ mod tests {
 
         pool.execute_typed(
             r#"UPDATE _pylon."Migrations" SET schema_state = $1::jsonb WHERE id = $2"#,
-            &[DecodedValue::Str(r#"{"types":[]}"#.to_string()), DecodedValue::Str(m.id.clone())],
+            &[
+                DecodedValue::Str(r#"{"types":[]}"#.to_string()),
+                DecodedValue::Str(m.id.clone()),
+            ],
         )
         .await
         .unwrap();
@@ -643,7 +751,10 @@ mod tests {
 
         pool.execute_typed(
             r#"UPDATE _pylon."Migrations" SET db_state = $1::jsonb WHERE id = $2"#,
-            &[DecodedValue::Str(r#"{"schemas":["default"]}"#.to_string()), DecodedValue::Str(m.id.clone())],
+            &[
+                DecodedValue::Str(r#"{"schemas":["default"]}"#.to_string()),
+                DecodedValue::Str(m.id.clone()),
+            ],
         )
         .await
         .unwrap();
@@ -671,16 +782,28 @@ mod tests {
         apply_one(&pool, &m, false).await.unwrap();
 
         for t in [&t1, &t2] {
-            let rows =
-                pool.query_typed(&format!("SELECT (1) AS result FROM {t}"), &[], &pylon_pgcon::ExtensionOids::default()).await;
+            let rows = pool
+                .query_typed(
+                    &format!("SELECT (1) AS result FROM {t}"),
+                    &[],
+                    &pylon_pgcon::ExtensionOids::default(),
+                )
+                .await;
             assert!(rows.is_ok(), "table {t} should exist after apply_one");
         }
 
-        let progress =
-            pool.query_typed(r#"SELECT (1) AS result FROM _pylon."Progress" WHERE id = $1"#, &[DecodedValue::Str(m.id.clone())], &pylon_pgcon::ExtensionOids::default())
-                .await
-                .unwrap();
-        assert!(progress.is_empty(), "progress row must be cleared after a successful multi-step apply");
+        let progress = pool
+            .query_typed(
+                r#"SELECT (1) AS result FROM _pylon."Progress" WHERE id = $1"#,
+                &[DecodedValue::Str(m.id.clone())],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            progress.is_empty(),
+            "progress row must be cleared after a successful multi-step apply"
+        );
 
         cleanup_migration_row(&pool, &m.id).await;
     }
@@ -693,15 +816,23 @@ mod tests {
         // Step 0 is intentionally invalid SQL — if apply_one didn't skip
         // it (via the pre-recorded progress row below), this test would
         // fail with a Postgres syntax error instead of succeeding.
-        let m = make_migration("initial", &format!("\nTHIS IS NOT VALID SQL;\n-- pylon:step\nCREATE TABLE {t2} (id int8);\n"));
+        let m = make_migration(
+            "initial",
+            &format!("\nTHIS IS NOT VALID SQL;\n-- pylon:step\nCREATE TABLE {t2} (id int8);\n"),
+        );
 
         // Simulate a prior run that got through step 0 already.
         record_progress(&pool, &m.id, 0).await.unwrap();
 
         apply_one(&pool, &m, false).await.unwrap();
 
-        let rows =
-            pool.query_typed(&format!("SELECT (1) AS result FROM {t2}"), &[], &pylon_pgcon::ExtensionOids::default()).await;
+        let rows = pool
+            .query_typed(
+                &format!("SELECT (1) AS result FROM {t2}"),
+                &[],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await;
         assert!(rows.is_ok(), "step 1 should have run");
 
         cleanup_migration_row(&pool, &m.id).await;
@@ -713,13 +844,18 @@ mod tests {
         let pool = test_pool().await;
         let table = unique_table_name("migrate_dev_mode_test");
         // Simulate `watch` having already applied this exact DDL out of band.
-        pool.batch_execute(&format!("CREATE TABLE {table} (id int8);")).await.unwrap();
+        pool.batch_execute(&format!("CREATE TABLE {table} (id int8);"))
+            .await
+            .unwrap();
 
         let m = make_migration("initial", &body(&format!("CREATE TABLE {table} (id int8);")));
         apply_one(&pool, &m, true).await.unwrap(); // dev_mode=true: must not error
 
         let tracking = read_tracking(&pool).await.unwrap();
-        assert!(tracking.iter().any(|r| r.id == m.id && r.applied), "still recorded applied despite the swallowed error");
+        assert!(
+            tracking.iter().any(|r| r.id == m.id && r.applied),
+            "still recorded applied despite the swallowed error"
+        );
 
         cleanup_migration_row(&pool, &m.id).await;
     }
@@ -729,7 +865,9 @@ mod tests {
     async fn apply_one_without_dev_mode_propagates_a_duplicate_table_error() {
         let pool = test_pool().await;
         let table = unique_table_name("migrate_no_dev_mode_test");
-        pool.batch_execute(&format!("CREATE TABLE {table} (id int8);")).await.unwrap();
+        pool.batch_execute(&format!("CREATE TABLE {table} (id int8);"))
+            .await
+            .unwrap();
 
         let m = make_migration("initial", &body(&format!("CREATE TABLE {table} (id int8);")));
         let result = apply_one(&pool, &m, false).await; // dev_mode=false: must error

@@ -34,31 +34,46 @@ use prometheus::{Encoder, IntCounterVec, IntGaugeVec, TextEncoder};
 
 pub static JOBS_PROCESSED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
-        prometheus::opts!("pylon_worker_jobs_processed_total", "Outbox rows successfully processed, by index kind"),
+        prometheus::opts!(
+            "pylon_worker_jobs_processed_total",
+            "Outbox rows successfully processed, by index kind"
+        ),
         &["index_kind"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(counter.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 pub static JOBS_FAILED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
-        prometheus::opts!("pylon_worker_jobs_failed_total", "Outbox rows that failed and were scheduled for retry, by index kind"),
+        prometheus::opts!(
+            "pylon_worker_jobs_failed_total",
+            "Outbox rows that failed and were scheduled for retry, by index kind"
+        ),
         &["index_kind"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(counter.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 pub static CACHE_INVALIDATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
-        prometheus::opts!("pylon_cache_invalidations_total", "Cache entries evicted by tag, by outcome"),
+        prometheus::opts!(
+            "pylon_cache_invalidations_total",
+            "Cache entries evicted by tag, by outcome"
+        ),
         &["outcome"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(counter.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -68,7 +83,9 @@ pub static CACHE_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["outcome"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(counter.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -78,7 +95,9 @@ pub static QUERIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["stage", "outcome"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(counter.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -103,41 +122,61 @@ pub fn record_compile_result(success: bool) {
 
 static POOL_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
-        prometheus::opts!("pylon_pgcon_pool_size", "Connections currently established (idle + checked out), by connection name"),
+        prometheus::opts!(
+            "pylon_pgcon_pool_size",
+            "Connections currently established (idle + checked out), by connection name"
+        ),
         &["connection"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(gauge.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .unwrap();
     gauge
 });
 
 static POOL_AVAILABLE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
-        prometheus::opts!("pylon_pgcon_pool_available", "Idle connections available for immediate checkout, by connection name"),
+        prometheus::opts!(
+            "pylon_pgcon_pool_available",
+            "Idle connections available for immediate checkout, by connection name"
+        ),
         &["connection"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(gauge.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .unwrap();
     gauge
 });
 
 static POOL_WAITING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
-        prometheus::opts!("pylon_pgcon_pool_waiting", "Callers currently blocked waiting for a connection, by connection name"),
+        prometheus::opts!(
+            "pylon_pgcon_pool_waiting",
+            "Callers currently blocked waiting for a connection, by connection name"
+        ),
         &["connection"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(gauge.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .unwrap();
     gauge
 });
 
 static POOL_MAX_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
-        prometheus::opts!("pylon_pgcon_pool_max_size", "Configured pool capacity, by connection name"),
+        prometheus::opts!(
+            "pylon_pgcon_pool_max_size",
+            "Configured pool capacity, by connection name"
+        ),
         &["connection"],
     )
     .unwrap();
-    prometheus::default_registry().register(Box::new(gauge.clone())).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .unwrap();
     gauge
 });
 
@@ -150,9 +189,13 @@ static POOL_MAX_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// events, only a point-in-time `status()` snapshot.
 pub fn record_pool_status(connection: &str, status: &pylon_pgcon::PoolStatus) {
     POOL_SIZE.with_label_values(&[connection]).set(status.size as i64);
-    POOL_AVAILABLE.with_label_values(&[connection]).set(status.available as i64);
+    POOL_AVAILABLE
+        .with_label_values(&[connection])
+        .set(status.available as i64);
     POOL_WAITING.with_label_values(&[connection]).set(status.waiting as i64);
-    POOL_MAX_SIZE.with_label_values(&[connection]).set(status.max_size as i64);
+    POOL_MAX_SIZE
+        .with_label_values(&[connection])
+        .set(status.max_size as i64);
 }
 
 /// Renders every metric registered so far (across every crate that shares

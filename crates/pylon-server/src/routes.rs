@@ -80,19 +80,30 @@ fn parse_query_request(body: &serde_json::Value) -> QueryRequest {
         .and_then(|v| v.as_object())
         .map(|m| m.iter().map(|(k, v)| (k.clone(), json_to_cached_value(v))).collect())
         .unwrap_or_default();
-    let allow_user_specified_id =
-        body.get("config").and_then(|v| v.get("allow_user_specified_id")).and_then(|v| v.as_bool()).unwrap_or(false);
-    QueryRequest { pyql, params, globals, config: SessionConfig { allow_user_specified_id } }
+    let allow_user_specified_id = body
+        .get("config")
+        .and_then(|v| v.get("allow_user_specified_id"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    QueryRequest {
+        pyql,
+        params,
+        globals,
+        config: SessionConfig {
+            allow_user_specified_id,
+        },
+    }
 }
 
-pub async fn handle_query(
-    state: Arc<AppState>,
-    connection: &str,
-    body: serde_json::Value,
-) -> Response<Full<Bytes>> {
+pub async fn handle_query(state: Arc<AppState>, connection: &str, body: serde_json::Value) -> Response<Full<Bytes>> {
     let client = match state.resolve_client(connection).await {
         Ok(Some(c)) => c,
-        Ok(None) => return json_response(StatusCode::NOT_FOUND, &serde_json::json!({"error": format!("No connection named {connection:?}")})),
+        Ok(None) => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": format!("No connection named {connection:?}")}),
+            );
+        }
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     };
     let req = parse_query_request(&body);
@@ -116,14 +127,15 @@ pub async fn handle_query(
     )
 }
 
-pub async fn handle_analyze(
-    state: Arc<AppState>,
-    connection: &str,
-    body: serde_json::Value,
-) -> Response<Full<Bytes>> {
+pub async fn handle_analyze(state: Arc<AppState>, connection: &str, body: serde_json::Value) -> Response<Full<Bytes>> {
     let client = match state.resolve_client(connection).await {
         Ok(Some(c)) => c,
-        Ok(None) => return json_response(StatusCode::NOT_FOUND, &serde_json::json!({"error": format!("No connection named {connection:?}")})),
+        Ok(None) => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": format!("No connection named {connection:?}")}),
+            );
+        }
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     };
     let req = parse_query_request(&body);
@@ -136,9 +148,13 @@ pub async fn handle_analyze(
         Err(e) => return json_response(StatusCode::BAD_REQUEST, &client_error_payload(&e)),
     };
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let coarse_grained_json: serde_json::Value = serde_json::from_str(&coarse_grained).unwrap_or(serde_json::Value::Null);
+    let coarse_grained_json: serde_json::Value =
+        serde_json::from_str(&coarse_grained).unwrap_or(serde_json::Value::Null);
 
-    json_response(StatusCode::OK, &serde_json::json!({"coarse_grained": coarse_grained_json, "duration_ms": duration_ms}))
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({"coarse_grained": coarse_grained_json, "duration_ms": duration_ms}),
+    )
 }
 
 /// `GET /api/<connection>/stats` — mirrors `asgi.py::_handle_get_stats`,
@@ -147,14 +163,23 @@ pub async fn handle_analyze(
 pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Full<Bytes>> {
     let client = match state.resolve_client(connection).await {
         Ok(Some(c)) => c,
-        Ok(None) => return json_response(StatusCode::NOT_FOUND, &serde_json::json!({"error": format!("No connection named {connection:?}")})),
+        Ok(None) => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": format!("No connection named {connection:?}")}),
+            );
+        }
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     };
     let schema = client.schema();
 
     let mut junction_tables: Vec<(String, String)> = Vec::new();
     for t in &schema.types {
-        let pg_schema = if t.module == "default" { "public".to_string() } else { t.module.clone() };
+        let pg_schema = if t.module == "default" {
+            "public".to_string()
+        } else {
+            t.module.clone()
+        };
         if t.junction {
             junction_tables.push((pg_schema.clone(), t.table.clone()));
         }
@@ -181,9 +206,18 @@ pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Fu
         "SELECT (SUM(n_live_tup)::bigint) AS result FROM pg_stat_user_tables \
          WHERE schemaname NOT IN ('pg_catalog', 'information_schema', '_pylon') {junction_filter}"
     );
-    let rows = match client.raw_connection().query_typed(&sql, &[], &pylon_pgcon::ExtensionOids::default()).await {
+    let rows = match client
+        .raw_connection()
+        .query_typed(&sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+    {
         Ok(r) => r,
-        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({"error": e.to_string()})),
+        Err(e) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": e.to_string()}),
+            );
+        }
     };
     let estimated_objects = match rows.first() {
         Some(pylon_value::DecodedValue::I64(n)) => *n,
@@ -201,8 +235,13 @@ pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Fu
 
 /// `GET /api/connections` — process-level, no DB round trip.
 pub fn handle_connections(state: &AppState) -> Response<Full<Bytes>> {
-    let mut others: Vec<&str> =
-        state.config.connections.keys().filter(|k| k.as_str() != "default").map(String::as_str).collect();
+    let mut others: Vec<&str> = state
+        .config
+        .connections
+        .keys()
+        .filter(|k| k.as_str() != "default")
+        .map(String::as_str)
+        .collect();
     others.sort();
     let mut connections = vec!["main".to_string()];
     connections.extend(others.into_iter().map(String::from));
@@ -256,8 +295,14 @@ pub fn handle_config_options() -> Response<Full<Bytes>> {
 async fn any_client(state: &AppState) -> Result<std::sync::Arc<pylon_client::Client>, Response<Full<Bytes>>> {
     match state.resolve_client("main").await {
         Ok(Some(c)) => Ok(c),
-        Ok(None) => Err(json_response(StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({"error": "no [database] connection configured"}))),
-        Err(e) => Err(json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e))),
+        Ok(None) => Err(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": "no [database] connection configured"}),
+        )),
+        Err(e) => Err(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &client_error_payload(&e),
+        )),
     }
 }
 

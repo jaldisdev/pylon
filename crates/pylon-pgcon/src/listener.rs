@@ -73,16 +73,25 @@ impl PgListener {
     }
 
     pub async fn listen(&self, channel: &str) -> Result<()> {
-        self.client.batch_execute(&format!("LISTEN {}", quote_ident(channel))).await?;
+        self.client
+            .batch_execute(&format!("LISTEN {}", quote_ident(channel)))
+            .await?;
         Ok(())
     }
 
     pub async fn unlisten(&self, channel: &str) -> Result<()> {
-        self.client.batch_execute(&format!("UNLISTEN {}", quote_ident(channel))).await?;
+        self.client
+            .batch_execute(&format!("UNLISTEN {}", quote_ident(channel)))
+            .await?;
         Ok(())
     }
 
-    pub async fn query_typed(&self, sql: &str, params: &[DecodedValue], ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
+    pub async fn query_typed(
+        &self,
+        sql: &str,
+        params: &[DecodedValue],
+        ext: &ExtensionOids,
+    ) -> Result<Vec<DecodedValue>> {
         query_typed_on(&self.client, sql, params, ext).await
     }
 
@@ -90,7 +99,12 @@ impl PgListener {
     /// (`DecodedValue::Object`) instead of assuming column 0 is the whole
     /// result — for hand-written queries with several named columns a
     /// caller accesses by name, matching `asyncpg.Record`'s behavior.
-    pub async fn query_typed_named(&self, sql: &str, params: &[DecodedValue], ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
+    pub async fn query_typed_named(
+        &self,
+        sql: &str,
+        params: &[DecodedValue],
+        ext: &ExtensionOids,
+    ) -> Result<Vec<DecodedValue>> {
         query_typed_named_on(&self.client, sql, params, ext).await
     }
 
@@ -113,8 +127,7 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN")
-            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     #[tokio::test]
@@ -125,7 +138,10 @@ mod tests {
         let received_clone = received.clone();
 
         let listener = PgListener::connect(&test_dsn(), move |n| {
-            received_clone.lock().unwrap().push((n.channel().to_string(), n.payload().to_string()));
+            received_clone
+                .lock()
+                .unwrap()
+                .push((n.channel().to_string(), n.payload().to_string()));
         })
         .await
         .unwrap();
@@ -165,7 +181,10 @@ mod tests {
         // Deliberately never call `.listen(...)`.
 
         let notifier = crate::PgPool::connect(&test_dsn(), 1).await.unwrap();
-        notifier.query_raw("NOTIFY pgcon_listener_unheard_test, 'should not arrive'").await.unwrap();
+        notifier
+            .query_raw("NOTIFY pgcon_listener_unheard_test, 'should not arrive'")
+            .await
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(received.lock().unwrap().is_empty());
@@ -186,7 +205,10 @@ mod tests {
         listener.listen("pgcon_listener_unlisten_test").await.unwrap();
 
         let notifier = crate::PgPool::connect(&test_dsn(), 1).await.unwrap();
-        notifier.query_raw("NOTIFY pgcon_listener_unlisten_test, 'first'").await.unwrap();
+        notifier
+            .query_raw("NOTIFY pgcon_listener_unlisten_test, 'first'")
+            .await
+            .unwrap();
         for _ in 0..50 {
             if *count.lock().unwrap() >= 1 {
                 break;
@@ -196,22 +218,39 @@ mod tests {
         assert_eq!(*count.lock().unwrap(), 1);
 
         listener.unlisten("pgcon_listener_unlisten_test").await.unwrap();
-        notifier.query_raw("NOTIFY pgcon_listener_unlisten_test, 'second'").await.unwrap();
+        notifier
+            .query_raw("NOTIFY pgcon_listener_unlisten_test, 'second'")
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(*count.lock().unwrap(), 1, "unlisten should have stopped further notifications");
+        assert_eq!(
+            *count.lock().unwrap(),
+            1,
+            "unlisten should have stopped further notifications"
+        );
     }
 
     #[tokio::test]
     #[ignore]
     async fn queries_run_on_the_same_connection_as_listen() {
         let listener = PgListener::connect(&test_dsn(), |_n| {}).await.unwrap();
-        listener.execute_typed("CREATE TEMP TABLE pgcon_listener_query_test (id int8)", &[]).await.unwrap();
         listener
-            .execute_typed("INSERT INTO pgcon_listener_query_test (id) VALUES ($1::int8)", &[DecodedValue::I64(7)])
+            .execute_typed("CREATE TEMP TABLE pgcon_listener_query_test (id int8)", &[])
+            .await
+            .unwrap();
+        listener
+            .execute_typed(
+                "INSERT INTO pgcon_listener_query_test (id) VALUES ($1::int8)",
+                &[DecodedValue::I64(7)],
+            )
             .await
             .unwrap();
         let rows = listener
-            .query_typed("SELECT (id) AS result FROM pgcon_listener_query_test", &[], &ExtensionOids::default())
+            .query_typed(
+                "SELECT (id) AS result FROM pgcon_listener_query_test",
+                &[],
+                &ExtensionOids::default(),
+            )
             .await
             .unwrap();
         assert_eq!(rows, vec![DecodedValue::I64(7)]);
@@ -227,7 +266,11 @@ mod tests {
         let rows = listener
             .query_typed_named(
                 "SELECT $1::int8 AS id, $2::text AS type_name, $3::text AS index_name",
-                &[DecodedValue::I64(42), DecodedValue::Str("default::Product".to_string()), DecodedValue::Null],
+                &[
+                    DecodedValue::I64(42),
+                    DecodedValue::Str("default::Product".to_string()),
+                    DecodedValue::Null,
+                ],
                 &ExtensionOids::default(),
             )
             .await
@@ -236,7 +279,10 @@ mod tests {
             rows,
             vec![DecodedValue::Object(vec![
                 ("id".to_string(), DecodedValue::I64(42)),
-                ("type_name".to_string(), DecodedValue::Str("default::Product".to_string())),
+                (
+                    "type_name".to_string(),
+                    DecodedValue::Str("default::Product".to_string())
+                ),
                 ("index_name".to_string(), DecodedValue::Null),
             ])]
         );

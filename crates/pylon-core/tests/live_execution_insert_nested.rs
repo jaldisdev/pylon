@@ -90,12 +90,8 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -103,11 +99,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -146,11 +138,7 @@ fn as_array(v: &DecodedValue) -> &[DecodedValue] {
 #[ignore]
 async fn insert_link_value_from_a_nested_insert_subquery() {
     let module = unique_module("live_insert_nested_link");
-    let person = ty(
-        "Person",
-        &module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     let mut post = ty("Post", &module, vec![id_prop(), text_prop("title")]);
     post.links = vec![link("author", &format!("{module}::Person"))];
     let sd = SchemaDescriptor {
@@ -160,19 +148,19 @@ async fn insert_link_value_from_a_nested_insert_subquery() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!(
-        "insert {module}::Post {{ \
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Post {{ \
              title := 'Hello', \
              author := (select (insert {module}::Person {{ name := 'Alice', age := 30 }}) {{ id }}) \
          }}"
-    )).await;
-
-    let people = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Person {{ name, age }}"),
+        ),
     )
     .await;
+
+    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }}")).await;
     assert_eq!(
         people.len(),
         1,
@@ -200,11 +188,7 @@ async fn insert_link_value_from_a_nested_insert_subquery() {
 #[ignore]
 async fn select_insert_shape_chaining_reads_the_newly_inserted_rows_fields() {
     let module = unique_module("live_insert_select_chain");
-    let person = ty(
-        "Person",
-        &module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     let sd = SchemaDescriptor {
         types: vec![person],
         ..Default::default()
@@ -245,18 +229,8 @@ async fn insert_assigns_a_multilink_directly_not_via_append() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Person {{ name := 'Alice' }}"),
-    )
-    .await;
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Person {{ name := 'Bob' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Bob' }}")).await;
 
     // `:=` at insert time (not `+=` on an already-existing row) — a
     // different code path in `Compiler::compile_insert`'s multilink
@@ -274,20 +248,9 @@ async fn insert_assigns_a_multilink_directly_not_via_append() {
     )
     .await;
 
-    let teams = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Team {{ members: {{ name }} }}"),
-    )
-    .await;
+    let teams = rows_of(&pool, &sd, &format!("select {module}::Team {{ members: {{ name }} }}")).await;
     assert_eq!(teams.len(), 1);
     let members = as_array(field(&teams[0], 1));
-    let names: HashSet<String> = members
-        .iter()
-        .map(|m| as_str(field(m, 1)).to_string())
-        .collect();
-    assert_eq!(
-        names,
-        HashSet::from(["Alice".to_string(), "Bob".to_string()])
-    );
+    let names: HashSet<String> = members.iter().map(|m| as_str(field(m, 1)).to_string()).collect();
+    assert_eq!(names, HashSet::from(["Alice".to_string(), "Bob".to_string()]));
 }

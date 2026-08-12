@@ -83,11 +83,7 @@ fn product_schema(module: &str) -> SchemaDescriptor {
     sku.is_exclusive = true;
     let mut stock = text_prop("stock");
     stock.pg_type = "int8".into();
-    let product = ty(
-        "Product",
-        module,
-        vec![id_prop(), sku, text_prop("name"), stock],
-    );
+    let product = ty("Product", module, vec![id_prop(), sku, text_prop("name"), stock]);
     SchemaDescriptor {
         types: vec![product],
         ..Default::default()
@@ -99,11 +95,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -118,9 +110,7 @@ fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
 }
 
 #[tokio::test]
@@ -130,9 +120,7 @@ async fn bare_unless_conflict_silently_keeps_the_original_row() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -141,9 +129,13 @@ async fn bare_unless_conflict_silently_keeps_the_original_row() {
     )
     .await;
     exec(
-        &pool, &sd,
-        &format!("insert {module}::Product {{ sku := 'ABC', name := 'Attempted Duplicate', stock := 99 }} unless conflict"),
-    ).await;
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Product {{ sku := 'ABC', name := 'Attempted Duplicate', stock := 99 }} unless conflict"
+        ),
+    )
+    .await;
 
     let rows = rows_of(
         &pool,
@@ -170,9 +162,7 @@ async fn unless_conflict_on_specific_property_no_ops() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -181,9 +171,13 @@ async fn unless_conflict_on_specific_property_no_ops() {
     )
     .await;
     exec(
-        &pool, &sd,
-        &format!("insert {module}::Product {{ sku := 'XYZ', name := 'Duplicate', stock := 5 }} unless conflict on .sku"),
-    ).await;
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Product {{ sku := 'XYZ', name := 'Duplicate', stock := 5 }} unless conflict on .sku"
+        ),
+    )
+    .await;
 
     let rows = rows_of(
         &pool,
@@ -192,10 +186,7 @@ async fn unless_conflict_on_specific_property_no_ops() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        field(&rows[0], 1),
-        &DecodedValue::Str("Original".to_string())
-    );
+    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Original".to_string()));
 }
 
 #[tokio::test]
@@ -205,9 +196,7 @@ async fn unless_conflict_else_update_upserts_in_place() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -256,9 +245,7 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
     exec(
         &pool,
@@ -271,12 +258,14 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
     // resetting it to (or offsetting from) the attempted insert's own 1.
     for _ in 0..3 {
         exec(
-            &pool, &sd,
+            &pool,
+            &sd,
             &format!(
                 "insert {module}::Product {{ sku := 'GHI', name := 'Widget', stock := 1 }} \
                  unless conflict on .sku else (update {module}::Product set {{ stock := .stock + 1 }})"
             ),
-        ).await;
+        )
+        .await;
     }
 
     let rows = rows_of(
@@ -302,24 +291,23 @@ async fn no_conflict_inserts_a_genuinely_new_row() {
     let sd = product_schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'A', name := 'Alpha', stock := 0 }} unless conflict on .sku")).await;
-    exec(&pool, &sd, &format!("insert {module}::Product {{ sku := 'B', name := 'Beta', stock := 0 }} unless conflict on .sku")).await;
-
-    let rows = rows_of(
+    exec(
         &pool,
         &sd,
-        &format!("select {module}::Product {{ sku }} order by .sku"),
+        &format!("insert {module}::Product {{ sku := 'A', name := 'Alpha', stock := 0 }} unless conflict on .sku"),
     )
     .await;
-    assert_eq!(
-        rows.len(),
-        2,
-        "two distinct skus must both be inserted, got {rows:?}"
-    );
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Product {{ sku := 'B', name := 'Beta', stock := 0 }} unless conflict on .sku"),
+    )
+    .await;
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ sku }} order by .sku")).await;
+    assert_eq!(rows.len(), 2, "two distinct skus must both be inserted, got {rows:?}");
     assert_eq!(field(&rows[0], 1), &DecodedValue::Str("A".to_string()));
     assert_eq!(field(&rows[1], 1), &DecodedValue::Str("B".to_string()));
 }

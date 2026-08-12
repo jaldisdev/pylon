@@ -25,9 +25,15 @@ pub enum Error {
     #[error("could not locate pylon.toml in {0} or any parent directory")]
     TomlNotFound(std::path::PathBuf),
     #[error("failed to read {path}: {source}")]
-    Io { path: std::path::PathBuf, source: std::io::Error },
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse {path}: {source}")]
-    TomlParse { path: std::path::PathBuf, source: toml::de::Error },
+    TomlParse {
+        path: std::path::PathBuf,
+        source: toml::de::Error,
+    },
     #[error("pylon.toml: required section [{0}] is missing or invalid")]
     MissingSection(&'static str),
     #[error("pylon.toml: [{section}] requires '{field}'")]

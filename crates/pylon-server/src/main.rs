@@ -107,29 +107,50 @@ fn parse_args() -> Result<Args, String> {
             "--host" => args.host = Some(it.next().ok_or("--host requires a value")?),
             "--port" => {
                 let raw = it.next().ok_or("--port requires a value")?;
-                args.port = Some(raw.parse::<u16>().map_err(|_| format!("--port: invalid port {raw:?}"))?);
+                args.port = Some(
+                    raw.parse::<u16>()
+                        .map_err(|_| format!("--port: invalid port {raw:?}"))?,
+                );
             }
             "--ui" => set_flag(&mut args.ui_enabled, true, "--ui", "--no-ui")?,
             "--no-ui" => set_flag(&mut args.ui_enabled, false, "--no-ui", "--ui")?,
             "--static-dir" => args.static_dir = Some(PathBuf::from(it.next().ok_or("--static-dir requires a value")?)),
-            "--vector-worker" => {
-                set_flag(&mut args.worker_toggles.vector, true, "--vector-worker", "--disable-vector-worker")?
-            }
-            "--disable-vector-worker" => {
-                set_flag(&mut args.worker_toggles.vector, false, "--disable-vector-worker", "--vector-worker")?
-            }
-            "--search-worker" => {
-                set_flag(&mut args.worker_toggles.search, true, "--search-worker", "--disable-search-worker")?
-            }
-            "--disable-search-worker" => {
-                set_flag(&mut args.worker_toggles.search, false, "--disable-search-worker", "--search-worker")?
-            }
-            "--cache-worker" => {
-                set_flag(&mut args.worker_toggles.cache, true, "--cache-worker", "--disable-cache-worker")?
-            }
-            "--disable-cache-worker" => {
-                set_flag(&mut args.worker_toggles.cache, false, "--disable-cache-worker", "--cache-worker")?
-            }
+            "--vector-worker" => set_flag(
+                &mut args.worker_toggles.vector,
+                true,
+                "--vector-worker",
+                "--disable-vector-worker",
+            )?,
+            "--disable-vector-worker" => set_flag(
+                &mut args.worker_toggles.vector,
+                false,
+                "--disable-vector-worker",
+                "--vector-worker",
+            )?,
+            "--search-worker" => set_flag(
+                &mut args.worker_toggles.search,
+                true,
+                "--search-worker",
+                "--disable-search-worker",
+            )?,
+            "--disable-search-worker" => set_flag(
+                &mut args.worker_toggles.search,
+                false,
+                "--disable-search-worker",
+                "--search-worker",
+            )?,
+            "--cache-worker" => set_flag(
+                &mut args.worker_toggles.cache,
+                true,
+                "--cache-worker",
+                "--disable-cache-worker",
+            )?,
+            "--disable-cache-worker" => set_flag(
+                &mut args.worker_toggles.cache,
+                false,
+                "--disable-cache-worker",
+                "--cache-worker",
+            )?,
             "--http" => set_flag(&mut args.http_enabled, true, "--http", "--no-http")?,
             "--no-http" => set_flag(&mut args.http_enabled, false, "--no-http", "--http")?,
             other => return Err(format!("unrecognized argument: {other}")),

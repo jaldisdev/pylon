@@ -128,8 +128,8 @@ fn decode_scalar_text(text: &str, pg_type: &str) -> Result<Value> {
 }
 
 fn decode_object_payload(declared_fields: &[(String, String)], raw_payload: &str) -> Result<Value> {
-    let parsed: serde_json::Value = serde_json::from_str(raw_payload)
-        .map_err(|e| Error::MalformedPayload(format!("invalid JSON payload: {e}")))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw_payload).map_err(|e| Error::MalformedPayload(format!("invalid JSON payload: {e}")))?;
     let obj = parsed
         .as_object()
         .ok_or_else(|| Error::MalformedPayload("expected a JSON object payload".to_string()))?;
@@ -141,7 +141,10 @@ fn decode_object_payload(declared_fields: &[(String, String)], raw_payload: &str
             .ok_or_else(|| Error::MalformedPayload(format!("payload is missing declared field {name:?}")))?;
         fields.push((name.clone(), decode_json_value(json_value, pg_type)?));
     }
-    Ok(Value::Object(Object { type_name: None, fields }))
+    Ok(Value::Object(Object {
+        type_name: None,
+        fields,
+    }))
 }
 
 /// Like `decode_scalar_text`, but for a value already parsed out of an
@@ -174,7 +177,13 @@ mod tests {
     use super::*;
 
     fn channel(payload: ChannelPayload) -> ChannelDescriptor {
-        ChannelDescriptor { name: "X".into(), module: "m".into(), wire_name: "m__x".into(), payload, description: None }
+        ChannelDescriptor {
+            name: "X".into(),
+            module: "m".into(),
+            wire_name: "m__x".into(),
+            payload,
+            description: None,
+        }
     }
 
     #[test]
@@ -198,7 +207,10 @@ mod tests {
 
     #[test]
     fn decode_scalar_numeric_kept_as_string() {
-        assert_eq!(decode_scalar_text("123.456", "numeric").unwrap(), Value::Decimal("123.456".to_string()));
+        assert_eq!(
+            decode_scalar_text("123.456", "numeric").unwrap(),
+            Value::Decimal("123.456".to_string())
+        );
     }
 
     #[test]
@@ -209,12 +221,18 @@ mod tests {
 
     #[test]
     fn decode_scalar_text_passthrough() {
-        assert_eq!(decode_scalar_text("hello", "text").unwrap(), Value::Str("hello".to_string()));
+        assert_eq!(
+            decode_scalar_text("hello", "text").unwrap(),
+            Value::Str("hello".to_string())
+        );
     }
 
     #[test]
     fn decode_scalar_unsupported_type_falls_back_to_raw_string() {
-        assert_eq!(decode_scalar_text("1 day 02:00:00", "interval").unwrap(), Value::Str("1 day 02:00:00".to_string()));
+        assert_eq!(
+            decode_scalar_text("1 day 02:00:00", "interval").unwrap(),
+            Value::Str("1 day 02:00:00".to_string())
+        );
     }
 
     #[test]
@@ -245,9 +263,14 @@ mod tests {
     #[test]
     fn decode_payload_object_kind() {
         let u = uuid::Uuid::parse_str("3fa85f64-5717-4562-b3fc-2c963f66afa6").unwrap();
-        let ch = channel(ChannelPayload::Object(vec![("doc_id".into(), "uuid".into()), ("score".into(), "float8".into())]));
+        let ch = channel(ChannelPayload::Object(vec![
+            ("doc_id".into(), "uuid".into()),
+            ("score".into(), "float8".into()),
+        ]));
         let payload = format!(r#"{{"doc_id": "{u}", "score": 0.5}}"#);
-        let Value::Object(obj) = decode_payload(&ch, &payload).unwrap() else { panic!("expected Object") };
+        let Value::Object(obj) = decode_payload(&ch, &payload).unwrap() else {
+            panic!("expected Object")
+        };
         assert_eq!(obj.get("doc_id"), Some(&Value::Uuid(u)));
         assert_eq!(obj.get("score"), Some(&Value::Float64(0.5)));
     }
@@ -269,7 +292,10 @@ mod tests {
     #[tokio::test]
     async fn listen_rejects_an_unknown_channel() {
         let schema = SchemaDescriptor::default();
-        let err = listen("postgresql://ignored", &schema, "NoSuchChannel").await.err().expect("expected an error");
+        let err = listen("postgresql://ignored", &schema, "NoSuchChannel")
+            .await
+            .err()
+            .expect("expected an error");
         assert!(matches!(err, Error::UnknownChannel(_)), "got: {err:?}");
     }
 }

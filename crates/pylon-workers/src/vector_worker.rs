@@ -52,14 +52,21 @@ pub struct VectorIndexWorker {
 impl VectorIndexWorker {
     /// Pre-compiles fetch SQL for every `(type_name, index_name)` key in
     /// `providers`, once at startup — matches `VectorIndexWorker.__init__`.
-    pub fn new(schema: core::schema::SchemaDescriptor, providers: HashMap<(String, Option<String>), ProviderConfig>) -> Result<Self> {
+    pub fn new(
+        schema: core::schema::SchemaDescriptor,
+        providers: HashMap<(String, Option<String>), ProviderConfig>,
+    ) -> Result<Self> {
         let mut fetch_sql = HashMap::with_capacity(providers.len());
         for (type_name, index_name) in providers.keys() {
             let sql = core::export::compile_index_fetch(type_name, index_name.as_deref(), &schema)
                 .map_err(|e| Error::Schema(e.to_string()))?;
             fetch_sql.insert((type_name.clone(), index_name.clone()), sql);
         }
-        Ok(Self { schema, providers, fetch_sql })
+        Ok(Self {
+            schema,
+            providers,
+            fetch_sql,
+        })
     }
 
     /// Mirrors `VectorIndexWorker._table_and_col`.
@@ -117,7 +124,10 @@ impl BatchProcessor for VectorIndexWorker {
     async fn process_batch(&self, listener: &PgListener, rows: &[ClaimedRow]) -> Result<()> {
         let mut groups: HashMap<(String, Option<String>), Vec<&ClaimedRow>> = HashMap::new();
         for r in rows {
-            groups.entry((r.type_name.clone(), r.index_name.clone())).or_default().push(r);
+            groups
+                .entry((r.type_name.clone(), r.index_name.clone()))
+                .or_default()
+                .push(r);
         }
 
         for ((type_name, index_name), group_rows) in groups {
@@ -144,10 +154,15 @@ impl BatchProcessor for VectorIndexWorker {
             // Mirrors `_make_provider`'s dispatch — `AnthropicProvider` has
             // no embeddings endpoint in the Python version either.
             let vectors = if provider_cfg.api_style == "anthropic" {
-                return Err(Error::Unsupported("AnthropicProvider does not support embeddings".into()));
+                return Err(Error::Unsupported(
+                    "AnthropicProvider does not support embeddings".into(),
+                ));
             } else {
-                let provider =
-                    pylon_providers::OpenAiProvider::new(&provider_cfg.api_url, &provider_cfg.model, provider_cfg.api_key.as_deref())?;
+                let provider = pylon_providers::OpenAiProvider::new(
+                    &provider_cfg.api_url,
+                    &provider_cfg.model,
+                    provider_cfg.api_key.as_deref(),
+                )?;
                 provider.embed_batch(&texts).await?
             };
 
@@ -162,7 +177,9 @@ impl BatchProcessor for VectorIndexWorker {
                 // API could bind for a type it had no codec for; Rust
                 // doesn't have that constraint.
                 let cached_vec = DecodedValue::Array(vec.iter().map(|f| DecodedValue::F64(*f as f64)).collect());
-                listener.execute_typed(&write_sql, &[DecodedValue::Uuid(record.id), cached_vec]).await?;
+                listener
+                    .execute_typed(&write_sql, &[DecodedValue::Uuid(record.id), cached_vec])
+                    .await?;
             }
         }
         Ok(())

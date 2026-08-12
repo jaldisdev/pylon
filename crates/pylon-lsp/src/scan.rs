@@ -76,7 +76,12 @@ struct Scanner<'a> {
 
 impl<'a> Scanner<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Scanner { bytes, pos: 0, line: 0, col: 0 }
+        Scanner {
+            bytes,
+            pos: 0,
+            line: 0,
+            col: 0,
+        }
     }
 
     fn peek_at(&self, offset: usize) -> Option<u8> {
