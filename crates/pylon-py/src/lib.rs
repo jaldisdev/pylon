@@ -588,6 +588,49 @@ impl IndexDescriptor {
 }
 
 #[pyclass(module = "pylon._core", frozen)]
+pub struct PartitionDescriptor {
+    inner: core::schema::PartitionDescriptor,
+}
+
+#[pymethods]
+impl PartitionDescriptor {
+    #[new]
+    #[pyo3(signature = (pointer, interval, premake, *, retention = None))]
+    fn new(pointer: String, interval: String, premake: u32, retention: Option<u32>) -> PyResult<Self> {
+        let parsed = core::schema::PartitionInterval::parse(&interval).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Partition: unknown interval {interval:?} (expected daily, weekly, monthly or yearly)"
+            ))
+        })?;
+        Ok(Self {
+            inner: core::schema::PartitionDescriptor {
+                pointer,
+                interval: parsed,
+                premake,
+                retention,
+            },
+        })
+    }
+
+    #[getter]
+    fn pointer(&self) -> &str {
+        &self.inner.pointer
+    }
+    #[getter]
+    fn interval(&self) -> &str {
+        self.inner.interval.as_str()
+    }
+    #[getter]
+    fn premake(&self) -> u32 {
+        self.inner.premake
+    }
+    #[getter]
+    fn retention(&self) -> Option<u32> {
+        self.inner.retention
+    }
+}
+
+#[pyclass(module = "pylon._core", frozen)]
 pub struct VectorIndexDescriptor {
     inner: core::schema::VectorIndexDescriptor,
 }
@@ -827,6 +870,7 @@ impl TypeDescriptor {
         exclusive_constraints = None,
         expression_constraints = None,
         indexes = None,
+        partition = None,
         vector_indexes = None,
         search_indexes = None,
         triggers = None,
@@ -849,6 +893,7 @@ impl TypeDescriptor {
         exclusive_constraints: Option<Vec<PyRef<ExclusiveConstraint>>>,
         expression_constraints: Option<Vec<PyRef<ExpressionConstraint>>>,
         indexes: Option<Vec<PyRef<IndexDescriptor>>>,
+        partition: Option<PyRef<PartitionDescriptor>>,
         vector_indexes: Option<Vec<PyRef<VectorIndexDescriptor>>>,
         search_indexes: Option<Vec<PyRef<SearchIndexDescriptor>>>,
         triggers: Option<Vec<PyRef<TriggerDescriptor>>>,
@@ -879,6 +924,7 @@ impl TypeDescriptor {
                 computed: computed.iter().map(|c| c.inner.clone()).collect(),
                 constraints,
                 indexes: indexes.unwrap_or_default().iter().map(|i| i.inner.clone()).collect(),
+                partition: partition.map(|p| p.inner.clone()),
                 vector_indexes: vector_indexes
                     .unwrap_or_default()
                     .iter()
@@ -949,6 +995,10 @@ impl TypeDescriptor {
             .collect()
     }
 
+    #[getter]
+    fn partition(&self) -> Option<PartitionDescriptor> {
+        self.inner.partition.clone().map(|inner| PartitionDescriptor { inner })
+    }
     #[getter]
     fn vector_indexes(&self) -> Vec<VectorIndexDescriptor> {
         self.inner
@@ -2443,6 +2493,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Type-level constructs
     m.add_class::<IndexDescriptor>()?;
+    m.add_class::<PartitionDescriptor>()?;
     m.add_class::<VectorIndexDescriptor>()?;
     m.add_class::<SearchPointerDescriptor>()?;
     m.add_class::<SearchIndexDescriptor>()?;

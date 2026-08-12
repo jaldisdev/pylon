@@ -185,6 +185,20 @@ pub fn spawn(
         );
     }
 
+    // Partition maintenance: only started when the schema actually declares
+    // a partitioned type, so an ordinary schema pays nothing for it.
+    if schema.types.iter().any(|t| t.partition.is_some()) {
+        let dsn = dsn.to_string();
+        eprintln!("pylon-server: PartitionMaintenanceWorker started");
+        handles.push(tokio::spawn(async move {
+            if let Err(e) =
+                pylon_workers::run_partition_maintenance(&dsn, pylon_workers::DEFAULT_MAINTENANCE_INTERVAL).await
+            {
+                eprintln!("pylon-server: PartitionMaintenanceWorker exited: {e}");
+            }
+        }));
+    }
+
     // Said out loud, not just documented at the top of this module: every
     // other worker announces itself on startup, so a schema with signals and
     // no line about them reads exactly like a worker that was silently

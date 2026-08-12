@@ -11,6 +11,7 @@ Pylon's schema is ordinary Python: classes decorated with `@pylon.type` (and fri
 - [Computed pointers](computed.md) — `Computed[]`
 - [Constraints](constraints.md) — `Default`, `Exclusive`, `Expression`, value/length bounds, `Readonly`
 - [Indexes](indexes.md) — `Index`, `VectorIndex`, `SearchIndex`
+- [Partitioning](partitioning.md) — `Partition`, range partitioning and retention
 - [Functions](functions.md) — `@pylon.function`
 - [Triggers and rewrites](triggers-and-rewrites.md) — `Trigger`, `Rewrite`
 - [Globals and aliases](globals-and-aliases.md) — `Global`, `Alias`

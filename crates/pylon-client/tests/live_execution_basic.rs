@@ -120,6 +120,7 @@ fn person_schema(module: &str) -> SchemaDescriptor {
             computed: vec![],
             constraints: vec![],
             indexes: vec![],
+            partition: None,
             vector_indexes: vec![],
             search_indexes: vec![],
             triggers: vec![],

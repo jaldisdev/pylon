@@ -472,6 +472,9 @@ pub fn required_extensions(target: &SchemaDescriptor) -> Vec<&'static str> {
     if target.types.iter().any(|t| !t.vector_indexes.is_empty()) {
         out.push("vector");
     }
+    if target.types.iter().any(|t| t.partition.is_some()) {
+        out.push("pg_partman");
+    }
     out
 }
 
@@ -3557,6 +3560,7 @@ mod tests {
             computed: vec![],
             constraints: vec![],
             indexes: vec![],
+            partition: None,
             vector_indexes: vec![],
             search_indexes: vec![],
             triggers: vec![],

@@ -32,6 +32,7 @@ from . import _collector
 from ._constraints import Default, Description, Exclusive, Expression, Readonly
 from ._indexes import Index, SearchIndex, VectorIndex
 from ._meta import MISSING, PointerMeta, PylonConfig
+from ._partition import Partition
 from ._pointers import (
     ArrayAnnotation,
     ComputedAnnotation,
@@ -425,6 +426,18 @@ def _build_type(
     class_search_indexes = [e for e in exprs if isinstance(e, SearchIndex)]
     class_constraints = [e for e in exprs if isinstance(e, (Exclusive, Expression))]
     class_triggers = [e for e in exprs if isinstance(e, Trigger)]
+    class_partitions = [e for e in exprs if isinstance(e, Partition)]
+
+    # A table has exactly one partition key, so a second declaration is a
+    # contradiction rather than a refinement. Caught here, at class-definition
+    # time, so the traceback points at the class that declared them.
+    if len(class_partitions) > 1:
+        raise ValueError(f'Type {cls.__name__!r}: at most one Partition is allowed per type.')
+    if class_partitions and abstract:
+        raise ValueError(
+            f'Type {cls.__name__!r} is abstract and has no table of its own, so it cannot declare a '
+            f'Partition — declare it on each concrete type instead.'
+        )
 
     default_vi = [vi for vi in class_vector_indexes if vi.index_name is None]
     if len(default_vi) > 1:
@@ -486,6 +499,7 @@ def _build_type(
         constraints=class_constraints,
         indexes=class_indexes,
         vector_indexes=class_vector_indexes,
+        partition=class_partitions[0] if class_partitions else None,
         search_indexes=class_search_indexes,
         triggers=class_triggers,
         description=description,

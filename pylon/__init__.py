@@ -79,6 +79,7 @@ from .schema import (
     On,
     OnDelete,
     OneOf,
+    Partition,
     PointerMeta,
     Property,
     PylonConfig,
@@ -184,6 +185,7 @@ __all__ = [
     # Schema — deletion policies
     'OnDelete',
     'OneOf',
+    'Partition',
     'PointerMeta',
     'Property',
     'PylonConfig',
