@@ -60,6 +60,13 @@ impl MeilisearchClient {
 
     /// Full-text query; returns `[(id, score)]` ordered by relevance.
     pub async fn search(&self, index: &str, query_text: &str, size: usize) -> Result<Vec<(String, f64)>> {
+        let started = std::time::Instant::now();
+        let result = self.search_inner(index, query_text, size).await;
+        crate::metrics::record_search_query("meilisearch", result.is_ok(), started.elapsed());
+        result
+    }
+
+    async fn search_inner(&self, index: &str, query_text: &str, size: usize) -> Result<Vec<(String, f64)>> {
         let url = format!("{}/indexes/{index}/search", self.base_url);
         let body = serde_json::json!({"q": query_text, "limit": size, "showRankingScore": true});
         let resp = self.http.post(&url).json(&body).send().await?.error_for_status()?;
@@ -138,6 +145,19 @@ impl OpenSearchClient {
 
     /// Full-text query; returns `[(id, score)]` ordered by relevance.
     pub async fn search(
+        &self,
+        index: &str,
+        query_text: &str,
+        fields: Option<&[String]>,
+        size: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let started = std::time::Instant::now();
+        let result = self.search_inner(index, query_text, fields, size).await;
+        crate::metrics::record_search_query("opensearch", result.is_ok(), started.elapsed());
+        result
+    }
+
+    async fn search_inner(
         &self,
         index: &str,
         query_text: &str,

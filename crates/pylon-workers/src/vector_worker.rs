@@ -121,6 +121,18 @@ impl BatchProcessor for VectorIndexWorker {
         "Vector"
     }
 
+    /// The embedding API style in use ("openai", "anthropic", ...) — enough
+    /// to tell a rate-limited provider from a slow one in the duration
+    /// histogram, without naming a specific endpoint.
+    fn provider_label(&self) -> &'static str {
+        match self.providers.values().next().map(|p| p.api_style.as_str()) {
+            Some("anthropic") => "anthropic",
+            Some("openai") => "openai",
+            Some(_) => "other",
+            None => "-",
+        }
+    }
+
     async fn process_batch(&self, listener: &PgListener, rows: &[ClaimedRow]) -> Result<()> {
         let mut groups: HashMap<(String, Option<String>), Vec<&ClaimedRow>> = HashMap::new();
         for r in rows {

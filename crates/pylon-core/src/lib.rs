@@ -29,6 +29,7 @@ pub mod migration;
 pub mod parse;
 pub mod query;
 pub mod schema;
+pub mod shape_id;
 pub mod sql;
 pub mod stdlib;
 pub mod validate;

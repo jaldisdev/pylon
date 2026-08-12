@@ -89,6 +89,27 @@ impl postgres_types::ToSql for BoundParam<'_> {
 pub struct PgPool {
     pool: deadpool_postgres::Pool,
     types: ExtensionOids,
+    /// Label for this pool in observability output. Set via
+    /// `PgPool::set_name`; `"default"` until then.
+    name: String,
+}
+
+/// Notified with `(pool name, time spent waiting)` every time a caller
+/// acquires a pooled connection.
+///
+/// A hook rather than a direct metrics call because the dependency only goes
+/// one way: `pylon-workers` (which owns the Prometheus registry) depends on
+/// this crate, so this crate can't call into it. Whoever owns the registry
+/// installs an observer at startup; nobody installing one costs a single
+/// `OnceLock` read per checkout.
+pub type PoolWaitObserver = fn(&str, std::time::Duration);
+
+static POOL_WAIT_OBSERVER: std::sync::OnceLock<PoolWaitObserver> = std::sync::OnceLock::new();
+
+/// Installs the pool-wait observer. The first call wins; later ones are
+/// ignored, so a process that initialises metrics twice can't double-count.
+pub fn set_pool_wait_observer(observer: PoolWaitObserver) {
+    let _ = POOL_WAIT_OBSERVER.set(observer);
 }
 
 /// Snapshot of a pool's connection accounting — deadpool's own `Status`,
@@ -135,7 +156,11 @@ impl PgPool {
         // assigned locally and so can't be known statically.
         let types = discover_types(&client).await?;
         drop(client);
-        Ok(Self { pool, types })
+        Ok(Self {
+            pool,
+            types,
+            name: "default".to_string(),
+        })
     }
 
     /// The type OIDs discovered for this database when the pool connected.
@@ -150,9 +175,29 @@ impl PgPool {
     /// domain, or extension type, since the registry is a connect-time
     /// snapshot and a pool normally outlives a migration.
     pub async fn refresh_types(&mut self) -> Result<()> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         self.types = discover_types(&client).await?;
         Ok(())
+    }
+
+    /// Labels this pool in observability output — see `PoolWaitObserver`.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
+    /// Acquires a pooled connection, reporting how long that took to the
+    /// pool-wait observer if one is installed.
+    ///
+    /// Every query path goes through this rather than `self.pool.get()`
+    /// directly, so "time spent waiting for a connection" is measured in one
+    /// place and can't drift between call sites.
+    async fn checkout(&self) -> Result<deadpool_postgres::Object> {
+        let started = std::time::Instant::now();
+        let client = self.pool.get().await?;
+        if let Some(observe) = POOL_WAIT_OBSERVER.get() {
+            observe(&self.name, started.elapsed());
+        }
+        Ok(client)
     }
 
     /// Current connection accounting — for the Prometheus gauge sampler
@@ -171,7 +216,7 @@ impl PgPool {
     /// Composite/record decoding is a later phase — this only proves the
     /// pool can connect and round-trip a query end to end.
     pub async fn query_raw(&self, sql: &str) -> Result<Vec<tokio_postgres::Row>> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         let rows = client.query(sql, &[]).await?;
         Ok(rows)
     }
@@ -199,7 +244,7 @@ impl PgPool {
         params: &[DecodedValue],
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         query_typed_on(&client, sql, params, ext).await
     }
 
@@ -213,7 +258,7 @@ impl PgPool {
         params: &[DecodedValue],
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         query_typed_named_on(&client, sql, params, ext).await
     }
 
@@ -222,7 +267,7 @@ impl PgPool {
     /// for `INSERT`/`UPDATE`/`DELETE` where the caller has no `RETURNING`
     /// clause to decode.
     pub async fn execute_typed(&self, sql: &str, params: &[DecodedValue]) -> Result<u64> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         execute_typed_on(&client, sql, params).await
     }
 
@@ -233,7 +278,7 @@ impl PgPool {
     /// Actually *runs* the query (`ANALYZE`), same as Postgres's own
     /// `EXPLAIN ANALYZE`, not just its planner estimate.
     pub async fn query_explain(&self, sql: &str, params: &[DecodedValue]) -> Result<String> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         query_explain_on(&client, sql, params).await
     }
 
@@ -245,7 +290,7 @@ impl PgPool {
     /// `PgTransaction` owns the connection until `commit`/`rollback`
     /// consumes it.
     pub async fn begin(&self, isolation: &str) -> Result<PgTransaction> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         let level = match isolation {
             "read_uncommitted" => "READ UNCOMMITTED",
             "read_committed" => "READ COMMITTED",
@@ -266,7 +311,7 @@ impl PgPool {
     /// isolation level — this matches a plain `conn.transaction()`
     /// (no `isolation=` kwarg) that the old Python migration executor used.
     pub async fn begin_default(&self) -> Result<PgTransaction> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         client.batch_execute("BEGIN").await?;
         Ok(PgTransaction {
             client,
@@ -282,7 +327,7 @@ impl PgPool {
     /// DDL steps rely on (a step's body is whatever raw SQL text sits
     /// between `-- pylon:step` markers, often more than one statement).
     pub async fn batch_execute(&self, sql: &str) -> Result<()> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         client.batch_execute(sql).await?;
         Ok(())
     }
@@ -297,7 +342,7 @@ impl PgPool {
     /// held connection — calling `PgPool::batch_execute` twice wouldn't
     /// work, since each call may checkout a different pooled connection.
     pub async fn connection(&self) -> Result<PgConnection> {
-        let client = self.pool.get().await?;
+        let client = self.checkout().await?;
         Ok(PgConnection {
             client,
             types: self.types.clone(),
