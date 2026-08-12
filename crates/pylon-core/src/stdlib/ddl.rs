@@ -250,9 +250,14 @@ pub const CACHE_INVALIDATE_DDL: &str = concat!(
     "$$;\n",
 );
 
-/// DDL for the `_pylon."Migrations"` and `_pylon."Progress"` tracking tables (§7).
+/// DDL for the migration tracking tables (§7): `_pylon."Migrations"`,
+/// `_pylon."Progress"`, and `_pylon."Schema"`.
 ///
-/// Emitted alongside `INDEX_OUTBOX_DDL` at schema-bootstrap time.
+/// **The single definition of these tables.** `migrate::ensure_tracking_tables`
+/// runs this same constant rather than carrying its own copy — an earlier
+/// second copy there had already drifted (it grew `schema_state`, this one
+/// never did), so a database bootstrapped through one path was missing a
+/// column the other path's queries select.
 pub const MIGRATION_TRACKING_DDL: &str = concat!(
     "CREATE TABLE IF NOT EXISTS _pylon.\"Migrations\" (\n",
     "    id          text        PRIMARY KEY,\n",
@@ -260,10 +265,20 @@ pub const MIGRATION_TRACKING_DDL: &str = concat!(
     "    filename    text        NOT NULL,\n",
     "    db_state    jsonb       NULL,\n",
     "    applied_at  timestamptz NULL\n",
-    ");\n\n",
+    ");\n",
+    // Added after the table above already shipped, so existing databases
+    // need the column bolted on rather than created fresh — ADD COLUMN IF
+    // NOT EXISTS makes this safe to run again on a table that was CREATE'd
+    // (not ALTER'd) before this column existed.
+    "ALTER TABLE _pylon.\"Migrations\" ADD COLUMN IF NOT EXISTS schema_state jsonb NULL;\n\n",
     "CREATE TABLE IF NOT EXISTS _pylon.\"Progress\" (\n",
     "    id          text        PRIMARY KEY,\n",
     "    step_index  integer     NOT NULL,\n",
+    "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
+    ");\n\n",
+    "CREATE TABLE IF NOT EXISTS _pylon.\"Schema\" (\n",
+    "    singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),\n",
+    "    snapshot    jsonb       NOT NULL,\n",
     "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
     ");\n",
 );

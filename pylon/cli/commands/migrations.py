@@ -647,7 +647,7 @@ def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
 
     body = blank_migration_body()
     content = render_migration_file(onto, body)
-    short_id = compute_migration_short_id(body)
+    short_id = compute_migration_short_id(body, onto)
 
     seq = _next_seq(d)
     stem = f'{seq:05d}_{short_id}'
@@ -1221,7 +1221,7 @@ async def _create_from_diff(
     body = _assemble_migration_body(ops)
     onto = chain_tip
     content = render_migration_file(onto, body)
-    short_id = compute_migration_short_id(body)
+    short_id = compute_migration_short_id(body, onto)
 
     seq = _next_seq(d)
     stem = f'{seq:05d}_{short_id}'
@@ -1316,12 +1316,12 @@ def rehash(ctx: click.Context, file: Path) -> None:
     if chain and chain[-1].id != m.id:
         raise click.ClickException(f'{file.name} is not the chain tip — rehash is only valid for the tip.')
 
-    new_id = compute_migration_id(m.body)
+    new_id = compute_migration_id(m.body, m.onto, list(m.squashed))
     if new_id == m.id:
         click.echo('ID is already correct — nothing to do.')
         return
 
-    new_short = compute_migration_short_id(m.body)
+    new_short = compute_migration_short_id(m.body, m.onto, list(m.squashed))
 
     # Rewrite the migration: line in the header
     lines = content.splitlines(keepends=True)
@@ -1491,7 +1491,7 @@ async def _squash(
         raise click.ClickException('Squash range produces no net DDL changes — nothing to write.')
 
     body = _assemble_migration_body(ops)
-    new_short_id = compute_migration_short_id(body)
+    new_short_id = compute_migration_short_id(body, onto, squashed_ids)
     content = render_migration_file(onto, body, squashed_ids)
 
     # Sequence number = position of range_start in the final file list (1-indexed).
