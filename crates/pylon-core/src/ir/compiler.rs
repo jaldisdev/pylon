@@ -6790,7 +6790,7 @@ impl<'a> Compiler<'a> {
                 return Err(PyQLError::Type(PyQLTypeError {
                     message: format!(
                         "operator '{op}' cannot be applied to operands of type '{target_display}' and the value type",
-                        op = &op,
+                        op = op,
                     ),
                     position: Position { line: 0, col: 0 },
                 }));
