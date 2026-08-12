@@ -565,7 +565,7 @@ mod tests {
     // ── build_coarse_grained ─────────────────────────────────────────────────
 
     /// No live Postgres in this test environment (the crate's own
-    /// `live_execution_*` integration tests are all `#[ignore]`d for the
+    /// `live_execution_*` integration tests are all `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]`d for the
     /// same reason), so this fixture's plan-node *shape* (Seq Scan / Nested
     /// Loop nesting) is hand-built to match real `EXPLAIN (FORMAT JSON)`
     /// output structurally — it's not a literal capture. The `Alias` values

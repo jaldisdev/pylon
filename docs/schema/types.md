@@ -8,7 +8,7 @@ Three decorators declare an object type. All three take the same `module=`/`name
 | `@pylon.abstract` | No | Yes (flattened into every subtype) | Shared fields/constraints with no identity of its own — a mixin. |
 | `@pylon.interface` | A PostgreSQL **view**, not a table | Yes (flattened, same as abstract) | A shared, polymorphically-queryable surface across otherwise-unrelated concrete types. |
 
-> **Don't assume "abstract" means polymorphically queryable** — in Pylon it doesn't. `@pylon.abstract` is a plain mixin: its fields flatten into subtypes at schema-build time, and it has no identity, no table, and no query surface of its own — you can never `select` an abstract type directly. `@pylon.interface` is the one with a polymorphic query surface: still no table of its own, but backed by a generated view so you can query it directly and get every concrete implementor's matching rows back, tagged by type. If a shared field or constraint should also be independently queryable across its implementors, it needs `@pylon.interface`, not `@pylon.abstract`.
+> **Don't assume "abstract" means polymorphically queryable** — in Pylon it doesn't. `@pylon.abstract` is a plain mixin: its fields flatten into subtypes at schema-build time, and it has no identity, no table, and no query surface of its own — you can never `select` an abstract type directly. `@pylon.interface` is the one with a polymorphic query surface: still no table of its own, but backed by a generated view so you can query it directly and get every concrete implementor's matching objects back, tagged by type. If a shared field or constraint should also be independently queryable across its implementors, it needs `@pylon.interface`, not `@pylon.abstract`.
 
 ## `@pylon.type`
 
@@ -54,7 +54,7 @@ class Video(Publishable):
     url: str
 ```
 
-`Publishable` is materialized as a PostgreSQL view unioning every concrete type that inherits from it — `select Publishable` returns rows from both `Post` and `Video`, each still carrying its own concrete type tag (readable in PyQL via the [`is`](../pyql/operators.md) operator: `select Publishable filter Publishable is Post`).
+`Publishable` is materialized as a PostgreSQL view unioning every concrete type that inherits from it — `select Publishable` returns objects from both `Post` and `Video`, each still carrying its own concrete type tag (readable in PyQL via the [`is`](../pyql/operators.md) operator: `select Publishable filter Publishable is Post`).
 
 **Conformance is checked, not assumed**: every concrete subtype must actually declare (or inherit) a pointer matching each of the interface's own pointers, by name and by *kind* — a property can't satisfy a link-shaped interface pointer, and vice versa. In practice this falls out naturally from ordinary Python inheritance (subclassing `Publishable` already gives `Post` a `published_at` property via the same field-flattening abstract types use) — the check exists to catch a mismatch, e.g. a subtype that shadows `published_at` with an incompatible kind.
 

@@ -33,7 +33,7 @@
 //! `overload_resolution_ignores_argument_types` below — turns out to
 //! resolve overloads by name and argument *count* only, not by type.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -126,7 +126,7 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn scalar_function_computes_correctly() {
     let module = unique_module("live_fn_scalar");
     let discount = FunctionDescriptor {
@@ -160,7 +160,7 @@ async fn scalar_function_computes_correctly() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn object_set_returning_function_filters_correctly() {
     let module = unique_module("live_fn_objset");
     let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
@@ -202,7 +202,7 @@ async fn object_set_returning_function_filters_correctly() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn function_composes_inside_a_larger_query() {
     let module = unique_module("live_fn_compose");
     let double = FunctionDescriptor {
@@ -254,7 +254,7 @@ async fn function_composes_inside_a_larger_query() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn overload_resolution_by_argument_count() {
     let module = unique_module("live_fn_overload_count");
     let one_arg = FunctionDescriptor {
@@ -301,7 +301,7 @@ async fn overload_resolution_by_argument_count() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn function_call_argument_gets_cast_to_the_declared_param_type() {
     let module = unique_module("live_fn_arg_cast");
     let discount = FunctionDescriptor {
@@ -348,7 +348,7 @@ async fn function_call_argument_gets_cast_to_the_declared_param_type() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn function_call_mixes_a_bound_parameter_and_a_literal_argument() {
     let module = unique_module("live_fn_mixed_args");
     let discount = FunctionDescriptor {
@@ -389,7 +389,7 @@ async fn function_call_mixes_a_bound_parameter_and_a_literal_argument() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn function_call_composed_as_an_argument_to_another_function_call() {
     let module = unique_module("live_fn_nested_call");
     let double = FunctionDescriptor {

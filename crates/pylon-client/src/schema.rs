@@ -68,7 +68,7 @@ mod tests {
     /// test data behind (see `pylon_core::migrate`'s own `schema_snapshot_round_trips`
     /// test for the identical concern).
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn fetches_a_valid_snapshot() {
         let pool = test_pool().await;
         let previous = pylon_core::migrate::read_schema_snapshot(&pool).await.unwrap();
@@ -87,7 +87,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn missing_snapshot_is_a_clear_error() {
         let pool = test_pool().await;
         let previous = pylon_core::migrate::read_schema_snapshot(&pool).await.unwrap();

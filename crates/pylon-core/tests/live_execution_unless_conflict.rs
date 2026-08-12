@@ -32,7 +32,7 @@
 //! schema (a plain `Exclusive` property, not a separate constraint
 //! model).
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -112,7 +112,7 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn bare_unless_conflict_silently_keeps_the_original_row() {
     let module = unique_module("live_uc_bare");
     let sd = product_schema(&module);
@@ -154,7 +154,7 @@ async fn bare_unless_conflict_silently_keeps_the_original_row() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn unless_conflict_on_specific_property_no_ops() {
     let module = unique_module("live_uc_on");
     let sd = product_schema(&module);
@@ -188,7 +188,7 @@ async fn unless_conflict_on_specific_property_no_ops() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn unless_conflict_else_update_upserts_in_place() {
     let module = unique_module("live_uc_upsert");
     let sd = product_schema(&module);
@@ -231,7 +231,7 @@ async fn unless_conflict_else_update_upserts_in_place() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value() {
     // `.stock` inside the ELSE update's own assignment compiles down to a
     // *bare* column reference (`compile_conflict_else` uses an empty alias,
@@ -282,7 +282,7 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn no_conflict_inserts_a_genuinely_new_row() {
     // The non-conflicting path must still behave like a plain insert.
     let module = unique_module("live_uc_new");

@@ -42,7 +42,7 @@ class Booking:
     pylon.Expression("__subject__.start_date <= __subject__.end_date")
 ```
 
-An arbitrary PyQL boolean expression, checked on every write — a `CHECK` constraint. `__subject__` refers to the row being validated.
+An arbitrary PyQL boolean expression, checked on every write — a `CHECK` constraint. `__subject__` refers to the object being validated.
 
 ## `Readonly`
 

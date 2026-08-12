@@ -343,7 +343,7 @@ async fn rows_of(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<De
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn same_table_duplicate_is_rejected() {
     let module = unique_module("live_excl");
     let schema = account_schema(&module);
@@ -369,7 +369,7 @@ async fn same_table_duplicate_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn cross_table_duplicate_is_rejected() {
     let module = unique_module("live_excl");
     let schema = account_schema(&module);
@@ -395,7 +395,7 @@ async fn cross_table_duplicate_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn distinct_emails_across_implementors_succeed() {
     let module = unique_module("live_excl");
     let schema = account_schema(&module);
@@ -421,7 +421,7 @@ async fn distinct_emails_across_implementors_succeed() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn same_transaction_cross_table_duplicate_is_still_caught() {
     // Both new rows exist by the time the DEFERRED trigger actually runs
     // (end of statement/transaction), so even inserting the conflicting
@@ -452,7 +452,7 @@ async fn same_transaction_cross_table_duplicate_is_still_caught() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn updating_into_a_cross_table_duplicate_is_rejected() {
     let module = unique_module("live_excl");
     let schema = account_schema(&module);
@@ -486,7 +486,7 @@ async fn updating_into_a_cross_table_duplicate_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn updating_an_unrelated_field_does_not_trigger_the_check() {
     let module = unique_module("live_excl");
     let schema = account_schema(&module);
@@ -512,7 +512,7 @@ async fn updating_an_unrelated_field_does_not_trigger_the_check() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn null_values_are_never_considered_duplicates_of_each_other() {
     let module = unique_module("live_excl");
     let schema = nullable_account_schema(&module);
@@ -538,7 +538,7 @@ async fn null_values_are_never_considered_duplicates_of_each_other() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn composite_exclusive_constraint_is_enforced_across_implementors() {
     let module = unique_module("live_excl");
     let schema = composite_account_schema(&module);
@@ -581,7 +581,7 @@ async fn composite_exclusive_constraint_is_enforced_across_implementors() {
 /// confirms the *emitted, applied* DDL from that path actually works too,
 /// not just that it type-checks.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn migration_path_emits_working_exclusive_triggers() {
     let module = unique_module("live_excl_mig");
     let schema = account_schema(&module);
@@ -613,7 +613,7 @@ async fn migration_path_emits_working_exclusive_triggers() {
 // ── Junction-backed exclusive link (cross-implementor helper view) ─────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn junction_backed_cross_table_duplicate_target_is_rejected() {
     let module = unique_module("live_excl_jt");
     let schema = employer_account_schema(&module);
@@ -642,7 +642,7 @@ async fn junction_backed_cross_table_duplicate_target_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn junction_backed_distinct_targets_across_implementors_succeed() {
     let module = unique_module("live_excl_jt");
     let schema = employer_account_schema(&module);
@@ -677,7 +677,7 @@ async fn junction_backed_distinct_targets_across_implementors_succeed() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn junction_backed_updating_into_a_cross_table_duplicate_is_rejected() {
     let module = unique_module("live_excl_jt");
     let schema = employer_account_schema(&module);
@@ -717,7 +717,7 @@ async fn junction_backed_updating_into_a_cross_table_duplicate_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn junction_backed_read_through_the_interface_view_resolves_the_link() {
     // Confirms the fix's other half: reading `employer` back — including
     // through the *interface's* own path, not just each concrete

@@ -29,7 +29,7 @@
 //! create` proposed recreating them forever, even with zero real schema
 //! changes. Either scenario would have caught it immediately.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -84,7 +84,7 @@ fn triggered_schema(module: &str) -> SchemaDescriptor {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn phantom_trigger_regression_second_create_reports_zero_changes() {
     let module = unique_module("live_migdiff_offline");
     let schema = triggered_schema(&module);
@@ -124,7 +124,7 @@ async fn phantom_trigger_regression_second_create_reports_zero_changes() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn zero_changes_against_live_introspection_after_apply() {
     let module = unique_module("live_migdiff_introspect");
     let schema = triggered_schema(&module);
@@ -152,7 +152,7 @@ async fn zero_changes_against_live_introspection_after_apply() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn rename_detected_and_applied_survives_real_data() {
     let module = unique_module("live_migdiff_rename");
 
@@ -252,7 +252,7 @@ async fn rename_detected_and_applied_survives_real_data() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn property_type_change_casts_existing_data() {
     let module = unique_module("live_migdiff_cast");
 

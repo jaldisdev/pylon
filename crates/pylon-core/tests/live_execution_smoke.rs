@@ -24,7 +24,7 @@
 //! rejecting SQL Postgres would have happily accepted, or trigger/cascade
 //! logic that only misbehaves once a row is actually deleted.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring the
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring the
 //! existing live-DB test pattern in `pylon_core::migrate`'s test module and
 //! `pylon-pgcon`'s own tests — same DSN env var, same default
 //! (`postgresql://postgres:postgres@localhost:5432/pylon_live_test`, matching
@@ -78,7 +78,7 @@ fn smoke_schema(module: &str) -> SchemaDescriptor {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_and_select_round_trip_a_real_value() {
     let module = unique_module("live_smoke");
     let schema = smoke_schema(&module);

@@ -48,19 +48,19 @@ select default::Job filter .id = <uuid>$id for key share
 
 A trailing row-locking clause, placed last (after `order by`/`offset`/`limit`, matching Postgres's own grammar — not right after `filter`). Compiles straight through to Postgres's `SELECT ... FOR UPDATE|SHARE|NO KEY UPDATE|KEY SHARE [NOWAIT|SKIP LOCKED]`, with the same semantics:
 
-- **Lock strength** — `for update` (exclusive) and `for no key update` (exclusive, but doesn't block a foreign key referencing the row) block concurrent writers; `for share` and `for key share` (weaker: doesn't block a concurrent `for no key update`) block concurrent writers but allow concurrent readers.
+- **Lock strength** — `for update` (exclusive) and `for no key update` (exclusive, but doesn't block a foreign key referencing the object) block concurrent writers; `for share` and `for key share` (weaker: doesn't block a concurrent `for no key update`) block concurrent writers but allow concurrent readers.
 - **Wait behavior** — with no modifier, a transaction that can't acquire the lock blocks until it can. `nowait` fails immediately instead (Postgres's `55P03`/`lock_not_available` error) rather than waiting. `skip locked` silently excludes any row it can't lock instead of blocking or failing — the classic job-queue dequeue pattern:
 
   ```pyql
   select default::Job filter .status = 'pending' order by .priority asc limit 1 for update skip locked
   ```
 
-  Each worker's transaction claims the next unclaimed row and moves on; a row another worker already has locked is simply skipped, not waited for.
+  Each worker's transaction claims the next unclaimed object and moves on; an object another worker already has locked is simply skipped, not waited for.
 
 Not allowed — same restriction Postgres itself enforces, since a locking clause only makes sense when every output row maps 1:1 to a physical table row:
 
 - Combined with `distinct`.
-- On an interface (polymorphic) type — its rows span more than one underlying table.
+- On an interface (polymorphic) type — its objects span more than one underlying table.
 - On `select (insert/update/delete ...) { ... }` — there's nothing left to lock once the DML has already run.
 
 ## `distinct`
@@ -69,7 +69,7 @@ Not allowed — same restriction Postgres itself enforces, since a locking claus
 select distinct Person { name }
 ```
 
-A prefix modifier right after `select`, not a shape-level or per-column thing — deduplicates entire result rows.
+A prefix modifier right after `select`, not a shape-level or per-column thing — deduplicates entire result objects.
 
 ## Free selects
 
@@ -77,7 +77,7 @@ A prefix modifier right after `select`, not a shape-level or per-column thing �
 
 ```pyql
 select 1 + 2
-select { 1, 2, 3 }          # a set literal — three rows
+select { 1, 2, 3 }          # a set literal — three elements
 select (1, 'hello')          # a positional tuple — one row
 select { foo := 'bar', n := 42 }   # a free (named-field) object
 select str_lower('HELLO')

@@ -26,7 +26,7 @@
 //! file covers the whole pipeline (schema → DDL → real trigger firing →
 //! real NOTIFY delivery).
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -157,7 +157,7 @@ async fn trigger_notify_on_object_channel_delivers_decodable_json() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn trigger_notify_on_scalar_channel_delivers_the_property_value() {
     let module = unique_module("live_notify_scalar");
     let wire_name = format!("{module}__widget_pings");
@@ -206,7 +206,7 @@ async fn trigger_notify_on_scalar_channel_delivers_the_property_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
     let module = unique_module("live_notify_type");
     let wire_name = format!("{module}__widget_updates");

@@ -25,7 +25,7 @@ select assert_exists((select Person filter .id = <uuid>$id))
 select assert_distinct((select Person filter .company = <uuid>$company_id))
 ```
 
-`assert_exists(subquery)` raises a database-level error if the wrapped subquery's result is empty — turns "silently got zero rows" into a hard failure at the point that's actually wrong, rather than downstream. `assert_distinct(subquery)` raises if any element appears more than once.
+`assert_exists(subquery)` raises a database-level error if the wrapped subquery's result is empty — turns "silently got an empty set" into a hard failure at the point that's actually wrong, rather than downstream. `assert_distinct(subquery)` raises if any element appears more than once.
 
 ## `notify` / `notify_raw`
 
@@ -39,7 +39,7 @@ select notify_raw('any_channel_name', 'raw text payload')
 Sends a PostgreSQL `NOTIFY` on a schema-declared [`Channel`](../schema/channels.md)'s wire name. The payload's required shape depends on the Channel's own declared kind:
 
 - **Type-shaped** — payload must be `__new__` or `__old__` (only valid inside a [`Trigger`](../schema/triggers-and-rewrites.md) handler in this phase); sends that row's `id`, not the whole object.
-- **Scalar-shaped** — payload is any expression of the matching type, e.g. `.name` on the row a trigger handler is firing for.
+- **Scalar-shaped** — payload is any expression of the matching type, e.g. `.name` on the object a trigger handler is firing for.
 - **Object-shaped** — payload must be a free object literal (`{ field := expr, ... }`) whose field names match the declared shape exactly.
 
 `notify_raw(channel_name, payload)` bypasses Channel resolution and payload-shape checking entirely — both arguments are arbitrary text expressions, an escape hatch for a channel Pylon doesn't know about.

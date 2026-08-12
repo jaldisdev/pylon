@@ -22,7 +22,7 @@
 //! feature surface: no access policies, no set-scoped ("for all")
 //! triggers, always per-row.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -102,7 +102,7 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_writes_to_another_type() {
     let module = unique_module("live_trig_insert");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
@@ -142,7 +142,7 @@ async fn insert_writes_to_another_type() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn delete_reads_old_row() {
     let module = unique_module("live_trig_delete");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
@@ -188,7 +188,7 @@ async fn delete_reads_old_row() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_reads_both_old_and_new() {
     let module = unique_module("live_trig_update");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
@@ -235,7 +235,7 @@ async fn update_reads_both_old_and_new() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multiple_independent_triggers_all_fire() {
     // Several triggers on one type,
     // including one combined-event trigger (Insert|Update|Delete) that
@@ -324,7 +324,7 @@ async fn multiple_independent_triggers_all_fire() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn trigger_updates_a_linked_row_of_another_type() {
     // Not just an audit-log insert,
     // a real cross-type mutation of a *linked* row.
@@ -373,7 +373,7 @@ async fn trigger_updates_a_linked_row_of_another_type() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn trigger_chaining_across_types() {
     // An insert trigger on A inserts
     // into B, and B's own insert trigger also fires (real Postgres row-
@@ -434,7 +434,7 @@ async fn trigger_chaining_across_types() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn before_trigger_does_not_block_the_operation_it_fires_on() {
     // Exercises the RETURN-statement fix live: a `Before` trigger's return
     // value is what Postgres actually persists/allows — the wrong RETURN
@@ -495,7 +495,7 @@ async fn before_trigger_does_not_block_the_operation_it_fires_on() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn migration_path_emits_the_same_working_trigger() {
     // Mirrors `live_execution_on_delete.rs`'s own final "migration path
     // parity" test — proves `diff_schema_steps` (the incremental-migration

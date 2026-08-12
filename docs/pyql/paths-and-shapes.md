@@ -36,7 +36,7 @@ select Post { title, authors := .<posts[is Person] { name } }
 select Person { name, other := (select detached Person filter .id != .id) }
 ```
 
-Evaluates the wrapped expression independently of the current implicit scope — breaks a path out of whatever object it would otherwise be resolved relative to. Useful inside a nested shape when you need a genuinely separate query, not one correlated to the row currently being projected.
+Evaluates the wrapped expression independently of the current implicit scope — breaks a path out of whatever object it would otherwise be resolved relative to. Useful inside a nested shape when you need a genuinely separate query, not one correlated to the object currently being projected.
 
 ## Shapes
 

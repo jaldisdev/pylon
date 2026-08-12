@@ -8,9 +8,9 @@ for name in {'Alice', 'Bob', 'Carol'} union (
 )
 ```
 
-`for [optional] var in <iterator> [union] <body>` — evaluates `body` once per element of `iterator`, collecting the results into one set. `union` is a readability keyword; `for var in iter (stmt)` (no `union`) parses identically. `optional` allows the loop to run once with `var` bound to nothing if `iterator` is empty, instead of producing zero rows.
+`for [optional] var in <iterator> [union] <body>` — evaluates `body` once per element of `iterator`, collecting the results into one set. `union` is a readability keyword; `for var in iter (stmt)` (no `union`) parses identically. `optional` allows the loop to run once with `var` bound to nothing if `iterator` is empty, instead of producing an empty set.
 
-The body is most often a parenthesized `insert`/`update`/`delete`/`select` — a bulk mutation driven by a set of inputs, the PyQL equivalent of looping over rows client-side and issuing one statement per row, but compiled as a single query.
+The body is most often a parenthesized `insert`/`update`/`delete`/`select` — a bulk mutation driven by a set of inputs, the PyQL equivalent of looping over objects client-side and issuing one statement per object, but compiled as a single query.
 
 ## `GROUP`
 
@@ -24,7 +24,7 @@ group Person { name } by .age
 Each result row decodes to `{"key": {...}, "grouping": [...], "elements": [...]}`:
 
 - `key` — a dict keyed by each `by` name (a `using` alias, or the bare property name when grouping directly by a property), holding that group's key value(s).
-- `elements` — the list of shaped rows belonging to that group.
+- `elements` — the set of shaped objects belonging to that group.
 - `grouping` — which key names actually apply to this row (relevant only for advanced multi-level grouping).
 
 ## `WITH`

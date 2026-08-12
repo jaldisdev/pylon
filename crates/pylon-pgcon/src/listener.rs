@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn receives_a_notification_on_a_listened_channel() {
         use std::sync::{Arc, Mutex};
         let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn does_not_receive_notifications_on_channels_never_listened_to() {
         use std::sync::{Arc, Mutex};
         let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn unlisten_stops_further_notifications() {
         use std::sync::{Arc, Mutex};
         let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn queries_run_on_the_same_connection_as_listen() {
         let listener = PgListener::connect(&test_dsn(), |_n| {}).await.unwrap();
         listener
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn query_typed_named_decodes_every_column_by_name() {
         // Named-column access, which
         // pylon.worker/pylon.vector/pylon.search rely on — unlike

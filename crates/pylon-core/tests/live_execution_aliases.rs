@@ -31,7 +31,7 @@
 //! actually produce correct query results against real data, not just that
 //! the alias's own body compiles in isolation.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -155,7 +155,7 @@ async fn seed(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn plain_select_uses_the_aliases_own_filter() {
     let module = unique_module("live_alias_filter");
     let sd = schema(&module);
@@ -176,7 +176,7 @@ async fn plain_select_uses_the_aliases_own_filter() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn outer_filter_ands_with_the_aliases_own_filter() {
     let module = unique_module("live_alias_and");
     let sd = schema(&module);
@@ -209,7 +209,7 @@ async fn outer_filter_ands_with_the_aliases_own_filter() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn outer_order_by_overrides_the_aliases_own_order_by() {
     let module = unique_module("live_alias_order");
     let sd = schema(&module);
@@ -232,7 +232,7 @@ async fn outer_order_by_overrides_the_aliases_own_order_by() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn aliases_own_order_and_limit_apply_with_no_outer_override() {
     let module = unique_module("live_alias_limit");
     let sd = schema(&module);
@@ -253,7 +253,7 @@ async fn aliases_own_order_and_limit_apply_with_no_outer_override() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn outer_limit_overrides_the_aliases_own_limit() {
     let module = unique_module("live_alias_outer_limit");
     let sd = schema(&module);
@@ -271,7 +271,7 @@ async fn outer_limit_overrides_the_aliases_own_limit() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn outer_shape_replaces_the_aliases_own_shape() {
     let module = unique_module("live_alias_shape");
     let sd = schema(&module);

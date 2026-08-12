@@ -40,19 +40,9 @@ from pylon.schema._registry import signals_snapshot, snapshot
 from pylon.schema._triggers import signal
 from pylon.schema._walker import walk
 
-
-def _core_has_new_api() -> bool:
-    try:
-        from pylon import _core
-
-        return hasattr(_core, 'Guidance')
-    except ImportError:
-        return False
-
-
-requires_new_core = pytest.mark.skipif(not _core_has_new_api(), reason='Requires rebuilt pylon._core with Guidance')
-
-pytestmark = [pytest.mark.live_db, requires_new_core]
+# A stale `pylon._core` is caught once, for the whole run, in conftest.py's
+# `pytest_configure`.
+pytestmark = [pytest.mark.live_db]
 
 
 def _build_schema(types, enums, scalars, signals=None):

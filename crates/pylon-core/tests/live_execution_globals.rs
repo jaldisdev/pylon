@@ -36,7 +36,7 @@
 //! compared it against a real non-text column (confirmed live, then fixed;
 //! see `Compiler::resolve_global_pg_type`'s own doc comment).
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -136,7 +136,7 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn session_global_of_uuid_type_filters_correctly() {
     // The exact type shape the bug lived in: a Global[UUID] compared
     // against a real uuid column. Before the fix this failed to even
@@ -174,7 +174,7 @@ async fn session_global_of_uuid_type_filters_correctly() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn session_global_unbound_is_null() {
     let module = unique_module("live_g_null");
     let widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
@@ -204,7 +204,7 @@ async fn session_global_unbound_is_null() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn session_global_of_array_type_resolves_correctly() {
     // Covers the array<...> branch resolve_global_pg_type's fix added —
     // pylon-demo's own `favorite_tags: Global[list[Str] | None]` is this
@@ -238,7 +238,7 @@ async fn session_global_of_array_type_resolves_correctly() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn computed_global_reads_a_session_global_it_references() {
     // The regression scenario itself: a computed global's own expression
     // references a *different* session global — this is exactly what

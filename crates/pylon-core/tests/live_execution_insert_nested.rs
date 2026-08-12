@@ -40,7 +40,7 @@
 //! approach here was verified correct manually against real Postgres before
 //! being wired into the compiler.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -134,7 +134,7 @@ fn as_array(v: &DecodedValue) -> &[DecodedValue] {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_link_value_from_a_nested_insert_subquery() {
     let module = unique_module("live_insert_nested_link");
     let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
@@ -184,7 +184,7 @@ async fn insert_link_value_from_a_nested_insert_subquery() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn select_insert_shape_chaining_reads_the_newly_inserted_rows_fields() {
     let module = unique_module("live_insert_select_chain");
     let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
@@ -215,7 +215,7 @@ async fn select_insert_shape_chaining_reads_the_newly_inserted_rows_fields() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_assigns_a_multilink_directly_not_via_append() {
     let module = unique_module("live_insert_multilink_assign");
     let person = ty("Person", &module, vec![id_prop(), text_prop("name")]);

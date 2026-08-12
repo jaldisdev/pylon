@@ -31,7 +31,7 @@
 //! own anywhere in the suite before this file (only indirectly, as setup
 //! steps inside other files' scenarios).
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -135,7 +135,7 @@ fn as_uuid(v: &DecodedValue) -> [u8; 16] {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_with_filter_modifies_only_matching_rows() {
     let module = unique_module("live_update_filter");
     let sd = schema_with_post(&module);
@@ -173,7 +173,7 @@ async fn update_with_filter_modifies_only_matching_rows() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_self_referential_expression_reads_the_existing_row_value() {
     let module = unique_module("live_update_self_ref");
     let sd = schema_with_post(&module);
@@ -203,7 +203,7 @@ async fn update_self_referential_expression_reads_the_existing_row_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_replaces_a_single_link() {
     let module = unique_module("live_update_link");
     let sd = schema_with_post(&module);
@@ -247,7 +247,7 @@ async fn update_replaces_a_single_link() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_replaces_a_single_link_with_a_nested_insert() {
     let module = unique_module("live_update_nested_link");
     let sd = schema_with_post(&module);
@@ -305,7 +305,7 @@ async fn update_replaces_a_single_link_with_a_nested_insert() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_returns_the_ids_of_the_rows_it_touched() {
     let module = unique_module("live_update_returning");
     let sd = schema_with_post(&module);

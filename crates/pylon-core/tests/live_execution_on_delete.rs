@@ -280,7 +280,7 @@ async fn rows_of(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &s
 // ── Single-link on_delete policies ──────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn single_link_default_restrict_blocks_delete_while_referenced() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Org {{ name := 'Acme' }}")).await;
@@ -305,7 +305,7 @@ async fn single_link_default_restrict_blocks_delete_while_referenced() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn single_link_allow_sets_the_fk_null_on_target_delete() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Org {{ name := 'Acme' }}")).await;
@@ -344,7 +344,7 @@ async fn single_link_allow_sets_the_fk_null_on_target_delete() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn single_link_target_delete_source_cascades_to_the_team() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Org {{ name := 'Acme' }}")).await;
@@ -369,7 +369,7 @@ async fn single_link_target_delete_source_cascades_to_the_team() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn single_link_source_delete_target_always_deletes_the_org() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Org {{ name := 'Acme' }}")).await;
@@ -394,7 +394,7 @@ async fn single_link_source_delete_target_always_deletes_the_org() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn single_link_source_delete_target_if_orphan_respects_other_references() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Org {{ name := 'Shared' }}")).await;
@@ -459,7 +459,7 @@ async fn single_link_source_delete_target_if_orphan_respects_other_references() 
 /// rows, regardless of any `on_delete` policy — `source_jt_fk_suffix` is
 /// hardcoded to `ON DELETE CASCADE` and isn't configurable.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn deleting_the_owner_always_cleans_up_its_own_junction_rows() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
@@ -490,7 +490,7 @@ async fn deleting_the_owner_always_cleans_up_its_own_junction_rows() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_default_restrict_blocks_target_delete_while_referenced() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
@@ -511,7 +511,7 @@ async fn multilink_default_restrict_blocks_target_delete_while_referenced() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_allow_removes_the_junction_row_on_target_delete() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
@@ -551,7 +551,7 @@ async fn multilink_allow_removes_the_junction_row_on_target_delete() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_target_delete_source_cascades_to_the_product() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
@@ -576,7 +576,7 @@ async fn multilink_target_delete_source_cascades_to_the_product() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_source_delete_target_always_deletes_the_tag() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
@@ -601,7 +601,7 @@ async fn multilink_source_delete_target_always_deletes_the_tag() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_source_delete_target_if_orphan_respects_other_references() {
     let (module, schema, pool) = setup().await;
     exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'shared' }}")).await;
@@ -660,7 +660,7 @@ async fn multilink_source_delete_target_if_orphan_respects_other_references() {
 /// and re-runs one single-link and one multilink on_delete scenario against
 /// it, proving the two DDL-generation paths now agree.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn migration_path_emits_working_deletion_policy_triggers() {
     let module = unique_module("live_on_delete_migration");
     let schema = on_delete_schema(&module);

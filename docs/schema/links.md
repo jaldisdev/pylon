@@ -63,8 +63,8 @@ messages: pylon.MultiLink[Message, pylon.OnDelete(Source, DeleteTargetIfOrphan)]
 | `Allow` | Deletion proceeds; the reference is simply cleared/removed. |
 | `Restrict` | Block the delete outright while a reference exists (an immediate, non-deferred check). |
 | `DeferredRestrict` | Same block, checked at transaction commit instead of immediately — allows a same-transaction reorder (e.g. delete both sides of a pair together) that an immediate `Restrict` would reject mid-transaction. |
-| `DeleteSource` | Deleting the target cascades to delete the row(s) referencing it. |
-| `DeleteTarget` | Deleting the source cascades to delete the row(s) it references. |
+| `DeleteSource` | Deleting the target cascades to delete the object(s) referencing it. |
+| `DeleteTarget` | Deleting the source cascades to delete the object(s) it references. |
 | `DeleteTargetIfOrphan` | Like `DeleteTarget`, but only if no other row still references that target. |
 
 With no `OnDelete` declared at all, a `Link`'s target defaults to a plain foreign key with Postgres's own default behavior — deleting a still-referenced row is blocked. Declare `OnDelete(Target, Allow)` explicitly if you want the reference silently cleared instead.

@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn connects_and_round_trips_a_scalar_query() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let rows = pool.query_raw("SELECT 1 + 1").await.unwrap();
@@ -567,7 +567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn pool_is_reused_across_multiple_queries() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         for i in 0..5 {
@@ -578,14 +578,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn invalid_dsn_fails_to_connect() {
         let result = PgPool::connect("not-a-valid-dsn", 5).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn connect_fails_eagerly_against_a_nonexistent_database() {
         // A well-formed DSN pointing at a database that doesn't exist must
         // fail right here, not lazily on the first query — matching
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn bad_sql_returns_an_error_not_a_panic() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let result = pool.query_raw("SELECT this is not valid sql").await;
@@ -621,7 +621,7 @@ mod tests {
     // here, not just in self-consistent hand-rolled fixtures.
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_a_bare_scalar_result_column() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let rows = pool
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_a_composite_matching_pylon_cores_own_emission_shape() {
         // Mirrors exactly what `sql/mod.rs::emit_bound_select` emits:
         // `SELECT (type_disc, col1, col2, ...) AS result`.
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_nested_composite_and_array_of_composite_for_real() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let sql = "SELECT (\
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_array_of_text_for_real() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let sql = "SELECT (ARRAY['a', 'b', NULL]::text[]) AS result";
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_numeric_and_jsonb_and_uuid_for_real() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let sql = "SELECT (\
@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_bytea_for_real() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let rows = pool
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn decodes_enum_cast_to_text_for_real() {
         // pylon-core always ::text-casts enum-typed columns (sql/mod.rs's
         // emit_scalar) specifically so the runtime-assigned enum OID never
@@ -840,7 +840,7 @@ mod tests {
     // ── query_explain against real Postgres ─────────────────────────────
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn query_explain_returns_parseable_json_with_a_plan_node() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let raw = pool.query_explain("SELECT 1 + 1", &[]).await.unwrap();
@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn query_explain_binds_params_the_same_way_query_typed_does() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let raw = pool
@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_bool_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_integer_params_at_every_width() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_float_params() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_text_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_bytea_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
@@ -933,7 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_uuid_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let bytes = [0x11u8; 16];
@@ -944,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn binds_a_plain_string_as_a_uuid_param() {
         // A JSON API request body (see `pylon serve`'s /api/<connection>/query
         // handler) necessarily carries a UUID query parameter as plain text —
@@ -962,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn binds_a_plain_string_as_a_jsonb_param() {
         // Regression test for a real bug: `migration apply`'s db_state
         // snapshot update binds already-serialized JSON text (a plain Rust
@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_numeric_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(
@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_null_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         assert_eq!(round_trip(&pool, "int8", DecodedValue::Null).await, DecodedValue::Null);
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_array_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let param = DecodedValue::Array(vec![
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_int_array_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let param = DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2), DecodedValue::I64(3)]);
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn round_trips_jsonb_object_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let param = DecodedValue::Object(vec![
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn query_typed_matches_pylon_cores_own_param_binding_convention() {
         // $1, $2, ... positional, matching multiple params in one query —
         // the same shape a real PyQL query with several kwargs produces.
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn wrong_param_count_returns_an_error_not_a_panic() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let result = pool
@@ -1078,7 +1078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn execute_typed_runs_a_mutation_and_reports_affected_rows() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw("CREATE TEMP TABLE IF NOT EXISTS pgcon_execute_test (id int8, name text)")
@@ -1121,7 +1121,7 @@ mod tests {
     // assumed from the SQLSTATE spec alone.
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn unique_violation_reports_23505() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw("CREATE TEMP TABLE pgcon_unique_test (id int8 PRIMARY KEY)")
@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn foreign_key_violation_reports_23503() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw("CREATE TEMP TABLE pgcon_fk_parent (id int8 PRIMARY KEY)")
@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn check_violation_reports_23514() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw("CREATE TEMP TABLE pgcon_check_test (age int8 CHECK (age >= 0))")
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn domain_check_violation_reports_the_domain_name_not_the_constraint_name() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw(
@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn syntax_error_has_no_sqlstate_matching_constraint_codes() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let err = pool.query_raw("SELECT this is not valid sql").await.unwrap_err();
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn connection_pool_error_has_no_sqlstate() {
         // A bad DSN never reaches Postgres at all — no SQLSTATE to report,
         // unlike a real server-side rejection.
@@ -1237,7 +1237,7 @@ mod tests {
     // ── PgTransaction: begin/commit/rollback on real Postgres ───────────
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn committed_transaction_persists_its_writes() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw("CREATE TEMP TABLE pgcon_tx_commit_test (id int8 PRIMARY KEY)")
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn rolled_back_transaction_discards_its_writes() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw("CREATE TEMP TABLE pgcon_tx_rollback_test (id int8 PRIMARY KEY)")
@@ -1291,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn begin_actually_sets_the_requested_isolation_level() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         for (level, expected) in [
@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn begin_rejects_an_unknown_isolation_level() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let result = pool.begin("not_a_real_level").await;
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn a_pooled_connection_is_reusable_after_commit_and_after_rollback() {
         // Guards the exact hazard begin()/PgTransaction's doc comment
         // describes: deadpool's default Fast recycling does nothing to a
@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn failed_commit_leaves_the_connection_reusable() {
         // Forces a real 40001 serialization failure at COMMIT time (the
         // same interleaving as `serializable_transactions_conflict_with_40001`
@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn serializable_transactions_conflict_with_40001() {
         // The canonical serialization-anomaly example from the Postgres
         // docs (13.2.3): two SERIALIZABLE transactions each read one
@@ -1484,7 +1484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn concurrent_transactions_deadlock_with_40p01() {
         // Classic reproducible deadlock: two transactions lock two rows in
         // opposite order. tx1 locks row 1 then blocks on row 2; tx2 locks
