@@ -121,4 +121,44 @@ impl AppState {
             pylon_workers::metrics::record_pool_status(name, &client.raw_connection().status());
         }
     }
+
+    /// Samples `_pylon."IndexOutbox"` into the queue-depth gauges, using the
+    /// main connection. Sampled here rather than from inside a worker on
+    /// purpose: the case worth seeing is an index kind with rows piling up
+    /// and *no* worker running to report on them (a `[search]` or
+    /// `[models.*]` section that was never configured), which a
+    /// worker-driven metric can't observe.
+    ///
+    /// Best-effort — a failure here must not fail the `/metrics` response.
+    pub async fn record_outbox_metrics(&self) {
+        let Some(client) = self.clients.lock().await.get(MAIN_CONNECTION_ALIAS).cloned() else {
+            return;
+        };
+        let pool = client.raw_connection();
+        let rows = match pool
+            .query_typed_named(pylon_workers::metrics::OUTBOX_DEPTH_SQL, &[], pool.types())
+            .await
+        {
+            Ok(rows) => rows,
+            // The outbox table only exists once a schema with an index has
+            // been migrated; before that there is simply nothing to report.
+            Err(_) => return,
+        };
+        for row in &rows {
+            let pylon_value::DecodedValue::Object(fields) = row else {
+                continue;
+            };
+            let get = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+            let (
+                Some(pylon_value::DecodedValue::Str(kind)),
+                Some(pylon_value::DecodedValue::Str(status)),
+                Some(pylon_value::DecodedValue::I64(depth)),
+                Some(pylon_value::DecodedValue::I64(age)),
+            ) = (get("index_kind"), get("status"), get("depth"), get("oldest_age"))
+            else {
+                continue;
+            };
+            pylon_workers::metrics::record_outbox_depth(kind, status, *depth, *age);
+        }
+    }
 }

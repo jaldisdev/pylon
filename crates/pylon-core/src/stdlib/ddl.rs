@@ -169,11 +169,16 @@ pub const INDEX_OUTBOX_DDL: &str = concat!(
     "    attempts      int         NOT NULL DEFAULT 0,\n",
     "    enqueued_at   timestamptz NOT NULL DEFAULT now(),\n",
     "    next_attempt  timestamptz,\n",
+    // When the current worker claimed this row. Lets a later drain tell an
+    // in-flight batch from one abandoned by a worker that died holding it.
+    "    claimed_at    timestamptz,\n",
     "    PRIMARY KEY (id),\n",
     "    UNIQUE NULLS NOT DISTINCT (object_id, index_kind, index_name)\n",
     ");\n",
     "ALTER TABLE _pylon.\"IndexOutbox\" ADD COLUMN IF NOT EXISTS\n",
-    "    operation text NOT NULL DEFAULT 'index';\n\n",
+    "    operation text NOT NULL DEFAULT 'index';\n",
+    "ALTER TABLE _pylon.\"IndexOutbox\" ADD COLUMN IF NOT EXISTS\n",
+    "    claimed_at timestamptz;\n\n",
     "CREATE INDEX IF NOT EXISTS \"IndexOutbox_status_next_attempt\" ON _pylon.\"IndexOutbox\" (status, next_attempt)\n",
     "    WHERE status IN ('Pending', 'Failed');\n\n",
     "CREATE OR REPLACE FUNCTION _pylon.notify_index_queue()\n",

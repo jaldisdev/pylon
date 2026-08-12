@@ -116,6 +116,14 @@ impl PgListener {
         query_typed_named_on(&self.client, sql, params, ext).await
     }
 
+    /// Runs `sql` via the simple query protocol — no bind parameters, but
+    /// able to run several `;`-separated statements in one call, matching
+    /// `PgPool::batch_execute`. Used for bootstrap DDL on this connection.
+    pub async fn batch_execute(&self, sql: &str) -> Result<()> {
+        self.client.batch_execute(sql).await?;
+        Ok(())
+    }
+
     pub async fn execute_typed(&self, sql: &str, params: &[DecodedValue]) -> Result<u64> {
         execute_typed_on(&self.client, sql, params).await
     }
