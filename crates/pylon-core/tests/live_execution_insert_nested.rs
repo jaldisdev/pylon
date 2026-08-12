@@ -24,8 +24,7 @@
 //! only `SELECT` is valid there), `select (insert ...) { ... }` chaining
 //! (reading the newly inserted row's own fields back out, not just its
 //! `id`), and a multilink assigned directly at insert time (`members :=
-//! {...}`) rather than appended after the fact via `+=`. Concepts inspired
-//! by Gel's own `test_edgeql_insert.py`, not ported literally — `+=`/`-=`
+//! {...}`) rather than appended after the fact via `+=`. `+=`/`-=`
 //! multi-link mutation and link-property (`Through[...]`) round-tripping
 //! are already covered in depth by `live_execution_linkprops.rs` and
 //! `live_execution_backlinks.rs`; this file is scoped to the three shapes

@@ -105,20 +105,20 @@ pub enum DecodedValue {
     // `DecodedValue: Archive`, forever) — see rkyv's own docs on recursive
     // types.
     /// A genuine Postgres array (`text[]`, `int8[]`, ...) — reconstructed
-    /// Python-side as a `list`, matching what asyncpg has always decoded a
+    /// Python-side as a `list`, matching what has always decoded a
     /// Postgres array into. Do not use this for a composite/record's
     /// positional fields; see `Composite`.
     Array(#[rkyv(omit_bounds)] Vec<DecodedValue>),
     /// A positional composite (`record` — a schema object's own field
     /// tuple, or a nested `ROW(...)`), reconstructed Python-side as a
-    /// `tuple`, matching `asyncpg.Record`'s own behavior — critically,
+    /// `tuple`, matching a record row's own behavior — critically,
     /// `isinstance(a_tuple, (dict, list))` is `False`, the same as a real
-    /// `asyncpg.Record`, which `pylon.query._decode()`'s `"named_tuple"`
+    /// a record row, which `pylon.query._decode()`'s `"named_tuple"`
     /// case relies on to tell "this position holds a raw jsonb value"
     /// apart from "this position holds a composite that needs `value[pos]`
     /// indexing first." Using `Array` (→ `list`) here instead silently
     /// breaks that check — a real bug caught by comparing decoded output
-    /// against the live asyncpg path on real queries.
+    /// against the live driver path on real queries.
     Composite(#[rkyv(omit_bounds)] Vec<DecodedValue>),
     /// Field name + value pairs, in shape order (not a map — field order is
     /// part of what `ShapeNode` positions describe, and duplicate names
@@ -154,7 +154,7 @@ pub enum DecodedValue {
 //
 // `i16`/`i32` and `f32` widen into this crate's single `I64`/`F64` variants
 // rather than getting their own — `DecodedValue` has never distinguished
-// integer/float width the way Postgres or Gel's own wire protocol does
+// integer/float width the way Postgres's own wire protocol does
 // (every integer column decodes to `I64`, every float column to `F64`
 // already, regardless of the underlying `int2`/`int4`/`int8` or
 // `float4`/`float8` column type), so these conversions just meet that

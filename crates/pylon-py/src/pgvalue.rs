@@ -31,7 +31,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 
 use pylon_value::DecodedValue;
 
-/// Encodes an already-decoded Python value (from asyncpg historically, or
+/// Encodes an already-decoded Python value (from
 /// any caller handing us a plain Python value to bind/cache) into
 /// `DecodedValue`. Runtime-type-driven, not shape-driven — the shape is
 /// only consulted later, by the unmodified `_decode()`.
@@ -158,11 +158,11 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
         return Ok(DecodedValue::Object(entries));
     }
     // A genuine Postgres array (`Array`) vs. a positional composite/record
-    // (`Composite`, e.g. `asyncpg.Record`, a plain `tuple`) matter on the
+    // (`Composite`, a plain `tuple`) matter on the
     // way back out: `_decode()`'s `"named_tuple"` case uses `isinstance(_,
     // (dict, list))` to tell "this position already holds the raw jsonb
     // value" apart from "this position holds a composite that needs
-    // `value[pos]` indexing first" — `asyncpg.Record` (and, correspondingly,
+    // `value[pos]` indexing first" — a record row (and, correspondingly,
     // `DecodedValue::Composite` → `tuple`) reads as neither dict nor list,
     // which the check relies on. A `list` genuinely means "Postgres array."
     if let Ok(l) = value.cast::<PyList>() {
@@ -182,7 +182,7 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
 }
 
 /// Reconstructs a Python value from `DecodedValue`, structurally equivalent
-/// to what asyncpg would have decoded — safe to feed into the existing
+/// to what the driver decodes — safe to feed into the existing
 /// `_decode()`/`_hydrate()` exactly as if it came from a live query,
 /// regardless of whether it actually did or came from the cache.
 pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResult<Bound<'py, PyAny>> {
@@ -202,7 +202,7 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
         DecodedValue::Decimal(s) => py.import("decimal")?.getattr("Decimal")?.call1((s,))?,
         DecodedValue::Array(items) => {
             // A Postgres array reconstructs as a `list` — matching what
-            // asyncpg has always decoded a Postgres array into, since a
+            // a Postgres array has always decoded into, since a
             // plain scalar array-typed property (e.g. `Person.tags:
             // pylon.Array[pylon.Str]`) is delivered to the caller as-is,
             // with no further node-based decoding to hide the container
@@ -215,7 +215,7 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
         }
         DecodedValue::Composite(items) => {
             // A positional composite/record reconstructs as a `tuple`,
-            // matching `asyncpg.Record`'s own behavior — see
+            // matching a record row's own behavior — see
             // `py_to_cached`'s note on why `_decode()` needs this distinct
             // from `Array`/`list`.
             let elems = items

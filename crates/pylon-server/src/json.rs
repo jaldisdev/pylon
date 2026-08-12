@@ -18,7 +18,7 @@
 //
 
 //! JSON request/response helpers — the hyper counterpart of
-//! `pylon/server/asgi.py`'s `_read_json_body`/`_send_json`. hyper's own
+//! JSON request-body reading and response writing. hyper's own
 //! `Incoming` body already gives the whole request body via
 //! `http_body_util::BodyExt::collect()` — no manual ASGI-style
 //! `more_body` loop needed.

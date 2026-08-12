@@ -17,13 +17,12 @@
 // limitations under the License.
 //
 
-//! `/api/...` route handlers — Rust port of the matching handlers in
-//! `pylon/server/asgi.py`.
+//! `/api/...` route handlers.
 //!
 //! **Known gap, flagged explicitly rather than silently shipped**: the
 //! `shape` field `/api/query`'s response carries (driving the frontend's
 //! type-aware `JsonTree` rendering — `shape_value_tags`/`_mark_decimals`/
-//! `_merge_decimal_shape` in `asgi.py`) is not ported yet; this returns
+//! decimal-aware shape tagging) is not implemented yet; this returns
 //! `"shape": null` for now. Porting it is real, separate work (walking
 //! `ShapeNode` into the frontend's value-tree-aligned tag format) — noted
 //! here so it isn't mistaken for an oversight.
@@ -157,8 +156,7 @@ pub async fn handle_analyze(state: Arc<AppState>, connection: &str, body: serde_
     )
 }
 
-/// `GET /api/<connection>/stats` — mirrors `asgi.py::_handle_get_stats`,
-/// excluding junction tables (both `through()`-backed and implicit) from
+/// `GET /api/<connection>/stats` — excludes junction tables (both `through()`-backed and implicit) from
 /// the `pg_stat_user_tables`-derived object-count estimate.
 pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Full<Bytes>> {
     let client = match state.resolve_client(connection).await {
@@ -255,8 +253,7 @@ pub fn handle_connections(state: &AppState) -> Response<Full<Bytes>> {
     )
 }
 
-/// `GET /api/models` — only "chat"-purpose models, matching
-/// `asgi.py::_handle_get_models`.
+/// `GET /api/models` — only "chat"-purpose models.
 pub fn handle_models(state: &AppState) -> Response<Full<Bytes>> {
     let mut models: Vec<serde_json::Value> = state
         .config

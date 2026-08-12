@@ -20,10 +20,9 @@
 //! The crate's single error type — deliberately *not* a boxed
 //! `dyn std::error::Error`, unlike the rest of this crate's early phases.
 //! Error mapping to Pylon's Python exception hierarchy (`pylon.exceptions`)
-//! needs the Postgres SQLSTATE code, exactly like `asyncpg`'s own typed
-//! exception classes (`asyncpg.SerializationError.sqlstate == "40001"`,
-//! `asyncpg.DeadlockDetectedError.sqlstate == "40P01"`) already give the
-//! current Python-side `_fmt_pg_error` today. Erasing into a boxed
+//! needs the Postgres SQLSTATE code (`"40001"` serialization failure,
+//! `"40P01"` deadlock detected) to pick the right class, and the Python-side
+//! `_fmt_pg_error` needs it to format the message. Erasing into a boxed
 //! `dyn Error` at every `?` site — this crate's original design — throws
 //! that code away before it can ever reach the pyo3 boundary.
 

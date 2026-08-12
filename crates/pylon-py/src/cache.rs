@@ -19,7 +19,7 @@
 
 //! pyo3 bindings over `pylon-cache`.
 //!
-//! Thin glue only: encode/decode between Python's already-asyncpg-decoded
+//! Thin glue only: encode/decode between Python's already-decoded
 //! `record["result"]` values and `pylon_cache::DecodedValue`, plus a single
 //! process-global `Cache` handle. No shape/type knowledge is needed here —
 //! the cache stores a structural mirror of whatever Python value it was
@@ -50,7 +50,7 @@ fn cache_err<E: std::fmt::Display>(e: E) -> PyErr {
 /// The process-global `Cache` handle `cache_init` opened, if any — shared
 /// with `workers::run_cache_invalidation_worker_shared` so `pylon serve`
 /// (which now also runs the cache-invalidation worker in-process, see
-/// `pylon/server/asgi.py`) evicts through the *same* open LMDB environment
+/// `pylon serve`) evicts through the *same* open LMDB environment
 /// its own read-through cache uses, rather than a second `Cache::open` on
 /// the same path — LMDB refuses that within one process.
 pub(crate) fn shared_cache() -> Option<Arc<Cache>> {
@@ -92,7 +92,7 @@ fn cache_get<'py>(py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyLi
     Ok(Some(PyList::new(py, rows)?))
 }
 
-/// Caches `rows` (each `record["result"]` from asyncpg, already decoded)
+/// Caches `rows` (each `record["result"]`, already decoded)
 /// under `key`, tagged with `tags` for later invalidation.
 #[pyfunction]
 fn cache_put(key: &str, tags: Vec<String>, rows: Vec<Bound<'_, PyAny>>) -> PyResult<()> {

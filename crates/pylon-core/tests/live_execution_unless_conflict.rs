@@ -28,10 +28,8 @@
 //! genuinely upserts in place rather than erroring or creating a duplicate,
 //! and a bare column reference inside that `else` update resolves against
 //! the *existing* conflicting row's own value, not the attempted insert's.
-//! Scenarios inspired by the upsert-shaped cases in Gel's own
-//! `test_edgeql_insert.py`, adapted to Pylon's syntax (`unless conflict`,
-//! not Gel's `unless conflict on ... else`, which differs in argument
-//! shape) and schema (a plain `Exclusive` property, not Gel's constraint
+//! Upsert-shaped scenarios in Pylon's own syntax (`unless conflict`) and
+//! schema (a plain `Exclusive` property, not a separate constraint
 //! model).
 //!
 //! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every

@@ -21,9 +21,8 @@
 //! expression referenced like any other type name, with the outer query's
 //! own filter/shape/order-by/offset/limit merged onto the alias's own
 //! select (`Compiler::try_compile_alias_select`). Concepts inspired by the
-//! filter/clause/limit-interaction scenarios in Gel's own
-//! `test_edgeql_expr_aliases.py`, not ported literally — that suite is
-//! mostly built around Gel's `CREATE ALIAS` DDL object and schema
+//! filter/clause/limit-interaction scenarios. Pylon has no `CREATE ALIAS`
+//! DDL object and no schema
 //! introspection, which Pylon's `Alias` (a plain module-level annotation,
 //! no DDL/introspection surface of its own) doesn't have.
 //!

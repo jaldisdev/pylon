@@ -1540,7 +1540,7 @@ impl CompiledQuery {
     }
 
     /// Ordered parameter names matching $1, $2, … in the SQL.
-    /// Use this to map kwargs to positional arguments for asyncpg.
+    /// Use this to map kwargs to positional query arguments.
     #[getter]
     fn param_names<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
         pyo3::types::PyList::new(py, self.inner.param_names.iter().map(|s| s.as_str()))
@@ -1548,7 +1548,7 @@ impl CompiledQuery {
     }
 
     /// Shape descriptor as a nested Python dict.
-    /// Walk this alongside each ``result`` column from asyncpg to decode records.
+    /// Walk this alongside each ``result`` column to decode records.
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyAny>> {
         shape_node_to_py(py, &self.inner.shape.root)

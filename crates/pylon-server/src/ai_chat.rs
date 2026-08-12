@@ -17,8 +17,8 @@
 // limitations under the License.
 //
 
-//! `POST /api/<connection>/ai/chat` — Rust port of `pylon/server/asgi.py`'s
-//! `_handle_ai_chat`/`_make_chat_provider`/`_resolve_vector_index_pointers`.
+//! `POST /api/<connection>/ai/chat` — chat-provider dispatch and
+//! vector-index pointer resolution for the Query Editor's assistant.
 //!
 //! The AI tab's RAG loop: runs `vector::search` for context, templates a
 //! (still hardcoded-default — no prompt-template registry exists in Pylon
@@ -225,10 +225,8 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
     // `index_name := <str>$indexName` is inert today even when `index_name`
     // is `Some` — `ir/compiler.rs::try_compile_vector_search` only ever
     // recognizes a *literal* string there, never a parameter, so this
-    // never actually narrows anything beyond the default index. Matches
-    // `asgi.py::_handle_ai_chat`'s existing behavior (not a regression
-    // introduced by this port) — fixing it is compiler-level work, out of
-    // scope here.
+    // never actually narrows anything beyond the default index. Fixing
+    // that is compiler-level work, tracked separately.
     let index_clause = if index_name.is_some() {
         ", index_name := <str>$indexName"
     } else {

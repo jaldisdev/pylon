@@ -185,7 +185,7 @@ impl BatchProcessor for VectorIndexWorker {
                 // `encode_non_null` recognizes a `$n::vector`-cast target
                 // and writes pgvector's own binary format. The old Python
                 // worker had to go through a `"[0.1,0.2,...]"` text literal
-                // instead, since that was the only thing asyncpg's Python
+                // instead, since that was the only thing the Python
                 // API could bind for a type it had no codec for; Rust
                 // doesn't have that constraint.
                 let cached_vec = DecodedValue::Array(vec.iter().map(|f| DecodedValue::F64(*f as f64)).collect());

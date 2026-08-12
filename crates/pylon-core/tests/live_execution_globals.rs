@@ -19,12 +19,10 @@
 
 //! Live-Postgres tests for `Global`s — session globals (client-injected
 //! per-request) and computed globals (a PyQL expression evaluated at query
-//! time, which may itself reference a session global). Concepts inspired by
-//! Gel's own `test_edgeql_globals.py`, not ported literally — Gel's suite is
-//! built entirely around its own `set global`/`reset global` session
-//! commands, which Pylon doesn't have (a Pylon session global is always
-//! bound as an ordinary query parameter per call, never mutated
-//! session-side); the underlying behaviors these tests check (a session
+//! time, which may itself reference a session global). Pylon has no
+//! `set global`/`reset global` session commands — a session global is
+//! always bound as an ordinary query parameter per call, never mutated
+//! session-side — so the behaviors proven here are (a session
 //! global's value flows correctly into a referencing query; a computed
 //! global correctly reads another global inside its own expression) are the
 //! same ones worth proving here.

@@ -72,7 +72,7 @@ class AsyncTransaction:
             # Happy path — attempt commit. `self._tx.commit()` already
             # raises the correctly-mapped `pylon.exceptions.*` instance
             # (see `pgcon_err` in `pgcon.rs`) — no further translation
-            # needed here, unlike the old asyncpg-native exception mapping.
+            # needed here — the driver already raises the mapped class.
             try:
                 await self._tx.commit()
             except (TransactionSerializationError, TransactionDeadlockError) as e:
@@ -177,7 +177,7 @@ class RetryingTransaction:
 
     async def __anext__(self) -> AsyncTransaction:
         # Inspect the outcome of the previous attempt. Unlike the old
-        # asyncpg-based pool, there's no separate release step: `commit`/
+        # pool, there's no separate release step: `commit`/
         # `rollback` on the pgcon transaction handle already consume the
         # underlying connection and return it to the pool themselves.
         if self._prev_tx is not None:
@@ -258,7 +258,7 @@ class Client:
             # `pgcon_connect_err` in `pgcon.rs`) — no try/except needed here
             # anymore. Note: `pool_min_size` isn't passed through — deadpool
             # (the pgcon pool implementation) has no eager pre-warm concept
-            # the way asyncpg's pool did; connections are created lazily on
+            # up front; connections are created lazily on
             # demand up to `pool_max_size` instead. The field is still
             # accepted/validated on `DatabaseConfig` for config-surface
             # compatibility, just not enforced at the connection layer.

@@ -18,7 +18,7 @@
 //
 
 //! Converts `pylon_client::Value` into `serde_json::Value` for the JSON
-//! API responses — the Rust counterpart of `pylon/server/asgi.py`'s
+//! API responses — the counterpart of
 //! `_to_jsonable`. Considerably simpler than the Python original: `Value`
 //! is already a generic, fully-decoded tree (no dataclass hydration, no
 //! `__pylon_saved__`-style internal bookkeeping keys to filter out), so
@@ -181,7 +181,7 @@ pub fn client_error_payload(err: &pylon_client::Error) -> Json {
         // lives one level deeper, in `pg_message()`. Discovered live while
         // testing this endpoint against a real Postgres, not a Python-
         // parity concern (Python surfaces the equivalent detail via
-        // asyncpg's own typed exceptions).
+        // the driver's own typed exceptions).
         pylon_client::Error::Db(e) => {
             serde_json::json!({"error": e.pg_message(), "errorType": "PylonExecutionError"})
         }

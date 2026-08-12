@@ -18,7 +18,7 @@
 //
 
 //! Serves the built React SPA at `/` when `[ui].enabled` — Rust port of
-//! `asgi.py::_serve_static`. The frontend build (`crates/pylon-server/static/`,
+//! static asset serving. The frontend build (`crates/pylon-server/static/`,
 //! gitignored — a deploy/dev step copies the `pylon-ui` build output there
 //! before `cargo build`) is embedded into the binary at compile time via
 //! `include_dir!`, so a built `pylon-server` is fully self-contained by

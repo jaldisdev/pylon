@@ -28,9 +28,9 @@
 //! walks PostgreSQL's own documented binary wire format directly, the same
 //! way the outgoing Python implementation's `_pg_decode_record`/
 //! `_pg_decode_value` (`pylon/client.py`) did — except comprehensive,
-//! rather than split across asyncpg's built-in composite decoder plus a
-//! handful of hand-registered codec overrides for the cases asyncpg
-//! couldn't handle natively (jsonb, `record[]`, `vector`).
+//! comprehensively, including the cases a generic composite decoder plus
+//! hand-registered codec overrides tends to miss (jsonb, `record[]`,
+//! `vector`).
 //!
 //! Composite field layout (used recursively for `record`/`record[]`):
 //! `i32 nfields`, then per field: `u32 type_oid`, `i32 field_len`
@@ -464,9 +464,9 @@ fn decode_array(data: &[u8], ext: &ExtensionOids) -> Result<DecodedValue> {
 // Bound query parameters don't need pylon-core to supply explicit
 // per-parameter Postgres types up front: `Client::prepare` already asks
 // Postgres itself to analyze the SQL and report each `$1, $2, ...`'s
-// expected `Type` back (`Statement::params()`) — exactly what asyncpg's
+// expected `Type` back (`Statement::params()`) — which drives
 // own extended-query-protocol binding already relies on today, just
-// surfaced explicitly here instead of hidden inside asyncpg's codec
+// encoding explicitly here instead of hiding it inside a codec
 // registry. So encoding is *type-directed*: given a `DecodedValue` and the
 // `Type` Postgres reported for that position, write the matching binary
 // representation. See `BoundParam` (in `lib.rs`) for the `ToSql` glue that
@@ -536,7 +536,7 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
                 // A JSON API request body necessarily carries a UUID query
                 // parameter as plain text (there's no JSON "uuid" type), so
                 // it arrives here as a `DecodedValue::Str`, not `::Uuid` —
-                // asyncpg's own `uuid` codec accepted a plain string the
+                // a `uuid` codec conventionally accepts a plain string the
                 // same way. Without this, the raw UTF-8 text bytes get sent
                 // for a binary-format `uuid` parameter, which Postgres
                 // rejects with "incorrect binary data format".

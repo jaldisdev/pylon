@@ -18,14 +18,11 @@
 //
 
 //! Live-Postgres tests for link properties on a `Through[...]`-backed
-//! multi-link (Pylon's analog of Gel's `@prop` link properties) — writing
+//! multi-link — writing
 //! them via `@prop := value` on insert/`+=`, re-linking upserts, `union`ed
 //! multi-target appends with distinct per-target values, `-=` removal, and
-//! reading them back via `@prop` in a shape. Scenarios inspired by Gel's own
-//! `test_edgeql_linkprops.py`, narrowed to what's directly portable — much
-//! of that suite exercises Gel-only concepts (link unions, computed link
-//! properties, tuple-typed link properties, backlink-scoped `@prop` access)
-//! Pylon doesn't have; this covers the write/read mechanics its own
+//! reading them back via `@prop` in a shape. Scoped to the write/read
+//! mechanics Pylon's own
 //! `Through[...]` feature actually supports (already exercised by pure
 //! SQL-shape unit tests in `sql/mod.rs` — this is their live-execution
 //! counterpart).

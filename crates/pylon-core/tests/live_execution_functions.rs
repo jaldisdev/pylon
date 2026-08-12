@@ -19,9 +19,8 @@
 
 //! Live-Postgres tests for `@pylon.function` execution — a scalar-returning
 //! function, an object-set-returning function, a function composed inside a
-//! larger query, and overload resolution. Concepts inspired by Gel's own
-//! `test_edgeql_functions.py`/`test_edgeql_calls.py`, not ported literally
-//! (Gel's suites lean heavily on its stdlib's own huge overload set and
+//! larger query, and overload resolution. Scoped to Pylon's own stdlib
+//! surface rather than an exhaustive sweep (a huge overload set and
 //! named/default-argument calling conventions Pylon's user-function call
 //! path doesn't support — only positional args do).
 //!

@@ -98,7 +98,7 @@ fn decode_inner(shape: &ShapeNode, value: &DecodedValue, position_override: Opti
 }
 
 /// Extracts the field at `pos` from a composite (tuple/`ROW(...)`) value —
-/// the Rust equivalent of Python's `value[pos]` on an asyncpg `Record`.
+/// the Rust equivalent of Python's `value[pos]` on a record row.
 /// Anything else (a bare scalar reached with `pos == 0`, or a genuinely
 /// out-of-range position) degrades to `Null` rather than panicking — the
 /// shape and the SQL that produced `value` are always built together by
