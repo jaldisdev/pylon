@@ -1830,7 +1830,29 @@ mod tests {
     #[test]
     fn test_notify_type_channel_rejects_arbitrary_payload() {
         let err = notify_compile_err("SELECT notify(PersonUpdates, 'not an anchor')");
-        assert!(err.contains("__new__ or __old__"), "got: {err}");
+        assert!(err.contains("must name an object of that type"), "got: {err}");
+    }
+
+    #[test]
+    fn notify_composes_with_a_with_block_binding() {
+        // The shape a notify-after-write actually wants: the mutation and
+        // the notification in one statement, in one transaction. This used
+        // to be a compile error — `notify` on an object channel only
+        // accepted the `__new__`/`__old__` anchors a trigger binds.
+        let sql = compile_notify_expr(
+            "WITH updated := (UPDATE Person FILTER .id = <uuid>$id SET { name := 'x' }) \
+             SELECT notify(PersonUpdates, updated)",
+        );
+        assert!(sql.contains("pg_notify"), "got: {sql}");
+        // The payload is the bound object's id, read out of its CTE.
+        assert!(sql.contains("\"id\""), "payload should be the CTE's id: {sql}");
+        assert!(sql.contains("updated"), "should reference the with-block CTE: {sql}");
+    }
+
+    #[test]
+    fn notify_rejects_a_with_block_binding_of_the_wrong_type() {
+        let err = notify_compile_err("WITH other := (SELECT Company) SELECT notify(PersonUpdates, other)");
+        assert!(err.contains("expects a payload of type"), "got: {err}");
     }
 
     #[test]
@@ -1889,6 +1911,24 @@ mod tests {
         // __new__ has no binding at all in a plain (non-trigger) compile.
         let err = notify_compile_err("SELECT notify(PersonUpdates, __new__)");
         assert!(err.contains("only bound inside a trigger handler"), "got: {err}");
+    }
+
+    #[test]
+    fn notify_rejects_an_oversized_concatenation_at_compile_time() {
+        // Neither half is over the cap on its own, so the old literal-only
+        // check passed this straight through to fail at runtime — where it
+        // aborts the transaction that sent the notification.
+        let half = "x".repeat(4500);
+        let err = notify_compile_err(&format!("SELECT notify_raw('c', '{half}' ++ '{half}')"));
+        assert!(err.contains("8000-byte"), "got: {err}");
+        assert!(err.contains("at least"), "got: {err}");
+    }
+
+    #[test]
+    fn notify_allows_a_concatenation_that_still_fits() {
+        let part = "x".repeat(3000);
+        let sql = compile_notify_expr(&format!("SELECT notify_raw('c', '{part}' ++ '{part}')"));
+        assert!(sql.contains("pg_notify"), "got: {sql}");
     }
 
     #[test]

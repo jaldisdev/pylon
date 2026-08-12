@@ -42,20 +42,50 @@ use crate::value::{Object, Value};
 pub struct ChannelListener {
     rx: mpsc::UnboundedReceiver<Result<Value>>,
     _conn: PgListener,
+    /// Set once a payload has failed to decode. The subscription is over at
+    /// that point; further `recv()` calls report end-of-stream rather than
+    /// resuming, so a caller can't accidentally keep consuming a channel it
+    /// has already seen foreign data on.
+    ended: bool,
 }
 
 impl ChannelListener {
-    /// Waits for the next decoded payload. Returns `None` once the
-    /// dedicated connection closes — mirrors
-    /// `tokio::sync::mpsc::Receiver::recv`'s own end-of-stream signal, not
-    /// an error.
+    /// Waits for the next decoded payload. Returns `None` once the dedicated
+    /// connection closes, or once a payload has failed to decode.
     ///
-    /// `Err(Error::MalformedPayload(_))` if a payload arrives that doesn't
-    /// match the Channel's own declared shape — that's returned rather than
-    /// silently skipped, but doesn't end the subscription itself; the next
-    /// `recv()` call keeps listening for the next notification.
+    /// A malformed payload yields `Err(Error::MalformedPayload(_))` **and
+    /// ends the subscription** — every later call returns `None`. A channel
+    /// is a database-wide name, so anything can publish to it; failing hard
+    /// keeps foreign data on a typed channel visible instead of silently
+    /// dropped, and not resuming keeps that failure from being papered over
+    /// by the next good message.
+    ///
+    /// A consumer that needs to stay subscribed past a bad message
+    /// re-subscribes itself:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let mut sub = client.listen("UserUpdates").await?;
+    ///     while let Some(payload) = sub.recv().await {
+    ///         match payload {
+    ///             Ok(v) => handle(v),
+    ///             Err(e) => { log(e); break; }  // re-listen on the next pass
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// This matches `Client.listen()` on the Python side, where the same
+    /// failure raises out of the `async for` and ends the generator.
     pub async fn recv(&mut self) -> Option<Result<Value>> {
-        self.rx.recv().await
+        if self.ended {
+            return None;
+        }
+        let item = self.rx.recv().await;
+        if matches!(item, Some(Err(_))) {
+            self.ended = true;
+        }
+        item
     }
 }
 
@@ -78,7 +108,11 @@ pub(crate) async fn listen(dsn: &str, schema: &SchemaDescriptor, channel: &str) 
     .map_err(Error::Db)?;
     conn.listen(&wire_name).await.map_err(Error::Db)?;
 
-    Ok(ChannelListener { rx, _conn: conn })
+    Ok(ChannelListener {
+        rx,
+        _conn: conn,
+        ended: false,
+    })
 }
 
 fn decode_payload(ch: &ChannelDescriptor, raw: &str) -> Result<Value> {
@@ -99,15 +133,17 @@ fn decode_uuid(text: &str) -> Result<Value> {
 /// cast would have rendered it (see `notify()`'s SQL emission — the
 /// payload is always literally cast to `text` before being sent).
 ///
-/// Covers `uuid`/`int2`/`int4`/`int8`/`float4`/`float8`/`numeric`/`boolean`
-/// — every base type this reasonably expects as a Channel payload.
-/// `date`/`time`/`timestamp`/`timestamptz`/`interval`/`bytea` fall back to
-/// the raw string: this crate has no date/time dependency to convert them
-/// into `Value::Date`/`Time`/`Timestamp`'s PG-epoch-relative integer
-/// representations correctly, and getting that wrong silently would be
-/// worse than returning the text as-is (matches
-/// `pylon.schema._channels._decode_scalar_text`'s own `interval`/`bytea`
-/// carve-out on the Python side, just a wider one here).
+/// Covers every base type `PG_TYPE_MAP` maps a built-in scalar to, except
+/// `interval` and `bytea`, whose text encodings are non-trivial to parse
+/// correctly and uncommon as a pub/sub payload — both pass through as the
+/// raw string rather than risk a wrong decode.
+///
+/// Deliberately identical in coverage to
+/// `pylon.schema._channels._decode_scalar_text` on the Python side: the same
+/// `Channel` declaration has to yield the same type through either client,
+/// and this used to fall back to a raw string for every temporal type while
+/// Python decoded them, so a `Channel(datetime)` produced a `datetime` in
+/// Python and a bare string in Rust.
 fn decode_scalar_text(text: &str, pg_type: &str) -> Result<Value> {
     match pg_type {
         "uuid" => decode_uuid(text),
@@ -123,8 +159,53 @@ fn decode_scalar_text(text: &str, pg_type: &str) -> Result<Value> {
         // documented convention elsewhere — no parsing needed.
         "numeric" => Ok(Value::Decimal(text.to_string())),
         "boolean" => Ok(Value::Bool(text == "true" || text == "t")),
+        "date" => parse_date(text),
+        "time" => parse_time(text),
+        "timestamp" => parse_timestamp(text).map(Value::Timestamp),
+        "timestamptz" => parse_timestamptz(text).map(Value::Timestamptz),
         _ => Ok(Value::Str(text.to_string())),
     }
+}
+
+/// Days from the Unix epoch to PostgreSQL's (2000-01-01), the offset between
+/// what `chrono` counts from and what `Value::Date`/`Timestamp` store.
+const PG_EPOCH_DAYS_FROM_UNIX: i64 = 10_957;
+const PG_EPOCH_MICROS_FROM_UNIX: i64 = PG_EPOCH_DAYS_FROM_UNIX * 86_400 * 1_000_000;
+
+fn malformed(kind: &str, text: &str, e: impl std::fmt::Display) -> Error {
+    Error::MalformedPayload(format!("invalid {kind} {text:?}: {e}"))
+}
+
+fn parse_date(text: &str) -> Result<Value> {
+    let d = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|e| malformed("date", text, e))?;
+    let days = d
+        .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch date"))
+        .num_days();
+    Ok(Value::Date((days - PG_EPOCH_DAYS_FROM_UNIX) as i32))
+}
+
+fn parse_time(text: &str) -> Result<Value> {
+    // Postgres omits the fractional part when it's zero.
+    let t = chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f").map_err(|e| malformed("time", text, e))?;
+    let micros = t
+        .signed_duration_since(chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("valid midnight"))
+        .num_microseconds()
+        .ok_or_else(|| Error::MalformedPayload(format!("time out of range: {text:?}")))?;
+    Ok(Value::Time(micros))
+}
+
+fn parse_timestamp(text: &str) -> Result<i64> {
+    let ts = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+        .map_err(|e| malformed("timestamp", text, e))?;
+    Ok(ts.and_utc().timestamp_micros() - PG_EPOCH_MICROS_FROM_UNIX)
+}
+
+/// `timestamptz` renders with a numeric UTC offset (`+00`, `-04:30`), which
+/// `%#z` accepts in all the widths Postgres emits.
+fn parse_timestamptz(text: &str) -> Result<i64> {
+    let ts = chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
+        .map_err(|e| malformed("timestamptz", text, e))?;
+    Ok(ts.timestamp_micros() - PG_EPOCH_MICROS_FROM_UNIX)
 }
 
 fn decode_object_payload(declared_fields: &[(String, String)], raw_payload: &str) -> Result<Value> {
@@ -184,6 +265,89 @@ mod tests {
             payload,
             description: None,
         }
+    }
+
+    // ── Temporal parity with `_channels._decode_scalar_text` ──────────
+    //
+    // These four used to fall through to `Value::Str` here while the Python
+    // client decoded them, so one `Channel` declaration produced two
+    // different types depending on which client read it.
+
+    #[test]
+    fn decodes_a_date_to_pg_epoch_days() {
+        // 2000-01-01 is the PG epoch itself, so day 0.
+        assert_eq!(decode_scalar_text("2000-01-01", "date").unwrap(), Value::Date(0));
+        assert_eq!(decode_scalar_text("2000-01-02", "date").unwrap(), Value::Date(1));
+        assert_eq!(decode_scalar_text("1999-12-31", "date").unwrap(), Value::Date(-1));
+    }
+
+    #[test]
+    fn decodes_a_time_to_microseconds_since_midnight() {
+        assert_eq!(decode_scalar_text("00:00:00", "time").unwrap(), Value::Time(0));
+        assert_eq!(
+            decode_scalar_text("01:00:00", "time").unwrap(),
+            Value::Time(3_600_000_000)
+        );
+        // Postgres only prints the fractional part when it is non-zero.
+        assert_eq!(decode_scalar_text("00:00:00.5", "time").unwrap(), Value::Time(500_000));
+    }
+
+    #[test]
+    fn decodes_a_timestamp_to_pg_epoch_microseconds() {
+        assert_eq!(
+            decode_scalar_text("2000-01-01 00:00:00", "timestamp").unwrap(),
+            Value::Timestamp(0)
+        );
+        assert_eq!(
+            decode_scalar_text("2000-01-01 00:00:01.5", "timestamp").unwrap(),
+            Value::Timestamp(1_500_000)
+        );
+    }
+
+    #[test]
+    fn decodes_a_timestamptz_and_normalises_the_offset() {
+        assert_eq!(
+            decode_scalar_text("2000-01-01 00:00:00+00", "timestamptz").unwrap(),
+            Value::Timestamptz(0)
+        );
+        // Same instant, written in a different zone.
+        assert_eq!(
+            decode_scalar_text("2000-01-01 01:00:00+01", "timestamptz").unwrap(),
+            Value::Timestamptz(0)
+        );
+        assert_eq!(
+            decode_scalar_text("1999-12-31 23:30:00-00:30", "timestamptz").unwrap(),
+            Value::Timestamptz(0)
+        );
+    }
+
+    #[test]
+    fn a_malformed_temporal_payload_is_an_error_not_a_string() {
+        for (text, pg_type) in [
+            ("not-a-date", "date"),
+            ("25:99:99", "time"),
+            ("nope", "timestamp"),
+            ("2000-01-01 00:00:00", "timestamptz"), // missing the offset
+        ] {
+            let err = decode_scalar_text(text, pg_type).unwrap_err();
+            assert!(
+                matches!(err, Error::MalformedPayload(_)),
+                "{pg_type} {text:?} should be MalformedPayload, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_and_bytea_still_pass_through_as_text() {
+        // Matches the Python side's own carve-out — deliberately not parsed.
+        assert_eq!(
+            decode_scalar_text("1 day", "interval").unwrap(),
+            Value::Str("1 day".into())
+        );
+        assert_eq!(
+            decode_scalar_text("\\xdeadbeef", "bytea").unwrap(),
+            Value::Str("\\xdeadbeef".into())
+        );
     }
 
     #[test]

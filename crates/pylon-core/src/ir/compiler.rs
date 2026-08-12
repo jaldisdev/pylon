@@ -7392,9 +7392,17 @@ impl<'a> Compiler<'a> {
     /// in the Postgres source) — a payload at or over this is rejected by the
     /// server at runtime, always, for every session. Checked here only when
     /// the payload is a literal string (the one case actually decidable at
-    /// compile time); anything else (a column, a param, an expression) is
-    /// left unchecked, same as every other best-effort check in this module.
+    /// compile time — see `static_min_payload_bytes` for how much of an
+    /// arbitrary payload expression can be sized without running it.
     const NOTIFY_PAYLOAD_MAX_BYTES: usize = 8000;
+
+    /// The rejection every non-object payload for a Type channel shares.
+    fn notify_type_payload_err(&self, channel: &str, qname: &str) -> PyQLError {
+        self.type_err(&format!(
+            "notify(): payload for Channel '{channel}' (a '{qname}' object channel) must name an object of that \
+             type — either a with-block binding, or __new__/__old__ inside a trigger handler"
+        ))
+    }
 
     /// Compile `notify(Channel, payload)` → `pg_notify('<wire_name>', (<payload>)::text)`.
     /// The payload's required shape depends on the Channel's declared kind:
@@ -7465,38 +7473,52 @@ impl<'a> Compiler<'a> {
 
         let payload_ir = match &channel.payload {
             crate::schema::ChannelPayload::Type(qname) => {
-                let anchor_name = match payload_arg {
-                    Expr::Path(Path { steps, partial: false }) => match steps.as_slice() {
-                        [PathStep::Name(s)] if s == "__new__" || s == "__old__" => s.as_str(),
-                        _ => {
-                            return Err(self.type_err(&format!(
-                                "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
-                             must be __new__ or __old__ — only supported inside a trigger handler in this phase"
-                            )));
-                        }
-                    },
-                    _ => {
+                // The payload for an object channel is the object's `id`, in
+                // either of the two places one can be named: the `__new__`/
+                // `__old__` anchor a trigger handler runs against, or a
+                // with-block binding in an ordinary query — which is what
+                // lets a notify compose with the mutation that caused it:
+                //
+                //   with updated := (update User filter ... set { ... }),
+                //   select (notify(UserUpdates, updated), updated)
+                let Expr::Path(Path { steps, partial: false }) = payload_arg else {
+                    return Err(self.notify_type_payload_err(&full_channel_name, qname));
+                };
+                let [PathStep::Name(name)] = steps.as_slice() else {
+                    return Err(self.notify_type_payload_err(&full_channel_name, qname));
+                };
+
+                if name == "__new__" || name == "__old__" {
+                    let (anchor_td, alias) = self.special_anchors.get(name.as_str()).cloned().ok_or_else(|| {
+                        self.type_err(&format!(
+                            "notify(): '{name}' cannot be used here — it's only bound inside a trigger handler"
+                        ))
+                    })?;
+                    let anchor_qname = format!("{}::{}", anchor_td.module, anchor_td.name);
+                    if &anchor_qname != qname {
                         return Err(self.type_err(&format!(
-                            "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
-                         must be __new__ or __old__ — only supported inside a trigger handler in this phase"
+                            "notify(): Channel '{full_channel_name}' expects a payload of type '{qname}', got '{anchor_qname}'"
                         )));
                     }
-                };
-                let (anchor_td, alias) = self.special_anchors.get(anchor_name).cloned().ok_or_else(|| {
-                    self.type_err(&format!(
-                        "notify(): '{anchor_name}' cannot be used here — it's only bound inside a trigger handler"
-                    ))
-                })?;
-                let anchor_qname = format!("{}::{}", anchor_td.module, anchor_td.name);
-                if &anchor_qname != qname {
-                    return Err(self.type_err(&format!(
-                        "notify(): Channel '{full_channel_name}' expects a payload of type '{qname}', got '{anchor_qname}'"
-                    )));
-                }
-                IrExpr::ColumnRef {
-                    alias,
-                    column: "id".to_string(),
-                    pg_type: "uuid".to_string(),
+                    IrExpr::ColumnRef {
+                        alias,
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    }
+                } else if let Some(cte_type) = self.cte_types.get(name.as_str()).cloned() {
+                    if &cte_type != qname {
+                        return Err(self.type_err(&format!(
+                            "notify(): Channel '{full_channel_name}' expects a payload of type '{qname}', got '{cte_type}'"
+                        )));
+                    }
+                    // `CteRef { scalar: false }` emits `(SELECT "id" FROM
+                    // "<cte>")` — the same id the trigger path sends.
+                    IrExpr::CteRef {
+                        name: name.clone(),
+                        scalar: false,
+                    }
+                } else {
+                    return Err(self.notify_type_payload_err(&full_channel_name, qname));
                 }
             }
             crate::schema::ChannelPayload::Scalar(pg_type) => {
@@ -7571,12 +7593,11 @@ impl<'a> Compiler<'a> {
             }
         };
 
-        if let Expr::Literal(ast::Literal::Str(s)) = payload_arg
-            && s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES
-        {
+        let floor = static_min_payload_bytes(payload_arg);
+        if floor >= Self::NOTIFY_PAYLOAD_MAX_BYTES {
             return Err(self.type_err(&format!(
-                "notify(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
-                s.len(),
+                "notify(): this payload is at least {floor} bytes, which is at or over PostgreSQL's {}-byte NOTIFY \
+                 payload limit — the notification would fail at runtime, aborting the transaction that sent it",
                 Self::NOTIFY_PAYLOAD_MAX_BYTES
             )));
         }
@@ -7604,13 +7625,13 @@ impl<'a> Compiler<'a> {
         let channel_ir = self.compile_expr_ctx(&fc.args[0], ctx)?;
         let payload_ir = self.compile_expr_ctx(&fc.args[1], ctx)?;
 
-        if let ast::Expr::Literal(ast::Literal::Str(s)) = &fc.args[1]
-            && s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES
-        {
+        let floor = static_min_payload_bytes(&fc.args[1]);
+        if floor >= Self::NOTIFY_PAYLOAD_MAX_BYTES {
             return Err(self.type_err(&format!(
-                    "notify_raw(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
-                    s.len(), Self::NOTIFY_PAYLOAD_MAX_BYTES
-                )));
+                "notify_raw(): this payload is at least {floor} bytes, which is at or over PostgreSQL's {}-byte \
+                 NOTIFY payload limit",
+                Self::NOTIFY_PAYLOAD_MAX_BYTES
+            )));
         }
 
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
@@ -8470,6 +8491,52 @@ fn is_array_expr(expr: &IrExpr) -> bool {
         IrExpr::ColumnRef { pg_type, .. } => pg_type.ends_with("[]"),
         IrExpr::TypeCast(tc) => tc.pg_type.ends_with("[]"),
         _ => false,
+    }
+}
+
+/// A lower bound, computable without running the query, on how many bytes a
+/// `notify()` payload will serialize to.
+///
+/// Only the parts that are already known contribute: string literals count
+/// their own length, a concatenation sums its sides, a free object counts the
+/// JSON envelope it will always emit (`{}`, the quoted field names, and the
+/// `:`/`,` separators) plus whatever its field expressions themselves floor
+/// at. Anything runtime-valued — a column, a parameter, a function call —
+/// contributes 0, so this never over-estimates and never rejects a payload
+/// that could actually have fit.
+///
+/// Exists because Postgres's 8000-byte NOTIFY cap is enforced at *runtime*,
+/// and blowing it aborts the transaction that sent the notification — which,
+/// for the composed `with update ... select (notify(...), updated)` shape, is
+/// the write itself.
+fn static_min_payload_bytes(expr: &ast::Expr) -> usize {
+    use crate::parse::ast::{BinOpKind, Expr, Literal};
+    match expr {
+        Expr::Literal(Literal::Str(s)) => s.len(),
+        Expr::BinOp(op) if matches!(op.op, BinOpKind::Concat) => {
+            static_min_payload_bytes(&op.left) + static_min_payload_bytes(&op.right)
+        }
+        Expr::Shape(sh) if sh.expr.is_none() => {
+            // `{"a":,"b":}` — braces, one quoted name and colon per field,
+            // and a comma between them. Every one of those bytes is emitted
+            // regardless of what the values turn out to be.
+            let mut total = 2;
+            for (i, el) in sh.elements.iter().enumerate() {
+                if i > 0 {
+                    total += 1;
+                }
+                let name_len = match el.path.steps.last() {
+                    Some(crate::parse::ast::PathStep::Name(n)) => n.len(),
+                    _ => 0,
+                };
+                total += name_len + 3;
+                if let Some(value) = &el.compexpr {
+                    total += static_min_payload_bytes(value);
+                }
+            }
+            total
+        }
+        _ => 0,
     }
 }
 

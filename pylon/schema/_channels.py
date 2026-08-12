@@ -173,14 +173,13 @@ def decode_channel_payload(channel: Any, raw_payload: str) -> Any:
       `pylon.Object(**fields)` — the same class query results use for
       free-form shapes.
 
-    Raises `pylon.exceptions.QueryError` (the same class every other
-    runtime decode failure in this codebase surfaces as — see
-    `pgcon_err` in `crates/pylon-py/src/pgcon.rs`) if the payload doesn't
-    actually match the declared shape, chaining the original parse error.
-    Left to propagate by `Client.listen()` — a malformed payload ends that
-    listen loop rather than being silently skipped.
+    Raises `pylon.exceptions.PayloadDecodeError` (a `QueryError` subclass,
+    so existing `except QueryError` handlers still catch it) if the payload
+    doesn't actually match the declared shape, chaining the original parse
+    error. Left to propagate by `Client.listen()` — a malformed payload ends
+    that listen loop rather than being silently skipped.
     """
-    from pylon.exceptions import QueryError
+    from pylon.exceptions import PayloadDecodeError, QueryError
 
     try:
         if channel.payload_kind == 'type':
@@ -198,7 +197,7 @@ def decode_channel_payload(channel: Any, raw_payload: str) -> Any:
     except QueryError:
         raise
     except Exception as exc:
-        raise QueryError(
+        raise PayloadDecodeError(
             f"listen(): payload on channel {channel.wire_name!r} doesn't match its declared shape: {exc}"
         ) from exc
 

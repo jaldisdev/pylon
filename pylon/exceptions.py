@@ -350,6 +350,30 @@ class InvalidQueryError(QueryError):
     """PyQL query is syntactically or semantically invalid."""
 
 
+class PayloadDecodeError(QueryError):
+    """A `NOTIFY` payload didn't match its `Channel`'s declared shape.
+
+    Raised by :meth:`pylon.Client.listen`. A channel is a database-wide
+    name, so anything — `psql`, another service, a different application —
+    can publish to it, which means a payload can arrive that doesn't decode.
+    Failing here rather than skipping the message keeps foreign data on a
+    typed channel visible instead of silently dropped.
+
+    Raising inside an ``async for`` ends the generator, so a consumer that
+    needs to stay subscribed past a bad message re-subscribes itself::
+
+        while True:
+            try:
+                async for payload in client.listen('UserUpdates'):
+                    ...
+            except pylon.exceptions.PayloadDecodeError:
+                continue
+
+    `listen()` deliberately does not do that on the consumer's behalf —
+    that would turn this hard failure back into a silent one.
+    """
+
+
 class UnknownParameterError(QueryError):
     """A query parameter was supplied that is not declared in the query."""
 
