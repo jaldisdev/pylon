@@ -144,7 +144,7 @@ async fn setup() -> (String, SchemaDescriptor, pylon_pgcon::PgPool) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn single_link_sourced_backlink_exists_filter_returns_the_right_orgs() {
     let (module, schema, pool) = setup().await;
 
@@ -187,7 +187,7 @@ async fn single_link_sourced_backlink_exists_filter_returns_the_right_orgs() {
 /// her `friends`, so from Bob's side `exists .<friends[is Person]` must be
 /// true only for Bob, and a third, unconnected Person must not match.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_sourced_backlink_exists_filter_returns_the_right_people() {
     let (module, schema, pool) = setup().await;
 
@@ -237,7 +237,7 @@ async fn multilink_sourced_backlink_exists_filter_returns_the_right_people() {
 /// computed pointer sourced from a further single-link backlink
 /// (`Team.<team[is Member]`), returns the right two-level object tree.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn nested_single_link_backlink_shape_returns_the_correct_two_level_chain() {
     let (module, schema, pool) = setup().await;
 
@@ -314,7 +314,7 @@ async fn nested_single_link_backlink_shape_returns_the_correct_two_level_chain()
 /// links — confirms `IrMultiLinkJoin::BacklinkJunction` (not just
 /// `BacklinkFk`) works in a shape position, not only in filter/exists.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multilink_sourced_backlink_shape_returns_the_right_followers() {
     let (module, schema, pool) = setup().await;
 
@@ -385,7 +385,7 @@ async fn multilink_sourced_backlink_shape_returns_the_right_followers() {
 /// Org/Team/Member test (`Org <- Team <- Member <- Task`, 3 backlink hops)
 /// to demonstrate it's genuinely open-ended, not coincidentally capped at 2.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn triple_nested_single_link_backlink_shape_returns_the_correct_chain() {
     let (module, schema, pool) = setup().await;
 

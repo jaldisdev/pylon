@@ -30,7 +30,7 @@
 //! `array_agg(ROW(...))`/grouping-array machinery actually round-trips
 //! through the wire decoder correctly.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -141,7 +141,7 @@ fn as_array(v: &DecodedValue) -> &[DecodedValue] {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn group_by_single_property_partitions_rows_into_correct_groups() {
     let module = unique_module("live_group_single");
     let sd = employee_schema(&module);
@@ -213,7 +213,7 @@ async fn group_by_single_property_partitions_rows_into_correct_groups() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn group_using_computed_alias_buckets_by_derived_value() {
     let module = unique_module("live_group_using");
     let sd = employee_schema(&module);
@@ -282,7 +282,7 @@ async fn group_using_computed_alias_buckets_by_derived_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn group_by_multiple_keys_produces_composite_grouping() {
     let module = unique_module("live_group_composite");
     let sd = employee_schema(&module);
@@ -351,7 +351,7 @@ async fn group_by_multiple_keys_produces_composite_grouping() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn group_with_no_explicit_shape_defaults_to_id_only() {
     let module = unique_module("live_group_noshape");
     let sd = employee_schema(&module);

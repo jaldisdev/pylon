@@ -180,6 +180,18 @@ pub fn spawn(
         );
     }
 
+    // Said out loud, not just documented at the top of this module: every
+    // other worker announces itself on startup, so a schema with signals and
+    // no line about them reads exactly like a worker that was silently
+    // skipped. It isn't — it can't run here at all.
+    if !schema.types.iter().all(|t| t.signals.is_empty()) {
+        eprintln!(
+            "pylon-server: signal dispatcher NOT started — it holds live references to \
+             @pylon.signal handlers, which only exist in a Python process. Run \
+             `pylon worker start` alongside this server to dispatch signals."
+        );
+    }
+
     handles
 }
 

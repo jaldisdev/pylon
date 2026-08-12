@@ -15,7 +15,7 @@ class Product:
     pylon.Index("name", unless=".archived_at")             # partial index
 ```
 
-A non-unique index declared as a class-body expression — `Index(pointer, *, unless=None)`. `pointer` is either a bare pointer name, a tuple for a composite index, or a PyQL expression string (detected automatically — anything containing `(`, `.`, a space, or an operator character is treated as an expression rather than a bare name). `unless=` makes it partial, only indexing rows where the given expression is false/null. **Uniqueness is always expressed via [`Exclusive`](constraints.md#exclusive), never via `Index`** — `Index` never enforces anything, only accelerates lookups.
+A non-unique index declared as a class-body expression — `Index(pointer, *, unless=None)`. `pointer` is either a bare pointer name, a tuple for a composite index, or a PyQL expression string (detected automatically — anything containing `(`, `.`, a space, or an operator character is treated as an expression rather than a bare name). `unless=` makes it partial, only indexing objects where the given expression is false/null. **Uniqueness is always expressed via [`Exclusive`](constraints.md#exclusive), never via `Index`** — `Index` never enforces anything, only accelerates lookups.
 
 ## `VectorIndex` — embeddings
 

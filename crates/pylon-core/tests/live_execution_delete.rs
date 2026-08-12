@@ -28,7 +28,7 @@
 //! statement's own filter/returning behavior, which had no live coverage
 //! anywhere in the suite before this file.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -123,7 +123,7 @@ fn as_uuid(v: &DecodedValue) -> [u8; 16] {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn delete_with_filter_removes_only_matching_rows() {
     let module = unique_module("live_delete_filter");
     let sd = person_schema(&module);
@@ -155,7 +155,7 @@ async fn delete_with_filter_removes_only_matching_rows() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn delete_returns_the_ids_of_the_rows_it_removed() {
     let module = unique_module("live_delete_returning");
     let sd = person_schema(&module);
@@ -195,7 +195,7 @@ async fn delete_returns_the_ids_of_the_rows_it_removed() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn delete_with_no_matches_is_a_no_op() {
     let module = unique_module("live_delete_no_match");
     let sd = person_schema(&module);
@@ -217,7 +217,7 @@ async fn delete_with_no_matches_is_a_no_op() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn delete_with_no_filter_removes_every_row() {
     let module = unique_module("live_delete_all");
     let sd = person_schema(&module);

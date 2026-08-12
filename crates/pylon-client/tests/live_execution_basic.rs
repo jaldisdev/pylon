@@ -18,7 +18,7 @@
 //
 
 //! Live-Postgres integration tests for `pylon-client` — same harness
-//! convention as `pylon-core/tests/live_execution_*.rs`: `#[ignore]`d,
+//! convention as `pylon-core/tests/live_execution_*.rs`: `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]`d,
 //! run explicitly against a real Postgres via `PYLON_PGCON_TEST_DSN`
 //! (required — no hardcoded fallback).
 //!
@@ -185,7 +185,7 @@ async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn query_and_execute_round_trip() {
     let module = unique_module("live_client_basic");
     let client = setup(&person_schema(&module)).await;
@@ -211,7 +211,7 @@ async fn query_and_execute_round_trip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn query_single_enforces_cardinality() {
     let module = unique_module("live_client_single");
     let client = setup(&person_schema(&module)).await;
@@ -250,7 +250,7 @@ async fn query_single_enforces_cardinality() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn globals_fill_the_dunder_global_param_slot() {
     let mut schema = person_schema(&unique_module("live_client_globals"));
     schema.globals.push(pylon_core::schema::GlobalDescriptor {
@@ -274,7 +274,7 @@ async fn globals_fill_the_dunder_global_param_slot() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn transaction_commits_on_success() {
     let module = unique_module("live_client_tx");
     let client = setup(&person_schema(&module)).await;
@@ -301,7 +301,7 @@ async fn transaction_commits_on_success() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors() {
     let module = unique_module("live_client_tx_rollback");
     let client = setup(&person_schema(&module)).await;
@@ -334,7 +334,7 @@ async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     let module = unique_module("live_client_cache");
     let client = setup_with_cache(&person_schema(&module)).await;
@@ -402,7 +402,7 @@ async fn recv_with_timeout(listener: &mut pylon_client::ChannelListener) -> pylo
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn listen_decodes_a_scalar_channel_payload() {
     let module = unique_module("live_client_listen_scalar");
     let mut schema = person_schema(&module);
@@ -436,7 +436,7 @@ async fn listen_decodes_a_scalar_channel_payload() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn listen_decodes_a_type_channel_payload_as_the_rows_id() {
     let module = unique_module("live_client_listen_type");
     let mut schema = person_schema(&module);
@@ -479,7 +479,7 @@ async fn listen_decodes_a_type_channel_payload_as_the_rows_id() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn listen_decodes_an_object_channel_payload() {
     let module = unique_module("live_client_listen_object");
     let mut schema = person_schema(&module);
@@ -519,7 +519,7 @@ async fn listen_decodes_an_object_channel_payload() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn listen_raises_on_a_malformed_payload() {
     let module = unique_module("live_client_listen_malformed");
     let mut schema = person_schema(&module);

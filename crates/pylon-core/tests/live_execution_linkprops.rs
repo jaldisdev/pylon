@@ -27,7 +27,7 @@
 //! SQL-shape unit tests in `sql/mod.rs` — this is their live-execution
 //! counterpart).
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -141,7 +141,7 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_with_link_property_round_trips() {
     let module = unique_module("live_lp_insert");
     let sd = schema(&module);
@@ -183,7 +183,7 @@ async fn insert_with_link_property_round_trips() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn append_link_property_upserts_on_reappend() {
     // Re-`+=`ing the *same* target with a new @weight must update the
     // existing junction row's property in place, not leave the old value
@@ -241,7 +241,7 @@ async fn append_link_property_upserts_on_reappend() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn append_union_lands_distinct_values_on_correct_targets() {
     // The realistic multi-checkbox scenario: several targets appended in one
     // `+=`, each carrying its own distinct property value, via a `union` of
@@ -295,7 +295,7 @@ async fn append_union_lands_distinct_values_on_correct_targets() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn remove_link_clears_the_junction_row() {
     let module = unique_module("live_lp_remove");
     let sd = schema(&module);

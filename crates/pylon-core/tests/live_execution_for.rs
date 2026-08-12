@@ -33,7 +33,7 @@
 //! real data, and there were no pure unit tests for `FOR`'s SQL emission at
 //! all before this session — this is the first coverage of either kind.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -128,7 +128,7 @@ fn as_i64(v: &DecodedValue) -> i64 {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn for_loop_bulk_inserts_one_row_per_iterator_value() {
     let module = unique_module("live_for_bulk_insert");
     let sd = person_schema(&module);
@@ -154,7 +154,7 @@ async fn for_loop_bulk_inserts_one_row_per_iterator_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn for_loop_variable_composes_inside_insert_body_expression() {
     let module = unique_module("live_for_compose");
     let sd = person_schema(&module);
@@ -178,7 +178,7 @@ async fn for_loop_variable_composes_inside_insert_body_expression() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn for_loop_select_body_cross_joins_lateral_per_iterator_value() {
     let module = unique_module("live_for_select");
     let sd = person_schema(&module);
@@ -218,7 +218,7 @@ async fn for_loop_select_body_cross_joins_lateral_per_iterator_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn for_loop_with_empty_iterator_set_is_a_no_op() {
     let module = unique_module("live_for_empty");
     let sd = person_schema(&module);

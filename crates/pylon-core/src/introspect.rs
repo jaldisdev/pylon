@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn finds_a_table_with_columns_fk_and_index() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let parent = unique_name("introspect_parent");
@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn finds_an_enum_with_all_members_in_order() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let enum_name = unique_name("introspect_enum");
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn finds_a_domain_a_sequence_and_a_view() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let domain_name = unique_name("introspect_domain");
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn finds_a_function_and_hashes_its_definition_stably() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let fn_name = unique_name("introspect_fn");
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn excludes_pylon_and_system_schema_objects() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
@@ -622,7 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn user_defined_module_schema_is_not_renamed() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let module = unique_name("introspect_module");

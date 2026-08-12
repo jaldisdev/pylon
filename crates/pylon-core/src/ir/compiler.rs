@@ -3173,6 +3173,24 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // Checked here rather than left to the SQL emitter: `emit_for_stmt`
+        // only implements these three body kinds, and reaching it with any
+        // other one used to abort the process instead of reporting a PyQL
+        // error the caller could act on.
+        let body_kind = match &body {
+            IrStmt::Insert(_) | IrStmt::Select(_) | IrStmt::PathSelect(_) => None,
+            IrStmt::Update(_) => Some("update"),
+            IrStmt::Delete(_) => Some("delete"),
+            IrStmt::For(_) => Some("nested for"),
+            IrStmt::Group(_) => Some("group"),
+            _ => Some("this statement"),
+        };
+        if let Some(kind) = body_kind {
+            return Err(self.type_err(&format!(
+                "for-loop body: {kind} is not supported as a `for` body — use insert or select"
+            )));
+        }
+
         Ok(IrFor {
             var_name: f.var.clone(),
             iterator: IrForIterator::Values { exprs, pg_type },

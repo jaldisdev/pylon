@@ -36,7 +36,7 @@
 //! trading a real reliability cost for coverage of Postgres's own
 //! documented guarantee rather than Pylon's.
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -120,7 +120,7 @@ fn as_i64(v: &DecodedValue) -> i64 {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
     let module = unique_module("live_lock_skip");
     let sd = job_schema(&module);
@@ -195,7 +195,7 @@ async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn nowait_fails_immediately_instead_of_blocking_on_a_locked_row() {
     let module = unique_module("live_lock_nowait");
     let sd = job_schema(&module);

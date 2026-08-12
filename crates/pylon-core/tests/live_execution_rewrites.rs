@@ -30,7 +30,7 @@
 //! parity" scenario to cover here the way `live_execution_triggers.rs` has
 //! one (nothing schema-diff-shaped to get out of sync).
 //!
-//! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
+//! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
 //!
 //! ```text
@@ -103,7 +103,7 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_rewrite_overrides_assigned_value() {
     let module = unique_module("live_rw_insert");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
@@ -134,7 +134,7 @@ async fn insert_rewrite_overrides_assigned_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_rewrite_overrides_assigned_value() {
     let module = unique_module("live_rw_update");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
@@ -173,7 +173,7 @@ async fn update_rewrite_overrides_assigned_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_rewrite_applies_to_defaulted_value() {
     // Interaction with a schema-level default:
     // the rewrite runs on whatever value the property ends up with, whether
@@ -215,7 +215,7 @@ async fn insert_rewrite_applies_to_defaulted_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_rewrite_references_sibling_property() {
     // A rewrite expression that
     // reads a *different* property of the same row (via the same `.`-scoped
@@ -261,7 +261,7 @@ async fn update_rewrite_references_sibling_property() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_only_rewrite_does_not_fire_on_update() {
     // Scoping correctness: an On.Insert-only rewrite must not also apply to
     // a later UPDATE that never declared its own rewrite for that property.
@@ -300,7 +300,7 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn multiple_rewrites_on_different_properties_do_not_interfere() {
     let module = unique_module("live_rw_multi");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("a"), text_prop("b")]);
@@ -333,7 +333,7 @@ async fn multiple_rewrites_on_different_properties_do_not_interfere() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn trigger_observes_rewritten_value_not_original() {
     // Rewrite/Trigger interaction, Pylon-specific (both features exist here,
     // an After-Insert trigger's __new__ must

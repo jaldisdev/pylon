@@ -629,27 +629,10 @@ class TestDefaultSql:
 # Integration: full walk() requires rebuilt Rust binary
 # ---------------------------------------------------------------------------
 
-# These tests need the rebuilt _core binary that exports PropertyDescriptor,
-# LinkDescriptor, MultiLinkDescriptor, etc.  They are skipped if the binary
-# is outdated (missing attributes on _core).
+# A stale `pylon._core` is caught once, for the whole run, in conftest.py's
+# `pytest_configure` — these no longer carry their own skip guard.
 
 
-def _core_has_new_api() -> bool:
-    try:
-        from pylon import _core
-
-        return hasattr(_core, 'PropertyDescriptor')
-    except ImportError:
-        return False
-
-
-requires_new_core = pytest.mark.skipif(
-    not _core_has_new_api(),
-    reason='Requires rebuilt pylon._core with PropertyDescriptor',
-)
-
-
-@requires_new_core
 class TestWalkIntegration:
     def setup_method(self):
         clear_registry()

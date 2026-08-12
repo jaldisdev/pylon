@@ -70,7 +70,7 @@ select Person filter .age < 18 union select Person filter .age > 65
 select Person except select Person filter .active = false
 ```
 
-`union` combines two sets (compiles to `UNION ALL` — duplicates are kept); `except` returns rows in the left operand not present in the right.
+`union` combines two sets (compiles to `UNION ALL` — duplicates are kept); `except` returns the elements of the left operand not present in the right.
 
 ## Precedence (loosest to tightest)
 

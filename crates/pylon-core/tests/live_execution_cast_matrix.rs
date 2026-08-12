@@ -34,7 +34,7 @@ use common::*;
 use pylon_value::DecodedValue;
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn mixed_int_and_float_arithmetic_returns_the_correct_value() {
     let pool = test_pool().await;
     assert_eq!(
@@ -48,7 +48,7 @@ async fn mixed_int_and_float_arithmetic_returns_the_correct_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn mixed_int_and_decimal_arithmetic_returns_the_correct_value() {
     let pool = test_pool().await;
     assert_eq!(
@@ -62,7 +62,7 @@ async fn mixed_int_and_decimal_arithmetic_returns_the_correct_value() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn same_family_arithmetic_still_returns_the_correct_value() {
     // Guards against the fix accidentally changing behavior for the
     // already-working same-family cases (int-int, float-float).

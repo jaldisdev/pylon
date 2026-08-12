@@ -26,6 +26,35 @@ import time
 
 import pytest
 
+#: Attributes the suite needs `pylon._core` to expose. A missing one means
+#: the compiled extension predates the Python code being tested against it.
+_REQUIRED_CORE_API = ('PropertyDescriptor', 'Guidance', 'SchemaDescriptor', 'pgcon_connect')
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Fail the whole run on a stale `pylon._core`, rather than skipping.
+
+    Whole test classes used to be `skipif`'d on `hasattr(_core, ...)`, which
+    meant an out-of-date compiled extension produced a green run with those
+    classes silently absent — the exact failure mode of `maturin develop`
+    leaving a stale `.so` behind. A build problem should look like a build
+    problem.
+    """
+    try:
+        from pylon import _core
+    except ImportError as exc:  # pragma: no cover - environment error
+        raise pytest.UsageError(
+            f'pylon._core is not importable ({exc}). Build it with: maturin develop && pip install -e ./'
+        ) from exc
+
+    missing = [name for name in _REQUIRED_CORE_API if not hasattr(_core, name)]
+    if missing:  # pragma: no cover - environment error
+        raise pytest.UsageError(
+            'pylon._core is out of date — missing '
+            + ', '.join(missing)
+            + '. Rebuild it with: maturin develop && pip install -e ./'
+        )
+
 
 def live_db_dsn() -> str:
     """Same env var as crates/pylon-core/tests/common/mod.rs's test_dsn() — no

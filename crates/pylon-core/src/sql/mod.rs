@@ -1735,7 +1735,9 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
             let body_out = match body {
                 IrStmt::Select(sel) => emit_select_stmt(sel, user_ctes),
                 IrStmt::PathSelect(sel) => emit_path_select(sel),
-                other => panic!("unsupported for-loop body: {:?}", other),
+                // Unreachable: `Compiler::compile_for` rejects every other
+                // body kind with a PyQL error before an `IrFor` is built.
+                other => unreachable!("for-loop body should have been rejected at compile time: {other:?}"),
             };
             let values_from = format!("(VALUES {}) AS {}(\"v\")", rows.join(", "), qi(&iter_alias));
             let indent_body = body_out.sql.replace('\n', "\n    ");

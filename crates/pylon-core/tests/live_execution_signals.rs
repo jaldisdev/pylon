@@ -98,7 +98,7 @@ fn field<'a>(row: &'a DecodedValue, name: &str) -> &'a DecodedValue {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn insert_writes_new_row_only() {
     let (module, schema, pool) = setup(1 /* Insert */).await;
     let type_name = format!("{module}::Widget");
@@ -121,7 +121,7 @@ async fn insert_writes_new_row_only() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_writes_both_old_and_new_row() {
     let (module, schema, pool) = setup(2 /* Update */).await;
     let type_name = format!("{module}::Widget");
@@ -156,7 +156,7 @@ async fn update_writes_both_old_and_new_row() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn delete_writes_old_row_only() {
     let (module, schema, pool) = setup(4 /* Delete */).await;
     let type_name = format!("{module}::Widget");
@@ -191,7 +191,7 @@ async fn delete_writes_old_row_only() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn unregistered_operations_on_the_same_type_enqueue_nothing() {
     // Only Insert is registered — the trigger's event list is scoped to
     // exactly the registered operations (`signal_trigger_infos` builds

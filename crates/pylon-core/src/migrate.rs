@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn ensure_tracking_tables_is_idempotent() {
         let pool = test_pool().await;
         ensure_tracking_tables(&pool).await.unwrap();
@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn schema_snapshot_round_trips() {
         // `_pylon."Schema"` is a shared singleton row across this whole test
         // module's DSN (same non-isolation concern as `_pylon."Migrations"`
@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn applied_tip_is_none_with_no_applied_rows() {
         assert_eq!(applied_tip(&[]), None);
         let all_pending = vec![TrackingRow {
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn applied_tip_is_the_row_with_no_descendant() {
         let tracking = vec![
             TrackingRow {
@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn applied_tip_is_deterministic_with_multiple_orphaned_tips() {
         // A tracking table can end up with several unrelated single-node
         // "tips" (orphaned rows from deleted/regenerated migration files) —
@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn apply_one_runs_ddl_and_records_tracking_row() {
         let pool = test_pool().await;
         let table = unique_table_name("migrate_apply_test");
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn read_tracking_decodes_schema_state_as_raw_json_text() {
         let pool = test_pool().await;
         let m = make_migration("initial", &body("SELECT 1;"));
@@ -812,7 +812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn read_tracking_decodes_db_state_as_raw_json_text() {
         let pool = test_pool().await;
         let m = make_migration("initial", &body("SELECT 1;"));
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn apply_one_multi_step_clears_progress_after_completion() {
         let pool = test_pool().await;
         let t1 = unique_table_name("migrate_step1");
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn apply_one_resumes_from_recorded_progress_skipping_earlier_steps() {
         let pool = test_pool().await;
         let t2 = unique_table_name("migrate_resume_step2");
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn apply_one_dev_mode_swallows_a_duplicate_table_error() {
         let pool = test_pool().await;
         let table = unique_table_name("migrate_dev_mode_test");
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn apply_one_without_dev_mode_propagates_a_duplicate_table_error() {
         let pool = test_pool().await;
         let table = unique_table_name("migrate_no_dev_mode_test");
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn record_applied_standalone_marks_a_migration_applied_without_running_ddl() {
         let pool = test_pool().await;
         let m = make_migration("initial", &body("SELECT 1;"));
@@ -1078,7 +1078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn advisory_lock_round_trips_and_blocks_a_concurrent_try_lock() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
 

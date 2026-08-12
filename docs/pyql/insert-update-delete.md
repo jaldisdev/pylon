@@ -42,7 +42,7 @@ Maps to PostgreSQL's `INSERT ... ON CONFLICT`. `on <expr>` names the conflicting
 update Person filter .id = <uuid>$id set { age := .age + 1 }
 ```
 
-`update <expr> [filter <bool-expr>] set { field := expr, ... }`. `.age` on the right-hand side refers to the row's *current* value, so `.age := .age + 1` is a genuine read-modify-write, not a self-referential error.
+`update <expr> [filter <bool-expr>] set { field := expr, ... }`. `.age` on the right-hand side refers to the object's *current* value, so `.age := .age + 1` is a genuine read-modify-write, not a self-referential error.
 
 Multi-link updates support three operators instead of just replace:
 

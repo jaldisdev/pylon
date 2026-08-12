@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn a_notify_on_the_channel_evicts_the_tagged_entry() {
         let dir = tempfile::tempdir().unwrap();
         let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10)
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn a_notify_on_an_unrelated_tag_leaves_the_entry_alone() {
         let dir = tempfile::tempdir().unwrap();
         let worker = CacheInvalidationWorker::connect(&test_dsn(), dir.path(), 10)
