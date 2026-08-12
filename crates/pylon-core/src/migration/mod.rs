@@ -303,6 +303,121 @@ pub fn parse_steps(body: &str) -> Vec<(bool, String)> {
     steps
 }
 
+// ── Statement splitting ───────────────────────────────────────────────────────
+
+/// Split one step's SQL into individual statements on top-level `;`.
+///
+/// Needed because `apply --dev-mode` has to be able to skip a *single*
+/// already-applied statement rather than discarding the whole step (see
+/// `migrate::apply_one`). A naive `split(';')` would corrupt every step that
+/// contains a dollar-quoted function body — which is most of them, since
+/// trigger and constraint DDL is emitted as `... AS $$ ... ; ... $$`.
+///
+/// Recognises the four places a `;` can appear without ending a statement:
+/// single-quoted strings (`''` escapes), quoted identifiers (`""` escapes),
+/// dollar-quoted bodies (`$$` or `$tag$`), and comments (`--` to end of line,
+/// `/* */` which nest in PostgreSQL). Empty statements are dropped, so a
+/// trailing `;` or a stray blank line never produces one.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        // A doubled quote is an escaped quote, not the end.
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => match dollar_tag(bytes, i) {
+                Some(tag) => {
+                    i += tag.len();
+                    // Scan to the matching closing tag; an unterminated body
+                    // runs to end of input rather than looping forever.
+                    match find_subslice(&bytes[i..], tag) {
+                        Some(offset) => i += offset + tag.len(),
+                        None => i = bytes.len(),
+                    }
+                }
+                None => i += 1,
+            },
+            b';' => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt.to_string());
+                }
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+/// If a dollar-quote tag opens at `at`, return it (including both `$`s).
+/// `$$` and `$tag$` open one; `$1` (a parameter) and a bare `$` do not.
+fn dollar_tag(bytes: &[u8], at: usize) -> Option<&[u8]> {
+    let mut j = at + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        // A tag can't start with a digit — that's a `$1` placeholder.
+        if j == at + 1 && bytes[j].is_ascii_digit() {
+            return None;
+        }
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b'$') {
+        Some(&bytes[at..=j])
+    } else {
+        None
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -458,5 +573,124 @@ mod tests {
     #[test]
     fn test_parse_steps_empty_body() {
         assert_eq!(parse_steps(""), vec![(true, String::new())]);
+    }
+
+    // ── split_statements ──────────────────────────────────────────────────
+
+    #[test]
+    fn split_statements_splits_on_plain_semicolons() {
+        assert_eq!(
+            split_statements("CREATE TABLE a (id int8); CREATE TABLE b (id int8);"),
+            vec!["CREATE TABLE a (id int8)", "CREATE TABLE b (id int8)"]
+        );
+    }
+
+    #[test]
+    fn split_statements_drops_empty_and_trailing_statements() {
+        assert_eq!(split_statements("SELECT 1;;\n\n;"), vec!["SELECT 1"]);
+        assert_eq!(split_statements(""), Vec::<String>::new());
+        assert_eq!(split_statements("   \n  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_statements_keeps_a_statement_without_a_trailing_semicolon() {
+        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolons_in_string_literals() {
+        assert_eq!(
+            split_statements("INSERT INTO t VALUES ('a;b'); SELECT 1;"),
+            vec!["INSERT INTO t VALUES ('a;b')", "SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn split_statements_handles_doubled_quote_escapes() {
+        assert_eq!(
+            split_statements("SELECT 'it''s; fine'; SELECT 2;"),
+            vec!["SELECT 'it''s; fine'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolons_in_quoted_identifiers() {
+        assert_eq!(
+            split_statements("CREATE TABLE \"weird;name\" (id int8); SELECT 1;"),
+            vec!["CREATE TABLE \"weird;name\" (id int8)", "SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolons_in_line_comments() {
+        assert_eq!(
+            split_statements("SELECT 1; -- trailing; comment\nSELECT 2;"),
+            vec!["SELECT 1", "-- trailing; comment\nSELECT 2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_ignores_semicolons_in_block_comments() {
+        assert_eq!(
+            split_statements("SELECT 1 /* a; b */; SELECT 2;"),
+            vec!["SELECT 1 /* a; b */", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_handles_nested_block_comments() {
+        assert_eq!(
+            split_statements("SELECT 1 /* a /* b; */ c; */; SELECT 2;"),
+            vec!["SELECT 1 /* a /* b; */ c; */", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_keeps_a_dollar_quoted_body_intact() {
+        // This is the case a naive split(';') corrupts: the function body has
+        // two internal semicolons that must not end the CREATE FUNCTION.
+        let sql = "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$\n\
+                   BEGIN\n  PERFORM 1;\n  RETURN NEW;\nEND;\n$$;\nSELECT 1;";
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2, "got {stmts:#?}");
+        assert!(stmts[0].starts_with("CREATE FUNCTION f()"));
+        assert!(stmts[0].ends_with("$$"));
+        assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn split_statements_keeps_a_tagged_dollar_quoted_body_intact() {
+        let sql = "CREATE FUNCTION f() RETURNS int8 AS $body$ SELECT 1; $body$ LANGUAGE sql; SELECT 2;";
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2, "got {stmts:#?}");
+        assert!(stmts[0].contains("$body$ SELECT 1; $body$"));
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn split_statements_handles_the_do_block_enum_form() {
+        // Exactly what `export::emit_enum` produces.
+        let sql = "DO $$ BEGIN CREATE TYPE s.t AS ENUM ('a'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;";
+        assert_eq!(split_statements(sql).len(), 1);
+    }
+
+    #[test]
+    fn split_statements_treats_dollar_digit_as_a_placeholder_not_a_tag() {
+        assert_eq!(
+            split_statements("SELECT $1; SELECT $2;"),
+            vec!["SELECT $1", "SELECT $2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_does_not_hang_on_an_unterminated_dollar_body() {
+        let stmts = split_statements("CREATE FUNCTION f() AS $$ SELECT 1;");
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn split_statements_does_not_hang_on_an_unterminated_string() {
+        let stmts = split_statements("SELECT 'oops;");
+        assert_eq!(stmts.len(), 1);
     }
 }
