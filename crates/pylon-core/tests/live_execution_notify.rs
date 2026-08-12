@@ -90,6 +90,72 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
+/// The one payload kind with no live coverage before: an Object channel's
+/// payload goes out as `jsonb_build_object(...)::text` and comes back
+/// through `json.loads` plus per-field type recovery, and nothing proved
+/// that round trip against a real database.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn trigger_notify_on_object_channel_delivers_decodable_json() {
+    let module = unique_module("live_notify_object");
+    let wire_name = format!("{module}__widget_events");
+
+    let qty = pylon_core::schema::PropertyDescriptor {
+        pg_type: "int8".into(),
+        ..text_prop("qty")
+    };
+    let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name"), qty]);
+    widget.triggers = vec![trigger(
+        1,
+        "After",
+        "select notify(WidgetEvents, { label := __new__.name, count := __new__.qty })",
+    )];
+    let schema = SchemaDescriptor {
+        types: vec![widget],
+        channels: vec![ChannelDescriptor {
+            name: "WidgetEvents".into(),
+            module: module.clone(),
+            wire_name: wire_name.clone(),
+            payload: ChannelPayload::Object(vec![
+                ("label".to_string(), "text".to_string()),
+                ("count".to_string(), "int8".to_string()),
+            ]),
+            description: None,
+        }],
+        ..Default::default()
+    };
+
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received.clone();
+    let listener = PgListener::connect(&test_dsn(), move |n| {
+        received_clone.lock().unwrap().push(n.payload().to_string());
+    })
+    .await
+    .unwrap();
+    listener.listen(&wire_name).await.unwrap();
+
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'gadget', qty := 7 }}"),
+    )
+    .await;
+
+    wait_until(|| !received.lock().unwrap().is_empty()).await;
+
+    let payload = received.lock().unwrap()[0].clone();
+    // Must be JSON — a ROW()-style composite text form here would mean every
+    // Object channel is undecodable by both clients.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).unwrap_or_else(|e| panic!("payload {payload:?} is not JSON: {e}"));
+    assert_eq!(parsed["label"], serde_json::json!("gadget"));
+    assert_eq!(parsed["count"], serde_json::json!(7));
+}
+
 #[tokio::test]
 #[ignore]
 async fn trigger_notify_on_scalar_channel_delivers_the_property_value() {
