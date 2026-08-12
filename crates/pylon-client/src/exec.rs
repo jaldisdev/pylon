@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use pylon_core::ir::SessionConfig;
 use pylon_core::query::{CompiledQuery, compile_with_config};
 use pylon_core::schema::SchemaDescriptor;
-use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
 
 use crate::decode::decode;
@@ -46,7 +45,7 @@ pub(crate) trait Executor {
 
 impl Executor for pylon_pgcon::PgPool {
     async fn run_query(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<Vec<DecodedValue>> {
-        self.query_typed(sql, params, &ExtensionOids::default()).await
+        self.query_typed(sql, params, self.types()).await
     }
     async fn run_execute(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<u64> {
         self.execute_typed(sql, params).await
@@ -58,7 +57,7 @@ impl Executor for pylon_pgcon::PgPool {
 
 impl Executor for pylon_pgcon::PgTransaction {
     async fn run_query(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<Vec<DecodedValue>> {
-        self.query_typed(sql, params, &ExtensionOids::default()).await
+        self.query_typed(sql, params, self.types()).await
     }
     async fn run_execute(&self, sql: &str, params: &[DecodedValue]) -> pylon_pgcon::Result<u64> {
         self.execute_typed(sql, params).await

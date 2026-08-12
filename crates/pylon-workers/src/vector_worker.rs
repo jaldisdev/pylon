@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 
 use pylon_core as core;
-use pylon_pgcon::{ExtensionOids, PgListener};
+use pylon_pgcon::PgListener;
 use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
@@ -143,7 +143,7 @@ impl BatchProcessor for VectorIndexWorker {
 
             let ids: Vec<DecodedValue> = group_rows.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
             let raw_records = listener
-                .query_typed_named(fetch_sql, &[DecodedValue::Array(ids)], &ExtensionOids::default())
+                .query_typed_named(fetch_sql, &[DecodedValue::Array(ids)], listener.types())
                 .await?;
             if raw_records.is_empty() {
                 continue;

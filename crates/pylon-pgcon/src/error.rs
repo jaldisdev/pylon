@@ -53,6 +53,16 @@ pub enum Error {
     /// A `DecodedValue::Decimal`'s string form wasn't a valid decimal.
     #[error(transparent)]
     Decimal(#[from] rust_decimal::Error),
+    /// A result column came back with a type OID this decoder has no rule
+    /// for and that connect-time discovery didn't classify either. Returned
+    /// rather than guessed at: the fallback that used to stand in here
+    /// (decode the raw binary as UTF-8 text) is only correct for text-like
+    /// types, and silently produced mojibake for everything else.
+    #[error(
+        "no decoder for PostgreSQL type OID {oid} — if this type was created after the \
+         connection opened, the type registry needs refreshing"
+    )]
+    UnknownTypeOid { oid: u32 },
     /// Everything else: DSN parse failures, the "cannot bind a composite
     /// as a query parameter" case — none of these originate from a real
     /// Postgres response, so none of them carry a SQLSTATE.

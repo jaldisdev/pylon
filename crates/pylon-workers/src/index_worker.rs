@@ -36,7 +36,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pylon_pgcon::{ExtensionOids, PgListener};
+use pylon_pgcon::PgListener;
 use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
@@ -173,7 +173,7 @@ async fn claim_batch(listener: &PgListener, index_kind: &str, limit: i64) -> Res
         .query_typed_named(
             CLAIM_BATCH_SQL,
             &[DecodedValue::Str(index_kind.to_string()), DecodedValue::I64(limit)],
-            &ExtensionOids::default(),
+            listener.types(),
         )
         .await?;
     rows.iter().map(decode_claimed_row).collect()
