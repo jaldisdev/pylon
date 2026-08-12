@@ -79,11 +79,7 @@ fn int_prop(name: &str) -> PropertyDescriptor {
 }
 
 fn person_schema(module: &str) -> SchemaDescriptor {
-    let person = ty(
-        "Person",
-        module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     SchemaDescriptor {
         types: vec![person],
         ..Default::default()
@@ -91,12 +87,8 @@ fn person_schema(module: &str) -> SchemaDescriptor {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
 }
 
 async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
@@ -104,11 +96,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -157,12 +145,7 @@ async fn delete_with_filter_removes_only_matching_rows() {
     )
     .await;
 
-    exec(
-        &pool,
-        &sd,
-        &format!("delete {module}::Person filter .age < 18"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("delete {module}::Person filter .age < 18")).await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
     assert_eq!(
@@ -228,20 +211,11 @@ async fn delete_with_no_matches_is_a_no_op() {
     )
     .await;
 
-    let deleted = rows_of(
-        &pool,
-        &sd,
-        &format!("delete {module}::Person filter .age > 100"),
-    )
-    .await;
+    let deleted = rows_of(&pool, &sd, &format!("delete {module}::Person filter .age > 100")).await;
     assert!(deleted.is_empty(), "no row should match, got {deleted:?}");
 
     let after = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
-    assert_eq!(
-        after.len(),
-        1,
-        "the non-matching row must survive, got {after:?}"
-    );
+    assert_eq!(after.len(), 1, "the non-matching row must survive, got {after:?}");
 }
 
 #[tokio::test]

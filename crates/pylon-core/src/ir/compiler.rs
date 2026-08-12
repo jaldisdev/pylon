@@ -18,32 +18,45 @@
 //
 
 use crate::error::{
-    Position, PyQLError, PyQLResolutionError, PyQLTypeError,
-    PyQLUnknownFieldError, PyQLUnknownTypeError,
+    Position, PyQLError, PyQLResolutionError, PyQLTypeError, PyQLUnknownFieldError, PyQLUnknownTypeError,
 };
-use crate::parse::ast::{
-    self, Expr, Literal, NonesOrder, ShapeElement, ShapeOp, SortDirection, Stmt,
-};
+use crate::parse::ast::{self, Expr, Literal, NonesOrder, ShapeElement, ShapeOp, SortDirection, Stmt};
 use crate::schema::{
-    FunctionDescriptor, LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor,
-    SearchBackend, TypeDescriptor,
+    FunctionDescriptor, LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, SchemaDescriptor, SearchBackend,
+    TypeDescriptor,
 };
 
 use std::collections::HashMap;
 
 use super::{
-    IrArraySource, IrBinOp, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrForIterator, IrFreeExpr, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrComputedGlobalCte,
-    IrSessionGlobalCte, IrIfElse, IrInsert, IrLiteral,
-    IrMultiLinkClear, IrMultiLinkPointer, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues,
-    IrMultiLinkValueSource,
-    IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite,
-    IrRowSource,
-    IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
-    IrFtsSearch, IrTypeCast, IrUnaryOp, IrUpdate, IrLinkProp, IrGroup, IrVectorSearch,
-    VectorEnqueueInfo, SearchEnqueueInfo, TupleCastShape,
-    IrLockClause, IrLockStrength, IrLockWait,
+    IrArraySource, IrBinOp, IrComputedGlobalCte, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
+    IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup, IrIfElse, IrInsert,
+    IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
+    IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
+    IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
+    IrSelect, IrSessionGlobalCte, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir,
+    IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate, IrVectorSearch, SearchEnqueueInfo, TupleCastShape,
+    VectorEnqueueInfo,
 };
+
+// ── Compiled-clause tuples ──────────────────────────────────────────────────────
+//
+// The three helpers that pull a statement's trailing clauses apart all return
+// the same shape: the pieces in source order, each optional because a query
+// need not spell any of them out. Named here so the signatures read as one
+// concept rather than as an anonymous 4-tuple repeated three times.
+
+/// `(filter, order_by, offset, limit)` — a plain `select`'s trailing clauses.
+type SelectModifiers = (Option<IrExpr>, Vec<IrSort>, Option<IrExpr>, Option<IrExpr>);
+
+/// `(filter, distance/rank direction, offset, limit)` — the trailing clauses of
+/// a `vector::search`/`fts::search` select, where `order by` is constrained to
+/// the search score rather than an arbitrary sort list.
+type SearchModifiers = (Option<IrExpr>, Option<IrSortDir>, Option<IrExpr>, Option<IrExpr>);
+
+/// `(type name, shape elements, sub-statement, link-property alias)` — the
+/// parts of an expression that names a type and optionally shapes it.
+type TypeAndShape<'e> = (String, &'e [ShapeElement], Option<&'e Stmt>, Option<String>);
 
 // ── Public entry point ──────────────────────────────────────────────────────────
 
@@ -71,18 +84,34 @@ pub fn compile_with_config(
         // Special case: `with search := vector::search(…); select search { … } …`
         // Merge into a single IrVectorSearch rather than going through the CTE machinery.
         if let Some(ir) = try_compile_vs_with_pattern(&mut c, w)? {
-            return Ok(IrOutput { stmt: ir, params: c.params, ctes: vec![], global_ctes: c.global_ctes, warnings: c.warnings });
+            return Ok(IrOutput {
+                stmt: ir,
+                params: c.params,
+                ctes: vec![],
+                global_ctes: c.global_ctes,
+                warnings: c.warnings,
+            });
         }
         // Special case: `with search := fts::search(…); select search { … } …`
         if let Some(ir) = try_compile_fts_with_pattern(&mut c, w)? {
-            return Ok(IrOutput { stmt: ir, params: c.params, ctes: vec![], global_ctes: c.global_ctes, warnings: c.warnings });
+            return Ok(IrOutput {
+                stmt: ir,
+                params: c.params,
+                ctes: vec![],
+                global_ctes: c.global_ctes,
+                warnings: c.warnings,
+            });
         }
 
         let mut cte_defs = vec![];
         for alias in &w.aliases {
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let type_name = c.register_cte(&alias.name, &ir_stmt);
-            cte_defs.push(IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name });
+            cte_defs.push(IrCteDef {
+                name: alias.name.clone(),
+                stmt: ir_stmt,
+                type_name,
+            });
         }
         let main = c.compile_stmt(&w.stmt)?;
         (cte_defs, main)
@@ -90,23 +119,30 @@ pub fn compile_with_config(
         (vec![], c.compile_stmt(stmt)?)
     };
 
-    Ok(IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
+    Ok(IrOutput {
+        stmt: ir,
+        params: c.params,
+        ctes,
+        global_ctes: c.global_ctes,
+        warnings: c.warnings,
+    })
 }
 
 /// Detect `with <var> := vector::search(Type, $vec); select <var> { object { … }, distance }`.
 /// When matched, compile the whole thing to a single `IrVectorSearch`.
-fn try_compile_vs_with_pattern(
-    c: &mut Compiler<'_>,
-    w: &ast::WithStmt,
-) -> Result<Option<IrStmt>, PyQLError> {
+fn try_compile_vs_with_pattern(c: &mut Compiler<'_>, w: &ast::WithStmt) -> Result<Option<IrStmt>, PyQLError> {
     // Only handle exactly one alias that is a bare function call (not a subquery).
-    if w.aliases.len() != 1 { return Ok(None); }
+    if w.aliases.len() != 1 {
+        return Ok(None);
+    }
     let alias_def = &w.aliases[0];
     let fc = match &alias_def.expr {
         Expr::FunctionCall(fc) => fc,
         _ => return Ok(None),
     };
-    if fc.module.as_deref() != Some("vector") || fc.name != "search" { return Ok(None); }
+    if fc.module.as_deref() != Some("vector") || fc.name != "search" {
+        return Ok(None);
+    }
 
     // Main statement must be `select <alias_name> { … }`.
     let select_stmt = match w.stmt.as_ref() {
@@ -125,8 +161,12 @@ fn try_compile_vs_with_pattern(
     match result_inner {
         Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
             if let ast::PathStep::Name(n) = &p.steps[0] {
-                if n != &alias_def.name { return Ok(None); }
-            } else { return Ok(None); }
+                if n != &alias_def.name {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
         }
         _ => return Ok(None),
     }
@@ -138,17 +178,18 @@ fn try_compile_vs_with_pattern(
     }
 }
 
-fn try_compile_fts_with_pattern(
-    c: &mut Compiler<'_>,
-    w: &ast::WithStmt,
-) -> Result<Option<IrStmt>, PyQLError> {
-    if w.aliases.len() != 1 { return Ok(None); }
+fn try_compile_fts_with_pattern(c: &mut Compiler<'_>, w: &ast::WithStmt) -> Result<Option<IrStmt>, PyQLError> {
+    if w.aliases.len() != 1 {
+        return Ok(None);
+    }
     let alias_def = &w.aliases[0];
     let fc = match &alias_def.expr {
         Expr::FunctionCall(fc) => fc,
         _ => return Ok(None),
     };
-    if fc.module.as_deref() != Some("fts") || fc.name != "search" { return Ok(None); }
+    if fc.module.as_deref() != Some("fts") || fc.name != "search" {
+        return Ok(None);
+    }
 
     let select_stmt = match w.stmt.as_ref() {
         Stmt::Select(s) => s,
@@ -164,8 +205,12 @@ fn try_compile_fts_with_pattern(
     match result_inner {
         Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
             if let ast::PathStep::Name(n) = &p.steps[0] {
-                if n != &alias_def.name { return Ok(None); }
-            } else { return Ok(None); }
+                if n != &alias_def.name {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
         }
         _ => return Ok(None),
     }
@@ -232,14 +277,17 @@ pub fn compile_fn_body(
     use crate::parse::ast::Stmt;
 
     let body = fn_desc.body.trim().to_string();
-    let body = if body.starts_with("select") || body.starts_with("SELECT")
-            || body.starts_with("with") || body.starts_with("WITH") {
+    let body = if body.starts_with("select")
+        || body.starts_with("SELECT")
+        || body.starts_with("with")
+        || body.starts_with("WITH")
+    {
         body
     } else {
         format!("select {}", body)
     };
 
-    let ast = parse::parse(&body).map_err(|e| e)?;
+    let ast = parse::parse(&body)?;
     let mut c = Compiler::new(schema);
     for p in &fn_desc.params {
         c.fn_params.insert(p.name.clone(), p.pg_type.clone());
@@ -251,7 +299,11 @@ pub fn compile_fn_body(
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let type_name = cte_stmt_type(&ir_stmt);
             c.cte_types.insert(alias.name.clone(), type_name.clone());
-            cte_defs.push(super::IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name });
+            cte_defs.push(super::IrCteDef {
+                name: alias.name.clone(),
+                stmt: ir_stmt,
+                type_name,
+            });
         }
         let main = c.compile_stmt(&w.stmt)?;
         (cte_defs, main)
@@ -259,7 +311,13 @@ pub fn compile_fn_body(
         (vec![], c.compile_stmt(&ast)?)
     };
 
-    Ok(super::IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
+    Ok(super::IrOutput {
+        stmt: ir,
+        params: c.params,
+        ctes,
+        global_ctes: c.global_ctes,
+        warnings: c.warnings,
+    })
 }
 
 /// Compile a schema `Trigger`'s `handler` PyQL statement for DDL emission —
@@ -294,10 +352,12 @@ pub fn compile_trigger_handler(
     // __new__.name }`, the ambient td at that point is `Note`, not this).
     let owner_td = c.resolve_type(type_name)?;
     if on_mask & 4 == 0 {
-        c.special_anchors.insert("__new__".to_string(), (owner_td, "NEW".to_string()));
+        c.special_anchors
+            .insert("__new__".to_string(), (owner_td, "NEW".to_string()));
     }
     if on_mask & 1 == 0 {
-        c.special_anchors.insert("__old__".to_string(), (owner_td, "OLD".to_string()));
+        c.special_anchors
+            .insert("__old__".to_string(), (owner_td, "OLD".to_string()));
     }
 
     let (ctes, ir) = if let Stmt::With(w) = &ast {
@@ -306,7 +366,11 @@ pub fn compile_trigger_handler(
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let cte_type_name = cte_stmt_type(&ir_stmt);
             c.cte_types.insert(alias.name.clone(), cte_type_name.clone());
-            cte_defs.push(super::IrCteDef { name: alias.name.clone(), stmt: ir_stmt, type_name: cte_type_name });
+            cte_defs.push(super::IrCteDef {
+                name: alias.name.clone(),
+                stmt: ir_stmt,
+                type_name: cte_type_name,
+            });
         }
         let main = c.compile_stmt(&w.stmt)?;
         (cte_defs, main)
@@ -316,21 +380,27 @@ pub fn compile_trigger_handler(
 
     let recursive_kind = recursive_dml_event(&ir, type_name)
         .or_else(|| ctes.iter().find_map(|cte| recursive_dml_event(&cte.stmt, type_name)));
-    if let Some(kind) = recursive_kind {
-        if kind & on_mask != 0 {
-            return Err(crate::error::PyQLError::Fragment(crate::error::PyQLFragmentError {
-                message: format!(
-                    "trigger on {type_name} is recursive: its handler {}s its own type, \
+    if let Some(kind) = recursive_kind
+        && kind & on_mask != 0
+    {
+        return Err(crate::error::PyQLError::Fragment(crate::error::PyQLFragmentError {
+            message: format!(
+                "trigger on {type_name} is recursive: its handler {}s its own type, \
                      which this trigger also fires on",
-                    dml_event_word(kind),
-                ),
-                context: type_name.to_string(),
-                position: crate::error::Position { line: 0, col: 0 },
-            }));
-        }
+                dml_event_word(kind),
+            ),
+            context: type_name.to_string(),
+            position: crate::error::Position { line: 0, col: 0 },
+        }));
     }
 
-    Ok(super::IrOutput { stmt: ir, params: c.params, ctes, global_ctes: c.global_ctes, warnings: c.warnings })
+    Ok(super::IrOutput {
+        stmt: ir,
+        params: c.params,
+        ctes,
+        global_ctes: c.global_ctes,
+        warnings: c.warnings,
+    })
 }
 
 fn dml_event_word(kind: u8) -> &'static str {
@@ -364,7 +434,10 @@ fn recursive_dml_event(stmt: &IrStmt, owner_type: &str) -> Option<u8> {
         IrStmt::Insert(ins) if ins.target.type_name == owner_type => Some(1),
         IrStmt::Update(upd) if upd.target.type_name == owner_type => Some(2),
         IrStmt::Delete(del) if del.target.type_name == owner_type => Some(4),
-        IrStmt::Select(sel) => sel.dml_source.as_deref().and_then(|inner| recursive_dml_event(inner, owner_type)),
+        IrStmt::Select(sel) => sel
+            .dml_source
+            .as_deref()
+            .and_then(|inner| recursive_dml_event(inner, owner_type)),
         IrStmt::For(for_stmt) => recursive_dml_event(&for_stmt.body, owner_type),
         _ => None,
     }
@@ -409,10 +482,7 @@ pub fn compile_scalar_default(pyql: &str, schema: &SchemaDescriptor) -> Result<S
 /// Like `compile_scalar_default`, but also returns the compiled `IrExpr` —
 /// used by schema-type-consistency validation (`crate::validate`) to infer
 /// the default's actual produced type via `infer_ir_type`.
-pub fn compile_scalar_default_typed(
-    pyql: &str,
-    schema: &SchemaDescriptor,
-) -> Result<(String, IrExpr), String> {
+pub fn compile_scalar_default_typed(pyql: &str, schema: &SchemaDescriptor) -> Result<(String, IrExpr), String> {
     use crate::parse::ast::Stmt;
     let full = format!("SELECT {}", pyql);
     let ast = crate::parse::parse(&full).map_err(|e| e.message)?;
@@ -504,10 +574,10 @@ impl<'a> Compiler<'a> {
     fn register_cte(&mut self, name: &str, ir_stmt: &IrStmt) -> String {
         let type_name = cte_stmt_type(ir_stmt);
         self.cte_types.insert(name.to_string(), type_name.clone());
-        if let IrStmt::Select(sel) = ir_stmt {
-            if let [IrRowSource::Free(item)] = sel.rows.as_slice() {
-                self.cte_free_items.insert(name.to_string(), item.clone());
-            }
+        if let IrStmt::Select(sel) = ir_stmt
+            && let [IrRowSource::Free(item)] = sel.rows.as_slice()
+        {
+            self.cte_free_items.insert(name.to_string(), item.clone());
         }
         type_name
     }
@@ -530,17 +600,35 @@ impl<'a> Compiler<'a> {
         };
         let mut current: &IrExpr = match fields.iter().find(|(n, _)| n == first) {
             Some((_, e)) => e,
-            None => return Some(Err(self.type_err(&format!("free object '{root}' has no field '{first}'")))),
+            None => {
+                return Some(Err(
+                    self.type_err(&format!("free object '{root}' has no field '{first}'"))
+                ));
+            }
         };
-        let mut expr = IrExpr::CteFieldRef { name: root.to_string(), field: first.to_string() };
+        let mut expr = IrExpr::CteFieldRef {
+            name: root.to_string(),
+            field: first.to_string(),
+        };
         for step in rest {
-            if let IrExpr::NamedTuple { fields: nested, is_free_object: true } = current {
+            if let IrExpr::NamedTuple {
+                fields: nested,
+                is_free_object: true,
+            } = current
+            {
                 match nested.iter().find(|(n, _)| n == step) {
                     Some((_, next)) => current = next,
-                    None => return Some(Err(self.type_err(&format!("{step} is not a member of the nested free object")))),
+                    None => {
+                        return Some(Err(
+                            self.type_err(&format!("{step} is not a member of the nested free object"))
+                        ));
+                    }
                 }
             }
-            expr = IrExpr::JsonbField { expr: Box::new(expr), field: step.to_string() };
+            expr = IrExpr::JsonbField {
+                expr: Box::new(expr),
+                field: step.to_string(),
+            };
         }
         Some(Ok(expr))
     }
@@ -553,7 +641,9 @@ impl<'a> Compiler<'a> {
         if p.partial || p.steps.len() < 2 {
             return None;
         }
-        let ast::PathStep::Name(root) = &p.steps[0] else { return None };
+        let ast::PathStep::Name(root) = &p.steps[0] else {
+            return None;
+        };
         let mut steps = Vec::with_capacity(p.steps.len() - 1);
         for step in &p.steps[1..] {
             match step {
@@ -566,14 +656,13 @@ impl<'a> Compiler<'a> {
 
     /// Return the CTE name if `expr` is a bare identifier that matches a registered CTE.
     fn resolve_cte_name<'e>(&self, expr: &'e Expr) -> Option<&'e str> {
-        if let Expr::Path(p) = expr {
-            if !p.partial && p.steps.len() == 1 {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if self.cte_types.contains_key(n.as_str()) {
-                        return Some(n.as_str());
-                    }
-                }
-            }
+        if let Expr::Path(p) = expr
+            && !p.partial
+            && p.steps.len() == 1
+            && let ast::PathStep::Name(n) = &p.steps[0]
+            && self.cte_types.contains_key(n.as_str())
+        {
+            return Some(n.as_str());
         }
         None
     }
@@ -612,23 +701,23 @@ impl<'a> Compiler<'a> {
     /// produce for a `Global[T]` annotation.
     fn resolve_global_pg_type(&self, scalar_type: &str) -> String {
         let builtin = match scalar_type {
-            "std::str"            => Some("text"),
-            "std::int16"          => Some("int2"),
-            "std::int32"          => Some("int4"),
-            "std::int64"          => Some("int8"),
-            "std::float32"        => Some("float4"),
-            "std::float64"        => Some("float8"),
-            "std::decimal"        => Some("numeric"),
-            "std::bool"           => Some("boolean"),
-            "std::datetime"       => Some("timestamptz"),
+            "std::str" => Some("text"),
+            "std::int16" => Some("int2"),
+            "std::int32" => Some("int4"),
+            "std::int64" => Some("int8"),
+            "std::float32" => Some("float4"),
+            "std::float64" => Some("float8"),
+            "std::decimal" => Some("numeric"),
+            "std::bool" => Some("boolean"),
+            "std::datetime" => Some("timestamptz"),
             "cal::local_datetime" => Some("timestamp"),
-            "cal::local_date"     => Some("date"),
-            "cal::local_time"     => Some("time"),
-            "std::uuid"           => Some("uuid"),
-            "std::bytes"          => Some("bytea"),
-            "std::json"           => Some("jsonb"),
-            "std::duration"       => Some("interval"),
-            _                     => None,
+            "cal::local_date" => Some("date"),
+            "cal::local_time" => Some("time"),
+            "std::uuid" => Some("uuid"),
+            "std::bytes" => Some("bytea"),
+            "std::json" => Some("jsonb"),
+            "std::duration" => Some("interval"),
+            _ => None,
         };
         if let Some(t) = builtin {
             return t.to_string();
@@ -646,7 +735,9 @@ impl<'a> Compiler<'a> {
             return "jsonb".to_string();
         }
         // Fall back to a registered custom scalar lookup.
-        self.schema.scalars.iter()
+        self.schema
+            .scalars
+            .iter()
             .find(|s| s.name == scalar_type || format!("{}::{}", s.module, s.name) == scalar_type)
             .map(|s| s.pg_type.clone())
             .unwrap_or_else(|| "text".to_string())
@@ -670,9 +761,11 @@ impl<'a> Compiler<'a> {
             _ => return Ok(None),
         };
 
-        let global = self.schema.globals.iter().find(|g| {
-            g.name == global_name || format!("{}::{}", g.module, g.name) == global_name
-        });
+        let global = self
+            .schema
+            .globals
+            .iter()
+            .find(|g| g.name == global_name || format!("{}::{}", g.module, g.name) == global_name);
         let global = match global {
             Some(g) => g.clone(),
             None => return Ok(None),
@@ -753,9 +846,11 @@ impl<'a> Compiler<'a> {
                 _ => return None,
             },
             Expr::Global(name) => {
-                let global = self.schema.globals.iter().find(|g| {
-                    g.name == *name || format!("{}::{}", g.module, g.name) == *name
-                })?;
+                let global = self
+                    .schema
+                    .globals
+                    .iter()
+                    .find(|g| g.name == *name || format!("{}::{}", g.module, g.name) == *name)?;
                 let computed_expr = global.computed_expr.as_ref()?;
                 match crate::parse::parse(computed_expr).ok()? {
                     Stmt::Select(sel) => sel,
@@ -855,9 +950,11 @@ impl<'a> Compiler<'a> {
         };
 
         // Match against schema aliases (bare name or module::name).
-        let alias = self.schema.aliases.iter().find(|a| {
-            a.name == path_name || format!("{}::{}", a.module, a.name) == path_name
-        });
+        let alias = self
+            .schema
+            .aliases
+            .iter()
+            .find(|a| a.name == path_name || format!("{}::{}", a.module, a.name) == path_name);
         let alias = match alias {
             Some(a) => a.clone(),
             None => return Ok(None),
@@ -866,9 +963,7 @@ impl<'a> Compiler<'a> {
         let inner_ast = crate::parse::parse(&alias.expr)?;
         let inner_sel = match inner_ast {
             Stmt::Select(sel) => sel,
-            _ => return Err(self.type_err(&format!(
-                "alias '{}' expression must be a select statement", alias.name
-            ))),
+            _ => return Err(self.type_err(&format!("alias '{}' expression must be a select statement", alias.name))),
         };
 
         // Merge outer shape / filter / modifiers over the alias's select.
@@ -925,15 +1020,19 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_global(&mut self, raw_name: &str) -> Result<IrExpr, PyQLError> {
-        let global = self.schema.globals.iter().find(|g| {
-            g.name == raw_name || format!("{}::{}", g.module, g.name) == raw_name
-        });
-        let global = global.ok_or_else(|| {
-            PyQLError::Resolution(PyQLResolutionError::UnknownField(PyQLUnknownFieldError {
-                message: format!("unknown global: {:?}", raw_name),
-                position: Position { line: 0, col: 0 },
-            }))
-        })?.clone();
+        let global = self
+            .schema
+            .globals
+            .iter()
+            .find(|g| g.name == raw_name || format!("{}::{}", g.module, g.name) == raw_name);
+        let global = global
+            .ok_or_else(|| {
+                PyQLError::Resolution(PyQLResolutionError::UnknownField(PyQLUnknownFieldError {
+                    message: format!("unknown global: {:?}", raw_name),
+                    position: Position { line: 0, col: 0 },
+                }))
+            })?
+            .clone();
 
         let qualified = format!("{}::{}", global.module, global.name);
         let cte_name = format!("__global__{}", qualified);
@@ -946,11 +1045,12 @@ impl<'a> Compiler<'a> {
             // Recursively compile the PyQL expression (shares params and global_ctes)
             let inner_ast = crate::parse::parse(&computed_expr)?;
             let inner_stmt = self.compile_stmt(&inner_ast)?;
-            self.global_ctes.push(IrGlobalCte::Computed(IrComputedGlobalCte {
-                cte_name: cte_name.clone(),
-                qualified_name: qualified,
-                stmt: inner_stmt,
-            }));
+            self.global_ctes
+                .push(IrGlobalCte::Computed(Box::new(IrComputedGlobalCte {
+                    cte_name: cte_name.clone(),
+                    qualified_name: qualified,
+                    stmt: inner_stmt,
+                })));
             Ok(IrExpr::GlobalRef { cte_name })
         } else {
             // Session global — allocate parameter slot
@@ -960,7 +1060,7 @@ impl<'a> Compiler<'a> {
             // Register CTE only once
             if !self.global_ctes.iter().any(|g| g.cte_name() == cte_name) {
                 self.global_ctes.push(IrGlobalCte::Session(IrSessionGlobalCte {
-                    cte_name: cte_name,
+                    cte_name,
                     qualified_name: qualified,
                     param_index: index,
                     pg_type: pg_type.clone(),
@@ -977,9 +1077,7 @@ impl<'a> Compiler<'a> {
         self.schema
             .types
             .iter()
-            .find(|t| {
-                t.name == name || format!("{}::{}", t.module, t.name) == name
-            })
+            .find(|t| t.name == name || format!("{}::{}", t.module, t.name) == name)
             .ok_or_else(|| {
                 PyQLError::Resolution(PyQLResolutionError::UnknownType(PyQLUnknownTypeError {
                     message: format!("unknown type '{name}'"),
@@ -989,9 +1087,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn resolve_enum(&self, name: &str) -> Option<&'a crate::schema::EnumDescriptor> {
-        self.schema.enums.iter().find(|e| {
-            e.name == name || format!("{}::{}", e.module, e.name) == name
-        })
+        self.schema
+            .enums
+            .iter()
+            .find(|e| e.name == name || format!("{}::{}", e.module, e.name) == name)
     }
 
     /// Resolve a `Channel` by name (bare or `module::Name`) — used by
@@ -1007,18 +1106,20 @@ impl<'a> Compiler<'a> {
     /// `resolve_cast_pg_type`); an anonymous (unregistered) scalar has no
     /// name reachable here at all, so it's never a valid cast target.
     fn resolve_scalar(&self, name: &str) -> Option<&'a crate::schema::ScalarDescriptor> {
-        self.schema.scalars.iter().find(|s| {
-            s.name == name || format!("{}::{}", s.module, s.name) == name
-        })
+        self.schema
+            .scalars
+            .iter()
+            .find(|s| s.name == name || format!("{}::{}", s.module, s.name) == name)
     }
 
     /// Resolve a registered (nominal) `@pylon.named_tuple` type by name — used only
     /// to recognize a cast target as a named tuple (member structure isn't
     /// validated here; the value is trusted the same way a plain `<json>` cast is).
     fn resolve_named_tuple(&self, name: &str) -> Option<&'a crate::schema::NamedTupleDescriptor> {
-        self.schema.named_tuples.iter().find(|nt| {
-            nt.name == name || format!("{}::{}", nt.module, nt.name) == name
-        })
+        self.schema
+            .named_tuples
+            .iter()
+            .find(|nt| nt.name == name || format!("{}::{}", nt.module, nt.name) == name)
     }
 
     /// Convert a schema-level `TupleMemberDescriptor` into a decode-time
@@ -1035,16 +1136,27 @@ impl<'a> Compiler<'a> {
                 let qname = format!("{}::{}", module, name);
                 let nested_members = self
                     .resolve_named_tuple(&qname)
-                    .map(|nt| nt.members.iter().map(|mm| self.tuple_member_to_json_member(mm)).collect())
+                    .map(|nt| {
+                        nt.members
+                            .iter()
+                            .map(|mm| self.tuple_member_to_json_member(mm))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                crate::query::JsonMemberKind::Tuple { type_name: Some(qname), members: nested_members }
+                crate::query::JsonMemberKind::Tuple {
+                    type_name: Some(qname),
+                    members: nested_members,
+                }
             }
             TupleMemberKind::Tuple { members } => crate::query::JsonMemberKind::Tuple {
                 type_name: None,
                 members: members.iter().map(|mm| self.tuple_member_to_json_member(mm)).collect(),
             },
         };
-        crate::query::JsonMember { key: m.name.clone(), kind }
+        crate::query::JsonMember {
+            key: m.name.clone(),
+            kind,
+        }
     }
 
     /// Convert a parsed cast-target `ast::TupleTypeElement` into a decode-time
@@ -1060,7 +1172,10 @@ impl<'a> Compiler<'a> {
         if let ast::TypeExpr::Tuple { elements } = ty {
             return crate::query::JsonMemberKind::Tuple {
                 type_name: None,
-                members: elements.iter().map(|e| self.ast_tuple_element_to_json_member(e)).collect(),
+                members: elements
+                    .iter()
+                    .map(|e| self.ast_tuple_element_to_json_member(e))
+                    .collect(),
             };
         }
         let Some((module, name)) = ty.as_named() else {
@@ -1093,7 +1208,10 @@ impl<'a> Compiler<'a> {
         match ty {
             ast::TypeExpr::Tuple { elements } => Some(TupleCastShape {
                 type_name: None,
-                members: elements.iter().map(|e| self.ast_tuple_element_to_json_member(e)).collect(),
+                members: elements
+                    .iter()
+                    .map(|e| self.ast_tuple_element_to_json_member(e))
+                    .collect(),
             }),
             _ => {
                 let (module, name) = ty.as_named()?;
@@ -1160,7 +1278,12 @@ impl<'a> Compiler<'a> {
     /// source is itself a tuple/named-tuple literal, applies each element's
     /// own cast by position (see `try_compile_tuple_literal_cast_ctx`)
     /// instead of jsonb-wrapping the raw uncast literal values.
-    fn scalar_cast_free_select(&mut self, tc: &ast::TypeCast, pg_type: String, distinct: bool) -> Result<IrStmt, PyQLError> {
+    fn scalar_cast_free_select(
+        &mut self,
+        tc: &ast::TypeCast,
+        pg_type: String,
+        distinct: bool,
+    ) -> Result<IrStmt, PyQLError> {
         let cast_expr = match &tc.ty {
             ast::TypeExpr::Tuple { elements } => {
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
@@ -1169,17 +1292,29 @@ impl<'a> Compiler<'a> {
                     // cast — still wrap in TypeCast so `tuple_shape` reaches SQL
                     // emission for decode-time ShapeNode building (jsonb_build_*
                     // already produces jsonb, so the outer `::jsonb` is a no-op).
-                    Some(ir) => IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })),
+                    Some(ir) => IrExpr::TypeCast(Box::new(IrTypeCast {
+                        expr: ir,
+                        pg_type,
+                        tuple_shape,
+                    })),
                     None => {
                         let inner = self.compile_expr_ctx(&tc.expr, None)?;
-                        IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
+                        IrExpr::TypeCast(Box::new(IrTypeCast {
+                            expr: inner,
+                            pg_type,
+                            tuple_shape,
+                        }))
                     }
                 }
             }
             _ => {
                 let inner = self.compile_expr_ctx(&tc.expr, None)?;
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape }))
+                IrExpr::TypeCast(Box::new(IrTypeCast {
+                    expr: inner,
+                    pg_type,
+                    tuple_shape,
+                }))
             }
         };
         Ok(IrStmt::Select(IrSelect {
@@ -1246,14 +1381,18 @@ impl<'a> Compiler<'a> {
         value: &Expr,
         ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
-        if let ast::TypeExpr::Tuple { elements } = target_ty {
-            if let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, value, ctx)? {
-                return Ok(ir);
-            }
+        if let ast::TypeExpr::Tuple { elements } = target_ty
+            && let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, value, ctx)?
+        {
+            return Ok(ir);
         }
         let inner = self.compile_expr_ctx(value, ctx)?;
         let pg_type = self.resolve_cast_pg_type(target_ty)?;
-        Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape: None })))
+        Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
+            expr: inner,
+            pg_type,
+            tuple_shape: None,
+        })))
     }
 
     /// When casting a tuple/named-tuple *literal* to a structural tuple type,
@@ -1288,7 +1427,10 @@ impl<'a> Compiler<'a> {
                 .zip(casted)
                 .map(|(e, v)| (e.name.clone().unwrap(), v))
                 .collect();
-            Ok(Some(IrExpr::NamedTuple { fields, is_free_object: false }))
+            Ok(Some(IrExpr::NamedTuple {
+                fields,
+                is_free_object: false,
+            }))
         } else {
             Ok(Some(IrExpr::Tuple(casted)))
         }
@@ -1320,9 +1462,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_enum_access(&self, type_ref: &str, variant: &str) -> Result<IrExpr, PyQLError> {
-        let ed = self.resolve_enum(type_ref).ok_or_else(|| {
-            self.type_err(&format!("unknown type '{}'", type_ref))
-        })?;
+        let ed = self
+            .resolve_enum(type_ref)
+            .ok_or_else(|| self.type_err(&format!("unknown type '{}'", type_ref)))?;
         if !ed.members.iter().any(|m| m == variant) {
             return Err(self.type_err(&format!(
                 "enum '{}::{}' has no member '{}'",
@@ -1336,7 +1478,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn find_poly_implementors(&self, iface_qname: &str) -> Vec<IrPolyImplementor> {
-        self.schema.types.iter()
+        self.schema
+            .types
+            .iter()
             .filter(|t| !t.abstract_ && t.interfaces.iter().any(|i| i == iface_qname))
             .map(|t| IrPolyImplementor {
                 type_name: format!("{}::{}", t.module, t.name),
@@ -1346,10 +1490,7 @@ impl<'a> Compiler<'a> {
             .collect()
     }
 
-    fn resolve_property<'t>(
-        td: &'t TypeDescriptor,
-        name: &str,
-    ) -> Option<&'t PropertyDescriptor> {
+    fn resolve_property<'t>(td: &'t TypeDescriptor, name: &str) -> Option<&'t PropertyDescriptor> {
         td.properties.iter().find(|p| p.name == name)
     }
 
@@ -1357,10 +1498,7 @@ impl<'a> Compiler<'a> {
         td.links.iter().find(|l| l.name == name)
     }
 
-    fn resolve_multilink<'t>(
-        td: &'t TypeDescriptor,
-        name: &str,
-    ) -> Option<&'t MultiLinkDescriptor> {
+    fn resolve_multilink<'t>(td: &'t TypeDescriptor, name: &str) -> Option<&'t MultiLinkDescriptor> {
         td.multilinks.iter().find(|m| m.name == name)
     }
 
@@ -1370,8 +1508,7 @@ impl<'a> Compiler<'a> {
         match stmt {
             Stmt::Select(s) => {
                 let (distinct, result) = match &s.result {
-                    Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct =>
-                        (true, &u.operand),
+                    Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => (true, &u.operand),
                     // detached at select level is a no-op: CTEs and top-level selects
                     // are already independent — strip the wrapper and compile normally.
                     Expr::Detached(inner) => (false, inner.as_ref()),
@@ -1395,30 +1532,29 @@ impl<'a> Compiler<'a> {
                 }
 
                 // select fn() { shape } — user-defined object-returning function with shape.
-                if let Expr::Shape(sh) = result {
-                    if let Some(Expr::FunctionCall(fc)) = sh.expr.as_ref() {
-                        if let Some(ir) = self.try_compile_fn_object_select(fc, &sh.elements, s, distinct)? {
-                            return Ok(IrStmt::FunctionSelect(ir));
-                        }
-                    }
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::FunctionCall(fc)) = sh.expr.as_ref()
+                    && let Some(ir) = self.try_compile_fn_object_select(fc, &sh.elements, s, distinct)?
+                {
+                    return Ok(IrStmt::FunctionSelect(ir));
                 }
 
                 // select fn() — bare user-defined object-returning function (no shape).
-                if let Expr::FunctionCall(fc) = result {
-                    if let Some(ir) = self.try_compile_fn_object_select(fc, &[], s, distinct)? {
-                        return Ok(IrStmt::FunctionSelect(ir));
-                    }
+                if let Expr::FunctionCall(fc) = result
+                    && let Some(ir) = self.try_compile_fn_object_select(fc, &[], s, distinct)?
+                {
+                    return Ok(IrStmt::FunctionSelect(ir));
                 }
 
                 // select vector::search(Type, $vec) { object { … }, distance }
-                if let Expr::Shape(sh) = result {
-                    if let Some(Expr::FunctionCall(fc)) = sh.expr.as_ref() {
-                        if let Some(ir) = self.try_compile_vector_search(fc, &sh.elements, s)? {
-                            return Ok(IrStmt::VectorSearch(ir));
-                        }
-                        if let Some(ir) = self.try_compile_fts_search(fc, &sh.elements, s)? {
-                            return Ok(IrStmt::FtsSearch(ir));
-                        }
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::FunctionCall(fc)) = sh.expr.as_ref()
+                {
+                    if let Some(ir) = self.try_compile_vector_search(fc, &sh.elements, s)? {
+                        return Ok(IrStmt::VectorSearch(ir));
+                    }
+                    if let Some(ir) = self.try_compile_fts_search(fc, &sh.elements, s)? {
+                        return Ok(IrStmt::FtsSearch(ir));
                     }
                 }
                 // bare vector::search / fts::search without shape
@@ -1435,45 +1571,47 @@ impl<'a> Compiler<'a> {
                 // The parens are stripped by the parser, leaving Shape { expr: TypeCast }.
                 // Only meaningful for a named schema type — a structural tuple cast
                 // never denotes an object-type lookup.
-                if let Expr::Shape(sh) = result {
-                    if let Some(Expr::TypeCast(tc)) = sh.expr.as_ref() {
-                        if let Some((module, name)) = tc.ty.as_named() {
-                            if module.map(|m| !["std","cal","math","sys","pgvector","crypto","postgis"].contains(&m)).unwrap_or(false) {
-                                let id_filter = Expr::BinOp(Box::new(ast::BinOp {
-                                    left: Expr::Path(ast::Path::relative("id")),
-                                    op: ast::BinOpKind::Eq,
-                                    right: tc.expr.clone(),
-                                }));
-                                let merged_filter = match &s.filter {
-                                    None => Some(id_filter),
-                                    Some(existing) => Some(Expr::BinOp(Box::new(ast::BinOp {
-                                        left: id_filter,
-                                        op: ast::BinOpKind::And,
-                                        right: existing.clone(),
-                                    }))),
-                                };
-                                // Keep the module qualification so an unknown
-                                // target reports its full name, not a bare one.
-                                let qname = match module {
-                                    Some(m) => format!("{}::{}", m, name),
-                                    None => name.to_string(),
-                                };
-                                let synthetic = ast::SelectStmt {
-                                    result: Expr::Shape(Box::new(ast::ShapeExpr {
-                                        expr: Some(Expr::Path(ast::Path::absolute(&qname))),
-                                        elements: sh.elements.clone(),
-                                        marker_offset: None,
-                                    })),
-                                    filter: merged_filter,
-                                    order_by: s.order_by.clone(),
-                                    offset: s.offset.clone(),
-                                    limit: s.limit.clone(),
-                                    lock: s.lock.clone(),
-                                };
-                                return self.compile_select(&synthetic, &synthetic.result, distinct).map(IrStmt::Select);
-                            }
-                        }
-                    }
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::TypeCast(tc)) = sh.expr.as_ref()
+                    && let Some((module, name)) = tc.ty.as_named()
+                    && module
+                        .map(|m| !["std", "cal", "math", "sys", "pgvector", "crypto", "postgis"].contains(&m))
+                        .unwrap_or(false)
+                {
+                    let id_filter = Expr::BinOp(Box::new(ast::BinOp {
+                        left: Expr::Path(ast::Path::relative("id")),
+                        op: ast::BinOpKind::Eq,
+                        right: tc.expr.clone(),
+                    }));
+                    let merged_filter = match &s.filter {
+                        None => Some(id_filter),
+                        Some(existing) => Some(Expr::BinOp(Box::new(ast::BinOp {
+                            left: id_filter,
+                            op: ast::BinOpKind::And,
+                            right: existing.clone(),
+                        }))),
+                    };
+                    // Keep the module qualification so an unknown
+                    // target reports its full name, not a bare one.
+                    let qname = match module {
+                        Some(m) => format!("{}::{}", m, name),
+                        None => name.to_string(),
+                    };
+                    let synthetic = ast::SelectStmt {
+                        result: Expr::Shape(Box::new(ast::ShapeExpr {
+                            expr: Some(Expr::Path(ast::Path::absolute(&qname))),
+                            elements: sh.elements.clone(),
+                            marker_offset: None,
+                        })),
+                        filter: merged_filter,
+                        order_by: s.order_by.clone(),
+                        offset: s.offset.clone(),
+                        limit: s.limit.clone(),
+                        lock: s.lock.clone(),
+                    };
+                    return self
+                        .compile_select(&synthetic, &synthetic.result, distinct)
+                        .map(IrStmt::Select);
                 }
                 // <Module::Type>expr — schema object lookup by id, or a scalar cast
                 // (enum, registered named tuple, or a bare structural `tuple<...>`).
@@ -1510,25 +1648,25 @@ impl<'a> Compiler<'a> {
                 }
                 // Path traversal: `select TypeName.link.prop` or `select TypeName.link { shape }`.
                 if let Expr::Path(p) = result {
-                    if !p.partial && p.steps.len() == 2 {
-                        if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
-                            if self.resolve_enum(type_ref).is_some() {
-                                let expr = self.compile_enum_access(type_ref, variant)?;
-                                return Ok(IrStmt::Select(IrSelect {
-                                    rows: vec![IrRowSource::Free(IrFreeExpr::Scalar(expr))],
-                                    filter: None,
-                                    order_by: vec![],
-                                    offset: None,
-                                    limit: None,
-                                    distinct,
-                                    dml_source: None,
-                                    polymorphic: false,
-                                    poly_implementors: vec![],
-                                    poly_columns: vec![],
-                                    lock: None,
-                                }));
-                            }
-                        }
+                    if !p.partial
+                        && p.steps.len() == 2
+                        && let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice()
+                        && self.resolve_enum(type_ref).is_some()
+                    {
+                        let expr = self.compile_enum_access(type_ref, variant)?;
+                        return Ok(IrStmt::Select(IrSelect {
+                            rows: vec![IrRowSource::Free(IrFreeExpr::Scalar(expr))],
+                            filter: None,
+                            order_by: vec![],
+                            offset: None,
+                            limit: None,
+                            distinct,
+                            dml_source: None,
+                            polymorphic: false,
+                            poly_implementors: vec![],
+                            poly_columns: vec![],
+                            lock: None,
+                        }));
                     }
                     // `root.field1.field2...` where `root` is a WITH-bound
                     // free object (not a real/CTE-bound schema type) —
@@ -1555,119 +1693,115 @@ impl<'a> Compiler<'a> {
                         return self.compile_path_select(s, p, &[], distinct).map(IrStmt::PathSelect);
                     }
                 }
-                if let Expr::Shape(sh) = result {
-                    if let Some(Expr::Path(p)) = sh.expr.as_ref() {
-                        if !p.partial && p.steps.len() > 1 {
-                            return self.compile_path_select(s, p, &sh.elements, distinct)
-                                .map(IrStmt::PathSelect);
-                        }
-                    }
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::Path(p)) = sh.expr.as_ref()
+                    && !p.partial
+                    && p.steps.len() > 1
+                {
+                    return self
+                        .compile_path_select(s, p, &sh.elements, distinct)
+                        .map(IrStmt::PathSelect);
                 }
                 // assert_exists/assert_distinct with SubQuery arg → set-returning assert
-                if let Expr::FunctionCall(f) = result {
-                    if (f.module.is_none() || f.module.as_deref() == Some("std"))
-                        && matches!(f.name.as_str(), "assert_exists" | "assert_distinct")
-                        && f.args.len() >= 1
-                    {
-                        if let Expr::SubQuery(inner_stmt) = &f.args[0] {
-                            let inner = self.compile_subquery_to_array_source(inner_stmt)?;
-                            let offset = s.offset.as_ref()
-                                .map(|e| self.compile_free_expr(e))
-                                .transpose()?;
-                            let limit = s.limit.as_ref()
-                                .map(|e| self.compile_free_expr(e))
-                                .transpose()?;
-                            return Ok(IrStmt::Select(IrSelect {
-                                rows: vec![IrRowSource::Free(IrFreeExpr::AssertSet {
-                                    fn_name: f.name.clone(),
-                                    inner: Box::new(inner),
-                                })],
-                                filter: None,
-                                order_by: vec![],
-                                offset,
-                                limit,
-                                distinct,
-                                dml_source: None,
-                                polymorphic: false,
-                                poly_implementors: vec![],
-                                poly_columns: vec![],
-                                lock: None,
-                            }));
-                        }
-                    }
+                if let Expr::FunctionCall(f) = result
+                    && (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && matches!(f.name.as_str(), "assert_exists" | "assert_distinct")
+                    && !f.args.is_empty()
+                    && let Expr::SubQuery(inner_stmt) = &f.args[0]
+                {
+                    let inner = self.compile_subquery_to_array_source(inner_stmt)?;
+                    let offset = s.offset.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
+                    let limit = s.limit.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
+                    return Ok(IrStmt::Select(IrSelect {
+                        rows: vec![IrRowSource::Free(IrFreeExpr::AssertSet {
+                            fn_name: f.name.clone(),
+                            inner: Box::new(inner),
+                        })],
+                        filter: None,
+                        order_by: vec![],
+                        offset,
+                        limit,
+                        distinct,
+                        dml_source: None,
+                        polymorphic: false,
+                        poly_implementors: vec![],
+                        poly_columns: vec![],
+                        lock: None,
+                    }));
                 }
                 // Expression containing a type-rooted path: `select fn(TypeName.link.prop, ...)`.
                 if let Some(root) = self.find_path_root_in_expr(result) {
-                    return self.compile_expr_as_path_select(s, result, &root, distinct)
+                    return self
+                        .compile_expr_as_path_select(s, result, &root, distinct)
                         .map(IrStmt::PathSelect);
                 }
                 // `select TypeName is CheckType` — iterate source type, return bool per row.
-                if let Expr::TypeIs { expr, ty } = result {
-                    if let Expr::Path(p) = expr.as_ref() {
-                        if !p.partial && p.steps.len() == 1 {
-                            if let ast::PathStep::Name(src_name) = &p.steps[0] {
-                                let src_td = self.resolve_type(src_name)?;
-                                {
-                                    let src_qname = format!("{}::{}", src_td.module, src_td.name);
-                                    let (ty_module, ty_name) = ty.as_named()
-                                        .ok_or_else(|| self.type_err("cannot use IS with a tuple or array type"))?;
-                                    let check_module = ty_module.unwrap_or(&src_td.module);
-                                    let check_name = format!("{}::{}", check_module, ty_name);
-                                    self.resolve_type(&check_name)?;
-                                    let check_qname = check_name;
-                                    let src_table = src_td.table.clone();
-                                    let src_abstract = src_td.abstract_;
-                                    let src_materialized = src_td.materialized;
-                                    let src_interfaces = src_td.interfaces.clone();
-                                    let src_alias = self.fresh_alias();
-                                    let poly_implementors = if src_abstract && src_materialized {
-                                        self.find_poly_implementors(&src_qname)
-                                    } else {
-                                        vec![]
-                                    };
-                                    let bool_expr = if check_qname == src_qname
-                                        || src_interfaces.iter().any(|i| i == &check_qname) {
-                                        IrExpr::Literal(IrLiteral::Bool(true))
-                                    } else if src_abstract && src_materialized {
-                                        IrExpr::BinOp(Box::new(IrBinOp {
-                                            left: IrExpr::ColumnRef {
-                                                alias: src_alias.clone(),
-                                                column: "__type__".into(),
-                                                pg_type: "text".into(),
-                                            },
-                                            op: crate::parse::ast::BinOpKind::Eq,
-                                            right: IrExpr::Literal(IrLiteral::Str(check_qname)),
-                                        }))
-                                    } else {
-                                        IrExpr::Literal(IrLiteral::Bool(false))
-                                    };
-                                    let ps = IrPathSelect {
-                                        root: IrSource {
-                                            type_name: src_qname,
-                                            table: src_table,
-                                            alias: src_alias,
-                                        },
-                                        joins: vec![],
-                                        result: IrPathResult::Scalar(bool_expr, None),
-                                        filter: s.filter.as_ref()
-                                            .map(|_| Err(self.type_err("FILTER is not supported on type-is SELECT")))
-                                            .transpose()?,
-                                        order_by: vec![],
-                                        offset: None,
-                                        limit: None,
-                                        distinct,
-                                        poly_implementors,
-                                    };
-                                    return Ok(IrStmt::PathSelect(ps));
-                                }
-                            }
-                        }
+                if let Expr::TypeIs { expr, ty } = result
+                    && let Expr::Path(p) = expr.as_ref()
+                    && !p.partial
+                    && p.steps.len() == 1
+                    && let ast::PathStep::Name(src_name) = &p.steps[0]
+                {
+                    let src_td = self.resolve_type(src_name)?;
+                    {
+                        let src_qname = format!("{}::{}", src_td.module, src_td.name);
+                        let (ty_module, ty_name) = ty
+                            .as_named()
+                            .ok_or_else(|| self.type_err("cannot use IS with a tuple or array type"))?;
+                        let check_module = ty_module.unwrap_or(&src_td.module);
+                        let check_name = format!("{}::{}", check_module, ty_name);
+                        self.resolve_type(&check_name)?;
+                        let check_qname = check_name;
+                        let src_table = src_td.table.clone();
+                        let src_abstract = src_td.abstract_;
+                        let src_materialized = src_td.materialized;
+                        let src_interfaces = src_td.interfaces.clone();
+                        let src_alias = self.fresh_alias();
+                        let poly_implementors = if src_abstract && src_materialized {
+                            self.find_poly_implementors(&src_qname)
+                        } else {
+                            vec![]
+                        };
+                        let bool_expr = if check_qname == src_qname || src_interfaces.iter().any(|i| i == &check_qname)
+                        {
+                            IrExpr::Literal(IrLiteral::Bool(true))
+                        } else if src_abstract && src_materialized {
+                            IrExpr::BinOp(Box::new(IrBinOp {
+                                left: IrExpr::ColumnRef {
+                                    alias: src_alias.clone(),
+                                    column: "__type__".into(),
+                                    pg_type: "text".into(),
+                                },
+                                op: crate::parse::ast::BinOpKind::Eq,
+                                right: IrExpr::Literal(IrLiteral::Str(check_qname)),
+                            }))
+                        } else {
+                            IrExpr::Literal(IrLiteral::Bool(false))
+                        };
+                        let ps = IrPathSelect {
+                            root: IrSource {
+                                type_name: src_qname,
+                                table: src_table,
+                                alias: src_alias,
+                            },
+                            joins: vec![],
+                            result: IrPathResult::Scalar(bool_expr, None),
+                            filter: s
+                                .filter
+                                .as_ref()
+                                .map(|_| Err(self.type_err("FILTER is not supported on type-is SELECT")))
+                                .transpose()?,
+                            order_by: vec![],
+                            offset: None,
+                            limit: None,
+                            distinct,
+                            poly_implementors,
+                        };
+                        return Ok(IrStmt::PathSelect(ps));
                     }
                 }
                 // Catch mixed object/scalar UNION before dispatching further.
-                if let Err(e) = self.check_union_type_compat(result) {
-                    return Err(e);
-                }
+                self.check_union_type_compat(result)?;
                 if self.is_free_result(result) {
                     self.compile_free_select(s, result, distinct).map(IrStmt::Select)
                 } else {
@@ -1699,11 +1833,7 @@ impl<'a> Compiler<'a> {
     /// `<Module::Type>expr` in SELECT position is a schema object lookup:
     /// select the object whose `id` equals `expr`.  Semantically identical to
     /// `SELECT Type FILTER .id = expr` plus any modifiers on the outer SELECT.
-    fn compile_schema_cast_select(
-        &mut self,
-        sel: &ast::SelectStmt,
-        tc: &ast::TypeCast,
-    ) -> Result<IrSelect, PyQLError> {
+    fn compile_schema_cast_select(&mut self, sel: &ast::SelectStmt, tc: &ast::TypeCast) -> Result<IrSelect, PyQLError> {
         let id_filter = Expr::BinOp(Box::new(ast::BinOp {
             left: Expr::Path(ast::Path::relative("id")),
             op: ast::BinOpKind::Eq,
@@ -1719,7 +1849,9 @@ impl<'a> Compiler<'a> {
         };
         // Callers only reach this function after confirming `tc.ty` is `Named`
         // (a structural tuple is never an object-type lookup).
-        let (module, name) = tc.ty.as_named()
+        let (module, name) = tc
+            .ty
+            .as_named()
             .ok_or_else(|| self.type_err("cannot use a tuple or array type as a schema object cast"))?;
         // Keep the module qualification in the synthetic path so a genuinely
         // unknown target (neither an object type, enum, scalar, nor named
@@ -1763,9 +1895,7 @@ impl<'a> Compiler<'a> {
         // type and source from the `@cte:` sentinel table (the same
         // mechanism `compile_select`'s bare-CTE-object-select case uses)
         // instead of failing with "unknown type '{root_name}'".
-        let cte_object_type = self.cte_types.get(root_name)
-            .filter(|t| t.contains("::"))
-            .cloned();
+        let cte_object_type = self.cte_types.get(root_name).filter(|t| t.contains("::")).cloned();
         let root_td = match &cte_object_type {
             Some(t) => self.resolve_type(t)?,
             None => self.resolve_type(root_name)?,
@@ -1805,7 +1935,11 @@ impl<'a> Compiler<'a> {
             if let PathStep::Backlink(link_name) = step {
                 // Peek ahead: if the next step is [is Type], use it to identify the owner.
                 let owner_hint = steps.get(idx + 1).and_then(|s| {
-                    if let PathStep::TypeIntersection(tr) = s { Some(tr.clone()) } else { None }
+                    if let PathStep::TypeIntersection(tr) = s {
+                        Some(tr.clone())
+                    } else {
+                        None
+                    }
                 });
                 let consumed_extra = if owner_hint.is_some() { 1 } else { 0 };
 
@@ -1816,8 +1950,14 @@ impl<'a> Compiler<'a> {
                     };
                     let td = self.resolve_type(&type_name)?;
                     let current_qname = format!("{}::{}", current_td.module, current_td.name);
-                    let link_targets_current = td.links.iter().any(|l| l.name == *link_name && l.target == current_qname)
-                        || td.multilinks.iter().any(|ml| ml.name == *link_name && ml.target == current_qname);
+                    let link_targets_current = td
+                        .links
+                        .iter()
+                        .any(|l| l.name == *link_name && l.target == current_qname)
+                        || td
+                            .multilinks
+                            .iter()
+                            .any(|ml| ml.name == *link_name && ml.target == current_qname);
                     if !link_targets_current {
                         return Err(self.type_err(&format!(
                             "link '{}::{}' does not target '{}'; backlink is not valid here",
@@ -1828,15 +1968,23 @@ impl<'a> Compiler<'a> {
                 } else {
                     // No hint — search for any type whose link/multilink targets current_td.
                     let current_qname = format!("{}::{}", current_td.module, current_td.name);
-                    self.schema.types.iter()
+                    self.schema
+                        .types
+                        .iter()
                         .find(|t| {
-                            t.links.iter().any(|l| l.name == *link_name && l.target == current_qname)
-                            || t.multilinks.iter().any(|ml| ml.name == *link_name && ml.target == current_qname)
+                            t.links
+                                .iter()
+                                .any(|l| l.name == *link_name && l.target == current_qname)
+                                || t.multilinks
+                                    .iter()
+                                    .any(|ml| ml.name == *link_name && ml.target == current_qname)
                         })
-                        .ok_or_else(|| self.type_err(&format!(
-                            "no type has a link '{}' targeting '{}'",
-                            link_name, current_qname,
-                        )))?
+                        .ok_or_else(|| {
+                            self.type_err(&format!(
+                                "no type has a link '{}' targeting '{}'",
+                                link_name, current_qname,
+                            ))
+                        })?
                 };
 
                 let target_alias = self.fresh_alias();
@@ -1871,7 +2019,12 @@ impl<'a> Compiler<'a> {
                         });
                     }
                 } else {
-                    let ml = owner_td.multilinks.iter().find(|ml| ml.name == *link_name).unwrap().clone();
+                    let ml = owner_td
+                        .multilinks
+                        .iter()
+                        .find(|ml| ml.name == *link_name)
+                        .unwrap()
+                        .clone();
                     let junction_alias = self.fresh_alias();
                     let (junction_table, module, _, _, _) = self.multilink_junction_info(owner_td, &ml)?;
                     joins.push(IrPathJoin::BacklinkMulti {
@@ -1886,8 +2039,8 @@ impl<'a> Compiler<'a> {
                 }
 
                 if is_last(consumed_extra) {
-                    let shape = self.compile_shape(shape_elements, owner_td, &target_alias,
-                        &owner_td.module.clone())?;
+                    let shape =
+                        self.compile_shape(shape_elements, owner_td, &target_alias, &owner_td.module.clone())?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", owner_td.module, owner_td.name),
@@ -1895,7 +2048,17 @@ impl<'a> Compiler<'a> {
                     };
                     let (filter, order_by, offset, limit) =
                         self.compile_path_modifiers(sel, owner_td, &target_alias)?;
-                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
+                    return Ok(IrPathSelect {
+                        root,
+                        joins,
+                        result,
+                        filter,
+                        order_by,
+                        offset,
+                        limit,
+                        distinct,
+                        poly_implementors: vec![],
+                    });
                 }
                 current_td = owner_td;
                 current_alias = target_alias;
@@ -1925,11 +2088,12 @@ impl<'a> Compiler<'a> {
                         for step in remaining {
                             let field = match step {
                                 ast::PathStep::Name(n) => n.clone(),
-                                _ => return Err(self.type_err(
-                                    "only field name steps are valid inside a named tuple",
-                                )),
+                                _ => return Err(self.type_err("only field name steps are valid inside a named tuple")),
                             };
-                            ir = IrExpr::JsonbField { expr: Box::new(ir), field };
+                            ir = IrExpr::JsonbField {
+                                expr: Box::new(ir),
+                                field,
+                            };
                         }
                         let (filter, order_by, offset, limit) =
                             self.compile_path_modifiers(sel, current_td, &current_alias)?;
@@ -1950,14 +2114,26 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 let tuple_shape = self.resolve_property_tuple_shape(p);
-                let result = IrPathResult::Scalar(IrExpr::ColumnRef {
-                    alias: current_alias.clone(),
-                    column: p.name.clone(),
-                    pg_type: p.pg_type.clone(),
-                }, tuple_shape);
-                let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers(sel, current_td, &current_alias)?;
-                return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
+                let result = IrPathResult::Scalar(
+                    IrExpr::ColumnRef {
+                        alias: current_alias.clone(),
+                        column: p.name.clone(),
+                        pg_type: p.pg_type.clone(),
+                    },
+                    tuple_shape,
+                );
+                let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                return Ok(IrPathSelect {
+                    root,
+                    joins,
+                    result,
+                    filter,
+                    order_by,
+                    offset,
+                    limit,
+                    distinct,
+                    poly_implementors: vec![],
+                });
             }
 
             // Single link.
@@ -1990,8 +2166,8 @@ impl<'a> Compiler<'a> {
                     });
                 }
                 if is_last(0) {
-                    let shape = self.compile_shape(shape_elements, target_td, &target_alias,
-                        &target_td.module.clone())?;
+                    let shape =
+                        self.compile_shape(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -1999,7 +2175,17 @@ impl<'a> Compiler<'a> {
                     };
                     let (filter, order_by, offset, limit) =
                         self.compile_path_modifiers(sel, target_td, &target_alias)?;
-                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
+                    return Ok(IrPathSelect {
+                        root,
+                        joins,
+                        result,
+                        filter,
+                        order_by,
+                        offset,
+                        limit,
+                        distinct,
+                        poly_implementors: vec![],
+                    });
                 }
                 current_td = target_td;
                 current_alias = target_alias;
@@ -2028,19 +2214,34 @@ impl<'a> Compiler<'a> {
                         }
                     } else {
                         let source_qname = format!("{}::{}", current_td.module, current_td.name);
-                        let source_col = through_td.links.iter()
+                        let source_col = through_td
+                            .links
+                            .iter()
                             .find(|l| l.target == source_qname)
-                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                                message: format!("through type {through_qname} has no link to {source_qname}"),
-                                position: Position { line: 0, col: 0 },
-                            }))?.name.clone();
-                        let target_col = through_td.links.iter()
+                            .ok_or_else(|| {
+                                PyQLError::Type(PyQLTypeError {
+                                    message: format!("through type {through_qname} has no link to {source_qname}"),
+                                    position: Position { line: 0, col: 0 },
+                                })
+                            })?
+                            .name
+                            .clone();
+                        let target_col = through_td
+                            .links
+                            .iter()
                             .find(|l| l.target == ml.target && l.name != source_col)
                             .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                                message: format!("through type {through_qname} has no link to target {}", ml.target),
-                                position: Position { line: 0, col: 0 },
-                            }))?.name.clone();
+                            .ok_or_else(|| {
+                                PyQLError::Type(PyQLTypeError {
+                                    message: format!(
+                                        "through type {through_qname} has no link to target {}",
+                                        ml.target
+                                    ),
+                                    position: Position { line: 0, col: 0 },
+                                })
+                            })?
+                            .name
+                            .clone();
                         IrMultiLinkJoin::Through {
                             junction_table: through_td.table.clone(),
                             module: through_td.module.clone(),
@@ -2061,8 +2262,8 @@ impl<'a> Compiler<'a> {
                     target,
                 });
                 if is_last(0) {
-                    let shape = self.compile_shape(shape_elements, target_td, &target_alias,
-                        &target_td.module.clone())?;
+                    let shape =
+                        self.compile_shape(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -2070,7 +2271,17 @@ impl<'a> Compiler<'a> {
                     };
                     let (filter, order_by, offset, limit) =
                         self.compile_path_modifiers(sel, target_td, &target_alias)?;
-                    return Ok(IrPathSelect { root, joins, result, filter, order_by, offset, limit, distinct, poly_implementors: vec![] });
+                    return Ok(IrPathSelect {
+                        root,
+                        joins,
+                        result,
+                        filter,
+                        order_by,
+                        offset,
+                        limit,
+                        distinct,
+                        poly_implementors: vec![],
+                    });
                 }
                 current_td = target_td;
                 current_alias = target_alias;
@@ -2090,17 +2301,25 @@ impl<'a> Compiler<'a> {
         sel: &ast::SelectStmt,
         td: &TypeDescriptor,
         alias: &str,
-    ) -> Result<(Option<IrExpr>, Vec<IrSort>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
-        let filter = sel.filter.as_ref()
+    ) -> Result<SelectModifiers, PyQLError> {
+        let filter = sel
+            .filter
+            .as_ref()
             .map(|f| self.compile_expr(f, td, alias))
             .transpose()?;
-        let order_by = sel.order_by.iter()
+        let order_by = sel
+            .order_by
+            .iter()
             .map(|s| self.compile_sort(s, td, alias))
             .collect::<Result<Vec<_>, _>>()?;
-        let offset = sel.offset.as_ref()
+        let offset = sel
+            .offset
+            .as_ref()
             .map(|e| self.compile_expr(e, td, alias))
             .transpose()?;
-        let limit = sel.limit.as_ref()
+        let limit = sel
+            .limit
+            .as_ref()
             .map(|e| self.compile_expr(e, td, alias))
             .transpose()?;
         Ok((filter, order_by, offset, limit))
@@ -2113,16 +2332,17 @@ impl<'a> Compiler<'a> {
     fn find_path_root_in_expr(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Path(p) if !p.partial && p.steps.len() > 1 => {
-                if let ast::PathStep::Name(root) = &p.steps[0] {
-                    if self.resolve_type(root).is_ok() { return Some(root.clone()); }
+                if let ast::PathStep::Name(root) = &p.steps[0]
+                    && self.resolve_type(root).is_ok()
+                {
+                    return Some(root.clone());
                 }
                 None
             }
-            Expr::FunctionCall(f) =>
-                f.args.iter().find_map(|a| self.find_path_root_in_expr(a)),
-            Expr::BinOp(b) =>
-                self.find_path_root_in_expr(&b.left)
-                    .or_else(|| self.find_path_root_in_expr(&b.right)),
+            Expr::FunctionCall(f) => f.args.iter().find_map(|a| self.find_path_root_in_expr(a)),
+            Expr::BinOp(b) => self
+                .find_path_root_in_expr(&b.left)
+                .or_else(|| self.find_path_root_in_expr(&b.right)),
             Expr::UnaryOp(u) => self.find_path_root_in_expr(&u.operand),
             _ => None,
         }
@@ -2132,20 +2352,23 @@ impl<'a> Compiler<'a> {
     fn rewrite_abs_to_partial(expr: Expr, root_name: &str) -> Expr {
         match expr {
             Expr::Path(ref p) if !p.partial => {
-                if let ast::PathStep::Name(first) = &p.steps[0] {
-                    if first == root_name && p.steps.len() > 1 {
-                        return Expr::Path(ast::Path {
-                            steps: p.steps[1..].to_vec(),
-                            partial: true,
-                        });
-                    }
+                if let ast::PathStep::Name(first) = &p.steps[0]
+                    && first == root_name
+                    && p.steps.len() > 1
+                {
+                    return Expr::Path(ast::Path {
+                        steps: p.steps[1..].to_vec(),
+                        partial: true,
+                    });
                 }
                 expr
             }
             Expr::FunctionCall(f) => Expr::FunctionCall(ast::FunctionCall {
                 module: f.module,
                 name: f.name,
-                args: f.args.into_iter()
+                args: f
+                    .args
+                    .into_iter()
                     .map(|a| Self::rewrite_abs_to_partial(a, root_name))
                     .collect(),
                 kwargs: f.kwargs,
@@ -2185,31 +2408,39 @@ impl<'a> Compiler<'a> {
             // Compile value side first so we can report its type in errors
             let root_td = self.resolve_type(root_type_name)?;
             // Build PathSelect for the path (builds root + joins + scalar/object result)
-            let ast_path = ast::Path { partial: false, steps: path_expr.steps.clone() };
+            let ast_path = ast::Path {
+                partial: false,
+                steps: path_expr.steps.clone(),
+            };
             let mut ps = self.compile_path_select(sel, &ast_path, &[], distinct)?;
             let val_ir = self.compile_expr(value_expr, root_td, &ps.root.alias)?;
             // Extract the scalar result from the path
             let scalar_col = match ps.result {
                 IrPathResult::Scalar(e, _) => e,
                 IrPathResult::Object { type_name, .. } => {
-                    let val_type = infer_ir_type(&val_ir)
-                        .map(pg_type_to_pyql)
-                        .unwrap_or("unknown");
+                    let val_type = infer_ir_type(&val_ir).map(pg_type_to_pyql).unwrap_or("unknown");
                     return Err(PyQLError::Type(PyQLTypeError {
                         message: format!(
                             "operator '{}' cannot be applied to operands of type '{}' and '{}'",
-                            b.op,
-                            type_name,
-                            val_type,
+                            b.op, type_name, val_type,
                         ),
                         position: Position { line: 0, col: 0 },
                     }));
                 }
             };
-            let (l, r) = if flip { (val_ir, scalar_col) } else { (scalar_col, val_ir) };
-            ps.result = IrPathResult::Scalar(IrExpr::BinOp(Box::new(IrBinOp {
-                left: l, op: b.op.clone(), right: r,
-            })), None);
+            let (l, r) = if flip {
+                (val_ir, scalar_col)
+            } else {
+                (scalar_col, val_ir)
+            };
+            ps.result = IrPathResult::Scalar(
+                IrExpr::BinOp(Box::new(IrBinOp {
+                    left: l,
+                    op: b.op.clone(),
+                    right: r,
+                })),
+                None,
+            );
             return Ok(ps);
         }
         self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct)
@@ -2231,8 +2462,7 @@ impl<'a> Compiler<'a> {
         };
         let rewritten = Self::rewrite_abs_to_partial(result.clone(), root_type_name);
         let expr = self.compile_expr(&rewritten, td, &alias)?;
-        let (filter, order_by, offset, limit) =
-            self.compile_path_modifiers(sel, td, &alias)?;
+        let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, td, &alias)?;
         Ok(IrPathSelect {
             root,
             joins: vec![],
@@ -2254,9 +2484,7 @@ impl<'a> Compiler<'a> {
                 Ok(IrArraySource::Select(s))
             }
             IrStmt::PathSelect(ps) => Ok(IrArraySource::PathSelect(ps)),
-            _ => Err(self.type_err(
-                "assert functions require a schema-bound SELECT as argument",
-            )),
+            _ => Err(self.type_err("assert functions require a schema-bound SELECT as argument")),
         }
     }
 
@@ -2285,9 +2513,8 @@ impl<'a> Compiler<'a> {
             }
 
             // exists .<link[is Type] → EXISTS(SELECT 1 FROM type WHERE type.link_id = alias.id)
-            Expr::Path(p) if ctx.is_some()
-                && p.partial
-                && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) =>
+            Expr::Path(p)
+                if ctx.is_some() && p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) =>
             {
                 let (td, alias) = ctx.unwrap();
                 let current_qname = format!("{}::{}", td.module, td.name);
@@ -2328,9 +2555,7 @@ impl<'a> Compiler<'a> {
             }
 
             // exists (select ...) → EXISTS(SELECT 1 FROM ...)
-            Expr::SubQuery(stmt) => {
-                self.compile_subquery_exists(stmt)
-            }
+            Expr::SubQuery(stmt) => self.compile_subquery_exists(stmt),
 
             // Fallback: any scalar expression → expr IS NOT NULL. When `ctx`
             // is `None` and `operand` is a partial `Path` not caught above
@@ -2356,7 +2581,10 @@ impl<'a> Compiler<'a> {
                     return Err(self.type_err("exists requires a schema-bound SELECT expression"));
                 };
                 let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(source, vec![], s.filter)));
-                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: inner,
+                })))
             }
             IrStmt::PathSelect(ps) => {
                 // EXISTS(SELECT 1 FROM root [JOINs] WHERE filter)
@@ -2390,9 +2618,17 @@ impl<'a> Compiler<'a> {
         let (jt_table, jt_module, jt_src_col, _, _) = self.junction_info_for(td, name, target, through)?;
 
         let filter = IrExpr::BinOp(Box::new(IrBinOp {
-            left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
+            left: IrExpr::ColumnRef {
+                alias: jt_alias.clone(),
+                column: jt_src_col,
+                pg_type: "uuid".to_string(),
+            },
             op: ast::BinOpKind::Eq,
-            right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+            right: IrExpr::ColumnRef {
+                alias: alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
         }));
         Ok(IrSelect::schema_bound(
             IrSource {
@@ -2458,16 +2694,27 @@ impl<'a> Compiler<'a> {
         alias: &str,
     ) -> Result<IrExpr, PyQLError> {
         let (name, target, through) = (l.name.clone(), l.target.clone(), l.through.clone());
-        let (jt_table, jt_module, jt_src_col, jt_tgt_col, _) =
-            self.junction_info_for(td, &name, &target, &through)?;
+        let (jt_table, jt_module, jt_src_col, jt_tgt_col, _) = self.junction_info_for(td, &name, &target, &through)?;
         let jt_alias = self.fresh_alias();
         let filter = IrExpr::BinOp(Box::new(IrBinOp {
-            left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
+            left: IrExpr::ColumnRef {
+                alias: jt_alias.clone(),
+                column: jt_src_col,
+                pg_type: "uuid".to_string(),
+            },
             op: ast::BinOpKind::Eq,
-            right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+            right: IrExpr::ColumnRef {
+                alias: alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
         }));
         let select = IrSelect::schema_bound(
-            IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias },
+            IrSource {
+                type_name: format!("{}::__jt__", jt_module),
+                table: jt_table,
+                alias: jt_alias,
+            },
             vec![IrShapePointer::Scalar(IrScalarPointer {
                 marker_offset: None,
                 alias: "target".to_string(),
@@ -2504,19 +2751,28 @@ impl<'a> Compiler<'a> {
     fn union_operand_type_display(&self, expr: &Expr) -> String {
         match expr {
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if let Some(t) = self.cte_types.get(n.as_str()) {
-                        if t.contains("::") {
-                            return t.clone(); // object CTE: "default::Person"
-                        }
-                        if !t.is_empty() {
-                            return pg_type_to_pyql(t).to_string(); // scalar CTE: "std::int64"
-                        }
+                if let ast::PathStep::Name(n) = &p.steps[0]
+                    && let Some(t) = self.cte_types.get(n.as_str())
+                {
+                    if t.contains("::") {
+                        return t.clone(); // object CTE: "default::Person"
+                    }
+                    if !t.is_empty() {
+                        return pg_type_to_pyql(t).to_string(); // scalar CTE: "std::int64"
                     }
                 }
                 // Bare type name reference
                 if let Ok(td) = self.resolve_type(
-                    p.steps.first().and_then(|s| if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None }).unwrap_or("")
+                    p.steps
+                        .first()
+                        .and_then(|s| {
+                            if let ast::PathStep::Name(n) = s {
+                                Some(n.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(""),
                 ) {
                     return format!("{}::{}", td.module, td.name);
                 }
@@ -2538,23 +2794,28 @@ impl<'a> Compiler<'a> {
         };
         match expr {
             Expr::Path(p) if !p.partial => {
-                if p.steps.len() == 1 {
-                    if let ast::PathStep::Name(n) = &p.steps[0] {
-                        // For-loop variable is a scalar, not a schema type reference.
-                        if self.for_vars.contains_key(n.as_str()) {
-                            return true;
-                        }
-                        // Scalar CTE: type string has no "::" (object types always do).
-                        if self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false) {
-                            return true;
-                        }
-                        // Function parameter — only populated while compiling a
-                        // function body (see `compile_fn_body`), so a bare `select a`
-                        // where `a` is a param must resolve as the param, not be
-                        // misread as a schema-type-name select.
-                        if self.fn_params.contains_key(n.as_str()) {
-                            return true;
-                        }
+                if p.steps.len() == 1
+                    && let ast::PathStep::Name(n) = &p.steps[0]
+                {
+                    // For-loop variable is a scalar, not a schema type reference.
+                    if self.for_vars.contains_key(n.as_str()) {
+                        return true;
+                    }
+                    // Scalar CTE: type string has no "::" (object types always do).
+                    if self
+                        .cte_types
+                        .get(n.as_str())
+                        .map(|t| !t.contains("::"))
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                    // Function parameter — only populated while compiling a
+                    // function body (see `compile_fn_body`), so a bare `select a`
+                    // where `a` is a param must resolve as the param, not be
+                    // misread as a schema-type-name select.
+                    if self.fn_params.contains_key(n.as_str()) {
+                        return true;
                     }
                 }
                 false
@@ -2575,17 +2836,18 @@ impl<'a> Compiler<'a> {
         if p.partial || p.steps.len() != 1 {
             return false;
         }
-        let ast::PathStep::Name(n) = &p.steps[0] else { return false };
-        self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false)
+        let ast::PathStep::Name(n) = &p.steps[0] else {
+            return false;
+        };
+        self.cte_types
+            .get(n.as_str())
+            .map(|t| !t.contains("::"))
+            .unwrap_or(false)
     }
 
     // ── FREE SELECT ───────────────────────────────────────────────────────────────
 
-    fn collect_union_items(
-        &mut self,
-        expr: &Expr,
-        items: &mut Vec<IrFreeExpr>,
-    ) -> Result<(), PyQLError> {
+    fn collect_union_items(&mut self, expr: &Expr, items: &mut Vec<IrFreeExpr>) -> Result<(), PyQLError> {
         match expr {
             Expr::Union(a, b) => {
                 self.collect_union_items(a, items)?;
@@ -2620,23 +2882,23 @@ impl<'a> Compiler<'a> {
                 // Type-check UNION operands: all scalar branches must be in the same type family.
                 let mut first: Option<(String, String)> = None; // (pg_type, pyql_name)
                 for item in &union_items {
-                    if let IrFreeExpr::Scalar(expr) = item {
-                        if let Some(t) = infer_ir_type(expr) {
-                            let t = t.to_string();
-                            if let Some((ft, fq)) = &first {
-                                if !types_compatible(ft, &t) {
-                                    return Err(PyQLError::Type(PyQLTypeError {
-                                        message: format!(
-                                            "operator 'UNION' cannot be applied to operands of type '{}' and '{}'",
-                                            fq,
-                                            pg_type_to_pyql(&t),
-                                        ),
-                                        position: Position { line: 0, col: 0 },
-                                    }));
-                                }
-                            } else {
-                                first = Some((t.clone(), pg_type_to_pyql(&t).to_string()));
+                    if let IrFreeExpr::Scalar(expr) = item
+                        && let Some(t) = infer_ir_type(expr)
+                    {
+                        let t = t.to_string();
+                        if let Some((ft, fq)) = &first {
+                            if !types_compatible(ft, &t) {
+                                return Err(PyQLError::Type(PyQLTypeError {
+                                    message: format!(
+                                        "operator 'UNION' cannot be applied to operands of type '{}' and '{}'",
+                                        fq,
+                                        pg_type_to_pyql(&t),
+                                    ),
+                                    position: Position { line: 0, col: 0 },
+                                }));
                             }
+                        } else {
+                            first = Some((t.clone(), pg_type_to_pyql(&t).to_string()));
                         }
                     }
                 }
@@ -2644,7 +2906,12 @@ impl<'a> Compiler<'a> {
             }
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if self.cte_types.get(n.as_str()).map(|t| !t.contains("::")).unwrap_or(false) {
+                    if self
+                        .cte_types
+                        .get(n.as_str())
+                        .map(|t| !t.contains("::"))
+                        .unwrap_or(false)
+                    {
                         vec![IrFreeExpr::CtePassthrough(n.clone())]
                     } else {
                         vec![IrFreeExpr::Scalar(self.compile_free_expr(result_expr)?)]
@@ -2660,9 +2927,7 @@ impl<'a> Compiler<'a> {
                     .map(|el| -> Result<(String, IrExpr), PyQLError> {
                         let name = path_leaf(&el.path)?.to_string();
                         let expr = el.compexpr.as_ref().ok_or_else(|| {
-                            self.type_err(
-                                "free object field must have a value expression (':= expr')",
-                            )
+                            self.type_err("free object field must have a value expression (':= expr')")
                         })?;
                         Ok((name, self.compile_free_expr(expr)?))
                     })
@@ -2681,7 +2946,10 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                vec![IrFreeExpr::Scalar(IrExpr::NamedTuple { fields: ir, is_free_object: false })]
+                vec![IrFreeExpr::Scalar(IrExpr::NamedTuple {
+                    fields: ir,
+                    is_free_object: false,
+                })]
             }
             other => vec![IrFreeExpr::Scalar(self.compile_free_expr(other)?)],
         };
@@ -2692,16 +2960,8 @@ impl<'a> Compiler<'a> {
             .map(|s| self.compile_sort_ctx(s, None))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let offset = sel
-            .offset
-            .as_ref()
-            .map(|e| self.compile_free_expr(e))
-            .transpose()?;
-        let limit = sel
-            .limit
-            .as_ref()
-            .map(|e| self.compile_free_expr(e))
-            .transpose()?;
+        let offset = sel.offset.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
+        let limit = sel.limit.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
 
         Ok(IrSelect {
             rows: items.into_iter().map(IrRowSource::Free).collect(),
@@ -2720,9 +2980,13 @@ impl<'a> Compiler<'a> {
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
 
-    fn compile_select(&mut self, sel: &ast::SelectStmt, result_expr: &Expr, distinct: bool) -> Result<IrSelect, PyQLError> {
-        let (type_name, shape_elements, inner_stmt, cte_name) =
-            self.extract_type_and_shape(result_expr)?;
+    fn compile_select(
+        &mut self,
+        sel: &ast::SelectStmt,
+        result_expr: &Expr,
+        distinct: bool,
+    ) -> Result<IrSelect, PyQLError> {
+        let (type_name, shape_elements, inner_stmt, cte_name) = self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
         let table = match cte_name {
@@ -2762,9 +3026,7 @@ impl<'a> Compiler<'a> {
             .transpose()?;
 
         // Compile the inner DML if this is a SELECT-over-DML / SELECT-over-SELECT.
-        let dml_source = inner_stmt
-            .map(|s| self.compile_stmt(s).map(Box::new))
-            .transpose()?;
+        let dml_source = inner_stmt.map(|s| self.compile_stmt(s).map(Box::new)).transpose()?;
 
         let polymorphic = td.abstract_ && td.materialized;
         let (poly_implementors, poly_columns) = if polymorphic {
@@ -2820,7 +3082,15 @@ impl<'a> Compiler<'a> {
 
         Ok(IrSelect {
             rows: vec![IrRowSource::Bound { source, shape }],
-            filter, order_by, offset, limit, distinct, dml_source, polymorphic, poly_implementors, poly_columns,
+            filter,
+            order_by,
+            offset,
+            limit,
+            distinct,
+            dml_source,
+            polymorphic,
+            poly_implementors,
+            poly_columns,
             lock,
         })
     }
@@ -2829,17 +3099,12 @@ impl<'a> Compiler<'a> {
     /// Returns (type_name, shape_elements, optional_inner_stmt, optional_cte_name).
     /// The inner stmt is Some when the subject is `(INSERT …)` / `(SELECT …)` etc.
     /// The cte_name is Some when the subject is a WITH-block CTE reference.
-    fn extract_type_and_shape<'e>(
-        &self,
-        expr: &'e Expr,
-    ) -> Result<(String, &'e [ShapeElement], Option<&'e Stmt>, Option<String>), PyQLError> {
+    fn extract_type_and_shape<'e>(&self, expr: &'e Expr) -> Result<TypeAndShape<'e>, PyQLError> {
         match expr {
             Expr::Shape(s) => {
                 // s.expr is Option<Expr> (not Box), so use as_ref() not as_deref()
                 let (type_name, cte_name, inner) = match s.expr.as_ref() {
-                    Some(Expr::SubQuery(stmt)) => {
-                        (self.dml_subject_type(stmt)?, None, Some(stmt.as_ref()))
-                    }
+                    Some(Expr::SubQuery(stmt)) => (self.dml_subject_type(stmt)?, None, Some(stmt.as_ref())),
                     Some(Expr::Path(p)) if !p.partial && p.steps.len() == 1 => {
                         if let ast::PathStep::Name(n) = &p.steps[0] {
                             if let Some(t) = self.cte_types.get(n.as_str()) {
@@ -2860,23 +3125,20 @@ impl<'a> Compiler<'a> {
                         return Err(PyQLError::Type(PyQLTypeError {
                             message: "shape without subject expression".into(),
                             position: Position { line: 0, col: 0 },
-                        }))
+                        }));
                     }
                 };
                 Ok((type_name, &s.elements, inner, cte_name))
             }
             // Bare `SELECT (DML)` without an outer shape
-            Expr::SubQuery(stmt) => {
-                Ok((self.dml_subject_type(stmt)?, &[], Some(stmt.as_ref()), None))
-            }
+            Expr::SubQuery(stmt) => Ok((self.dml_subject_type(stmt)?, &[], Some(stmt.as_ref()), None)),
             // Bare CTE object reference: `select cte_name`
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if let Some(t) = self.cte_types.get(n.as_str()) {
-                        if t.contains("::") {
-                            return Ok((t.clone(), &[], None, Some(n.clone())));
-                        }
-                    }
+                if let ast::PathStep::Name(n) = &p.steps[0]
+                    && let Some(t) = self.cte_types.get(n.as_str())
+                    && t.contains("::")
+                {
+                    return Ok((t.clone(), &[], None, Some(n.clone())));
                 }
                 Ok((self.expr_as_type_name(expr)?, &[], None, None))
             }
@@ -2888,12 +3150,9 @@ impl<'a> Compiler<'a> {
         // Compile the iterator expression to determine scalar type and VALUES list.
         let (exprs, pg_type) = match &f.iterator {
             Expr::Set(elems) => {
-                let compiled: Result<Vec<_>, _> =
-                    elems.iter().map(|e| self.compile_free_expr(e)).collect();
+                let compiled: Result<Vec<_>, _> = elems.iter().map(|e| self.compile_free_expr(e)).collect();
                 let compiled = compiled?;
-                let raw = compiled.first()
-                    .and_then(|e| infer_ir_type(e))
-                    .unwrap_or("text");
+                let raw = compiled.first().and_then(|e| infer_ir_type(e)).unwrap_or("text");
                 let pg_type = literal_sentinel_to_pg(raw).to_string();
                 (compiled, pg_type)
             }
@@ -2910,8 +3169,12 @@ impl<'a> Compiler<'a> {
         let body = self.compile_stmt(&f.body)?;
         // Restore previous for-var (or remove if none existed).
         match prev {
-            Some(old) => { self.for_vars.insert(f.var.clone(), old); }
-            None => { self.for_vars.remove(&f.var); }
+            Some(old) => {
+                self.for_vars.insert(f.var.clone(), old);
+            }
+            None => {
+                self.for_vars.remove(&f.var);
+            }
         }
 
         Ok(IrFor {
@@ -2924,27 +3187,28 @@ impl<'a> Compiler<'a> {
     fn compile_group(&mut self, g: &ast::GroupStmt) -> Result<IrGroup, PyQLError> {
         // Resolve the subject type — may be a schema type or a CTE alias.
         let (type_name, cte_name) = match &g.subject {
-            Expr::Path(p) if !p.partial => {
-                match p.steps.as_slice() {
-                    [ast::PathStep::Name(n)] => {
-                        if let Some(t) = self.cte_types.get(n.as_str()) {
-                            (t.clone(), Some(n.clone()))
-                        } else {
-                            (n.clone(), None)
-                        }
+            Expr::Path(p) if !p.partial => match p.steps.as_slice() {
+                [ast::PathStep::Name(n)] => {
+                    if let Some(t) = self.cte_types.get(n.as_str()) {
+                        (t.clone(), Some(n.clone()))
+                    } else {
+                        (n.clone(), None)
                     }
-                    [ast::PathStep::Name(m), ast::PathStep::Name(n)] =>
-                        (format!("{}::{}", m, n), None),
-                    _ => return Err(PyQLError::Type(PyQLTypeError {
+                }
+                [ast::PathStep::Name(m), ast::PathStep::Name(n)] => (format!("{}::{}", m, n), None),
+                _ => {
+                    return Err(PyQLError::Type(PyQLTypeError {
                         message: format!("unsupported group subject: {:?}", g.subject),
                         position: Position { line: 0, col: 0 },
-                    })),
+                    }));
                 }
+            },
+            _ => {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: "group subject must be a type name".to_string(),
+                    position: Position { line: 0, col: 0 },
+                }));
             }
-            _ => return Err(PyQLError::Type(PyQLTypeError {
-                message: "group subject must be a type name".to_string(),
-                position: Position { line: 0, col: 0 },
-            })),
         };
 
         let td = self.resolve_type(&type_name)?;
@@ -2962,12 +3226,7 @@ impl<'a> Compiler<'a> {
         let module = td.module.clone();
 
         // Compile the element shape. No explicit shape → implicit { id }.
-        let shape = self.compile_shape(
-            g.shape.as_deref().unwrap_or(&[]),
-            td,
-            &alias,
-            &module,
-        )?;
+        let shape = self.compile_shape(g.shape.as_deref().unwrap_or(&[]), td, &alias, &module)?;
 
         // Build a map from using-alias → compiled expression.
         let td = self.resolve_type(&type_name)?;
@@ -2997,10 +3256,12 @@ impl<'a> Compiler<'a> {
                 Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                     if let ast::PathStep::Name(name) = &p.steps[0] {
                         // Bare ident: must be a using alias.
-                        let ir = using_map.get(name).ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                            message: format!("group by references unknown alias '{}'", name),
-                            position: Position { line: 0, col: 0 },
-                        }))?;
+                        let ir = using_map.get(name).ok_or_else(|| {
+                            PyQLError::Type(PyQLTypeError {
+                                message: format!("group by references unknown alias '{}'", name),
+                                position: Position { line: 0, col: 0 },
+                            })
+                        })?;
                         keys.push((name.clone(), ir.clone()));
                     } else {
                         return Err(PyQLError::Type(PyQLTypeError {
@@ -3009,10 +3270,12 @@ impl<'a> Compiler<'a> {
                         }));
                     }
                 }
-                _ => return Err(PyQLError::Type(PyQLTypeError {
-                    message: format!("unsupported group by expression: {:?}", by_expr),
-                    position: Position { line: 0, col: 0 },
-                })),
+                _ => {
+                    return Err(PyQLError::Type(PyQLTypeError {
+                        message: format!("unsupported group by expression: {:?}", by_expr),
+                        position: Position { line: 0, col: 0 },
+                    }));
+                }
             }
         }
 
@@ -3031,12 +3294,11 @@ impl<'a> Compiler<'a> {
             Stmt::Group(g) => self.expr_as_type_name(&g.subject),
             Stmt::Select(sel) => {
                 // <Module::Type>expr — type name comes from the cast target
-                if let Expr::TypeCast(tc) = &sel.result {
-                    if let Some((module, name)) = tc.ty.as_named() {
-                        if module.map(|m| m != "std").unwrap_or(false) {
-                            return Ok(name.to_string());
-                        }
-                    }
+                if let Expr::TypeCast(tc) = &sel.result
+                    && let Some((module, name)) = tc.ty.as_named()
+                    && module.map(|m| m != "std").unwrap_or(false)
+                {
+                    return Ok(name.to_string());
                 }
                 // SELECT-over-SELECT: get the type from the inner select's result
                 let (type_name, _, _, _) = self.extract_type_and_shape(&sel.result)?;
@@ -3066,7 +3328,7 @@ impl<'a> Compiler<'a> {
         // *outer* insert's link value) had pending, so each level attaches
         // only its own CTEs to its own `IrInsert`.
         let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
-        let type_name = format!("{}", ins.subject.name);
+        let type_name = ins.subject.name.to_string();
         let td = self.resolve_type(&type_name)?;
         if td.abstract_ && td.materialized {
             return Err(self.type_err(&format!(
@@ -3089,22 +3351,30 @@ impl<'a> Compiler<'a> {
         for el in &ins.shape {
             let pointer_name = match path_leaf(&el.path) {
                 Ok(n) => n,
-                Err(_) => { scalar_elements.push(el.clone()); continue; }
+                Err(_) => {
+                    scalar_elements.push(el.clone());
+                    continue;
+                }
             };
             if let Some(ml) = Self::resolve_multilink(td, pointer_name) {
                 match el.op {
-                    ShapeOp::Remove => return Err(self.type_err(&format!(
-                        "cannot use `-=` for multi-link '{pointer_name}' in an insert; \
+                    ShapeOp::Remove => {
+                        return Err(self.type_err(&format!(
+                            "cannot use `-=` for multi-link '{pointer_name}' in an insert; \
                          there is nothing to remove from yet"
-                    ))),
+                        )));
+                    }
                     ShapeOp::Assign | ShapeOp::Append => {
                         if let Some(expr) = &el.compexpr {
-                            let (jt, module, src_col, tgt_col, through_td) =
-                                self.multilink_junction_info(td, ml)?;
+                            let (jt, module, src_col, tgt_col, through_td) = self.multilink_junction_info(td, ml)?;
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
-                                junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values, single: false,
+                                junction_table: jt,
+                                module,
+                                source_col: src_col,
+                                target_col: tgt_col,
+                                values,
+                                single: false,
                             });
                         }
                     }
@@ -3125,12 +3395,15 @@ impl<'a> Compiler<'a> {
                     // omitting the pointer entirely: nothing to append, no
                     // junction row created yet.
                     if !is_empty_set_expr(expr) {
-                        let (jt, module, src_col, tgt_col, through_td) =
-                            self.link_junction_info(td, l)?;
+                        let (jt, module, src_col, tgt_col, through_td) = self.link_junction_info(td, l)?;
                         let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                         multi_link_appends.push(IrMultiLinkMutation {
-                            junction_table: jt, module, source_col: src_col,
-                            target_col: tgt_col, values, single: true,
+                            junction_table: jt,
+                            module,
+                            source_col: src_col,
+                            target_col: tgt_col,
+                            values,
+                            single: true,
                         });
                     }
                 }
@@ -3155,25 +3428,30 @@ impl<'a> Compiler<'a> {
         let mut assignment_map: HashMap<String, IrExpr> =
             assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
         for prop in &td.properties {
-            if !assignment_map.contains_key(&prop.name) {
-                if let Some(default_sql) = &prop.default_sql {
-                    assignment_map.insert(prop.name.clone(), IrExpr::RawSql(default_sql.clone()));
-                }
+            if !assignment_map.contains_key(&prop.name)
+                && let Some(default_sql) = &prop.default_sql
+            {
+                assignment_map.insert(prop.name.clone(), IrExpr::RawSql(default_sql.clone()));
             }
         }
-        let rewrites = self.compile_rewrites(td, &alias, 1)?
+        let rewrites = self
+            .compile_rewrites(td, &alias, 1)?
             .into_iter()
             .map(|rw| IrRewrite {
                 column: rw.column,
                 expr: substitute_col_refs(rw.expr, &assignment_map),
             })
             .collect();
-        let unless_conflict = ins.unless_conflict.as_ref()
+        let unless_conflict = ins
+            .unless_conflict
+            .as_ref()
             .map(|uc| self.compile_conflict(uc, td))
             .transpose()?;
         let returning = Self::pk_returning(td);
         let type_name = format!("{}::{}", td.module, td.name);
-        let enqueue_vector = td.vector_indexes.iter()
+        let enqueue_vector = td
+            .vector_indexes
+            .iter()
             .map(|vi| VectorEnqueueInfo {
                 type_name: type_name.clone(),
                 index_name: vi.index_name.clone(),
@@ -3325,16 +3603,20 @@ impl<'a> Compiler<'a> {
         for el in &upd.shape {
             let pointer_name = match path_leaf(&el.path) {
                 Ok(n) => n,
-                Err(_) => { scalar_elements.push(el.clone()); continue; }
+                Err(_) => {
+                    scalar_elements.push(el.clone());
+                    continue;
+                }
             };
 
             if let Some(ml) = Self::resolve_multilink(td, pointer_name) {
-                let (jt, module, src_col, tgt_col, through_td) =
-                    self.multilink_junction_info(td, ml)?;
+                let (jt, module, src_col, tgt_col, through_td) = self.multilink_junction_info(td, ml)?;
 
                 match el.op {
                     ShapeOp::Assign => {
-                        let is_empty = el.compexpr.as_ref()
+                        let is_empty = el
+                            .compexpr
+                            .as_ref()
                             .map(|e| matches!(e, Expr::Set(v) if v.is_empty()))
                             .unwrap_or(false);
                         if is_empty {
@@ -3353,8 +3635,12 @@ impl<'a> Compiler<'a> {
                             });
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_replaces.push(IrMultiLinkMutation {
-                                junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values, single: false,
+                                junction_table: jt,
+                                module,
+                                source_col: src_col,
+                                target_col: tgt_col,
+                                values,
+                                single: false,
                             });
                         }
                     }
@@ -3362,8 +3648,12 @@ impl<'a> Compiler<'a> {
                         if let Some(expr) = &el.compexpr {
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
-                                junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values, single: false,
+                                junction_table: jt,
+                                module,
+                                source_col: src_col,
+                                target_col: tgt_col,
+                                values,
+                                single: false,
                             });
                         }
                     }
@@ -3373,12 +3663,16 @@ impl<'a> Compiler<'a> {
                             if has_any_link_props(&values) {
                                 return Err(self.type_err(
                                     "link properties (`@prop := value`) cannot be assigned \
-                                     when removing a link (`-=`)"
+                                     when removing a link (`-=`)",
                                 ));
                             }
                             multi_link_removals.push(IrMultiLinkMutation {
-                                junction_table: jt, module, source_col: src_col,
-                                target_col: tgt_col, values, single: false,
+                                junction_table: jt,
+                                module,
+                                source_col: src_col,
+                                target_col: tgt_col,
+                                values,
+                                single: false,
                             });
                         }
                     }
@@ -3393,9 +3687,7 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 let (jt, module, src_col, tgt_col, through_td) = self.link_junction_info(td, l)?;
-                let is_empty = el.compexpr.as_ref()
-                    .map(is_empty_set_expr)
-                    .unwrap_or(false);
+                let is_empty = el.compexpr.as_ref().map(is_empty_set_expr).unwrap_or(false);
                 if is_empty {
                     // := {} — clear the junction row
                     multi_link_clears.push(IrMultiLinkClear {
@@ -3411,8 +3703,12 @@ impl<'a> Compiler<'a> {
                     });
                     let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                     multi_link_replaces.push(IrMultiLinkMutation {
-                        junction_table: jt, module, source_col: src_col,
-                        target_col: tgt_col, values, single: true,
+                        junction_table: jt,
+                        module,
+                        source_col: src_col,
+                        target_col: tgt_col,
+                        values,
+                        single: true,
                     });
                 }
             } else {
@@ -3421,9 +3717,9 @@ impl<'a> Compiler<'a> {
         }
 
         let assignments = self.compile_assignments_for_update(&scalar_elements, td, &alias)?;
-        let assignment_map: HashMap<String, IrExpr> =
-            assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
-        let rewrites = self.compile_rewrites(td, &alias, 2)?
+        let assignment_map: HashMap<String, IrExpr> = assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
+        let rewrites = self
+            .compile_rewrites(td, &alias, 2)?
             .into_iter()
             .map(|rw| IrRewrite {
                 column: rw.column,
@@ -3433,16 +3729,20 @@ impl<'a> Compiler<'a> {
         let returning = Self::pk_returning(td);
 
         let (poly_implementors, poly_columns) = if td.abstract_ && td.materialized {
-            (self.find_poly_implementors(&format!("{}::{}", td.module, td.name)), Self::poly_dml_columns(td))
+            (
+                self.find_poly_implementors(&format!("{}::{}", td.module, td.name)),
+                Self::poly_dml_columns(td),
+            )
         } else {
             (vec![], vec![])
         };
 
         // Only enqueue indexes whose source pointers are touched by this update.
-        let written_cols: std::collections::HashSet<&str> =
-            assignments.iter().map(|(c, _)| c.as_str()).collect();
+        let written_cols: std::collections::HashSet<&str> = assignments.iter().map(|(c, _)| c.as_str()).collect();
         let type_name = format!("{}::{}", td.module, td.name);
-        let enqueue_vector: Vec<VectorEnqueueInfo> = td.vector_indexes.iter()
+        let enqueue_vector: Vec<VectorEnqueueInfo> = td
+            .vector_indexes
+            .iter()
             .filter(|vi| vi.pointers.iter().any(|f| written_cols.contains(f.as_str())))
             .map(|vi| VectorEnqueueInfo {
                 type_name: type_name.clone(),
@@ -3458,10 +3758,17 @@ impl<'a> Compiler<'a> {
         let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
 
         Ok(IrUpdate {
-            target, filter, assignments, rewrites, returning,
-            multi_link_clears, multi_link_replaces,
-            multi_link_appends, multi_link_removals,
-            poly_implementors, poly_columns,
+            target,
+            filter,
+            assignments,
+            rewrites,
+            returning,
+            multi_link_clears,
+            multi_link_replaces,
+            multi_link_appends,
+            multi_link_removals,
+            poly_implementors,
+            poly_columns,
             enqueue_vector,
             enqueue_search,
             nested_ctes,
@@ -3494,7 +3801,9 @@ impl<'a> Compiler<'a> {
             Some(through_qname) => {
                 let through_td = self.resolve_type(through_qname)?;
                 let src_type = format!("{}::{}", td.module, td.name);
-                let source_col = through_td.links.iter()
+                let source_col = through_td
+                    .links
+                    .iter()
                     .find(|l| l.target == src_type)
                     .map(|l| l.name.clone())
                     .unwrap_or_else(|| "source".to_string());
@@ -3504,7 +3813,9 @@ impl<'a> Compiler<'a> {
                 // for both sides — prefer a differently-named one first,
                 // matching the tie-break already used for the read-side
                 // join resolution elsewhere in this file.
-                let target_col = through_td.links.iter()
+                let target_col = through_td
+                    .links
+                    .iter()
                     .find(|l| l.target == target && l.name != source_col)
                     .or_else(|| through_td.links.iter().find(|l| l.target == target))
                     .map(|l| l.name.clone())
@@ -3528,7 +3839,13 @@ impl<'a> Compiler<'a> {
                 } else {
                     (through_td.table.clone(), through_td.module.clone())
                 };
-                Ok((junction_table, junction_module, source_col, target_col, Some(through_td)))
+                Ok((
+                    junction_table,
+                    junction_module,
+                    source_col,
+                    target_col,
+                    Some(through_td),
+                ))
             }
         }
     }
@@ -3574,19 +3891,31 @@ impl<'a> Compiler<'a> {
                 })
             } else {
                 let source_qname = format!("{}::{}", td.module, td.name);
-                let source_col = through_td.links.iter()
+                let source_col = through_td
+                    .links
+                    .iter()
                     .find(|l| l.target == source_qname)
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!("through type {through_qname} has no link to {source_qname}"),
-                        position: Position { line: 0, col: 0 },
-                    }))?.name.clone();
-                let target_col = through_td.links.iter()
+                    .ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to {source_qname}"),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?
+                    .name
+                    .clone();
+                let target_col = through_td
+                    .links
+                    .iter()
                     .find(|l| l.target == target && l.name != source_col)
                     .or_else(|| through_td.links.iter().find(|l| l.target == target))
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!("through type {through_qname} has no link to target {target}"),
-                        position: Position { line: 0, col: 0 },
-                    }))?.name.clone();
+                    .ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to target {target}"),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?
+                    .name
+                    .clone();
                 Ok(IrMultiLinkJoin::Through {
                     junction_table: through_td.table.clone(),
                     module: through_td.module.clone(),
@@ -3631,36 +3960,35 @@ impl<'a> Compiler<'a> {
         // `expr { @prop := value, ... }` — link-property assignments layered
         // onto an inner target-selecting expression.
         if let Expr::Shape(shape) = expr {
-            let inner_expr = shape.expr.as_ref().ok_or_else(|| {
-                self.type_err("multilink value shape must have a base expression")
-            })?;
+            let inner_expr = shape
+                .expr
+                .as_ref()
+                .ok_or_else(|| self.type_err("multilink value shape must have a base expression"))?;
             let mut inner = self.compile_multilink_values(inner_expr, td, alias, through_td)?;
 
             let Some(through) = through_td else {
                 return Err(self.type_err(
                     "link properties (`@prop := value`) are only valid on a multi-link \
-                     declared with `Through[...]`"
+                     declared with `Through[...]`",
                 ));
             };
 
             for el in &shape.elements {
                 let prop_name = match el.path.steps.as_slice() {
                     [ast::PathStep::LinkProp(name)] => name.clone(),
-                    _ => return Err(self.type_err(
-                        "only `@prop := value` link-property assignments are valid here"
-                    )),
+                    _ => return Err(self.type_err("only `@prop := value` link-property assignments are valid here")),
                 };
-                let prop = Self::resolve_property(through, &prop_name).ok_or_else(|| {
-                    self.field_err(&prop_name, &format!("{}::{}", through.module, through.name))
-                })?;
+                let prop = Self::resolve_property(through, &prop_name)
+                    .ok_or_else(|| self.field_err(&prop_name, &format!("{}::{}", through.module, through.name)))?;
                 if prop.is_readonly {
                     return Err(self.type_err(&format!(
                         "cannot set link property '{prop_name}': it is declared as read-only"
                     )));
                 }
-                let value_expr = el.compexpr.as_ref().ok_or_else(|| {
-                    self.type_err(&format!("link property '{prop_name}' must be assigned a value"))
-                })?;
+                let value_expr = el
+                    .compexpr
+                    .as_ref()
+                    .ok_or_else(|| self.type_err(&format!("link property '{prop_name}' must be assigned a value")))?;
                 let ir_expr = self.compile_expr(value_expr, td, alias)?;
                 inner.link_props.push((prop.name.clone(), ir_expr));
             }
@@ -3688,42 +4016,38 @@ impl<'a> Compiler<'a> {
                     source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
                     link_props: vec![],
                 }),
-                _ => Err(self.type_err(
-                    "multilink value must resolve to a SELECT or path query"
-                )),
+                _ => Err(self.type_err("multilink value must resolve to a SELECT or path query")),
             };
         }
 
         // Absolute path expression (type reference or path traversal)
-        if let Expr::Path(p) = expr {
-            if !p.partial {
-                let fake_sel = ast::SelectStmt {
-                    result: expr.clone(),
-                    filter: None,
-                    order_by: vec![],
-                    offset: None,
-                    limit: None,
-                    lock: None,
-                };
-                return match self.compile_stmt(&Stmt::Select(fake_sel))? {
-                    IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues {
-                        source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
+        if let Expr::Path(p) = expr
+            && !p.partial
+        {
+            let fake_sel = ast::SelectStmt {
+                result: expr.clone(),
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            };
+            return match self.compile_stmt(&Stmt::Select(fake_sel))? {
+                IrStmt::PathSelect(ps) => Ok(IrMultiLinkValues {
+                    source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
+                    link_props: vec![],
+                }),
+                IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
+                    Ok(IrMultiLinkValues {
+                        source: IrMultiLinkValueSource::Select(Box::new(s)),
                         link_props: vec![],
-                    }),
-                    IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
-                        Ok(IrMultiLinkValues {
-                            source: IrMultiLinkValueSource::Select(Box::new(s)),
-                            link_props: vec![],
-                        })
-                    }
-                    _ => Err(self.type_err("expected a path expression for multilink value")),
-                };
-            }
+                    })
+                }
+                _ => Err(self.type_err("expected a path expression for multilink value")),
+            };
         }
 
-        Err(self.type_err(
-            "multilink value must be a CTE reference, parenthesised subquery, or type path"
-        ))
+        Err(self.type_err("multilink value must be a CTE reference, parenthesised subquery, or type path"))
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────────────
@@ -3747,14 +4071,24 @@ impl<'a> Compiler<'a> {
         let returning = Self::pk_returning(td);
 
         let (poly_implementors, poly_columns) = if td.abstract_ && td.materialized {
-            (self.find_poly_implementors(&format!("{}::{}", td.module, td.name)), Self::poly_dml_columns(td))
+            (
+                self.find_poly_implementors(&format!("{}::{}", td.module, td.name)),
+                Self::poly_dml_columns(td),
+            )
         } else {
             (vec![], vec![])
         };
         let qname = format!("{}::{}", td.module, td.name);
         let enqueue_search = collect_search_enqueue(td, &qname, "delete");
 
-        Ok(IrDelete { target, filter, returning, poly_implementors, poly_columns, enqueue_search })
+        Ok(IrDelete {
+            target,
+            filter,
+            returning,
+            poly_implementors,
+            poly_columns,
+            enqueue_search,
+        })
     }
 
     // ── Shape compilation ─────────────────────────────────────────────────────────
@@ -3799,18 +4133,19 @@ impl<'a> Compiler<'a> {
         let mut pointers: Vec<IrShapePointer> = td
             .properties
             .iter()
-            .map(|p| IrShapePointer::Scalar(IrScalarPointer {
-                marker_offset: None,
-                alias: p.name.clone(),
-                column: p.name.clone(),
-                pg_type: p.pg_type.clone(),
-                tuple_shape: self.resolve_property_tuple_shape(p),
-            }))
+            .map(|p| {
+                IrShapePointer::Scalar(IrScalarPointer {
+                    marker_offset: None,
+                    alias: p.name.clone(),
+                    column: p.name.clone(),
+                    pg_type: p.pg_type.clone(),
+                    tuple_shape: self.resolve_property_tuple_shape(p),
+                })
+            })
             .collect();
 
         for cd in &td.computed.clone() {
-            let expr_ast = crate::parse::parse_expr(&cd.expression)
-                .map_err(|e| PyQLError::Syntax(e))?;
+            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
             let ir = self.compile_expr(&expr_ast, td, alias)?;
             pointers.push(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset: None,
@@ -3840,9 +4175,15 @@ impl<'a> Compiler<'a> {
                 );
                 let correlation = if l.is_junction_backed() {
                     let join = self.build_multilink_join(td, &l.name, &l.target, &l.through)?;
-                    IrSingleLinkCorrelation::Junction { join, target_pk: "id".to_string() }
+                    IrSingleLinkCorrelation::Junction {
+                        join,
+                        target_pk: "id".to_string(),
+                    }
                 } else {
-                    IrSingleLinkCorrelation::Fk { fk_column: format!("{}_id", l.name), target_pk: "id".to_string() }
+                    IrSingleLinkCorrelation::Fk {
+                        fk_column: format!("{}_id", l.name),
+                        target_pk: "id".to_string(),
+                    }
                 };
                 pointers.push(IrShapePointer::SingleLink(IrSingleLinkPointer {
                     marker_offset: None,
@@ -3874,12 +4215,14 @@ impl<'a> Compiler<'a> {
                             .links
                             .iter()
                             .find(|l| l.target == source_qname)
-                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                                message: format!(
-                                    "through type {through_qname} has no link to source type {source_qname}"
-                                ),
-                                position: Position { line: 0, col: 0 },
-                            }))?
+                            .ok_or_else(|| {
+                                PyQLError::Type(PyQLTypeError {
+                                    message: format!(
+                                        "through type {through_qname} has no link to source type {source_qname}"
+                                    ),
+                                    position: Position { line: 0, col: 0 },
+                                })
+                            })?
                             .name
                             .clone();
                         let target_col = through_td
@@ -3887,13 +4230,15 @@ impl<'a> Compiler<'a> {
                             .iter()
                             .find(|l| l.target == ml.target && l.name != source_col)
                             .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                            .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                                message: format!(
-                                    "through type {through_qname} has no link to target type {}",
-                                    ml.target
-                                ),
-                                position: Position { line: 0, col: 0 },
-                            }))?
+                            .ok_or_else(|| {
+                                PyQLError::Type(PyQLTypeError {
+                                    message: format!(
+                                        "through type {through_qname} has no link to target type {}",
+                                        ml.target
+                                    ),
+                                    position: Position { line: 0, col: 0 },
+                                })
+                            })?
                             .name
                             .clone();
                         IrMultiLinkJoin::Through {
@@ -3952,12 +4297,13 @@ impl<'a> Compiler<'a> {
         let concrete_table = concrete_td.table.clone();
 
         // Interface properties: those in the parent (interface) td
-        let interface_props: std::collections::HashSet<String> = parent_td.properties.iter()
-            .map(|p| p.name.clone())
-            .collect();
+        let interface_props: std::collections::HashSet<String> =
+            parent_td.properties.iter().map(|p| p.name.clone()).collect();
 
         // Emit scalar subquery for each property not already in the interface
-        let props: Vec<_> = concrete_td.properties.iter()
+        let props: Vec<_> = concrete_td
+            .properties
+            .iter()
             .filter(|p| !interface_props.contains(&p.name))
             .cloned()
             .collect();
@@ -3965,17 +4311,18 @@ impl<'a> Compiler<'a> {
         // Same for computed pointers not already defined on the interface —
         // `[is Concrete].*` must include the concrete type's own computed
         // properties (e.g. `full_name`), not just its stored properties.
-        let interface_computed: std::collections::HashSet<String> = parent_td.computed.iter()
-            .map(|c| c.name.clone())
-            .collect();
-        let computed: Vec<_> = concrete_td.computed.iter()
+        let interface_computed: std::collections::HashSet<String> =
+            parent_td.computed.iter().map(|c| c.name.clone()).collect();
+        let computed: Vec<_> = concrete_td
+            .computed
+            .iter()
             .filter(|c| !interface_computed.contains(&c.name))
             .cloned()
             .collect();
 
         // For deep splat, also include links
         let links: Vec<_> = if matches!(splat, ast::Splat::Deep) {
-            concrete_td.links.iter().cloned().collect()
+            concrete_td.links.to_vec()
         } else {
             vec![]
         };
@@ -4065,19 +4412,39 @@ impl<'a> Compiler<'a> {
                 let jt_alias = self.fresh_alias();
                 let jt_filter = IrExpr::BinOp(Box::new(IrBinOp {
                     left: IrExpr::BinOp(Box::new(IrBinOp {
-                        left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_src_col, pg_type: "uuid".to_string() },
+                        left: IrExpr::ColumnRef {
+                            alias: jt_alias.clone(),
+                            column: jt_src_col,
+                            pg_type: "uuid".to_string(),
+                        },
                         op: ast::BinOpKind::Eq,
-                        right: IrExpr::ColumnRef { alias: parent_alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                        right: IrExpr::ColumnRef {
+                            alias: parent_alias.to_string(),
+                            column: "id".to_string(),
+                            pg_type: "uuid".to_string(),
+                        },
                     })),
                     op: ast::BinOpKind::And,
                     right: IrExpr::BinOp(Box::new(IrBinOp {
-                        left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_tgt_col, pg_type: "uuid".to_string() },
+                        left: IrExpr::ColumnRef {
+                            alias: jt_alias.clone(),
+                            column: jt_tgt_col,
+                            pg_type: "uuid".to_string(),
+                        },
                         op: ast::BinOpKind::Eq,
-                        right: IrExpr::ColumnRef { alias: sub_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                        right: IrExpr::ColumnRef {
+                            alias: sub_alias.clone(),
+                            column: "id".to_string(),
+                            pg_type: "uuid".to_string(),
+                        },
                     })),
                 }));
                 let exists_select = IrSelect::schema_bound(
-                    IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias },
+                    IrSource {
+                        type_name: format!("{}::__jt__", jt_module),
+                        table: jt_table,
+                        alias: jt_alias,
+                    },
                     vec![],
                     Some(jt_filter),
                 );
@@ -4134,7 +4501,11 @@ impl<'a> Compiler<'a> {
             Some(ast::PathStep::Name(n)) => n.clone(),
             _ => return Err(self.type_err("type intersection must end with a pointer name")),
         };
-        Ok(IrShapePointer::Computed(IrComputedPointer { alias, expr, marker_offset }))
+        Ok(IrShapePointer::Computed(IrComputedPointer {
+            alias,
+            expr,
+            marker_offset,
+        }))
     }
 
     /// Compile `[is Type].name` as an `IrExpr` (for computed pointer / expression context).
@@ -4170,12 +4541,13 @@ impl<'a> Compiler<'a> {
 
         let pointer_name = match tail_steps.first() {
             Some(PathStep::Name(n)) => n.as_str(),
-            _ => return Err(self.type_err(
-                "type intersection must be followed by a pointer name, e.g. [is Type].name"
-            )),
+            _ => return Err(self.type_err("type intersection must be followed by a pointer name, e.g. [is Type].name")),
         };
 
-        let prop = concrete_td.properties.iter().find(|p| p.name == pointer_name)
+        let prop = concrete_td
+            .properties
+            .iter()
+            .find(|p| p.name == pointer_name)
             .ok_or_else(|| self.field_err(pointer_name, &concrete_qname))?;
         let prop_name = prop.name.clone();
         let prop_type = prop.pg_type.clone();
@@ -4220,11 +4592,12 @@ impl<'a> Compiler<'a> {
         module: &str,
     ) -> Result<IrShapePointer, PyQLError> {
         // Type intersection pointer: [is Type].pointer_name (without compexpr)
-        if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first() {
-            if el.compexpr.is_none() && el.path.steps.len() >= 2 {
-                let type_ref = type_ref.clone();
-                return self.compile_type_intersection_pointer(&type_ref, &el.path.steps[1..], alias, el.marker_offset);
-            }
+        if let Some(ast::PathStep::TypeIntersection(type_ref)) = el.path.steps.first()
+            && el.compexpr.is_none()
+            && el.path.steps.len() >= 2
+        {
+            let type_ref = type_ref.clone();
+            return self.compile_type_intersection_pointer(&type_ref, &el.path.steps[1..], alias, el.marker_offset);
         }
 
         let pointer_name = path_leaf(&el.path)?;
@@ -4253,15 +4626,13 @@ impl<'a> Compiler<'a> {
         if let Some(compexpr) = &el.compexpr {
             // `alias := .multilink` → rename a multilink, same semantics as a regular pointer
             if let Expr::Path(p) = compexpr {
-                if p.partial && p.steps.len() == 1 {
-                    if let ast::PathStep::Name(ml_name) = &p.steps[0] {
-                        if Self::resolve_multilink(td, ml_name).is_some() {
-                            let ml_name = ml_name.clone();
-                            return self.compile_multilink_pointer(
-                                pointer_name, &ml_name, td, alias, module, el,
-                            );
-                        }
-                    }
+                if p.partial
+                    && p.steps.len() == 1
+                    && let ast::PathStep::Name(ml_name) = &p.steps[0]
+                    && Self::resolve_multilink(td, ml_name).is_some()
+                {
+                    let ml_name = ml_name.clone();
+                    return self.compile_multilink_pointer(pointer_name, &ml_name, td, alias, module, el);
                 }
                 // `alias := .<backlink[is Type]` (no shape) → a backlink
                 // used as a computed pointer.
@@ -4279,18 +4650,24 @@ impl<'a> Compiler<'a> {
             // path — see `parse_shape_element`). So the shape case has to
             // be unwrapped here rather than read off `el.nested` the way
             // `compile_multilink_pointer`'s bare (non-computed) call site does.
-            if let Expr::Shape(sh) = compexpr {
-                if let Some(Expr::Path(p)) = &sh.expr {
-                    if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
-                        let current_qname = format!("{}::{}", td.module, td.name);
-                        return self.compile_backlink_pointer(pointer_name, p, &current_qname, &sh.elements, el.marker_offset);
-                    }
-                }
+            if let Expr::Shape(sh) = compexpr
+                && let Some(Expr::Path(p)) = &sh.expr
+                && p.partial
+                && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_)))
+            {
+                let current_qname = format!("{}::{}", td.module, td.name);
+                return self.compile_backlink_pointer(pointer_name, p, &current_qname, &sh.elements, el.marker_offset);
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
             // Cross-scope TypeIs: promote to set-valued shape pointer.
             if let IrExpr::ArrayFromSelect(src) = ir {
-                if let IrArraySource::RawExpr { source, poly_implementors, poly_columns, expr } = *src {
+                if let IrArraySource::RawExpr {
+                    source,
+                    poly_implementors,
+                    poly_columns,
+                    expr,
+                } = *src
+                {
                     return Ok(IrShapePointer::ScalarSet(IrScalarSetPointer {
                         alias: pointer_name.to_string(),
                         source,
@@ -4333,24 +4710,22 @@ impl<'a> Compiler<'a> {
             // (e.g. `spouse: { name, @since }`), the same as a multi-link's
             // own nested shape (`compile_multilink_pointer`) — partition
             // those out before compiling the rest as a regular shape.
-            let (regular_els, link_properties): (Vec<ShapeElement>, Vec<IrLinkProp>) =
-                if l.is_junction_backed() {
-                    let mut regular = Vec::new();
-                    let mut props = Vec::new();
-                    for nel in nested_elements {
-                        if let [ast::PathStep::LinkProp(name)] = nel.path.steps.as_slice() {
-                            props.push(IrLinkProp { name: name.clone() });
-                        } else {
-                            regular.push(nel.clone());
-                        }
+            let (regular_els, link_properties): (Vec<ShapeElement>, Vec<IrLinkProp>) = if l.is_junction_backed() {
+                let mut regular = Vec::new();
+                let mut props = Vec::new();
+                for nel in nested_elements {
+                    if let [ast::PathStep::LinkProp(name)] = nel.path.steps.as_slice() {
+                        props.push(IrLinkProp { name: name.clone() });
+                    } else {
+                        regular.push(nel.clone());
                     }
-                    (regular, props)
-                } else {
-                    (nested_elements.to_vec(), vec![])
-                };
+                }
+                (regular, props)
+            } else {
+                (nested_elements.to_vec(), vec![])
+            };
 
-            let sub_shape =
-                self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
+            let sub_shape = self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
             let subquery = IrSelect::schema_bound(
                 IrSource {
                     type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -4362,9 +4737,15 @@ impl<'a> Compiler<'a> {
             );
             let correlation = if l.is_junction_backed() {
                 let join = self.build_multilink_join(td, &l.name, &l.target, &l.through)?;
-                IrSingleLinkCorrelation::Junction { join, target_pk: "id".to_string() }
+                IrSingleLinkCorrelation::Junction {
+                    join,
+                    target_pk: "id".to_string(),
+                }
             } else {
-                IrSingleLinkCorrelation::Fk { fk_column: format!("{}_id", l.name), target_pk: "id".to_string() }
+                IrSingleLinkCorrelation::Fk {
+                    fk_column: format!("{}_id", l.name),
+                    target_pk: "id".to_string(),
+                }
             };
             return Ok(IrShapePointer::SingleLink(IrSingleLinkPointer {
                 marker_offset: el.marker_offset,
@@ -4382,8 +4763,7 @@ impl<'a> Compiler<'a> {
 
         // Schema-defined computed pointer
         if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name) {
-            let expr_ast = crate::parse::parse_expr(&cd.expression)
-                .map_err(|e| PyQLError::Syntax(e))?;
+            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
             let ir = self.compile_expr(&expr_ast, td, alias)?;
             return Ok(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset: el.marker_offset,
@@ -4422,8 +4802,7 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let sub_shape =
-            self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
+        let sub_shape = self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
 
         let join = if let Some(through_qname) = &ml.through {
             let through_td = self.resolve_type(through_qname)?;
@@ -4441,12 +4820,12 @@ impl<'a> Compiler<'a> {
                     .links
                     .iter()
                     .find(|l| l.target == source_qname)
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!(
-                            "through type {through_qname} has no link to source type {source_qname}"
-                        ),
-                        position: Position { line: 0, col: 0 },
-                    }))?
+                    .ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to source type {source_qname}"),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?
                     .name
                     .clone();
                 let target_col = through_td
@@ -4454,13 +4833,12 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .find(|l| l.target == ml.target && l.name != source_col)
                     .or_else(|| through_td.links.iter().find(|l| l.target == ml.target))
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!(
-                            "through type {through_qname} has no link to target type {}",
-                            ml.target
-                        ),
-                        position: Position { line: 0, col: 0 },
-                    }))?
+                    .ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to target type {}", ml.target),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?
                     .name
                     .clone();
                 IrMultiLinkJoin::Through {
@@ -4508,7 +4886,9 @@ impl<'a> Compiler<'a> {
                 .transpose()?,
             distinct: false,
             dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
             lock: None,
         };
 
@@ -4546,13 +4926,15 @@ impl<'a> Compiler<'a> {
         };
         let type_ref = match path.steps.get(1) {
             Some(PathStep::TypeIntersection(tr)) => tr,
-            _ => return Err(PyQLError::Type(PyQLTypeError {
-                message: format!(
-                    "backlink '.< {backlink_name}' requires a type intersection, \
+            _ => {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: format!(
+                        "backlink '.< {backlink_name}' requires a type intersection, \
                      e.g.: .< {backlink_name}[is SomeType]"
-                ),
-                position: Position { line: 0, col: 0 },
-            })),
+                    ),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
         };
         if path.steps.len() > 2 {
             return Err(self.type_err(
@@ -4569,14 +4951,30 @@ impl<'a> Compiler<'a> {
         let owner_td = self.resolve_type(&type_name)?;
         let owner_qname = format!("{}::{}", owner_td.module, owner_td.name);
 
-        let join = if let Some(l) = owner_td.links.iter().find(|l| l.name == backlink_name && l.target == current_qname) {
+        let join = if let Some(l) = owner_td
+            .links
+            .iter()
+            .find(|l| l.name == backlink_name && l.target == current_qname)
+        {
             if l.is_junction_backed() {
                 let (junction_table, module, owner_col, current_col, _) = self.link_junction_info(owner_td, l)?;
-                IrMultiLinkJoin::BacklinkJunction { junction_table, module, owner_col, current_col }
+                IrMultiLinkJoin::BacklinkJunction {
+                    junction_table,
+                    module,
+                    owner_col,
+                    current_col,
+                }
             } else {
-                IrMultiLinkJoin::BacklinkFk { fk_col: format!("{}_id", backlink_name) }
+                IrMultiLinkJoin::BacklinkFk {
+                    fk_col: format!("{}_id", backlink_name),
+                }
             }
-        } else if let Some(ml) = owner_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname).cloned() {
+        } else if let Some(ml) = owner_td
+            .multilinks
+            .iter()
+            .find(|ml| ml.name == backlink_name && ml.target == current_qname)
+            .cloned()
+        {
             let (junction_table, module, _, _, _) = self.multilink_junction_info(owner_td, &ml)?;
             IrMultiLinkJoin::BacklinkJunction {
                 junction_table,
@@ -4606,7 +5004,11 @@ impl<'a> Compiler<'a> {
         // etc. from.
         let subquery = IrSelect {
             rows: vec![IrRowSource::Bound {
-                source: IrSource { type_name: owner_qname, table: owner_td.table.clone(), alias: sub_alias.clone() },
+                source: IrSource {
+                    type_name: owner_qname,
+                    table: owner_td.table.clone(),
+                    alias: sub_alias.clone(),
+                },
                 shape: sub_shape,
             }],
             filter: None,
@@ -4615,7 +5017,9 @@ impl<'a> Compiler<'a> {
             limit: None,
             distinct: false,
             dml_source: None,
-            polymorphic: false, poly_implementors: vec![], poly_columns: vec![],
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
             lock: None,
         };
 
@@ -4639,11 +5043,7 @@ impl<'a> Compiler<'a> {
     /// thread `ctx` through recursive calls; the handful that genuinely
     /// diverge (`Path`, `BinOp`, `FunctionCall`, `Set`, `Detached`, `TypeIs`)
     /// branch internally on `ctx` — see each arm's own comment.
-    fn compile_expr_ctx(
-        &mut self,
-        expr: &Expr,
-        ctx: Option<(&TypeDescriptor, &str)>,
-    ) -> Result<IrExpr, PyQLError> {
+    fn compile_expr_ctx(&mut self, expr: &Expr, ctx: Option<(&TypeDescriptor, &str)>) -> Result<IrExpr, PyQLError> {
         match expr {
             // The main free/schema divergence — kept genuinely two-branched
             // (`compile_path` needs a schema type + alias throughout:
@@ -4674,10 +5074,18 @@ impl<'a> Compiler<'a> {
                 let ir_expr = self.compile_expr_ctx(e, ctx)?;
                 let ir_index = self.compile_expr_ctx(i, ctx)?;
                 let is_array = is_array_expr(&ir_expr);
-                Ok(IrExpr::Subscript { expr: Box::new(ir_expr), index: Box::new(ir_index), is_array })
+                Ok(IrExpr::Subscript {
+                    expr: Box::new(ir_expr),
+                    index: Box::new(ir_index),
+                    is_array,
+                })
             }
 
-            Expr::Slice { expr: e, lower: lo, upper: hi } => {
+            Expr::Slice {
+                expr: e,
+                lower: lo,
+                upper: hi,
+            } => {
                 let ir_expr = self.compile_expr_ctx(e, ctx)?;
                 let is_array = is_array_expr(&ir_expr);
                 let ir_lower = lo.as_ref().map(|x| self.compile_expr_ctx(x, ctx)).transpose()?;
@@ -4702,18 +5110,26 @@ impl<'a> Compiler<'a> {
                 if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
                     return Ok(IrExpr::Null);
                 }
-                if let ast::TypeExpr::Tuple { elements } = &tc.ty {
-                    if let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, &tc.expr, ctx)? {
-                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                        let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape })));
-                    }
+                if let ast::TypeExpr::Tuple { elements } = &tc.ty
+                    && let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, &tc.expr, ctx)?
+                {
+                    let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                    let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
+                    return Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
+                        expr: ir,
+                        pg_type,
+                        tuple_shape,
+                    })));
                 }
-                if let ast::TypeExpr::Array { element } = &tc.ty {
-                    if let Some(ir) = self.try_compile_array_literal_cast_ctx(element, &tc.expr, ctx)? {
-                        let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                        return Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: ir, pg_type, tuple_shape: None })));
-                    }
+                if let ast::TypeExpr::Array { element } = &tc.ty
+                    && let Some(ir) = self.try_compile_array_literal_cast_ctx(element, &tc.expr, ctx)?
+                {
+                    let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                    return Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
+                        expr: ir,
+                        pg_type,
+                        tuple_shape: None,
+                    })));
                 }
                 let inner = self.compile_expr_ctx(&tc.expr, ctx)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
@@ -4730,23 +5146,35 @@ impl<'a> Compiler<'a> {
                 if infer_ir_type(&inner) == Some("jsonb") {
                     if let ast::TypeExpr::Array { element } = &tc.ty {
                         let elem_pg = self.resolve_cast_pg_type(element)?;
-                        let sql_template = format!(
-                            "ARRAY(SELECT (elem #>> '{{}}')::{elem_pg} FROM jsonb_array_elements($1) AS elem)"
-                        );
+                        let sql_template =
+                            format!("ARRAY(SELECT (elem #>> '{{}}')::{elem_pg} FROM jsonb_array_elements($1) AS elem)");
                         return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
-                            schema: None, name: "jsonb_array_cast".to_string(), args: vec![inner], sql_template: Some(sql_template),
+                            schema: None,
+                            name: "jsonb_array_cast".to_string(),
+                            args: vec![inner],
+                            sql_template: Some(sql_template),
                         }));
                     }
-                    if matches!(pg_type.as_str(), "uuid" | "timestamptz" | "timestamp" | "date" | "time" | "interval") {
+                    if matches!(
+                        pg_type.as_str(),
+                        "uuid" | "timestamptz" | "timestamp" | "date" | "time" | "interval"
+                    ) {
                         let sql_template = format!("(($1 #>> '{{}}'))::{pg_type}");
                         return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
-                            schema: None, name: "jsonb_scalar_cast".to_string(), args: vec![inner], sql_template: Some(sql_template),
+                            schema: None,
+                            name: "jsonb_scalar_cast".to_string(),
+                            args: vec![inner],
+                            sql_template: Some(sql_template),
                         }));
                     }
                 }
 
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                Ok(IrExpr::TypeCast(Box::new(IrTypeCast { expr: inner, pg_type, tuple_shape })))
+                Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
+                    expr: inner,
+                    pg_type,
+                    tuple_shape,
+                })))
             }
 
             Expr::BinOp(b) => {
@@ -4767,34 +5195,43 @@ impl<'a> Compiler<'a> {
                 // an array-typed right operand, so this is the one
                 // expression position a set literal is actually meaningful
                 // in, in either schema-bound or free context.
-                if matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn) {
-                    if let Expr::Set(elems) = &b.right {
-                        let left = self.compile_expr_ctx(&b.left, ctx)?;
-                        let items = elems
-                            .iter()
-                            .map(|e| self.compile_expr_ctx(e, ctx))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let right = IrExpr::Array(items);
-                        return Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })));
-                    }
+                if matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn)
+                    && let Expr::Set(elems) = &b.right
+                {
+                    let left = self.compile_expr_ctx(&b.left, ctx)?;
+                    let items = elems
+                        .iter()
+                        .map(|e| self.compile_expr_ctx(e, ctx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let right = IrExpr::Array(items);
+                    return Ok(IrExpr::BinOp(Box::new(IrBinOp {
+                        left,
+                        op: b.op.clone(),
+                        right,
+                    })));
                 }
                 let left = self.compile_expr_ctx(&b.left, ctx)?;
                 let right = self.compile_expr_ctx(&b.right, ctx)?;
-                if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right)) {
-                    if !types_compatible(lt, rt) && !datetime_arithmetic_compatible(&b.op, lt, rt) {
-                        return Err(PyQLError::Type(PyQLTypeError {
-                            message: format!(
-                                "operator '{op}' cannot be applied to operands of type \
+                if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right))
+                    && !types_compatible(lt, rt)
+                    && !datetime_arithmetic_compatible(&b.op, lt, rt)
+                {
+                    return Err(PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "operator '{op}' cannot be applied to operands of type \
                                  '{lq}' and '{rq}'",
-                                op = b.op,
-                                lq = pg_type_to_pyql(lt),
-                                rq = pg_type_to_pyql(rt),
-                            ),
-                            position: Position { line: 0, col: 0 },
-                        }));
-                    }
+                            op = b.op,
+                            lq = pg_type_to_pyql(lt),
+                            rq = pg_type_to_pyql(rt),
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }));
                 }
-                Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op: b.op.clone(), right })))
+                Ok(IrExpr::BinOp(Box::new(IrBinOp {
+                    left,
+                    op: b.op.clone(),
+                    right,
+                })))
             }
 
             Expr::FunctionCall(f) => {
@@ -4830,49 +5267,42 @@ impl<'a> Compiler<'a> {
                 if (f.module.is_none() || f.module.as_deref() == Some("std"))
                     && assert_names.contains(&f.name.as_str())
                     && !f.args.is_empty()
+                    && let Expr::SubQuery(inner_stmt) = &f.args[0]
                 {
-                    if let Expr::SubQuery(inner_stmt) = &f.args[0] {
-                        let inner = self.compile_subquery_to_array_source(inner_stmt)?;
-                        let fn_pg = match f.name.as_str() {
-                            "assert_single" => "assert_single",
-                            "assert_exists" => "assert_exists",
-                            _ => "assert_distinct",
-                        };
-                        return Ok(IrExpr::FunctionCall(IrFunctionCall {
-                            schema: Some("_pylon".to_string()),
-                            name: fn_pg.to_string(),
-                            args: vec![IrExpr::ArrayFromSelect(Box::new(inner))],
-                            sql_template: None,
-                        }));
-                    }
+                    let inner = self.compile_subquery_to_array_source(inner_stmt)?;
+                    let fn_pg = match f.name.as_str() {
+                        "assert_single" => "assert_single",
+                        "assert_exists" => "assert_exists",
+                        _ => "assert_distinct",
+                    };
+                    return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        schema: Some("_pylon".to_string()),
+                        name: fn_pg.to_string(),
+                        args: vec![IrExpr::ArrayFromSelect(Box::new(inner))],
+                        sql_template: None,
+                    }));
                 }
 
                 // contains(.multilink.scalar, value) → EXISTS (set-membership
                 // semantics; schema-bound only, needs td/alias to resolve the
                 // multilink).
-                if let Some((td, alias)) = ctx {
-                    if (f.module.is_none() || f.module.as_deref() == Some("std"))
-                        && f.name == "contains"
-                        && f.args.len() == 2
-                    {
-                        if let Expr::Path(p) = &f.args[0] {
-                            if p.partial && p.steps.len() >= 2 {
-                                if let ast::PathStep::Name(ln) = &p.steps[0] {
-                                    if Self::resolve_multilink(td, ln).is_some() {
-                                        let synthetic = ast::BinOp {
-                                            left: f.args[0].clone(),
-                                            op: ast::BinOpKind::Eq,
-                                            right: f.args[1].clone(),
-                                        };
-                                        if let Some(exists) =
-                                            self.try_multilink_exists(&synthetic, td, alias)?
-                                        {
-                                            return Ok(exists);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                if let Some((td, alias)) = ctx
+                    && (f.module.is_none() || f.module.as_deref() == Some("std"))
+                    && f.name == "contains"
+                    && f.args.len() == 2
+                    && let Expr::Path(p) = &f.args[0]
+                    && p.partial
+                    && p.steps.len() >= 2
+                    && let ast::PathStep::Name(ln) = &p.steps[0]
+                    && Self::resolve_multilink(td, ln).is_some()
+                {
+                    let synthetic = ast::BinOp {
+                        left: f.args[0].clone(),
+                        op: ast::BinOpKind::Eq,
+                        right: f.args[1].clone(),
+                    };
+                    if let Some(exists) = self.try_multilink_exists(&synthetic, td, alias)? {
+                        return Ok(exists);
                     }
                 }
 
@@ -4884,33 +5314,49 @@ impl<'a> Compiler<'a> {
                 if f.args.len() == 1 {
                     let arg = &f.args[0];
                     if let Some((td, alias)) = ctx {
-                        if let Expr::Path(p) = arg {
-                            if p.partial && p.steps.len() == 1 {
-                                if let ast::PathStep::Name(ml_name) = &p.steps[0] {
-                                    if Self::resolve_multilink(td, ml_name).is_some() {
-                                        use crate::stdlib::{lookup, ImplStrategy};
-                                        let ns = f.module.as_deref().unwrap_or("std");
-                                        let overloads = lookup(ns, &f.name);
-                                        let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
-                                        if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy) {
-                                            let fn_name = sql_name.to_string();
-                                            let inner = self.multilink_correlation_select(ml_name, td, alias)?;
-                                            return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner) });
-                                        }
-                                    }
-                                }
+                        if let Expr::Path(p) = arg
+                            && p.partial
+                            && p.steps.len() == 1
+                            && let ast::PathStep::Name(ml_name) = &p.steps[0]
+                            && Self::resolve_multilink(td, ml_name).is_some()
+                        {
+                            use crate::stdlib::{ImplStrategy, lookup};
+                            let ns = f.module.as_deref().unwrap_or("std");
+                            let overloads = lookup(ns, &f.name);
+                            let best = overloads
+                                .iter()
+                                .find(|d| d.params.len() == 1)
+                                .or_else(|| overloads.first());
+                            if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy) {
+                                let fn_name = sql_name.to_string();
+                                let inner = self.multilink_correlation_select(ml_name, td, alias)?;
+                                return Ok(IrExpr::AggOverQuery {
+                                    fn_name,
+                                    inner: Box::new(inner),
+                                });
                             }
                         }
                     } else {
                         let inner_sel: Option<ast::SelectStmt> = match arg {
                             Expr::Path(p) if !p.partial => {
                                 // Resolve as a schema type if it matches a known type (not enum).
-                                let qname = p.steps.iter().filter_map(|s| {
-                                    if let ast::PathStep::Name(n) = s { Some(n.as_str()) } else { None }
-                                }).collect::<Vec<_>>().join("::");
-                                let is_schema_type = self.schema.types.iter().any(|t| {
-                                    format!("{}::{}", t.module, t.name) == qname || t.name == qname
-                                });
+                                let qname = p
+                                    .steps
+                                    .iter()
+                                    .filter_map(|s| {
+                                        if let ast::PathStep::Name(n) = s {
+                                            Some(n.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("::");
+                                let is_schema_type = self
+                                    .schema
+                                    .types
+                                    .iter()
+                                    .any(|t| format!("{}::{}", t.module, t.name) == qname || t.name == qname);
                                 if is_schema_type {
                                     Some(ast::SelectStmt {
                                         result: arg.clone(),
@@ -4934,16 +5380,22 @@ impl<'a> Compiler<'a> {
                             _ => None,
                         };
                         if let Some(sel) = inner_sel {
-                            use crate::stdlib::{lookup, ImplStrategy};
+                            use crate::stdlib::{ImplStrategy, lookup};
                             let ns = f.module.as_deref().unwrap_or("std");
                             let overloads = lookup(ns, &f.name);
-                            let best = overloads.iter().find(|d| d.params.len() == 1).or_else(|| overloads.first());
-                            if let Some(d) = best {
-                                if let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy {
-                                    let fn_name = sql_name.to_string();
-                                    let inner_ir = self.compile_select(&sel, &sel.result, false)?;
-                                    return Ok(IrExpr::AggOverQuery { fn_name, inner: Box::new(inner_ir) });
-                                }
+                            let best = overloads
+                                .iter()
+                                .find(|d| d.params.len() == 1)
+                                .or_else(|| overloads.first());
+                            if let Some(d) = best
+                                && let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy
+                            {
+                                let fn_name = sql_name.to_string();
+                                let inner_ir = self.compile_select(&sel, &sel.result, false)?;
+                                return Ok(IrExpr::AggOverQuery {
+                                    fn_name,
+                                    inner: Box::new(inner_ir),
+                                });
                             }
                         }
                     }
@@ -4955,32 +5407,31 @@ impl<'a> Compiler<'a> {
                 // special case never existed on the schema side).
                 if ctx.is_none() {
                     let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
-                    if let Some(idx) = set_arg_idx {
-                        if let Expr::Set(set_elems) = &f.args[idx] {
-                            use crate::stdlib::{lookup, ImplStrategy};
-                            let ns = f.module.as_deref().unwrap_or("std");
-                            let overloads = lookup(ns, &f.name);
-                            let best = overloads
-                                .iter()
-                                .find(|d| d.params.len() == f.args.len())
-                                .or_else(|| overloads.first());
-                            let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
-                                Some(ImplStrategy::SqlBuiltin(sql_name)) =>
-                                    (None, sql_name.to_string()),
-                                Some(_) => return Err(self.type_err(&format!(
+                    if let Some(idx) = set_arg_idx
+                        && let Expr::Set(set_elems) = &f.args[idx]
+                    {
+                        use crate::stdlib::{ImplStrategy, lookup};
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let overloads = lookup(ns, &f.name);
+                        let best = overloads
+                            .iter()
+                            .find(|d| d.params.len() == f.args.len())
+                            .or_else(|| overloads.first());
+                        let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
+                            Some(ImplStrategy::SqlBuiltin(sql_name)) => (None, sql_name.to_string()),
+                            Some(_) => {
+                                return Err(self.type_err(&format!(
                                     "function '{}::{}' cannot be called with a set literal in this context",
                                     ns, f.name
-                                ))),
-                                None => return Err(self.type_err(&format!(
-                                    "function '{}::{}' does not exist", ns, f.name
-                                ))),
-                            };
-                            let elems = set_elems
-                                .iter()
-                                .map(|e| self.compile_expr_ctx(e, ctx))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
-                        }
+                                )));
+                            }
+                            None => return Err(self.type_err(&format!("function '{}::{}' does not exist", ns, f.name))),
+                        };
+                        let elems = set_elems
+                            .iter()
+                            .map(|e| self.compile_expr_ctx(e, ctx))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
                     }
                 }
 
@@ -4992,13 +5443,14 @@ impl<'a> Compiler<'a> {
                 self.resolve_fn_call(f.module.as_deref(), &f.name, args)
             }
 
-            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => {
-                self.compile_exists_ctx(&u.operand, ctx)
-            }
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => self.compile_exists_ctx(&u.operand, ctx),
 
             Expr::UnaryOp(u) => {
                 let operand = self.compile_expr_ctx(&u.operand, ctx)?;
-                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: u.op.clone(), operand })))
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: u.op.clone(),
+                    operand,
+                })))
             }
 
             Expr::IfElse(ie) => {
@@ -5021,7 +5473,10 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|(name, e)| Ok((name.clone(), self.compile_expr_ctx(e, ctx)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                Ok(IrExpr::NamedTuple { fields: ir, is_free_object: false })
+                Ok(IrExpr::NamedTuple {
+                    fields: ir,
+                    is_free_object: false,
+                })
             }
 
             Expr::Tuple(elems) => {
@@ -5035,15 +5490,15 @@ impl<'a> Compiler<'a> {
             Expr::FieldAccess { expr: inner, field } => {
                 if let Expr::NamedTuple(fields) = inner.as_ref() {
                     let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
-                        self.type_err(&format!(
-                            "{field} is not a member of {}",
-                            named_tuple_type_str(fields)
-                        ))
+                        self.type_err(&format!("{field} is not a member of {}", named_tuple_type_str(fields)))
                     })?;
                     return self.compile_expr_ctx(val, ctx);
                 }
                 let ir = self.compile_expr_ctx(inner, ctx)?;
-                Ok(IrExpr::JsonbField { expr: Box::new(ir), field: field.clone() })
+                Ok(IrExpr::JsonbField {
+                    expr: Box::new(ir),
+                    field: field.clone(),
+                })
             }
 
             Expr::TupleIndex { expr: inner, index } => {
@@ -5059,10 +5514,7 @@ impl<'a> Compiler<'a> {
                     }
                     Expr::NamedTuple(fields) => {
                         let (_, val) = fields.get(*index).ok_or_else(|| {
-                            self.type_err(&format!(
-                                "{index} is not a member of {}",
-                                named_tuple_type_str(fields)
-                            ))
+                            self.type_err(&format!("{index} is not a member of {}", named_tuple_type_str(fields)))
                         })?;
                         self.compile_expr_ctx(val, ctx)
                     }
@@ -5072,18 +5524,20 @@ impl<'a> Compiler<'a> {
                     // bounds-check the index against its arity at compile time
                     // (e.g. `2 is not a member of tuple<std::int64, std::str>`).
                     _ => {
-                        if let Expr::TypeCast(tc) = inner.as_ref() {
-                            if let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty) {
-                                if *index >= shape.members.len() {
-                                    return Err(self.type_err(&format!(
-                                        "{index} is not a member of {}",
-                                        self.type_expr_to_display_str(&tc.ty)
-                                    )));
-                                }
-                            }
+                        if let Expr::TypeCast(tc) = inner.as_ref()
+                            && let Some(shape) = self.resolve_tuple_cast_shape(&tc.ty)
+                            && *index >= shape.members.len()
+                        {
+                            return Err(self.type_err(&format!(
+                                "{index} is not a member of {}",
+                                self.type_expr_to_display_str(&tc.ty)
+                            )));
                         }
                         let ir = self.compile_expr_ctx(inner, ctx)?;
-                        Ok(IrExpr::JsonbIndex { expr: Box::new(ir), index: *index })
+                        Ok(IrExpr::JsonbIndex {
+                            expr: Box::new(ir),
+                            index: *index,
+                        })
                     }
                 }
             }
@@ -5098,16 +5552,19 @@ impl<'a> Compiler<'a> {
             // in the first place (`find_path_root_in_expr` only ever matches
             // against a resolvable schema type name).
             Expr::Detached(inner) => {
-                if ctx.is_some() {
-                    if let Some(root) = self.find_path_root_in_expr(inner) {
-                        let synthetic = ast::SelectStmt {
-                            result: (**inner).clone(),
-                            filter: None, order_by: vec![], offset: None, limit: None,
-                            lock: None,
-                        };
-                        let ps = self.compile_expr_as_path_select(&synthetic, inner, &root, false)?;
-                        return Ok(IrExpr::PathSubquery(Box::new(ps)));
-                    }
+                if ctx.is_some()
+                    && let Some(root) = self.find_path_root_in_expr(inner)
+                {
+                    let synthetic = ast::SelectStmt {
+                        result: (**inner).clone(),
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        lock: None,
+                    };
+                    let ps = self.compile_expr_as_path_select(&synthetic, inner, &root, false)?;
+                    return Ok(IrExpr::PathSubquery(Box::new(ps)));
                 }
                 self.compile_expr_ctx(inner, None)
             }
@@ -5120,15 +5577,12 @@ impl<'a> Compiler<'a> {
             Expr::Set(elems) if ctx.is_none() && elems.is_empty() => Ok(IrExpr::Null),
 
             Expr::Set(elems) if ctx.is_none() => {
-                let compiled: Result<Vec<_>, _> =
-                    elems.iter().map(|e| self.compile_expr_ctx(e, ctx)).collect();
+                let compiled: Result<Vec<_>, _> = elems.iter().map(|e| self.compile_expr_ctx(e, ctx)).collect();
                 let mut compiled = compiled?;
                 if compiled.len() == 1 {
                     Ok(compiled.remove(0))
                 } else {
-                    Err(self.type_err(
-                        "multi-element set literal is not supported in free SELECT context",
-                    ))
+                    Err(self.type_err("multi-element set literal is not supported in free SELECT context"))
                 }
             }
 
@@ -5152,14 +5606,15 @@ impl<'a> Compiler<'a> {
                     .map(|el| -> Result<(String, IrExpr), PyQLError> {
                         let name = path_leaf(&el.path)?.to_string();
                         let expr = el.compexpr.as_ref().ok_or_else(|| {
-                            self.type_err(
-                                "free object field must have a value expression (':= expr')",
-                            )
+                            self.type_err("free object field must have a value expression (':= expr')")
                         })?;
                         Ok((name, self.compile_expr_ctx(expr, ctx)?))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::NamedTuple { fields, is_free_object: true })
+                Ok(IrExpr::NamedTuple {
+                    fields,
+                    is_free_object: true,
+                })
             }
 
             // A shape applied to a WITH-bound free object (`test := test {
@@ -5170,8 +5625,12 @@ impl<'a> Compiler<'a> {
             // override, compiles a brand new value in the current context,
             // exactly like a fresh free-object-literal field would.
             Expr::Shape(s) if matches!(&s.expr, Some(inner) if self.is_free_cte_ref(inner)) => {
-                let Some(Expr::Path(root_path)) = &s.expr else { unreachable!() };
-                let ast::PathStep::Name(root) = &root_path.steps[0] else { unreachable!() };
+                let Some(Expr::Path(root_path)) = &s.expr else {
+                    unreachable!()
+                };
+                let ast::PathStep::Name(root) = &root_path.steps[0] else {
+                    unreachable!()
+                };
                 let fields = s
                     .elements
                     .iter()
@@ -5181,15 +5640,18 @@ impl<'a> Compiler<'a> {
                             Some(over) => self.compile_expr_ctx(over, ctx)?,
                             None => match self.resolve_cte_field_chain(root, &[name.as_str()]) {
                                 Some(result) => result?,
-                                None => return Err(self.type_err(&format!(
-                                    "free object '{root}' has no field '{name}'"
-                                ))),
+                                None => {
+                                    return Err(self.type_err(&format!("free object '{root}' has no field '{name}'")));
+                                }
                             },
                         };
                         Ok((name, expr))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::NamedTuple { fields, is_free_object: true })
+                Ok(IrExpr::NamedTuple {
+                    fields,
+                    is_free_object: true,
+                })
             }
 
             // A bare shape or set literal is never valid in expression
@@ -5237,12 +5699,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile_expr(
-        &mut self,
-        expr: &Expr,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<IrExpr, PyQLError> {
+    fn compile_expr(&mut self, expr: &Expr, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
         self.compile_expr_ctx(expr, Some((td, alias)))
     }
 
@@ -5280,7 +5737,8 @@ impl<'a> Compiler<'a> {
             _ => (self_qname.clone(), false),
         };
 
-        let (ty_module, ty_name) = ty.as_named()
+        let (ty_module, ty_name) = ty
+            .as_named()
             .ok_or_else(|| self.type_err("cannot use IS with a tuple or array type"))?;
         let check_module = ty_module.unwrap_or(td.module.as_str());
         let check_qname = format!("{}::{}", check_module, ty_name);
@@ -5293,8 +5751,7 @@ impl<'a> Compiler<'a> {
 
         // Cross-scope: ARRAY(SELECT bool_expr FROM source_table).
         // Collect everything needed before calling fresh_alias (which needs &mut self).
-        let (source_table, source_abstract, source_materialized,
-             poly_implementors, poly_columns) = {
+        let (source_table, source_abstract, source_materialized, poly_implementors, poly_columns) = {
             let src_td = self.resolve_type(&source_qname)?;
             let table = src_td.table.clone();
             let abstract_ = src_td.abstract_;
@@ -5305,8 +5762,17 @@ impl<'a> Compiler<'a> {
                 vec![]
             };
             let cols = if abstract_ && materialized {
-                src_td.properties.iter().map(|p| p.name.clone())
-                    .chain(src_td.links.iter().filter(|l| !l.is_junction_backed()).map(|l| format!("{}_id", l.name)))
+                src_td
+                    .properties
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .chain(
+                        src_td
+                            .links
+                            .iter()
+                            .filter(|l| !l.is_junction_backed())
+                            .map(|l| format!("{}_id", l.name)),
+                    )
                     .collect::<Vec<_>>()
             } else {
                 vec![]
@@ -5347,13 +5813,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Build the boolean `IrExpr` for `source_qname is check_qname` in the current row's scope.
-    fn type_check_bool_expr(
-        &self,
-        source_qname: &str,
-        check_qname: &str,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> IrExpr {
+    fn type_check_bool_expr(&self, source_qname: &str, check_qname: &str, td: &TypeDescriptor, alias: &str) -> IrExpr {
         if check_qname == source_qname || td.interfaces.iter().any(|i| i == check_qname) {
             IrExpr::Literal(IrLiteral::Bool(true))
         } else if td.abstract_ && td.materialized {
@@ -5394,53 +5854,54 @@ impl<'a> Compiler<'a> {
         // the generic `IrExpr::CteRef` below would reference a column that
         // doesn't exist.
         if let Some(IrFreeExpr::FreeObject(_)) = self.cte_free_items.get(name) {
-            return Some(IrExpr::NamedTuple { fields: vec![], is_free_object: true });
+            return Some(IrExpr::NamedTuple {
+                fields: vec![],
+                is_free_object: true,
+            });
         }
         if let Some(t) = self.cte_types.get(name) {
             let scalar = !t.contains("::");
-            return Some(IrExpr::CteRef { name: name.to_string(), scalar });
+            return Some(IrExpr::CteRef {
+                name: name.to_string(),
+                scalar,
+            });
         }
-        if allow_fn_param {
-            if let Some(pg_type) = self.fn_params.get(name) {
-                return Some(IrExpr::FnParam { name: name.to_string(), pg_type: pg_type.clone() });
-            }
+        if allow_fn_param && let Some(pg_type) = self.fn_params.get(name) {
+            return Some(IrExpr::FnParam {
+                name: name.to_string(),
+                pg_type: pg_type.clone(),
+            });
         }
         None
     }
 
-    fn compile_path(
-        &mut self,
-        p: &ast::Path,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<IrExpr, PyQLError> {
+    fn compile_path(&mut self, p: &ast::Path, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
         if !p.partial {
-            if p.steps.len() == 1 {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if let Some(ir) = self.resolve_name_ref(n, false) {
-                        return Ok(ir);
-                    }
-                    // __type__ without a leading dot still means the current object's type.
-                    if n == "__type__" {
-                        return Ok(if td.abstract_ && td.materialized {
-                            IrExpr::ColumnRef {
-                                alias: alias.to_string(),
-                                column: "__type__".to_string(),
-                                pg_type: "text".to_string(),
-                            }
-                        } else {
-                            IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
-                        });
-                    }
+            if p.steps.len() == 1
+                && let ast::PathStep::Name(n) = &p.steps[0]
+            {
+                if let Some(ir) = self.resolve_name_ref(n, false) {
+                    return Ok(ir);
+                }
+                // __type__ without a leading dot still means the current object's type.
+                if n == "__type__" {
+                    return Ok(if td.abstract_ && td.materialized {
+                        IrExpr::ColumnRef {
+                            alias: alias.to_string(),
+                            column: "__type__".to_string(),
+                            pg_type: "text".to_string(),
+                        }
+                    } else {
+                        IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
+                    });
                 }
             }
             // Enum member access: `default::Gender.Female`
-            if p.steps.len() == 2 {
-                if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
-                    if self.resolve_enum(type_ref).is_some() {
-                        return self.compile_enum_access(type_ref, variant);
-                    }
-                }
+            if p.steps.len() == 2
+                && let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice()
+                && self.resolve_enum(type_ref).is_some()
+            {
+                return self.compile_enum_access(type_ref, variant);
             }
             // `root.field1.field2...` where `root` is a WITH-bound free object.
             if let Some(resolved) = self.resolve_cte_path(p) {
@@ -5461,19 +5922,28 @@ impl<'a> Compiler<'a> {
             // (the same vehicle `Detached` uses for a type-rooted path in
             // expression position) turns the whole traversal into one
             // correlated scalar/id expression.
-            if p.steps.len() > 1 {
-                if let ast::PathStep::Name(root) = &p.steps[0] {
-                    if self.cte_types.get(root.as_str()).map(|t| t.contains("::")).unwrap_or(false) {
-                        let full_path = ast::Path { steps: p.steps.clone(), partial: false };
-                        let synthetic = ast::SelectStmt {
-                            result: Expr::Path(full_path.clone()),
-                            filter: None, order_by: vec![], offset: None, limit: None,
-                            lock: None,
-                        };
-                        let ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
-                        return Ok(IrExpr::PathSubquery(Box::new(ps)));
-                    }
-                }
+            if p.steps.len() > 1
+                && let ast::PathStep::Name(root) = &p.steps[0]
+                && self
+                    .cte_types
+                    .get(root.as_str())
+                    .map(|t| t.contains("::"))
+                    .unwrap_or(false)
+            {
+                let full_path = ast::Path {
+                    steps: p.steps.clone(),
+                    partial: false,
+                };
+                let synthetic = ast::SelectStmt {
+                    result: Expr::Path(full_path.clone()),
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                };
+                let ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
+                return Ok(IrExpr::PathSubquery(Box::new(ps)));
             }
             // `__new__.prop` / `__old__.prop` — the inserted/updated/deleted
             // row a trigger handler is compiled against (see
@@ -5488,32 +5958,37 @@ impl<'a> Compiler<'a> {
             // explicit error below rather than the generic "absolute
             // paths" message, matching the upstream engine's `__old__`/`__new__ cannot be
             // used in this expression`.
-            if p.steps.len() > 1 {
-                if let ast::PathStep::Name(root) = &p.steps[0] {
-                    if root == "__new__" || root == "__old__" {
-                        if let Some((anchor_td, anchor_alias)) = self.special_anchors.get(root).cloned() {
-                            let relative = ast::Path { steps: p.steps[1..].to_vec(), partial: true };
-                            return self.compile_path(&relative, anchor_td, &anchor_alias);
-                        }
-                        return Err(PyQLError::Resolution(PyQLResolutionError::UnknownField(
-                            PyQLUnknownFieldError {
-                                message: format!("{root} cannot be used in this expression"),
-                                position: Position { line: 0, col: 0 },
-                            },
-                        )));
-                    }
+            if p.steps.len() > 1
+                && let ast::PathStep::Name(root) = &p.steps[0]
+                && (root == "__new__" || root == "__old__")
+            {
+                if let Some((anchor_td, anchor_alias)) = self.special_anchors.get(root).cloned() {
+                    let relative = ast::Path {
+                        steps: p.steps[1..].to_vec(),
+                        partial: true,
+                    };
+                    return self.compile_path(&relative, anchor_td, &anchor_alias);
                 }
+                return Err(PyQLError::Resolution(PyQLResolutionError::UnknownField(
+                    PyQLUnknownFieldError {
+                        message: format!("{root} cannot be used in this expression"),
+                        position: Position { line: 0, col: 0 },
+                    },
+                )));
             }
             // Absolute path rooted at the current td: `TypeName.prop` inside a schema-bound
             // expression (e.g. the value side of a BinOp in compile_expr_as_path_select).
             // Rewrite to a relative path and compile normally.
-            if p.steps.len() > 1 {
-                if let ast::PathStep::Name(root) = &p.steps[0] {
-                    let qualified = format!("{}::{}", td.module, td.name);
-                    if *root == td.name || *root == qualified {
-                        let relative = ast::Path { steps: p.steps[1..].to_vec(), partial: true };
-                        return self.compile_path(&relative, td, alias);
-                    }
+            if p.steps.len() > 1
+                && let ast::PathStep::Name(root) = &p.steps[0]
+            {
+                let qualified = format!("{}::{}", td.module, td.name);
+                if *root == td.name || *root == qualified {
+                    let relative = ast::Path {
+                        steps: p.steps[1..].to_vec(),
+                        partial: true,
+                    };
+                    return self.compile_path(&relative, td, alias);
                 }
             }
             return Err(PyQLError::Type(PyQLTypeError {
@@ -5544,7 +6019,7 @@ impl<'a> Compiler<'a> {
                 return Err(PyQLError::Type(PyQLTypeError {
                     message: "type intersections are not valid in expression context".into(),
                     position: Position { line: 0, col: 0 },
-                }))
+                }));
             }
         };
 
@@ -5584,8 +6059,7 @@ impl<'a> Compiler<'a> {
 
         // Schema-defined computed pointer: inline the expression in place.
         if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name) {
-            let expr_ast = crate::parse::parse_expr(&cd.expression)
-                .map_err(|e| PyQLError::Syntax(e))?;
+            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
             return self.compile_expr(&expr_ast, td, alias);
         }
 
@@ -5603,47 +6077,44 @@ impl<'a> Compiler<'a> {
                  use a schema-bound SELECT instead",
             ));
         }
-        if p.steps.len() == 2 {
-            if let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice() {
-                if self.resolve_enum(type_ref).is_some() {
-                    return self.compile_enum_access(type_ref, variant);
-                }
-            }
+        if p.steps.len() == 2
+            && let [ast::PathStep::Name(type_ref), ast::PathStep::Name(variant)] = p.steps.as_slice()
+            && self.resolve_enum(type_ref).is_some()
+        {
+            return self.compile_enum_access(type_ref, variant);
         }
         // `root.field1.field2...` where `root` is a WITH-bound free object
         // (any length >= 2, including chains through nested free objects).
         if let Some(resolved) = self.resolve_cte_path(p) {
             return resolved;
         }
-        if p.steps.len() == 1 {
-            if let ast::PathStep::Name(n) = &p.steps[0] {
-                if let Some(ir) = self.resolve_name_ref(n, true) {
-                    return Ok(ir);
-                }
-            }
+        if p.steps.len() == 1
+            && let ast::PathStep::Name(n) = &p.steps[0]
+            && let Some(ir) = self.resolve_name_ref(n, true)
+        {
+            return Ok(ir);
         }
         Err(self.type_err("expression is not valid in free SELECT context"))
     }
 
-    fn compile_path_2step(
-        &mut self,
-        p: &ast::Path,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<IrExpr, PyQLError> {
+    fn compile_path_2step(&mut self, p: &ast::Path, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
         let link_name = match &p.steps[0] {
             ast::PathStep::Name(n) => n.as_str(),
-            _ => return Err(PyQLError::Type(PyQLTypeError {
-                message: "type intersections are not valid in expression context".into(),
-                position: Position { line: 0, col: 0 },
-            })),
+            _ => {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: "type intersections are not valid in expression context".into(),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
         };
         let pointer_name = match &p.steps[1] {
             ast::PathStep::Name(n) => n.as_str(),
-            _ => return Err(PyQLError::Type(PyQLTypeError {
-                message: "type intersections are not valid in expression context".into(),
-                position: Position { line: 0, col: 0 },
-            })),
+            _ => {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: "type intersections are not valid in expression context".into(),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
         };
 
         if let Some(link) = Self::resolve_link(td, link_name) {
@@ -5724,18 +6195,27 @@ impl<'a> Compiler<'a> {
             p.partial && matches!(p.steps.first(), Some(PathStep::Backlink(_)))
         }
         let (path_steps, value_ast, flip) = if let Expr::Path(p) = &b.left {
-            if is_backlink(p) { (p.steps.as_slice(), &b.right, false) }
-            else { return Ok(None); }
+            if is_backlink(p) {
+                (p.steps.as_slice(), &b.right, false)
+            } else {
+                return Ok(None);
+            }
         } else if let Expr::Path(p) = &b.right {
-            if is_backlink(p) { (p.steps.as_slice(), &b.left, true) }
-            else { return Ok(None); }
+            if is_backlink(p) {
+                (p.steps.as_slice(), &b.left, true)
+            } else {
+                return Ok(None);
+            }
         } else {
             return Ok(None);
         };
         let value_expr = self.compile_expr(value_ast, td, alias)?;
         let current_qname = format!("{}::{}", td.module, td.name);
         let exists = self.compile_backlink_as_exists(
-            path_steps, Some((b.op.clone(), value_expr, flip)), &current_qname, alias,
+            path_steps,
+            Some((b.op.clone(), value_expr, flip)),
+            &current_qname,
+            alias,
         )?;
         Ok(Some(exists))
     }
@@ -5758,13 +6238,15 @@ impl<'a> Compiler<'a> {
         };
         let type_ref = match steps.get(1) {
             Some(PathStep::TypeIntersection(tr)) => tr,
-            _ => return Err(PyQLError::Type(PyQLTypeError {
-                message: format!(
-                    "backlink '.< {backlink_name}' requires a type intersection, \
+            _ => {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: format!(
+                        "backlink '.< {backlink_name}' requires a type intersection, \
                      e.g.: .< {backlink_name}[is SomeType]"
-                ),
-                position: Position { line: 0, col: 0 },
-            })),
+                    ),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
         };
 
         let type_name = match &type_ref.module {
@@ -5784,7 +6266,11 @@ impl<'a> Compiler<'a> {
         // path previously didn't: it only ever checked `target_td.links`,
         // so a self-referential-multilink backlink like `Person.friends`
         // failed to compile here even though it worked in a shape position.
-        let join_cond = if let Some(l) = target_td.links.iter().find(|l| l.name == backlink_name && l.target == current_qname) {
+        let join_cond = if let Some(l) = target_td
+            .links
+            .iter()
+            .find(|l| l.name == backlink_name && l.target == current_qname)
+        {
             if l.is_junction_backed() {
                 // Same junction-table EXISTS shape the multi-link branch
                 // below uses — no direct FK column, since this link is
@@ -5794,19 +6280,39 @@ impl<'a> Compiler<'a> {
                 IrExpr::UnaryOp(Box::new(IrUnaryOp {
                     op: ast::UnaryOpKind::Exists,
                     operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
-                        IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias.clone() },
+                        IrSource {
+                            type_name: format!("{}::__jt__", jt_module),
+                            table: jt_table,
+                            alias: jt_alias.clone(),
+                        },
                         vec![],
                         Some(IrExpr::BinOp(Box::new(IrBinOp {
                             left: IrExpr::BinOp(Box::new(IrBinOp {
-                                left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: jt_owner_col, pg_type: "uuid".to_string() },
+                                left: IrExpr::ColumnRef {
+                                    alias: jt_alias.clone(),
+                                    column: jt_owner_col,
+                                    pg_type: "uuid".to_string(),
+                                },
                                 op: ast::BinOpKind::Eq,
-                                right: IrExpr::ColumnRef { alias: t_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                                right: IrExpr::ColumnRef {
+                                    alias: t_alias.clone(),
+                                    column: "id".to_string(),
+                                    pg_type: "uuid".to_string(),
+                                },
                             })),
                             op: ast::BinOpKind::And,
                             right: IrExpr::BinOp(Box::new(IrBinOp {
-                                left: IrExpr::ColumnRef { alias: jt_alias, column: jt_current_col, pg_type: "uuid".to_string() },
+                                left: IrExpr::ColumnRef {
+                                    alias: jt_alias,
+                                    column: jt_current_col,
+                                    pg_type: "uuid".to_string(),
+                                },
                                 op: ast::BinOpKind::Eq,
-                                right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                                right: IrExpr::ColumnRef {
+                                    alias: alias.to_string(),
+                                    column: "id".to_string(),
+                                    pg_type: "uuid".to_string(),
+                                },
                             })),
                         }))),
                     ))),
@@ -5828,7 +6334,12 @@ impl<'a> Compiler<'a> {
                     },
                 }))
             }
-        } else if let Some(ml) = target_td.multilinks.iter().find(|ml| ml.name == backlink_name && ml.target == current_qname).cloned() {
+        } else if let Some(ml) = target_td
+            .multilinks
+            .iter()
+            .find(|ml| ml.name == backlink_name && ml.target == current_qname)
+            .cloned()
+        {
             // Junction row connects t_alias (as the multi-link's owner/
             // "source") to the current row (as its "target") — no direct FK
             // column on either table, so this is a nested EXISTS over the
@@ -5838,19 +6349,39 @@ impl<'a> Compiler<'a> {
             IrExpr::UnaryOp(Box::new(IrUnaryOp {
                 op: ast::UnaryOpKind::Exists,
                 operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
-                    IrSource { type_name: format!("{}::__jt__", jt_module), table: jt_table, alias: jt_alias.clone() },
+                    IrSource {
+                        type_name: format!("{}::__jt__", jt_module),
+                        table: jt_table,
+                        alias: jt_alias.clone(),
+                    },
                     vec![],
                     Some(IrExpr::BinOp(Box::new(IrBinOp {
                         left: IrExpr::BinOp(Box::new(IrBinOp {
-                            left: IrExpr::ColumnRef { alias: jt_alias.clone(), column: "source".to_string(), pg_type: "uuid".to_string() },
+                            left: IrExpr::ColumnRef {
+                                alias: jt_alias.clone(),
+                                column: "source".to_string(),
+                                pg_type: "uuid".to_string(),
+                            },
                             op: ast::BinOpKind::Eq,
-                            right: IrExpr::ColumnRef { alias: t_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                            right: IrExpr::ColumnRef {
+                                alias: t_alias.clone(),
+                                column: "id".to_string(),
+                                pg_type: "uuid".to_string(),
+                            },
                         })),
                         op: ast::BinOpKind::And,
                         right: IrExpr::BinOp(Box::new(IrBinOp {
-                            left: IrExpr::ColumnRef { alias: jt_alias, column: "target".to_string(), pg_type: "uuid".to_string() },
+                            left: IrExpr::ColumnRef {
+                                alias: jt_alias,
+                                column: "target".to_string(),
+                                pg_type: "uuid".to_string(),
+                            },
                             op: ast::BinOpKind::Eq,
-                            right: IrExpr::ColumnRef { alias: alias.to_string(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                            right: IrExpr::ColumnRef {
+                                alias: alias.to_string(),
+                                column: "id".to_string(),
+                                pg_type: "uuid".to_string(),
+                            },
                         })),
                     }))),
                 ))),
@@ -5880,7 +6411,11 @@ impl<'a> Compiler<'a> {
         Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
             op: ast::UnaryOpKind::Exists,
             operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
-                IrSource { type_name: target_qname, table: target_table, alias: t_alias },
+                IrSource {
+                    type_name: target_qname,
+                    table: target_table,
+                    alias: t_alias,
+                },
                 vec![],
                 Some(filter),
             ))),
@@ -5935,56 +6470,56 @@ impl<'a> Compiler<'a> {
         }
 
         // Two forward steps: link then property (single FK join)
-        if let [PathStep::Name(link_name), PathStep::Name(prop_name)] = steps {
-            if let Some(link) = Self::resolve_link(target_td, link_name) {
-                let link_target = link.target.clone();
-                let target_id_expr = if link.is_junction_backed() {
-                    self.junction_target_id_expr(target_td, link, t_alias)?
-                } else {
-                    IrExpr::ColumnRef {
-                        alias: t_alias.to_string(),
-                        column: format!("{}_id", link_name),
-                        pg_type: "uuid".to_string(),
-                    }
-                };
-                let link_target_td = self.resolve_type(&link_target)?;
-                let link_target_qname = format!("{}::{}", link_target_td.module, link_target_td.name);
-                let link_target_table = link_target_td.table.clone();
-                if let Some(prop) = Self::resolve_property(link_target_td, prop_name) {
-                    let l_alias = self.fresh_alias();
-                    let id_cond = IrExpr::BinOp(Box::new(IrBinOp {
-                        left: IrExpr::ColumnRef {
-                            alias: l_alias.clone(),
-                            column: "id".to_string(),
-                            pg_type: "uuid".to_string(),
-                        },
-                        op: ast::BinOpKind::Eq,
-                        right: target_id_expr,
-                    }));
-                    let col = IrExpr::ColumnRef {
-                        alias: l_alias.clone(),
-                        column: prop.name.clone(),
-                        pg_type: prop.pg_type.clone(),
-                    };
-                    let prop_cond = Self::apply_comparison(col, comparison);
-                    let full = IrExpr::BinOp(Box::new(IrBinOp {
-                        left: id_cond,
-                        op: ast::BinOpKind::And,
-                        right: prop_cond,
-                    }));
-                    return Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
-                        op: ast::UnaryOpKind::Exists,
-                        operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
-                            IrSource {
-                                type_name: link_target_qname,
-                                table: link_target_table,
-                                alias: l_alias,
-                            },
-                            vec![],
-                            Some(full),
-                        ))),
-                    }))));
+        if let [PathStep::Name(link_name), PathStep::Name(prop_name)] = steps
+            && let Some(link) = Self::resolve_link(target_td, link_name)
+        {
+            let link_target = link.target.clone();
+            let target_id_expr = if link.is_junction_backed() {
+                self.junction_target_id_expr(target_td, link, t_alias)?
+            } else {
+                IrExpr::ColumnRef {
+                    alias: t_alias.to_string(),
+                    column: format!("{}_id", link_name),
+                    pg_type: "uuid".to_string(),
                 }
+            };
+            let link_target_td = self.resolve_type(&link_target)?;
+            let link_target_qname = format!("{}::{}", link_target_td.module, link_target_td.name);
+            let link_target_table = link_target_td.table.clone();
+            if let Some(prop) = Self::resolve_property(link_target_td, prop_name) {
+                let l_alias = self.fresh_alias();
+                let id_cond = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: l_alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: target_id_expr,
+                }));
+                let col = IrExpr::ColumnRef {
+                    alias: l_alias.clone(),
+                    column: prop.name.clone(),
+                    pg_type: prop.pg_type.clone(),
+                };
+                let prop_cond = Self::apply_comparison(col, comparison);
+                let full = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: id_cond,
+                    op: ast::BinOpKind::And,
+                    right: prop_cond,
+                }));
+                return Ok(Some(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                        IrSource {
+                            type_name: link_target_qname,
+                            table: link_target_table,
+                            alias: l_alias,
+                        },
+                        vec![],
+                        Some(full),
+                    ))),
+                }))));
             }
         }
 
@@ -6013,8 +6548,13 @@ impl<'a> Compiler<'a> {
         alias: &str,
     ) -> Result<Option<IrExpr>, PyQLError> {
         fn ml_first_name(steps: &[ast::PathStep]) -> Option<&str> {
-            if steps.len() < 2 { return None; }
-            match &steps[0] { ast::PathStep::Name(n) => Some(n.as_str()), _ => None }
+            if steps.len() < 2 {
+                return None;
+            }
+            match &steps[0] {
+                ast::PathStep::Name(n) => Some(n.as_str()),
+                _ => None,
+            }
         }
 
         let (path_steps, value_ast, flip) = if let Expr::Path(p) = &b.left {
@@ -6022,32 +6562,50 @@ impl<'a> Compiler<'a> {
                 if let Some(ln) = ml_first_name(&p.steps) {
                     if Self::resolve_multilink(td, ln).is_some() {
                         (p.steps.as_slice(), &b.right, false)
-                    } else { return Ok(None); }
-                } else { return Ok(None); }
-            } else { return Ok(None); }
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
         } else if let Expr::Path(p) = &b.right {
             if p.partial {
                 if let Some(ln) = ml_first_name(&p.steps) {
                     if Self::resolve_multilink(td, ln).is_some() {
                         (p.steps.as_slice(), &b.left, true)
-                    } else { return Ok(None); }
-                } else { return Ok(None); }
-            } else { return Ok(None); }
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
         } else {
             return Ok(None);
         };
 
         let value_expr = self.compile_expr(value_ast, td, alias)?;
-        let ml_name = match &path_steps[0] { ast::PathStep::Name(n) => n.clone(), _ => return Ok(None) };
+        let ml_name = match &path_steps[0] {
+            ast::PathStep::Name(n) => n.clone(),
+            _ => return Ok(None),
+        };
         let ml = Self::resolve_multilink(td, &ml_name).unwrap();
 
         // Warn: multi-link traversal in a comparison returns a set, not a single boolean.
         // The query works (compiled as EXISTS), but `any()` makes the intent explicit.
         {
-            let pointer_path: Vec<_> = path_steps.iter().map(|s| match s {
-                ast::PathStep::Name(n) => n.as_str(),
-                _ => "?",
-            }).collect();
+            let pointer_path: Vec<_> = path_steps
+                .iter()
+                .map(|s| match s {
+                    ast::PathStep::Name(n) => n.as_str(),
+                    _ => "?",
+                })
+                .collect();
             self.warnings.push(format!(
                 "possibly more than one element returned by an expression in a FILTER clause \
                  (multi-link '.{}'); wrap with any() to make intent explicit",
@@ -6082,22 +6640,30 @@ impl<'a> Compiler<'a> {
             } else {
                 let source_qname = format!("{}::{}", td_module, td_name);
                 let src_col = through_td
-                    .links.iter()
+                    .links
+                    .iter()
                     .find(|l| l.target == source_qname)
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!("through type {through_qname} has no link to {source_qname}"),
-                        position: Position { line: 0, col: 0 },
-                    }))?
-                    .name.clone();
+                    .ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to {source_qname}"),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?
+                    .name
+                    .clone();
                 let tgt_col = through_td
-                    .links.iter()
+                    .links
+                    .iter()
                     .find(|l| l.target == ml_target && l.name != src_col)
                     .or_else(|| through_td.links.iter().find(|l| l.target == ml_target))
-                    .ok_or_else(|| PyQLError::Type(PyQLTypeError {
-                        message: format!("through type {through_qname} has no link to {ml_target}"),
-                        position: Position { line: 0, col: 0 },
-                    }))?
-                    .name.clone();
+                    .ok_or_else(|| {
+                        PyQLError::Type(PyQLTypeError {
+                            message: format!("through type {through_qname} has no link to {ml_target}"),
+                            position: Position { line: 0, col: 0 },
+                        })
+                    })?
+                    .name
+                    .clone();
                 (
                     through_td.table.clone(),
                     through_td.module.clone(),
@@ -6195,7 +6761,11 @@ impl<'a> Compiler<'a> {
                     column: jt_tgt_col.to_string(),
                     pg_type: "uuid".to_string(),
                 };
-                let (l, r) = if flip { (value_expr, col_ref) } else { (col_ref, value_expr) };
+                let (l, r) = if flip {
+                    (value_expr, col_ref)
+                } else {
+                    (col_ref, value_expr)
+                };
                 return Ok(IrExpr::BinOp(Box::new(IrBinOp { left: l, op, right: r })));
             }
             // Check if it's a link (object) rather than a scalar
@@ -6211,7 +6781,9 @@ impl<'a> Compiler<'a> {
                     position: Position { line: 0, col: 0 },
                 }));
             }
-            let prop = target_td.properties.iter()
+            let prop = target_td
+                .properties
+                .iter()
                 .find(|p| p.name == first_name)
                 .ok_or_else(|| self.field_err(&first_name, target_type))?;
             let prop_name = prop.name.clone();
@@ -6219,13 +6791,33 @@ impl<'a> Compiler<'a> {
             let tgt_alias = self.fresh_alias();
             // Build EXISTS(SELECT 1 FROM target WHERE target.id = jt.target AND target.prop op value)
             let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
-                left: IrExpr::ColumnRef { alias: tgt_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+                left: IrExpr::ColumnRef {
+                    alias: tgt_alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
                 op: ast::BinOpKind::Eq,
-                right: IrExpr::ColumnRef { alias: jt_alias.to_string(), column: jt_tgt_col.to_string(), pg_type: "uuid".to_string() },
+                right: IrExpr::ColumnRef {
+                    alias: jt_alias.to_string(),
+                    column: jt_tgt_col.to_string(),
+                    pg_type: "uuid".to_string(),
+                },
             }));
-            let prop_col = IrExpr::ColumnRef { alias: tgt_alias.clone(), column: prop_name, pg_type: prop_pg };
-            let (pl, pr) = if flip { (value_expr, prop_col) } else { (prop_col, value_expr) };
-            let prop_filter = IrExpr::BinOp(Box::new(IrBinOp { left: pl, op, right: pr }));
+            let prop_col = IrExpr::ColumnRef {
+                alias: tgt_alias.clone(),
+                column: prop_name,
+                pg_type: prop_pg,
+            };
+            let (pl, pr) = if flip {
+                (value_expr, prop_col)
+            } else {
+                (prop_col, value_expr)
+            };
+            let prop_filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: pl,
+                op,
+                right: pr,
+            }));
             let full = IrExpr::BinOp(Box::new(IrBinOp {
                 left: id_filter,
                 op: ast::BinOpKind::And,
@@ -6240,16 +6832,19 @@ impl<'a> Compiler<'a> {
                 vec![],
                 Some(full),
             )));
-            return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
+            return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                op: ast::UnaryOpKind::Exists,
+                operand: inner,
+            })));
         }
 
         // steps.len() >= 2: first_name must be a single link (not multi)
         if target_td.multilinks.iter().any(|l| l.name == first_name) {
-            return Err(self.type_err(
-                "nested multi-link traversal in comparison is not yet supported",
-            ));
+            return Err(self.type_err("nested multi-link traversal in comparison is not yet supported"));
         }
-        let link = target_td.links.iter()
+        let link = target_td
+            .links
+            .iter()
             .find(|l| l.name == first_name)
             .ok_or_else(|| self.field_err(&first_name, target_type))?;
         if link.is_junction_backed() {
@@ -6270,55 +6865,78 @@ impl<'a> Compiler<'a> {
         let tgt_alias = self.fresh_alias();
 
         // FK optimisation for [single_link, "id"]:
-        if steps.len() == 2 {
-            if let Some(ast::PathStep::Name(n)) = steps.get(1) {
-                if n == "id" {
-                    // Compare tgt.{fk_col} (the FK in current target) directly
-                    // We need an EXISTS over the target to access fk_col
-                    // Actually: EXISTS(target WHERE target.id = jt.target AND target.{fk_col} op value)
-                    let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
-                        left: IrExpr::ColumnRef { alias: tgt_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
-                        op: ast::BinOpKind::Eq,
-                        right: IrExpr::ColumnRef { alias: jt_alias.to_string(), column: jt_tgt_col.to_string(), pg_type: "uuid".to_string() },
-                    }));
-                    let fk_ref = IrExpr::ColumnRef { alias: tgt_alias.clone(), column: fk_col, pg_type: "uuid".to_string() };
-                    let (fl, fr) = if flip { (value_expr, fk_ref) } else { (fk_ref, value_expr) };
-                    let fk_filter = IrExpr::BinOp(Box::new(IrBinOp { left: fl, op, right: fr }));
-                    let full = IrExpr::BinOp(Box::new(IrBinOp {
-                        left: id_filter,
-                        op: ast::BinOpKind::And,
-                        right: fk_filter,
-                    }));
-                    let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
-                        IrSource {
-                            type_name: target_type.to_string(),
-                            table: target_table,
-                            alias: tgt_alias,
-                        },
-                        vec![],
-                        Some(full),
-                    )));
-                    return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })));
-                }
-            }
+        if steps.len() == 2
+            && let Some(ast::PathStep::Name(n)) = steps.get(1)
+            && n == "id"
+        {
+            // Compare tgt.{fk_col} (the FK in current target) directly
+            // We need an EXISTS over the target to access fk_col
+            // Actually: EXISTS(target WHERE target.id = jt.target AND target.{fk_col} op value)
+            let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: tgt_alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef {
+                    alias: jt_alias.to_string(),
+                    column: jt_tgt_col.to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+            }));
+            let fk_ref = IrExpr::ColumnRef {
+                alias: tgt_alias.clone(),
+                column: fk_col,
+                pg_type: "uuid".to_string(),
+            };
+            let (fl, fr) = if flip {
+                (value_expr, fk_ref)
+            } else {
+                (fk_ref, value_expr)
+            };
+            let fk_filter = IrExpr::BinOp(Box::new(IrBinOp {
+                left: fl,
+                op,
+                right: fr,
+            }));
+            let full = IrExpr::BinOp(Box::new(IrBinOp {
+                left: id_filter,
+                op: ast::BinOpKind::And,
+                right: fk_filter,
+            }));
+            let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                IrSource {
+                    type_name: target_type.to_string(),
+                    table: target_table,
+                    alias: tgt_alias,
+                },
+                vec![],
+                Some(full),
+            )));
+            return Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                op: ast::UnaryOpKind::Exists,
+                operand: inner,
+            })));
         }
 
         // General case: EXISTS(target WHERE target.id = jt.jt_tgt_col AND <tail_filter for steps[1..]>)
         // Recursive call uses tgt_alias.fk_col as the "pointer to the next type's id"
         let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
-            left: IrExpr::ColumnRef { alias: tgt_alias.clone(), column: "id".to_string(), pg_type: "uuid".to_string() },
+            left: IrExpr::ColumnRef {
+                alias: tgt_alias.clone(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
             op: ast::BinOpKind::Eq,
-            right: IrExpr::ColumnRef { alias: jt_alias.to_string(), column: jt_tgt_col.to_string(), pg_type: "uuid".to_string() },
+            right: IrExpr::ColumnRef {
+                alias: jt_alias.to_string(),
+                column: jt_tgt_col.to_string(),
+                pg_type: "uuid".to_string(),
+            },
         }));
-        let nested_filter = self.compile_path_tail_filter(
-            &steps[1..],
-            op,
-            value_expr,
-            flip,
-            &next_target,
-            &tgt_alias,
-            &fk_col,
-        )?;
+        let nested_filter =
+            self.compile_path_tail_filter(&steps[1..], op, value_expr, flip, &next_target, &tgt_alias, &fk_col)?;
         let full = IrExpr::BinOp(Box::new(IrBinOp {
             left: id_filter,
             op: ast::BinOpKind::And,
@@ -6333,23 +6951,18 @@ impl<'a> Compiler<'a> {
             vec![],
             Some(full),
         )));
-        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp { op: ast::UnaryOpKind::Exists, operand: inner })))
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: ast::UnaryOpKind::Exists,
+            operand: inner,
+        })))
     }
 
     /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.
-    fn compile_conflict(
-        &mut self,
-        uc: &ast::UnlessConflict,
-        td: &TypeDescriptor,
-    ) -> Result<IrConflict, PyQLError> {
+    fn compile_conflict(&mut self, uc: &ast::UnlessConflict, td: &TypeDescriptor) -> Result<IrConflict, PyQLError> {
         // ON clause: compile with empty alias → bare column name (`"col"` not `"t0"."col"`)
         // so the emitter produces `ON CONFLICT ("name")` not `ON CONFLICT ("t0"."name")`.
-        let on = uc.on.as_ref()
-            .map(|e| self.compile_expr(e, td, ""))
-            .transpose()?;
-        let do_update = uc.else_.as_ref()
-            .map(|e| self.compile_conflict_else(e))
-            .transpose()?;
+        let on = uc.on.as_ref().map(|e| self.compile_expr(e, td, "")).transpose()?;
+        let do_update = uc.else_.as_ref().map(|e| self.compile_conflict_else(e)).transpose()?;
         Ok(IrConflict { on, do_update })
     }
 
@@ -6367,19 +6980,12 @@ impl<'a> Compiler<'a> {
     /// own docs describe exactly this qualification: "the existing row
     /// using the table's name (or an alias)," no explicit `AS` needed on
     /// the INSERT target for that self-reference to work.
-    fn compile_conflict_else(
-        &mut self,
-        expr: &Expr,
-    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+    fn compile_conflict_else(&mut self, expr: &Expr) -> Result<Vec<(String, IrExpr)>, PyQLError> {
         let Expr::SubQuery(stmt) = expr else {
-            return Err(self.type_err(
-                "UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)",
-            ));
+            return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)"));
         };
         let Stmt::Update(upd) = stmt.as_ref() else {
-            return Err(self.type_err(
-                "UNLESS CONFLICT ELSE must be an UPDATE expression",
-            ));
+            return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression"));
         };
         let type_name = self.expr_as_type_name(&upd.subject)?;
         let upd_td = self.resolve_type(&type_name)?;
@@ -6427,7 +7033,9 @@ impl<'a> Compiler<'a> {
                 Some(inner.as_ref())
             }
             Expr::Shape(s) => match s.expr.as_ref() {
-                Some(Expr::SubQuery(inner)) if matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
+                Some(Expr::SubQuery(inner))
+                    if matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) =>
+                {
                     Some(inner.as_ref())
                 }
                 _ => None,
@@ -6492,12 +7100,7 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    fn compile_sort(
-        &mut self,
-        s: &ast::SortExpr,
-        td: &TypeDescriptor,
-        alias: &str,
-    ) -> Result<IrSort, PyQLError> {
+    fn compile_sort(&mut self, s: &ast::SortExpr, td: &TypeDescriptor, alias: &str) -> Result<IrSort, PyQLError> {
         self.compile_sort_ctx(s, Some((td, alias)))
     }
 
@@ -6506,13 +7109,8 @@ impl<'a> Compiler<'a> {
     /// Look up `name` in the stdlib (namespace = `module` or `"std"`) and produce
     /// the correct `IrExpr::FunctionCall` based on the matching `ImplStrategy`.
     /// Falls through to a plain call if no overload is found (unknown / PG built-in).
-    fn resolve_fn_call(
-        &self,
-        module: Option<&str>,
-        name: &str,
-        args: Vec<IrExpr>,
-    ) -> Result<IrExpr, PyQLError> {
-        use crate::stdlib::{lookup, ImplStrategy};
+    fn resolve_fn_call(&self, module: Option<&str>, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
+        use crate::stdlib::{ImplStrategy, lookup};
 
         let ns = module.unwrap_or("std");
         let overloads = lookup(ns, name);
@@ -6522,29 +7120,27 @@ impl<'a> Compiler<'a> {
         let best = overloads
             .iter()
             .find(|d| {
-                d.params.len() == args.len()
-                    && d.params.iter().zip(&args).all(|(p, a)| pylon_type_matches(a, &p.ty))
+                d.params.len() == args.len() && d.params.iter().zip(&args).all(|(p, a)| pylon_type_matches(a, &p.ty))
             })
             .or_else(|| overloads.first());
 
         let (schema, resolved_name, sql_template) = if let Some(desc) = best {
             match &desc.impl_strategy {
-                ImplStrategy::SqlBuiltin(sql_name) =>
-                    (None, sql_name.to_string(), None),
-                ImplStrategy::SqlExpression(tmpl) =>
-                    (None, name.to_string(), Some(tmpl.to_string())),
-                ImplStrategy::PylonFunction(def) =>
-                    (Some("_pylon".to_string()), def.name.to_string(), None),
+                ImplStrategy::SqlBuiltin(sql_name) => (None, sql_name.to_string(), None),
+                ImplStrategy::SqlExpression(tmpl) => (None, name.to_string(), Some(tmpl.to_string())),
+                ImplStrategy::PylonFunction(def) => (Some("_pylon".to_string()), def.name.to_string(), None),
                 // Binary infix operator: emit as a template so sql/mod.rs's
                 // generic FunctionCall path (which only ever calls
                 // `schema.name(args)`) doesn't swallow the operator symbol —
                 // previously unreachable in practice (only `std::overlaps`
                 // used this strategy, untested, and would have silently
                 // resolved to a nonexistent `"std".overlaps(...)` call).
-                ImplStrategy::SqlOperator(op) if args.len() == 2 =>
-                    (None, name.to_string(), Some(format!("($1 {op} $2)"))),
-                ImplStrategy::TranspilerIntrinsic(intrinsic) =>
-                    return self.compile_range_intrinsic(intrinsic, name, args),
+                ImplStrategy::SqlOperator(op) if args.len() == 2 => {
+                    (None, name.to_string(), Some(format!("($1 {op} $2)")))
+                }
+                ImplStrategy::TranspilerIntrinsic(intrinsic) => {
+                    return self.compile_range_intrinsic(intrinsic, name, args);
+                }
                 // TranspilerIntrinsic: pass through; handled elsewhere
                 _ => (module.map(str::to_string), name.to_string(), None),
             }
@@ -6565,25 +7161,42 @@ impl<'a> Compiler<'a> {
             // first-declared member takes 1 arg reported "expects 1
             // argument(s), got 2" even though a 2-arg overload existed).
             let effective_module = module.unwrap_or("default");
-            let candidates: Vec<&FunctionDescriptor> = self.schema.functions.iter().filter(|f| {
-                let module_matches = module.map(|m| m == f.module.as_str()).unwrap_or(true);
-                module_matches && f.name == name && !f.return_is_object
-            }).collect();
-            let user_fn = candidates.iter().find(|f| f.params.len() == args.len()).copied()
+            let candidates: Vec<&FunctionDescriptor> = self
+                .schema
+                .functions
+                .iter()
+                .filter(|f| {
+                    let module_matches = module.map(|m| m == f.module.as_str()).unwrap_or(true);
+                    module_matches && f.name == name && !f.return_is_object
+                })
+                .collect();
+            let user_fn = candidates
+                .iter()
+                .find(|f| f.params.len() == args.len())
+                .copied()
                 .or_else(|| candidates.first().copied());
             if let Some(fd) = user_fn {
                 if fd.params.len() != args.len() {
                     return Err(self.type_err(&format!(
                         "function '{}::{}' expects {} argument(s), got {}",
-                        fd.module, fd.name, fd.params.len(), args.len()
+                        fd.module,
+                        fd.name,
+                        fd.params.len(),
+                        args.len()
                     )));
                 }
-                let cast_args = fd.params.iter().zip(args).map(|(p, a)| {
-                    IrExpr::TypeCast(Box::new(super::IrTypeCast {
-                        expr: a,
-                        pg_type: p.pg_type.clone(),
-                    tuple_shape: None, }))
-                }).collect();
+                let cast_args = fd
+                    .params
+                    .iter()
+                    .zip(args)
+                    .map(|(p, a)| {
+                        IrExpr::TypeCast(Box::new(super::IrTypeCast {
+                            expr: a,
+                            pg_type: p.pg_type.clone(),
+                            tuple_shape: None,
+                        }))
+                    })
+                    .collect();
                 return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
                     schema: Some(fd.module.clone()),
                     name: fd.name.clone(),
@@ -6592,9 +7205,7 @@ impl<'a> Compiler<'a> {
                 }));
             }
             let qualified = format!("{}::{}", effective_module, name);
-            return Err(self.type_err(&format!(
-                "function '{qualified}' does not exist"
-            )));
+            return Err(self.type_err(&format!("function '{qualified}' does not exist")));
         };
 
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
@@ -6616,19 +7227,25 @@ impl<'a> Compiler<'a> {
     fn compile_range_intrinsic(&self, intrinsic: &str, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
         match intrinsic {
             "range" => {
-                let point_ty = args.first().and_then(infer_ir_type).ok_or_else(|| self.type_err(
-                    "range(): cannot infer the element type of the first argument — \
-                     use an explicit cast, e.g. range(<int64>$lower, <int64>$upper)"
-                ))?;
-                let ctor = range_ctor_for_pg_type(point_ty).ok_or_else(|| self.type_err(&format!(
-                    "range(): unsupported element type '{point_ty}' — PostgreSQL only has native \
+                let point_ty = args.first().and_then(infer_ir_type).ok_or_else(|| {
+                    self.type_err(
+                        "range(): cannot infer the element type of the first argument — \
+                     use an explicit cast, e.g. range(<int64>$lower, <int64>$upper)",
+                    )
+                })?;
+                let ctor = range_ctor_for_pg_type(point_ty).ok_or_else(|| {
+                    self.type_err(&format!(
+                        "range(): unsupported element type '{point_ty}' — PostgreSQL only has native \
                      ranges over int64, decimal, datetime, cal::local_datetime, and cal::local_date"
-                )))?;
+                    ))
+                })?;
                 let sql_template = match args.len() {
-                    1 => return Err(self.type_err(
-                        "range(empty) has no inferable element type in this context — not \
-                         currently supported; use range(lower, upper) instead"
-                    )),
+                    1 => {
+                        return Err(self.type_err(
+                            "range(empty) has no inferable element type in this context — not \
+                         currently supported; use range(lower, upper) instead",
+                        ));
+                    }
                     2 => format!("{ctor}($1, $2)"),
                     4 => format!(
                         "{ctor}($1, $2, \
@@ -6642,28 +7259,39 @@ impl<'a> Compiler<'a> {
                 // goes through `sql_template` above, so this doesn't change
                 // the SQL text.
                 Ok(IrExpr::FunctionCall(super::IrFunctionCall {
-                    schema: None, name: ctor.to_string(), args, sql_template: Some(sql_template),
+                    schema: None,
+                    name: ctor.to_string(),
+                    args,
+                    sql_template: Some(sql_template),
                 }))
             }
             "multirange" => {
                 let Some(IrExpr::Array(elems)) = args.first() else {
                     return Err(self.type_err("multirange(): argument must be an array literal of ranges"));
                 };
-                let first_ctor = elems.first().and_then(|e| match e {
-                    IrExpr::FunctionCall(fc) => Some(fc.name.as_str()),
-                    _ => None,
-                }).ok_or_else(|| self.type_err(
-                    "multirange(): cannot infer the element range type from an empty or non-range \
-                     array — pass at least one range(...) call, e.g. multirange([range(1, 3)])"
-                ))?;
-                let ctor = multirange_ctor_for_range_ctor(first_ctor).ok_or_else(|| self.type_err(&format!(
-                    "multirange(): unrecognized range constructor '{first_ctor}'"
-                )))?;
+                let first_ctor = elems
+                    .first()
+                    .and_then(|e| match e {
+                        IrExpr::FunctionCall(fc) => Some(fc.name.as_str()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        self.type_err(
+                            "multirange(): cannot infer the element range type from an empty or non-range \
+                     array — pass at least one range(...) call, e.g. multirange([range(1, 3)])",
+                        )
+                    })?;
+                let ctor = multirange_ctor_for_range_ctor(first_ctor).ok_or_else(|| {
+                    self.type_err(&format!("multirange(): unrecognized range constructor '{first_ctor}'"))
+                })?;
                 // PostgreSQL's multirange constructors (int8multirange, etc.)
                 // are VARIADIC — they don't accept a plain array argument
                 // without the VARIADIC keyword.
                 Ok(IrExpr::FunctionCall(super::IrFunctionCall {
-                    schema: None, name: name.to_string(), args, sql_template: Some(format!("{ctor}(VARIADIC $1)")),
+                    schema: None,
+                    name: name.to_string(),
+                    args,
+                    sql_template: Some(format!("{ctor}(VARIADIC $1)")),
                 }))
             }
             other => Err(self.type_err(&format!("internal error: unhandled TranspilerIntrinsic '{other}'"))),
@@ -6720,9 +7348,12 @@ impl<'a> Compiler<'a> {
     fn resolve_sequence_scalar_arg(&self, fc: &ast::FunctionCall) -> Result<(String, String), PyQLError> {
         use crate::parse::ast::{Expr, Path, PathStep};
 
-        let arg = fc.args.first().ok_or_else(|| self.type_err(
-            &format!("{}() requires a sequence scalar type as its first argument", fc.name)
-        ))?;
+        let arg = fc.args.first().ok_or_else(|| {
+            self.type_err(&format!(
+                "{}() requires a sequence scalar type as its first argument",
+                fc.name
+            ))
+        })?;
 
         // The parser encodes `module::Name` as a single PathStep::Name("module::Name"),
         // so we split on "::" here to recover the module part.
@@ -6747,9 +7378,7 @@ impl<'a> Compiler<'a> {
         };
 
         let scalar = self.schema.scalars.iter().find(|s| {
-            s.is_sequence
-                && s.name == arg_name
-                && arg_module.map(|m| m == s.module.as_str()).unwrap_or(true)
+            s.is_sequence && s.name == arg_name && arg_module.map(|m| m == s.module.as_str()).unwrap_or(true)
         });
 
         match scalar {
@@ -6794,23 +7423,31 @@ impl<'a> Compiler<'a> {
         let (channel_module, channel_name): (Option<&str>, &str) = match &fc.args[0] {
             Expr::Path(Path { steps, partial: false }) => match steps.as_slice() {
                 [PathStep::Name(s)] => {
-                    if let Some((m, n)) = s.split_once("::") { (Some(m), n) } else { (None, s.as_str()) }
+                    if let Some((m, n)) = s.split_once("::") {
+                        (Some(m), n)
+                    } else {
+                        (None, s.as_str())
+                    }
                 }
-                _ => return Err(self.type_err(
-                    "notify(): first argument must be a Channel name (e.g. OrderEvents or orders::OrderEvents)"
-                )),
+                _ => {
+                    return Err(self.type_err(
+                        "notify(): first argument must be a Channel name (e.g. OrderEvents or orders::OrderEvents)",
+                    ));
+                }
             },
-            _ => return Err(self.type_err(
-                "notify(): first argument must be a Channel name (e.g. OrderEvents or orders::OrderEvents)"
-            )),
+            _ => {
+                return Err(self.type_err(
+                    "notify(): first argument must be a Channel name (e.g. OrderEvents or orders::OrderEvents)",
+                ));
+            }
         };
         let full_channel_name = match channel_module {
             Some(m) => format!("{m}::{channel_name}"),
             None => channel_name.to_string(),
         };
-        let channel = self.resolve_channel(&full_channel_name).ok_or_else(|| {
-            self.type_err(&format!("notify(): '{channel_name}' is not a known Channel"))
-        })?;
+        let channel = self
+            .resolve_channel(&full_channel_name)
+            .ok_or_else(|| self.type_err(&format!("notify(): '{channel_name}' is not a known Channel")))?;
         let wire_name = channel.wire_name.clone();
         let payload_arg = &fc.args[1];
 
@@ -6827,8 +7464,7 @@ impl<'a> Compiler<'a> {
         // Cloned out of `special_anchors` (rather than borrowed) so it
         // doesn't hold an immutable borrow of `self` across the `&mut self`
         // `compile_expr_ctx` calls below.
-        let anchor_fallback: Option<(&'a TypeDescriptor, String)> =
-            self.special_anchors.values().next().cloned();
+        let anchor_fallback: Option<(&'a TypeDescriptor, String)> = self.special_anchors.values().next().cloned();
         let ctx = ctx.or_else(|| anchor_fallback.as_ref().map(|(td, alias)| (*td, alias.as_str())));
 
         let payload_ir = match &channel.payload {
@@ -6836,15 +7472,19 @@ impl<'a> Compiler<'a> {
                 let anchor_name = match payload_arg {
                     Expr::Path(Path { steps, partial: false }) => match steps.as_slice() {
                         [PathStep::Name(s)] if s == "__new__" || s == "__old__" => s.as_str(),
-                        _ => return Err(self.type_err(&format!(
-                            "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
+                        _ => {
+                            return Err(self.type_err(&format!(
+                                "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
                              must be __new__ or __old__ — only supported inside a trigger handler in this phase"
-                        ))),
+                            )));
+                        }
                     },
-                    _ => return Err(self.type_err(&format!(
-                        "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
+                    _ => {
+                        return Err(self.type_err(&format!(
+                            "notify(): payload for Channel '{full_channel_name}' (a '{qname}' object channel) \
                          must be __new__ or __old__ — only supported inside a trigger handler in this phase"
-                    ))),
+                        )));
+                    }
                 };
                 let (anchor_td, alias) = self.special_anchors.get(anchor_name).cloned().ok_or_else(|| {
                     self.type_err(&format!(
@@ -6857,18 +7497,22 @@ impl<'a> Compiler<'a> {
                         "notify(): Channel '{full_channel_name}' expects a payload of type '{qname}', got '{anchor_qname}'"
                     )));
                 }
-                IrExpr::ColumnRef { alias, column: "id".to_string(), pg_type: "uuid".to_string() }
+                IrExpr::ColumnRef {
+                    alias,
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                }
             }
             crate::schema::ChannelPayload::Scalar(pg_type) => {
                 let ir = self.compile_expr_ctx(payload_arg, ctx)?;
-                if let Some(actual) = infer_ir_type(&ir) {
-                    if !types_compatible(actual, pg_type) {
-                        return Err(self.type_err(&format!(
+                if let Some(actual) = infer_ir_type(&ir)
+                    && !types_compatible(actual, pg_type)
+                {
+                    return Err(self.type_err(&format!(
                             "notify(): Channel '{full_channel_name}' expects a payload of type '{expected}', got '{actual_pyql}'",
                             expected = pg_type_to_pyql(pg_type),
                             actual_pyql = pg_type_to_pyql(actual),
                         )));
-                    }
                 }
                 ir
             }
@@ -6877,7 +7521,11 @@ impl<'a> Compiler<'a> {
                     return Err(self.type_err(&format!(
                         "notify(): payload for Channel '{full_channel_name}' (an Object channel) must be a free \
                          object literal, e.g. {{ {} }}",
-                        declared_fields.iter().map(|(n, _)| format!("{n} := ..")).collect::<Vec<_>>().join(", ")
+                        declared_fields
+                            .iter()
+                            .map(|(n, _)| format!("{n} := .."))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )));
                 };
                 if sh.expr.is_some() {
@@ -6887,15 +7535,18 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 let ir = self.compile_expr_ctx(payload_arg, ctx)?;
-                let IrExpr::NamedTuple { fields, is_free_object: true } = &ir else {
+                let IrExpr::NamedTuple {
+                    fields,
+                    is_free_object: true,
+                } = &ir
+                else {
                     return Err(self.type_err(&format!(
                         "notify(): payload for Channel '{full_channel_name}' (an Object channel) must be a free object literal"
                     )));
                 };
                 let declared_names: std::collections::HashSet<&str> =
                     declared_fields.iter().map(|(n, _)| n.as_str()).collect();
-                let actual_names: std::collections::HashSet<&str> =
-                    fields.iter().map(|(n, _)| n.as_str()).collect();
+                let actual_names: std::collections::HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
                 if declared_names != actual_names {
                     let mut expected: Vec<&str> = declared_names.iter().copied().collect();
                     expected.sort();
@@ -6907,28 +7558,31 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 for (name, expr) in fields {
-                    let Some((_, declared_pg_type)) = declared_fields.iter().find(|(n, _)| n == name) else { continue };
-                    if let Some(actual) = infer_ir_type(expr) {
-                        if !types_compatible(actual, declared_pg_type) {
-                            return Err(self.type_err(&format!(
+                    let Some((_, declared_pg_type)) = declared_fields.iter().find(|(n, _)| n == name) else {
+                        continue;
+                    };
+                    if let Some(actual) = infer_ir_type(expr)
+                        && !types_compatible(actual, declared_pg_type)
+                    {
+                        return Err(self.type_err(&format!(
                                 "notify(): field '{name}' of Channel '{full_channel_name}' expects type '{expected}', got '{actual_pyql}'",
                                 expected = pg_type_to_pyql(declared_pg_type),
                                 actual_pyql = pg_type_to_pyql(actual),
                             )));
-                        }
                     }
                 }
                 ir
             }
         };
 
-        if let Expr::Literal(ast::Literal::Str(s)) = payload_arg {
-            if s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES {
-                return Err(self.type_err(&format!(
-                    "notify(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
-                    s.len(), Self::NOTIFY_PAYLOAD_MAX_BYTES
-                )));
-            }
+        if let Expr::Literal(ast::Literal::Str(s)) = payload_arg
+            && s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES
+        {
+            return Err(self.type_err(&format!(
+                "notify(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
+                s.len(),
+                Self::NOTIFY_PAYLOAD_MAX_BYTES
+            )));
         }
 
         let sql = format!("pg_notify('{}', ($1)::text)", wire_name.replace('\'', "''"));
@@ -6954,13 +7608,13 @@ impl<'a> Compiler<'a> {
         let channel_ir = self.compile_expr_ctx(&fc.args[0], ctx)?;
         let payload_ir = self.compile_expr_ctx(&fc.args[1], ctx)?;
 
-        if let ast::Expr::Literal(ast::Literal::Str(s)) = &fc.args[1] {
-            if s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES {
-                return Err(self.type_err(&format!(
+        if let ast::Expr::Literal(ast::Literal::Str(s)) = &fc.args[1]
+            && s.len() >= Self::NOTIFY_PAYLOAD_MAX_BYTES
+        {
+            return Err(self.type_err(&format!(
                     "notify_raw(): payload literal is {} bytes, which is at or over PostgreSQL's {}-byte NOTIFY payload limit",
                     s.len(), Self::NOTIFY_PAYLOAD_MAX_BYTES
                 )));
-            }
         }
 
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
@@ -6996,7 +7650,10 @@ impl<'a> Compiler<'a> {
         if fd.params.len() != fc.args.len() {
             return Err(self.type_err(&format!(
                 "function '{}::{}' expects {} argument(s), got {}",
-                fd.module, fd.name, fd.params.len(), fc.args.len()
+                fd.module,
+                fd.name,
+                fd.params.len(),
+                fc.args.len()
             )));
         }
 
@@ -7005,7 +7662,9 @@ impl<'a> Compiler<'a> {
         let return_type_name = fd.return_pg_type.clone(); // qualified type name for object returns
         let polymorphic = fd.return_is_polymorphic;
 
-        let fn_args = fc.args.iter()
+        let fn_args = fc
+            .args
+            .iter()
             .map(|a| self.compile_free_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -7051,17 +7710,27 @@ impl<'a> Compiler<'a> {
     /// builders (write path) so a DML-as-CTE fan-out (sql/mod.rs) can expose
     /// the same columns a polymorphic select would.
     fn poly_dml_columns(td: &TypeDescriptor) -> Vec<String> {
-        td.properties.iter().map(|p| p.name.clone())
-            .chain(td.links.iter().filter(|l| !l.is_junction_backed()).map(|l| format!("{}_id", l.name)))
+        td.properties
+            .iter()
+            .map(|p| p.name.clone())
+            .chain(
+                td.links
+                    .iter()
+                    .filter(|l| !l.is_junction_backed())
+                    .map(|l| format!("{}_id", l.name)),
+            )
             .collect()
     }
 
     /// Collect poly_implementors and poly_columns for a polymorphic return type.
     fn collect_poly_info(&self, type_name: &str) -> (Vec<IrPolyImplementor>, Vec<String>) {
         let implementors = self.find_poly_implementors(type_name);
-        let columns = if let Some(td) = self.schema.types.iter().find(|t| {
-            format!("{}::{}", t.module, t.name) == type_name
-        }) {
+        let columns = if let Some(td) = self
+            .schema
+            .types
+            .iter()
+            .find(|t| format!("{}::{}", t.module, t.name) == type_name)
+        {
             td.properties.iter().map(|p| p.name.clone()).collect()
         } else {
             vec![]
@@ -7090,15 +7759,13 @@ impl<'a> Compiler<'a> {
         }
 
         // Detect text overload: `query :=` kwarg present (no positional second arg needed).
-        let text_query_arg = fc.kwargs.iter()
-            .find(|(k, _)| k == "query")
-            .map(|(_, v)| v);
+        let text_query_arg = fc.kwargs.iter().find(|(k, _)| k == "query").map(|(_, v)| v);
         let is_text_overload = text_query_arg.is_some();
 
         if !is_text_overload && fc.args.len() < 2 {
-            return Err(self.type_err(
-                "vector::search requires either a positional vector argument or `query := $text`"
-            ));
+            return Err(
+                self.type_err("vector::search requires either a positional vector argument or `query := $text`")
+            );
         }
 
         // First argument: a type name or a filtered subquery narrowing the candidate set.
@@ -7142,13 +7809,20 @@ impl<'a> Compiler<'a> {
         };
 
         // Optional named argument: index_name := '…'
-        let index_name: Option<String> = fc.kwargs.iter()
-            .find(|(k, _)| k == "index_name")
-            .and_then(|(_, v)| if let ast::Expr::Literal(ast::Literal::Str(s)) = v { Some(s.clone()) } else { None });
+        let index_name: Option<String> = fc.kwargs.iter().find(|(k, _)| k == "index_name").and_then(|(_, v)| {
+            if let ast::Expr::Literal(ast::Literal::Str(s)) = v {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
 
         // Resolve the type and find the VectorIndex.
         let td = self.resolve_type(&type_qname)?.clone();
-        let vi = td.vector_indexes.iter().find(|vi| vi.index_name.as_deref() == index_name.as_deref())
+        let vi = td
+            .vector_indexes
+            .iter()
+            .find(|vi| vi.index_name.as_deref() == index_name.as_deref())
             .ok_or_else(|| {
                 let key = index_name.as_deref().unwrap_or("<default>");
                 self.type_err(&format!("type '{}' has no vector index '{}'", type_qname, key))
@@ -7156,14 +7830,20 @@ impl<'a> Compiler<'a> {
 
         let vector_col = vi.column_name();
         let distance_op = match vi.metric.as_str() {
-            "euclidean"     => "<->",
+            "euclidean" => "<->",
             "inner_product" => "<#>",
-            _               => "<=>",  // cosine (default)
+            _ => "<=>", // cosine (default)
         };
 
         // Build query expression and inference fields.
-        let (query_expr, inference_query_param_name, inference_query_literal,
-             inference_model, inference_type_name, inference_index_name);
+        let (
+            query_expr,
+            inference_query_param_name,
+            inference_query_literal,
+            inference_model,
+            inference_type_name,
+            inference_index_name,
+        );
 
         if is_text_overload {
             // Text overload: register __deferred_vec__ as the SQL param; Python injects
@@ -7174,11 +7854,13 @@ impl<'a> Compiler<'a> {
             let inner_cast = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: vec_param,
                 pg_type: "float8[]".to_string(),
-            tuple_shape: None, }));
+                tuple_shape: None,
+            }));
             query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: inner_cast,
                 pg_type: "vector".to_string(),
-            tuple_shape: None, }));
+                tuple_shape: None,
+            }));
             let query_arg = text_query_arg.unwrap();
             inference_query_param_name = Some(match query_arg {
                 ast::Expr::Parameter(name) => name.clone(),
@@ -7197,7 +7879,8 @@ impl<'a> Compiler<'a> {
             query_expr = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: raw_query_expr,
                 pg_type: "vector".to_string(),
-            tuple_shape: None, }));
+                tuple_shape: None,
+            }));
             inference_query_param_name = None;
             inference_query_literal = None;
             inference_model = None;
@@ -7225,7 +7908,9 @@ impl<'a> Compiler<'a> {
         // at compile time (distance is always emitted; unknown pointers are an error).
         let mut object_shape: Vec<IrShapePointer> = vec![];
         for el in elements {
-            if el.splat.is_some() { continue; } // ignore splat in outer shape
+            if el.splat.is_some() {
+                continue;
+            } // ignore splat in outer shape
             let pointer_name = match el.path.steps.first() {
                 Some(ast::PathStep::Name(n)) => n.as_str(),
                 _ => continue,
@@ -7278,10 +7963,7 @@ impl<'a> Compiler<'a> {
 
     /// Compile `order by`, `filter`, `offset`, `limit` for a VectorSearch source.
     /// Recognises `.distance` (relative path) as the distance expression.
-    fn compile_vs_modifiers(
-        &mut self,
-        s: &ast::SelectStmt,
-    ) -> Result<(Option<IrExpr>, Option<IrSortDir>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
+    fn compile_vs_modifiers(&mut self, s: &ast::SelectStmt) -> Result<SearchModifiers, PyQLError> {
         let mut order_by_distance: Option<IrSortDir> = None;
         for sort in &s.order_by {
             let is_distance = matches!(&sort.expr,
@@ -7291,7 +7973,7 @@ impl<'a> Compiler<'a> {
             if is_distance {
                 let dir = match sort.direction {
                     ast::SortDirection::Desc => IrSortDir::Desc,
-                    ast::SortDirection::Asc  => IrSortDir::Asc,
+                    ast::SortDirection::Asc => IrSortDir::Asc,
                 };
                 order_by_distance = Some(dir);
             } else {
@@ -7336,7 +8018,8 @@ impl<'a> Compiler<'a> {
         let type_qname = match &fc.args[0] {
             ast::Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
-                    let td = self.resolve_type(n)
+                    let td = self
+                        .resolve_type(n)
                         .map_err(|_| self.type_err(&format!("fts::search: '{}' is not a known type", n)))?;
                     format!("{}::{}", td.module, td.name)
                 } else {
@@ -7347,23 +8030,37 @@ impl<'a> Compiler<'a> {
         };
 
         // Optional named arguments.
-        let index_name: Option<String> = fc.kwargs.iter()
-            .find(|(k, _)| k == "index_name")
-            .and_then(|(_, v)| if let ast::Expr::Literal(ast::Literal::Str(s)) = v { Some(s.clone()) } else { None });
+        let index_name: Option<String> = fc.kwargs.iter().find(|(k, _)| k == "index_name").and_then(|(_, v)| {
+            if let ast::Expr::Literal(ast::Literal::Str(s)) = v {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
 
-        let mode_str = fc.kwargs.iter()
+        let mode_str = fc
+            .kwargs
+            .iter()
             .find(|(k, _)| k == "mode")
-            .and_then(|(_, v)| if let ast::Expr::Literal(ast::Literal::Str(s)) = v { Some(s.as_str()) } else { None })
+            .and_then(|(_, v)| {
+                if let ast::Expr::Literal(ast::Literal::Str(s)) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
             .unwrap_or("BestFields");
 
         let tsquery_fn: &'static str = match mode_str {
             "Phrase" => "phraseto_tsquery",
-            _ => "websearch_to_tsquery",   // BestFields and PhrasePrefix both use websearch
+            _ => "websearch_to_tsquery", // BestFields and PhrasePrefix both use websearch
         };
 
         // Resolve the type and find the SearchIndex.
         let td = self.resolve_type(&type_qname)?.clone();
-        let si = td.search_indexes.iter()
+        let si = td
+            .search_indexes
+            .iter()
             .find(|si| si.index_name.as_deref() == index_name.as_deref())
             .ok_or_else(|| {
                 let key = index_name.as_deref().unwrap_or("<default>");
@@ -7422,7 +8119,9 @@ impl<'a> Compiler<'a> {
         // Compile the object shape from `object { … }` in the outer shape.
         let mut object_shape: Vec<IrShapePointer> = vec![];
         for el in elements {
-            if el.splat.is_some() { continue; }
+            if el.splat.is_some() {
+                continue;
+            }
             let pointer_name = match el.path.steps.first() {
                 Some(ast::PathStep::Name(n)) => n.as_str(),
                 _ => continue,
@@ -7465,10 +8164,7 @@ impl<'a> Compiler<'a> {
 
     /// Compile `order by`, `filter`, `offset`, `limit` for a FtsSearch source.
     /// Recognises `.score` (relative path) as the score expression.
-    fn compile_fts_modifiers(
-        &mut self,
-        s: &ast::SelectStmt,
-    ) -> Result<(Option<IrExpr>, Option<IrSortDir>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
+    fn compile_fts_modifiers(&mut self, s: &ast::SelectStmt) -> Result<SearchModifiers, PyQLError> {
         let mut order_by_rank: Option<IrSortDir> = None;
         for sort in &s.order_by {
             let is_rank = matches!(&sort.expr,
@@ -7478,7 +8174,7 @@ impl<'a> Compiler<'a> {
             if is_rank {
                 let dir = match sort.direction {
                     ast::SortDirection::Desc => IrSortDir::Desc,
-                    ast::SortDirection::Asc  => IrSortDir::Asc,
+                    ast::SortDirection::Asc => IrSortDir::Asc,
                 };
                 order_by_rank = Some(dir);
             } else {
@@ -7512,7 +8208,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn field_err(&self, field: &str, type_name: &str) -> PyQLError {
-        let suggestion = self.schema.types.iter()
+        let suggestion = self
+            .schema
+            .types
+            .iter()
             .find(|t| format!("{}::{}", t.module, t.name) == type_name)
             .and_then(|td| Self::suggest_pointer_name(td, field));
         let message = match suggestion {
@@ -7537,7 +8236,9 @@ impl<'a> Compiler<'a> {
     /// otherwise-dissimilar set of candidates.
     fn suggest_pointer_name(td: &TypeDescriptor, name: &str) -> Option<String> {
         const MIN_SIMILARITY: f64 = 0.7;
-        td.properties.iter().map(|p| p.name.as_str())
+        td.properties
+            .iter()
+            .map(|p| p.name.as_str())
             .chain(td.links.iter().map(|l| l.name.as_str()))
             .chain(td.multilinks.iter().map(|m| m.name.as_str()))
             .chain(td.computed.iter().map(|c| c.name.as_str()))
@@ -7561,7 +8262,8 @@ impl<'a> Compiler<'a> {
                     alias: p.name.clone(),
                     column: p.name.clone(),
                     pg_type: p.pg_type.clone(),
-                tuple_shape: None, })
+                    tuple_shape: None,
+                })
             })
             .collect()
     }
@@ -7571,22 +8273,19 @@ impl<'a> Compiler<'a> {
     /// Compile all active rewrites on `td`'s properties for the given event mask
     /// (1 = INSERT, 2 = UPDATE). Uses `self` so the alias counter and param list
     /// are shared with the surrounding statement.
-    fn compile_rewrites(
-        &mut self,
-        td: &TypeDescriptor,
-        alias: &str,
-        on_mask: u8,
-    ) -> Result<Vec<IrRewrite>, PyQLError> {
+    fn compile_rewrites(&mut self, td: &TypeDescriptor, alias: &str, on_mask: u8) -> Result<Vec<IrRewrite>, PyQLError> {
         let mut out = Vec::new();
         for prop in &td.properties {
             for rw in &prop.rewrites {
                 if rw.on & on_mask == 0 {
                     continue;
                 }
-                let expr_ast = crate::parse::parse_expr(&rw.handler)
-                    .map_err(PyQLError::Syntax)?;
+                let expr_ast = crate::parse::parse_expr(&rw.handler).map_err(PyQLError::Syntax)?;
                 let ir_expr = self.compile_expr(&expr_ast, td, alias)?;
-                out.push(IrRewrite { column: prop.name.clone(), expr: ir_expr });
+                out.push(IrRewrite {
+                    column: prop.name.clone(),
+                    expr: ir_expr,
+                });
             }
         }
         Ok(out)
@@ -7662,9 +8361,7 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
             "box2d" => Ok("box2d".to_string()),
             "box3d" => Ok("box3d".to_string()),
             other => Err(PyQLError::Type(PyQLTypeError {
-                message: format!(
-                    "unknown postgis type '{other}'; valid types are: geometry, geography, box2d, box3d"
-                ),
+                message: format!("unknown postgis type '{other}'; valid types are: geometry, geography, box2d, box3d"),
                 position: Position { line: 0, col: 0 },
             })),
         };
@@ -7674,17 +8371,19 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
     if module == Some("cal") {
         let pg = match bare_name {
             "local_datetime" => "timestamp",
-            "local_date"     => "date",
-            "local_time"     => "time",
+            "local_date" => "date",
+            "local_time" => "time",
             "relative_duration" | "date_duration" => "interval",
-            other => return Err(PyQLError::Type(PyQLTypeError {
-                message: format!(
-                    "unknown cal type '{other}'; \
+            other => {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: format!(
+                        "unknown cal type '{other}'; \
                      valid types are: local_datetime, local_date, local_time, \
                      relative_duration, date_duration"
-                ),
-                position: Position { line: 0, col: 0 },
-            })),
+                    ),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
         };
         return Ok(pg.to_string());
     }
@@ -7695,7 +8394,7 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
             return Err(PyQLError::Type(PyQLTypeError {
                 message: format!("unknown type '{}::{}'", m, bare_name),
                 position: Position { line: 0, col: 0 },
-            }))
+            }));
         }
     };
     Ok(match name {
@@ -7717,10 +8416,12 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
         "date" => "date",
         "time" => "time",
         "duration" => "interval",
-        other => return Err(PyQLError::Type(PyQLTypeError {
-            message: format!("unknown type '{other}'"),
-            position: Position { line: 0, col: 0 },
-        })),
+        other => {
+            return Err(PyQLError::Type(PyQLTypeError {
+                message: format!("unknown type '{other}'"),
+                position: Position { line: 0, col: 0 },
+            }));
+        }
     }
     .to_string())
 }
@@ -7748,10 +8449,10 @@ fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
         PT::Str => infer_ir_type(expr) == Some("text"),
         PT::Bool => infer_ir_type(expr) == Some("boolean"),
         PT::Uuid => infer_ir_type(expr) == Some("uuid"),
-        PT::Int16 | PT::Int32 | PT::Int64 | PT::BigInt =>
-            matches!(infer_ir_type(expr), Some(t) if INT_TYPES.contains(&t)),
-        PT::Float32 | PT::Float64 =>
-            matches!(infer_ir_type(expr), Some(t) if FLOAT_TYPES.contains(&t)),
+        PT::Int16 | PT::Int32 | PT::Int64 | PT::BigInt => {
+            matches!(infer_ir_type(expr), Some(t) if INT_TYPES.contains(&t))
+        }
+        PT::Float32 | PT::Float64 => matches!(infer_ir_type(expr), Some(t) if FLOAT_TYPES.contains(&t)),
         PT::Range(_) => matches!(infer_ir_type(expr), Some(t) if t.ends_with("range") && !t.starts_with('m')),
         PT::Multirange(_) => matches!(infer_ir_type(expr), Some(t) if t.starts_with("multi")),
         // For unrecognised / complex types, allow (don't reject).
@@ -7903,10 +8604,14 @@ fn datetime_arithmetic_compatible(op: &ast::BinOpKind, a: &str, b: &str) -> bool
     }
     matches!(
         (a, b),
-        ("timestamptz", "interval") | ("interval", "timestamptz")
-            | ("timestamp", "interval") | ("interval", "timestamp")
-            | ("date", "interval") | ("interval", "date")
-            | ("time", "interval") | ("interval", "time")
+        ("timestamptz", "interval")
+            | ("interval", "timestamptz")
+            | ("timestamp", "interval")
+            | ("interval", "timestamp")
+            | ("date", "interval")
+            | ("interval", "date")
+            | ("time", "interval")
+            | ("interval", "time")
     )
 }
 
@@ -7914,12 +8619,9 @@ fn datetime_arithmetic_compatible(op: &ast::BinOpKind, a: &str, b: &str) -> bool
 /// search index on a type — `Postgres`-backed indexes are excluded since
 /// they're maintained synchronously by a trigger-updated tsvector column,
 /// not an async outbox worker.
-fn collect_search_enqueue(
-    td: &TypeDescriptor,
-    type_name: &str,
-    operation: &'static str,
-) -> Vec<SearchEnqueueInfo> {
-    td.search_indexes.iter()
+fn collect_search_enqueue(td: &TypeDescriptor, type_name: &str, operation: &'static str) -> Vec<SearchEnqueueInfo> {
+    td.search_indexes
+        .iter()
         .filter(|si| si.backend == SearchBackend::OpenSearch || si.backend == SearchBackend::Meilisearch)
         .map(|si| SearchEnqueueInfo {
             type_name: type_name.to_string(),
@@ -7945,24 +8647,24 @@ fn collect_search_enqueue(
 pub fn pg_type_to_pyql(pg: &str) -> &str {
     match pg {
         "text" | "varchar" => "std::str",
-        "uuid"             => "std::uuid",
-        "int2"             => "std::int16",
-        "int4"             => "std::int32",
-        "int8"             => "std::int64",
-        "float4"           => "std::float32",
-        "float8"           => "std::float64",
-        "boolean"          => "std::bool",
-        "numeric"          => "std::decimal",
-        "timestamptz"      => "std::datetime",
-        "timestamp"        => "cal::local_datetime",
-        "date"             => "cal::local_date",
-        "time"             => "cal::local_time",
-        "interval"         => "std::duration",
-        "bytea"            => "std::bytes",
-        "jsonb"            => "std::json",
-        "__int_literal"    => "std::int64",
-        "__float_literal"  => "std::float64",
-        other              => other,
+        "uuid" => "std::uuid",
+        "int2" => "std::int16",
+        "int4" => "std::int32",
+        "int8" => "std::int64",
+        "float4" => "std::float32",
+        "float8" => "std::float64",
+        "boolean" => "std::bool",
+        "numeric" => "std::decimal",
+        "timestamptz" => "std::datetime",
+        "timestamp" => "cal::local_datetime",
+        "date" => "cal::local_date",
+        "time" => "cal::local_time",
+        "interval" => "std::duration",
+        "bytea" => "std::bytes",
+        "jsonb" => "std::json",
+        "__int_literal" => "std::int64",
+        "__float_literal" => "std::float64",
+        other => other,
     }
 }
 
@@ -7973,10 +8675,7 @@ pub fn pg_type_to_pyql(pg: &str) -> &str {
 /// `FunctionCall(lower, [ColumnRef("name")])`. If `name := $1` in the INSERT,
 /// substituting produces `FunctionCall(lower, [Param(0)])`, which is valid in a
 /// VALUES clause.
-pub(super) fn substitute_col_refs(
-    expr: IrExpr,
-    bindings: &HashMap<String, IrExpr>,
-) -> IrExpr {
+pub(super) fn substitute_col_refs(expr: IrExpr, bindings: &HashMap<String, IrExpr>) -> IrExpr {
     match expr {
         IrExpr::ColumnRef { ref column, .. } => {
             if let Some(replacement) = bindings.get(column) {
@@ -8003,21 +8702,21 @@ pub(super) fn substitute_col_refs(
         IrExpr::TypeCast(c) => IrExpr::TypeCast(Box::new(IrTypeCast {
             expr: substitute_col_refs(c.expr, bindings),
             pg_type: c.pg_type,
-        tuple_shape: None, })),
+            tuple_shape: None,
+        })),
         IrExpr::IfElse(ie) => IrExpr::IfElse(Box::new(IrIfElse {
             condition: substitute_col_refs(ie.condition, bindings),
             if_: substitute_col_refs(ie.if_, bindings),
             else_: substitute_col_refs(ie.else_, bindings),
         })),
-        IrExpr::Array(elems) => {
-            IrExpr::Array(elems.into_iter().map(|e| substitute_col_refs(e, bindings)).collect())
-        }
-        IrExpr::NamedTuple { fields, is_free_object } => {
-            IrExpr::NamedTuple {
-                fields: fields.into_iter().map(|(k, v)| (k, substitute_col_refs(v, bindings))).collect(),
-                is_free_object,
-            }
-        }
+        IrExpr::Array(elems) => IrExpr::Array(elems.into_iter().map(|e| substitute_col_refs(e, bindings)).collect()),
+        IrExpr::NamedTuple { fields, is_free_object } => IrExpr::NamedTuple {
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k, substitute_col_refs(v, bindings)))
+                .collect(),
+            is_free_object,
+        },
         // Literals, Params, Subqueries — no column refs to substitute
         other => other,
     }

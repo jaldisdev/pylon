@@ -148,38 +148,67 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
     let type_map: HashMap<String, (&str, &str)> = schema
         .types
         .iter()
-        .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
+        .map(|t| {
+            (
+                format!("{}::{}", t.module, t.name),
+                (t.module.as_str(), t.table.as_str()),
+            )
+        })
         .collect();
 
     // Collect all module names that contribute a Postgres schema.
     let mut schema_set: BTreeSet<String> = BTreeSet::new();
-    for t in &schema.types  { schema_set.insert(t.module.clone()); }
-    for e in &schema.enums  { schema_set.insert(e.module.clone()); }
-    for s in &schema.scalars { schema_set.insert(s.module.clone()); }
+    for t in &schema.types {
+        schema_set.insert(t.module.clone());
+    }
+    for e in &schema.enums {
+        schema_set.insert(e.module.clone());
+    }
+    for s in &schema.scalars {
+        schema_set.insert(s.module.clone());
+    }
 
     let schemas: Vec<String> = schema_set.into_iter().collect();
 
     // Enums
-    let enums: Vec<DbEnum> = schema.enums.iter()
-        .map(|e| DbEnum { schema: e.module.clone(), name: e.name.clone(), members: e.members.clone() })
+    let enums: Vec<DbEnum> = schema
+        .enums
+        .iter()
+        .map(|e| DbEnum {
+            schema: e.module.clone(),
+            name: e.name.clone(),
+            members: e.members.clone(),
+        })
         .collect();
 
     // Domains (custom scalars)
-    let domains: Vec<DbDomain> = schema.scalars.iter()
-        .map(|s| DbDomain { schema: s.module.clone(), name: s.name.clone() })
+    let domains: Vec<DbDomain> = schema
+        .scalars
+        .iter()
+        .map(|s| DbDomain {
+            schema: s.module.clone(),
+            name: s.name.clone(),
+        })
         .collect();
 
     // Sequences (sequence scalars only)
-    let sequences: Vec<DbSequence> = schema.scalars.iter()
+    let sequences: Vec<DbSequence> = schema
+        .scalars
+        .iter()
         .filter(|s| s.is_sequence)
-        .map(|s| DbSequence { schema: s.module.clone(), name: format!("{}_seq", s.name) })
+        .map(|s| DbSequence {
+            schema: s.module.clone(),
+            name: format!("{}_seq", s.name),
+        })
         .collect();
 
     let expected_trigger_names = expected_triggers(schema, &type_map);
     let mut tables: Vec<DbTable> = Vec::new();
 
     for td in &schema.types {
-        if td.abstract_ || td.junction { continue; }
+        if td.abstract_ || td.junction {
+            continue;
+        }
 
         // Columns: properties + link FK stubs + vector/search generated columns
         let mut columns: Vec<DbColumn> = Vec::new();
@@ -196,7 +225,9 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             // A junction-backed link has no `{name}_id` column — it's
             // stored via a junction table instead (below), same as a
             // multi-link.
-            if l.is_junction_backed() { continue; }
+            if l.is_junction_backed() {
+                continue;
+            }
             columns.push(DbColumn {
                 name: format!("{}_id", l.name),
                 pg_type: "uuid".to_string(),
@@ -220,7 +251,9 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         }
         // Generated columns for search indexes (tsvector)
         for si in &td.search_indexes {
-            if si.backend != SearchBackend::Postgres { continue; }
+            if si.backend != SearchBackend::Postgres {
+                continue;
+            }
             let col = si.column_name();
             if !columns.iter().any(|c| c.name == col) {
                 columns.push(DbColumn {
@@ -236,7 +269,9 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         // FK constraints: one per single link
         let mut foreign_keys: Vec<DbForeignKey> = Vec::new();
         for l in &td.links {
-            if l.is_junction_backed() { continue; }
+            if l.is_junction_backed() {
+                continue;
+            }
             let cname = format!("{}_{}_fkey", td.table, l.name);
             if let Some((tgt_schema, tgt_table)) = type_map.get(&l.target) {
                 foreign_keys.push(DbForeignKey {
@@ -276,7 +311,11 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             if let TypeConstraint::Exclusive { pointers: fields, .. } = constraint {
                 // Postgres auto-names these; mirror the convention.
                 let idx_name = format!("{}_{}_{}_key", td.table, fields.join("_"), i);
-                indexes.push(DbIndex { name: idx_name, is_unique: true, method: "btree".to_string() });
+                indexes.push(DbIndex {
+                    name: idx_name,
+                    is_unique: true,
+                    method: "btree".to_string(),
+                });
             }
         }
         // Plain indexes (Postgres auto-names these too).
@@ -286,7 +325,11 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             } else {
                 format!("{}__{}_idx", td.table, idx.pointers.join("_"))
             };
-            indexes.push(DbIndex { name, is_unique: idx.unique, method: "btree".to_string() });
+            indexes.push(DbIndex {
+                name,
+                is_unique: idx.unique,
+                method: "btree".to_string(),
+            });
         }
         // Vector HNSW indexes
         for vi in &td.vector_indexes {
@@ -294,29 +337,43 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 None => format!("{}__vector__", td.table),
                 Some(n) => format!("{}__vector_{}__", td.table, n),
             };
-            indexes.push(DbIndex { name: idx_name, is_unique: false, method: "hnsw".to_string() });
+            indexes.push(DbIndex {
+                name: idx_name,
+                is_unique: false,
+                method: "hnsw".to_string(),
+            });
         }
         // Search GIN indexes
         for si in &td.search_indexes {
-            if si.backend != SearchBackend::Postgres { continue; }
+            if si.backend != SearchBackend::Postgres {
+                continue;
+            }
             let idx_name = match &si.index_name {
                 None => format!("{}__search__", td.table),
                 Some(n) => format!("{}__search_{}__", td.table, n),
             };
-            indexes.push(DbIndex { name: idx_name, is_unique: false, method: "gin".to_string() });
+            indexes.push(DbIndex {
+                name: idx_name,
+                is_unique: false,
+                method: "gin".to_string(),
+            });
         }
 
         // CHECK constraints — names are hash-based in the real schema; approximate here.
         let mut checks: Vec<DbCheck> = Vec::new();
         for p in &td.properties {
             for (i, _) in p.check_constraints.iter().enumerate() {
-                checks.push(DbCheck { constraint_name: format!("{}_{}_check_{}", td.table, p.name, i) });
+                checks.push(DbCheck {
+                    constraint_name: format!("{}_{}_check_{}", td.table, p.name, i),
+                });
             }
         }
         for (i, constraint) in td.constraints.iter().enumerate() {
             use crate::schema::TypeConstraint;
             if let TypeConstraint::Expression { .. } = constraint {
-                checks.push(DbCheck { constraint_name: format!("{}_expr_check_{}", td.table, i) });
+                checks.push(DbCheck {
+                    constraint_name: format!("{}_expr_check_{}", td.table, i),
+                });
             }
         }
 
@@ -339,7 +396,13 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         // Junction tables for multi-links
         for ml in &td.multilinks {
             tables.push(build_junction_db_table(
-                schema, &type_map, td, &ml.name, &ml.target, ml.through.as_deref(), &expected_trigger_names,
+                schema,
+                &type_map,
+                td,
+                &ml.name,
+                &ml.target,
+                ml.through.as_deref(),
+                &expected_trigger_names,
             ));
         }
         // Junction tables for junction-backed single links — same shape
@@ -349,9 +412,17 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         // multi-link's own inline `PRIMARY KEY (source, target)` isn't
         // tracked as an index here either).
         for l in &td.links {
-            if !l.is_junction_backed() { continue; }
+            if !l.is_junction_backed() {
+                continue;
+            }
             tables.push(build_junction_db_table(
-                schema, &type_map, td, &l.name, &l.target, l.through.as_deref(), &expected_trigger_names,
+                schema,
+                &type_map,
+                td,
+                &l.name,
+                &l.target,
+                l.through.as_deref(),
+                &expected_trigger_names,
             ));
         }
     }
@@ -359,19 +430,36 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
     // Views (interface types)
     let views: Vec<DbView> = crate::export::interface_view_ddl_with_names(schema)
         .into_iter()
-        .map(|(module, name, ddl)| DbView { schema: module, name, body_hash: ddl_hash(&ddl) })
+        .map(|(module, name, ddl)| DbView {
+            schema: module,
+            name,
+            body_hash: ddl_hash(&ddl),
+        })
         .collect();
 
     // User-defined functions
     let functions: Vec<DbFunction> = crate::export::function_ddl_with_names(schema)
         .unwrap_or_default()
         .into_iter()
-        .map(|(module, name, ddl)| DbFunction { schema: module, name, body_hash: ddl_hash(&ddl) })
+        .map(|(module, name, ddl)| DbFunction {
+            schema: module,
+            name,
+            body_hash: ddl_hash(&ddl),
+        })
         .collect();
 
     let extensions: Vec<String> = required_extensions(schema).iter().map(|s| s.to_string()).collect();
 
-    DbState { schemas, tables, enums, domains, sequences, views, functions, extensions }
+    DbState {
+        schemas,
+        tables,
+        enums,
+        domains,
+        sequences,
+        views,
+        functions,
+        extensions,
+    }
 }
 
 /// Postgres extensions `target` needs in order for its own DDL to apply
@@ -418,26 +506,41 @@ fn build_junction_db_table(
 ) -> DbTable {
     let jt_name = format!("{}.{}", td.table, name);
     let mut jt_columns = vec![
-        DbColumn { name: "source".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
-        DbColumn { name: "target".to_string(), pg_type: "uuid".to_string(), nullable: false, is_generated: false, column_default: None },
+        DbColumn {
+            name: "source".to_string(),
+            pg_type: "uuid".to_string(),
+            nullable: false,
+            is_generated: false,
+            column_default: None,
+        },
+        DbColumn {
+            name: "target".to_string(),
+            pg_type: "uuid".to_string(),
+            nullable: false,
+            is_generated: false,
+            column_default: None,
+        },
     ];
 
     // Extra columns from the through junction type
-    if let Some(through_qname) = through {
-        if let Some(through_td) = schema.types.iter().find(|t| {
-            format!("{}::{}", t.module, t.name) == *through_qname && t.junction
-        }) {
-            for p in &through_td.properties {
-                if p.name == "id" { continue; }
-                let pg_type = col_type_str(p).to_string();
-                jt_columns.push(DbColumn {
-                    name: p.name.clone(),
-                    pg_type,
-                    nullable: p.nullable,
-                    is_generated: false,
-                    column_default: p.default_sql.clone(),
-                });
+    if let Some(through_qname) = through
+        && let Some(through_td) = schema
+            .types
+            .iter()
+            .find(|t| format!("{}::{}", t.module, t.name) == *through_qname && t.junction)
+    {
+        for p in &through_td.properties {
+            if p.name == "id" {
+                continue;
             }
+            let pg_type = col_type_str(p).to_string();
+            jt_columns.push(DbColumn {
+                name: p.name.clone(),
+                pg_type,
+                nullable: p.nullable,
+                is_generated: false,
+                column_default: p.default_sql.clone(),
+            });
         }
     }
 
@@ -525,15 +628,21 @@ pub fn expected_triggers(
     let mut expected: HashMap<(String, String), HashSet<String>> = HashMap::new();
 
     for info in crate::export::interface_exclusive_trigger_infos(schema) {
-        expected.entry((info.impl_module.clone(), info.impl_table.clone())).or_default()
+        expected
+            .entry((info.impl_module.clone(), info.impl_table.clone()))
+            .or_default()
             .extend([info.ins_trigger_name, info.upd_trigger_name]);
     }
     for info in crate::export::deletion_policy_trigger_infos(schema, type_map) {
-        expected.entry((info.table_module.clone(), info.table_name.clone())).or_default()
+        expected
+            .entry((info.table_module.clone(), info.table_name.clone()))
+            .or_default()
             .insert(info.trigger_name);
     }
     for info in crate::export::signal_trigger_infos(schema) {
-        expected.entry((info.table_module.clone(), info.table_name.clone())).or_default()
+        expected
+            .entry((info.table_module.clone(), info.table_name.clone()))
+            .or_default()
             .insert(info.trigger_name);
     }
     for (module, table, name) in crate::export::user_trigger_names(schema) {
@@ -546,25 +655,31 @@ pub fn expected_triggers(
     // see the cache layer plan's design decision).
     let mut cache_trigger_tables: HashSet<(String, String)> = HashSet::new();
     for td in &schema.types {
-        if td.abstract_ { continue; }
+        if td.abstract_ {
+            continue;
+        }
         cache_trigger_tables.insert((td.module.clone(), td.table.clone()));
         if !td.junction {
             for ml in &td.multilinks {
                 cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
             }
             for l in &td.links {
-                if !l.is_junction_backed() { continue; }
+                if !l.is_junction_backed() {
+                    continue;
+                }
                 cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
             }
         }
     }
     for key in cache_trigger_tables {
-        expected.entry(key).or_default().insert("pylon_cache_invalidate".to_string());
+        expected
+            .entry(key)
+            .or_default()
+            .insert("pylon_cache_invalidate".to_string());
     }
 
     expected
 }
-
 
 // ── Rename candidates ─────────────────────────────────────────────────────────
 
@@ -701,7 +816,10 @@ impl MigrationStep {
                     let value = overrides.get(&input.placeholder).unwrap_or(&input.default_expr);
                     sql = sql.replace(&format!("\\({})", input.placeholder), value);
                 }
-                DiffOp { sql, non_transactional: op.non_transactional }
+                DiffOp {
+                    sql,
+                    non_transactional: op.non_transactional,
+                }
             })
             .collect()
     }
@@ -803,7 +921,14 @@ impl StepBuilder {
             .map(|key| {
                 let (verb, object_desc, ddl, required_input) = drafts.remove(&key).unwrap();
                 let prompt = format!("did you {} {}?", verb.as_str(), object_desc);
-                MigrationStep { prompt, verb, object_desc, ddl, op_key: key, required_input }
+                MigrationStep {
+                    prompt,
+                    verb,
+                    object_desc,
+                    ddl,
+                    op_key: key,
+                    required_input,
+                }
             })
             .collect()
     }
@@ -923,19 +1048,31 @@ pub fn diff_states(before: &DbState, after: &DbState) -> Vec<DiffOp> {
 /// `current`, where the column-set Jaccard similarity meets a threshold.
 /// Candidates already rejected once (`guidance.banned_type_renames`) are
 /// never proposed again — a re-diff after "no" should offer something else.
-pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState, guidance: &Guidance) -> Vec<TypeRenameCandidate> {
-    let target_keys: HashSet<(&str, &str)> = target.types.iter()
+pub fn detect_type_renames(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    guidance: &Guidance,
+) -> Vec<TypeRenameCandidate> {
+    let target_keys: HashSet<(&str, &str)> = target
+        .types
+        .iter()
         .filter(|t| !t.abstract_ && !t.junction)
         .map(|t| (t.module.as_str(), t.table.as_str()))
         .collect();
-    let current_keys: HashSet<(&str, &str)> = current.tables.iter()
+    let current_keys: HashSet<(&str, &str)> = current
+        .tables
+        .iter()
         .map(|t| (t.schema.as_str(), t.name.as_str()))
         .collect();
 
-    let dropped: Vec<&DbTable> = current.tables.iter()
+    let dropped: Vec<&DbTable> = current
+        .tables
+        .iter()
         .filter(|t| !target_keys.contains(&(t.schema.as_str(), t.name.as_str())))
         .collect();
-    let created: Vec<&TypeDescriptor> = target.types.iter()
+    let created: Vec<&TypeDescriptor> = target
+        .types
+        .iter()
         .filter(|t| !t.abstract_ && !t.junction)
         .filter(|t| !current_keys.contains(&(t.module.as_str(), t.table.as_str())))
         .collect();
@@ -946,21 +1083,25 @@ pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState, guidanc
 
     let mut candidates: Vec<TypeRenameCandidate> = Vec::new();
     for dropped_t in &dropped {
-        let old_cols: HashSet<&str> = dropped_t.columns.iter()
+        let old_cols: HashSet<&str> = dropped_t
+            .columns
+            .iter()
             .map(|c| c.name.as_str())
             .filter(|n| !n.starts_with("__"))
             .collect();
         for new_type in &created {
-            let new_cols: HashSet<&str> = new_type.properties.iter()
-                .map(|p| p.name.as_str())
-                .collect();
+            let new_cols: HashSet<&str> = new_type.properties.iter().map(|p| p.name.as_str()).collect();
             let intersection = old_cols.intersection(&new_cols).count();
             let union_size = old_cols.union(&new_cols).count();
-            if union_size == 0 { continue; }
+            if union_size == 0 {
+                continue;
+            }
             let confidence = intersection as f64 / union_size as f64;
             let banned = guidance.banned_type_renames.contains(&(
-                dropped_t.schema.clone(), dropped_t.name.clone(),
-                new_type.module.clone(), new_type.table.clone(),
+                dropped_t.schema.clone(),
+                dropped_t.name.clone(),
+                new_type.module.clone(),
+                new_type.table.clone(),
             ));
             if confidence >= 0.4 && !banned {
                 candidates.push(TypeRenameCandidate {
@@ -974,7 +1115,11 @@ pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState, guidanc
             }
         }
     }
-    candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     candidates
 }
 
@@ -982,40 +1127,63 @@ pub fn detect_type_renames(target: &SchemaDescriptor, current: &DbState, guidanc
 /// and `target`. A candidate is a (dropped_col, added_col) pair in the same
 /// table with the same Postgres type. Candidates already rejected once
 /// (`guidance.banned_col_renames`) are never proposed again.
-pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState, guidance: &Guidance) -> Vec<ColRenameCandidate> {
-    let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
+pub fn detect_col_renames(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    guidance: &Guidance,
+) -> Vec<ColRenameCandidate> {
+    let cur_tables: HashMap<(&str, &str), &DbTable> = current
+        .tables
+        .iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
         .collect();
 
     let mut candidates: Vec<ColRenameCandidate> = Vec::new();
     for td in &target.types {
-        if td.abstract_ || td.junction { continue; }
-        let Some(cur) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) else { continue };
+        if td.abstract_ || td.junction {
+            continue;
+        }
+        let Some(cur) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) else {
+            continue;
+        };
 
         // Target columns as owned Vec to avoid temporary String lifetime issues.
-        let target_cols: Vec<(String, String)> = td.properties.iter()
+        let target_cols: Vec<(String, String)> = td
+            .properties
+            .iter()
             .map(|p| (p.name.clone(), col_type_str(p).to_string()))
-            .chain(td.links.iter().filter(|l| !l.is_junction_backed())
-                .map(|l| (format!("{}_id", l.name), "uuid".to_string())))
+            .chain(
+                td.links
+                    .iter()
+                    .filter(|l| !l.is_junction_backed())
+                    .map(|l| (format!("{}_id", l.name), "uuid".to_string())),
+            )
             .collect();
 
         // Current columns (skip internal __*__ columns).
-        let cur_cols: Vec<(&str, &str)> = cur.columns.iter()
+        let cur_cols: Vec<(&str, &str)> = cur
+            .columns
+            .iter()
             .filter(|c| !c.name.starts_with("__"))
             .map(|c| (c.name.as_str(), c.pg_type.as_str()))
             .collect();
 
         // Dropped: in current but not in target.
-        let dropped: Vec<(&str, &str)> = cur_cols.iter().copied()
+        let dropped: Vec<(&str, &str)> = cur_cols
+            .iter()
+            .copied()
             .filter(|(name, _)| !target_cols.iter().any(|(t, _)| t.as_str() == *name))
             .collect();
         // Added: in target but not in current.
-        let added: Vec<(&str, &str)> = target_cols.iter()
+        let added: Vec<(&str, &str)> = target_cols
+            .iter()
             .filter(|(name, _)| !cur_cols.iter().any(|&(c, _)| c == name.as_str()))
             .map(|(n, t)| (n.as_str(), t.as_str()))
             .collect();
 
-        if dropped.is_empty() || added.is_empty() { continue; }
+        if dropped.is_empty() || added.is_empty() {
+            continue;
+        }
 
         // Match dropped↔added pairs by Postgres type.
         // Only propose when unambiguous: exactly one dropped and one added per type.
@@ -1029,21 +1197,24 @@ pub fn detect_col_renames(target: &SchemaDescriptor, current: &DbState, guidance
         }
 
         for (pg_type, dropped_names) in &dropped_by_type {
-            if let Some(added_names) = added_by_type.get(pg_type) {
-                if dropped_names.len() == 1 && added_names.len() == 1 {
-                    let banned = guidance.banned_col_renames.contains(&(
-                        td.module.clone(), td.table.clone(),
-                        dropped_names[0].to_string(), added_names[0].to_string(),
-                    ));
-                    if !banned {
-                        candidates.push(ColRenameCandidate {
-                            module: td.module.clone(),
-                            table: td.table.clone(),
-                            old_col: dropped_names[0].to_string(),
-                            new_col: added_names[0].to_string(),
-                            pg_type: pg_type.to_string(),
-                        });
-                    }
+            if let Some(added_names) = added_by_type.get(pg_type)
+                && dropped_names.len() == 1
+                && added_names.len() == 1
+            {
+                let banned = guidance.banned_col_renames.contains(&(
+                    td.module.clone(),
+                    td.table.clone(),
+                    dropped_names[0].to_string(),
+                    added_names[0].to_string(),
+                ));
+                if !banned {
+                    candidates.push(ColRenameCandidate {
+                        module: td.module.clone(),
+                        table: td.table.clone(),
+                        old_col: dropped_names[0].to_string(),
+                        new_col: added_names[0].to_string(),
+                        pg_type: pg_type.to_string(),
+                    });
                 }
             }
         }
@@ -1069,22 +1240,24 @@ pub fn diff_schema_ops_with_renames(
     // ── Emit type rename DDL and update modified state ────────────────────────
     for (old_mod, old_table, new_mod, new_table) in type_renames {
         if old_mod == new_mod {
-            push_tx(&mut ops, format!(
-                "ALTER TABLE {} RENAME TO {};",
-                qn(old_mod, old_table), qi(new_table)
-            ));
+            push_tx(
+                &mut ops,
+                format!("ALTER TABLE {} RENAME TO {};", qn(old_mod, old_table), qi(new_table)),
+            );
         } else {
-            push_tx(&mut ops, format!(
-                "ALTER TABLE {} SET SCHEMA {};",
-                qn(old_mod, old_table), qi(new_mod)
-            ));
-            push_tx(&mut ops, format!(
-                "ALTER TABLE {} RENAME TO {};",
-                qn(new_mod, old_table), qi(new_table)
-            ));
+            push_tx(
+                &mut ops,
+                format!("ALTER TABLE {} SET SCHEMA {};", qn(old_mod, old_table), qi(new_mod)),
+            );
+            push_tx(
+                &mut ops,
+                format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, old_table), qi(new_table)),
+            );
         }
         // Make diff_inner think the new name already exists (with old columns).
-        if let Some(t) = modified.tables.iter_mut()
+        if let Some(t) = modified
+            .tables
+            .iter_mut()
             .find(|t| &t.schema == old_mod && &t.name == old_table)
         {
             t.schema = new_mod.clone();
@@ -1094,16 +1267,22 @@ pub fn diff_schema_ops_with_renames(
 
     // ── Emit column rename DDL and update modified state ──────────────────────
     for (module, table, old_col, new_col) in col_renames {
-        push_tx(&mut ops, format!(
-            "ALTER TABLE {} RENAME COLUMN {} TO {};",
-            qn(module, table), qi(old_col), qi(new_col)
-        ));
-        if let Some(t) = modified.tables.iter_mut()
+        push_tx(
+            &mut ops,
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {};",
+                qn(module, table),
+                qi(old_col),
+                qi(new_col)
+            ),
+        );
+        if let Some(t) = modified
+            .tables
+            .iter_mut()
             .find(|t| &t.schema == module && &t.name == table)
+            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
         {
-            if let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col) {
-                col.name = new_col.clone();
-            }
+            col.name = new_col.clone();
         }
     }
 
@@ -1124,22 +1303,28 @@ pub fn diff_schema_ops_with_renames(
 /// New tables are excluded (no rows yet).  PK columns are excluded (always NOT
 /// NULL by definition).
 pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec<FillRequired> {
-    let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
+    let cur_tables: HashMap<(&str, &str), &DbTable> = current
+        .tables
+        .iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
         .collect();
 
     let mut result: Vec<FillRequired> = Vec::new();
 
     for td in &target.types {
-        if td.abstract_ || td.junction { continue; }
-        let Some(cur) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) else { continue };
+        if td.abstract_ || td.junction {
+            continue;
+        }
+        let Some(cur) = cur_tables.get(&(td.module.as_str(), td.table.as_str())) else {
+            continue;
+        };
 
-        let cur_col_map: HashMap<&str, &DbColumn> = cur.columns.iter()
-            .map(|c| (c.name.as_str(), c))
-            .collect();
+        let cur_col_map: HashMap<&str, &DbColumn> = cur.columns.iter().map(|c| (c.name.as_str(), c)).collect();
 
         for p in &td.properties {
-            if p.nullable || p.is_pk { continue; }
+            if p.nullable || p.is_pk {
+                continue;
+            }
             match cur_col_map.get(p.name.as_str()) {
                 None => {
                     // New required column — only needs a fill when there's no default.
@@ -1172,7 +1357,9 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
         }
 
         for l in &td.links {
-            if l.nullable || l.is_junction_backed() { continue; }
+            if l.nullable || l.is_junction_backed() {
+                continue;
+            }
             let col = format!("{}_id", l.name);
             match cur_col_map.get(col.as_str()) {
                 None => {
@@ -1230,21 +1417,23 @@ pub fn diff_schema_ops_with_renames_and_fills(
     // ── Apply type renames ────────────────────────────────────────────────────
     for (old_mod, old_table, new_mod, new_table) in type_renames {
         if old_mod == new_mod {
-            push_tx(&mut ops, format!(
-                "ALTER TABLE {} RENAME TO {};",
-                qn(old_mod, old_table), qi(new_table)
-            ));
+            push_tx(
+                &mut ops,
+                format!("ALTER TABLE {} RENAME TO {};", qn(old_mod, old_table), qi(new_table)),
+            );
         } else {
-            push_tx(&mut ops, format!(
-                "ALTER TABLE {} SET SCHEMA {};",
-                qn(old_mod, old_table), qi(new_mod)
-            ));
-            push_tx(&mut ops, format!(
-                "ALTER TABLE {} RENAME TO {};",
-                qn(new_mod, old_table), qi(new_table)
-            ));
+            push_tx(
+                &mut ops,
+                format!("ALTER TABLE {} SET SCHEMA {};", qn(old_mod, old_table), qi(new_mod)),
+            );
+            push_tx(
+                &mut ops,
+                format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, old_table), qi(new_table)),
+            );
         }
-        if let Some(t) = modified.tables.iter_mut()
+        if let Some(t) = modified
+            .tables
+            .iter_mut()
             .find(|t| &t.schema == old_mod && &t.name == old_table)
         {
             t.schema = new_mod.clone();
@@ -1254,16 +1443,22 @@ pub fn diff_schema_ops_with_renames_and_fills(
 
     // ── Apply column renames ──────────────────────────────────────────────────
     for (module, table, old_col, new_col) in col_renames {
-        push_tx(&mut ops, format!(
-            "ALTER TABLE {} RENAME COLUMN {} TO {};",
-            qn(module, table), qi(old_col), qi(new_col)
-        ));
-        if let Some(t) = modified.tables.iter_mut()
+        push_tx(
+            &mut ops,
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {};",
+                qn(module, table),
+                qi(old_col),
+                qi(new_col)
+            ),
+        );
+        if let Some(t) = modified
+            .tables
+            .iter_mut()
             .find(|t| &t.schema == module && &t.name == table)
+            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
         {
-            if let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col) {
-                col.name = new_col.clone();
-            }
+            col.name = new_col.clone();
         }
     }
 
@@ -1282,14 +1477,24 @@ pub fn diff_schema_ops_with_renames_and_fills(
 
     // ── Fill DDL: UPDATE backfill + SET NOT NULL ──────────────────────────────
     for (module, table, col, fill_expr) in fills {
-        push_tx(&mut ops, format!(
-            "UPDATE {} SET {} = {} WHERE {} IS NULL;",
-            qn(module, table), qi(col), fill_expr, qi(col)
-        ));
-        push_tx(&mut ops, format!(
-            "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
-            qn(module, table), qi(col)
-        ));
+        push_tx(
+            &mut ops,
+            format!(
+                "UPDATE {} SET {} = {} WHERE {} IS NULL;",
+                qn(module, table),
+                qi(col),
+                fill_expr,
+                qi(col)
+            ),
+        );
+        push_tx(
+            &mut ops,
+            format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                qn(module, table),
+                qi(col)
+            ),
+        );
     }
 
     Ok(ops)
@@ -1313,7 +1518,9 @@ pub fn diff_schema_steps_with_renames_and_fills(
     let mut modified = current.clone();
 
     for (old_mod, old_table, new_mod, new_table) in type_renames {
-        if let Some(t) = modified.tables.iter_mut()
+        if let Some(t) = modified
+            .tables
+            .iter_mut()
             .find(|t| &t.schema == old_mod && &t.name == old_table)
         {
             t.schema = new_mod.clone();
@@ -1321,28 +1528,51 @@ pub fn diff_schema_steps_with_renames_and_fills(
         }
     }
     for (module, table, old_col, new_col) in col_renames {
-        if let Some(t) = modified.tables.iter_mut()
+        if let Some(t) = modified
+            .tables
+            .iter_mut()
             .find(|t| &t.schema == module && &t.name == table)
+            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
         {
-            if let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col) {
-                col.name = new_col.clone();
-            }
+            col.name = new_col.clone();
         }
     }
 
     let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for (module, table, col, _) in fills {
-        fill_index.entry((module.clone(), table.clone())).or_default().insert(col.clone());
+        fill_index
+            .entry((module.clone(), table.clone()))
+            .or_default()
+            .insert(col.clone());
     }
 
     let mut steps = diff_inner(target, &modified, true, &fill_index)?;
 
     for (module, table, col, fill_expr) in fills {
         let fill_ops = vec![
-            DiffOp { sql: format!("UPDATE {} SET {} = {} WHERE {} IS NULL;", qn(module, table), qi(col), fill_expr, qi(col)), non_transactional: false },
-            DiffOp { sql: format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;", qn(module, table), qi(col)), non_transactional: false },
+            DiffOp {
+                sql: format!(
+                    "UPDATE {} SET {} = {} WHERE {} IS NULL;",
+                    qn(module, table),
+                    qi(col),
+                    fill_expr,
+                    qi(col)
+                ),
+                non_transactional: false,
+            },
+            DiffOp {
+                sql: format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                    qn(module, table),
+                    qi(col)
+                ),
+                non_transactional: false,
+            },
         ];
-        match steps.iter_mut().find(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == module && t == table)) {
+        match steps
+            .iter_mut()
+            .find(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == module && t == table))
+        {
             Some(step) => step.ddl.extend(fill_ops),
             None => steps.push(MigrationStep {
                 prompt: format!("did you {} {}?", Verb::Alter.as_str(), verbosename_type(module, table)),
@@ -1365,7 +1595,11 @@ fn qi(s: &str) -> String {
 }
 
 fn pg_schema(module: &str) -> String {
-    if module == "default" { "\"public\"".into() } else { qi(module) }
+    if module == "default" {
+        "\"public\"".into()
+    } else {
+        qi(module)
+    }
 }
 
 fn qn(schema: &str, name: &str) -> String {
@@ -1393,11 +1627,14 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
         order: &mut Vec<usize>,
     ) -> Result<(), String> {
         match colour[i] {
-            2 => return Ok(()),   // already fully processed
-            1 => return Err(format!(  // back-edge → cycle
-                "circular type dependency involving '{}::{}'",
-                types[i].module, types[i].name
-            )),
+            2 => return Ok(()), // already fully processed
+            1 => {
+                return Err(format!(
+                    // back-edge → cycle
+                    "circular type dependency involving '{}::{}'",
+                    types[i].module, types[i].name
+                ));
+            }
             _ => {}
         }
         colour[i] = 1;
@@ -1406,7 +1643,9 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
         // columns on the source table (the junction table does), so
         // neither is an ordering constraint for the source type itself.
         for l in &types[i].links {
-            if l.is_junction_backed() { continue; }
+            if l.is_junction_backed() {
+                continue;
+            }
             if let Some(&dep) = idx_of.get(&l.target) {
                 visit(dep, types, idx_of, colour, order)?;
             }
@@ -1426,9 +1665,9 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
 /// name when it has one (`column_type`), else its plain `pg_type` (with the
 /// `__nt__:` nominal-tuple marker resolved to `jsonb`).
 fn col_type_str(p: &crate::schema::PropertyDescriptor) -> &str {
-    p.column_type.as_deref().unwrap_or_else(|| {
-        p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type)
-    })
+    p.column_type
+        .as_deref()
+        .unwrap_or_else(|| p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type))
 }
 
 /// Maps a Pylon-internal base `pg_type` spelling to PostgreSQL's own
@@ -1450,7 +1689,8 @@ fn canonical_pg_type(pg_type: &str) -> String {
         "timestamp" => "timestamp without time zone",
         "time" => "time without time zone",
         other => other,
-    }.to_string()
+    }
+    .to_string()
 }
 
 /// The bare (unqualified, unquoted) identifier at the end of a possibly
@@ -1489,27 +1729,46 @@ fn diff_inner(
     let mut steps = StepBuilder::new();
 
     let cur_schemas: HashSet<&str> = current.schemas.iter().map(|s| s.as_str()).collect();
-    let cur_tables: HashMap<(&str, &str), &DbTable> = current.tables.iter()
+    let cur_tables: HashMap<(&str, &str), &DbTable> = current
+        .tables
+        .iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
         .collect();
-    let cur_enums: HashMap<(&str, &str), &DbEnum> = current.enums.iter()
+    let cur_enums: HashMap<(&str, &str), &DbEnum> = current
+        .enums
+        .iter()
         .map(|e| ((e.schema.as_str(), e.name.as_str()), e))
         .collect();
-    let cur_domains: HashSet<(&str, &str)> = current.domains.iter()
+    let cur_domains: HashSet<(&str, &str)> = current
+        .domains
+        .iter()
         .map(|d| (d.schema.as_str(), d.name.as_str()))
         .collect();
-    let cur_sequences: HashSet<(&str, &str)> = current.sequences.iter()
+    let cur_sequences: HashSet<(&str, &str)> = current
+        .sequences
+        .iter()
         .map(|s| (s.schema.as_str(), s.name.as_str()))
         .collect();
-    let cur_views: HashMap<(&str, &str), &str> = current.views.iter()
+    let cur_views: HashMap<(&str, &str), &str> = current
+        .views
+        .iter()
         .map(|v| ((v.schema.as_str(), v.name.as_str()), v.body_hash.as_str()))
         .collect();
-    let cur_functions: HashMap<(&str, &str), &str> = current.functions.iter()
+    let cur_functions: HashMap<(&str, &str), &str> = current
+        .functions
+        .iter()
         .map(|f| ((f.schema.as_str(), f.name.as_str()), f.body_hash.as_str()))
         .collect();
 
-    let type_map: HashMap<String, (&str, &str)> = target.types.iter()
-        .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
+    let type_map: HashMap<String, (&str, &str)> = target
+        .types
+        .iter()
+        .map(|t| {
+            (
+                format!("{}::{}", t.module, t.name),
+                (t.module.as_str(), t.table.as_str()),
+            )
+        })
         .collect();
 
     // Every kind of top-level declaration can live in a module of its own,
@@ -1518,20 +1777,39 @@ fn diff_inner(
     // function/global/alias-only module's own CREATE SCHEMA step was never
     // generated, so its first CREATE FUNCTION/etc. failed outright).
     let mut target_schemas: HashSet<String> = HashSet::new();
-    for t in &target.types     { target_schemas.insert(t.module.clone()); }
-    for e in &target.enums     { target_schemas.insert(e.module.clone()); }
-    for s in &target.scalars   { target_schemas.insert(s.module.clone()); }
-    for f in &target.functions { target_schemas.insert(f.module.clone()); }
-    for g in &target.globals   { target_schemas.insert(g.module.clone()); }
-    for a in &target.aliases   { target_schemas.insert(a.module.clone()); }
+    for t in &target.types {
+        target_schemas.insert(t.module.clone());
+    }
+    for e in &target.enums {
+        target_schemas.insert(e.module.clone());
+    }
+    for s in &target.scalars {
+        target_schemas.insert(s.module.clone());
+    }
+    for f in &target.functions {
+        target_schemas.insert(f.module.clone());
+    }
+    for g in &target.globals {
+        target_schemas.insert(g.module.clone());
+    }
+    for a in &target.aliases {
+        target_schemas.insert(a.module.clone());
+    }
 
     // ── Phase 1: modules ─────────────────────────────────────────────────────
     for module in &target_schemas {
-        if module == "default" { continue; } // public always exists
+        if module == "default" {
+            continue;
+        } // public always exists
         if !cur_schemas.contains(module.as_str()) {
             steps.push(
-                OpKey::Module(module.clone()), Verb::Create, verbosename_module(module),
-                DiffOp { sql: format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(module)), non_transactional: false },
+                OpKey::Module(module.clone()),
+                Verb::Create,
+                verbosename_module(module),
+                DiffOp {
+                    sql: format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(module)),
+                    non_transactional: false,
+                },
             );
         }
     }
@@ -1541,16 +1819,25 @@ fn diff_inner(
     for e in &target.enums {
         match cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
             None => {
-                let members: Vec<String> = e.members.iter()
+                let members: Vec<String> = e
+                    .members
+                    .iter()
                     .map(|m| format!("'{}'", m.replace('\'', "''")))
                     .collect();
                 steps.push(
-                    OpKey::Scalar(e.module.clone(), e.name.clone()), Verb::Create, verbosename_scalar(&e.module, &e.name),
-                    DiffOp { sql: format!(
-                        "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
+                    OpKey::Scalar(e.module.clone(), e.name.clone()),
+                    Verb::Create,
+                    verbosename_scalar(&e.module, &e.name),
+                    DiffOp {
+                        sql: format!(
+                            "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
                          EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                        pg_schema(&e.module), qi(&e.name), members.join(", ")
-                    ), non_transactional: false },
+                            pg_schema(&e.module),
+                            qi(&e.name),
+                            members.join(", ")
+                        ),
+                        non_transactional: false,
+                    },
                 );
             }
             Some(existing) => {
@@ -1558,11 +1845,18 @@ fn diff_inner(
                 for member in &e.members {
                     if !existing_set.contains(member.as_str()) {
                         steps.push(
-                            OpKey::Scalar(e.module.clone(), e.name.clone()), Verb::Alter, verbosename_scalar(&e.module, &e.name),
-                            DiffOp { sql: format!(
-                                "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                                pg_schema(&e.module), qi(&e.name), member.replace('\'', "''")
-                            ), non_transactional: false },
+                            OpKey::Scalar(e.module.clone(), e.name.clone()),
+                            Verb::Alter,
+                            verbosename_scalar(&e.module, &e.name),
+                            DiffOp {
+                                sql: format!(
+                                    "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                                    pg_schema(&e.module),
+                                    qi(&e.name),
+                                    member.replace('\'', "''")
+                                ),
+                                non_transactional: false,
+                            },
                         );
                     }
                 }
@@ -1576,13 +1870,23 @@ fn diff_inner(
         if s.is_sequence {
             let seq_name = format!("{}_seq", s.name);
             if !cur_sequences.contains(&(s.module.as_str(), seq_name.as_str())) {
-                let verb = if cur_domains.contains(&(s.module.as_str(), s.name.as_str())) { Verb::Alter } else { Verb::Create };
+                let verb = if cur_domains.contains(&(s.module.as_str(), s.name.as_str())) {
+                    Verb::Alter
+                } else {
+                    Verb::Create
+                };
                 steps.push(
-                    OpKey::Scalar(s.module.clone(), s.name.clone()), verb, verbosename_scalar(&s.module, &s.name),
-                    DiffOp { sql: format!(
-                        "CREATE SEQUENCE IF NOT EXISTS {}.{};",
-                        pg_schema(&s.module), qi(&seq_name)
-                    ), non_transactional: false },
+                    OpKey::Scalar(s.module.clone(), s.name.clone()),
+                    verb,
+                    verbosename_scalar(&s.module, &s.name),
+                    DiffOp {
+                        sql: format!(
+                            "CREATE SEQUENCE IF NOT EXISTS {}.{};",
+                            pg_schema(&s.module),
+                            qi(&seq_name)
+                        ),
+                        non_transactional: false,
+                    },
                 );
             }
         }
@@ -1591,37 +1895,62 @@ fn diff_inner(
     // ── Phase 3: custom scalar domains ───────────────────────────────────────
     for s in &target.scalars {
         if !cur_domains.contains(&(s.module.as_str(), s.name.as_str())) {
-            let checks: Vec<String> = s.check_constraints.iter()
+            let checks: Vec<String> = s
+                .check_constraints
+                .iter()
                 .map(|c| format!("    CHECK ({})", c))
                 .collect();
-            let check_clause = if checks.is_empty() { String::new() } else { format!("\n{}", checks.join("\n")) };
+            let check_clause = if checks.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", checks.join("\n"))
+            };
             steps.push(
-                OpKey::Scalar(s.module.clone(), s.name.clone()), Verb::Create, verbosename_scalar(&s.module, &s.name),
-                DiffOp { sql: format!(
-                    "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
+                OpKey::Scalar(s.module.clone(), s.name.clone()),
+                Verb::Create,
+                verbosename_scalar(&s.module, &s.name),
+                DiffOp {
+                    sql: format!(
+                        "DO $do$ BEGIN CREATE DOMAIN {}.{} AS {}{}; \
                      EXCEPTION WHEN duplicate_object THEN NULL; END $do$;",
-                    pg_schema(&s.module), qi(&s.name), s.pg_type, check_clause
-                ), non_transactional: false },
+                        pg_schema(&s.module),
+                        qi(&s.name),
+                        s.pg_type,
+                        check_clause
+                    ),
+                    non_transactional: false,
+                },
             );
         }
     }
 
     // ── Phase 3.5: scalar functions (before tables — table DEFAULTs may call them) ──
-    let scalar_fn_ddls = crate::export::scalar_function_ddl_with_names(target)
-        .map_err(|e| e.to_string())?;
+    let scalar_fn_ddls = crate::export::scalar_function_ddl_with_names(target).map_err(|e| e.to_string())?;
     for (module, name, ddl) in scalar_fn_ddls {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
-            cur_functions.get(&(module.as_str(), name.as_str()))
+            cur_functions
+                .get(&(module.as_str(), name.as_str()))
                 .map(|&h| h != hash)
                 .unwrap_or(true)
         } else {
             true
         };
         if emit {
-            let verb = if cur_functions.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
-            steps.push(OpKey::Function(module.clone(), name.clone()), verb, verbosename_function(&module, &name),
-                DiffOp { sql: ddl, non_transactional: false });
+            let verb = if cur_functions.contains_key(&(module.as_str(), name.as_str())) {
+                Verb::Alter
+            } else {
+                Verb::Create
+            };
+            steps.push(
+                OpKey::Function(module.clone(), name.clone()),
+                verb,
+                verbosename_function(&module, &name),
+                DiffOp {
+                    sql: ddl,
+                    non_transactional: false,
+                },
+            );
         }
     }
 
@@ -1633,13 +1962,20 @@ fn diff_inner(
 
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.junction { continue; }
+        if td.abstract_ || td.junction {
+            continue;
+        }
         let key = (td.module.as_str(), td.table.as_str());
         match cur_tables.get(&key) {
             None => {
                 let mut local: Vec<DiffOp> = Vec::new();
                 emit_create_table(td, target, &mut local);
-                steps.extend(OpKey::Table(td.module.clone(), td.table.clone()), Verb::Create, verbosename_type(&td.module, &td.name), local);
+                steps.extend(
+                    OpKey::Table(td.module.clone(), td.table.clone()),
+                    Verb::Create,
+                    verbosename_type(&td.module, &td.name),
+                    local,
+                );
                 new_tables.insert((td.module.clone(), td.table.clone()));
             }
             Some(existing) => {
@@ -1650,7 +1986,13 @@ fn diff_inner(
                 let mut local: Vec<DiffOp> = Vec::new();
                 let mut inputs: Vec<RequiredInput> = Vec::new();
                 emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target, &mut inputs);
-                steps.extend_with_input(OpKey::Table(td.module.clone(), td.table.clone()), Verb::Alter, verbosename_type(&td.module, &td.name), local, inputs);
+                steps.extend_with_input(
+                    OpKey::Table(td.module.clone(), td.table.clone()),
+                    Verb::Alter,
+                    verbosename_type(&td.module, &td.name),
+                    local,
+                    inputs,
+                );
             }
         }
     }
@@ -1663,12 +2005,23 @@ fn diff_inner(
     // empty "already has" set instead of an introspected one.
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.junction { continue; }
+        if td.abstract_ || td.junction {
+            continue;
+        }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str())).copied();
-        let verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) { Verb::Create } else { Verb::Alter };
+        let verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) {
+            Verb::Create
+        } else {
+            Verb::Alter
+        };
         let mut local: Vec<DiffOp> = Vec::new();
         emit_fk_diff(td, existing, &type_map, &mut local);
-        steps.extend(OpKey::Table(td.module.clone(), td.table.clone()), verb, verbosename_type(&td.module, &td.name), local);
+        steps.extend(
+            OpKey::Table(td.module.clone(), td.table.clone()),
+            verb,
+            verbosename_type(&td.module, &td.name),
+            local,
+        );
     }
 
     // ── Phase 7: junction tables for new multi-links (and junction-backed
@@ -1678,25 +2031,55 @@ fn diff_inner(
     // add a multi-link", not as a separate table ────────────────────────────
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.junction { continue; }
+        if td.abstract_ || td.junction {
+            continue;
+        }
         let owner_key = OpKey::Table(td.module.clone(), td.table.clone());
-        let owner_verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) { Verb::Create } else { Verb::Alter };
+        let owner_verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) {
+            Verb::Create
+        } else {
+            Verb::Alter
+        };
         let owner_desc = verbosename_type(&td.module, &td.name);
         for ml in &td.multilinks {
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
                 let mut local: Vec<DiffOp> = Vec::new();
-                emit_junction_table(td, &ml.name, &ml.target, ml.through.as_deref(), &ml.on_delete, &type_map, target, false, false, &mut local);
+                emit_junction_table(
+                    td,
+                    &ml.name,
+                    &ml.target,
+                    ml.through.as_deref(),
+                    &ml.on_delete,
+                    &type_map,
+                    target,
+                    false,
+                    false,
+                    &mut local,
+                );
                 steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
         }
         for l in &td.links {
-            if !l.is_junction_backed() { continue; }
+            if !l.is_junction_backed() {
+                continue;
+            }
             let jt = format!("{}.{}", td.table, l.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
                 let mut local: Vec<DiffOp> = Vec::new();
-                emit_junction_table(td, &l.name, &l.target, l.through.as_deref(), &l.on_delete, &type_map, target, true, l.is_exclusive, &mut local);
+                emit_junction_table(
+                    td,
+                    &l.name,
+                    &l.target,
+                    l.through.as_deref(),
+                    &l.on_delete,
+                    &type_map,
+                    target,
+                    true,
+                    l.is_exclusive,
+                    &mut local,
+                );
                 steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
@@ -1706,7 +2089,9 @@ fn diff_inner(
     // ── Phase 8: vector columns + indexes (folded into the owning type's step) ──
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.vector_indexes.is_empty() { continue; }
+        if td.abstract_ || td.vector_indexes.is_empty() {
+            continue;
+        }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str()));
         let table_is_new = new_tables.contains(&(td.module.clone(), td.table.clone()));
         let owner_key = OpKey::Table(td.module.clone(), td.table.clone());
@@ -1715,14 +2100,22 @@ fn diff_inner(
 
         for vi in &td.vector_indexes {
             let col = vi.column_name();
-            if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
+            if existing
+                .map(|t| t.columns.iter().any(|c| c.name == col))
+                .unwrap_or(false)
+            {
                 continue;
             }
             let mut local: Vec<DiffOp> = Vec::new();
-            push_tx(&mut local, format!(
-                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} vector({});",
-                qn(&td.module, &td.table), qi(&col), vi.dimensions
-            ));
+            push_tx(
+                &mut local,
+                format!(
+                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} vector({});",
+                    qn(&td.module, &td.table),
+                    qi(&col),
+                    vi.dimensions
+                ),
+            );
             let idx_name = match &vi.index_name {
                 None => format!("{}__vector__", td.table),
                 Some(n) => format!("{}__vector_{}__", td.table, n),
@@ -1731,13 +2124,26 @@ fn diff_inner(
             // New tables: plain CREATE INDEX (no rows, no locking concern).
             let use_concurrently = for_migration && !table_is_new;
             let idx_sql = if use_concurrently {
-                format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING hnsw ({} {});",
-                    qi(&idx_name), qn(&td.module, &td.table), qi(&col), vi.ops_class())
+                format!(
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING hnsw ({} {});",
+                    qi(&idx_name),
+                    qn(&td.module, &td.table),
+                    qi(&col),
+                    vi.ops_class()
+                )
             } else {
-                format!("CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});",
-                    qi(&idx_name), qn(&td.module, &td.table), qi(&col), vi.ops_class())
+                format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});",
+                    qi(&idx_name),
+                    qn(&td.module, &td.table),
+                    qi(&col),
+                    vi.ops_class()
+                )
             };
-            local.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            local.push(DiffOp {
+                sql: idx_sql,
+                non_transactional: use_concurrently,
+            });
             steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
         }
     }
@@ -1745,7 +2151,9 @@ fn diff_inner(
     // ── Phase 9: search tsvector columns + GIN indexes (folded likewise) ─────
     for &i in &sort_order {
         let td = &target.types[i];
-        if td.abstract_ || td.search_indexes.is_empty() { continue; }
+        if td.abstract_ || td.search_indexes.is_empty() {
+            continue;
+        }
         let existing = cur_tables.get(&(td.module.as_str(), td.table.as_str()));
         let table_is_new = new_tables.contains(&(td.module.clone(), td.table.clone()));
         let owner_key = OpKey::Table(td.module.clone(), td.table.clone());
@@ -1753,36 +2161,66 @@ fn diff_inner(
         let owner_desc = verbosename_type(&td.module, &td.name);
 
         for si in &td.search_indexes {
-            if si.backend != SearchBackend::Postgres { continue; }
+            if si.backend != SearchBackend::Postgres {
+                continue;
+            }
             let col = si.column_name();
-            if existing.map(|t| t.columns.iter().any(|c| c.name == col)).unwrap_or(false) {
+            if existing
+                .map(|t| t.columns.iter().any(|c| c.name == col))
+                .unwrap_or(false)
+            {
                 continue;
             }
             let mut local: Vec<DiffOp> = Vec::new();
-            let parts: Vec<String> = si.pointers.iter()
-                .map(|sf| format!(
-                    "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
-                    qi(&sf.name), sf.weight.as_str()
-                ))
+            let parts: Vec<String> = si
+                .pointers
+                .iter()
+                .map(|sf| {
+                    format!(
+                        "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
+                        qi(&sf.name),
+                        sf.weight.as_str()
+                    )
+                })
                 .collect();
-            let expr = if parts.len() == 1 { parts.into_iter().next().unwrap() } else { parts.join(" || ") };
-            push_tx(&mut local, format!(
-                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} tsvector GENERATED ALWAYS AS ({}) STORED;",
-                qn(&td.module, &td.table), qi(&col), expr
-            ));
+            let expr = if parts.len() == 1 {
+                parts.into_iter().next().unwrap()
+            } else {
+                parts.join(" || ")
+            };
+            push_tx(
+                &mut local,
+                format!(
+                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} tsvector GENERATED ALWAYS AS ({}) STORED;",
+                    qn(&td.module, &td.table),
+                    qi(&col),
+                    expr
+                ),
+            );
             let idx_name = match &si.index_name {
                 None => format!("{}__search__", td.table),
                 Some(n) => format!("{}__search_{}__", td.table, n),
             };
             let use_concurrently = for_migration && !table_is_new;
             let idx_sql = if use_concurrently {
-                format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING gin ({});",
-                    qi(&idx_name), qn(&td.module, &td.table), qi(&col))
+                format!(
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING gin ({});",
+                    qi(&idx_name),
+                    qn(&td.module, &td.table),
+                    qi(&col)
+                )
             } else {
-                format!("CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});",
-                    qi(&idx_name), qn(&td.module, &td.table), qi(&col))
+                format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});",
+                    qi(&idx_name),
+                    qn(&td.module, &td.table),
+                    qi(&col)
+                )
             };
-            local.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            local.push(DiffOp {
+                sql: idx_sql,
+                non_transactional: use_concurrently,
+            });
             steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
         }
     }
@@ -1793,16 +2231,28 @@ fn diff_inner(
     for (module, name, ddl) in crate::export::interface_view_ddl_with_names(target) {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
-            cur_views.get(&(module.as_str(), name.as_str()))
+            cur_views
+                .get(&(module.as_str(), name.as_str()))
                 .map(|&h| h != hash)
                 .unwrap_or(true)
         } else {
             true
         };
         if emit {
-            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
-            steps.push(OpKey::View(module.clone(), name.clone()), verb, verbosename_interface(&module, &name),
-                DiffOp { sql: ddl, non_transactional: false });
+            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) {
+                Verb::Alter
+            } else {
+                Verb::Create
+            };
+            steps.push(
+                OpKey::View(module.clone(), name.clone()),
+                verb,
+                verbosename_interface(&module, &name),
+                DiffOp {
+                    sql: ddl,
+                    non_transactional: false,
+                },
+            );
         }
     }
 
@@ -1816,35 +2266,58 @@ fn diff_inner(
     for (module, name, ddl) in crate::export::junction_excl_view_ddl_with_names(target) {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
-            cur_views.get(&(module.as_str(), name.as_str()))
+            cur_views
+                .get(&(module.as_str(), name.as_str()))
                 .map(|&h| h != hash)
                 .unwrap_or(true)
         } else {
             true
         };
         if emit {
-            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
-            steps.push(OpKey::View(module.clone(), name.clone()), verb, verbosename_interface(&module, &name),
-                DiffOp { sql: ddl, non_transactional: false });
+            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) {
+                Verb::Alter
+            } else {
+                Verb::Create
+            };
+            steps.push(
+                OpKey::View(module.clone(), name.clone()),
+                verb,
+                verbosename_interface(&module, &name),
+                DiffOp {
+                    sql: ddl,
+                    non_transactional: false,
+                },
+            );
         }
     }
 
     // ── Phase 11: object-returning functions (after tables and views exist) ──
-    let obj_fn_ddls = crate::export::object_function_ddl_with_names(target)
-        .map_err(|e| e.to_string())?;
+    let obj_fn_ddls = crate::export::object_function_ddl_with_names(target).map_err(|e| e.to_string())?;
     for (module, name, ddl) in obj_fn_ddls {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
-            cur_functions.get(&(module.as_str(), name.as_str()))
+            cur_functions
+                .get(&(module.as_str(), name.as_str()))
                 .map(|&h| h != hash)
                 .unwrap_or(true)
         } else {
             true
         };
         if emit {
-            let verb = if cur_functions.contains_key(&(module.as_str(), name.as_str())) { Verb::Alter } else { Verb::Create };
-            steps.push(OpKey::Function(module.clone(), name.clone()), verb, verbosename_function(&module, &name),
-                DiffOp { sql: ddl, non_transactional: false });
+            let verb = if cur_functions.contains_key(&(module.as_str(), name.as_str())) {
+                Verb::Alter
+            } else {
+                Verb::Create
+            };
+            steps.push(
+                OpKey::Function(module.clone(), name.clone()),
+                verb,
+                verbosename_function(&module, &name),
+                DiffOp {
+                    sql: ddl,
+                    non_transactional: false,
+                },
+            );
         }
     }
 
@@ -1862,7 +2335,9 @@ fn diff_inner(
                 target_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
             }
             for l in &td.links {
-                if !l.is_junction_backed() { continue; }
+                if !l.is_junction_backed() {
+                    continue;
+                }
                 target_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
             }
         }
@@ -1873,11 +2348,15 @@ fn diff_inner(
     // "altering type X", not as separate objects) ────────────────────────────
     {
         let infos = crate::export::interface_exclusive_trigger_infos(target);
-        let cur_trigger_map: HashMap<(&str, &str), HashSet<&str>> = current.tables.iter()
-            .map(|t| (
-                (t.schema.as_str(), t.name.as_str()),
-                t.triggers.iter().map(|n| n.as_str()).collect::<HashSet<_>>(),
-            ))
+        let cur_trigger_map: HashMap<(&str, &str), HashSet<&str>> = current
+            .tables
+            .iter()
+            .map(|t| {
+                (
+                    (t.schema.as_str(), t.name.as_str()),
+                    t.triggers.iter().map(|n| n.as_str()).collect::<HashSet<_>>(),
+                )
+            })
             .collect();
 
         // What every table's trigger set *should* be once `target` is fully
@@ -1896,18 +2375,37 @@ fn diff_inner(
         let owner_of = |module: &str, table: &str| -> (OpKey, Verb, String) {
             for &i in &sort_order {
                 let td = &target.types[i];
-                if td.abstract_ || td.junction { continue; }
-                let is_owner = td.module == module && (
-                    td.table == table
-                    || td.multilinks.iter().any(|ml| format!("{}.{}", td.table, ml.name) == table)
-                    || td.links.iter().any(|l| l.is_junction_backed() && format!("{}.{}", td.table, l.name) == table)
-                );
+                if td.abstract_ || td.junction {
+                    continue;
+                }
+                let is_owner = td.module == module
+                    && (td.table == table
+                        || td
+                            .multilinks
+                            .iter()
+                            .any(|ml| format!("{}.{}", td.table, ml.name) == table)
+                        || td
+                            .links
+                            .iter()
+                            .any(|l| l.is_junction_backed() && format!("{}.{}", td.table, l.name) == table));
                 if is_owner {
-                    let verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) { Verb::Create } else { Verb::Alter };
-                    return (OpKey::Table(td.module.clone(), td.table.clone()), verb, verbosename_type(&td.module, &td.name));
+                    let verb = if new_tables.contains(&(td.module.clone(), td.table.clone())) {
+                        Verb::Create
+                    } else {
+                        Verb::Alter
+                    };
+                    return (
+                        OpKey::Table(td.module.clone(), td.table.clone()),
+                        verb,
+                        verbosename_type(&td.module, &td.name),
+                    );
                 }
             }
-            (OpKey::Table(module.to_string(), table.to_string()), Verb::Alter, verbosename_type(module, table))
+            (
+                OpKey::Table(module.to_string(), table.to_string()),
+                Verb::Alter,
+                verbosename_type(module, table),
+            )
         };
 
         for info in &infos {
@@ -1922,8 +2420,12 @@ fn diff_inner(
                 if fn_emitted.insert(info.fn_name.clone()) {
                     push_tx(&mut local, info.fn_ddl.clone());
                 }
-                if need_ins { push_tx(&mut local, info.ins_ddl.clone()); }
-                if need_upd { push_tx(&mut local, info.upd_ddl.clone()); }
+                if need_ins {
+                    push_tx(&mut local, info.ins_ddl.clone());
+                }
+                if need_upd {
+                    push_tx(&mut local, info.upd_ddl.clone());
+                }
                 let (key, verb, desc) = owner_of(&info.impl_module, &info.impl_table);
                 steps.extend(key, verb, desc, local);
             }
@@ -1943,7 +2445,15 @@ fn diff_inner(
                 .unwrap_or_default();
             if !cur.contains(info.trigger_name.as_str()) {
                 let (key, verb, desc) = owner_of(&info.table_module, &info.table_name);
-                steps.extend(key, verb, desc, vec![DiffOp { sql: info.ddl.clone(), non_transactional: false }]);
+                steps.extend(
+                    key,
+                    verb,
+                    desc,
+                    vec![DiffOp {
+                        sql: info.ddl.clone(),
+                        non_transactional: false,
+                    }],
+                );
             }
         }
 
@@ -1960,7 +2470,15 @@ fn diff_inner(
                 .unwrap_or_default();
             if !cur.contains(info.trigger_name.as_str()) {
                 let (key, verb, desc) = owner_of(&info.table_module, &info.table_name);
-                steps.extend(key, verb, desc, vec![DiffOp { sql: info.ddl.clone(), non_transactional: false }]);
+                steps.extend(
+                    key,
+                    verb,
+                    desc,
+                    vec![DiffOp {
+                        sql: info.ddl.clone(),
+                        non_transactional: false,
+                    }],
+                );
             }
         }
 
@@ -1981,7 +2499,15 @@ fn diff_inner(
                 .unwrap_or_default();
             if !cur.contains(info.trigger_name.as_str()) {
                 let (key, verb, desc) = owner_of(&info.table_module, &info.table_name);
-                steps.extend(key, verb, desc, vec![DiffOp { sql: info.ddl.clone(), non_transactional: false }]);
+                steps.extend(
+                    key,
+                    verb,
+                    desc,
+                    vec![DiffOp {
+                        sql: info.ddl.clone(),
+                        non_transactional: false,
+                    }],
+                );
             }
         }
 
@@ -2000,14 +2526,18 @@ fn diff_inner(
         // `CREATE TRIGGER` statement twice for that table.
         let mut cache_trigger_tables: HashSet<(String, String)> = HashSet::new();
         for td in &target.types {
-            if td.abstract_ { continue; }
+            if td.abstract_ {
+                continue;
+            }
             cache_trigger_tables.insert((td.module.clone(), td.table.clone()));
             if !td.junction {
                 for ml in &td.multilinks {
                     cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, ml.name)));
                 }
                 for l in &td.links {
-                    if !l.is_junction_backed() { continue; }
+                    if !l.is_junction_backed() {
+                        continue;
+                    }
                     cache_trigger_tables.insert((td.module.clone(), format!("{}.{}", td.table, l.name)));
                 }
             }
@@ -2019,7 +2549,15 @@ fn diff_inner(
                 .unwrap_or(false);
             if !already_present {
                 let (key, verb, desc) = owner_of(module, table);
-                steps.extend(key, verb, desc, vec![DiffOp { sql: cache_invalidate_trigger_sql(&qn(module, table)), non_transactional: false }]);
+                steps.extend(
+                    key,
+                    verb,
+                    desc,
+                    vec![DiffOp {
+                        sql: cache_invalidate_trigger_sql(&qn(module, table)),
+                        non_transactional: false,
+                    }],
+                );
             }
         }
 
@@ -2042,10 +2580,19 @@ fn diff_inner(
             for trigger_name in &cur_table.triggers {
                 if !expected.contains(trigger_name) {
                     let (owner_key, verb, desc) = owner_of(&cur_table.schema, &cur_table.name);
-                    steps.extend(owner_key, verb, desc, vec![DiffOp { sql: format!(
-                        "DROP TRIGGER IF EXISTS {} ON {};",
-                        qi(trigger_name), qn(&cur_table.schema, &cur_table.name)
-                    ), non_transactional: false }]);
+                    steps.extend(
+                        owner_key,
+                        verb,
+                        desc,
+                        vec![DiffOp {
+                            sql: format!(
+                                "DROP TRIGGER IF EXISTS {} ON {};",
+                                qi(trigger_name),
+                                qn(&cur_table.schema, &cur_table.name)
+                            ),
+                            non_transactional: false,
+                        }],
+                    );
                 }
             }
         }
@@ -2056,44 +2603,73 @@ fn diff_inner(
         let key = (cur_table.schema.clone(), cur_table.name.clone());
         if !target_tables.contains(&key) {
             steps.push(
-                OpKey::Table(cur_table.schema.clone(), cur_table.name.clone()), Verb::Drop,
+                OpKey::Table(cur_table.schema.clone(), cur_table.name.clone()),
+                Verb::Drop,
                 verbosename_type(&cur_table.schema, &cur_table.name),
-                DiffOp { sql: format!("DROP TABLE IF EXISTS {} CASCADE;", qn(&cur_table.schema, &cur_table.name)), non_transactional: false },
+                DiffOp {
+                    sql: format!(
+                        "DROP TABLE IF EXISTS {} CASCADE;",
+                        qn(&cur_table.schema, &cur_table.name)
+                    ),
+                    non_transactional: false,
+                },
             );
         }
     }
 
     // ── Phase 13: drop removed enums ─────────────────────────────────────────
-    let target_enum_set: HashSet<(String, String)> = target.enums.iter()
+    let target_enum_set: HashSet<(String, String)> = target
+        .enums
+        .iter()
         .map(|e| (e.module.clone(), e.name.clone()))
         .collect();
     for cur_enum in &current.enums {
         if !target_enum_set.contains(&(cur_enum.schema.clone(), cur_enum.name.clone())) {
             steps.push(
-                OpKey::Scalar(cur_enum.schema.clone(), cur_enum.name.clone()), Verb::Drop,
+                OpKey::Scalar(cur_enum.schema.clone(), cur_enum.name.clone()),
+                Verb::Drop,
                 verbosename_scalar(&cur_enum.schema, &cur_enum.name),
-                DiffOp { sql: format!("DROP TYPE IF EXISTS {}.{} CASCADE;", pg_schema(&cur_enum.schema), qi(&cur_enum.name)), non_transactional: false },
+                DiffOp {
+                    sql: format!(
+                        "DROP TYPE IF EXISTS {}.{} CASCADE;",
+                        pg_schema(&cur_enum.schema),
+                        qi(&cur_enum.name)
+                    ),
+                    non_transactional: false,
+                },
             );
         }
     }
 
     // ── Phase 14: drop removed domains ───────────────────────────────────────
-    let target_domain_set: HashSet<(String, String)> = target.scalars.iter()
+    let target_domain_set: HashSet<(String, String)> = target
+        .scalars
+        .iter()
         .map(|s| (s.module.clone(), s.name.clone()))
         .collect();
     for cur_domain in &current.domains {
         if !target_domain_set.contains(&(cur_domain.schema.clone(), cur_domain.name.clone())) {
             steps.push(
-                OpKey::Scalar(cur_domain.schema.clone(), cur_domain.name.clone()), Verb::Drop,
+                OpKey::Scalar(cur_domain.schema.clone(), cur_domain.name.clone()),
+                Verb::Drop,
                 verbosename_scalar(&cur_domain.schema, &cur_domain.name),
-                DiffOp { sql: format!("DROP DOMAIN IF EXISTS {}.{} CASCADE;", pg_schema(&cur_domain.schema), qi(&cur_domain.name)), non_transactional: false },
+                DiffOp {
+                    sql: format!(
+                        "DROP DOMAIN IF EXISTS {}.{} CASCADE;",
+                        pg_schema(&cur_domain.schema),
+                        qi(&cur_domain.name)
+                    ),
+                    non_transactional: false,
+                },
             );
         }
     }
 
     // ── Phase 14.5: drop removed sequences (folded into their scalar's drop
     // step by name, matching phase 2.5's own OpKey::Scalar grouping) ────────
-    let target_sequence_set: HashSet<(String, String)> = target.scalars.iter()
+    let target_sequence_set: HashSet<(String, String)> = target
+        .scalars
+        .iter()
         .filter(|s| s.is_sequence)
         .map(|s| (s.module.clone(), format!("{}_seq", s.name)))
         .collect();
@@ -2101,20 +2677,35 @@ fn diff_inner(
         if !target_sequence_set.contains(&(cur_seq.schema.clone(), cur_seq.name.clone())) {
             let scalar_name = cur_seq.name.strip_suffix("_seq").unwrap_or(&cur_seq.name).to_string();
             steps.push(
-                OpKey::Scalar(cur_seq.schema.clone(), scalar_name.clone()), Verb::Drop,
+                OpKey::Scalar(cur_seq.schema.clone(), scalar_name.clone()),
+                Verb::Drop,
                 verbosename_scalar(&cur_seq.schema, &scalar_name),
-                DiffOp { sql: format!("DROP SEQUENCE IF EXISTS {}.{};", pg_schema(&cur_seq.schema), qi(&cur_seq.name)), non_transactional: false },
+                DiffOp {
+                    sql: format!(
+                        "DROP SEQUENCE IF EXISTS {}.{};",
+                        pg_schema(&cur_seq.schema),
+                        qi(&cur_seq.name)
+                    ),
+                    non_transactional: false,
+                },
             );
         }
     }
 
     // ── Phase 15: drop removed modules ───────────────────────────────────────
     for module in &current.schemas {
-        if module == "default" { continue; } // never drop public
+        if module == "default" {
+            continue;
+        } // never drop public
         if !target_schemas.contains(module) {
             steps.push(
-                OpKey::Module(module.clone()), Verb::Drop, verbosename_module(module),
-                DiffOp { sql: format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(module)), non_transactional: false },
+                OpKey::Module(module.clone()),
+                Verb::Drop,
+                verbosename_module(module),
+                DiffOp {
+                    sql: format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(module)),
+                    non_transactional: false,
+                },
             );
         }
     }
@@ -2123,7 +2714,10 @@ fn diff_inner(
 }
 
 fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
-    ops.push(DiffOp { sql, non_transactional: false });
+    ops.push(DiffOp {
+        sql,
+        non_transactional: false,
+    });
 }
 
 // ── Default resolution ────────────────────────────────────────────────────────
@@ -2156,25 +2750,41 @@ fn emit_create_table(td: &TypeDescriptor, schema: &SchemaDescriptor, ops: &mut V
         let default = resolve_default(p, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        lines.push(format!("    {} {}{}{}", qi(&p.name), col_type_str(p), not_null, default));
+        lines.push(format!(
+            "    {} {}{}{}",
+            qi(&p.name),
+            col_type_str(p),
+            not_null,
+            default
+        ));
     }
     for l in &td.links {
-        if l.is_junction_backed() { continue; }
+        if l.is_junction_backed() {
+            continue;
+        }
         let not_null = if l.nullable { "" } else { " NOT NULL" };
         let default = resolve_link_default(l, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        lines.push(format!("    {} uuid{}{}", qi(&format!("{}_id", l.name)), not_null, default));
+        lines.push(format!(
+            "    {} uuid{}{}",
+            qi(&format!("{}_id", l.name)),
+            not_null,
+            default
+        ));
     }
     let pk_cols: Vec<String> = td.properties.iter().filter(|p| p.is_pk).map(|p| qi(&p.name)).collect();
     if !pk_cols.is_empty() {
         lines.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
-    push_tx(ops, format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
-        qn(&td.module, &td.table),
-        lines.join(",\n")
-    ));
+    push_tx(
+        ops,
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
+            qn(&td.module, &td.table),
+            lines.join(",\n")
+        ),
+    );
 }
 
 /// `CREATE OR REPLACE TRIGGER` statement wiring `qualified_table` into the
@@ -2203,49 +2813,64 @@ fn emit_column_diff(
     schema: &SchemaDescriptor,
     required_input: &mut Vec<RequiredInput>,
 ) {
-    let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter()
-        .map(|c| (c.name.as_str(), c))
-        .collect();
+    let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter().map(|c| (c.name.as_str(), c)).collect();
 
     // ── Add new columns ───────────────────────────────────────────────────────
     for p in &td.properties {
-        if existing_col_map.contains_key(p.name.as_str()) { continue; }
+        if existing_col_map.contains_key(p.name.as_str()) {
+            continue;
+        }
         let eff_default = resolve_default(p, schema);
-        let needs_fill = for_migration && !p.nullable && eff_default.is_none()
-            && fill_cols.contains(&p.name);
+        let needs_fill = for_migration && !p.nullable && eff_default.is_none() && fill_cols.contains(&p.name);
         let not_null = if p.nullable || needs_fill { "" } else { " NOT NULL" };
-        let default = eff_default
-            .map(|d| format!(" DEFAULT {}", d))
-            .unwrap_or_default();
-        push_tx(ops, format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
-            qn(&td.module, &td.table), qi(&p.name), col_type_str(p), not_null, default
-        ));
+        let default = eff_default.map(|d| format!(" DEFAULT {}", d)).unwrap_or_default();
+        push_tx(
+            ops,
+            format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
+                qn(&td.module, &td.table),
+                qi(&p.name),
+                col_type_str(p),
+                not_null,
+                default
+            ),
+        );
     }
     for l in &td.links {
-        if l.is_junction_backed() { continue; }
+        if l.is_junction_backed() {
+            continue;
+        }
         let col = format!("{}_id", l.name);
-        if existing_col_map.contains_key(col.as_str()) { continue; }
+        if existing_col_map.contains_key(col.as_str()) {
+            continue;
+        }
         let eff_default = resolve_link_default(l, schema);
-        let needs_fill = for_migration && !l.nullable && eff_default.is_none()
-            && fill_cols.contains(&col);
+        let needs_fill = for_migration && !l.nullable && eff_default.is_none() && fill_cols.contains(&col);
         let not_null = if l.nullable || needs_fill { "" } else { " NOT NULL" };
-        let default = eff_default
-            .map(|d| format!(" DEFAULT {}", d))
-            .unwrap_or_default();
-        push_tx(ops, format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{}{};",
-            qn(&td.module, &td.table), qi(&col), not_null, default
-        ));
+        let default = eff_default.map(|d| format!(" DEFAULT {}", d)).unwrap_or_default();
+        push_tx(
+            ops,
+            format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} uuid{}{};",
+                qn(&td.module, &td.table),
+                qi(&col),
+                not_null,
+                default
+            ),
+        );
     }
 
     // ── Type changes on existing columns ──────────────────────────────────────
     // e.g. a property gaining a registered custom scalar's own DOMAIN (see
     // PropertyDescriptor.column_type), or any other base-type change.
-    let type_changes: Vec<(&str, &str)> = td.properties.iter()
+    let type_changes: Vec<(&str, &str)> = td
+        .properties
+        .iter()
         .filter_map(|p| {
             let cur = existing_col_map.get(p.name.as_str())?;
-            if cur.is_generated { return None; }
+            if cur.is_generated {
+                return None;
+            }
             let target_type = col_type_str(p);
             pg_type_changed(target_type, &cur.pg_type).then_some((p.name.as_str(), target_type))
         })
@@ -2281,10 +2906,16 @@ fn emit_column_diff(
                 default_expr,
                 type_name: format!("{}::{}", td.module, td.name),
             });
-            push_tx(ops, format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING \\({});",
-                qn(&td.module, &td.table), qi(col), target_type, placeholder
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING \\({});",
+                    qn(&td.module, &td.table),
+                    qi(col),
+                    target_type,
+                    placeholder
+                ),
+            );
         }
         for (_, _, ddl) in &affected_views {
             push_tx(ops, ddl.clone());
@@ -2293,20 +2924,32 @@ fn emit_column_diff(
 
     // ── Nullability + DEFAULT changes on existing columns ─────────────────────
     for p in &td.properties {
-        let Some(cur) = existing_col_map.get(p.name.as_str()) else { continue };
-        if cur.is_generated { continue; }
+        let Some(cur) = existing_col_map.get(p.name.as_str()) else {
+            continue;
+        };
+        if cur.is_generated {
+            continue;
+        }
         if !cur.nullable && p.nullable {
             // NOT NULL → nullable: always safe, no fill needed.
-            push_tx(ops, format!(
-                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
-                qn(&td.module, &td.table), qi(&p.name)
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                    qn(&td.module, &td.table),
+                    qi(&p.name)
+                ),
+            );
         } else if cur.nullable && !p.nullable && !for_migration {
             // nullable → NOT NULL: safe in watch mode (dev DB, typically no rows).
-            push_tx(ops, format!(
-                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
-                qn(&td.module, &td.table), qi(&p.name)
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                    qn(&td.module, &td.table),
+                    qi(&p.name)
+                ),
+            );
             // In migration mode this is intentionally skipped; the fill mechanism
             // emits UPDATE + SET NOT NULL after the main diff body.
         }
@@ -2316,79 +2959,135 @@ fn emit_column_diff(
         let db_default = cur.column_default.as_deref();
         match (&target_default, db_default) {
             (Some(want), Some(have)) if want != have => {
-                push_tx(ops, format!(
-                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
-                    qn(&td.module, &td.table), qi(&p.name), want
-                ));
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                        qn(&td.module, &td.table),
+                        qi(&p.name),
+                        want
+                    ),
+                );
             }
             (Some(want), None) => {
-                push_tx(ops, format!(
-                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
-                    qn(&td.module, &td.table), qi(&p.name), want
-                ));
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                        qn(&td.module, &td.table),
+                        qi(&p.name),
+                        want
+                    ),
+                );
             }
             (None, Some(_)) => {
-                push_tx(ops, format!(
-                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
-                    qn(&td.module, &td.table), qi(&p.name)
-                ));
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                        qn(&td.module, &td.table),
+                        qi(&p.name)
+                    ),
+                );
             }
             _ => {}
         }
     }
     for l in &td.links {
-        if l.is_junction_backed() { continue; }
+        if l.is_junction_backed() {
+            continue;
+        }
         let col = format!("{}_id", l.name);
-        let Some(cur) = existing_col_map.get(col.as_str()) else { continue };
+        let Some(cur) = existing_col_map.get(col.as_str()) else {
+            continue;
+        };
         if !cur.nullable && l.nullable {
-            push_tx(ops, format!(
-                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
-                qn(&td.module, &td.table), qi(&col)
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                    qn(&td.module, &td.table),
+                    qi(&col)
+                ),
+            );
         } else if cur.nullable && !l.nullable && !for_migration {
-            push_tx(ops, format!(
-                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
-                qn(&td.module, &td.table), qi(&col)
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                    qn(&td.module, &td.table),
+                    qi(&col)
+                ),
+            );
         }
 
         let target_default = resolve_link_default(l, schema);
         let db_default = cur.column_default.as_deref();
         match (&target_default, db_default) {
             (Some(want), Some(have)) if want != have => {
-                push_tx(ops, format!(
-                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
-                    qn(&td.module, &td.table), qi(&col), want
-                ));
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                        qn(&td.module, &td.table),
+                        qi(&col),
+                        want
+                    ),
+                );
             }
             (Some(want), None) => {
-                push_tx(ops, format!(
-                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
-                    qn(&td.module, &td.table), qi(&col), want
-                ));
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                        qn(&td.module, &td.table),
+                        qi(&col),
+                        want
+                    ),
+                );
             }
             (None, Some(_)) => {
-                push_tx(ops, format!(
-                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
-                    qn(&td.module, &td.table), qi(&col)
-                ));
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                        qn(&td.module, &td.table),
+                        qi(&col)
+                    ),
+                );
             }
             _ => {}
         }
     }
 
     // ── Drop removed columns ──────────────────────────────────────────────────
-    let target_cols: HashSet<String> = td.properties.iter().map(|p| p.name.clone())
-        .chain(td.links.iter().filter(|l| !l.is_junction_backed()).map(|l| format!("{}_id", l.name)))
+    let target_cols: HashSet<String> = td
+        .properties
+        .iter()
+        .map(|p| p.name.clone())
+        .chain(
+            td.links
+                .iter()
+                .filter(|l| !l.is_junction_backed())
+                .map(|l| format!("{}_id", l.name)),
+        )
         .collect();
     for col in &existing.columns {
         let n = col.name.as_str();
-        if target_cols.contains(n) { continue; }
-        if n.starts_with("__") && n.ends_with("__") { continue; }
-        push_tx(ops, format!(
-            "ALTER TABLE {} DROP COLUMN IF EXISTS {};",
-            qn(&td.module, &td.table), qi(n)
-        ));
+        if target_cols.contains(n) {
+            continue;
+        }
+        if n.starts_with("__") && n.ends_with("__") {
+            continue;
+        }
+        push_tx(
+            ops,
+            format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {};",
+                qn(&td.module, &td.table),
+                qi(n)
+            ),
+        );
     }
 }
 
@@ -2407,10 +3106,16 @@ fn emit_fk_diff(
         .unwrap_or_default();
 
     for l in &td.links {
-        if l.is_junction_backed() { continue; }
+        if l.is_junction_backed() {
+            continue;
+        }
         let cname = format!("{}_{}_fkey", td.table, l.name);
-        if existing_fk_names.contains(cname.as_str()) { continue; }
-        let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
+        if existing_fk_names.contains(cname.as_str()) {
+            continue;
+        }
+        let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else {
+            continue;
+        };
         // See `export::needs_deferred_target_fk`'s doc comment — a
         // Source-side DeleteTarget/DeleteTargetIfOrphan trigger deletes the
         // target while the still-not-yet-removed owner row would otherwise
@@ -2418,7 +3123,9 @@ fn emit_fk_diff(
         // `tests/live_execution_on_delete.rs`); force it deferrable so the
         // check only runs at commit, after both deletes have completed.
         let needs_deferred = crate::export::needs_deferred_target_fk(&l.on_delete);
-        let on_delete = l.on_delete.iter()
+        let on_delete = l
+            .on_delete
+            .iter()
             .find(|p| p.side == DeleteSide::Target)
             .map(|p| match &p.action {
                 DeleteAction::Restrict if needs_deferred => " DEFERRABLE INITIALLY DEFERRED",
@@ -2428,20 +3135,33 @@ fn emit_fk_diff(
                 DeleteAction::Allow => " ON DELETE SET NULL",
                 _ => " ON DELETE RESTRICT",
             })
-            .unwrap_or(if needs_deferred { " DEFERRABLE INITIALLY DEFERRED" } else { " ON DELETE RESTRICT" });
-        push_tx(ops, format!(
-            "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id){};",
-            qn(&td.module, &td.table),
-            qi(&cname),
-            qi(&format!("{}_id", l.name)),
-            qn(tgt_module, tgt_table),
-            on_delete
-        ));
+            .unwrap_or(if needs_deferred {
+                " DEFERRABLE INITIALLY DEFERRED"
+            } else {
+                " ON DELETE RESTRICT"
+            });
+        push_tx(
+            ops,
+            format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}(id){};",
+                qn(&td.module, &td.table),
+                qi(&cname),
+                qi(&format!("{}_id", l.name)),
+                qn(tgt_module, tgt_table),
+                on_delete
+            ),
+        );
     }
 }
 
 // ── Junction table for a new multi-link ───────────────────────────────────────
 
+// Every parameter here is one independent axis of a junction table's shape
+// (name, target, through-type, delete policy, cardinality, exclusivity), and
+// they come from three different places in the caller. Bundling them into a
+// params struct would move the same ten fields one level out without making
+// any call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn emit_junction_table(
     td: &TypeDescriptor,
     ml_name: &str,
@@ -2460,7 +3180,8 @@ fn emit_junction_table(
     let src_on_delete = " ON DELETE CASCADE";
     // See the identical comment in `emit_fk_diff` above / `export::needs_deferred_target_fk`.
     let needs_deferred = crate::export::needs_deferred_target_fk(on_delete);
-    let tgt_on_delete = on_delete.iter()
+    let tgt_on_delete = on_delete
+        .iter()
         .find(|p| p.side == DeleteSide::Target)
         .map(|p| match &p.action {
             DeleteAction::Restrict if needs_deferred => " DEFERRABLE INITIALLY DEFERRED",
@@ -2470,39 +3191,57 @@ fn emit_junction_table(
             DeleteAction::DeleteSource => " ON DELETE CASCADE",
             _ => " ON DELETE RESTRICT",
         })
-        .unwrap_or(if needs_deferred { " DEFERRABLE INITIALLY DEFERRED" } else { " ON DELETE RESTRICT" });
+        .unwrap_or(if needs_deferred {
+            " DEFERRABLE INITIALLY DEFERRED"
+        } else {
+            " ON DELETE RESTRICT"
+        });
 
-    let tgt_ref = type_map.get(ml_target).map(|(m, t)| qn(m, t))
+    let tgt_ref = type_map
+        .get(ml_target)
+        .map(|(m, t)| qn(m, t))
         .unwrap_or_else(|| qi(ml_target));
 
     let mut col_lines = format!(
         "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){}",
-        qn(&td.module, &td.table), src_on_delete,
-        tgt_ref, tgt_on_delete,
+        qn(&td.module, &td.table),
+        src_on_delete,
+        tgt_ref,
+        tgt_on_delete,
     );
 
     // Extra columns from the through junction type.
-    if let Some(through_qname) = through {
-        if let Some(through_td) = schema.types.iter().find(|t| {
-            format!("{}::{}", t.module, t.name) == through_qname && t.junction
-        }) {
-            for p in &through_td.properties {
-                if p.name == "id" { continue; }
-                let not_null = if p.nullable { "" } else { " NOT NULL" };
-                col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), col_type_str(p), not_null));
+    if let Some(through_qname) = through
+        && let Some(through_td) = schema
+            .types
+            .iter()
+            .find(|t| format!("{}::{}", t.module, t.name) == through_qname && t.junction)
+    {
+        for p in &through_td.properties {
+            if p.name == "id" {
+                continue;
             }
+            let not_null = if p.nullable { "" } else { " NOT NULL" };
+            col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), col_type_str(p), not_null));
         }
     }
 
-    let pk_clause = if single { "PRIMARY KEY (source)" } else { "PRIMARY KEY (source, target)" };
+    let pk_clause = if single {
+        "PRIMARY KEY (source)"
+    } else {
+        "PRIMARY KEY (source, target)"
+    };
     let unique_clause = if exclusive { ",\n    UNIQUE (target)" } else { "" };
-    push_tx(ops, format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n{},\n    {}{}\n);",
-        qn(&td.module, &jt_name),
-        col_lines,
-        pk_clause,
-        unique_clause,
-    ));
+    push_tx(
+        ops,
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{},\n    {}{}\n);",
+            qn(&td.module, &jt_name),
+            col_lines,
+            pk_clause,
+            unique_clause,
+        ),
+    );
 }
 
 // ── diff_states: diff two live-DB snapshots (for squash) ──────────────────────
@@ -2511,19 +3250,27 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
     let mut ops: Vec<DiffOp> = Vec::new();
 
     let before_schemas: HashSet<&str> = before.schemas.iter().map(|s| s.as_str()).collect();
-    let before_tables: HashMap<(&str, &str), &DbTable> = before.tables.iter()
+    let before_tables: HashMap<(&str, &str), &DbTable> = before
+        .tables
+        .iter()
         .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
         .collect();
-    let before_enums: HashMap<(&str, &str), &DbEnum> = before.enums.iter()
+    let before_enums: HashMap<(&str, &str), &DbEnum> = before
+        .enums
+        .iter()
         .map(|e| ((e.schema.as_str(), e.name.as_str()), e))
         .collect();
-    let before_domains: HashSet<(&str, &str)> = before.domains.iter()
+    let before_domains: HashSet<(&str, &str)> = before
+        .domains
+        .iter()
         .map(|d| (d.schema.as_str(), d.name.as_str()))
         .collect();
 
     // New schemas
     for schema in &after.schemas {
-        if schema == "default" { continue; } // public always exists
+        if schema == "default" {
+            continue;
+        } // public always exists
         if !before_schemas.contains(schema.as_str()) {
             push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(schema)));
         }
@@ -2533,23 +3280,35 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
     for e in &after.enums {
         match before_enums.get(&(e.schema.as_str(), e.name.as_str())) {
             None => {
-                let members: Vec<String> = e.members.iter()
+                let members: Vec<String> = e
+                    .members
+                    .iter()
                     .map(|m| format!("'{}'", m.replace('\'', "''")))
                     .collect();
-                push_tx(&mut ops, format!(
-                    "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
+                push_tx(
+                    &mut ops,
+                    format!(
+                        "DO $$ BEGIN CREATE TYPE {}.{} AS ENUM ({}); \
                      EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
-                    pg_schema(&e.schema), qi(&e.name), members.join(", ")
-                ));
+                        pg_schema(&e.schema),
+                        qi(&e.name),
+                        members.join(", ")
+                    ),
+                );
             }
             Some(existing) => {
                 let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
                 for member in &e.members {
                     if !existing_set.contains(member.as_str()) {
-                        push_tx(&mut ops, format!(
-                            "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                            pg_schema(&e.schema), qi(&e.name), member.replace('\'', "''")
-                        ));
+                        push_tx(
+                            &mut ops,
+                            format!(
+                                "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                                pg_schema(&e.schema),
+                                qi(&e.name),
+                                member.replace('\'', "''")
+                            ),
+                        );
                     }
                 }
             }
@@ -2561,10 +3320,14 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
         if !before_domains.contains(&(d.schema.as_str(), d.name.as_str())) {
             // We can't reconstruct the full domain DDL from pg_catalog cheaply;
             // emit a placeholder that will be filled by the squash command.
-            push_tx(&mut ops, format!(
-                "-- TODO: recreate domain {}.{} (reconstruct DDL from source migrations)",
-                pg_schema(&d.schema), qi(&d.name)
-            ));
+            push_tx(
+                &mut ops,
+                format!(
+                    "-- TODO: recreate domain {}.{} (reconstruct DDL from source migrations)",
+                    pg_schema(&d.schema),
+                    qi(&d.name)
+                ),
+            );
         }
     }
 
@@ -2588,18 +3351,27 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
     // FK constraints for existing tables that gained new FKs
     for t in &after.tables {
         if let Some(before_t) = before_tables.get(&(t.schema.as_str(), t.name.as_str())) {
-            let before_fk_names: HashSet<&str> = before_t.foreign_keys.iter()
+            let before_fk_names: HashSet<&str> = before_t
+                .foreign_keys
+                .iter()
                 .map(|fk| fk.constraint_name.as_str())
                 .collect();
             for fk in &t.foreign_keys {
                 if !before_fk_names.contains(fk.constraint_name.as_str()) {
                     // Can't fully reconstruct FK DDL from DbForeignKey without ON DELETE info;
                     // emit best-effort.
-                    push_tx(&mut ops, format!(
-                        "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{}(id);",
-                        pg_schema(&t.schema), qi(&t.name), qi(&fk.constraint_name),
-                        qi(&fk.local_column), pg_schema(&fk.ref_schema), qi(&fk.ref_table)
-                    ));
+                    push_tx(
+                        &mut ops,
+                        format!(
+                            "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{}(id);",
+                            pg_schema(&t.schema),
+                            qi(&t.name),
+                            qi(&fk.constraint_name),
+                            qi(&fk.local_column),
+                            pg_schema(&fk.ref_schema),
+                            qi(&fk.ref_table)
+                        ),
+                    );
                 }
             }
         }
@@ -2613,50 +3385,66 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
             .map(|bt| bt.indexes.iter().map(|i| i.name.as_str()).collect())
             .unwrap_or_default();
         for idx in &t.indexes {
-            if before_idx_names.contains(idx.name.as_str()) { continue; }
+            if before_idx_names.contains(idx.name.as_str()) {
+                continue;
+            }
             let use_concurrently = !table_is_new;
             let concurrently = if use_concurrently { "CONCURRENTLY " } else { "" };
             let unique = if idx.is_unique { "UNIQUE " } else { "" };
             let idx_sql = format!(
                 "CREATE {unique}INDEX {concurrently}IF NOT EXISTS {} ON {}.{};",
-                qi(&idx.name), pg_schema(&t.schema), qi(&t.name)
+                qi(&idx.name),
+                pg_schema(&t.schema),
+                qi(&t.name)
             );
-            ops.push(DiffOp { sql: idx_sql, non_transactional: use_concurrently });
+            ops.push(DiffOp {
+                sql: idx_sql,
+                non_transactional: use_concurrently,
+            });
         }
     }
 
     // Drop removed tables
-    let after_tables: HashSet<(&str, &str)> = after.tables.iter()
+    let after_tables: HashSet<(&str, &str)> = after
+        .tables
+        .iter()
         .map(|t| (t.schema.as_str(), t.name.as_str()))
         .collect();
     for t in &before.tables {
         if !after_tables.contains(&(t.schema.as_str(), t.name.as_str())) {
-            push_tx(&mut ops, format!(
-                "DROP TABLE IF EXISTS {}.{} CASCADE;",
-                pg_schema(&t.schema), qi(&t.name)
-            ));
+            push_tx(
+                &mut ops,
+                format!("DROP TABLE IF EXISTS {}.{} CASCADE;", pg_schema(&t.schema), qi(&t.name)),
+            );
         }
     }
 
     // Drop removed enums
-    let after_enum_set: HashSet<(&str, &str)> = after.enums.iter()
+    let after_enum_set: HashSet<(&str, &str)> = after
+        .enums
+        .iter()
         .map(|e| (e.schema.as_str(), e.name.as_str()))
         .collect();
     for e in &before.enums {
         if !after_enum_set.contains(&(e.schema.as_str(), e.name.as_str())) {
-            push_tx(&mut ops, format!(
-                "DROP TYPE IF EXISTS {}.{} CASCADE;",
-                pg_schema(&e.schema), qi(&e.name)
-            ));
+            push_tx(
+                &mut ops,
+                format!("DROP TYPE IF EXISTS {}.{} CASCADE;", pg_schema(&e.schema), qi(&e.name)),
+            );
         }
     }
 
     // Drop removed schemas
     let after_schema_set: HashSet<&str> = after.schemas.iter().map(|s| s.as_str()).collect();
     for schema in &before.schemas {
-        if schema == "default" { continue; } // never drop public
+        if schema == "default" {
+            continue;
+        } // never drop public
         if !after_schema_set.contains(schema.as_str()) {
-            push_tx(&mut ops, format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(schema)));
+            push_tx(
+                &mut ops,
+                format!("DROP SCHEMA IF EXISTS {} CASCADE;", pg_schema(schema)),
+            );
         }
     }
 
@@ -2669,16 +3457,24 @@ fn emit_create_table_from_db(t: &DbTable, ops: &mut Vec<DiffOp>) {
         let not_null = if col.nullable { "" } else { " NOT NULL" };
         if col.is_generated {
             // Can't reconstruct the generation expression from DbColumn alone.
-            lines.push(format!("    {} {} GENERATED ALWAYS AS (/* see source */) STORED", qi(&col.name), col.pg_type));
+            lines.push(format!(
+                "    {} {} GENERATED ALWAYS AS (/* see source */) STORED",
+                qi(&col.name),
+                col.pg_type
+            ));
         } else {
             lines.push(format!("    {} {}{}", qi(&col.name), col.pg_type, not_null));
         }
     }
-    push_tx(ops, format!(
-        "CREATE TABLE IF NOT EXISTS {}.{} (\n{}\n);",
-        pg_schema(&t.schema), qi(&t.name),
-        lines.join(",\n")
-    ));
+    push_tx(
+        ops,
+        format!(
+            "CREATE TABLE IF NOT EXISTS {}.{} (\n{}\n);",
+            pg_schema(&t.schema),
+            qi(&t.name),
+            lines.join(",\n")
+        ),
+    );
 }
 
 fn emit_column_diff_from_db(after: &DbTable, before: &DbTable, ops: &mut Vec<DiffOp>) {
@@ -2688,18 +3484,30 @@ fn emit_column_diff_from_db(after: &DbTable, before: &DbTable, ops: &mut Vec<Dif
     for col in &after.columns {
         if !before_cols.contains(col.name.as_str()) {
             let not_null = if col.nullable { "" } else { " NOT NULL" };
-            push_tx(ops, format!(
-                "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} {}{};",
-                pg_schema(&after.schema), qi(&after.name), qi(&col.name), col.pg_type, not_null
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} {}{};",
+                    pg_schema(&after.schema),
+                    qi(&after.name),
+                    qi(&col.name),
+                    col.pg_type,
+                    not_null
+                ),
+            );
         }
     }
     for col in &before.columns {
         if !after_cols.contains(col.name.as_str()) {
-            push_tx(ops, format!(
-                "ALTER TABLE {}.{} DROP COLUMN IF EXISTS {};",
-                pg_schema(&after.schema), qi(&after.name), qi(&col.name)
-            ));
+            push_tx(
+                ops,
+                format!(
+                    "ALTER TABLE {}.{} DROP COLUMN IF EXISTS {};",
+                    pg_schema(&after.schema),
+                    qi(&after.name),
+                    qi(&col.name)
+                ),
+            );
         }
     }
 }
@@ -2711,28 +3519,47 @@ mod tests {
     use super::*;
     use crate::schema::{EnumDescriptor, LinkDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor};
 
-    fn empty_state() -> DbState { DbState::default() }
+    fn empty_state() -> DbState {
+        DbState::default()
+    }
 
     fn prop(name: &str, pg_type: &str, nullable: bool) -> PropertyDescriptor {
         PropertyDescriptor {
-            name: name.into(), pg_type: pg_type.into(), nullable,
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable,
             default_sql: if name == "id" { Some("uuidv7()".into()) } else { None },
-                        default_pyql: None,
-            description: None, check_constraints: vec![],
-            is_exclusive: name == "id", is_pk: name == "id",
-            is_readonly: name == "id", rewrites: vec![],
-        tuple_members: None, column_type: None, }
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: name == "id",
+            is_pk: name == "id",
+            is_readonly: name == "id",
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }
     }
 
     fn simple_type(module: &str, name: &str, table: &str) -> TypeDescriptor {
         TypeDescriptor {
-            name: name.into(), module: module.into(), table: table.into(),
-            abstract_: false, materialized: false, description: None,
-            parents: vec![], interfaces: vec![],
+            name: name.into(),
+            module: module.into(),
+            table: table.into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
             properties: vec![prop("id", "uuid", false), prop("name", "text", true)],
-            links: vec![], multilinks: vec![], computed: vec![],
-            constraints: vec![], indexes: vec![],
-            vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
             junction: false,
             signals: vec![],
         }
@@ -2751,12 +3578,24 @@ mod tests {
         assert_ne!(before.properties[1].is_readonly, after.properties[1].is_readonly);
 
         let schema_before = SchemaDescriptor {
-            types: vec![before], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![before],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let schema_after = SchemaDescriptor {
-            types: vec![after], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![after],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -2766,16 +3605,29 @@ mod tests {
         let before = simple_type("default", "Person", "Person");
         let mut after = before.clone();
         after.properties[1].rewrites.push(crate::schema::RewriteEntry {
-            on: 1, handler: "str_upper(.name)".into(),
+            on: 1,
+            handler: "str_upper(.name)".into(),
         });
 
         let schema_before = SchemaDescriptor {
-            types: vec![before], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![before],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let schema_after = SchemaDescriptor {
-            types: vec![after], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![after],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -2784,8 +3636,14 @@ mod tests {
     fn test_schema_content_changed_is_false_for_identical_schemas() {
         let t = simple_type("default", "Person", "Person");
         let schema = SchemaDescriptor {
-            types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![t],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let other = schema.clone();
         assert!(!schema_content_changed(&schema, Some(&other)));
@@ -2795,10 +3653,19 @@ mod tests {
     fn test_schema_content_changed_true_against_none_when_target_is_non_empty() {
         let t = simple_type("default", "Person", "Person");
         let schema = SchemaDescriptor {
-            types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![t],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
-        assert!(schema_content_changed(&schema, None), "no prior snapshot at all must count as changed");
+        assert!(
+            schema_content_changed(&schema, None),
+            "no prior snapshot at all must count as changed"
+        );
     }
 
     #[test]
@@ -2815,8 +3682,13 @@ mod tests {
         let schema_before = SchemaDescriptor::default();
         let schema_after = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -2845,12 +3717,24 @@ mod tests {
     fn test_new_schema_and_table() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("catalog", "Product", "Product")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("CREATE SCHEMA IF NOT EXISTS \"catalog\""), "got:\n{joined}");
-        assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""), "got:\n{joined}");
+        assert!(
+            joined.contains("CREATE SCHEMA IF NOT EXISTS \"catalog\""),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""),
+            "got:\n{joined}"
+        );
         assert!(
             joined.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"catalog\".\"Product\""),
             "new table must get the cache-invalidation trigger; got:\n{joined}"
@@ -2859,7 +3743,11 @@ mod tests {
 
     fn widget_with_trigger(on: u8, timing: &str, handler: &str) -> TypeDescriptor {
         let mut t = simple_type("default", "Widget", "Widget");
-        t.triggers = vec![crate::schema::TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }];
+        t.triggers = vec![crate::schema::TriggerDescriptor {
+            on,
+            timing: timing.into(),
+            handler: handler.into(),
+        }];
         t
     }
 
@@ -2872,8 +3760,18 @@ mod tests {
         // `Trigger(...)` to an existing type had zero effect on a real
         // migration.
         let schema = SchemaDescriptor {
-            types: vec![widget_with_trigger(1, "After", "update Widget set { name := __new__.name }")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![widget_with_trigger(
+                1,
+                "After",
+                "update Widget set { name := __new__.name }",
+            )],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -2887,12 +3785,25 @@ mod tests {
         // a user Trigger as already present, or `migration create` would
         // propose recreating it forever, even with zero real schema changes.
         let schema = SchemaDescriptor {
-            types: vec![widget_with_trigger(1, "After", "update Widget set { name := __new__.name }")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![widget_with_trigger(
+                1,
+                "After",
+                "update Widget set { name := __new__.name }",
+            )],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let baseline = schema_to_db_state(&schema);
         let steps = diff_schema_steps(&schema, &baseline, &HashMap::new()).unwrap();
-        assert!(steps.is_empty(), "expected zero further migration steps, got: {steps:?}");
+        assert!(
+            steps.is_empty(),
+            "expected zero further migration steps, got: {steps:?}"
+        );
     }
 
     #[test]
@@ -2917,7 +3828,13 @@ mod tests {
         });
         let schema = SchemaDescriptor {
             types: vec![order, simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -2946,10 +3863,17 @@ mod tests {
 
         let schema = SchemaDescriptor {
             types: vec![product, junction, simple_type("default", "Tag", "Tag")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
-        let trigger_count = ops.iter()
+        let trigger_count = ops
+            .iter()
             .filter(|op| op.contains("AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Product.tags\""))
             .count();
         assert_eq!(
@@ -2978,7 +3902,13 @@ mod tests {
 
         SchemaDescriptor {
             types: vec![person, junction],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -2987,8 +3917,14 @@ mod tests {
         let schema = person_with_junction_backed_spouse();
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
-        assert!(!joined.contains("spouse_id"), "no {{name}}_id column/FK for a junction-backed link, got:\n{joined}");
-        assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"public\".\"Person.spouse\""), "got:\n{joined}");
+        assert!(
+            !joined.contains("spouse_id"),
+            "no {{name}}_id column/FK for a junction-backed link, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("CREATE TABLE IF NOT EXISTS \"public\".\"Person.spouse\""),
+            "got:\n{joined}"
+        );
         assert!(joined.contains("PRIMARY KEY (source)"), "got:\n{joined}");
         assert!(joined.contains("UNIQUE (target)"), "got:\n{joined}");
     }
@@ -3007,54 +3943,126 @@ mod tests {
             schemas: vec![],
             tables: vec![
                 DbTable {
-                    schema: "default".into(), name: "Person".into(),
+                    schema: "default".into(),
+                    name: "Person".into(),
                     columns: vec![
-                        DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                        DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                        DbColumn {
+                            name: "id".into(),
+                            pg_type: "uuid".into(),
+                            nullable: false,
+                            is_generated: false,
+                            column_default: Some("uuidv7()".into()),
+                        },
+                        DbColumn {
+                            name: "name".into(),
+                            pg_type: "text".into(),
+                            nullable: true,
+                            is_generated: false,
+                            column_default: None,
+                        },
                     ],
-                    foreign_keys: vec![], indexes: vec![], checks: vec![],
+                    foreign_keys: vec![],
+                    indexes: vec![],
+                    checks: vec![],
                     triggers: vec!["pylon_cache_invalidate".into()],
                 },
                 DbTable {
-                    schema: "default".into(), name: "Person.spouse".into(),
+                    schema: "default".into(),
+                    name: "Person.spouse".into(),
                     columns: vec![
-                        DbColumn { name: "source".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: None },
-                        DbColumn { name: "target".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: None },
-                        DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                        DbColumn {
+                            name: "source".into(),
+                            pg_type: "uuid".into(),
+                            nullable: false,
+                            is_generated: false,
+                            column_default: None,
+                        },
+                        DbColumn {
+                            name: "target".into(),
+                            pg_type: "uuid".into(),
+                            nullable: false,
+                            is_generated: false,
+                            column_default: None,
+                        },
+                        DbColumn {
+                            name: "name".into(),
+                            pg_type: "text".into(),
+                            nullable: true,
+                            is_generated: false,
+                            column_default: None,
+                        },
                     ],
                     foreign_keys: vec![
-                        DbForeignKey { constraint_name: "Person_spouse_source_fkey".into(), local_column: "source".into(), ref_schema: "default".into(), ref_table: "Person".into() },
-                        DbForeignKey { constraint_name: "Person_spouse_target_fkey".into(), local_column: "target".into(), ref_schema: "default".into(), ref_table: "Person".into() },
+                        DbForeignKey {
+                            constraint_name: "Person_spouse_source_fkey".into(),
+                            local_column: "source".into(),
+                            ref_schema: "default".into(),
+                            ref_table: "Person".into(),
+                        },
+                        DbForeignKey {
+                            constraint_name: "Person_spouse_target_fkey".into(),
+                            local_column: "target".into(),
+                            ref_schema: "default".into(),
+                            ref_table: "Person".into(),
+                        },
                     ],
-                    indexes: vec![], checks: vec![],
+                    indexes: vec![],
+                    checks: vec![],
                     triggers: vec!["pylon_cache_invalidate".into()],
                 },
             ],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
-        assert!(ops.is_empty(), "already-migrated junction-backed single link must diff to no ops, got: {:?}", ops);
+        assert!(
+            ops.is_empty(),
+            "already-migrated junction-backed single link must diff to no ops, got: {:?}",
+            ops
+        );
     }
 
     #[test]
     fn test_cache_invalidate_trigger_backfilled_on_pre_existing_table() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
                 triggers: vec![], // pre-existing table, created before this feature shipped
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
@@ -3069,45 +4077,93 @@ mod tests {
     fn test_cache_invalidate_trigger_not_dropped_when_already_present() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
                 triggers: vec!["pylon_cache_invalidate".into()],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
-        assert!(ops.iter().all(|op| !op.contains("DROP TRIGGER") && !op.contains("pylon_cache_invalidate")),
-            "already-present trigger must not be re-created or dropped; got: {:?}", ops);
+        assert!(
+            ops.iter()
+                .all(|op| !op.contains("DROP TRIGGER") && !op.contains("pylon_cache_invalidate")),
+            "already-present trigger must not be re-created or dropped; got: {:?}",
+            ops
+        );
     }
 
     #[test]
     fn test_no_ops_when_in_sync() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Person", "Person")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
                 triggers: vec!["pylon_cache_invalidate".into()],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
@@ -3119,19 +4175,43 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("email", "text", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
@@ -3146,26 +4226,58 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("rating", "int8", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
-                    DbColumn { name: "rating".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
+                    DbColumn {
+                        name: "rating".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
         assert!(
-            joined.contains("ALTER TABLE \"public\".\"Person\" ALTER COLUMN \"rating\" TYPE int8 USING \"rating\"::int8;"),
+            joined.contains(
+                "ALTER TABLE \"public\".\"Person\" ALTER COLUMN \"rating\" TYPE int8 USING \"rating\"::int8;"
+            ),
             "got:\n{joined}"
         );
     }
@@ -3175,25 +4287,56 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("rating", "int8", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
-                    DbColumn { name: "rating".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
+                    DbColumn {
+                        name: "rating".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
 
         let steps = diff_schema_steps(&schema, &state, &HashMap::new()).unwrap();
-        let step = steps.iter()
+        let step = steps
+            .iter()
             .find(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == "default" && t == "Person"))
             .expect("expected an alter step for Person");
 
@@ -3221,24 +4364,58 @@ mod tests {
         let mut td = simple_type("default", "Person", "Person");
         td.properties.push(prop("age", "int8", true));
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
-                    DbColumn { name: "age".into(), pg_type: "bigint".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
+                    DbColumn {
+                        name: "age".into(),
+                        pg_type: "bigint".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec!["pylon_cache_invalidate".into()],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec!["pylon_cache_invalidate".into()],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
-        assert!(ops.iter().all(|op| !op.contains("ALTER COLUMN")), "expected no ALTER COLUMN ops, got: {:?}", ops);
+        assert!(
+            ops.iter().all(|op| !op.contains("ALTER COLUMN")),
+            "expected no ALTER COLUMN ops, got: {:?}",
+            ops
+        );
     }
 
     #[test]
@@ -3264,10 +4441,19 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![account, individual],
             scalars: vec![ScalarDescriptor {
-                name: "Email".into(), module: "default".into(), base: "Str".into(),
-                pg_type: "text".into(), check_constraints: vec!["value ~ '@'".into()], is_sequence: false,
+                name: "Email".into(),
+                module: "default".into(),
+                base: "Str".into(),
+                pg_type: "text".into(),
+                check_constraints: vec!["value ~ '@'".into()],
+                is_sequence: false,
             }],
-            enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
 
         // The view's own SELECT text never mentions column types, so its
@@ -3275,20 +4461,44 @@ mod tests {
         // `current` confirms Phase 10 doesn't ALSO try to (redundantly,
         // and invalidly, since it'd already exist) recreate it.
         let view_ddl = crate::export::interface_view_ddl_with_names(&schema)
-            .into_iter().find(|(_, n, _)| n == "Account").unwrap().2;
+            .into_iter()
+            .find(|(_, n, _)| n == "Account")
+            .unwrap()
+            .2;
 
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Individual".into(),
+                schema: "default".into(),
+                name: "Individual".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "email".into(), pg_type: "text".into(), nullable: false, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "email".into(),
+                        pg_type: "text".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec!["pylon_cache_invalidate".into()],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec!["pylon_cache_invalidate".into()],
             }],
-            views: vec![DbView { schema: "default".into(), name: "Account".into(), body_hash: ddl_hash(&view_ddl) }],
-            enums: vec![], domains: vec![],
+            views: vec![DbView {
+                schema: "default".into(),
+                name: "Account".into(),
+                body_hash: ddl_hash(&view_ddl),
+            }],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
 
@@ -3297,13 +4507,23 @@ mod tests {
         // unchanged DDL hash and doesn't redundantly re-emit it.
         let ops = diff_schema_ops(&schema, &state).unwrap();
         let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
-        let drop_pos = joined.find("DROP VIEW IF EXISTS \"public\".\"Account\"").expect(&format!("missing DROP VIEW; got:\n{joined}"));
-        let alter_pos = joined.find("ALTER TABLE \"public\".\"Individual\" ALTER COLUMN \"email\" TYPE \"public\".\"Email\"").expect(&format!("missing ALTER COLUMN TYPE; got:\n{joined}"));
-        let create_pos = joined.rfind("CREATE VIEW \"public\".\"Account\"").expect(&format!("missing CREATE VIEW; got:\n{joined}"));
+        let drop_pos = joined
+            .find("DROP VIEW IF EXISTS \"public\".\"Account\"")
+            .unwrap_or_else(|| panic!("missing DROP VIEW; got:\n{joined}"));
+        let alter_pos = joined
+            .find("ALTER TABLE \"public\".\"Individual\" ALTER COLUMN \"email\" TYPE \"public\".\"Email\"")
+            .unwrap_or_else(|| panic!("missing ALTER COLUMN TYPE; got:\n{joined}"));
+        let create_pos = joined
+            .rfind("CREATE VIEW \"public\".\"Account\"")
+            .unwrap_or_else(|| panic!("missing CREATE VIEW; got:\n{joined}"));
         assert!(drop_pos < alter_pos, "DROP VIEW must precede the ALTER; got:\n{joined}");
-        assert!(alter_pos < create_pos, "CREATE VIEW must follow the ALTER; got:\n{joined}");
+        assert!(
+            alter_pos < create_pos,
+            "CREATE VIEW must follow the ALTER; got:\n{joined}"
+        );
         assert_eq!(
-            joined.matches("CREATE VIEW \"public\".\"Account\"").count(), 1,
+            joined.matches("CREATE VIEW \"public\".\"Account\"").count(),
+            1,
             "view must be recreated exactly once, not duplicated by Phase 10; got:\n{joined}"
         );
     }
@@ -3325,7 +4545,13 @@ mod tests {
         }
         SchemaDescriptor {
             types,
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -3340,26 +4566,44 @@ mod tests {
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Individual".into(),
+                schema: "default".into(),
+                name: "Individual".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "email".into(), pg_type: "text".into(), nullable: false, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "email".into(),
+                        pg_type: "text".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
                 triggers: vec![
                     "pylon_cache_invalidate".into(),
                     "_excl_Account_email_ins".into(),
                     "_excl_Account_email_upd".into(),
                 ],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
 
         let ops = diff_schema_ops(&schema, &state).unwrap();
         let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
         assert!(
-            joined.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Organization\""),
+            joined.contains(
+                "CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Organization\""
+            ),
             "the new implementor must get the exclusive trigger; got:\n{joined}"
         );
         assert!(
@@ -3377,25 +4621,43 @@ mod tests {
         let mut schema = exclusive_email_account_schema(&["Individual"]);
         for t in &mut schema.types {
             for p in &mut t.properties {
-                if p.name == "email" { p.is_exclusive = false; }
+                if p.name == "email" {
+                    p.is_exclusive = false;
+                }
             }
         }
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Individual".into(),
+                schema: "default".into(),
+                name: "Individual".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "email".into(), pg_type: "text".into(), nullable: false, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "email".into(),
+                        pg_type: "text".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
                 triggers: vec![
                     "pylon_cache_invalidate".into(),
                     "_excl_Account_email_ins".into(),
                     "_excl_Account_email_upd".into(),
                 ],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
 
@@ -3418,41 +4680,65 @@ mod tests {
     #[test]
     fn test_new_enum() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![],
+            types: vec![],
+            scalars: vec![],
             enums: vec![EnumDescriptor {
-                name: "Status".into(), module: "default".into(),
+                name: "Status".into(),
+                module: "default".into(),
                 members: vec!["Active".into(), "Inactive".into()],
             }],
             named_tuples: vec![],
-            globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("CREATE TYPE \"public\".\"Status\" AS ENUM"), "got:\n{joined}");
+        assert!(
+            joined.contains("CREATE TYPE \"public\".\"Status\" AS ENUM"),
+            "got:\n{joined}"
+        );
     }
 
     #[test]
     fn test_drop_table() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "OldType".into(),
-                columns: vec![], foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                schema: "default".into(),
+                name: "OldType".into(),
+                columns: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("DROP TABLE IF EXISTS \"public\".\"OldType\" CASCADE"), "got:\n{joined}");
+        assert!(
+            joined.contains("DROP TABLE IF EXISTS \"public\".\"OldType\" CASCADE"),
+            "got:\n{joined}"
+        );
     }
 
     #[test]
     fn test_index_on_existing_table_is_concurrently() {
-        use crate::schema::{VectorIndexDescriptor};
+        use crate::schema::VectorIndexDescriptor;
         let mut td = simple_type("default", "Post", "Post");
         td.vector_indexes.push(VectorIndexDescriptor {
             index_name: None,
@@ -3462,33 +4748,70 @@ mod tests {
             dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         // The table already exists in the DB (pre-existing).
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Post".into(),
+                schema: "default".into(),
+                name: "Post".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
         let ops = diff_schema_ops(&schema, &state).unwrap();
         let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
-        assert!(idx_op.non_transactional, "index on pre-existing table should be non-transactional");
-        assert!(idx_op.sql.contains("CONCURRENTLY"), "should use CONCURRENTLY: {}", idx_op.sql);
+        assert!(
+            idx_op.non_transactional,
+            "index on pre-existing table should be non-transactional"
+        );
+        assert!(
+            idx_op.sql.contains("CONCURRENTLY"),
+            "should use CONCURRENTLY: {}",
+            idx_op.sql
+        );
     }
 
     #[test]
     fn test_required_extensions_empty_without_vector_indexes() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Post", "Post")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         assert!(required_extensions(&schema).is_empty());
     }
@@ -3498,17 +4821,31 @@ mod tests {
         use crate::schema::VectorIndexDescriptor;
         let mut td = simple_type("default", "Post", "Post");
         td.vector_indexes.push(VectorIndexDescriptor {
-            index_name: None, pointers: vec!["name".into()], model: "test".into(), metric: "cosine".into(), dimensions: 1536,
+            index_name: None,
+            pointers: vec!["name".into()],
+            model: "test".into(),
+            metric: "cosine".into(),
+            dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         assert_eq!(required_extensions(&schema), vec!["vector"]);
 
         let ddl = missing_extension_ddl(&schema, &DbState::default());
         assert_eq!(ddl, vec!["CREATE EXTENSION IF NOT EXISTS \"vector\";".to_string()]);
 
-        let already_installed = DbState { extensions: vec!["vector".into()], ..DbState::default() };
+        let already_installed = DbState {
+            extensions: vec!["vector".into()],
+            ..DbState::default()
+        };
         assert!(missing_extension_ddl(&schema, &already_installed).is_empty());
     }
 
@@ -3524,13 +4861,24 @@ mod tests {
             dimensions: 1536,
         });
         let schema = SchemaDescriptor {
-            types: vec![td], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![td],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         // Table does NOT exist in the DB → it's new.
         let ops = diff_schema_ops(&schema, &empty_state()).unwrap();
         let idx_op = ops.iter().find(|op| op.sql.contains("hnsw")).unwrap();
         assert!(!idx_op.non_transactional, "index on new table should be transactional");
-        assert!(!idx_op.sql.contains("CONCURRENTLY"), "should NOT use CONCURRENTLY: {}", idx_op.sql);
+        assert!(
+            !idx_op.sql.contains("CONCURRENTLY"),
+            "should NOT use CONCURRENTLY: {}",
+            idx_op.sql
+        );
     }
 
     fn sequence_scalar(module: &str, name: &str) -> crate::schema::ScalarDescriptor {
@@ -3547,13 +4895,25 @@ mod tests {
     #[test]
     fn test_new_sequence_creates_sequence_and_domain() {
         let schema = SchemaDescriptor {
-            types: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("CREATE SEQUENCE IF NOT EXISTS \"public\".\"OrderNumber_seq\""), "got:\n{joined}");
-        assert!(joined.contains("CREATE DOMAIN \"public\".\"OrderNumber\" AS int8"), "got:\n{joined}");
+        assert!(
+            joined.contains("CREATE SEQUENCE IF NOT EXISTS \"public\".\"OrderNumber_seq\""),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("CREATE DOMAIN \"public\".\"OrderNumber\" AS int8"),
+            "got:\n{joined}"
+        );
         // Sequence must precede domain
         let seq_pos = joined.find("CREATE SEQUENCE").unwrap();
         let dom_pos = joined.find("CREATE DOMAIN").unwrap();
@@ -3563,34 +4923,69 @@ mod tests {
     #[test]
     fn test_no_ops_sequence_already_exists() {
         let schema = SchemaDescriptor {
-            types: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
         };
         let state = DbState {
             schemas: vec!["default".into()],
-            domains: vec![DbDomain { schema: "default".into(), name: "OrderNumber".into() }],
-            sequences: vec![DbSequence { schema: "default".into(), name: "OrderNumber_seq".into() }],
+            domains: vec![DbDomain {
+                schema: "default".into(),
+                name: "OrderNumber".into(),
+            }],
+            sequences: vec![DbSequence {
+                schema: "default".into(),
+                name: "OrderNumber_seq".into(),
+            }],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
-        assert!(ops.is_empty(), "expected no ops when sequence and domain exist, got: {:?}", ops);
+        assert!(
+            ops.is_empty(),
+            "expected no ops when sequence and domain exist, got: {:?}",
+            ops
+        );
     }
 
     #[test]
     fn test_drop_removed_sequence() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
-            domains: vec![DbDomain { schema: "default".into(), name: "OrderNumber".into() }],
-            sequences: vec![DbSequence { schema: "default".into(), name: "OrderNumber_seq".into() }],
+            domains: vec![DbDomain {
+                schema: "default".into(),
+                name: "OrderNumber".into(),
+            }],
+            sequences: vec![DbSequence {
+                schema: "default".into(),
+                name: "OrderNumber_seq".into(),
+            }],
             ..DbState::default()
         };
         let ops = diff_schema(&schema, &state).unwrap();
         let joined = ops.join("\n");
-        assert!(joined.contains("DROP DOMAIN IF EXISTS \"public\".\"OrderNumber\""), "got:\n{joined}");
-        assert!(joined.contains("DROP SEQUENCE IF EXISTS \"public\".\"OrderNumber_seq\""), "got:\n{joined}");
+        assert!(
+            joined.contains("DROP DOMAIN IF EXISTS \"public\".\"OrderNumber\""),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("DROP SEQUENCE IF EXISTS \"public\".\"OrderNumber_seq\""),
+            "got:\n{joined}"
+        );
     }
 
     // ── MigrationStep grouping ───────────────────────────────────────────────
@@ -3602,36 +4997,61 @@ mod tests {
         person.properties.push(prop("age", "int8", true));
         let schema = SchemaDescriptor {
             types: vec![person],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
                 triggers: vec!["pylon_cache_invalidate".into()],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
 
         let steps = diff_schema_steps(&schema, &state, &HashMap::new()).unwrap();
-        let table_steps: Vec<&MigrationStep> = steps.iter()
+        let table_steps: Vec<&MigrationStep> = steps
+            .iter()
             .filter(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == "default" && t == "Person"))
             .collect();
         assert_eq!(
-            table_steps.len(), 1,
+            table_steps.len(),
+            1,
             "two new columns on the same table must produce one step, got: {:?}",
             steps.iter().map(|s| &s.prompt).collect::<Vec<_>>()
         );
         assert_eq!(table_steps[0].verb, Verb::Alter);
         assert_eq!(table_steps[0].prompt, "did you alter object type 'default::Person'?");
         assert_eq!(
-            table_steps[0].ddl.len(), 2,
+            table_steps[0].ddl.len(),
+            2,
             "expected one ADD COLUMN per new property, got: {:?}",
             table_steps[0].ddl.iter().map(|d| &d.sql).collect::<Vec<_>>()
         );
@@ -3641,20 +5061,40 @@ mod tests {
     fn test_diff_schema_steps_new_table_is_one_create_step_including_its_trigger() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("catalog", "Product", "Product")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let steps = diff_schema_steps(&schema, &empty_state(), &HashMap::new()).unwrap();
-        let table_steps: Vec<&MigrationStep> = steps.iter()
+        let table_steps: Vec<&MigrationStep> = steps
+            .iter()
             .filter(|s| matches!(&s.op_key, OpKey::Table(m, t) if m == "catalog" && t == "Product"))
             .collect();
-        assert_eq!(table_steps.len(), 1, "got steps: {:?}", steps.iter().map(|s| &s.prompt).collect::<Vec<_>>());
+        assert_eq!(
+            table_steps.len(),
+            1,
+            "got steps: {:?}",
+            steps.iter().map(|s| &s.prompt).collect::<Vec<_>>()
+        );
         assert_eq!(table_steps[0].verb, Verb::Create);
         assert_eq!(table_steps[0].prompt, "did you create object type 'catalog::Product'?");
 
         // The cache-invalidation trigger for a brand new table must fold
         // into this same create step, not a separate one (Phase 11.5).
-        let joined: String = table_steps[0].ddl.iter().map(|d| d.sql.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""), "got:\n{joined}");
+        let joined: String = table_steps[0]
+            .ddl
+            .iter()
+            .map(|d| d.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("CREATE TABLE IF NOT EXISTS \"catalog\".\"Product\""),
+            "got:\n{joined}"
+        );
         assert!(joined.contains("pylon_cache_invalidate"), "got:\n{joined}");
     }
 
@@ -3662,31 +5102,63 @@ mod tests {
     fn test_guidance_bans_a_rejected_type_rename_candidate() {
         let schema = SchemaDescriptor {
             types: vec![simple_type("default", "Customer", "Customer")],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let state = DbState {
             schemas: vec!["default".into()],
             tables: vec![DbTable {
-                schema: "default".into(), name: "Person".into(),
+                schema: "default".into(),
+                name: "Person".into(),
                 columns: vec![
-                    DbColumn { name: "id".into(), pg_type: "uuid".into(), nullable: false, is_generated: false, column_default: Some("uuidv7()".into()) },
-                    DbColumn { name: "name".into(), pg_type: "text".into(), nullable: true, is_generated: false, column_default: None },
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "name".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
                 ],
-                foreign_keys: vec![], indexes: vec![], checks: vec![], triggers: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
             }],
-            enums: vec![], domains: vec![],
+            enums: vec![],
+            domains: vec![],
             ..DbState::default()
         };
 
         let candidates = detect_type_renames(&schema, &state, &Guidance::default());
-        assert_eq!(candidates.len(), 1, "expected Person -> Customer to be proposed as a rename");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected Person -> Customer to be proposed as a rename"
+        );
 
         let mut guidance = Guidance::default();
         guidance.banned_type_renames.insert((
-            "default".to_string(), "Person".to_string(),
-            "default".to_string(), "Customer".to_string(),
+            "default".to_string(),
+            "Person".to_string(),
+            "default".to_string(),
+            "Customer".to_string(),
         ));
         let candidates = detect_type_renames(&schema, &state, &guidance);
-        assert!(candidates.is_empty(), "a banned rename candidate must not be re-proposed");
+        assert!(
+            candidates.is_empty(),
+            "a banned rename candidate must not be re-proposed"
+        );
     }
 }

@@ -31,7 +31,9 @@
 //! here rather than teaching `pylon-pgcon` a second, more general
 //! "decode every column" path for this one caller.
 
-use crate::diff::{DbColumn, DbDomain, DbEnum, DbForeignKey, DbIndex, DbSequence, DbState, DbTable, DbView, DbFunction};
+use crate::diff::{
+    DbColumn, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence, DbState, DbTable, DbView,
+};
 use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::DecodedValue;
 
@@ -45,7 +47,11 @@ const SCHEMA_LIST_EXCLUDES: [&str; 5] = ["_pylon", "public", "pg_catalog", "info
 const OBJECT_EXCLUDES: [&str; 4] = ["_pylon", "pg_catalog", "information_schema", "pg_toast"];
 
 fn pg_to_module(schema: &str) -> String {
-    if schema == "public" { "default".to_string() } else { schema.to_string() }
+    if schema == "public" {
+        "default".to_string()
+    } else {
+        schema.to_string()
+    }
 }
 
 fn exclude_param(excludes: &[&str]) -> DecodedValue {
@@ -249,48 +255,96 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
     let mut current_enum: Option<(String, String)> = None;
     let mut members: Vec<String> = Vec::new();
     for row in query(pool, ENUMS_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([schema, name, member]) = fields::<3>(row) else { continue };
-        let (Some(schema), Some(name), Some(member)) = (as_str(schema), as_str(name), as_str(member)) else { continue };
+        let Some([schema, name, member]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(member)) = (as_str(schema), as_str(name), as_str(member)) else {
+            continue;
+        };
         let key = (schema, name);
         if current_enum.as_ref() != Some(&key) {
             if let Some((cs, cn)) = current_enum.take() {
-                state.enums.push(DbEnum { schema: pg_to_module(&cs), name: cn, members: std::mem::take(&mut members) });
+                state.enums.push(DbEnum {
+                    schema: pg_to_module(&cs),
+                    name: cn,
+                    members: std::mem::take(&mut members),
+                });
             }
             current_enum = Some(key);
         }
         members.push(member);
     }
     if let Some((cs, cn)) = current_enum {
-        state.enums.push(DbEnum { schema: pg_to_module(&cs), name: cn, members });
+        state.enums.push(DbEnum {
+            schema: pg_to_module(&cs),
+            name: cn,
+            members,
+        });
     }
 
     // Domains
     for row in query(pool, DOMAINS_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([schema, name]) = fields::<2>(row) else { continue };
-        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else { continue };
-        state.domains.push(DbDomain { schema: pg_to_module(&schema), name });
+        let Some([schema, name]) = fields::<2>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else {
+            continue;
+        };
+        state.domains.push(DbDomain {
+            schema: pg_to_module(&schema),
+            name,
+        });
     }
 
     // Tables + columns + FKs + indexes
     for row in query(pool, TABLES_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([pg_schema_v, name_v]) = fields::<2>(row) else { continue };
-        let (Some(pg_schema), Some(name)) = (as_str(pg_schema_v), as_str(name_v)) else { continue };
+        let Some([pg_schema_v, name_v]) = fields::<2>(row) else {
+            continue;
+        };
+        let (Some(pg_schema), Some(name)) = (as_str(pg_schema_v), as_str(name_v)) else {
+            continue;
+        };
         let module = pg_to_module(&pg_schema);
 
         let mut columns = Vec::new();
-        for col in query(pool, COLUMNS_SQL, &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())]).await? {
-            let Some([attname, pg_type, nullable, is_generated, column_default]) = fields::<5>(col) else { continue };
-            let (Some(attname), Some(pg_type), Some(nullable), Some(is_generated)) =
-                (as_str(attname), as_str(pg_type), as_bool(nullable), as_bool(is_generated))
-            else {
+        for col in query(
+            pool,
+            COLUMNS_SQL,
+            &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())],
+        )
+        .await?
+        {
+            let Some([attname, pg_type, nullable, is_generated, column_default]) = fields::<5>(col) else {
                 continue;
             };
-            columns.push(DbColumn { name: attname, pg_type, nullable, is_generated, column_default: as_opt_str(column_default) });
+            let (Some(attname), Some(pg_type), Some(nullable), Some(is_generated)) = (
+                as_str(attname),
+                as_str(pg_type),
+                as_bool(nullable),
+                as_bool(is_generated),
+            ) else {
+                continue;
+            };
+            columns.push(DbColumn {
+                name: attname,
+                pg_type,
+                nullable,
+                is_generated,
+                column_default: as_opt_str(column_default),
+            });
         }
 
         let mut foreign_keys = Vec::new();
-        for fk in query(pool, FKS_SQL, &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())]).await? {
-            let Some([conname, attname, ref_schema, ref_table]) = fields::<4>(fk) else { continue };
+        for fk in query(
+            pool,
+            FKS_SQL,
+            &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())],
+        )
+        .await?
+        {
+            let Some([conname, attname, ref_schema, ref_table]) = fields::<4>(fk) else {
+                continue;
+            };
             let (Some(conname), Some(attname), Some(ref_schema), Some(ref_table)) =
                 (as_str(conname), as_str(attname), as_str(ref_schema), as_str(ref_table))
             else {
@@ -305,42 +359,89 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
         }
 
         let mut indexes = Vec::new();
-        for idx in query(pool, INDEXES_SQL, &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())]).await? {
-            let Some([relname, is_unique, amname]) = fields::<3>(idx) else { continue };
-            let (Some(relname), Some(is_unique), Some(amname)) = (as_str(relname), as_bool(is_unique), as_str(amname)) else {
+        for idx in query(
+            pool,
+            INDEXES_SQL,
+            &[DecodedValue::Str(pg_schema.clone()), DecodedValue::Str(name.clone())],
+        )
+        .await?
+        {
+            let Some([relname, is_unique, amname]) = fields::<3>(idx) else {
                 continue;
             };
-            indexes.push(DbIndex { name: relname, is_unique, method: amname });
+            let (Some(relname), Some(is_unique), Some(amname)) = (as_str(relname), as_bool(is_unique), as_str(amname))
+            else {
+                continue;
+            };
+            indexes.push(DbIndex {
+                name: relname,
+                is_unique,
+                method: amname,
+            });
         }
 
-        state.tables.push(DbTable { schema: module, name, columns, foreign_keys, indexes, checks: Vec::new(), triggers: Vec::new() });
+        state.tables.push(DbTable {
+            schema: module,
+            name,
+            columns,
+            foreign_keys,
+            indexes,
+            checks: Vec::new(),
+            triggers: Vec::new(),
+        });
     }
 
     // Sequences
     for row in query(pool, SEQUENCES_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([schema, name]) = fields::<2>(row) else { continue };
-        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else { continue };
-        state.sequences.push(DbSequence { schema: pg_to_module(&schema), name });
+        let Some([schema, name]) = fields::<2>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else {
+            continue;
+        };
+        state.sequences.push(DbSequence {
+            schema: pg_to_module(&schema),
+            name,
+        });
     }
 
     // Views
     for row in query(pool, VIEWS_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([schema, name, definition]) = fields::<3>(row) else { continue };
-        let (Some(schema), Some(name), Some(definition)) = (as_str(schema), as_str(name), as_str(definition)) else { continue };
-        state.views.push(DbView { schema: pg_to_module(&schema), name, body_hash: ddl_hash(&definition) });
+        let Some([schema, name, definition]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(definition)) = (as_str(schema), as_str(name), as_str(definition)) else {
+            continue;
+        };
+        state.views.push(DbView {
+            schema: pg_to_module(&schema),
+            name,
+            body_hash: ddl_hash(&definition),
+        });
     }
 
     // Functions
     for row in query(pool, FUNCTIONS_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([schema, name, definition]) = fields::<3>(row) else { continue };
-        let (Some(schema), Some(name), Some(definition)) = (as_str(schema), as_str(name), as_str(definition)) else { continue };
-        state.functions.push(DbFunction { schema: pg_to_module(&schema), name, body_hash: ddl_hash(&definition) });
+        let Some([schema, name, definition]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(definition)) = (as_str(schema), as_str(name), as_str(definition)) else {
+            continue;
+        };
+        state.functions.push(DbFunction {
+            schema: pg_to_module(&schema),
+            name,
+            body_hash: ddl_hash(&definition),
+        });
     }
 
     // Constraint triggers (cross-table exclusive enforcement)
     for row in query(pool, TRIGGERS_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([tgname, pg_schema, table_name]) = fields::<3>(row) else { continue };
-        let (Some(tgname), Some(pg_schema), Some(table_name)) = (as_str(tgname), as_str(pg_schema), as_str(table_name)) else {
+        let Some([tgname, pg_schema, table_name]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(tgname), Some(pg_schema), Some(table_name)) = (as_str(tgname), as_str(pg_schema), as_str(table_name))
+        else {
             continue;
         };
         state.add_trigger(&pg_to_module(&pg_schema), &table_name, &tgname);
@@ -361,8 +462,7 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN")
-            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     fn unique_name(prefix: &str) -> String {
@@ -391,7 +491,11 @@ mod tests {
 
         let state = introspect_db_state(&pool).await.unwrap();
 
-        let child_table = state.tables.iter().find(|t| t.name == child).expect("child table found");
+        let child_table = state
+            .tables
+            .iter()
+            .find(|t| t.name == child)
+            .expect("child table found");
         assert_eq!(child_table.schema, "default"); // public -> default
 
         let parent_id_col = child_table.columns.iter().find(|c| c.name == "parent_id").unwrap();
@@ -407,7 +511,11 @@ mod tests {
         assert_eq!(fk.ref_table, parent);
         assert_eq!(fk.ref_schema, "default");
 
-        let idx = child_table.indexes.iter().find(|i| i.name == format!("{child}_label_idx")).expect("index found");
+        let idx = child_table
+            .indexes
+            .iter()
+            .find(|i| i.name == format!("{child}_label_idx"))
+            .expect("index found");
         assert!(!idx.is_unique);
         assert_eq!(idx.method, "btree");
     }
@@ -417,7 +525,9 @@ mod tests {
     async fn finds_an_enum_with_all_members_in_order() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let enum_name = unique_name("introspect_enum");
-        pool.batch_execute(&format!("CREATE TYPE {enum_name} AS ENUM ('a', 'b', 'c');")).await.unwrap();
+        pool.batch_execute(&format!("CREATE TYPE {enum_name} AS ENUM ('a', 'b', 'c');"))
+            .await
+            .unwrap();
 
         let state = introspect_db_state(&pool).await.unwrap();
 
@@ -443,8 +553,18 @@ mod tests {
 
         let state = introspect_db_state(&pool).await.unwrap();
 
-        assert!(state.domains.iter().any(|d| d.name == domain_name && d.schema == "default"));
-        assert!(state.sequences.iter().any(|s| s.name == seq_name && s.schema == "default"));
+        assert!(
+            state
+                .domains
+                .iter()
+                .any(|d| d.name == domain_name && d.schema == "default")
+        );
+        assert!(
+            state
+                .sequences
+                .iter()
+                .any(|s| s.name == seq_name && s.schema == "default")
+        );
         assert!(state.views.iter().any(|v| v.name == view_name && v.schema == "default"));
     }
 
@@ -453,12 +573,20 @@ mod tests {
     async fn finds_a_function_and_hashes_its_definition_stably() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let fn_name = unique_name("introspect_fn");
-        pool.batch_execute(&format!("CREATE FUNCTION {fn_name}() RETURNS int8 AS $$ SELECT 1::int8 $$ LANGUAGE sql;")).await.unwrap();
+        pool.batch_execute(&format!(
+            "CREATE FUNCTION {fn_name}() RETURNS int8 AS $$ SELECT 1::int8 $$ LANGUAGE sql;"
+        ))
+        .await
+        .unwrap();
 
         let state1 = introspect_db_state(&pool).await.unwrap();
         let state2 = introspect_db_state(&pool).await.unwrap();
 
-        let f1 = state1.functions.iter().find(|f| f.name == fn_name).expect("function found");
+        let f1 = state1
+            .functions
+            .iter()
+            .find(|f| f.name == fn_name)
+            .expect("function found");
         let f2 = state2.functions.iter().find(|f| f.name == fn_name).unwrap();
         assert_eq!(f1.schema, "default");
         assert_eq!(f1.body_hash, f2.body_hash, "hash must be stable across introspections");
@@ -471,13 +599,26 @@ mod tests {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
         let internal_table = unique_name("introspect_internal");
-        pool.batch_execute(&format!("CREATE TABLE _pylon.{internal_table} (id int8);")).await.unwrap();
+        pool.batch_execute(&format!("CREATE TABLE _pylon.{internal_table} (id int8);"))
+            .await
+            .unwrap();
 
         let state = introspect_db_state(&pool).await.unwrap();
 
-        assert!(!state.tables.iter().any(|t| t.name == internal_table), "_pylon-schema tables must be excluded");
-        assert!(!state.schemas.iter().any(|s| s == "_pylon"), "_pylon must never appear in the schema list");
-        assert!(!state.schemas.iter().any(|s| s == "pg_catalog" || s == "information_schema"));
+        assert!(
+            !state.tables.iter().any(|t| t.name == internal_table),
+            "_pylon-schema tables must be excluded"
+        );
+        assert!(
+            !state.schemas.iter().any(|s| s == "_pylon"),
+            "_pylon must never appear in the schema list"
+        );
+        assert!(
+            !state
+                .schemas
+                .iter()
+                .any(|s| s == "pg_catalog" || s == "information_schema")
+        );
     }
 
     #[tokio::test]

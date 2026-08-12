@@ -31,8 +31,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use pylon_core::migrate as core_migrate;
 
-use crate::pgcon::{pgcon_err, PgconPool};
 use crate::MigrationFile;
+use crate::pgcon::{PgconPool, pgcon_err};
 
 fn migrate_err(err: core_migrate::MigrateError) -> PyErr {
     match err {
@@ -44,7 +44,9 @@ fn migrate_err(err: core_migrate::MigrateError) -> PyErr {
 #[pyfunction]
 fn migration_ensure_tracking_tables<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
-    pyo3_async_runtimes::tokio::future_into_py(py, async move { core_migrate::ensure_tracking_tables(&pool).await.map_err(migrate_err) })
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_migrate::ensure_tracking_tables(&pool).await.map_err(migrate_err)
+    })
 }
 
 /// Returns every `_pylon."Migrations"` row as `(id, onto, db_state,
@@ -58,7 +60,10 @@ fn migration_read_tracking<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<B
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let tracking = core_migrate::read_tracking(&pool).await.map_err(migrate_err)?;
-        Ok(tracking.into_iter().map(|r| (r.id, r.onto, r.db_state, r.schema_state, r.applied)).collect::<Vec<_>>())
+        Ok(tracking
+            .into_iter()
+            .map(|r| (r.id, r.onto, r.db_state, r.schema_state, r.applied))
+            .collect::<Vec<_>>())
     })
 }
 
@@ -68,7 +73,15 @@ fn migration_read_tracking<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<B
 fn migration_applied_tip(tracking: Vec<(String, String, Option<String>, Option<String>, bool)>) -> Option<String> {
     let rows: Vec<core_migrate::TrackingRow> = tracking
         .into_iter()
-        .map(|(id, onto, db_state, schema_state, applied)| core_migrate::TrackingRow { id, onto, db_state, schema_state, applied })
+        .map(
+            |(id, onto, db_state, schema_state, applied)| core_migrate::TrackingRow {
+                id,
+                onto,
+                db_state,
+                schema_state,
+                applied,
+            },
+        )
         .collect();
     core_migrate::applied_tip(&rows)
 }
@@ -77,10 +90,18 @@ fn migration_applied_tip(tracking: Vec<(String, String, Option<String>, Option<S
 /// squash-backfill case in `apply`'s outer loop (a migration whose
 /// squashed constituent IDs are already applied under the old chain).
 #[pyfunction]
-fn migration_record_applied<'py>(py: Python<'py>, pool: &PgconPool, id: String, onto: String, filename: String) -> PyResult<Bound<'py, PyAny>> {
+fn migration_record_applied<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    id: String,
+    onto: String,
+    filename: String,
+) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        core_migrate::record_applied(&pool, &id, &onto, &filename).await.map_err(migrate_err)
+        core_migrate::record_applied(&pool, &id, &onto, &filename)
+            .await
+            .map_err(migrate_err)
     })
 }
 
@@ -88,10 +109,19 @@ fn migration_record_applied<'py>(py: Python<'py>, pool: &PgconPool, id: String, 
 /// running dev-mode savepoint retry when `dev_mode` is set) — see
 /// `pylon_core::migrate::apply_one`.
 #[pyfunction]
-fn migration_apply_one<'py>(py: Python<'py>, pool: &PgconPool, m: &MigrationFile, dev_mode: bool) -> PyResult<Bound<'py, PyAny>> {
+fn migration_apply_one<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    m: &MigrationFile,
+    dev_mode: bool,
+) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     let migration = m.inner.clone();
-    pyo3_async_runtimes::tokio::future_into_py(py, async move { core_migrate::apply_one(&pool, &migration, dev_mode).await.map_err(migrate_err) })
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_migrate::apply_one(&pool, &migration, dev_mode)
+            .await
+            .map_err(migrate_err)
+    })
 }
 
 /// A held advisory-lock connection — see `pylon_core::migrate::advisory_lock`
@@ -108,9 +138,11 @@ impl MigrationLock {
     fn unlock<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let conn = inner.lock().await.take().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("migration lock already released")
-            })?;
+            let conn = inner
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("migration lock already released"))?;
             core_migrate::advisory_unlock(conn).await.map_err(migrate_err)
         })
     }
@@ -122,7 +154,9 @@ fn migration_advisory_lock<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<B
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let conn = core_migrate::advisory_lock(&pool).await.map_err(migrate_err)?;
-        Ok(MigrationLock { inner: Arc::new(AsyncMutex::new(Some(conn))) })
+        Ok(MigrationLock {
+            inner: Arc::new(AsyncMutex::new(Some(conn))),
+        })
     })
 }
 
@@ -133,7 +167,9 @@ fn migration_try_advisory_lock<'py>(py: Python<'py>, pool: &PgconPool) -> PyResu
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         match core_migrate::try_advisory_lock(&pool).await.map_err(migrate_err)? {
-            Some(conn) => Ok(Some(MigrationLock { inner: Arc::new(AsyncMutex::new(Some(conn))) })),
+            Some(conn) => Ok(Some(MigrationLock {
+                inner: Arc::new(AsyncMutex::new(Some(conn))),
+            })),
             None => Ok(None),
         }
     })
@@ -143,10 +179,16 @@ fn migration_try_advisory_lock<'py>(py: Python<'py>, pool: &PgconPool) -> PyResu
 /// client fetches at startup instead of `.pylon/schema.json` — called by
 /// `apply` after a migration lands and by `watch` after a dev-mode sync.
 #[pyfunction]
-fn migration_write_schema_snapshot<'py>(py: Python<'py>, pool: &PgconPool, snapshot_json: String) -> PyResult<Bound<'py, PyAny>> {
+fn migration_write_schema_snapshot<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    snapshot_json: String,
+) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        core_migrate::write_schema_snapshot(&pool, &snapshot_json).await.map_err(migrate_err)
+        core_migrate::write_schema_snapshot(&pool, &snapshot_json)
+            .await
+            .map_err(migrate_err)
     })
 }
 

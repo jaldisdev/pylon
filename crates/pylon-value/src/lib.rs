@@ -75,7 +75,11 @@ pub enum DecodedValue {
     /// into a single duration, since `months` (a calendar-relative unit —
     /// "1 month" isn't a fixed number of days) can't be losslessly combined
     /// with `days`/`microseconds` without a reference date.
-    Interval { months: i32, days: i32, microseconds: i64 },
+    Interval {
+        months: i32,
+        days: i32,
+        microseconds: i64,
+    },
     /// PostgreSQL `date` — whole days since the PG epoch (2000-01-01),
     /// exactly as the wire encodes it. Backs `cal::local_date`.
     Date(i32),
@@ -240,21 +244,37 @@ mod tests {
             ("score".into(), DecodedValue::F64(1.5)),
             ("active".into(), DecodedValue::Bool(true)),
             ("balance".into(), DecodedValue::Decimal("12.50".into())),
-            ("tags".into(), DecodedValue::Array(vec![DecodedValue::Str("a".into()), DecodedValue::Null])),
+            (
+                "tags".into(),
+                DecodedValue::Array(vec![DecodedValue::Str("a".into()), DecodedValue::Null]),
+            ),
             ("avatar".into(), DecodedValue::Bytes(vec![1, 2, 3])),
-            ("point".into(), DecodedValue::Composite(vec![DecodedValue::F64(1.0), DecodedValue::F64(2.0)])),
-            ("span".into(), DecodedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }),
+            (
+                "point".into(),
+                DecodedValue::Composite(vec![DecodedValue::F64(1.0), DecodedValue::F64(2.0)]),
+            ),
+            (
+                "span".into(),
+                DecodedValue::Interval {
+                    months: 1,
+                    days: 2,
+                    microseconds: 3_600_000_000,
+                },
+            ),
             ("day".into(), DecodedValue::Date(9525)),
             ("clock".into(), DecodedValue::Time(3_600_000_000)),
             ("naive_ts".into(), DecodedValue::Timestamp(1_000_000_000)),
             ("aware_ts".into(), DecodedValue::Timestamptz(1_000_000_000)),
-            ("span_range".into(), DecodedValue::Range {
-                lower: Some(Box::new(DecodedValue::I64(1))),
-                upper: Some(Box::new(DecodedValue::I64(10))),
-                inc_lower: true,
-                inc_upper: false,
-                empty: false,
-            }),
+            (
+                "span_range".into(),
+                DecodedValue::Range {
+                    lower: Some(Box::new(DecodedValue::I64(1))),
+                    upper: Some(Box::new(DecodedValue::I64(10))),
+                    inc_lower: true,
+                    inc_upper: false,
+                    empty: false,
+                },
+            ),
         ]);
         let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
         // SAFETY: bytes were produced moments ago by `to_bytes` on this same
@@ -283,7 +303,10 @@ mod tests {
 
     #[test]
     fn from_native_string_types() {
-        assert_eq!(DecodedValue::from("hello".to_string()), DecodedValue::Str("hello".into()));
+        assert_eq!(
+            DecodedValue::from("hello".to_string()),
+            DecodedValue::Str("hello".into())
+        );
         assert_eq!(DecodedValue::from("hello"), DecodedValue::Str("hello".into()));
     }
 

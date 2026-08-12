@@ -73,8 +73,14 @@ pub fn error_range(m: &PyqlMatch, position: &PyqlPosition) -> Range {
     };
 
     Range {
-        start: LspPosition { line: start.0, character: start.1 },
-        end: LspPosition { line: end.0, character: end.1 },
+        start: LspPosition {
+            line: start.0,
+            character: start.1,
+        },
+        end: LspPosition {
+            line: end.0,
+            character: end.1,
+        },
     }
 }
 
@@ -114,7 +120,10 @@ mod tests {
                 col += 1;
             }
         }
-        PyqlMatch { text: text.to_string(), raw_pos }
+        PyqlMatch {
+            text: text.to_string(),
+            raw_pos,
+        }
     }
 
     #[test]

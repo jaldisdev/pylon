@@ -58,13 +58,23 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config, static_dir_override: Option<PathBuf>) -> crate::error::Result<Self> {
         let cache = if config.cache.enabled {
-            let cache = pylon_cache::Cache::open(&config.cache.path, config.cache.max_size_mb as usize)
-                .map_err(|e| crate::error::Error::Invalid(format!("failed to open cache at {}: {e}", config.cache.path.display())))?;
+            let cache =
+                pylon_cache::Cache::open(&config.cache.path, config.cache.max_size_mb as usize).map_err(|e| {
+                    crate::error::Error::Invalid(format!(
+                        "failed to open cache at {}: {e}",
+                        config.cache.path.display()
+                    ))
+                })?;
             Some(Arc::new(cache))
         } else {
             None
         };
-        Ok(Self { config, static_dir_override, clients: Mutex::new(HashMap::new()), cache })
+        Ok(Self {
+            config,
+            static_dir_override,
+            clients: Mutex::new(HashMap::new()),
+            cache,
+        })
     }
 
     pub fn static_dir_override(&self) -> Option<&std::path::Path> {
@@ -74,8 +84,15 @@ impl AppState {
     /// Looks up (or lazily connects) the `Client` for `connection_name` —
     /// mirrors `asgi.py::_resolve_client`. `Ok(None)` means the name isn't
     /// a configured connection at all (the caller turns that into a 404).
-    pub async fn resolve_client(&self, connection_name: &str) -> pylon_client::Result<Option<Arc<pylon_client::Client>>> {
-        let key = if connection_name == MAIN_CONNECTION_ALIAS { "default" } else { connection_name };
+    pub async fn resolve_client(
+        &self,
+        connection_name: &str,
+    ) -> pylon_client::Result<Option<Arc<pylon_client::Client>>> {
+        let key = if connection_name == MAIN_CONNECTION_ALIAS {
+            "default"
+        } else {
+            connection_name
+        };
         let Some(db) = self.config.connections.get(key) else {
             return Ok(None);
         };
@@ -83,8 +100,7 @@ impl AppState {
         if let Some(existing) = clients.get(key) {
             return Ok(Some(existing.clone()));
         }
-        let mut builder = pylon_client::Client::builder(db.dsn_string())
-            .max_pool_size(db.pool_max_size as usize);
+        let mut builder = pylon_client::Client::builder(db.dsn_string()).max_pool_size(db.pool_max_size as usize);
         if let Some(cache) = &self.cache {
             builder = builder.cache_handle(cache.clone());
         }

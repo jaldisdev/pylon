@@ -117,13 +117,21 @@ async fn trigger_notify_on_scalar_channel_delivers_the_property_value() {
     let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let received_clone = received.clone();
     let listener = PgListener::connect(&test_dsn(), move |n| {
-        received_clone.lock().unwrap().push((n.channel().to_string(), n.payload().to_string()));
+        received_clone
+            .lock()
+            .unwrap()
+            .push((n.channel().to_string(), n.payload().to_string()));
     })
     .await
     .unwrap();
     listener.listen(&wire_name).await.unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'gadget' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'gadget' }}"),
+    )
+    .await;
 
     wait_until(|| !received.lock().unwrap().is_empty()).await;
 
@@ -164,7 +172,12 @@ async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
     .unwrap();
     listener.listen(&wire_name).await.unwrap();
 
-    exec(&pool, &schema, &format!("insert {module}::Widget {{ name := 'gadget' }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Widget {{ name := 'gadget' }}"),
+    )
+    .await;
 
     wait_until(|| !received.lock().unwrap().is_empty()).await;
 
@@ -177,7 +190,10 @@ async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
         &schema,
     )
     .unwrap();
-    let ids = pool.query_typed(&rows.sql, &[], &pylon_pgcon::ExtensionOids::default()).await.unwrap();
+    let ids = pool
+        .query_typed(&rows.sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+        .unwrap();
     // Field 0 is always the implicit `id` column every shape carries;
     // `id_text` (the one explicit computed field) lands at index 1 —
     // matching this suite's own convention (see live_execution_triggers.rs's

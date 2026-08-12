@@ -87,11 +87,7 @@ async fn insert_and_select_round_trip_a_real_value() {
     let pool = test_pool().await;
     pool.batch_execute(&ddl).await.unwrap();
 
-    let insert = query::compile(
-        &format!("insert {module}::Widget {{ name := 'hello' }}"),
-        &schema,
-    )
-    .unwrap();
+    let insert = query::compile(&format!("insert {module}::Widget {{ name := 'hello' }}"), &schema).unwrap();
     assert!(
         insert.param_names.is_empty(),
         "fixture query intentionally uses no PyQL params"
@@ -108,11 +104,7 @@ async fn insert_and_select_round_trip_a_real_value() {
         .query_typed(&select.sql, &[], &ExtensionOids::default())
         .await
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "expected exactly one Widget row back, got {rows:?}"
-    );
+    assert_eq!(rows.len(), 1, "expected exactly one Widget row back, got {rows:?}");
     match &rows[0] {
         // A schema-backed object row decodes as a positional `Composite`,
         // not a name-keyed `Object` — position 0 is always the
@@ -120,10 +112,7 @@ async fn insert_and_select_round_trip_a_real_value() {
         // `_decode()`, the `"object"` branch), remaining positions are the
         // selected pointers in shape order.
         DecodedValue::Composite(fields) => {
-            assert_eq!(
-                fields.first(),
-                Some(&DecodedValue::Str(format!("{module}::Widget")))
-            );
+            assert_eq!(fields.first(), Some(&DecodedValue::Str(format!("{module}::Widget"))));
             assert_eq!(fields.get(1), Some(&DecodedValue::Str("hello".to_string())));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),

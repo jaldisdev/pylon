@@ -40,9 +40,7 @@
 mod common;
 
 use common::*;
-use pylon_core::diff::{
-    Verb, diff_schema_steps, diff_schema_steps_with_renames_and_fills, schema_to_db_state,
-};
+use pylon_core::diff::{Verb, diff_schema_steps, diff_schema_steps_with_renames_and_fills, schema_to_db_state};
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, SignalEntry, TypeDescriptor};
@@ -99,9 +97,7 @@ async fn phantom_trigger_regression_second_create_reports_zero_changes() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     for step in &steps {
         for op in step.resolved_ddl(&HashMap::new()) {
             pool.batch_execute(&op.sql).await.unwrap();
@@ -140,9 +136,7 @@ async fn zero_changes_against_live_introspection_after_apply() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
 
     // Catches drift the other direction from the offline-baseline scenario
@@ -194,16 +188,10 @@ async fn rename_detected_and_applied_survives_real_data() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
 
-    let insert = query::compile(
-        &format!("insert {module}::Widget {{ name := 'keep-me' }}"),
-        &v1,
-    )
-    .unwrap();
+    let insert = query::compile(&format!("insert {module}::Widget {{ name := 'keep-me' }}"), &v1).unwrap();
     assert_eq!(pool.execute_typed(&insert.sql, &[]).await.unwrap(), 1);
 
     // v2: same type, renamed Widget -> Gadget, same columns.
@@ -211,9 +199,7 @@ async fn rename_detected_and_applied_survives_real_data() {
     v2.types[0].name = "Gadget".into();
     v2.types[0].table = "Gadget".into();
 
-    let live = pylon_core::introspect::introspect_db_state(&pool)
-        .await
-        .unwrap();
+    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
     let type_renames = vec![(
         module.clone(),
         "Widget".to_string(),
@@ -228,14 +214,11 @@ async fn rename_detected_and_applied_survives_real_data() {
     // responsibility (mirrors `pylon/cli/commands/migrations.py`'s
     // `_rename_prompt_loop`, which builds this exact statement directly
     // rather than sourcing it from the diff engine's output).
-    pool.batch_execute(&format!(
-        r#"ALTER TABLE "{module}"."Widget" RENAME TO "Gadget";"#
-    ))
-    .await
-    .unwrap();
+    pool.batch_execute(&format!(r#"ALTER TABLE "{module}"."Widget" RENAME TO "Gadget";"#))
+        .await
+        .unwrap();
 
-    let steps =
-        diff_schema_steps_with_renames_and_fills(&v2, &live, &type_renames, &[], &[]).unwrap();
+    let steps = diff_schema_steps_with_renames_and_fills(&v2, &live, &type_renames, &[], &[]).unwrap();
     for step in &steps {
         for op in step.resolved_ddl(&HashMap::new()) {
             pool.batch_execute(&op.sql).await.unwrap();
@@ -258,10 +241,7 @@ async fn rename_detected_and_applied_survives_real_data() {
     );
     match &rows[0] {
         DecodedValue::Composite(fields) => {
-            assert_eq!(
-                fields.get(1),
-                Some(&DecodedValue::Str("keep-me".to_string()))
-            );
+            assert_eq!(fields.get(1), Some(&DecodedValue::Str("keep-me".to_string())));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
@@ -308,13 +288,10 @@ async fn property_type_change_casts_existing_data() {
     // `_pylon.notify_cache_invalidate()` — that function (and the `_pylon`
     // schema itself) only exist once `export_stdlib()`'s DDL has run,
     // normally done once via `pylon database install`.
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
 
-    let insert =
-        query::compile(&format!("insert {module}::Widget {{ code := '42' }}"), &v1).unwrap();
+    let insert = query::compile(&format!("insert {module}::Widget {{ code := '42' }}"), &v1).unwrap();
     assert_eq!(pool.execute_typed(&insert.sql, &[]).await.unwrap(), 1);
 
     // v2: `code` widened from text to int8 — the type-changing-column path
@@ -322,9 +299,7 @@ async fn property_type_change_casts_existing_data() {
     let mut v2 = v1.clone();
     v2.types[0].properties[1].pg_type = "int8".into();
 
-    let live = pylon_core::introspect::introspect_db_state(&pool)
-        .await
-        .unwrap();
+    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
     let steps = diff_schema_steps(&v2, &live, &HashMap::new()).unwrap();
     let table_step = steps
         .iter()
@@ -339,11 +314,7 @@ async fn property_type_change_casts_existing_data() {
         pool.batch_execute(&op.sql).await.unwrap();
     }
 
-    let select = query::compile(
-        &format!("select {module}::Widget {{ code }} filter .code = 42"),
-        &v2,
-    )
-    .unwrap();
+    let select = query::compile(&format!("select {module}::Widget {{ code }} filter .code = 42"), &v2).unwrap();
     let rows = pool
         .query_typed(&select.sql, &[], &ExtensionOids::default())
         .await

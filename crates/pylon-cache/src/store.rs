@@ -143,7 +143,10 @@ impl Cache {
     }
 
     pub fn put(&self, key: &str, rows: Vec<DecodedValue>, tags: Vec<String>) -> Result<()> {
-        let entry = CachedEntry { rows, tags: tags.clone() };
+        let entry = CachedEntry {
+            rows,
+            tags: tags.clone(),
+        };
         let bytes = rkyv::to_bytes::<RkyvError>(&entry)?;
 
         let mut wtxn = self.env.write_txn()?;
@@ -190,7 +193,10 @@ impl Cache {
         let entry_count = self.entries.len(&rtxn)?;
         drop(rtxn);
         let used_bytes = self.env.non_free_pages_size()?;
-        Ok(CacheStats { entry_count, used_bytes })
+        Ok(CacheStats {
+            entry_count,
+            used_bytes,
+        })
     }
 
     /// Evicts every cache entry, unconditionally — used by the `pylon cache
@@ -224,14 +230,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let cache = Cache::open(dir.path(), 10).unwrap();
-            cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
+            cache
+                .put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()])
+                .unwrap();
             assert!(cache.get("key1").unwrap().is_some());
         }
         // Simulate a cache directory written under a different format
         // version by overwriting the version marker directly.
         {
             let env = unsafe {
-                EnvOpenOptions::new().map_size(10 * 1024 * 1024).max_dbs(3).open(dir.path()).unwrap()
+                EnvOpenOptions::new()
+                    .map_size(10 * 1024 * 1024)
+                    .max_dbs(3)
+                    .open(dir.path())
+                    .unwrap()
             };
             let mut wtxn = env.write_txn().unwrap();
             let meta: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("meta")).unwrap();
@@ -247,7 +259,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let cache = Cache::open(dir.path(), 10).unwrap();
-            cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
+            cache
+                .put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()])
+                .unwrap();
         }
         let cache = Cache::open(dir.path(), 10).unwrap();
         assert!(cache.get("key1").unwrap().is_some());
@@ -273,9 +287,19 @@ mod tests {
     #[test]
     fn invalidate_evicts_all_entries_sharing_a_tag() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
-        cache.put("key2", vec![DecodedValue::I64(2)], vec!["public.person".into(), "public.pet".into()]).unwrap();
-        cache.put("key3", vec![DecodedValue::I64(3)], vec!["public.pet".into()]).unwrap();
+        cache
+            .put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()])
+            .unwrap();
+        cache
+            .put(
+                "key2",
+                vec![DecodedValue::I64(2)],
+                vec!["public.person".into(), "public.pet".into()],
+            )
+            .unwrap();
+        cache
+            .put("key3", vec![DecodedValue::I64(3)], vec!["public.pet".into()])
+            .unwrap();
 
         cache.invalidate(&["public.person".to_string()]).unwrap();
 
@@ -287,7 +311,9 @@ mod tests {
     #[test]
     fn invalidate_unknown_tag_is_a_no_op() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
+        cache
+            .put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()])
+            .unwrap();
         cache.invalidate(&["public.nonexistent".to_string()]).unwrap();
         assert!(cache.get("key1").unwrap().is_some());
     }
@@ -311,8 +337,12 @@ mod tests {
     #[test]
     fn stat_reports_entry_count_and_nonzero_used_bytes_after_put() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
-        cache.put("key2", vec![DecodedValue::I64(2)], vec!["public.pet".into()]).unwrap();
+        cache
+            .put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()])
+            .unwrap();
+        cache
+            .put("key2", vec![DecodedValue::I64(2)], vec!["public.pet".into()])
+            .unwrap();
 
         let stats = cache.stat().unwrap();
         assert_eq!(stats.entry_count, 2);
@@ -322,8 +352,12 @@ mod tests {
     #[test]
     fn clear_removes_all_entries_and_tags() {
         let (_dir, cache) = open_temp();
-        cache.put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()]).unwrap();
-        cache.put("key2", vec![DecodedValue::I64(2)], vec!["public.pet".into()]).unwrap();
+        cache
+            .put("key1", vec![DecodedValue::I64(1)], vec!["public.person".into()])
+            .unwrap();
+        cache
+            .put("key2", vec![DecodedValue::I64(2)], vec!["public.pet".into()])
+            .unwrap();
 
         cache.clear().unwrap();
 

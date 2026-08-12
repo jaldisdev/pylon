@@ -139,10 +139,10 @@ pub struct ExtensionOids {
 /// field length never reaches this function) — see `decode_record`/
 /// `decode_array` for where that's checked.
 pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<DecodedValue> {
-    if let Some(vector_oid) = ext.vector {
-        if oid == vector_oid {
-            return Ok(DecodedValue::Array(decode_vector(data)?));
-        }
+    if let Some(vector_oid) = ext.vector
+        && oid == vector_oid
+    {
+        return Ok(DecodedValue::Array(decode_vector(data)?));
     }
     match oid {
         OID_BOOL => Ok(DecodedValue::Bool(data.first().copied().unwrap_or(0) != 0)),
@@ -167,18 +167,14 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Decode
         OID_JSONB => decode_jsonb(data),
         OID_RECORD => decode_record(data, ext),
         OID_RECORD_ARRAY => decode_array(data, ext),
-        OID_BOOL_ARRAY | OID_BYTEA_ARRAY | OID_INT2_ARRAY | OID_INT4_ARRAY | OID_INT8_ARRAY
-        | OID_TEXT_ARRAY | OID_BPCHAR_ARRAY | OID_VARCHAR_ARRAY | OID_FLOAT4_ARRAY
-        | OID_FLOAT8_ARRAY | OID_NUMERIC_ARRAY | OID_UUID_ARRAY | OID_JSONB_ARRAY => {
-            decode_array(data, ext)
-        }
+        OID_BOOL_ARRAY | OID_BYTEA_ARRAY | OID_INT2_ARRAY | OID_INT4_ARRAY | OID_INT8_ARRAY | OID_TEXT_ARRAY
+        | OID_BPCHAR_ARRAY | OID_VARCHAR_ARRAY | OID_FLOAT4_ARRAY | OID_FLOAT8_ARRAY | OID_NUMERIC_ARRAY
+        | OID_UUID_ARRAY | OID_JSONB_ARRAY => decode_array(data, ext),
         OID_INT4RANGE | OID_INT8RANGE | OID_NUMRANGE | OID_TSRANGE | OID_TSTZRANGE | OID_DATERANGE => {
             decode_range(data, range_element_oid(oid).expect("range OID"), ext)
         }
-        OID_INT4MULTIRANGE | OID_INT8MULTIRANGE | OID_NUMMULTIRANGE | OID_TSMULTIRANGE
-        | OID_TSTZMULTIRANGE | OID_DATEMULTIRANGE => {
-            decode_multirange(data, range_element_oid(oid).expect("multirange OID"), ext)
-        }
+        OID_INT4MULTIRANGE | OID_INT8MULTIRANGE | OID_NUMMULTIRANGE | OID_TSMULTIRANGE | OID_TSTZMULTIRANGE
+        | OID_DATEMULTIRANGE => decode_multirange(data, range_element_oid(oid).expect("multirange OID"), ext),
         // Enums, domains, and other extension/text-compatible custom types
         // (schema-qualified enums are always emitted `::text`-cast by
         // pylon-core — see `sql/mod.rs::emit_scalar` — so their runtime
@@ -201,13 +197,18 @@ fn decode_numeric(data: &[u8]) -> Result<DecodedValue> {
 fn decode_interval(data: &[u8]) -> Result<DecodedValue> {
     if data.len() != 16 {
         return Err(Error::message(format!(
-            "malformed interval: expected 16 bytes, got {}", data.len()
+            "malformed interval: expected 16 bytes, got {}",
+            data.len()
         )));
     }
     let microseconds = i64::from_be_bytes(data[0..8].try_into()?);
     let days = i32::from_be_bytes(data[8..12].try_into()?);
     let months = i32::from_be_bytes(data[12..16].try_into()?);
-    Ok(DecodedValue::Interval { months, days, microseconds })
+    Ok(DecodedValue::Interval {
+        months,
+        days,
+        microseconds,
+    })
 }
 
 // PostgreSQL's range binary-format flag bits (`rangetypes.h`).
@@ -226,7 +227,13 @@ fn decode_range(data: &[u8], element_oid: u32, ext: &ExtensionOids) -> Result<De
     let flags = data[0];
     let mut offset = 1usize;
     if flags & RANGE_EMPTY != 0 {
-        return Ok(DecodedValue::Range { lower: None, upper: None, inc_lower: false, inc_upper: false, empty: true });
+        return Ok(DecodedValue::Range {
+            lower: None,
+            upper: None,
+            inc_lower: false,
+            inc_upper: false,
+            empty: true,
+        });
     }
     let lower = if flags & RANGE_LB_INF != 0 {
         None
@@ -317,7 +324,10 @@ fn decode_vector(data: &[u8]) -> Result<Vec<DecodedValue>> {
 /// Encodes `items` (each expected to be `DecodedValue::F64`/`I64`) as
 /// pgvector's binary format — the inverse of `decode_vector`.
 fn encode_vector(items: &[DecodedValue], out: &mut bytes::BytesMut) -> Result<()> {
-    let ndim: u16 = items.len().try_into().map_err(|_| Error::message("vector has too many dimensions to encode"))?;
+    let ndim: u16 = items
+        .len()
+        .try_into()
+        .map_err(|_| Error::message("vector has too many dimensions to encode"))?;
     out.put_u16(ndim);
     out.put_u16(0); // reserved
     for item in items {
@@ -432,7 +442,9 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             DecodedValue::Decimal(s) => s.parse()?,
             DecodedValue::Str(s) => s.parse()?,
             DecodedValue::I64(i) => Decimal::from(*i),
-            DecodedValue::F64(f) => Decimal::try_from(*f).map_err(|e| Error::message(format!("invalid decimal value: {e}")))?,
+            DecodedValue::F64(f) => {
+                Decimal::try_from(*f).map_err(|e| Error::message(format!("invalid decimal value: {e}")))?
+            }
             _ => return Err(Error::message("cannot bind this value as a numeric parameter")),
         };
         decimal.to_sql(&Type::NUMERIC, out)?;
@@ -522,7 +534,11 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             out.put_u8(1); // jsonb binary format version prefix
             out.put_slice(json.to_string().as_bytes());
         }
-        DecodedValue::Interval { months, days, microseconds } => {
+        DecodedValue::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
             // Same field order as `decode_interval`'s read.
             out.put_i64(*microseconds);
             out.put_i32(*days);
@@ -532,7 +548,13 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
         DecodedValue::Time(us) => out.put_i64(*us),
         DecodedValue::Timestamp(us) => out.put_i64(*us),
         DecodedValue::Timestamptz(us) => out.put_i64(*us),
-        DecodedValue::Range { lower, upper, inc_lower, inc_upper, empty } => {
+        DecodedValue::Range {
+            lower,
+            upper,
+            inc_lower,
+            inc_upper,
+            empty,
+        } => {
             if *empty {
                 out.put_u8(RANGE_EMPTY);
                 return Ok(IsNull::No);
@@ -546,10 +568,18 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
                 _ => Type::TEXT,
             };
             let mut flags = 0u8;
-            if *inc_lower { flags |= RANGE_LB_INC; }
-            if *inc_upper { flags |= RANGE_UB_INC; }
-            if lower.is_none() { flags |= RANGE_LB_INF; }
-            if upper.is_none() { flags |= RANGE_UB_INF; }
+            if *inc_lower {
+                flags |= RANGE_LB_INC;
+            }
+            if *inc_upper {
+                flags |= RANGE_UB_INC;
+            }
+            if lower.is_none() {
+                flags |= RANGE_LB_INF;
+            }
+            if upper.is_none() {
+                flags |= RANGE_UB_INF;
+            }
             out.put_u8(flags);
             for bound in [lower, upper].into_iter().flatten() {
                 let mut buf = bytes::BytesMut::new();
@@ -571,7 +601,9 @@ fn cached_to_json(value: &DecodedValue) -> serde_json::Value {
         DecodedValue::Null => serde_json::Value::Null,
         DecodedValue::Bool(b) => serde_json::Value::Bool(*b),
         DecodedValue::I64(i) => serde_json::Value::Number((*i).into()),
-        DecodedValue::F64(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+        DecodedValue::F64(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         DecodedValue::Str(s) => serde_json::Value::String(s.clone()),
         DecodedValue::Bytes(b) => serde_json::Value::String(hex::encode(b)),
         DecodedValue::Uuid(bytes) => serde_json::Value::String(format_uuid(bytes)),
@@ -584,7 +616,11 @@ fn cached_to_json(value: &DecodedValue) -> serde_json::Value {
         // Interval value ends up nested inside an Object being sent as a
         // jsonb parameter — represented as its raw components so it's at
         // least round-trippable, not silently dropped.
-        DecodedValue::Interval { months, days, microseconds } => serde_json::json!({
+        DecodedValue::Interval {
+            months,
+            days,
+            microseconds,
+        } => serde_json::json!({
             "months": months, "days": days, "microseconds": microseconds,
         }),
         // Same rationale as Interval above — raw PG wire units, not a
@@ -595,7 +631,13 @@ fn cached_to_json(value: &DecodedValue) -> serde_json::Value {
         DecodedValue::Time(us) => serde_json::json!({ "microseconds_since_midnight": us }),
         DecodedValue::Timestamp(us) => serde_json::json!({ "microseconds_since_2000_01_01": us }),
         DecodedValue::Timestamptz(us) => serde_json::json!({ "microseconds_since_2000_01_01_utc": us }),
-        DecodedValue::Range { lower, upper, inc_lower, inc_upper, empty } => serde_json::json!({
+        DecodedValue::Range {
+            lower,
+            upper,
+            inc_lower,
+            inc_upper,
+            empty,
+        } => serde_json::json!({
             "lower": lower.as_deref().map(cached_to_json),
             "upper": upper.as_deref().map(cached_to_json),
             "inc_lower": inc_lower,
@@ -607,7 +649,14 @@ fn cached_to_json(value: &DecodedValue) -> serde_json::Value {
 
 fn format_uuid(bytes: &[u8; 16]) -> String {
     let hex = hex::encode(bytes);
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Parses a hyphenated UUID string into its 16 raw bytes — the inverse of
@@ -618,7 +667,9 @@ fn format_uuid(bytes: &[u8; 16]) -> String {
 fn parse_uuid_str(s: &str) -> Result<[u8; 16]> {
     let hex_only: String = s.chars().filter(|c| *c != '-').collect();
     let bytes = hex::decode(&hex_only).map_err(|_| Error::message(format!("invalid UUID string: {s:?}")))?;
-    bytes.try_into().map_err(|_: Vec<u8>| Error::message(format!("invalid UUID string: {s:?}")))
+    bytes
+        .try_into()
+        .map_err(|_: Vec<u8>| Error::message(format!("invalid UUID string: {s:?}")))
 }
 
 /// 1-dimensional Postgres array binary format (see the module doc comment
@@ -662,14 +713,26 @@ mod tests {
 
     #[test]
     fn decodes_bool() {
-        assert_eq!(decode_value(OID_BOOL, &[1], &no_ext()).unwrap(), DecodedValue::Bool(true));
-        assert_eq!(decode_value(OID_BOOL, &[0], &no_ext()).unwrap(), DecodedValue::Bool(false));
+        assert_eq!(
+            decode_value(OID_BOOL, &[1], &no_ext()).unwrap(),
+            DecodedValue::Bool(true)
+        );
+        assert_eq!(
+            decode_value(OID_BOOL, &[0], &no_ext()).unwrap(),
+            DecodedValue::Bool(false)
+        );
     }
 
     #[test]
     fn decodes_integers() {
-        assert_eq!(decode_value(OID_INT2, &7i16.to_be_bytes(), &no_ext()).unwrap(), DecodedValue::I64(7));
-        assert_eq!(decode_value(OID_INT4, &(-42i32).to_be_bytes(), &no_ext()).unwrap(), DecodedValue::I64(-42));
+        assert_eq!(
+            decode_value(OID_INT2, &7i16.to_be_bytes(), &no_ext()).unwrap(),
+            DecodedValue::I64(7)
+        );
+        assert_eq!(
+            decode_value(OID_INT4, &(-42i32).to_be_bytes(), &no_ext()).unwrap(),
+            DecodedValue::I64(-42)
+        );
         assert_eq!(
             decode_value(OID_INT8, &9_223_372_036_854_775_807i64.to_be_bytes(), &no_ext()).unwrap(),
             DecodedValue::I64(9_223_372_036_854_775_807)
@@ -678,8 +741,14 @@ mod tests {
 
     #[test]
     fn decodes_floats() {
-        assert_eq!(decode_value(OID_FLOAT4, &1.5f32.to_be_bytes(), &no_ext()).unwrap(), DecodedValue::F64(1.5));
-        assert_eq!(decode_value(OID_FLOAT8, &2.25f64.to_be_bytes(), &no_ext()).unwrap(), DecodedValue::F64(2.25));
+        assert_eq!(
+            decode_value(OID_FLOAT4, &1.5f32.to_be_bytes(), &no_ext()).unwrap(),
+            DecodedValue::F64(1.5)
+        );
+        assert_eq!(
+            decode_value(OID_FLOAT8, &2.25f64.to_be_bytes(), &no_ext()).unwrap(),
+            DecodedValue::F64(2.25)
+        );
     }
 
     #[test]
@@ -703,7 +772,10 @@ mod tests {
     #[test]
     fn decodes_uuid() {
         let bytes: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        assert_eq!(decode_value(OID_UUID, &bytes, &no_ext()).unwrap(), DecodedValue::Uuid(bytes));
+        assert_eq!(
+            decode_value(OID_UUID, &bytes, &no_ext()).unwrap(),
+            DecodedValue::Uuid(bytes)
+        );
     }
 
     #[test]
@@ -725,13 +797,21 @@ mod tests {
         data.extend_from_slice(&1i32.to_be_bytes()); // 1 month
         assert_eq!(
             decode_value(OID_INTERVAL, &data, &no_ext()).unwrap(),
-            DecodedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 }
+            DecodedValue::Interval {
+                months: 1,
+                days: 2,
+                microseconds: 3_600_000_000
+            }
         );
     }
 
     #[test]
     fn encodes_interval() {
-        let value = DecodedValue::Interval { months: 1, days: 2, microseconds: 3_600_000_000 };
+        let value = DecodedValue::Interval {
+            months: 1,
+            days: 2,
+            microseconds: 3_600_000_000,
+        };
         let mut out = bytes::BytesMut::new();
         encode_value(&value, &postgres_types::Type::INTERVAL, &mut out).unwrap();
         assert_eq!(decode_value(OID_INTERVAL, &out, &no_ext()).unwrap(), value);
@@ -742,8 +822,14 @@ mod tests {
         // Regression: these had no binary decoder either — date silently
         // returned garbage bytes (never even errored), the others panicked
         // on the same UTF-8-text-fallback assumption interval did.
-        assert_eq!(decode_value(OID_DATE, &9525i32.to_be_bytes(), &no_ext()).unwrap(), DecodedValue::Date(9525));
-        assert_eq!(decode_value(OID_TIME, &3_600_000_000i64.to_be_bytes(), &no_ext()).unwrap(), DecodedValue::Time(3_600_000_000));
+        assert_eq!(
+            decode_value(OID_DATE, &9525i32.to_be_bytes(), &no_ext()).unwrap(),
+            DecodedValue::Date(9525)
+        );
+        assert_eq!(
+            decode_value(OID_TIME, &3_600_000_000i64.to_be_bytes(), &no_ext()).unwrap(),
+            DecodedValue::Time(3_600_000_000)
+        );
         assert_eq!(
             decode_value(OID_TIMESTAMP, &1_000_000_000i64.to_be_bytes(), &no_ext()).unwrap(),
             DecodedValue::Timestamp(1_000_000_000)
@@ -760,7 +846,10 @@ mod tests {
             (DecodedValue::Date(9525), postgres_types::Type::DATE),
             (DecodedValue::Time(3_600_000_000), postgres_types::Type::TIME),
             (DecodedValue::Timestamp(1_000_000_000), postgres_types::Type::TIMESTAMP),
-            (DecodedValue::Timestamptz(1_000_000_000), postgres_types::Type::TIMESTAMPTZ),
+            (
+                DecodedValue::Timestamptz(1_000_000_000),
+                postgres_types::Type::TIMESTAMPTZ,
+            ),
         ] {
             let mut out = bytes::BytesMut::new();
             encode_value(&value, &ty, &mut out).unwrap();
@@ -799,7 +888,13 @@ mod tests {
     fn decodes_an_empty_range() {
         assert_eq!(
             decode_value(OID_INT8RANGE, &[RANGE_EMPTY], &no_ext()).unwrap(),
-            DecodedValue::Range { lower: None, upper: None, inc_lower: false, inc_upper: false, empty: true }
+            DecodedValue::Range {
+                lower: None,
+                upper: None,
+                inc_lower: false,
+                inc_upper: false,
+                empty: true
+            }
         );
     }
 
@@ -809,7 +904,13 @@ mod tests {
         let data = [RANGE_LB_INF | RANGE_UB_INF];
         assert_eq!(
             decode_value(OID_INT8RANGE, &data, &no_ext()).unwrap(),
-            DecodedValue::Range { lower: None, upper: None, inc_lower: false, inc_upper: false, empty: false }
+            DecodedValue::Range {
+                lower: None,
+                upper: None,
+                inc_lower: false,
+                inc_upper: false,
+                empty: false
+            }
         );
     }
 
@@ -854,12 +955,16 @@ mod tests {
                 DecodedValue::Range {
                     lower: Some(Box::new(DecodedValue::I64(1))),
                     upper: Some(Box::new(DecodedValue::I64(3))),
-                    inc_lower: true, inc_upper: false, empty: false,
+                    inc_lower: true,
+                    inc_upper: false,
+                    empty: false,
                 },
                 DecodedValue::Range {
                     lower: Some(Box::new(DecodedValue::I64(5))),
                     upper: Some(Box::new(DecodedValue::I64(7))),
-                    inc_lower: true, inc_upper: false, empty: false,
+                    inc_lower: true,
+                    inc_upper: false,
+                    empty: false,
                 },
             ])
         );
@@ -895,20 +1000,29 @@ mod tests {
     fn decodes_numeric_integer() {
         // 12345 = digit groups [1, 2345] at weight 1 (10000^1 * 1 + 10000^0 * 2345)
         let data = encode_numeric(0x0000, 1, 0, &[1, 2345]);
-        assert_eq!(decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(), DecodedValue::Decimal("12345".to_string()));
+        assert_eq!(
+            decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(),
+            DecodedValue::Decimal("12345".to_string())
+        );
     }
 
     #[test]
     fn decodes_numeric_with_fraction() {
         // 12.50, dscale=2: digit groups [12, 5000] at weight 0
         let data = encode_numeric(0x0000, 0, 2, &[12, 5000]);
-        assert_eq!(decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(), DecodedValue::Decimal("12.50".to_string()));
+        assert_eq!(
+            decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(),
+            DecodedValue::Decimal("12.50".to_string())
+        );
     }
 
     #[test]
     fn decodes_negative_numeric() {
         let data = encode_numeric(0x4000, 0, 2, &[12, 5000]);
-        assert_eq!(decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(), DecodedValue::Decimal("-12.50".to_string()));
+        assert_eq!(
+            decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(),
+            DecodedValue::Decimal("-12.50".to_string())
+        );
     }
 
     #[test]
@@ -921,7 +1035,10 @@ mod tests {
             DecodedValue::Object(vec![
                 ("a".into(), DecodedValue::I64(1)),
                 ("b".into(), DecodedValue::Str("two".into())),
-                ("c".into(), DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2), DecodedValue::I64(3)])),
+                (
+                    "c".into(),
+                    DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2), DecodedValue::I64(3)])
+                ),
                 ("d".into(), DecodedValue::Null),
             ])
         );
@@ -931,7 +1048,10 @@ mod tests {
     fn decodes_jsonb_scalar_and_array() {
         let mut data = vec![1u8];
         data.extend_from_slice(b"42");
-        assert_eq!(decode_value(OID_JSONB, &data, &no_ext()).unwrap(), DecodedValue::I64(42));
+        assert_eq!(
+            decode_value(OID_JSONB, &data, &no_ext()).unwrap(),
+            DecodedValue::I64(42)
+        );
 
         let mut data2 = vec![1u8];
         data2.extend_from_slice(b"[1.5, 2.5]");
@@ -970,7 +1090,11 @@ mod tests {
         let decoded = decode_value(OID_RECORD, &data, &no_ext()).unwrap();
         assert_eq!(
             decoded,
-            DecodedValue::Composite(vec![DecodedValue::I64(42), DecodedValue::Str("alice".into()), DecodedValue::Null])
+            DecodedValue::Composite(vec![
+                DecodedValue::I64(42),
+                DecodedValue::Str("alice".into()),
+                DecodedValue::Null
+            ])
         );
     }
 
@@ -1023,14 +1147,21 @@ mod tests {
         let decoded = decode_value(OID_TEXT_ARRAY, &data, &no_ext()).unwrap();
         assert_eq!(
             decoded,
-            DecodedValue::Array(vec![DecodedValue::Str("a".into()), DecodedValue::Str("b".into()), DecodedValue::Null])
+            DecodedValue::Array(vec![
+                DecodedValue::Str("a".into()),
+                DecodedValue::Str("b".into()),
+                DecodedValue::Null
+            ])
         );
     }
 
     #[test]
     fn decodes_empty_array() {
         let data = encode_array(OID_TEXT, &[]);
-        assert_eq!(decode_value(OID_TEXT_ARRAY, &data, &no_ext()).unwrap(), DecodedValue::Array(vec![]));
+        assert_eq!(
+            decode_value(OID_TEXT_ARRAY, &data, &no_ext()).unwrap(),
+            DecodedValue::Array(vec![])
+        );
     }
 
     #[test]
@@ -1057,7 +1188,10 @@ mod tests {
 
         let ext = ExtensionOids { vector: Some(50_000) };
         let decoded = decode_value(50_000, &data, &ext).unwrap();
-        assert_eq!(decoded, DecodedValue::Array(vec![DecodedValue::F64(1.5), DecodedValue::F64(2.5)]));
+        assert_eq!(
+            decoded,
+            DecodedValue::Array(vec![DecodedValue::F64(1.5), DecodedValue::F64(2.5)])
+        );
     }
 
     #[test]
@@ -1083,7 +1217,9 @@ mod tests {
         encode_value(&value, &postgres_types::Type::UUID, &mut out).unwrap();
         assert_eq!(
             out.as_ref(),
-            &[0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]
+            &[
+                0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55
+            ]
         );
     }
 
@@ -1107,7 +1243,12 @@ mod tests {
         // builtin — construct it the way `Statement::params()` would
         // report it back (any OID works here; encoding only inspects the
         // name via `ty.name()`, matching `$n::vector`'s cast-reported type).
-        Type::new("vector".to_string(), 50_000, postgres_types::Kind::Simple, "public".to_string())
+        Type::new(
+            "vector".to_string(),
+            50_000,
+            postgres_types::Kind::Simple,
+            "public".to_string(),
+        )
     }
 
     #[test]
@@ -1118,7 +1259,11 @@ mod tests {
         // `Array` value bound against it must produce pgvector's own
         // binary format (`u16 ndim`, `u16 reserved`, then big-endian
         // `f32`s), not the generic Postgres array wire format.
-        let value = DecodedValue::Array(vec![DecodedValue::F64(1.5), DecodedValue::F64(-2.25), DecodedValue::F64(0.0)]);
+        let value = DecodedValue::Array(vec![
+            DecodedValue::F64(1.5),
+            DecodedValue::F64(-2.25),
+            DecodedValue::F64(0.0),
+        ]);
         let mut out = bytes::BytesMut::new();
         encode_value(&value, &vector_type(), &mut out).unwrap();
         let mut expected = vec![0u8, 3, 0, 0];
@@ -1130,11 +1275,18 @@ mod tests {
 
     #[test]
     fn a_vector_encoded_value_round_trips_through_decode_vector() {
-        let value = DecodedValue::Array(vec![DecodedValue::F64(1.0), DecodedValue::F64(2.0), DecodedValue::F64(3.0)]);
+        let value = DecodedValue::Array(vec![
+            DecodedValue::F64(1.0),
+            DecodedValue::F64(2.0),
+            DecodedValue::F64(3.0),
+        ]);
         let mut out = bytes::BytesMut::new();
         encode_value(&value, &vector_type(), &mut out).unwrap();
         let decoded = decode_vector(out.as_ref()).unwrap();
-        assert_eq!(decoded, vec![DecodedValue::F64(1.0), DecodedValue::F64(2.0), DecodedValue::F64(3.0)]);
+        assert_eq!(
+            decoded,
+            vec![DecodedValue::F64(1.0), DecodedValue::F64(2.0), DecodedValue::F64(3.0)]
+        );
     }
 
     #[test]
@@ -1159,6 +1311,9 @@ mod tests {
         encode_value(&value, &postgres_types::Type::JSONB, &mut out).unwrap();
         assert_eq!(out.as_ref(), [&[1u8][..], br#"{"a":1}"#].concat());
         // And decodes back correctly through the normal jsonb decode path.
-        assert_eq!(decode_value(OID_JSONB, &out, &no_ext()).unwrap(), DecodedValue::Object(vec![("a".into(), DecodedValue::I64(1))]));
+        assert_eq!(
+            decode_value(OID_JSONB, &out, &no_ext()).unwrap(),
+            DecodedValue::Object(vec![("a".into(), DecodedValue::I64(1))])
+        );
     }
 }

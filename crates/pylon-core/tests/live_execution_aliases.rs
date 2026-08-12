@@ -92,12 +92,7 @@ fn schema(module: &str) -> SchemaDescriptor {
     let person = ty(
         "Person",
         module,
-        vec![
-            id_prop(),
-            text_prop("name"),
-            int_prop("age"),
-            bool_prop("active"),
-        ],
+        vec![id_prop(), text_prop("name"), int_prop("age"), bool_prop("active")],
     );
     let active_alias = AliasDescriptor {
         name: "ActiveAlias".into(),
@@ -121,11 +116,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -140,9 +131,7 @@ fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
 }
 
 async fn seed(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) {
@@ -173,9 +162,7 @@ async fn plain_select_uses_the_aliases_own_filter() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
     seed(&pool, &sd, &module).await;
 
     let rows = rows_of(
@@ -184,11 +171,7 @@ async fn plain_select_uses_the_aliases_own_filter() {
         &format!("select {module}::ActiveAlias {{ name }} order by .name"),
     )
     .await;
-    assert_eq!(
-        rows.len(),
-        2,
-        "only the two active people should match, got {rows:?}"
-    );
+    assert_eq!(rows.len(), 2, "only the two active people should match, got {rows:?}");
     assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
     assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Carol".to_string()));
 }
@@ -200,9 +183,7 @@ async fn outer_filter_ands_with_the_aliases_own_filter() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
     seed(&pool, &sd, &module).await;
 
     // Bob is inactive, so even though the outer filter matches his name,
@@ -235,9 +216,7 @@ async fn outer_order_by_overrides_the_aliases_own_order_by() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
     seed(&pool, &sd, &module).await;
 
     // ActiveAlias declares no order of its own; give one explicitly and
@@ -260,19 +239,13 @@ async fn aliases_own_order_and_limit_apply_with_no_outer_override() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
     seed(&pool, &sd, &module).await;
 
     // Youngest already has its own `order by .age asc limit 1` — plain
     // `select Youngest { name }` with no further modifiers must honor them.
     let rows = rows_of(&pool, &sd, &format!("select {module}::Youngest {{ name }}")).await;
-    assert_eq!(
-        rows.len(),
-        1,
-        "the alias's own limit must apply, got {rows:?}"
-    );
+    assert_eq!(rows.len(), 1, "the alias's own limit must apply, got {rows:?}");
     assert_eq!(
         field(&rows[0], 1),
         &DecodedValue::Str("Bob".to_string()),
@@ -287,17 +260,10 @@ async fn outer_limit_overrides_the_aliases_own_limit() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
     seed(&pool, &sd, &module).await;
 
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Youngest {{ name }} limit 2"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Youngest {{ name }} limit 2")).await;
     assert_eq!(
         rows.len(),
         2,
@@ -312,20 +278,13 @@ async fn outer_shape_replaces_the_aliases_own_shape() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
     seed(&pool, &sd, &module).await;
 
     // Youngest's own shape only projects `name` — an outer shape asking for
     // `age` too must still work (the outer shape replaces, not merges with,
     // the alias's own).
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::Youngest {{ name, age }}"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Youngest {{ name, age }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Bob".to_string()));
     assert_eq!(field(&rows[0], 2), &DecodedValue::I64(25));

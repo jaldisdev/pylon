@@ -85,15 +85,18 @@ impl AnthropicProvider {
         if let Some(key) = api_key {
             headers.insert(
                 "x-api-key",
-                reqwest::header::HeaderValue::from_str(key)
-                    .map_err(|e| crate::error::Error::Shape(e.to_string()))?,
+                reqwest::header::HeaderValue::from_str(key).map_err(|e| crate::error::Error::Shape(e.to_string()))?,
             );
         }
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
-        Ok(Self { client, base_url: api_url.trim_end_matches('/').to_string(), model: model.to_string() })
+        Ok(Self {
+            client,
+            base_url: api_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+        })
     }
 
     pub async fn chat(&self, messages: &[Message]) -> Result<String> {
@@ -101,9 +104,17 @@ impl AnthropicProvider {
         let turns: Vec<AnthropicMessage<'_>> = messages
             .iter()
             .filter(|m| m.role != "system")
-            .map(|m| AnthropicMessage { role: &m.role, content: &m.content })
+            .map(|m| AnthropicMessage {
+                role: &m.role,
+                content: &m.content,
+            })
             .collect();
-        let body = ChatRequest { model: &self.model, max_tokens: MAX_TOKENS, messages: turns, system };
+        let body = ChatRequest {
+            model: &self.model,
+            max_tokens: MAX_TOKENS,
+            messages: turns,
+            system,
+        };
         let response = self
             .client
             .post(format!("{}/messages", self.base_url))

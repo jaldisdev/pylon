@@ -31,7 +31,9 @@
 //!     curl http://127.0.0.1:5656/metrics
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: smoke <dir containing pylon.toml>");
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: smoke <dir containing pylon.toml>");
     let mut config = pylon_server::load_config(Some(std::path::Path::new(&dir))).expect("load pylon.toml");
     // Overridden away from pylon.toml's own [webserver] port to avoid
     // colliding with whatever else is already bound to it locally.

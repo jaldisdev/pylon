@@ -48,8 +48,7 @@ use common::*;
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{
-    FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, SchemaDescriptor,
-    TypeDescriptor,
+    FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
 };
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
@@ -96,11 +95,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -127,12 +122,8 @@ fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
-    pool.batch_execute(&export_schema(sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(sd).unwrap()).await.unwrap();
 }
 
 #[tokio::test]
@@ -158,12 +149,7 @@ async fn scalar_function_computes_correctly() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::discount_price(100, 25)"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::discount_price(100, 25)")).await;
     assert_eq!(rows.len(), 1);
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
@@ -178,11 +164,7 @@ async fn scalar_function_computes_correctly() {
 #[ignore]
 async fn object_set_returning_function_filters_correctly() {
     let module = unique_module("live_fn_objset");
-    let person = ty(
-        "Person",
-        &module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     let adults = FunctionDescriptor {
         name: "adults".into(),
         module: module.clone(),
@@ -235,11 +217,7 @@ async fn function_composes_inside_a_larger_query() {
         volatility: "immutable".into(),
         body: "n * 2".into(),
     };
-    let person = ty(
-        "Person",
-        &module,
-        vec![id_prop(), text_prop("name"), int_prop("age")],
-    );
+    let person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
     let sd = SchemaDescriptor {
         types: vec![person],
         functions: vec![double],
@@ -436,12 +414,7 @@ async fn function_call_composed_as_an_argument_to_another_function_call() {
 
     // double(double(3)) — the inner call's IR result must be a valid
     // argument expression to the outer call, not just a top-level scalar.
-    let rows = rows_of(
-        &pool,
-        &sd,
-        &format!("select {module}::double({module}::double(3))"),
-    )
-    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::double({module}::double(3))")).await;
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };

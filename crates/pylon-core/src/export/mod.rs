@@ -18,7 +18,9 @@
 //
 
 use crate::error::{PyQLError, PyQLFragmentError};
-use crate::schema::{DeleteAction, DeleteSide, FunctionDescriptor, OnDeletePolicy, SchemaDescriptor, TypeDescriptor, TypeConstraint};
+use crate::schema::{
+    DeleteAction, DeleteSide, FunctionDescriptor, OnDeletePolicy, SchemaDescriptor, TypeConstraint, TypeDescriptor,
+};
 use std::collections::{BTreeSet, HashMap};
 
 pub mod python_snippet;
@@ -47,7 +49,12 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     let type_map: HashMap<String, (&str, &str)> = schema
         .types
         .iter()
-        .map(|t| (format!("{}::{}", t.module, t.name), (t.module.as_str(), t.table.as_str())))
+        .map(|t| {
+            (
+                format!("{}::{}", t.module, t.name),
+                (t.module.as_str(), t.table.as_str()),
+            )
+        })
         .collect();
 
     emit_schemas(schema, &mut out);
@@ -84,7 +91,11 @@ fn qi(s: &str) -> String {
 }
 
 fn pg_schema(module: &str) -> String {
-    if module == "default" { "\"public\"".into() } else { qi(module) }
+    if module == "default" {
+        "\"public\"".into()
+    } else {
+        qi(module)
+    }
 }
 
 fn qn(module: &str, name: &str) -> String {
@@ -110,9 +121,15 @@ fn fnv(parts: &[&str]) -> String {
 
 fn trigger_events(on: u8) -> String {
     let mut events = Vec::new();
-    if on & 1 != 0 { events.push("INSERT"); }
-    if on & 2 != 0 { events.push("UPDATE"); }
-    if on & 4 != 0 { events.push("DELETE"); }
+    if on & 1 != 0 {
+        events.push("INSERT");
+    }
+    if on & 2 != 0 {
+        events.push("UPDATE");
+    }
+    if on & 4 != 0 {
+        events.push("DELETE");
+    }
     events.join(" OR ")
 }
 
@@ -135,12 +152,24 @@ fn emit_schemas(schema: &SchemaDescriptor, out: &mut String) {
     // first `CREATE FUNCTION`/global/alias DDL then fails outright with
     // "schema does not exist" (confirmed live).
     let mut modules: BTreeSet<&str> = BTreeSet::new();
-    for t in &schema.types     { modules.insert(&t.module); }
-    for s in &schema.scalars   { modules.insert(&s.module); }
-    for e in &schema.enums     { modules.insert(&e.module); }
-    for f in &schema.functions { modules.insert(&f.module); }
-    for g in &schema.globals   { modules.insert(&g.module); }
-    for a in &schema.aliases   { modules.insert(&a.module); }
+    for t in &schema.types {
+        modules.insert(&t.module);
+    }
+    for s in &schema.scalars {
+        modules.insert(&s.module);
+    }
+    for e in &schema.enums {
+        modules.insert(&e.module);
+    }
+    for f in &schema.functions {
+        modules.insert(&f.module);
+    }
+    for g in &schema.globals {
+        modules.insert(&g.module);
+    }
+    for a in &schema.aliases {
+        modules.insert(&a.module);
+    }
     let non_default: Vec<&str> = modules.into_iter().filter(|m| *m != "default").collect();
     for module in &non_default {
         out.push_str(&format!("CREATE SCHEMA IF NOT EXISTS {};\n", pg_schema(module)));
@@ -154,7 +183,9 @@ fn emit_schemas(schema: &SchemaDescriptor, out: &mut String) {
 
 fn emit_enums(schema: &SchemaDescriptor, out: &mut String) {
     for e in &schema.enums {
-        let members: Vec<String> = e.members.iter()
+        let members: Vec<String> = e
+            .members
+            .iter()
             .map(|m| format!("'{}'", m.replace('\'', "''")))
             .collect();
         out.push_str(&format!(
@@ -180,7 +211,9 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
                 qi(&format!("{}_seq", s.name)),
             ));
         }
-        let checks: Vec<String> = s.check_constraints.iter()
+        let checks: Vec<String> = s
+            .check_constraints
+            .iter()
             .map(|c| format!("    CHECK ({})", c))
             .collect();
         let check_clause = if checks.is_empty() {
@@ -205,7 +238,9 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
 
 fn emit_tables(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         emit_one_table(t, out);
     }
 }
@@ -218,12 +253,15 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
     // Property columns
     for p in &t.properties {
         let not_null = if p.nullable { "" } else { " NOT NULL" };
-        let default = p.default_sql.as_deref()
+        let default = p
+            .default_sql
+            .as_deref()
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        let col_type = p.column_type.as_deref().unwrap_or_else(|| {
-            p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type)
-        });
+        let col_type = p
+            .column_type
+            .as_deref()
+            .unwrap_or_else(|| p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type));
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type, not_null, default));
     }
 
@@ -231,16 +269,15 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
     // junction-backed link has no column here at all — it's stored the
     // same way a multi-link is, via a junction table (`emit_junction_tables`).
     for l in &t.links {
-        if l.is_junction_backed() { continue; }
+        if l.is_junction_backed() {
+            continue;
+        }
         let not_null = if l.nullable { "" } else { " NOT NULL" };
         lines.push(format!("    {} uuid{}", qi(&format!("{}_id", l.name)), not_null));
     }
 
     // Primary key
-    let pk_cols: Vec<String> = t.properties.iter()
-        .filter(|p| p.is_pk)
-        .map(|p| qi(&p.name))
-        .collect();
+    let pk_cols: Vec<String> = t.properties.iter().filter(|p| p.is_pk).map(|p| qi(&p.name)).collect();
     if !pk_cols.is_empty() {
         lines.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
@@ -283,7 +320,10 @@ fn policy_for<'a>(policies: &'a [OnDeletePolicy], side: &DeleteSide) -> Option<&
 pub(crate) fn needs_deferred_target_fk(policies: &[OnDeletePolicy]) -> bool {
     policies.iter().any(|p| {
         p.side == DeleteSide::Source
-            && matches!(p.action, DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan)
+            && matches!(
+                p.action,
+                DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan
+            )
     })
 }
 
@@ -323,17 +363,19 @@ fn target_jt_fk_suffix(policies: &[OnDeletePolicy]) -> String {
 
 // ── Phase 5: FK constraints for single links ───────────────────────────────────
 
-fn emit_fk_constraints(
-    schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
-    out: &mut String,
-) {
+fn emit_fk_constraints(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         for l in &t.links {
-            if l.is_junction_backed() { continue; }
-            let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
+            if l.is_junction_backed() {
+                continue;
+            }
+            let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else {
+                continue;
+            };
             let cname = qi(&format!("{}_{}_fkey", t.table, l.name));
             let suffix = target_fk_suffix(&l.on_delete);
             out.push_str(&format!(
@@ -354,13 +396,7 @@ fn emit_fk_constraints(
 
 // ── Trigger emit helper ────────────────────────────────────────────────────────
 
-fn emit_before_delete_trigger(
-    fn_qname: &str,
-    trigger_name: &str,
-    table_qname: &str,
-    body: &str,
-    out: &mut String,
-) {
+fn emit_before_delete_trigger(fn_qname: &str, trigger_name: &str, table_qname: &str, body: &str, out: &mut String) {
     out.push_str(&format!(
         "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
          RETURNS trigger LANGUAGE plpgsql AS $$\n\
@@ -386,13 +422,7 @@ fn emit_before_delete_trigger(
 /// command" — confirmed live (`tests/live_execution_on_delete.rs`) — and
 /// Postgres's error hint is literally to use `AFTER` instead, since by then
 /// the row is actually gone and the reentrant cascade has nothing to touch.
-fn emit_after_delete_trigger(
-    fn_qname: &str,
-    trigger_name: &str,
-    table_qname: &str,
-    body: &str,
-    out: &mut String,
-) {
+fn emit_after_delete_trigger(fn_qname: &str, trigger_name: &str, table_qname: &str, body: &str, out: &mut String) {
     out.push_str(&format!(
         "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
          RETURNS trigger LANGUAGE plpgsql AS $$\n\
@@ -459,24 +489,32 @@ pub struct DeletionTriggerInfo {
     pub ddl: String,
 }
 
-fn link_source_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>) -> Vec<DeletionTriggerInfo> {
+fn link_source_trigger_infos(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+) -> Vec<DeletionTriggerInfo> {
     let mut result = Vec::new();
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         for l in &t.links {
             // A junction-backed link has no `{name}_id` column to trigger
             // off of — its deletion-policy triggers are emitted alongside
             // multi-links' own, against the junction table's source/target
             // columns instead (`multilink_deletion_trigger_infos`).
-            if l.is_junction_backed() { continue; }
-            let src_action = policy_for(&l.on_delete, &DeleteSide::Source)
-                .unwrap_or(&DeleteAction::Allow);
+            if l.is_junction_backed() {
+                continue;
+            }
+            let src_action = policy_for(&l.on_delete, &DeleteSide::Source).unwrap_or(&DeleteAction::Allow);
             match src_action {
                 DeleteAction::Allow => continue,
                 DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan => {}
                 _ => continue,
             }
-            let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else { continue };
+            let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else {
+                continue;
+            };
             let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
                 "del_orphan"
             } else {
@@ -490,7 +528,9 @@ fn link_source_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<Strin
             let col = qi(&format!("{}_id", l.name));
 
             let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
-                format!("    IF NOT EXISTS (\n        SELECT 1 FROM {tbl_qname} WHERE {col} = OLD.{col} AND id != OLD.id\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.{col};\n    END IF;")
+                format!(
+                    "    IF NOT EXISTS (\n        SELECT 1 FROM {tbl_qname} WHERE {col} = OLD.{col} AND id != OLD.id\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.{col};\n    END IF;"
+                )
             } else {
                 format!("    DELETE FROM {tgt_qname} WHERE id = OLD.{col};")
             };
@@ -508,11 +548,7 @@ fn link_source_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<Strin
     result
 }
 
-fn emit_link_source_triggers(
-    schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
-    out: &mut String,
-) {
+fn emit_link_source_triggers(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
     for info in link_source_trigger_infos(schema, type_map) {
         out.push_str(&info.ddl);
     }
@@ -520,17 +556,23 @@ fn emit_link_source_triggers(
 
 // ── Phase 6: junction tables for multi-links ───────────────────────────────────
 
-fn emit_junction_tables(
-    schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
-    out: &mut String,
-) {
+fn emit_junction_tables(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         for ml in &t.multilinks {
             emit_one_junction_table(
-                schema, type_map, t, &ml.name, &ml.target, &ml.on_delete,
-                ml.through.as_deref(), false, false, out,
+                schema,
+                type_map,
+                t,
+                &ml.name,
+                &ml.target,
+                &ml.on_delete,
+                ml.through.as_deref(),
+                false,
+                false,
+                out,
             );
         }
         // A junction-backed single link is stored exactly like a
@@ -539,15 +581,28 @@ fn emit_junction_tables(
         // `(source, target)`, plus `UNIQUE (target)` when the link is
         // also declared exclusive.
         for l in &t.links {
-            if !l.is_junction_backed() { continue; }
+            if !l.is_junction_backed() {
+                continue;
+            }
             emit_one_junction_table(
-                schema, type_map, t, &l.name, &l.target, &l.on_delete,
-                l.through.as_deref(), true, l.is_exclusive, out,
+                schema,
+                type_map,
+                t,
+                &l.name,
+                &l.target,
+                &l.on_delete,
+                l.through.as_deref(),
+                true,
+                l.is_exclusive,
+                out,
             );
         }
     }
 }
 
+// Same ten independent axes as `diff::emit_junction_table` — see the note
+// there for why these stay as parameters rather than a params struct.
+#[allow(clippy::too_many_arguments)]
 fn emit_one_junction_table(
     schema: &SchemaDescriptor,
     type_map: &HashMap<String, (&str, &str)>,
@@ -581,16 +636,19 @@ fn emit_one_junction_table(
 
     // Extra property columns from a junction through type.
     if let Some(through_qname) = through {
-        let through_td = schema.types.iter().find(|td| {
-            format!("{}::{}", td.module, td.name) == *through_qname
-        });
-        if let Some(td) = through_td {
-            if td.junction {
-                for p in &td.properties {
-                    if p.name == "id" { continue; }
-                    let not_null = if p.nullable { "" } else { " NOT NULL" };
-                    out.push_str(&format!("    {} {}{},\n", qi(&p.name), p.pg_type, not_null));
+        let through_td = schema
+            .types
+            .iter()
+            .find(|td| format!("{}::{}", td.module, td.name) == *through_qname);
+        if let Some(td) = through_td
+            && td.junction
+        {
+            for p in &td.properties {
+                if p.name == "id" {
+                    continue;
                 }
+                let not_null = if p.nullable { "" } else { " NOT NULL" };
+                out.push_str(&format!("    {} {}{},\n", qi(&p.name), p.pg_type, not_null));
             }
         }
     }
@@ -611,10 +669,15 @@ fn emit_one_junction_table(
 
 // ── Phase 6.5: multilink deletion policy triggers ──────────────────────────────
 
-fn multilink_deletion_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>) -> Vec<DeletionTriggerInfo> {
+fn multilink_deletion_trigger_infos(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+) -> Vec<DeletionTriggerInfo> {
     let mut result = Vec::new();
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         for ml in &t.multilinks {
             push_junction_deletion_triggers(t, &ml.name, &ml.target, &ml.on_delete, type_map, &mut result);
         }
@@ -622,7 +685,9 @@ fn multilink_deletion_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMa
         // source/target columns as a multi-link's, so the same
         // deletion-policy trigger bodies apply unchanged.
         for l in &t.links {
-            if !l.is_junction_backed() { continue; }
+            if !l.is_junction_backed() {
+                continue;
+            }
             push_junction_deletion_triggers(t, &l.name, &l.target, &l.on_delete, type_map, &mut result);
         }
     }
@@ -641,41 +706,43 @@ fn push_junction_deletion_triggers(
     let jt_qname = qn(&t.module, &jt_name);
 
     // Source-side: DeleteTarget / DeleteTargetIfOrphan
-    let src_action = policy_for(on_delete, &DeleteSide::Source)
-        .unwrap_or(&DeleteAction::Allow);
-    if matches!(src_action, DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan) {
-        if let Some((tgt_module, tgt_table)) = type_map.get(target) {
-            let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
-                "del_orphan"
-            } else {
-                "del_target"
-            };
-            let hash = fnv(&[&t.table, name, suffix]);
-            let fname = format!("{}_{}_{}_{}", t.table, name, suffix, &hash[..8]);
-            let fn_qname = qn(&t.module, &fname);
-            let tgt_qname = qn(tgt_module, tgt_table);
+    let src_action = policy_for(on_delete, &DeleteSide::Source).unwrap_or(&DeleteAction::Allow);
+    if matches!(
+        src_action,
+        DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan
+    ) && let Some((tgt_module, tgt_table)) = type_map.get(target)
+    {
+        let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+            "del_orphan"
+        } else {
+            "del_target"
+        };
+        let hash = fnv(&[&t.table, name, suffix]);
+        let fname = format!("{}_{}_{}_{}", t.table, name, suffix, &hash[..8]);
+        let fn_qname = qn(&t.module, &fname);
+        let tgt_qname = qn(tgt_module, tgt_table);
 
-            let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
-                format!("    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.target;\n    END IF;")
-            } else {
-                format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
-            };
+        let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+            format!(
+                "    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.target;\n    END IF;"
+            )
+        } else {
+            format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
+        };
 
-            let mut ddl = String::new();
-            emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
-            result.push(DeletionTriggerInfo {
-                table_module: t.module.clone(),
-                table_name: jt_name.clone(),
-                trigger_name: fname,
-                ddl,
-            });
-        }
+        let mut ddl = String::new();
+        emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
+        result.push(DeletionTriggerInfo {
+            table_module: t.module.clone(),
+            table_name: jt_name.clone(),
+            trigger_name: fname,
+            ddl,
+        });
     }
 
     // Target-side: DeleteSource — when target deleted (cascade removes junction row),
     // also delete the source object.
-    let tgt_action = policy_for(on_delete, &DeleteSide::Target)
-        .unwrap_or(&DeleteAction::Restrict);
+    let tgt_action = policy_for(on_delete, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict);
     if matches!(tgt_action, DeleteAction::DeleteSource) {
         let hash = fnv(&[&t.table, name, "del_source"]);
         let fname = format!("{}_{}_{}", t.table, name, &hash[..8]);
@@ -706,7 +773,10 @@ fn emit_multilink_deletion_triggers(
 
 /// Combined single-link + multilink deletion-policy trigger specs for
 /// `schema`. Public entry point for `diff/mod.rs` — see `DeletionTriggerInfo`.
-pub fn deletion_policy_trigger_infos(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>) -> Vec<DeletionTriggerInfo> {
+pub fn deletion_policy_trigger_infos(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+) -> Vec<DeletionTriggerInfo> {
     let mut result = link_source_trigger_infos(schema, type_map);
     result.extend(multilink_deletion_trigger_infos(schema, type_map));
     result
@@ -725,7 +795,9 @@ pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInf
 
     let mut result = Vec::new();
     for t in &schema.types {
-        if t.abstract_ || t.junction || t.signals.is_empty() { continue; }
+        if t.abstract_ || t.junction || t.signals.is_empty() {
+            continue;
+        }
 
         let qname = format!("{}::{}", t.module, t.name);
         let qname_literal = format!("'{}'", qname.replace('\'', "''"));
@@ -741,9 +813,15 @@ pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInf
         // drain) Update/Delete rows nobody asked for.
         let combined_on = t.signals.iter().fold(0u8, |acc, s| acc | s.on);
         let mut events = Vec::new();
-        if combined_on & 1 != 0 { events.push("INSERT"); }
-        if combined_on & 2 != 0 { events.push("UPDATE"); }
-        if combined_on & 4 != 0 { events.push("DELETE"); }
+        if combined_on & 1 != 0 {
+            events.push("INSERT");
+        }
+        if combined_on & 2 != 0 {
+            events.push("UPDATE");
+        }
+        if combined_on & 4 != 0 {
+            events.push("DELETE");
+        }
         let events_str = events.join(" OR ");
 
         // Columns that hold Pylon-maintained index state rather than
@@ -758,14 +836,21 @@ pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInf
         // case). Skipping these keeps a signal handler's `UPDATE` firing
         // scoped to changes a caller actually made, not Pylon's own
         // index-maintenance side effects on the same row.
-        let index_cols: Vec<String> = t.vector_indexes.iter().map(|vi| vi.column_name())
-            .chain(t.search_indexes.iter()
-                .filter(|si| si.backend == SearchBackend::Postgres)
-                .map(|si| si.column_name()))
+        let index_cols: Vec<String> = t
+            .vector_indexes
+            .iter()
+            .map(|vi| vi.column_name())
+            .chain(
+                t.search_indexes
+                    .iter()
+                    .filter(|si| si.backend == SearchBackend::Postgres)
+                    .map(|si| si.column_name()),
+            )
             .collect();
 
         let update_guard = if combined_on & 2 != 0 && !index_cols.is_empty() {
-            let strip: String = index_cols.iter()
+            let strip: String = index_cols
+                .iter()
                 .map(|c| format!(" - '{}'", c.replace('\'', "''")))
                 .collect();
             format!(
@@ -810,15 +895,14 @@ fn emit_signal_triggers(schema: &SchemaDescriptor, out: &mut String) {
 fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         let qname = qn(&t.module, &t.table);
 
         for p in &t.properties {
             if p.is_exclusive && !p.is_pk {
-                out.push_str(&format!(
-                    "CREATE UNIQUE INDEX ON {} ({});\n",
-                    qname, qi(&p.name),
-                ));
+                out.push_str(&format!("CREATE UNIQUE INDEX ON {} ({});\n", qname, qi(&p.name),));
                 emitted = true;
             }
         }
@@ -829,20 +913,28 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
             if l.is_exclusive && !l.is_junction_backed() {
                 out.push_str(&format!(
                     "CREATE UNIQUE INDEX ON {} ({});\n",
-                    qname, qi(&format!("{}_id", l.name)),
+                    qname,
+                    qi(&format!("{}_id", l.name)),
                 ));
                 emitted = true;
             }
         }
         for c in &t.constraints {
-            if let TypeConstraint::Exclusive { pointers: fields, unless } = c {
+            if let TypeConstraint::Exclusive {
+                pointers: fields,
+                unless,
+            } = c
+            {
                 let cols: Vec<String> = fields.iter().map(|f| qi(f)).collect();
-                let where_clause = unless.as_deref()
+                let where_clause = unless
+                    .as_deref()
                     .map(|u| format!(" WHERE NOT ({})", u))
                     .unwrap_or_default();
                 out.push_str(&format!(
                     "CREATE UNIQUE INDEX ON {} ({}){};\n",
-                    qname, cols.join(", "), where_clause,
+                    qname,
+                    cols.join(", "),
+                    where_clause,
                 ));
                 emitted = true;
             }
@@ -858,7 +950,9 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
 fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         let qname = qn(&t.module, &t.table);
 
         for p in &t.properties {
@@ -894,7 +988,9 @@ fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) {
 fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         let qname = qn(&t.module, &t.table);
 
         for idx in &t.indexes {
@@ -905,7 +1001,9 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
                 let cols: Vec<String> = idx.pointers.iter().map(|f| qi(f)).collect();
                 format!("({})", cols.join(", "))
             };
-            let where_clause = idx.unless.as_deref()
+            let where_clause = idx
+                .unless
+                .as_deref()
                 .map(|u| format!(" WHERE NOT ({})", u))
                 .unwrap_or_default();
             out.push_str(&format!(
@@ -968,7 +1066,9 @@ fn trigger_ddl_name(table: &str, trig: &crate::schema::TriggerDescriptor) -> Str
 pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
     let mut result = Vec::new();
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         for trig in &t.triggers {
             result.push((t.module.clone(), t.table.clone(), trigger_ddl_name(&t.table, trig)));
         }
@@ -993,7 +1093,9 @@ pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, Str
 pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTriggerInfo>, PyQLError> {
     let mut result = Vec::new();
     for t in &schema.types {
-        if t.abstract_ || t.junction { continue; }
+        if t.abstract_ || t.junction {
+            continue;
+        }
         let table_qname = qn(&t.module, &t.table);
         let type_name = format!("{}::{}", t.module, t.name);
 
@@ -1004,8 +1106,8 @@ pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigg
             let timing = trigger_timing(&trig.timing);
             let return_stmt = trigger_return_statement(&trig.timing, trig.on);
 
-            let body_sql = crate::query::compile_trigger_handler(&trig.handler, &type_name, trig.on, schema)
-                .map_err(|e| {
+            let body_sql =
+                crate::query::compile_trigger_handler(&trig.handler, &type_name, trig.on, schema).map_err(|e| {
                     let msg = format!("error in trigger handler for '{type_name}': {e}");
                     PyQLError::Fragment(PyQLFragmentError {
                         message: msg,
@@ -1062,10 +1164,14 @@ pub fn interface_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, 
     }
     let mut result = Vec::new();
     for t in &schema.types {
-        if !(t.abstract_ && t.materialized) { continue; }
+        if !(t.abstract_ && t.materialized) {
+            continue;
+        }
         let key = format!("{}::{}", t.module, t.name);
         let Some(impls) = implementors.get(&key) else { continue };
-        if impls.is_empty() { continue; }
+        if impls.is_empty() {
+            continue;
+        }
         let mut ddl = String::new();
         emit_one_interface_view(t, impls, &mut ddl);
         let ddl = ddl.trim().to_string();
@@ -1109,14 +1215,21 @@ pub fn junction_excl_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(Stri
     }
     let mut result = Vec::new();
     for t in &schema.types {
-        if !(t.abstract_ && t.materialized) { continue; }
+        if !(t.abstract_ && t.materialized) {
+            continue;
+        }
         let key = format!("{}::{}", t.module, t.name);
         let Some(impls) = implementors.get(&key) else { continue };
-        if impls.is_empty() { continue; }
+        if impls.is_empty() {
+            continue;
+        }
         for l in &t.links {
-            if !(l.is_exclusive && l.is_junction_backed()) { continue; }
+            if !(l.is_exclusive && l.is_junction_backed()) {
+                continue;
+            }
             let view_name = junction_excl_view_name(&t.table, &l.name);
-            let selects: Vec<String> = impls.iter()
+            let selects: Vec<String> = impls
+                .iter()
                 .map(|impl_t| {
                     let jt_name = format!("{}.{}", impl_t.table, l.name);
                     format!("    SELECT source, target FROM {}", qn(&impl_t.module, &jt_name))
@@ -1142,28 +1255,39 @@ fn emit_junction_excl_views(schema: &SchemaDescriptor, out: &mut String) {
 
 /// Return `CREATE OR REPLACE FUNCTION` DDL for every user-defined function in `schema`.
 pub fn function_ddl(schema: &SchemaDescriptor) -> Result<Vec<String>, crate::error::PyQLError> {
-    function_ddl_with_names(schema)
-        .map(|v| v.into_iter().map(|(_, _, ddl)| ddl).collect())
+    function_ddl_with_names(schema).map(|v| v.into_iter().map(|(_, _, ddl)| ddl).collect())
 }
 
 /// Like `function_ddl` but also returns the module and function name for each entry.
-pub fn function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
-    schema.functions.iter()
+pub fn function_ddl_with_names(
+    schema: &SchemaDescriptor,
+) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
+    schema
+        .functions
+        .iter()
         .map(|fd| emit_one_function(fd, schema).map(|ddl| (fd.module.clone(), fd.name.clone(), ddl)))
         .collect()
 }
 
 /// DDL for scalar (non-object-returning) functions only — safe to emit before tables.
-pub fn scalar_function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
-    schema.functions.iter()
+pub fn scalar_function_ddl_with_names(
+    schema: &SchemaDescriptor,
+) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
+    schema
+        .functions
+        .iter()
         .filter(|fd| !fd.return_is_object)
         .map(|fd| emit_one_function(fd, schema).map(|ddl| (fd.module.clone(), fd.name.clone(), ddl)))
         .collect()
 }
 
 /// DDL for object-returning functions only — must be emitted after tables exist.
-pub fn object_function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
-    schema.functions.iter()
+pub fn object_function_ddl_with_names(
+    schema: &SchemaDescriptor,
+) -> Result<Vec<(String, String, String)>, crate::error::PyQLError> {
+    schema
+        .functions
+        .iter()
         .filter(|fd| fd.return_is_object)
         .map(|fd| emit_one_function(fd, schema).map(|ddl| (fd.module.clone(), fd.name.clone(), ddl)))
         .collect()
@@ -1172,12 +1296,20 @@ pub fn object_function_ddl_with_names(schema: &SchemaDescriptor) -> Result<Vec<(
 // ── Phase 11: interface views ──────────────────────────────────────────────────
 
 fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &mut String) {
-    let cols: Vec<String> = t.properties.iter()
+    let cols: Vec<String> = t
+        .properties
+        .iter()
         .map(|p| qi(&p.name))
-        .chain(t.links.iter().filter(|l| !l.is_junction_backed()).map(|l| qi(&format!("{}_id", l.name))))
+        .chain(
+            t.links
+                .iter()
+                .filter(|l| !l.is_junction_backed())
+                .map(|l| qi(&format!("{}_id", l.name))),
+        )
         .collect();
     let col_list = cols.join(", ");
-    let selects: Vec<String> = impls.iter()
+    let selects: Vec<String> = impls
+        .iter()
         .map(|impl_t| format!("    SELECT {} FROM {}", col_list, qn(&impl_t.module, &impl_t.table)))
         .collect();
     out.push_str(&format!("CREATE VIEW {} AS\n", qn(&t.module, &t.table)));
@@ -1195,10 +1327,14 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
         }
     }
     for t in &schema.types {
-        if !(t.abstract_ && t.materialized) { continue; }
+        if !(t.abstract_ && t.materialized) {
+            continue;
+        }
         let key = format!("{}::{}", t.module, t.name);
         let Some(impls) = implementors.get(&key) else { continue };
-        if impls.is_empty() { continue; }
+        if impls.is_empty() {
+            continue;
+        }
         emit_one_interface_view(t, impls, out);
     }
 }
@@ -1229,13 +1365,12 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
     let view_qname = qn(&iface.module, &iface.table);
     let tbl_qname = qn(&impl_t.module, &impl_t.table);
 
-    let field_conds: Vec<String> = fields.iter()
-        .map(|f| format!("{} = NEW.{}", qi(f), qi(f)))
-        .collect();
+    let field_conds: Vec<String> = fields.iter().map(|f| format!("{} = NEW.{}", qi(f), qi(f))).collect();
     let where_clause = format!("{} AND \"id\" <> NEW.\"id\"", field_conds.join(" AND "));
 
     let detail_keys = fields.join(", ");
-    let detail_vals = fields.iter()
+    let detail_vals = fields
+        .iter()
         .map(|f| format!("NEW.{}::text", qi(f)))
         .collect::<Vec<_>>()
         .join(" || ', ' || ");
@@ -1261,7 +1396,8 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
     let ins_trigger_name = format!("{}_ins", fn_name);
     let upd_trigger_name = format!("{}_upd", fn_name);
     let of_cols = fields.iter().map(|f| qi(f)).collect::<Vec<_>>().join(", ");
-    let when_clause = fields.iter()
+    let when_clause = fields
+        .iter()
         .map(|f| format!("OLD.{} IS DISTINCT FROM NEW.{}", qi(f), qi(f)))
         .collect::<Vec<_>>()
         .join(" OR ");
@@ -1271,7 +1407,9 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
          AFTER INSERT ON {}\n\
          DEFERRABLE INITIALLY DEFERRED\n\
          FOR EACH ROW EXECUTE FUNCTION {}();",
-        qi(&ins_trigger_name), tbl_qname, fn_qname,
+        qi(&ins_trigger_name),
+        tbl_qname,
+        fn_qname,
     );
     let upd_ddl = format!(
         "CREATE CONSTRAINT TRIGGER {}\n\
@@ -1279,7 +1417,11 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
          DEFERRABLE INITIALLY DEFERRED\n\
          FOR EACH ROW WHEN ({})\n\
          EXECUTE FUNCTION {}();",
-        qi(&upd_trigger_name), of_cols, tbl_qname, when_clause, fn_qname,
+        qi(&upd_trigger_name),
+        of_cols,
+        tbl_qname,
+        when_clause,
+        fn_qname,
     );
 
     ExclTriggerInfo {
@@ -1337,7 +1479,9 @@ fn make_excl_junction_info(iface: &TypeDescriptor, link_name: &str, impl_t: &Typ
          AFTER INSERT ON {}\n\
          DEFERRABLE INITIALLY DEFERRED\n\
          FOR EACH ROW EXECUTE FUNCTION {}();",
-        qi(&ins_trigger_name), jt_qname, fn_qname,
+        qi(&ins_trigger_name),
+        jt_qname,
+        fn_qname,
     );
     let upd_ddl = format!(
         "CREATE CONSTRAINT TRIGGER {}\n\
@@ -1345,7 +1489,9 @@ fn make_excl_junction_info(iface: &TypeDescriptor, link_name: &str, impl_t: &Typ
          DEFERRABLE INITIALLY DEFERRED\n\
          FOR EACH ROW WHEN (OLD.\"target\" IS DISTINCT FROM NEW.\"target\")\n\
          EXECUTE FUNCTION {}();",
-        qi(&upd_trigger_name), jt_qname, fn_qname,
+        qi(&upd_trigger_name),
+        jt_qname,
+        fn_qname,
     );
 
     ExclTriggerInfo {
@@ -1378,20 +1524,28 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
 
     let mut result = Vec::new();
     for t in &schema.types {
-        if !(t.abstract_ && t.materialized) { continue; }
+        if !(t.abstract_ && t.materialized) {
+            continue;
+        }
         let key = format!("{}::{}", t.module, t.name);
         let Some(impls) = implementors.get(&key) else { continue };
-        if impls.is_empty() { continue; }
+        if impls.is_empty() {
+            continue;
+        }
 
         for p in &t.properties {
-            if !p.is_exclusive || p.is_pk { continue; }
+            if !p.is_exclusive || p.is_pk {
+                continue;
+            }
             let fields = vec![p.name.clone()];
             for impl_t in impls {
                 result.push(make_excl_info(t, &fields, impl_t));
             }
         }
         for l in &t.links {
-            if !l.is_exclusive { continue; }
+            if !l.is_exclusive {
+                continue;
+            }
             // A junction-backed exclusive link has no `{name}_id` column
             // on the owner row — its value lives one level down, in each
             // implementor's own separate junction table (a `through()`
@@ -1475,7 +1629,9 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
     let body_sql = emit_fn_body(&ir_output);
 
     // Parameter list: "name" pg_type, ...
-    let params_sql = fd.params.iter()
+    let params_sql = fd
+        .params
+        .iter()
         .map(|p| format!("{} {}", qi(&p.name), p.pg_type))
         .collect::<Vec<_>>()
         .join(", ");
@@ -1515,9 +1671,10 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
 
 fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> String {
     let type_name = &fd.return_pg_type; // qualified type name for object returns
-    let td = schema.types.iter().find(|t| {
-        format!("{}::{}", t.module, t.name) == *type_name
-    });
+    let td = schema
+        .types
+        .iter()
+        .find(|t| format!("{}::{}", t.module, t.name) == *type_name);
     let Some(td) = td else {
         return "__type__ text, id uuid".to_string();
     };
@@ -1531,7 +1688,9 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
         cols.push(format!("{} {}", qi(&p.name), pg_type));
     }
     for l in &td.links {
-        if l.is_junction_backed() { continue; }
+        if l.is_junction_backed() {
+            continue;
+        }
         cols.push(format!("{} uuid", qi(&format!("{}_id", l.name))));
     }
     cols.join(", ")
@@ -1541,7 +1700,9 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
 
 fn emit_vector_columns(schema: &SchemaDescriptor, out: &mut String) {
     for td in &schema.types {
-        if td.abstract_ || td.vector_indexes.is_empty() { continue; }
+        if td.abstract_ || td.vector_indexes.is_empty() {
+            continue;
+        }
         for vi in &td.vector_indexes {
             out.push_str(&format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} vector({});\n",
@@ -1551,7 +1712,11 @@ fn emit_vector_columns(schema: &SchemaDescriptor, out: &mut String) {
             ));
         }
     }
-    if schema.types.iter().any(|t| !t.abstract_ && !t.vector_indexes.is_empty()) {
+    if schema
+        .types
+        .iter()
+        .any(|t| !t.abstract_ && !t.vector_indexes.is_empty())
+    {
         out.push('\n');
     }
 }
@@ -1560,7 +1725,9 @@ fn emit_vector_columns(schema: &SchemaDescriptor, out: &mut String) {
 
 fn emit_vector_indexes(schema: &SchemaDescriptor, out: &mut String) {
     for td in &schema.types {
-        if td.abstract_ || td.vector_indexes.is_empty() { continue; }
+        if td.abstract_ || td.vector_indexes.is_empty() {
+            continue;
+        }
         for vi in &td.vector_indexes {
             let index_name = match &vi.index_name {
                 None => format!("{}__vector__", td.table),
@@ -1584,16 +1751,24 @@ fn emit_search_columns(schema: &SchemaDescriptor, out: &mut String) {
 
     let mut emitted = false;
     for td in &schema.types {
-        if td.abstract_ { continue; }
+        if td.abstract_ {
+            continue;
+        }
         for si in &td.search_indexes {
-            if si.backend != SearchBackend::Postgres { continue; }
+            if si.backend != SearchBackend::Postgres {
+                continue;
+            }
 
             // Build: setweight(to_tsvector('english', coalesce(col, '')), 'W') || ...
-            let parts: Vec<String> = si.pointers.iter().map(|sf| {
-                let col = qi(&sf.name);
-                let w = sf.weight.as_str();
-                format!("setweight(to_tsvector('english', coalesce({col}, '')), '{w}')")
-            }).collect();
+            let parts: Vec<String> = si
+                .pointers
+                .iter()
+                .map(|sf| {
+                    let col = qi(&sf.name);
+                    let w = sf.weight.as_str();
+                    format!("setweight(to_tsvector('english', coalesce({col}, '')), '{w}')")
+                })
+                .collect();
 
             let expr = if parts.len() == 1 {
                 parts.into_iter().next().unwrap()
@@ -1621,9 +1796,13 @@ fn emit_search_indexes(schema: &SchemaDescriptor, out: &mut String) {
     use crate::schema::SearchBackend;
 
     for td in &schema.types {
-        if td.abstract_ { continue; }
+        if td.abstract_ {
+            continue;
+        }
         for si in &td.search_indexes {
-            if si.backend != SearchBackend::Postgres { continue; }
+            if si.backend != SearchBackend::Postgres {
+                continue;
+            }
 
             let col = si.column_name();
             let index_name = match &si.index_name {
@@ -1658,15 +1837,22 @@ pub fn compile_index_fetch(
     index_name: Option<&str>,
     schema: &SchemaDescriptor,
 ) -> Result<String, PyQLError> {
-    let td = schema.types.iter().find(|t| {
-        format!("{}::{}", t.module, t.name) == type_name
-    }).ok_or_else(|| PyQLError::Fragment(PyQLFragmentError {
-        message: format!("compile_index_fetch: unknown type '{}'", type_name),
-        context: type_name.to_string(),
-        position: crate::error::Position { line: 0, col: 0 },
-    }))?;
+    let td = schema
+        .types
+        .iter()
+        .find(|t| format!("{}::{}", t.module, t.name) == type_name)
+        .ok_or_else(|| {
+            PyQLError::Fragment(PyQLFragmentError {
+                message: format!("compile_index_fetch: unknown type '{}'", type_name),
+                context: type_name.to_string(),
+                position: crate::error::Position { line: 0, col: 0 },
+            })
+        })?;
 
-    let vi = td.vector_indexes.iter().find(|vi| vi.index_name.as_deref() == index_name)
+    let vi = td
+        .vector_indexes
+        .iter()
+        .find(|vi| vi.index_name.as_deref() == index_name)
         .ok_or_else(|| {
             let key = index_name.unwrap_or("<default>");
             PyQLError::Fragment(PyQLFragmentError {
@@ -1676,15 +1862,25 @@ pub fn compile_index_fetch(
             })
         })?;
 
-    let field_exprs = vi.pointers.iter().map(|f| {
-        // Resolve the field's pg_type to decide whether an explicit cast is needed.
-        let pg_type = td.properties.iter()
-            .find(|p| p.name == *f)
-            .map(|p| p.pg_type.as_str())
-            .unwrap_or("text");
-        let col = qi(f);
-        if pg_type == "text" { col } else { format!("{}::text", col) }
-    }).collect::<Vec<_>>();
+    let field_exprs = vi
+        .pointers
+        .iter()
+        .map(|f| {
+            // Resolve the field's pg_type to decide whether an explicit cast is needed.
+            let pg_type = td
+                .properties
+                .iter()
+                .find(|p| p.name == *f)
+                .map(|p| p.pg_type.as_str())
+                .unwrap_or("text");
+            let col = qi(f);
+            if pg_type == "text" {
+                col
+            } else {
+                format!("{}::text", col)
+            }
+        })
+        .collect::<Vec<_>>();
 
     let concat = if field_exprs.len() == 1 {
         field_exprs.into_iter().next().unwrap()
@@ -1706,34 +1902,53 @@ pub fn compile_search_index_fetch(
     index_name: Option<&str>,
     schema: &SchemaDescriptor,
 ) -> Result<String, PyQLError> {
-    let td = schema.types.iter().find(|t| {
-        format!("{}::{}", t.module, t.name) == type_name
-    }).ok_or_else(|| PyQLError::Fragment(PyQLFragmentError {
-        message: format!("compile_search_index_fetch: unknown type '{}'", type_name),
-        context: type_name.to_string(),
-        position: crate::error::Position { line: 0, col: 0 },
-    }))?;
-
-    use crate::schema::SearchBackend;
-    let si = td.search_indexes.iter()
-        .find(|si| si.index_name.as_deref() == index_name && si.backend != SearchBackend::Postgres)
+    let td = schema
+        .types
+        .iter()
+        .find(|t| format!("{}::{}", t.module, t.name) == type_name)
         .ok_or_else(|| {
-            let key = index_name.unwrap_or("<default>");
             PyQLError::Fragment(PyQLFragmentError {
-                message: format!("compile_search_index_fetch: no remote SearchIndex '{}' on type '{}'", key, type_name),
+                message: format!("compile_search_index_fetch: unknown type '{}'", type_name),
                 context: type_name.to_string(),
                 position: crate::error::Position { line: 0, col: 0 },
             })
         })?;
 
-    let field_exprs = si.pointers.iter().map(|sf| {
-        let pg_type = td.properties.iter()
-            .find(|p| p.name == sf.name)
-            .map(|p| p.pg_type.as_str())
-            .unwrap_or("text");
-        let col = qi(&sf.name);
-        if pg_type == "text" { col } else { format!("{}::text", col) }
-    }).collect::<Vec<_>>();
+    use crate::schema::SearchBackend;
+    let si = td
+        .search_indexes
+        .iter()
+        .find(|si| si.index_name.as_deref() == index_name && si.backend != SearchBackend::Postgres)
+        .ok_or_else(|| {
+            let key = index_name.unwrap_or("<default>");
+            PyQLError::Fragment(PyQLFragmentError {
+                message: format!(
+                    "compile_search_index_fetch: no remote SearchIndex '{}' on type '{}'",
+                    key, type_name
+                ),
+                context: type_name.to_string(),
+                position: crate::error::Position { line: 0, col: 0 },
+            })
+        })?;
+
+    let field_exprs = si
+        .pointers
+        .iter()
+        .map(|sf| {
+            let pg_type = td
+                .properties
+                .iter()
+                .find(|p| p.name == sf.name)
+                .map(|p| p.pg_type.as_str())
+                .unwrap_or("text");
+            let col = qi(&sf.name);
+            if pg_type == "text" {
+                col
+            } else {
+                format!("{}::text", col)
+            }
+        })
+        .collect::<Vec<_>>();
 
     let concat = if field_exprs.len() == 1 {
         field_exprs.into_iter().next().unwrap()
@@ -1748,13 +1963,12 @@ pub fn compile_search_index_fetch(
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::{
-        DeleteAction, DeleteSide, FunctionDescriptor, FunctionParamDescriptor, LinkDescriptor,
-        MultiLinkDescriptor, OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
+        DeleteAction, DeleteSide, FunctionDescriptor, FunctionParamDescriptor, LinkDescriptor, MultiLinkDescriptor,
+        OnDeletePolicy, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn person_type() -> TypeDescriptor {
@@ -1773,27 +1987,31 @@ mod tests {
                     pg_type: "uuid".into(),
                     nullable: false,
                     default_sql: Some("uuidv7()".into()),
-                        default_pyql: None,
+                    default_pyql: None,
                     description: None,
                     check_constraints: vec![],
                     is_exclusive: true,
                     is_pk: true,
                     is_readonly: true,
                     rewrites: vec![],
-                tuple_members: None, column_type: None, },
+                    tuple_members: None,
+                    column_type: None,
+                },
                 PropertyDescriptor {
                     name: "age".into(),
                     pg_type: "int8".into(),
                     nullable: true,
                     default_sql: None,
-                        default_pyql: None,
+                    default_pyql: None,
                     description: None,
                     check_constraints: vec![],
                     is_exclusive: false,
                     is_pk: false,
                     is_readonly: false,
                     rewrites: vec![],
-                tuple_members: None, column_type: None, },
+                    tuple_members: None,
+                    column_type: None,
+                },
             ],
             links: vec![],
             multilinks: vec![],
@@ -1816,7 +2034,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: fns,
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -1831,13 +2050,26 @@ mod tests {
     }
 
     fn trig(on: u8, timing: &str, handler: &str) -> crate::schema::TriggerDescriptor {
-        crate::schema::TriggerDescriptor { on, timing: timing.into(), handler: handler.into() }
+        crate::schema::TriggerDescriptor {
+            on,
+            timing: timing.into(),
+            handler: handler.into(),
+        }
     }
 
     fn schema_with_trigger(trigger: crate::schema::TriggerDescriptor) -> SchemaDescriptor {
         let mut t = person_type();
         t.triggers = vec![trigger];
-        SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![] }
+        SchemaDescriptor {
+            types: vec![t],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        }
     }
 
     #[test]
@@ -1864,7 +2096,11 @@ mod tests {
     fn test_recursive_insert_wrapped_in_a_select_shape_is_still_caught() {
         // `select (insert Person {...}) { age }` — the DML lives in
         // `IrSelect::dml_source`, not as the top-level statement.
-        let schema = schema_with_trigger(trig(1, "After", "select (insert Person { age := __new__.age }) { age }"));
+        let schema = schema_with_trigger(trig(
+            1,
+            "After",
+            "select (insert Person { age := __new__.age }) { age }",
+        ));
         let err = export_schema(&schema).unwrap_err();
         assert!(err.to_string().contains("is recursive"), "got: {err}");
     }
@@ -1934,11 +2170,17 @@ mod tests {
     fn test_trigger_before_timing_returns_new_or_old_appropriately() {
         let insert_only = schema_with_trigger(trig(1, "Before", "update Person set { age := __new__.age }"));
         let ddl = export_schema(&insert_only).unwrap();
-        assert!(ddl.contains("RETURN NEW;"), "insert-only Before should return NEW, got:\n{ddl}");
+        assert!(
+            ddl.contains("RETURN NEW;"),
+            "insert-only Before should return NEW, got:\n{ddl}"
+        );
 
         let delete_only = schema_with_trigger(trig(4, "Before", "update Person set { age := __old__.age }"));
         let ddl = export_schema(&delete_only).unwrap();
-        assert!(ddl.contains("RETURN OLD;"), "delete-only Before should return OLD, got:\n{ddl}");
+        assert!(
+            ddl.contains("RETURN OLD;"),
+            "delete-only Before should return OLD, got:\n{ddl}"
+        );
 
         // On.Insert | On.Delete = 5 — combined with Delete needs the conditional.
         // Neither anchor is legal for this combination (see
@@ -1959,7 +2201,16 @@ mod tests {
             trig(1, "After", "update Person set { age := __new__.age }"),
             trig(4, "Before", "update Person set { age := __old__.age }"),
         ];
-        let schema = SchemaDescriptor { types: vec![t], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![] };
+        let schema = SchemaDescriptor {
+            types: vec![t],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        };
         let ddl = export_schema(&schema).unwrap();
         let fn_count = ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"Person_").count();
         assert_eq!(fn_count, 2, "expected one function per Trigger(...), got:\n{ddl}");
@@ -1971,8 +2222,14 @@ mod tests {
             name: "mysum".into(),
             module: "math".into(),
             params: vec![
-                FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() },
-                FunctionParamDescriptor { name: "b".into(), pg_type: "int8".into() },
+                FunctionParamDescriptor {
+                    name: "a".into(),
+                    pg_type: "int8".into(),
+                },
+                FunctionParamDescriptor {
+                    name: "b".into(),
+                    pg_type: "int8".into(),
+                },
             ],
             return_pg_type: "int8".into(),
             return_is_object: false,
@@ -1983,7 +2240,11 @@ mod tests {
         };
         let schema = minimal_schema(vec![fd.clone()]);
         let ddl = emit_one_function(&fd, &schema).unwrap();
-        assert!(ddl.contains("CREATE OR REPLACE FUNCTION \"math\".\"mysum\""), "got:\n{}", ddl);
+        assert!(
+            ddl.contains("CREATE OR REPLACE FUNCTION \"math\".\"mysum\""),
+            "got:\n{}",
+            ddl
+        );
         assert!(ddl.contains("\"a\" int8, \"b\" int8"), "got:\n{}", ddl);
         assert!(ddl.contains("RETURNS int8"), "got:\n{}", ddl);
         assert!(ddl.contains("IMMUTABLE"), "got:\n{}", ddl);
@@ -2024,7 +2285,11 @@ mod tests {
         };
         let schema = minimal_schema(vec![fd.clone()]);
         let ddl = emit_one_function(&fd, &schema).unwrap();
-        assert!(ddl.contains("CREATE OR REPLACE FUNCTION \"public\".\"adults\"()"), "got:\n{}", ddl);
+        assert!(
+            ddl.contains("CREATE OR REPLACE FUNCTION \"public\".\"adults\"()"),
+            "got:\n{}",
+            ddl
+        );
         assert!(ddl.contains("RETURNS TABLE("), "got:\n{}", ddl);
         assert!(ddl.contains("\"id\" uuid"), "got:\n{}", ddl);
         assert!(ddl.contains("\"age\" int8"), "got:\n{}", ddl);
@@ -2048,11 +2313,21 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
-        assert!(ddl.contains("CREATE SEQUENCE \"public\".\"OrderNumber_seq\""), "got:\n{}", ddl);
-        assert!(ddl.contains("CREATE DOMAIN \"public\".\"OrderNumber\" AS int8"), "got:\n{}", ddl);
+        assert!(
+            ddl.contains("CREATE SEQUENCE \"public\".\"OrderNumber_seq\""),
+            "got:\n{}",
+            ddl
+        );
+        assert!(
+            ddl.contains("CREATE DOMAIN \"public\".\"OrderNumber\" AS int8"),
+            "got:\n{}",
+            ddl
+        );
         // Sequence must precede domain in the output
         let seq_pos = ddl.find("CREATE SEQUENCE").unwrap();
         let dom_pos = ddl.find("CREATE DOMAIN").unwrap();
@@ -2069,19 +2344,39 @@ mod tests {
         use crate::schema::ScalarDescriptor;
         let schema = SchemaDescriptor {
             types: vec![TypeDescriptor {
-                name: "Contact".into(), module: "default".into(), table: "Contact".into(),
-                abstract_: false, materialized: true, description: None,
-                parents: vec![], interfaces: vec![],
+                name: "Contact".into(),
+                module: "default".into(),
+                table: "Contact".into(),
+                abstract_: false,
+                materialized: true,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
                 properties: vec![PropertyDescriptor {
-                    name: "email".into(), pg_type: "text".into(), nullable: false,
-                    default_sql: None, default_pyql: None, description: None,
-                    check_constraints: vec![], is_exclusive: false, is_pk: false,
-                    is_readonly: false, rewrites: vec![], tuple_members: None,
+                    name: "email".into(),
+                    pg_type: "text".into(),
+                    nullable: false,
+                    default_sql: None,
+                    default_pyql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: false,
+                    is_pk: false,
+                    is_readonly: false,
+                    rewrites: vec![],
+                    tuple_members: None,
                     column_type: Some("\"public\".\"EmailStr\"".into()),
                 }],
-                links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                triggers: vec![], junction: false, signals: vec![],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+                signals: vec![],
             }],
             scalars: vec![ScalarDescriptor {
                 name: "EmailStr".into(),
@@ -2094,16 +2389,20 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
             ddl.contains("CREATE DOMAIN \"public\".\"EmailStr\" AS text\n    CHECK (value ~ '^[^@]+@[^@]+\\.[^@]+$')"),
-            "got:\n{}", ddl
+            "got:\n{}",
+            ddl
         );
         assert!(
             ddl.contains("\"email\" \"public\".\"EmailStr\" NOT NULL"),
-            "column must use the domain type, not the plain base type — got:\n{}", ddl
+            "column must use the domain type, not the plain base type — got:\n{}",
+            ddl
         );
     }
 
@@ -2111,18 +2410,39 @@ mod tests {
 
     fn account_interface_schema() -> SchemaDescriptor {
         let mut account = TypeDescriptor {
-            name: "Account".into(), module: "default".into(), table: "Account".into(),
-            abstract_: true, materialized: true, description: None,
-            parents: vec![], interfaces: vec![],
+            name: "Account".into(),
+            module: "default".into(),
+            table: "Account".into(),
+            abstract_: true,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
             properties: vec![PropertyDescriptor {
-                name: "email".into(), pg_type: "text".into(), nullable: false,
-                default_sql: None, default_pyql: None, description: None,
-                check_constraints: vec![], is_exclusive: true, is_pk: false,
-                is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
+                name: "email".into(),
+                pg_type: "text".into(),
+                nullable: false,
+                default_sql: None,
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: false,
+                is_readonly: false,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
             }],
-            links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-            indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-            triggers: vec![], junction: false, signals: vec![],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
         };
         let mut individual = account.clone();
         individual.name = "Individual".into();
@@ -2136,7 +2456,13 @@ mod tests {
         account.constraints = vec![]; // interface itself has no table of its own to constrain
         SchemaDescriptor {
             types: vec![account, individual, organization],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -2145,12 +2471,20 @@ mod tests {
         let schema = account_interface_schema();
         let ddl = export_schema(&schema).unwrap();
 
-        assert!(ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Individual\" (\"email\")"), "got:\n{ddl}");
-        assert!(ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Organization\" (\"email\")"), "got:\n{ddl}");
+        assert!(
+            ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Individual\" (\"email\")"),
+            "got:\n{ddl}"
+        );
+        assert!(
+            ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Organization\" (\"email\")"),
+            "got:\n{ddl}"
+        );
 
         // One shared trigger function (not duplicated per implementor)...
         assert_eq!(
-            ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"_excl_Account_email\"").count(), 1,
+            ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"_excl_Account_email\"")
+                .count(),
+            1,
             "the trigger function must be emitted exactly once, shared by every implementor; got:\n{ddl}"
         );
         // ...checking the interface's own UNION-ALL view, not a single table.
@@ -2158,11 +2492,15 @@ mod tests {
 
         // ...but a constraint trigger attached to *each* implementor's own table.
         assert!(
-            ddl.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Individual\""),
+            ddl.contains(
+                "CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Individual\""
+            ),
             "got:\n{ddl}"
         );
         assert!(
-            ddl.contains("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Organization\""),
+            ddl.contains(
+                "CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"\nAFTER INSERT ON \"public\".\"Organization\""
+            ),
             "got:\n{ddl}"
         );
         assert!(ddl.contains("DEFERRABLE INITIALLY DEFERRED"), "got:\n{ddl}");
@@ -2186,9 +2524,16 @@ mod tests {
             t.properties.retain(|p| p.name != "email");
             if t.name == "Account" || t.name == "Individual" || t.name == "Organization" {
                 t.links.push(LinkDescriptor {
-                    name: "owner".into(), target: "default::Person".into(), nullable: true,
-                    through: Some("default::AccountOwner".into()), description: None, default_pyql: None,
-                    is_exclusive: true, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                    name: "owner".into(),
+                    target: "default::Person".into(),
+                    nullable: true,
+                    through: Some("default::AccountOwner".into()),
+                    description: None,
+                    default_pyql: None,
+                    is_exclusive: true,
+                    is_readonly: false,
+                    rewrites: vec![],
+                    on_delete: vec![],
                 });
             }
         }
@@ -2198,16 +2543,33 @@ mod tests {
         let (view_module, view_name, view_ddl) = &views[0];
         assert_eq!(view_module, "default");
         assert_eq!(view_name, "Account.owner");
-        assert!(view_ddl.contains("SELECT source, target FROM \"public\".\"Individual.owner\""), "got:\n{view_ddl}");
-        assert!(view_ddl.contains("SELECT source, target FROM \"public\".\"Organization.owner\""), "got:\n{view_ddl}");
+        assert!(
+            view_ddl.contains("SELECT source, target FROM \"public\".\"Individual.owner\""),
+            "got:\n{view_ddl}"
+        );
+        assert!(
+            view_ddl.contains("SELECT source, target FROM \"public\".\"Organization.owner\""),
+            "got:\n{view_ddl}"
+        );
 
         let infos = interface_exclusive_trigger_infos(&schema);
-        assert_eq!(infos.len(), 2, "expected one entry per implementor, got: {}", infos.len());
+        assert_eq!(
+            infos.len(),
+            2,
+            "expected one entry per implementor, got: {}",
+            infos.len()
+        );
         assert!(
-            infos.iter().any(|i| i.impl_table == "Individual.owner" && i.ins_ddl.contains("AFTER INSERT ON \"public\".\"Individual.owner\"")),
+            infos.iter().any(|i| i.impl_table == "Individual.owner"
+                && i.ins_ddl.contains("AFTER INSERT ON \"public\".\"Individual.owner\"")),
             "the constraint trigger must attach to the implementor's own *junction* table, not the owner table"
         );
-        assert!(infos.iter().any(|i| i.fn_ddl.contains("SELECT 1 FROM \"public\".\"Account.owner\"")), "the trigger function must query the helper view");
+        assert!(
+            infos
+                .iter()
+                .any(|i| i.fn_ddl.contains("SELECT 1 FROM \"public\".\"Account.owner\"")),
+            "the trigger function must query the helper view"
+        );
         assert!(infos.iter().all(|i| i.upd_ddl.contains("AFTER UPDATE OF \"target\"")));
     }
 
@@ -2221,10 +2583,16 @@ mod tests {
         // (non-deferred) RESTRICT on the same FK's Target side rejects that
         // nested delete every time. Confirmed live
         // (`tests/live_execution_on_delete.rs`) before this fix.
-        let policies = vec![OnDeletePolicy { side: DeleteSide::Source, action: DeleteAction::DeleteTarget }];
+        let policies = vec![OnDeletePolicy {
+            side: DeleteSide::Source,
+            action: DeleteAction::DeleteTarget,
+        }];
         assert_eq!(target_fk_suffix(&policies), " DEFERRABLE INITIALLY DEFERRED");
 
-        let policies = vec![OnDeletePolicy { side: DeleteSide::Source, action: DeleteAction::DeleteTargetIfOrphan }];
+        let policies = vec![OnDeletePolicy {
+            side: DeleteSide::Source,
+            action: DeleteAction::DeleteTargetIfOrphan,
+        }];
         assert_eq!(target_fk_suffix(&policies), " DEFERRABLE INITIALLY DEFERRED");
     }
 
@@ -2232,32 +2600,57 @@ mod tests {
     fn test_target_fk_suffix_unaffected_when_no_source_side_policy() {
         // The fix above must not change behavior for the ordinary case.
         assert_eq!(target_fk_suffix(&[]), " ON DELETE RESTRICT");
-        let policies = vec![OnDeletePolicy { side: DeleteSide::Target, action: DeleteAction::Allow }];
+        let policies = vec![OnDeletePolicy {
+            side: DeleteSide::Target,
+            action: DeleteAction::Allow,
+        }];
         assert_eq!(target_fk_suffix(&policies), " ON DELETE SET NULL");
     }
 
     #[test]
     fn test_target_jt_fk_suffix_forces_deferrable_when_source_side_deletes_target() {
         // Same fix, multilink junction-table variant.
-        let policies = vec![OnDeletePolicy { side: DeleteSide::Source, action: DeleteAction::DeleteTargetIfOrphan }];
+        let policies = vec![OnDeletePolicy {
+            side: DeleteSide::Source,
+            action: DeleteAction::DeleteTargetIfOrphan,
+        }];
         assert_eq!(target_jt_fk_suffix(&policies), " DEFERRABLE INITIALLY DEFERRED");
     }
 
     fn org_type(module: &str) -> TypeDescriptor {
         TypeDescriptor {
-            name: "Org".into(), module: module.into(), table: "Org".into(),
-            abstract_: false, materialized: true, description: None,
-            parents: vec![], interfaces: vec![],
+            name: "Org".into(),
+            module: module.into(),
+            table: "Org".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
             properties: vec![PropertyDescriptor {
-                name: "id".into(), pg_type: "uuid".into(), nullable: false,
-                default_sql: Some("gen_random_uuid()".into()), default_pyql: None,
-                description: None, check_constraints: vec![], is_exclusive: true,
-                is_pk: true, is_readonly: true, rewrites: vec![], tuple_members: None,
+                name: "id".into(),
+                pg_type: "uuid".into(),
+                nullable: false,
+                default_sql: Some("gen_random_uuid()".into()),
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: true,
+                is_readonly: true,
+                rewrites: vec![],
+                tuple_members: None,
                 column_type: None,
             }],
-            links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-            indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-            triggers: vec![], junction: false,
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
             signals: vec![],
         }
     }
@@ -2284,16 +2677,30 @@ mod tests {
             nullable: false,
             description: None,
             default_pyql: None,
-            on_delete: vec![OnDeletePolicy { side: DeleteSide::Target, action: DeleteAction::DeleteSource }],
+            on_delete: vec![OnDeletePolicy {
+                side: DeleteSide::Target,
+                action: DeleteAction::DeleteSource,
+            }],
         }];
         let schema = SchemaDescriptor {
             types: vec![org_type(module), owner],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
-        assert!(ddl.contains("AFTER DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
-        assert!(!ddl.contains("BEFORE DELETE ON \"public\".\"Product.tags\""), "got:\n{ddl}");
+        assert!(
+            ddl.contains("AFTER DELETE ON \"public\".\"Product.tags\""),
+            "got:\n{ddl}"
+        );
+        assert!(
+            !ddl.contains("BEFORE DELETE ON \"public\".\"Product.tags\""),
+            "got:\n{ddl}"
+        );
     }
 
     // ── junction-backed single links ────────────────────────────────────────────
@@ -2318,16 +2725,33 @@ mod tests {
         }];
         let schema = SchemaDescriptor {
             types: vec![org_type(module), owner],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
 
-        assert!(!ddl.contains("spouse_id"), "no {{name}}_id column/FK for a junction-backed link, got:\n{ddl}");
+        assert!(
+            !ddl.contains("spouse_id"),
+            "no {{name}}_id column/FK for a junction-backed link, got:\n{ddl}"
+        );
         assert!(ddl.contains("CREATE TABLE \"public\".\"Person.spouse\""), "got:\n{ddl}");
-        assert!(ddl.contains("PRIMARY KEY (source)"), "single-link junction table must be capped to one row per source, got:\n{ddl}");
-        assert!(ddl.contains("UNIQUE (target)"), "exclusive single link must also be unique on the target side, got:\n{ddl}");
-        assert!(!ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Person\" (\"spouse_id\")"), "got:\n{ddl}");
+        assert!(
+            ddl.contains("PRIMARY KEY (source)"),
+            "single-link junction table must be capped to one row per source, got:\n{ddl}"
+        );
+        assert!(
+            ddl.contains("UNIQUE (target)"),
+            "exclusive single link must also be unique on the target side, got:\n{ddl}"
+        );
+        assert!(
+            !ddl.contains("CREATE UNIQUE INDEX ON \"public\".\"Person\" (\"spouse_id\")"),
+            "got:\n{ddl}"
+        );
     }
 
     // ── @pylon.signal capture triggers ──────────────────────────────────────────
@@ -2339,11 +2763,19 @@ mod tests {
         with_signal.signals = vec![SignalEntry { on: 5 }]; // Insert | Delete
         let schema = SchemaDescriptor {
             types: vec![with_signal],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
-        assert!(ddl.contains("AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""), "got:\n{ddl}");
+        assert!(
+            ddl.contains("AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""),
+            "got:\n{ddl}"
+        );
         assert!(ddl.contains("_pylon.\"SignalOutbox\""), "got:\n{ddl}");
         assert!(ddl.contains("'default::Person'"), "got:\n{ddl}");
     }
@@ -2377,12 +2809,19 @@ mod tests {
         }];
         let schema = SchemaDescriptor {
             types: vec![with_signal],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
-            ddl.contains("IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) - '__vector__') = (to_jsonb(NEW) - '__vector__') THEN"),
+            ddl.contains(
+                "IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) - '__vector__') = (to_jsonb(NEW) - '__vector__') THEN"
+            ),
             "got:\n{ddl}"
         );
         assert!(ddl.contains("RETURN NULL;\n    END IF;"), "got:\n{ddl}");
@@ -2397,11 +2836,15 @@ mod tests {
         with_signal.signals = vec![SignalEntry { on: 2 }]; // Update
         let schema = SchemaDescriptor {
             types: vec![with_signal],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(!ddl.contains("IF TG_OP = 'UPDATE'"), "got:\n{ddl}");
     }
 }
-

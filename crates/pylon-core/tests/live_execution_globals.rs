@@ -122,11 +122,7 @@ async fn rows_with_params(
         .unwrap()
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     rows_with_params(pool, sd, pyql, &[]).await
 }
 
@@ -138,9 +134,7 @@ fn field(row: &DecodedValue, i: usize) -> &DecodedValue {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
 }
 
 #[tokio::test]
@@ -161,16 +155,9 @@ async fn session_global_of_uuid_type_filters_correctly() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Widget {{ name := 'Alice' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Widget {{ name := 'Alice' }}")).await;
     let inserted = rows_of(&pool, &sd, &format!("select {module}::Widget {{ id }}")).await;
     let DecodedValue::Composite(shape) = &inserted[0] else {
         panic!("expected Composite")
@@ -201,16 +188,9 @@ async fn session_global_unbound_is_null() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Widget {{ name := 'Alice' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Widget {{ name := 'Alice' }}")).await;
 
     let rows = rows_with_params(
         &pool,
@@ -240,9 +220,7 @@ async fn session_global_of_array_type_resolves_correctly() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
     let rows = rows_with_params(
         &pool,
@@ -287,29 +265,16 @@ async fn computed_global_reads_a_session_global_it_references() {
 
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Person {{ name := 'Ada' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Ada' }}")).await;
     let inserted = rows_of(&pool, &sd, &format!("select {module}::Person {{ id }}")).await;
     let DecodedValue::Composite(shape) = &inserted[0] else {
         panic!("expected Composite")
     };
     let person_id = shape[1].clone();
 
-    let rows = rows_with_params(
-        &pool,
-        &sd,
-        &format!("select global current_user {{ name }}"),
-        &[person_id],
-    )
-    .await;
+    let rows = rows_with_params(&pool, &sd, "select global current_user { name }", &[person_id]).await;
     assert_eq!(
         rows.len(),
         1,

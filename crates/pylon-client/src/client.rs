@@ -95,7 +95,10 @@ impl Builder {
     /// connection) must use `Builder::cache_handle` with one already-open
     /// `Arc<pylon_cache::Cache>` instead of calling this per client.
     pub fn cache(mut self, path: impl Into<PathBuf>, max_size_mb: usize) -> Self {
-        self.cache = Some(CacheSource::Open { path: path.into(), max_size_mb });
+        self.cache = Some(CacheSource::Open {
+            path: path.into(),
+            max_size_mb,
+        });
         self
     }
 
@@ -113,13 +116,15 @@ impl Builder {
     /// `Error::NoSchemaSnapshot` if neither `pylon migration apply` nor
     /// `pylon migration watch` has ever run against this database.
     pub async fn build(self) -> Result<Client> {
-        let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size).await.map_err(Error::Db)?;
+        let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size)
+            .await
+            .map_err(Error::Db)?;
         let schema = schema::fetch(&pool).await?;
         let cache = match self.cache {
             None => None,
-            Some(CacheSource::Open { path, max_size_mb }) => {
-                Some(Arc::new(pylon_cache::Cache::open(&path, max_size_mb).map_err(|e| Error::Cache(e.to_string()))?))
-            }
+            Some(CacheSource::Open { path, max_size_mb }) => Some(Arc::new(
+                pylon_cache::Cache::open(&path, max_size_mb).map_err(|e| Error::Cache(e.to_string()))?,
+            )),
             Some(CacheSource::Shared(cache)) => Some(cache),
         };
         Ok(Client {
@@ -181,7 +186,10 @@ impl Client {
     pub fn with_globals(&self, globals: impl IntoIterator<Item = (String, DecodedValue)>) -> Client {
         let mut merged = (*self.globals).clone();
         merged.extend(globals);
-        Client { globals: Arc::new(merged), ..self.clone() }
+        Client {
+            globals: Arc::new(merged),
+            ..self.clone()
+        }
     }
 
     /// Returns a client view that applies `config` to every query — sharing
@@ -216,19 +224,42 @@ impl Client {
 
     pub async fn query(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref()).await
+        exec::query(
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
+        )
+        .await
     }
 
     pub async fn query_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref())
-            .await
+        exec::query_single(
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
+        )
+        .await
     }
 
     pub async fn query_required_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Value> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_required_single(
-            &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
         )
         .await
     }
@@ -267,14 +298,28 @@ impl Client {
 
     pub async fn query_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_json(&*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref())
-            .await
+        exec::query_json(
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
+        )
+        .await
     }
 
     pub async fn query_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<String>> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_single_json(
-            &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
         )
         .await
     }
@@ -282,7 +327,13 @@ impl Client {
     pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
         exec::query_required_single_json(
-            &*self.pool, pyql, params, &schema, &self.config, &self.globals, self.cache.as_deref(),
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
         )
         .await
     }

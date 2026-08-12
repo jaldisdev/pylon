@@ -30,15 +30,17 @@ async fn sends_x_api_key_and_anthropic_version_headers_not_authorization() {
         .and(header("anthropic-version", "2023-06-01"))
         .respond_with(|req: &wiremock::Request| {
             assert!(!req.headers.contains_key("authorization"));
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"content": [{"type": "text", "text": "hi"}]}))
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"content": [{"type": "text", "text": "hi"}]}))
         })
         .mount(&server)
         .await;
 
     let provider = AnthropicProvider::new(&server.uri(), "claude", Some("sk-ant-test")).unwrap();
     let reply = provider
-        .chat(&[Message { role: "user".into(), content: "hello".into() }])
+        .chat(&[Message {
+            role: "user".into(),
+            content: "hello".into(),
+        }])
         .await
         .unwrap();
 
@@ -57,8 +59,7 @@ async fn splits_the_system_role_message_into_a_top_level_field() {
             let messages = body["messages"].as_array().unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0]["role"], "user");
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"content": [{"type": "text", "text": "ok"}]}))
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"content": [{"type": "text", "text": "ok"}]}))
         })
         .mount(&server)
         .await;
@@ -66,8 +67,14 @@ async fn splits_the_system_role_message_into_a_top_level_field() {
     let provider = AnthropicProvider::new(&server.uri(), "claude", None).unwrap();
     provider
         .chat(&[
-            Message { role: "system".into(), content: "be nice".into() },
-            Message { role: "user".into(), content: "hello".into() },
+            Message {
+                role: "system".into(),
+                content: "be nice".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: "hello".into(),
+            },
         ])
         .await
         .unwrap();
@@ -90,7 +97,10 @@ async fn joins_multiple_text_content_blocks_and_skips_non_text_blocks() {
 
     let provider = AnthropicProvider::new(&server.uri(), "claude", None).unwrap();
     let reply = provider
-        .chat(&[Message { role: "user".into(), content: "hi".into() }])
+        .chat(&[Message {
+            role: "user".into(),
+            content: "hi".into(),
+        }])
         .await
         .unwrap();
 
@@ -108,7 +118,10 @@ async fn propagates_a_non_2xx_response_as_an_error() {
 
     let provider = AnthropicProvider::new(&server.uri(), "claude", None).unwrap();
     let err = provider
-        .chat(&[Message { role: "user".into(), content: "hi".into() }])
+        .chat(&[Message {
+            role: "user".into(),
+            content: "hi".into(),
+        }])
         .await
         .unwrap_err();
 

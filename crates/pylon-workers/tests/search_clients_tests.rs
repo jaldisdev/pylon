@@ -61,7 +61,10 @@ async fn meilisearch_sends_bearer_auth_when_an_api_key_is_given() {
         .await;
 
     let client = MeilisearchClient::new(&server.uri(), Some("secret-key"), timeout()).unwrap();
-    client.index_document("products", "doc-1", &HashMap::new()).await.unwrap();
+    client
+        .index_document("products", "doc-1", &HashMap::new())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -166,7 +169,10 @@ async fn opensearch_sends_basic_auth_when_credentials_are_given() {
         .await;
 
     let client = OpenSearchClient::new(&server.uri(), Some(("user", "pass")), timeout()).unwrap();
-    client.index_document("products", "doc-1", &HashMap::new()).await.unwrap();
+    client
+        .index_document("products", "doc-1", &HashMap::new())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

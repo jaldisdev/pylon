@@ -42,14 +42,10 @@ use pylon_core::schema::{
     PropertyDescriptor, SchemaDescriptor, TupleMemberDescriptor, TupleMemberKind, TypeDescriptor,
     VectorIndexDescriptor,
 };
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 fn pg_schema_to_module(pg_schema: &str) -> &str {
-    if pg_schema == "public" {
-        "default"
-    } else {
-        pg_schema
-    }
+    if pg_schema == "public" { "default" } else { pg_schema }
 }
 
 /// `"\"schema\".\"Name\""` -> `"module::Name"` — reverses the
@@ -198,8 +194,11 @@ fn type_json(t: &TypeDescriptor) -> Json {
 
 /// `GET /api/schema`'s full response body.
 pub fn schema_json(schema: &SchemaDescriptor) -> Json {
-    let enums: Vec<Json> =
-        schema.enums.iter().map(|e| json!({"module": e.module, "name": e.name, "members": e.members})).collect();
+    let enums: Vec<Json> = schema
+        .enums
+        .iter()
+        .map(|e| json!({"module": e.module, "name": e.name, "members": e.members}))
+        .collect();
     json!({
         "types": schema.types.iter().map(type_json).collect::<Vec<_>>(),
         "enums": enums,
@@ -218,6 +217,11 @@ fn global_json(g: &GlobalDescriptor) -> Json {
 /// `GET /api/globals`'s full response body — only *settable* globals
 /// (computed ones are derived at query time, never user-set).
 pub fn globals_json(schema: &SchemaDescriptor) -> Json {
-    let globals: Vec<Json> = schema.globals.iter().filter(|g| g.computed_expr.is_none()).map(global_json).collect();
+    let globals: Vec<Json> = schema
+        .globals
+        .iter()
+        .filter(|g| g.computed_expr.is_none())
+        .map(global_json)
+        .collect();
     json!({"globals": globals})
 }

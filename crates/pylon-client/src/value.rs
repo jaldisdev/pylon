@@ -44,7 +44,11 @@ pub enum Value {
     /// A PostgreSQL `interval` (`std::duration` / `cal::relative_duration`)
     /// — kept as its three raw wire components, same reasoning as
     /// `DecodedValue::Interval`.
-    Duration { months: i32, days: i32, microseconds: i64 },
+    Duration {
+        months: i32,
+        days: i32,
+        microseconds: i64,
+    },
     /// Whole days since the PG epoch (2000-01-01). Backs `cal::local_date`.
     Date(i32),
     /// Microseconds since midnight. Backs `cal::local_time`.
@@ -63,13 +67,22 @@ pub enum Value {
     /// An enum value, hydrated to its qualified type name + variant label
     /// rather than a generated Rust enum (there's no per-schema-type codegen
     /// on this client, matching the generic-`Object` design as a whole).
-    Enum { type_name: String, value: String },
+    Enum {
+        type_name: String,
+        value: String,
+    },
     /// Result of a `group` statement.
     Group(Box<Group>),
     /// Result of a `vector::search` statement.
-    VectorSearch { object: Box<Value>, distance: f64 },
+    VectorSearch {
+        object: Box<Value>,
+        distance: f64,
+    },
     /// Result of an `fts::search` statement.
-    FtsSearch { object: Box<Value>, score: f64 },
+    FtsSearch {
+        object: Box<Value>,
+        score: f64,
+    },
 }
 
 /// A schema object, a free object literal, or a named tuple — all three

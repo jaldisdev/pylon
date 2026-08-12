@@ -18,13 +18,12 @@
 //
 
 use crate::ir::{
-    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr,
-    IrFunctionSelect, IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrMultiLinkPointer,
-    IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkValues, IrMultiLinkValueSource, IrNulls,
-    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer,
-    IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrFtsSearch, IrSort, IrSortDir,
-    IrSource, IrStmt, IrUpdate, IrVectorSearch, VectorEnqueueInfo, SearchEnqueueInfo,
-    IrLockClause, IrLockStrength, IrLockWait,
+    IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionSelect,
+    IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkJoin,
+    IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
+    IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
+    IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
+    IrUpdate, IrVectorSearch, SearchEnqueueInfo, VectorEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, InferencePlan, ShapeDescriptor, ShapeNode};
@@ -47,10 +46,15 @@ pub struct SqlOutput {
 /// "multiple assignments to same column" (confirmed live).
 fn update_set_fragments(assignments: &[(String, IrExpr)], rewrites: &[IrRewrite], indent: &str) -> Vec<String> {
     let rewrite_cols: std::collections::HashSet<&str> = rewrites.iter().map(|r| r.column.as_str()).collect();
-    assignments.iter()
+    assignments
+        .iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(col, expr)| format!("{indent}{} = {}", qi(col), emit_expr(expr)))
-        .chain(rewrites.iter().map(|rw| format!("{indent}{} = {}", qi(&rw.column), emit_expr(&rw.expr))))
+        .chain(
+            rewrites
+                .iter()
+                .map(|rw| format!("{indent}{} = {}", qi(&rw.column), emit_expr(&rw.expr))),
+        )
         .collect()
 }
 
@@ -91,16 +95,21 @@ fn emit_for_global_cte(stmt: &IrStmt) -> String {
 }
 
 fn emit_global_cte_parts(global_ctes: &[IrGlobalCte]) -> Vec<String> {
-    global_ctes.iter().map(|g| match g {
-        IrGlobalCte::Session(s) => format!(
-            "\"{}\" AS (SELECT ${}::{} AS \"value\")",
-            s.cte_name, s.param_index + 1, s.pg_type
-        ),
-        IrGlobalCte::Computed(c) => {
-            let body = emit_for_global_cte(&c.stmt);
-            format!("\"{}\" AS (\n{}\n)", c.cte_name, body)
-        }
-    }).collect()
+    global_ctes
+        .iter()
+        .map(|g| match g {
+            IrGlobalCte::Session(s) => format!(
+                "\"{}\" AS (SELECT ${}::{} AS \"value\")",
+                s.cte_name,
+                s.param_index + 1,
+                s.pg_type
+            ),
+            IrGlobalCte::Computed(c) => {
+                let body = emit_for_global_cte(&c.stmt);
+                format!("\"{}\" AS (\n{}\n)", c.cte_name, body)
+            }
+        })
+        .collect()
 }
 
 pub fn emit(ir: &IrOutput) -> SqlOutput {
@@ -156,7 +165,11 @@ fn qi(s: &str) -> String {
 }
 
 fn pg_schema(module: &str) -> String {
-    if module == "default" { "\"public\"".into() } else { qi(module) }
+    if module == "default" {
+        "\"public\"".into()
+    } else {
+        qi(module)
+    }
 }
 
 pub fn pg_schema_str(module: &str) -> String {
@@ -194,14 +207,18 @@ fn source_ref(src: &IrSource) -> String {
 
 fn emit_poly_union(implementors: &[IrPolyImplementor], columns: &[String]) -> String {
     let col_list = columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
-    implementors.iter().map(|imp| {
-        format!(
-            "    SELECT {}::text AS \"__type__\", {} FROM {}",
-            sql_str(&imp.type_name),
-            col_list,
-            qn(&imp.module, &imp.table),
-        )
-    }).collect::<Vec<_>>().join("\n    UNION ALL\n")
+    implementors
+        .iter()
+        .map(|imp| {
+            format!(
+                "    SELECT {}::text AS \"__type__\", {} FROM {}",
+                sql_str(&imp.type_name),
+                col_list,
+                qn(&imp.module, &imp.table),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n    UNION ALL\n")
 }
 
 // ── SELECT statement ────────────────────────────────────────────────────────
@@ -249,18 +266,33 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
         };
         cte_parts.extend(enqueue_ctes(enqueue_v, "_dml"));
         cte_parts.extend(enqueue_search_ctes(enqueue_s, "_dml", enqueue_v.len()));
-        format!("WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
-            cte_parts.join(",\n"), distinct, tuple, qi(alias))
+        format!(
+            "WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
+            cte_parts.join(",\n"),
+            distinct,
+            tuple,
+            qi(alias)
+        )
     } else if sel.polymorphic && !source.table.starts_with("@cte:") {
         // Polymorphic interface with no CTE indirection: fan out to implementor tables.
         let union_sql = emit_poly_union(&sel.poly_implementors, &sel.poly_columns);
-        format!("SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
-            distinct, tuple, union_sql, qi(alias))
+        format!(
+            "SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
+            distinct,
+            tuple,
+            union_sql,
+            qi(alias)
+        )
     } else {
         // Concrete table or CTE (pre-filtered): query directly.
         // For CTE-backed polymorphic sources, __type__ is already present in the CTE result.
-        format!("SELECT {}(\n    {}\n) AS result\nFROM {} AS {}",
-            distinct, tuple, source_ref(source), qi(alias))
+        format!(
+            "SELECT {}(\n    {}\n) AS result\nFROM {} AS {}",
+            distinct,
+            tuple,
+            source_ref(source),
+            qi(alias)
+        )
     };
 
     let mut sql = from_clause;
@@ -292,12 +324,16 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
         IrStmt::Insert(ins) => {
             let rewrite_cols: std::collections::HashSet<&str> =
                 ins.rewrites.iter().map(|r| r.column.as_str()).collect();
-            let cols: Vec<String> = ins.assignments.iter()
+            let cols: Vec<String> = ins
+                .assignments
+                .iter()
                 .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
                 .map(|(c, _)| format!("    {}", qi(c)))
                 .chain(ins.rewrites.iter().map(|r| format!("    {}", qi(&r.column))))
                 .collect();
-            let vals: Vec<String> = ins.assignments.iter()
+            let vals: Vec<String> = ins
+                .assignments
+                .iter()
                 .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
                 .map(|(_, e)| format!("    {}", emit_expr(e)))
                 .chain(ins.rewrites.iter().map(|r| format!("    {}", emit_expr(&r.expr))))
@@ -327,7 +363,9 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "    ");
             let mut sql = format!(
                 "    UPDATE {} AS {}\n    SET\n{}",
-                source_ref(&upd.target), qi(alias), sets.join(",\n"),
+                source_ref(&upd.target),
+                qi(alias),
+                sets.join(",\n"),
             );
             append_filter(&mut sql, &upd.filter);
             sql.push_str("\n    RETURNING *");
@@ -335,10 +373,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
         }
         IrStmt::Delete(del) => {
             let alias = &del.target.alias;
-            let mut sql = format!(
-                "    DELETE FROM {} AS {}",
-                source_ref(&del.target), qi(alias),
-            );
+            let mut sql = format!("    DELETE FROM {} AS {}", source_ref(&del.target), qi(alias),);
             append_filter(&mut sql, &del.filter);
             sql.push_str("\n    RETURNING *");
             sql
@@ -380,7 +415,9 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &sel.offset, &sel.limit);
             sql
         }
-        IrStmt::For(_) | IrStmt::Group(_) | IrStmt::VectorSearch(_) | IrStmt::FtsSearch(_) => unreachable!("cannot appear as a CTE source"),
+        IrStmt::For(_) | IrStmt::Group(_) | IrStmt::VectorSearch(_) | IrStmt::FtsSearch(_) => {
+            unreachable!("cannot appear as a CTE source")
+        }
         IrStmt::PathSelect(ps) => {
             // Path select as CTE: emit a flat SELECT that exposes an `id` column.
             let mut sql = emit_path_joins(&ps.root, &ps.joins);
@@ -435,7 +472,9 @@ fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         let cte_name = format!("{}__u{}", name, i);
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            qn(&imp.module, &imp.table), qi(alias), sets.join(", "),
+            qn(&imp.module, &imp.table),
+            qi(alias),
+            sets.join(", "),
         );
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str(&format!("\nRETURNING {}", col_list));
@@ -443,7 +482,9 @@ fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
 
         union_parts.push(format!(
             "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
-            sql_str(&imp.type_name), col_list, cte_name,
+            sql_str(&imp.type_name),
+            col_list,
+            cte_name,
         ));
     }
     cte_parts.push(format!("\"{}\" AS (\n{}\n)", name, union_parts.join("\nUNION ALL\n")));
@@ -458,17 +499,16 @@ fn emit_poly_delete_dml_ctes(del: &IrDelete, name: &str) -> Vec<String> {
     let mut union_parts = vec![];
     for (i, imp) in del.poly_implementors.iter().enumerate() {
         let cte_name = format!("{}__d{}", name, i);
-        let mut del_sql = format!(
-            "DELETE FROM {} AS {}",
-            qn(&imp.module, &imp.table), qi(alias),
-        );
+        let mut del_sql = format!("DELETE FROM {} AS {}", qn(&imp.module, &imp.table), qi(alias),);
         append_filter(&mut del_sql, &del.filter);
         del_sql.push_str(&format!("\nRETURNING {}", col_list));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, del_sql));
 
         union_parts.push(format!(
             "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
-            sql_str(&imp.type_name), col_list, cte_name,
+            sql_str(&imp.type_name),
+            col_list,
+            cte_name,
         ));
     }
     cte_parts.push(format!("\"{}\" AS (\n{}\n)", name, union_parts.join("\nUNION ALL\n")));
@@ -505,7 +545,11 @@ fn ml_clear_exclusion(rep: Option<&IrMultiLinkMutation>) -> String {
     match rep {
         Some(rep) => {
             let vals_ref = emit_multilink_values_subquery(&rep.values, &[]);
-            format!(" AND {} NOT IN (SELECT \"_v\".\"id\" FROM {} AS \"_v\")", qi(&rep.target_col), vals_ref)
+            format!(
+                " AND {} NOT IN (SELECT \"_v\".\"id\" FROM {} AS \"_v\")",
+                qi(&rep.target_col),
+                vals_ref
+            )
         }
         None => String::new(),
     }
@@ -534,7 +578,9 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target), qi(alias), sets.join(", "),
+            source_ref(&upd.target),
+            qi(alias),
+            sets.join(", "),
         );
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\nRETURNING *");
@@ -542,7 +588,9 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     } else {
         let mut sel = format!(
             "SELECT {}.* FROM {} AS {}",
-            qi(alias), source_ref(&upd.target), qi(alias),
+            qi(alias),
+            source_ref(&upd.target),
+            qi(alias),
         );
         append_filter(&mut sel, &upd.filter);
         parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sel));
@@ -552,7 +600,10 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         let exclude = ml_clear_exclusion(upd.multi_link_replaces.get(i));
         let del = format!(
             "DELETE FROM {} WHERE {} IN (SELECT id FROM \"{}\"){}",
-            qn(&clr.module, &clr.junction_table), qi(&clr.source_col), ids_name, exclude,
+            qn(&clr.module, &clr.junction_table),
+            qi(&clr.source_col),
+            ids_name,
+            exclude,
         );
         parts.push(format!("\"{}__clr_{}\" AS (\n{}\n)", name, i, del));
     }
@@ -584,7 +635,9 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
     let mut parts: Vec<String> = emit_user_cte_parts(&ins.nested_ctes);
 
     let mut insert_sql = emit_insert_row_sql(ins);
-    if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
+    if let Some(conflict) = &ins.unless_conflict {
+        emit_conflict(&mut insert_sql, conflict);
+    }
     insert_sql.push_str("\nRETURNING *");
     parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, insert_sql));
 
@@ -617,17 +670,17 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
                 continue;
             }
         }
-        if let IrStmt::Insert(ins) = &c.stmt {
-            if insert_has_any_multilink(ins) {
-                parts.extend(emit_insert_multilink_ctes(ins, &c.name));
-                continue;
-            }
+        if let IrStmt::Insert(ins) = &c.stmt
+            && insert_has_any_multilink(ins)
+        {
+            parts.extend(emit_insert_multilink_ctes(ins, &c.name));
+            continue;
         }
-        if let IrStmt::Delete(del) = &c.stmt {
-            if !del.poly_implementors.is_empty() {
-                parts.extend(emit_poly_delete_dml_ctes(del, &c.name));
-                continue;
-            }
+        if let IrStmt::Delete(del) = &c.stmt
+            && !del.poly_implementors.is_empty()
+        {
+            parts.extend(emit_poly_delete_dml_ctes(del, &c.name));
+            continue;
         }
         parts.push(format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)));
     }
@@ -705,7 +758,10 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
             let alias = &source.alias;
             let mut sql = format!(
                 "(SELECT {}.\"id\"{} FROM {} AS {}",
-                qi(alias), prop_cols, source_ref(source), qi(alias)
+                qi(alias),
+                prop_cols,
+                source_ref(source),
+                qi(alias)
             );
             append_filter(&mut sql, &s.filter);
             sql.push(')');
@@ -715,7 +771,10 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
             let root_alias = &ps.root.alias;
             let mut sql = format!(
                 "(SELECT {}.\"id\"{} FROM {} AS {}",
-                qi(root_alias), prop_cols, source_ref(&ps.root), qi(root_alias)
+                qi(root_alias),
+                prop_cols,
+                source_ref(&ps.root),
+                qi(root_alias)
             );
             for join in &ps.joins {
                 sql.push_str(&emit_path_join_sql(join));
@@ -731,49 +790,93 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
 /// SQL fragment for a single path join (used in multilink values emission).
 fn emit_path_join_sql(join: &IrPathJoin) -> String {
     match join {
-        IrPathJoin::Single { source_alias, fk_col, target } => {
+        IrPathJoin::Single {
+            source_alias,
+            fk_col,
+            target,
+        } => {
             format!(
                 " JOIN {} AS {} ON {}.\"id\" = {}.{}",
-                source_ref(target), qi(&target.alias),
-                qi(&target.alias), qi(source_alias), qi(fk_col)
+                source_ref(target),
+                qi(&target.alias),
+                qi(&target.alias),
+                qi(source_alias),
+                qi(fk_col)
             )
         }
-        IrPathJoin::Multi { source_alias, junction_alias, join: ml_join, target } => {
+        IrPathJoin::Multi {
+            source_alias,
+            junction_alias,
+            join: ml_join,
+            target,
+        } => {
             let (jt_ref, src_col, tgt_col) = match ml_join {
-                IrMultiLinkJoin::Standard { junction_table, module } =>
-                    (qn(module, junction_table), "source".to_string(), "target".to_string()),
-                IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } =>
-                    (qn(module, junction_table), source_col.clone(), target_col.clone()),
+                IrMultiLinkJoin::Standard { junction_table, module } => {
+                    (qn(module, junction_table), "source".to_string(), "target".to_string())
+                }
+                IrMultiLinkJoin::Through {
+                    junction_table,
+                    module,
+                    source_col,
+                    target_col,
+                } => (qn(module, junction_table), source_col.clone(), target_col.clone()),
                 // A forward `IrPathJoin::Multi` step is always built from a
                 // real multi-link (`compile_path_select`'s middle-step
                 // handling), never a backlink — the Backlink* variants only
                 // ever appear inside `IrShapePointer::MultiLink.join`.
-                IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } =>
-                    unreachable!("a forward multi-link path step never uses a backlink join variant"),
+                IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } => {
+                    unreachable!("a forward multi-link path step never uses a backlink join variant")
+                }
             };
             format!(
                 " JOIN {} AS {} ON {}.{} = {}.\"id\" JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                jt_ref, qi(junction_alias),
-                qi(junction_alias), qi(&src_col), qi(source_alias),
-                source_ref(target), qi(&target.alias),
-                qi(junction_alias), qi(&tgt_col), qi(&target.alias),
+                jt_ref,
+                qi(junction_alias),
+                qi(junction_alias),
+                qi(&src_col),
+                qi(source_alias),
+                source_ref(target),
+                qi(&target.alias),
+                qi(junction_alias),
+                qi(&tgt_col),
+                qi(&target.alias),
             )
         }
-        IrPathJoin::BacklinkSingle { source_alias, fk_col, target } => {
+        IrPathJoin::BacklinkSingle {
+            source_alias,
+            fk_col,
+            target,
+        } => {
             format!(
                 " JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                source_ref(target), qi(&target.alias),
-                qi(&target.alias), qi(fk_col), qi(source_alias),
+                source_ref(target),
+                qi(&target.alias),
+                qi(&target.alias),
+                qi(fk_col),
+                qi(source_alias),
             )
         }
-        IrPathJoin::BacklinkMulti { source_alias, junction_alias, junction_table, module,
-                                    owner_col, current_col, target } => {
+        IrPathJoin::BacklinkMulti {
+            source_alias,
+            junction_alias,
+            junction_table,
+            module,
+            owner_col,
+            current_col,
+            target,
+        } => {
             format!(
                 " JOIN {} AS {} ON {}.{} = {}.\"id\" JOIN {} AS {} ON {}.\"id\" = {}.{}",
-                qn(module, junction_table), qi(junction_alias),
-                qi(junction_alias), qi(current_col), qi(source_alias),
-                source_ref(target), qi(&target.alias),
-                qi(&target.alias), qi(junction_alias), qi(owner_col),
+                qn(module, junction_table),
+                qi(junction_alias),
+                qi(junction_alias),
+                qi(current_col),
+                qi(source_alias),
+                source_ref(target),
+                qi(&target.alias),
+                qi(&target.alias),
+                qi(junction_alias),
+                qi(owner_col),
             )
         }
     }
@@ -804,18 +907,29 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: 
         // `DO NOTHING` would then silently drop a genuine reassignment.
         // `source` alone is always this table's conflict target, so this
         // must always be an upsert, not just when link properties exist.
-        let mut sets = vec![format!("{} = EXCLUDED.{}", qi(&mutation.target_col), qi(&mutation.target_col))];
+        let mut sets = vec![format!(
+            "{} = EXCLUDED.{}",
+            qi(&mutation.target_col),
+            qi(&mutation.target_col)
+        )];
         sets.extend(prop_names.iter().map(|n| format!("{} = EXCLUDED.{}", qi(n), qi(n))));
-        format!("ON CONFLICT ({}) DO UPDATE SET {}", qi(&mutation.source_col), sets.join(", "))
+        format!(
+            "ON CONFLICT ({}) DO UPDATE SET {}",
+            qi(&mutation.source_col),
+            sets.join(", ")
+        )
     } else if prop_names.is_empty() {
         "ON CONFLICT DO NOTHING".to_string()
     } else {
-        let sets: Vec<String> = prop_names.iter()
+        let sets: Vec<String> = prop_names
+            .iter()
             .map(|n| format!("{} = EXCLUDED.{}", qi(n), qi(n)))
             .collect();
         format!(
             "ON CONFLICT ({}, {}) DO UPDATE SET {}",
-            qi(&mutation.source_col), qi(&mutation.target_col), sets.join(", "),
+            qi(&mutation.source_col),
+            qi(&mutation.target_col),
+            sets.join(", "),
         )
     };
 
@@ -891,8 +1005,10 @@ fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
 /// Return them as plain top-level columns instead.
 fn is_integer_expr(expr: &IrExpr) -> bool {
     match expr {
-        IrExpr::ColumnRef { pg_type, .. } =>
-            matches!(pg_type.as_str(), "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"),
+        IrExpr::ColumnRef { pg_type, .. } => matches!(
+            pg_type.as_str(),
+            "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint"
+        ),
         IrExpr::Literal(crate::ir::IrLiteral::Int(_)) => true,
         IrExpr::BinOp(op) => is_integer_expr(&op.left) && is_integer_expr(&op.right),
         _ => false,
@@ -916,97 +1032,125 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
 fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> SqlOutput {
     use crate::query::ShapeNode;
 
-    let items: Vec<&IrFreeExpr> = rows.iter().map(|r| match r {
-        IrRowSource::Free(item) => item,
-        IrRowSource::Bound { .. } => unreachable!("mixed Bound/Free rows rejected at compile time"),
-    }).collect();
+    let items: Vec<&IrFreeExpr> = rows
+        .iter()
+        .map(|r| match r {
+            IrRowSource::Free(item) => item,
+            IrRowSource::Bound { .. } => unreachable!("mixed Bound/Free rows rejected at compile time"),
+        })
+        .collect();
 
     if items.is_empty() {
         return SqlOutput {
             sql: "SELECT NULL AS result WHERE FALSE".to_string(),
             shape: ShapeDescriptor {
-                root: ShapeNode::Scalar { name: String::new(), position: 0 },
+                root: ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 0,
+                },
             },
             inference_plan: None,
         };
     }
 
     // assert_exists / assert_distinct: set-returning — emit as unnest, not UNION ALL
-    if items.len() == 1 {
-        if let IrFreeExpr::AssertSet { fn_name, inner } = items[0] {
-            let array_sql = emit_array_source(inner);
-            let mut sql = format!(
-                "SELECT ROW(v) AS result FROM unnest(\"_pylon\".{}({})) AS _assert(v)",
-                fn_name, array_sql,
-            );
-            if sel.distinct {
-                sql = format!("SELECT DISTINCT * FROM ({}) AS \"_distinct\"", sql);
-            }
-            append_order_by(&mut sql, &sel.order_by);
-            append_offset_limit(&mut sql, &sel.offset, &sel.limit);
-            return SqlOutput {
-                sql,
-                shape: ShapeDescriptor {
-                    root: ShapeNode::Scalar { name: String::new(), position: 0 },
-                },
-                inference_plan: None,
-            };
+    if items.len() == 1
+        && let IrFreeExpr::AssertSet { fn_name, inner } = items[0]
+    {
+        let array_sql = emit_array_source(inner);
+        let mut sql = format!(
+            "SELECT ROW(v) AS result FROM unnest(\"_pylon\".{}({})) AS _assert(v)",
+            fn_name, array_sql,
+        );
+        if sel.distinct {
+            sql = format!("SELECT DISTINCT * FROM ({}) AS \"_distinct\"", sql);
         }
+        append_order_by(&mut sql, &sel.order_by);
+        append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+        return SqlOutput {
+            sql,
+            shape: ShapeDescriptor {
+                root: ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 0,
+                },
+            },
+            inference_plan: None,
+        };
     }
 
     let shape_root = free_item_shape(items.first().unwrap(), ctes);
 
-    let branches: Vec<String> = items.iter().map(|item| match item {
-        IrFreeExpr::Scalar(expr) => {
-            // Arrays (OID 1007) and jsonb (OID 3802) can't be decoded inside anonymous
-            // ROW() composites by asyncpg. Return them as plain top-level columns instead.
-            if is_raw_scalar(expr) {
-                format!("SELECT {} AS result", emit_expr(expr))
-            } else {
-                // `result` is a ROW() composite for top-level asyncpg decoding.
-                // `v` is the unwrapped scalar for use in CteRef expression context.
-                // Wrap in a subquery so volatile functions (nextval, etc.) are called once.
-                // Enum values also need a ::text cast inside the ROW() — same
-                // unregistered-OID problem as arrays/jsonb — but the bare `v`
-                // column stays natively typed for CteRef expression use.
-                let e = emit_expr(expr);
-                let row_value = if enum_type_of_expr(expr).is_some() { "v::text" } else { "v" };
-                format!("SELECT ROW({row_value}) AS result, v FROM (SELECT {e} AS v) AS _scalar")
+    let branches: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            IrFreeExpr::Scalar(expr) => {
+                // Arrays (OID 1007) and jsonb (OID 3802) can't be decoded inside anonymous
+                // ROW() composites by asyncpg. Return them as plain top-level columns instead.
+                if is_raw_scalar(expr) {
+                    format!("SELECT {} AS result", emit_expr(expr))
+                } else {
+                    // `result` is a ROW() composite for top-level asyncpg decoding.
+                    // `v` is the unwrapped scalar for use in CteRef expression context.
+                    // Wrap in a subquery so volatile functions (nextval, etc.) are called once.
+                    // Enum values also need a ::text cast inside the ROW() — same
+                    // unregistered-OID problem as arrays/jsonb — but the bare `v`
+                    // column stays natively typed for CteRef expression use.
+                    let e = emit_expr(expr);
+                    let row_value = if enum_type_of_expr(expr).is_some() {
+                        "v::text"
+                    } else {
+                        "v"
+                    };
+                    format!("SELECT ROW({row_value}) AS result, v FROM (SELECT {e} AS v) AS _scalar")
+                }
             }
-        }
-        IrFreeExpr::FreeObject(fields) => {
-            // Each field is computed once in an inner subquery (so a
-            // volatile expression like nextval() isn't evaluated twice) and
-            // exposed both packed into the `result` composite (for whole-
-            // object passthrough/decoding) and as its own named column (for
-            // `IrExpr::CteFieldRef` — `with x := {a := ...} select x.a`).
-            let inner_cols: Vec<String> = fields.iter().enumerate()
-                .map(|(i, (_, e))| format!("{} AS \"_f{}\"", emit_expr(e), i))
-                .collect();
-            let row_items: Vec<String> = fields.iter().enumerate()
-                .map(|(i, (_, e))| {
-                    if enum_type_of_expr(e).is_some() { format!("\"_f{}\"::text", i) } else { format!("\"_f{}\"", i) }
-                })
-                .collect();
-            let named_cols: Vec<String> = fields.iter().enumerate()
-                .map(|(i, (name, _))| format!("\"_f{}\" AS {}", i, qi(name)))
-                .collect();
-            format!(
-                "SELECT ROW({}) AS result, {} FROM (SELECT {}) AS _obj",
-                row_items.join(", "), named_cols.join(", "), inner_cols.join(", "),
-            )
-        }
-        IrFreeExpr::Tuple(exprs) => {
-            if exprs.len() == 1 {
-                format!("SELECT ROW({}) AS result", emit_free_field_expr(&exprs[0]))
-            } else {
-                let parts: Vec<String> = exprs.iter().map(emit_free_field_expr).collect();
-                format!("SELECT ({}) AS result", parts.join(", "))
+            IrFreeExpr::FreeObject(fields) => {
+                // Each field is computed once in an inner subquery (so a
+                // volatile expression like nextval() isn't evaluated twice) and
+                // exposed both packed into the `result` composite (for whole-
+                // object passthrough/decoding) and as its own named column (for
+                // `IrExpr::CteFieldRef` — `with x := {a := ...} select x.a`).
+                let inner_cols: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, e))| format!("{} AS \"_f{}\"", emit_expr(e), i))
+                    .collect();
+                let row_items: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, e))| {
+                        if enum_type_of_expr(e).is_some() {
+                            format!("\"_f{}\"::text", i)
+                        } else {
+                            format!("\"_f{}\"", i)
+                        }
+                    })
+                    .collect();
+                let named_cols: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _))| format!("\"_f{}\" AS {}", i, qi(name)))
+                    .collect();
+                format!(
+                    "SELECT ROW({}) AS result, {} FROM (SELECT {}) AS _obj",
+                    row_items.join(", "),
+                    named_cols.join(", "),
+                    inner_cols.join(", "),
+                )
             }
-        }
-        IrFreeExpr::AssertSet { .. } => unreachable!("AssertSet is handled by early return above"),
-        IrFreeExpr::CtePassthrough(name) => format!("SELECT \"result\" FROM {}", qi(name)),
-    }).collect();
+            IrFreeExpr::Tuple(exprs) => {
+                if exprs.len() == 1 {
+                    format!("SELECT ROW({}) AS result", emit_free_field_expr(&exprs[0]))
+                } else {
+                    let parts: Vec<String> = exprs.iter().map(emit_free_field_expr).collect();
+                    format!("SELECT ({}) AS result", parts.join(", "))
+                }
+            }
+            IrFreeExpr::AssertSet { .. } => unreachable!("AssertSet is handled by early return above"),
+            IrFreeExpr::CtePassthrough(name) => format!("SELECT \"result\" FROM {}", qi(name)),
+        })
+        .collect();
 
     let union_sql = branches.join("\nUNION ALL\n");
 
@@ -1019,7 +1163,11 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor { root: shape_root },
+        inference_plan: None,
+    }
 }
 
 /// Determine whether `expr`'s runtime SQL type is a custom/enum type whose
@@ -1055,8 +1203,15 @@ fn emit_free_field_expr(expr: &IrExpr) -> String {
 fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::ShapeNode;
     match enum_type_of_expr(expr) {
-        Some(enum_type) => ShapeNode::Enum { name: name.to_string(), position, enum_type },
-        None => ShapeNode::Scalar { name: name.to_string(), position },
+        Some(enum_type) => ShapeNode::Enum {
+            name: name.to_string(),
+            position,
+            enum_type,
+        },
+        None => ShapeNode::Scalar {
+            name: name.to_string(),
+            position,
+        },
     }
 }
 
@@ -1115,7 +1270,10 @@ fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeN
                 .map(|(i, e)| free_field_shape_node("", i, e))
                 .collect(),
         },
-        IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar { name: String::new(), position: 0 },
+        IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar {
+            name: String::new(),
+            position: 0,
+        },
         // The referenced CTE's own `result` column carries whatever shape its
         // defining free row has (a bare scalar, a multi-field free object, a
         // tuple, or even another passthrough) — resolve it by looking the CTE
@@ -1131,7 +1289,10 @@ fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeN
                 },
                 _ => None,
             })
-            .unwrap_or(ShapeNode::Scalar { name: String::new(), position: 0 }),
+            .unwrap_or(ShapeNode::Scalar {
+                name: String::new(),
+                position: 0,
+            }),
     }
 }
 
@@ -1141,64 +1302,110 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
     let mut parts = vec![format!("{} AS {}", source_ref(root), qi(&root.alias))];
     for join in joins {
         match join {
-            IrPathJoin::Single { source_alias, fk_col, target } => {
+            IrPathJoin::Single {
+                source_alias,
+                fk_col,
+                target,
+            } => {
                 parts.push(format!(
                     "JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                    source_ref(target), qi(&target.alias),
-                    qi(source_alias), qi(fk_col),
+                    source_ref(target),
+                    qi(&target.alias),
+                    qi(source_alias),
+                    qi(fk_col),
                     qi(&target.alias),
                 ));
             }
-            IrPathJoin::Multi { source_alias, junction_alias, join, target } => {
+            IrPathJoin::Multi {
+                source_alias,
+                junction_alias,
+                join,
+                target,
+            } => {
                 match join {
                     IrMultiLinkJoin::Standard { junction_table, module } => {
                         parts.push(format!(
                             "JOIN {} AS {} ON {}.\"source\" = {}.\"id\"",
-                            qn(module, junction_table), qi(junction_alias),
-                            qi(junction_alias), qi(source_alias),
+                            qn(module, junction_table),
+                            qi(junction_alias),
+                            qi(junction_alias),
+                            qi(source_alias),
                         ));
                         parts.push(format!(
                             "JOIN {} AS {} ON {}.\"id\" = {}.\"target\"",
-                            source_ref(target), qi(&target.alias),
-                            qi(&target.alias), qi(junction_alias),
+                            source_ref(target),
+                            qi(&target.alias),
+                            qi(&target.alias),
+                            qi(junction_alias),
                         ));
                     }
-                    IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
+                    IrMultiLinkJoin::Through {
+                        junction_table,
+                        module,
+                        source_col,
+                        target_col,
+                    } => {
                         parts.push(format!(
                             "JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                            qn(module, junction_table), qi(junction_alias),
-                            qi(junction_alias), qi(source_col),
+                            qn(module, junction_table),
+                            qi(junction_alias),
+                            qi(junction_alias),
+                            qi(source_col),
                             qi(source_alias),
                         ));
                         parts.push(format!(
                             "JOIN {} AS {} ON {}.\"id\" = {}.{}",
-                            source_ref(target), qi(&target.alias),
-                            qi(&target.alias), qi(junction_alias), qi(target_col),
+                            source_ref(target),
+                            qi(&target.alias),
+                            qi(&target.alias),
+                            qi(junction_alias),
+                            qi(target_col),
                         ));
                     }
                     // See the identical comment in `emit_path_join_sql` above.
-                    IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } =>
-                        unreachable!("a forward multi-link path step never uses a backlink join variant"),
+                    IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } => {
+                        unreachable!("a forward multi-link path step never uses a backlink join variant")
+                    }
                 }
             }
-            IrPathJoin::BacklinkSingle { source_alias, fk_col, target } => {
+            IrPathJoin::BacklinkSingle {
+                source_alias,
+                fk_col,
+                target,
+            } => {
                 parts.push(format!(
                     "JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                    source_ref(target), qi(&target.alias),
-                    qi(&target.alias), qi(fk_col), qi(source_alias),
+                    source_ref(target),
+                    qi(&target.alias),
+                    qi(&target.alias),
+                    qi(fk_col),
+                    qi(source_alias),
                 ));
             }
-            IrPathJoin::BacklinkMulti { source_alias, junction_alias, junction_table, module,
-                                        owner_col, current_col, target } => {
+            IrPathJoin::BacklinkMulti {
+                source_alias,
+                junction_alias,
+                junction_table,
+                module,
+                owner_col,
+                current_col,
+                target,
+            } => {
                 parts.push(format!(
                     "JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                    qn(module, junction_table), qi(junction_alias),
-                    qi(junction_alias), qi(current_col), qi(source_alias),
+                    qn(module, junction_table),
+                    qi(junction_alias),
+                    qi(junction_alias),
+                    qi(current_col),
+                    qi(source_alias),
                 ));
                 parts.push(format!(
                     "JOIN {} AS {} ON {}.\"id\" = {}.{}",
-                    source_ref(target), qi(&target.alias),
-                    qi(&target.alias), qi(junction_alias), qi(owner_col),
+                    source_ref(target),
+                    qi(&target.alias),
+                    qi(&target.alias),
+                    qi(junction_alias),
+                    qi(owner_col),
                 ));
             }
         }
@@ -1216,12 +1423,10 @@ fn emit_array_source(src: &IrArraySource) -> String {
                 unreachable!("IrArraySource::Select is always schema-bound")
             };
             let scalar = match shape.first() {
-                Some(IrShapePointer::Scalar(sf)) =>
-                    format!("{}.{}", qi(&source.alias), qi(&sf.column)),
+                Some(IrShapePointer::Scalar(sf)) => format!("{}.{}", qi(&source.alias), qi(&sf.column)),
                 _ => format!("{}.\"id\"", qi(&source.alias)),
             };
-            let mut sql = format!("SELECT {} FROM {} AS {}",
-                scalar, source_ref(source), qi(&source.alias));
+            let mut sql = format!("SELECT {} FROM {} AS {}", scalar, source_ref(source), qi(&source.alias));
             append_filter(&mut sql, &s.filter);
             format!("ARRAY({})", sql)
         }
@@ -1235,11 +1440,18 @@ fn emit_array_source(src: &IrArraySource) -> String {
             append_filter(&mut sql, &ps.filter);
             format!("ARRAY({})", sql)
         }
-        IrArraySource::RawExpr { source, poly_implementors, poly_columns, expr } => {
+        IrArraySource::RawExpr {
+            source,
+            poly_implementors,
+            poly_columns,
+            expr,
+        } => {
             let from_sql = if !poly_implementors.is_empty() {
-                format!("(\n{}\n) AS {}",
+                format!(
+                    "(\n{}\n) AS {}",
                     emit_poly_union(poly_implementors, poly_columns),
-                    qi(&source.alias))
+                    qi(&source.alias)
+                )
             } else {
                 format!("{} AS {}", source_ref(source), qi(&source.alias))
             };
@@ -1251,15 +1463,15 @@ fn emit_array_source(src: &IrArraySource) -> String {
 /// Emit a group-key expression, casting schema-qualified enum ColumnRefs to `::text`
 /// so asyncpg can decode them outside of a typed composite.
 fn emit_key_expr(expr: &IrExpr) -> String {
-    if let IrExpr::ColumnRef { alias, column, pg_type } = expr {
-        if pg_type.starts_with('"') {
-            let col_ref = if alias.is_empty() {
-                qi(column)
-            } else {
-                format!("{}.{}", qi(alias), qi(column))
-            };
-            return format!("{}::text", col_ref);
-        }
+    if let IrExpr::ColumnRef { alias, column, pg_type } = expr
+        && pg_type.starts_with('"')
+    {
+        let col_ref = if alias.is_empty() {
+            qi(column)
+        } else {
+            format!("{}.{}", qi(alias), qi(column))
+        };
+        return format!("{}::text", col_ref);
     }
     emit_expr(expr)
 }
@@ -1283,38 +1495,42 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
     let mut key_nodes: Vec<ShapeNode> = vec![];
     for (i, (key_name, key_expr)) in grp.keys.iter().enumerate() {
         let pos = i + 1;
-        if let IrExpr::ColumnRef { pg_type, .. } = key_expr {
-            if pg_type.starts_with('"') {
-                key_exprs_sql.push(emit_key_expr(key_expr));
-                let enum_type = pg_quoted_to_pylon(pg_type);
-                key_nodes.push(ShapeNode::Enum {
-                    name: key_name.clone(),
-                    position: pos,
-                    enum_type,
-                });
-                continue;
-            }
+        if let IrExpr::ColumnRef { pg_type, .. } = key_expr
+            && pg_type.starts_with('"')
+        {
+            key_exprs_sql.push(emit_key_expr(key_expr));
+            let enum_type = pg_quoted_to_pylon(pg_type);
+            key_nodes.push(ShapeNode::Enum {
+                name: key_name.clone(),
+                position: pos,
+                enum_type,
+            });
+            continue;
         }
         key_exprs_sql.push(emit_expr(key_expr));
-        key_nodes.push(ShapeNode::Scalar { name: key_name.clone(), position: pos });
+        key_nodes.push(ShapeNode::Scalar {
+            name: key_name.clone(),
+            position: pos,
+        });
     }
 
     // Build the outer SELECT tuple.
     let mut outer_parts = vec!["NULL::text".to_string()];
     outer_parts.extend(key_exprs_sql.clone());
-    let key_names_sql = grp.keys.iter()
+    let key_names_sql = grp
+        .keys
+        .iter()
         .map(|(name, _)| format!("'{}'", name))
         .collect::<Vec<_>>()
         .join(", ");
     outer_parts.push(format!("ARRAY[{}]::text[]", key_names_sql));
-    outer_parts.push(format!(
-        "array_agg(ROW(\n            {}\n        )::record)",
-        elem_row
-    ));
+    outer_parts.push(format!("array_agg(ROW(\n            {}\n        )::record)", elem_row));
 
     let outer_tuple = outer_parts.join(",\n    ");
 
-    let group_by_sql = grp.keys.iter()
+    let group_by_sql = grp
+        .keys
+        .iter()
         .map(|(_, key_expr)| emit_expr(key_expr))
         .collect::<Vec<_>>()
         .join(", ");
@@ -1343,17 +1559,25 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         element: Box::new(element_node),
     };
 
-    SqlOutput { sql, shape: ShapeDescriptor { root }, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor { root },
+        inference_plan: None,
+    }
 }
 
 fn emit_poly_union_type_only(implementors: &[IrPolyImplementor]) -> String {
-    implementors.iter().map(|imp| {
-        format!(
-            "    SELECT {}::text AS \"__type__\" FROM {}",
-            sql_str(&imp.type_name),
-            qn(&imp.module, &imp.table),
-        )
-    }).collect::<Vec<_>>().join("\n    UNION ALL\n")
+    implementors
+        .iter()
+        .map(|imp| {
+            format!(
+                "    SELECT {}::text AS \"__type__\" FROM {}",
+                sql_str(&imp.type_name),
+                qn(&imp.module, &imp.table),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n    UNION ALL\n")
 }
 
 fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
@@ -1379,7 +1603,10 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 || tuple_shape.is_some();
             if is_nt {
                 let expr_sql = format!("{} AS result", emit_expr(ir_expr));
-                let shape = if matches!(ir_expr, IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Tuple(_)) {
+                let shape = if matches!(
+                    ir_expr,
+                    IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Tuple(_)
+                ) {
                     ShapeNode::RawScalar
                 } else if let Some(shape) = tuple_shape {
                     // A bare tuple-typed property reference (nominal or
@@ -1396,11 +1623,16 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                     }
                 } else {
                     let type_name = match ir_expr {
-                        IrExpr::ColumnRef { pg_type, .. } =>
-                            pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
+                        IrExpr::ColumnRef { pg_type, .. } => pg_type.strip_prefix("__nt__:").map(|s| s.to_string()),
                         _ => None,
                     };
-                    ShapeNode::NamedTuple { name: String::new(), position: 0, type_name, members: None, is_free_object: false }
+                    ShapeNode::NamedTuple {
+                        name: String::new(),
+                        position: 0,
+                        type_name,
+                        members: None,
+                        is_free_object: false,
+                    }
                 };
                 (expr_sql, shape)
             } else {
@@ -1410,19 +1642,39 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                     if pg_type.starts_with('"') {
                         let enum_type = pg_quoted_to_pylon(pg_type);
                         let expr = format!("ROW({}::text) AS result", emit_expr(ir_expr));
-                        let shape = ShapeNode::Enum { name: String::new(), position: 0, enum_type };
+                        let shape = ShapeNode::Enum {
+                            name: String::new(),
+                            position: 0,
+                            enum_type,
+                        };
                         (expr, shape)
                     } else {
                         let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
-                        (expr, ShapeNode::Scalar { name: String::new(), position: 0 })
+                        (
+                            expr,
+                            ShapeNode::Scalar {
+                                name: String::new(),
+                                position: 0,
+                            },
+                        )
                     }
                 } else {
                     let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
-                    (expr, ShapeNode::Scalar { name: String::new(), position: 0 })
+                    (
+                        expr,
+                        ShapeNode::Scalar {
+                            name: String::new(),
+                            position: 0,
+                        },
+                    )
                 }
             }
         }
-        IrPathResult::Object { alias, type_name, shape } => {
+        IrPathResult::Object {
+            alias,
+            type_name,
+            shape,
+        } => {
             let (pointer_exprs, pointer_nodes) = build_shape(shape, alias);
             let mut parts = vec![type_disc(type_name)];
             parts.extend(pointer_exprs);
@@ -1443,7 +1695,11 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
-    SqlOutput { sql, shape: ShapeDescriptor { root: shape_root }, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor { root: shape_root },
+        inference_plan: None,
+    }
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────
@@ -1455,13 +1711,19 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
     if exprs.is_empty() {
         let empty = SqlOutput {
             sql: "SELECT NULL AS result WHERE FALSE".to_string(),
-            shape: ShapeDescriptor { root: ShapeNode::Scalar { name: String::new(), position: 0 } },
+            shape: ShapeDescriptor {
+                root: ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 0,
+                },
+            },
             inference_plan: None,
         };
         return empty;
     }
 
-    let rows: Vec<String> = exprs.iter()
+    let rows: Vec<String> = exprs
+        .iter()
         .map(|e| format!("({}::{})", emit_expr(e), pg_type))
         .collect();
 
@@ -1475,31 +1737,37 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
             };
             let values_from = format!("(VALUES {}) AS {}(\"v\")", rows.join(", "), qi(&iter_alias));
             let indent_body = body_out.sql.replace('\n', "\n    ");
-            let cte_prefix = if !user_ctes.is_empty() { emit_cte_prefix(user_ctes) } else { String::new() };
+            let cte_prefix = if !user_ctes.is_empty() {
+                emit_cte_prefix(user_ctes)
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "{}SELECT \"_body\".result\nFROM {}\nCROSS JOIN LATERAL (\n    {}\n) AS \"_body\"",
                 cte_prefix, values_from, indent_body,
             );
-            SqlOutput { sql, shape: body_out.shape, inference_plan: None }
+            SqlOutput {
+                sql,
+                shape: body_out.shape,
+                inference_plan: None,
+            }
         }
     }
 }
 
-fn emit_for_insert(
-    ins: &IrInsert,
-    iter_alias: &str,
-    rows: &[String],
-    user_ctes: &[IrCteDef],
-) -> SqlOutput {
-    let rewrite_cols: std::collections::HashSet<&str> =
-        ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+fn emit_for_insert(ins: &IrInsert, iter_alias: &str, rows: &[String], user_ctes: &[IrCteDef]) -> SqlOutput {
+    let rewrite_cols: std::collections::HashSet<&str> = ins.rewrites.iter().map(|r| r.column.as_str()).collect();
 
-    let cols: Vec<String> = ins.assignments.iter()
+    let cols: Vec<String> = ins
+        .assignments
+        .iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(c, _)| qi(c))
         .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
         .collect();
-    let sel_exprs: Vec<String> = ins.assignments.iter()
+    let sel_exprs: Vec<String> = ins
+        .assignments
+        .iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(_, e)| emit_expr(e))
         .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
@@ -1523,7 +1791,11 @@ fn emit_for_insert(
     if let Some(r) = returning_sql {
         sql.push_str(&r);
     }
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 // ── INSERT ──────────────────────────────────────────────────────────────────
@@ -1556,7 +1828,9 @@ fn enqueue_cte_sql(eq: &VectorEnqueueInfo, source_cte: &str, cte_name: &str) -> 
 
 /// Build the full list of enqueue CTE strings for a set of vector indexes.
 fn enqueue_ctes(enqueue: &[VectorEnqueueInfo], source_cte: &str) -> Vec<String> {
-    enqueue.iter().enumerate()
+    enqueue
+        .iter()
+        .enumerate()
         .map(|(i, eq)| enqueue_cte_sql(eq, source_cte, &format!("_eq{}", i)))
         .collect()
 }
@@ -1602,7 +1876,9 @@ fn enqueue_search_cte_sql(eq: &SearchEnqueueInfo, source_cte: &str, cte_name: &s
 
 /// Build the full list of OpenSearch/Meilisearch enqueue CTE strings.
 fn enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], source_cte: &str, offset: usize) -> Vec<String> {
-    enqueue.iter().enumerate()
+    enqueue
+        .iter()
+        .enumerate()
         .map(|(i, eq)| enqueue_search_cte_sql(eq, source_cte, &format!("_es{}", offset + i)))
         .collect()
 }
@@ -1616,7 +1892,12 @@ fn shape_select_from_cte(
 ) -> (ShapeDescriptor, Option<String>) {
     if returning.is_empty() {
         return (
-            ShapeDescriptor { root: ShapeNode::Scalar { name: String::new(), position: 0 } },
+            ShapeDescriptor {
+                root: ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 0,
+                },
+            },
             None,
         );
     }
@@ -1647,38 +1928,64 @@ fn shape_select_from_cte(
 /// Shared by the plain wrap path and the multi-link junction wrap path
 /// below, both of which need this same VALUES/SELECT choice.
 fn emit_insert_row_sql(ins: &IrInsert) -> String {
-    let rewrite_cols: std::collections::HashSet<&str> =
-        ins.rewrites.iter().map(|r| r.column.as_str()).collect();
-    let cols: Vec<String> = ins.assignments.iter()
+    let rewrite_cols: std::collections::HashSet<&str> = ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+    let cols: Vec<String> = ins
+        .assignments
+        .iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(c, _)| qi(c))
         .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
         .collect();
-    let vals: Vec<String> = ins.assignments.iter()
+    let vals: Vec<String> = ins
+        .assignments
+        .iter()
         .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
         .map(|(_, e)| emit_expr(e))
         .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
         .collect();
     if ins.nested_ctes.is_empty() {
-        format!("INSERT INTO {} ({}) VALUES ({})", source_ref(&ins.target), cols.join(", "), vals.join(", "))
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            source_ref(&ins.target),
+            cols.join(", "),
+            vals.join(", ")
+        )
     } else {
-        let from_ctes = ins.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+        let from_ctes = ins
+            .nested_ctes
+            .iter()
+            .map(|c| qi(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "INSERT INTO {} ({}) SELECT {} FROM {}",
-            source_ref(&ins.target), cols.join(", "), vals.join(", "), from_ctes,
+            source_ref(&ins.target),
+            cols.join(", "),
+            vals.join(", "),
+            from_ctes,
         )
     }
 }
 
 fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
-    if ins.enqueue_vector.is_empty() && ins.enqueue_search.is_empty()
-        && !insert_has_any_multilink(ins) && ins.nested_ctes.is_empty()
+    if ins.enqueue_vector.is_empty()
+        && ins.enqueue_search.is_empty()
+        && !insert_has_any_multilink(ins)
+        && ins.nested_ctes.is_empty()
     {
         let mut sql = emit_insert_row_sql(ins);
-        if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut sql, conflict); }
+        if let Some(conflict) = &ins.unless_conflict {
+            emit_conflict(&mut sql, conflict);
+        }
         let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
-        if let Some(r) = returning_sql { sql.push_str(&r); }
-        return SqlOutput { sql, shape, inference_plan: None };
+        if let Some(r) = returning_sql {
+            sql.push_str(&r);
+        }
+        return SqlOutput {
+            sql,
+            shape,
+            inference_plan: None,
+        };
     }
 
     // Wrap path: needed for outbox enqueue CTEs, junction-table population
@@ -1691,7 +1998,9 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
     } else {
         let mut cte_parts = emit_user_cte_parts(&ins.nested_ctes);
         let mut insert_sql = emit_insert_row_sql(ins);
-        if let Some(conflict) = &ins.unless_conflict { emit_conflict(&mut insert_sql, conflict); }
+        if let Some(conflict) = &ins.unless_conflict {
+            emit_conflict(&mut insert_sql, conflict);
+        }
         insert_sql.push_str("\nRETURNING \"id\"");
         cte_parts.push(format!("\"_w\" AS (\n{}\n)", insert_sql));
         cte_parts
@@ -1705,7 +2014,11 @@ fn emit_insert_stmt(ins: &IrInsert) -> SqlOutput {
         cte_parts.join(",\n"),
         select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
     );
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────
@@ -1725,7 +2038,14 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     let from_ctes = if upd.nested_ctes.is_empty() {
         String::new()
     } else {
-        format!("\nFROM {}", upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", "))
+        format!(
+            "\nFROM {}",
+            upd.nested_ctes
+                .iter()
+                .map(|c| qi(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
 
     for (i, imp) in upd.poly_implementors.iter().enumerate() {
@@ -1751,14 +2071,14 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         ));
     }
 
-    let sql = format!(
-        "WITH\n{}\n{}",
-        cte_parts.join(",\n"),
-        union_parts.join("\nUNION ALL\n"),
-    );
+    let sql = format!("WITH\n{}\n{}", cte_parts.join(",\n"), union_parts.join("\nUNION ALL\n"),);
 
     let (shape, _) = emit_returning_shape(&upd.target, &upd.returning, true);
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
@@ -1783,20 +2103,37 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target), qi(alias), sets.join(", "),
+            source_ref(&upd.target),
+            qi(alias),
+            sets.join(", "),
         );
         if !upd.nested_ctes.is_empty() {
-            let from_ctes = upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+            let from_ctes = upd
+                .nested_ctes
+                .iter()
+                .map(|c| qi(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
             sql.push_str(&format!("\nFROM {}", from_ctes));
         }
         append_filter(&mut sql, &upd.filter);
-        if let Some(r) = returning_sql { sql.push_str(&r); }
-        let combined_ctes: Vec<IrCteDef> =
-            upd.nested_ctes.iter().cloned().chain(user_ctes.iter().cloned()).collect();
+        if let Some(r) = returning_sql {
+            sql.push_str(&r);
+        }
+        let combined_ctes: Vec<IrCteDef> = upd
+            .nested_ctes
+            .iter()
+            .cloned()
+            .chain(user_ctes.iter().cloned())
+            .collect();
         if !combined_ctes.is_empty() {
             sql = format!("{}{}", emit_cte_prefix(&combined_ctes), sql);
         }
-        return SqlOutput { sql, shape, inference_plan: None };
+        return SqlOutput {
+            sql,
+            shape,
+            inference_plan: None,
+        };
     }
 
     if !has_any_multilink && (!upd.enqueue_vector.is_empty() || !upd.enqueue_search.is_empty()) {
@@ -1804,10 +2141,17 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "    UPDATE {} AS {}\n    SET {}",
-            source_ref(&upd.target), qi(alias), sets.join(", "),
+            source_ref(&upd.target),
+            qi(alias),
+            sets.join(", "),
         );
         if !upd.nested_ctes.is_empty() {
-            let from_ctes = upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+            let from_ctes = upd
+                .nested_ctes
+                .iter()
+                .map(|c| qi(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
             upd_sql.push_str(&format!("\n    FROM {}", from_ctes));
         }
         append_filter(&mut upd_sql, &upd.filter);
@@ -1825,7 +2169,11 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             cte_parts.join(",\n"),
             select_sql.unwrap_or_else(|| "SELECT * FROM \"_w\"".to_string()),
         );
-        return SqlOutput { sql, shape: shape2, inference_plan: None };
+        return SqlOutput {
+            sql,
+            shape: shape2,
+            inference_plan: None,
+        };
     }
 
     // CTE-based UPDATE for junction table mutations.
@@ -1851,10 +2199,17 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target), qi(alias), sets.join(", "),
+            source_ref(&upd.target),
+            qi(alias),
+            sets.join(", "),
         );
         if !upd.nested_ctes.is_empty() {
-            let from_ctes = upd.nested_ctes.iter().map(|c| qi(&c.name)).collect::<Vec<_>>().join(", ");
+            let from_ctes = upd
+                .nested_ctes
+                .iter()
+                .map(|c| qi(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
             upd_sql.push_str(&format!("\nFROM {}", from_ctes));
         }
         append_filter(&mut upd_sql, &upd.filter);
@@ -1863,7 +2218,9 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     } else {
         let mut sel = format!(
             "SELECT {}.* FROM {} AS {}",
-            qi(alias), source_ref(&upd.target), qi(alias),
+            qi(alias),
+            source_ref(&upd.target),
+            qi(alias),
         );
         append_filter(&mut sel, &upd.filter);
         cte_parts.push(format!("\"_ids\" AS (\n{}\n)", sel));
@@ -1874,7 +2231,9 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let exclude = ml_clear_exclusion(upd.multi_link_replaces.get(i));
         let del = format!(
             "DELETE FROM {} WHERE {} IN (SELECT id FROM \"_ids\"){}",
-            qn(&clr.module, &clr.junction_table), qi(&clr.source_col), exclude,
+            qn(&clr.module, &clr.junction_table),
+            qi(&clr.source_col),
+            exclude,
         );
         cte_parts.push(format!("\"_clr_{}\" AS (\n{}\n)", i, del));
     }
@@ -1896,7 +2255,11 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Enqueue CTEs (source is _ids which has all columns including id).
     cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_ids"));
-    cte_parts.extend(enqueue_search_ctes(&upd.enqueue_search, "_ids", upd.enqueue_vector.len()));
+    cte_parts.extend(enqueue_search_ctes(
+        &upd.enqueue_search,
+        "_ids",
+        upd.enqueue_vector.len(),
+    ));
 
     let sql = format!(
         "WITH\n{}\nSELECT (\n    {}\n) AS result\nFROM \"_ids\" AS {}",
@@ -1904,7 +2267,11 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         result_expr,
         qi(alias),
     );
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
@@ -1916,23 +2283,21 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
     let alias = &del.target.alias;
 
     if del.enqueue_search.is_empty() {
-        let mut sql = format!(
-            "DELETE FROM {} AS {}",
-            source_ref(&del.target),
-            qi(alias),
-        );
+        let mut sql = format!("DELETE FROM {} AS {}", source_ref(&del.target), qi(alias),);
         append_filter(&mut sql, &del.filter);
         let (shape, returning_sql) = emit_returning_shape(&del.target, &del.returning, true);
-        if let Some(r) = returning_sql { sql.push_str(&r); }
-        return SqlOutput { sql, shape, inference_plan: None };
+        if let Some(r) = returning_sql {
+            sql.push_str(&r);
+        }
+        return SqlOutput {
+            sql,
+            shape,
+            inference_plan: None,
+        };
     }
 
     // Wrap DELETE in a CTE to enqueue OpenSearch delete jobs.
-    let mut del_sql = format!(
-        "    DELETE FROM {} AS {}",
-        source_ref(&del.target),
-        qi(alias),
-    );
+    let mut del_sql = format!("    DELETE FROM {} AS {}", source_ref(&del.target), qi(alias),);
     append_filter(&mut del_sql, &del.filter);
     del_sql.push_str("\n    RETURNING \"id\"");
 
@@ -1945,7 +2310,11 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
         cte_parts.join(",\n"),
         select_sql.unwrap_or_else(|| "SELECT * FROM \"_del\"".to_string()),
     );
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
@@ -1955,11 +2324,7 @@ fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
 
     for (i, imp) in del.poly_implementors.iter().enumerate() {
         let cte_name = format!("_d{}", i);
-        let mut del_sql = format!(
-            "DELETE FROM {} AS {}",
-            qn(&imp.module, &imp.table),
-            qi(alias),
-        );
+        let mut del_sql = format!("DELETE FROM {} AS {}", qn(&imp.module, &imp.table), qi(alias),);
         append_filter(&mut del_sql, &del.filter);
         del_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, del_sql));
@@ -1974,14 +2339,14 @@ fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
         ));
     }
 
-    let sql = format!(
-        "WITH\n{}\n{}",
-        cte_parts.join(",\n"),
-        union_parts.join("\nUNION ALL\n"),
-    );
+    let sql = format!("WITH\n{}\n{}", cte_parts.join(",\n"), union_parts.join("\nUNION ALL\n"),);
 
     let (shape, _) = emit_returning_shape(&del.target, &del.returning, true);
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 // ── RETURNING helper ─────────────────────────────────────────────────────────
@@ -1996,7 +2361,10 @@ fn emit_returning_shape(
     if returning.is_empty() {
         return (
             ShapeDescriptor {
-                root: ShapeNode::Scalar { name: String::new(), position: 0 },
+                root: ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 0,
+                },
             },
             None,
         );
@@ -2027,9 +2395,11 @@ fn emit_returning_shape(
 
 fn emit_scalar_set(f: &IrScalarSetPointer, pos: usize) -> (String, ShapeNode) {
     let from_sql = if !f.poly_implementors.is_empty() {
-        format!("(\n{}\n) AS {}",
+        format!(
+            "(\n{}\n) AS {}",
             emit_poly_union(&f.poly_implementors, &f.poly_columns),
-            qi(&f.source.alias))
+            qi(&f.source.alias)
+        )
     } else {
         format!("{} AS {}", source_ref(&f.source), qi(&f.source.alias))
     };
@@ -2041,17 +2411,17 @@ fn emit_scalar_set(f: &IrScalarSetPointer, pos: usize) -> (String, ShapeNode) {
     let node = ShapeNode::Array {
         name: f.alias.clone(),
         position: pos,
-        element: Box::new(ShapeNode::Scalar { name: String::new(), position: 0 }),
+        element: Box::new(ShapeNode::Scalar {
+            name: String::new(),
+            position: 0,
+        }),
     };
     (sql, node)
 }
 
 /// Build SQL expressions and ShapeNodes for `pointers`, starting at position 1
 /// (position 0 is always the type discriminator, added by the caller).
-fn build_shape(
-    pointers: &[IrShapePointer],
-    table_alias: &str,
-) -> (Vec<String>, Vec<ShapeNode>) {
+fn build_shape(pointers: &[IrShapePointer], table_alias: &str) -> (Vec<String>, Vec<ShapeNode>) {
     let mut exprs = Vec::new();
     let mut nodes = Vec::new();
 
@@ -2108,13 +2478,16 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
         } else {
             format!("{}.{}::jsonb", qi(table_alias), qi(&f.column))
         };
-        return (sql, ShapeNode::NamedTuple {
-            name: f.alias.clone(),
-            position: pos,
-            type_name: Some(nt_name.to_string()),
-            members: f.tuple_shape.as_ref().map(|s| s.members.clone()),
-            is_free_object: false,
-        });
+        return (
+            sql,
+            ShapeNode::NamedTuple {
+                name: f.alias.clone(),
+                position: pos,
+                type_name: Some(nt_name.to_string()),
+                members: f.tuple_shape.as_ref().map(|s| s.members.clone()),
+                is_free_object: false,
+            },
+        );
     }
     // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to asyncpg's
     // anonymous_record_decode. Cast to text — the string label is all the decoder needs.
@@ -2125,7 +2498,14 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
         } else {
             format!("{}.{}::text", qi(table_alias), qi(&f.column))
         };
-        return (sql, ShapeNode::Enum { name: f.alias.clone(), position: pos, enum_type });
+        return (
+            sql,
+            ShapeNode::Enum {
+                name: f.alias.clone(),
+                position: pos,
+                enum_type,
+            },
+        );
     }
     // A structural pylon.Tuple[...]-typed property — same jsonb column shape
     // as the nominal `__nt__:` case above, just with no registered dataclass
@@ -2136,27 +2516,32 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
         } else {
             format!("{}.{}::jsonb", qi(table_alias), qi(&f.column))
         };
-        return (sql, ShapeNode::NamedTuple {
-            name: f.alias.clone(),
-            position: pos,
-            type_name: shape.type_name.clone(),
-            members: Some(shape.members.clone()),
-            is_free_object: false,
-        });
+        return (
+            sql,
+            ShapeNode::NamedTuple {
+                name: f.alias.clone(),
+                position: pos,
+                type_name: shape.type_name.clone(),
+                members: Some(shape.members.clone()),
+                is_free_object: false,
+            },
+        );
     }
     let sql = if table_alias.is_empty() {
         format!("{}::{}", qi(&f.column), f.pg_type)
     } else {
         format!("{}.{}::{}", qi(table_alias), qi(&f.column), f.pg_type)
     };
-    (sql, ShapeNode::Scalar { name: f.alias.clone(), position: pos })
+    (
+        sql,
+        ShapeNode::Scalar {
+            name: f.alias.clone(),
+            position: pos,
+        },
+    )
 }
 
-fn emit_single_link(
-    f: &IrSingleLinkPointer,
-    parent_alias: &str,
-    pos: usize,
-) -> (String, ShapeNode) {
+fn emit_single_link(f: &IrSingleLinkPointer, parent_alias: &str, pos: usize) -> (String, ShapeNode) {
     let sub = &f.subquery;
     let [IrRowSource::Bound { source, shape }] = sub.rows.as_slice() else {
         unreachable!("single-link subquery is always schema-bound")
@@ -2174,7 +2559,10 @@ fn emit_single_link(
     for lp in &f.link_properties {
         parts.push(format!("\"jt\".{}", qi(&lp.name)));
         let pos = sub_nodes.len() + 1;
-        sub_nodes.push(ShapeNode::Scalar { name: format!("@{}", lp.name), position: pos });
+        sub_nodes.push(ShapeNode::Scalar {
+            name: format!("@{}", lp.name),
+            position: pos,
+        });
     }
 
     let tuple = parts.join(",\n        ");
@@ -2184,43 +2572,49 @@ fn emit_single_link(
             let from = format!("FROM {} AS {}", source_ref(source), qi(sub_alias));
             let cond = format!(
                 "{}.{} = {}.{}",
-                qi(parent_alias), qi(fk_column), qi(sub_alias), qi(target_pk),
+                qi(parent_alias),
+                qi(fk_column),
+                qi(sub_alias),
+                qi(target_pk),
             );
             (from, vec![cond])
         }
         // Junction-backed — same join shape a multi-link's correlated
         // subquery uses; cardinality-one is a schema-level invariant on the
         // junction table, not something this query needs to enforce itself.
-        IrSingleLinkCorrelation::Junction { join, target_pk: _ } => {
-            match join {
-                IrMultiLinkJoin::Standard { junction_table, module } => {
-                    let from = format!(
-                        "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".target",
-                        qn(module, junction_table),
-                        source_ref(source),
-                        qi(sub_alias),
-                        qi(sub_alias),
-                    );
-                    let cond = format!("\"jt\".source = {}.id", qi(parent_alias));
-                    (from, vec![cond])
-                }
-                IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
-                    let from = format!(
-                        "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
-                        qn(module, junction_table),
-                        source_ref(source),
-                        qi(sub_alias),
-                        qi(sub_alias),
-                        qi(target_col),
-                    );
-                    let cond = format!("\"jt\".{} = {}.id", qi(source_col), qi(parent_alias));
-                    (from, vec![cond])
-                }
-                IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } => {
-                    unreachable!("a junction-backed single link's own forward join is always Standard or Through")
-                }
+        IrSingleLinkCorrelation::Junction { join, target_pk: _ } => match join {
+            IrMultiLinkJoin::Standard { junction_table, module } => {
+                let from = format!(
+                    "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".target",
+                    qn(module, junction_table),
+                    source_ref(source),
+                    qi(sub_alias),
+                    qi(sub_alias),
+                );
+                let cond = format!("\"jt\".source = {}.id", qi(parent_alias));
+                (from, vec![cond])
             }
-        }
+            IrMultiLinkJoin::Through {
+                junction_table,
+                module,
+                source_col,
+                target_col,
+            } => {
+                let from = format!(
+                    "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
+                    qn(module, junction_table),
+                    source_ref(source),
+                    qi(sub_alias),
+                    qi(sub_alias),
+                    qi(target_col),
+                );
+                let cond = format!("\"jt\".{} = {}.id", qi(source_col), qi(parent_alias));
+                (from, vec![cond])
+            }
+            IrMultiLinkJoin::BacklinkFk { .. } | IrMultiLinkJoin::BacklinkJunction { .. } => {
+                unreachable!("a junction-backed single link's own forward join is always Standard or Through")
+            }
+        },
     };
     if let Some(filter) = &sub.filter {
         where_parts.push(emit_expr(filter));
@@ -2248,11 +2642,7 @@ fn emit_single_link(
     (sql, node)
 }
 
-fn emit_multi_link(
-    f: &IrMultiLinkPointer,
-    parent_alias: &str,
-    pos: usize,
-) -> (String, ShapeNode) {
+fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (String, ShapeNode) {
     let sub = &f.subquery;
     let [IrRowSource::Bound { source, shape }] = sub.rows.as_slice() else {
         unreachable!("multi-link subquery is always schema-bound")
@@ -2271,7 +2661,10 @@ fn emit_multi_link(
         // Positions are 1-based (0 = type discriminator). sub_nodes.len() gives
         // the count of already-assigned positions, so the next position is len+1.
         let pos = sub_nodes.len() + 1;
-        sub_nodes.push(ShapeNode::Scalar { name: format!("@{}", lp.name), position: pos });
+        sub_nodes.push(ShapeNode::Scalar {
+            name: format!("@{}", lp.name),
+            position: pos,
+        });
     }
 
     let row = row_parts.join(",\n            ");
@@ -2296,7 +2689,12 @@ fn emit_multi_link(
             let cond = format!("\"jt\".source = {}.id", qi(parent_alias));
             (from, cond)
         }
-        IrMultiLinkJoin::Through { junction_table, module, source_col, target_col } => {
+        IrMultiLinkJoin::Through {
+            junction_table,
+            module,
+            source_col,
+            target_col,
+        } => {
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
                 qn(module, junction_table),
@@ -2319,7 +2717,12 @@ fn emit_multi_link(
         // `Through`, with the owner/current column roles swapped — the
         // sub-select's own rows join via `owner_col`, the outer (current)
         // row correlates via `current_col`.
-        IrMultiLinkJoin::BacklinkJunction { junction_table, module, owner_col, current_col } => {
+        IrMultiLinkJoin::BacklinkJunction {
+            junction_table,
+            module,
+            owner_col,
+            current_col,
+        } => {
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
                 qn(module, junction_table),
@@ -2363,7 +2766,10 @@ fn emit_multi_link(
 /// Prepend `ShapeNode::Scalar { name: "__type__", position: 0 }` and shift
 /// existing nodes' positions by 1.
 fn prepend_type(nodes: Vec<ShapeNode>) -> Vec<ShapeNode> {
-    let mut out = vec![ShapeNode::Scalar { name: "__type__".into(), position: 0 }];
+    let mut out = vec![ShapeNode::Scalar {
+        name: "__type__".into(),
+        position: 0,
+    }];
     out.extend(nodes);
     out
 }
@@ -2551,7 +2957,11 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             }
         }
         IrExpr::Null => "NULL".to_string(),
-        IrExpr::AggOverSet { fn_name, schema: _, elems } => {
+        IrExpr::AggOverSet {
+            fn_name,
+            schema: _,
+            elems,
+        } => {
             let union_all = elems
                 .iter()
                 .map(|e| format!("SELECT {}", emit_expr(e)))
@@ -2591,7 +3001,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
 
         IrExpr::NamedTuple { fields, .. } => {
-            let pairs: Vec<String> = fields.iter()
+            let pairs: Vec<String> = fields
+                .iter()
                 .flat_map(|(k, v)| [format!("'{}'", k.replace('\'', "''")), emit_expr(v)])
                 .collect();
             format!("jsonb_build_object({})", pairs.join(", "))
@@ -2612,13 +3023,19 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             }
         }
 
-        IrExpr::Slice { expr, lower, upper, is_array } => {
+        IrExpr::Slice {
+            expr,
+            lower,
+            upper,
+            is_array,
+        } => {
             let e = emit_expr(expr);
             if *is_array {
-                let lo = lower.as_deref().map(|x| format!("({}) + 1", emit_expr(x)))
+                let lo = lower
+                    .as_deref()
+                    .map(|x| format!("({}) + 1", emit_expr(x)))
                     .unwrap_or_else(|| "1".to_string());
-                let hi = upper.as_deref().map(|x| emit_expr(x))
-                    .unwrap_or_default();
+                let hi = upper.as_deref().map(emit_expr).unwrap_or_default();
                 if hi.is_empty() {
                     format!("({})[{}:]", e, lo)
                 } else {
@@ -2626,13 +3043,21 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 }
             } else {
                 // substr(expr, start, length) for text/bytea.
-                let start = lower.as_deref().map(|x| format!("({}) + 1", emit_expr(x)))
+                let start = lower
+                    .as_deref()
+                    .map(|x| format!("({}) + 1", emit_expr(x)))
                     .unwrap_or_else(|| "1".to_string());
                 match upper.as_deref() {
                     Some(hi_expr) => {
                         let lo_val = lower.as_deref().map(emit_expr).unwrap_or_else(|| "0".to_string());
                         // GREATEST(0, ...) so reversed bounds yield '' instead of a PG error.
-                        format!("substr({}, {}, GREATEST(0, ({}) - ({})))", e, start, emit_expr(hi_expr), lo_val)
+                        format!(
+                            "substr({}, {}, GREATEST(0, ({}) - ({})))",
+                            e,
+                            start,
+                            emit_expr(hi_expr),
+                            lo_val
+                        )
                     }
                     None => format!("substr({}, {})", e, start),
                 }
@@ -2669,21 +3094,41 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             let mut sql = if shape.is_empty() {
                 // EXISTS inner: SELECT 1 FROM …
                 format!("(SELECT 1\nFROM {} AS {}", source_ref(source), qi(alias))
-            } else if let Some(c) = shape.iter().find_map(|f| if let IrShapePointer::Computed(c) = f { Some(c) } else { None }) {
+            } else if let Some(c) = shape.iter().find_map(|f| {
+                if let IrShapePointer::Computed(c) = f {
+                    Some(c)
+                } else {
+                    None
+                }
+            }) {
                 // Computed subquery (e.g. a type-intersection splat's
                 // computed pointer): select the compiled expression itself,
                 // not a bare column — the expression already references
                 // `alias`'s own columns via ColumnRef.
-                format!("(SELECT {}\nFROM {} AS {}", emit_expr(&c.expr), source_ref(source), qi(alias))
+                format!(
+                    "(SELECT {}\nFROM {} AS {}",
+                    emit_expr(&c.expr),
+                    source_ref(source),
+                    qi(alias)
+                )
             } else {
                 // Scalar subquery: SELECT alias.col FROM …
                 let pk_col = shape
                     .iter()
-                    .find_map(|f| if let IrShapePointer::Scalar(s) = f { Some(s.column.as_str()) } else { None })
+                    .find_map(|f| {
+                        if let IrShapePointer::Scalar(s) = f {
+                            Some(s.column.as_str())
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or("id");
                 format!(
                     "(SELECT {}.{}\nFROM {} AS {}",
-                    qi(alias), qi(pk_col), source_ref(source), qi(alias),
+                    qi(alias),
+                    qi(pk_col),
+                    source_ref(source),
+                    qi(alias),
                 )
             };
             append_filter(&mut sql, &sel.filter);
@@ -2717,7 +3162,10 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
         let type_expr = type_disc(&vs.source.type_name);
         let id_expr = format!("{}.\"id\"", qi(alias));
         let tuple = format!("{},\n    {}", type_expr, id_expr);
-        let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
+        let id_node = ShapeNode::Scalar {
+            name: "id".to_string(),
+            position: 1,
+        };
         (tuple, vec![id_node])
     } else {
         let (pointer_exprs, shape_pointers) = build_shape(&vs.object_shape, alias);
@@ -2741,7 +3189,10 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
 
     // ORDER BY distance if requested.
     if let Some(dir) = &vs.order_by_distance {
-        let dir_sql = match dir { IrSortDir::Asc => "ASC", IrSortDir::Desc => "DESC" };
+        let dir_sql = match dir {
+            IrSortDir::Asc => "ASC",
+            IrSortDir::Desc => "DESC",
+        };
         sql.push_str(&format!("\nORDER BY {} {}", dist_sql, dir_sql));
     }
     append_offset_limit(&mut sql, &vs.offset, &vs.limit);
@@ -2760,16 +3211,18 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    let inference_plan = vs.inference_model.as_ref().map(|model_name| {
-        InferencePlan::Embedding {
-            model_name: model_name.clone(),
-            type_name: vs.inference_type_name.clone().unwrap_or_default(),
-            index_name: vs.inference_index_name.clone().unwrap_or(None),
-            query_param_name: vs.inference_query_param_name.clone().unwrap_or_default(),
-            query_literal: vs.inference_query_literal.clone(),
-        }
+    let inference_plan = vs.inference_model.as_ref().map(|model_name| InferencePlan::Embedding {
+        model_name: model_name.clone(),
+        type_name: vs.inference_type_name.clone().unwrap_or_default(),
+        index_name: vs.inference_index_name.clone().unwrap_or(None),
+        query_param_name: vs.inference_query_param_name.clone().unwrap_or_default(),
+        query_literal: vs.inference_query_literal.clone(),
     });
-    SqlOutput { sql, shape, inference_plan }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan,
+    }
 }
 
 // ── FTS search ───────────────────────────────────────────────────────────────
@@ -2790,7 +3243,10 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
         let type_expr = type_disc(&fs.source.type_name);
         let id_expr = format!("{}.\"id\"", qi(alias));
         let tuple = format!("{},\n    {}", type_expr, id_expr);
-        let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
+        let id_node = ShapeNode::Scalar {
+            name: "id".to_string(),
+            position: 1,
+        };
         (tuple, vec![id_node])
     } else {
         let (pointer_exprs, shape_pointers) = build_shape(&fs.object_shape, alias);
@@ -2815,7 +3271,10 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
         sql.push_str(&format!(" AND ({})", emit_expr(f)));
     }
     if let Some(dir) = &fs.order_by_rank {
-        let dir_sql = match dir { IrSortDir::Asc => "ASC", IrSortDir::Desc => "DESC" };
+        let dir_sql = match dir {
+            IrSortDir::Asc => "ASC",
+            IrSortDir::Desc => "DESC",
+        };
         sql.push_str(&format!("\nORDER BY {} {}", rank_sql, dir_sql));
     }
     append_offset_limit(&mut sql, &fs.offset, &fs.limit);
@@ -2834,13 +3293,21 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
             object_node: Box::new(object_node),
         },
     };
-    SqlOutput { sql, shape, inference_plan: None }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
     let alias = &fs.source.alias;
-    let ids_idx = fs.deferred_ids_param.expect("deferred_ids_param must be set for deferred backend");
-    let scores_idx = fs.deferred_scores_param.expect("deferred_scores_param must be set for deferred backend");
+    let ids_idx = fs
+        .deferred_ids_param
+        .expect("deferred_ids_param must be set for deferred backend");
+    let scores_idx = fs
+        .deferred_scores_param
+        .expect("deferred_scores_param must be set for deferred backend");
     let ids_param = format!("${}", ids_idx + 1);
     let scores_param = format!("${}", scores_idx + 1);
 
@@ -2848,7 +3315,10 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         let type_expr = type_disc(&fs.source.type_name);
         let id_expr = format!("{}.\"id\"", qi(alias));
         let tuple = format!("{},\n    {}", type_expr, id_expr);
-        let id_node = ShapeNode::Scalar { name: "id".to_string(), position: 1 };
+        let id_node = ShapeNode::Scalar {
+            name: "id".to_string(),
+            position: 1,
+        };
         (tuple, vec![id_node])
     } else {
         let (pointer_exprs, shape_pointers) = build_shape(&fs.object_shape, alias);
@@ -2879,12 +3349,19 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         sql.push_str(&format!("\nWHERE ({})", emit_expr(f)));
     }
     if let Some(dir) = &fs.order_by_rank {
-        let dir_sql = match dir { IrSortDir::Asc => "ASC", IrSortDir::Desc => "DESC" };
+        let dir_sql = match dir {
+            IrSortDir::Asc => "ASC",
+            IrSortDir::Desc => "DESC",
+        };
         sql.push_str(&format!("\nORDER BY \"_os\".\"score\" {}", dir_sql));
     }
     // limit/offset are passed to OpenSearch as size/from, not emitted in Postgres SQL.
     let size = fs.limit.as_ref().and_then(|lim| {
-        if let IrExpr::Literal(IrLiteral::Int(n)) = lim { Some(*n as usize) } else { None }
+        if let IrExpr::Literal(IrLiteral::Int(n)) = lim {
+            Some(*n as usize)
+        } else {
+            None
+        }
     });
 
     let object_node = ShapeNode::Object {
@@ -2912,7 +3389,11 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         query_literal: fs.deferred_query_literal.clone(),
         size,
     });
-    SqlOutput { sql, shape, inference_plan }
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan,
+    }
 }
 
 // ── Function select ──────────────────────────────────────────────────────────
@@ -2942,10 +3423,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
         format!("{} AS {}", fn_call, qi(alias))
     };
 
-    let mut sql = format!(
-        "SELECT {}(\n    {}\n) AS result\nFROM {}",
-        distinct, tuple, from_clause,
-    );
+    let mut sql = format!("SELECT {}(\n    {}\n) AS result\nFROM {}", distinct, tuple, from_clause,);
     append_filter(&mut sql, &sel.filter);
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
@@ -2974,7 +3452,9 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
 pub fn emit_fn_body(ir: &crate::ir::IrOutput) -> String {
     let body = match &ir.stmt {
         IrStmt::Select(sel) if matches!(sel.rows.as_slice(), [IrRowSource::Free(IrFreeExpr::Scalar(_))]) => {
-            let IrRowSource::Free(IrFreeExpr::Scalar(e)) = &sel.rows[0] else { unreachable!() };
+            let IrRowSource::Free(IrFreeExpr::Scalar(e)) = &sel.rows[0] else {
+                unreachable!()
+            };
             format!("SELECT {}", emit_expr(e))
         }
         other => emit_dml_as_cte_source(other),
@@ -3001,10 +3481,20 @@ fn emit_literal(lit: &IrLiteral) -> String {
             // _pg_decode_numeric in pylon/client.py, still needed for
             // genuine decimal casts).
             let s = f.to_string();
-            let s = if s.contains('.') || s.contains('e') { s } else { format!("{}.0", s) };
+            let s = if s.contains('.') || s.contains('e') {
+                s
+            } else {
+                format!("{}.0", s)
+            };
             format!("({}::float8)", s)
         }
-        IrLiteral::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+        IrLiteral::Bool(b) => {
+            if *b {
+                "TRUE".into()
+            } else {
+                "FALSE".into()
+            }
+        }
     }
 }
 
@@ -3016,9 +3506,8 @@ mod tests {
     use crate::ir;
     use crate::parse;
     use crate::schema::{
-        FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor, LinkDescriptor,
-        MultiLinkDescriptor, NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor,
-        TypeDescriptor,
+        FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor, LinkDescriptor, MultiLinkDescriptor,
+        NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
 
     fn make_schema() -> SchemaDescriptor {
@@ -3039,40 +3528,46 @@ mod tests {
                             pg_type: "uuid".into(),
                             nullable: false,
                             default_sql: Some("uuidv7()".into()),
-                        default_pyql: None,
+                            default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: true,
                             is_pk: true,
                             is_readonly: true,
                             rewrites: vec![],
-                        tuple_members: None, column_type: None, },
+                            tuple_members: None,
+                            column_type: None,
+                        },
                         PropertyDescriptor {
                             name: "name".into(),
                             pg_type: "text".into(),
                             nullable: false,
                             default_sql: None,
-                        default_pyql: None,
+                            default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        tuple_members: None, column_type: None, },
+                            tuple_members: None,
+                            column_type: None,
+                        },
                         PropertyDescriptor {
                             name: "age".into(),
                             pg_type: "int8".into(),
                             nullable: true,
                             default_sql: None,
-                        default_pyql: None,
+                            default_pyql: None,
                             description: None,
                             check_constraints: vec![],
                             is_exclusive: false,
                             is_pk: false,
                             is_readonly: false,
                             rewrites: vec![],
-                        tuple_members: None, column_type: None, },
+                            tuple_members: None,
+                            column_type: None,
+                        },
                     ],
                     links: vec![LinkDescriptor {
                         name: "company".into(),
@@ -3125,7 +3620,9 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    tuple_members: None, column_type: None, }],
+                        tuple_members: None,
+                        column_type: None,
+                    }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -3158,7 +3655,9 @@ mod tests {
                         is_pk: false,
                         is_readonly: false,
                         rewrites: vec![],
-                    tuple_members: None, column_type: None, }],
+                        tuple_members: None,
+                        column_type: None,
+                    }],
                     links: vec![],
                     multilinks: vec![],
                     computed: vec![],
@@ -3175,7 +3674,9 @@ mod tests {
             enums: vec![],
             named_tuples: vec![],
             globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -3215,8 +3716,12 @@ mod tests {
         assert!(out.sql.contains("42"));
         assert!(out.sql.contains("AS result"));
         // Shape should describe an object with pointers foo and n
-        let crate::query::ShapeNode::Object { pointers, type_name, .. } = &out.shape.root
-            else { panic!("expected Object shape") };
+        let crate::query::ShapeNode::Object {
+            pointers, type_name, ..
+        } = &out.shape.root
+        else {
+            panic!("expected Object shape")
+        };
         assert!(type_name.is_none());
         assert_eq!(pointers.len(), 2);
         assert!(matches!(&pointers[0], crate::query::ShapeNode::Scalar { name, position: 0 } if name == "foo"));
@@ -3238,10 +3743,7 @@ mod tests {
             module: "default".into(),
             members: vec!["Male".into(), "Female".into()],
         });
-        let out = compile_and_emit_with(
-            "select { gender := default::Gender.Male }",
-            &schema,
-        );
+        let out = compile_and_emit_with("select { gender := default::Gender.Male }", &schema);
         // The enum value is computed once (`'Male'::"public"."Gender" AS
         // "_f0"`) and reused for both the `result` composite (cast to
         // `::text` there, since asyncpg can't decode an enum OID inside an
@@ -3250,20 +3752,27 @@ mod tests {
         // to that computed column, not inline on the enum literal itself.
         assert!(
             out.sql.contains("'Male'::\"public\".\"Gender\""),
-            "expected the enum literal, got:\n{}", out.sql
+            "expected the enum literal, got:\n{}",
+            out.sql
         );
         assert!(
             out.sql.contains("ROW(\"_f0\"::text) AS result"),
-            "expected the ROW composite to cast the enum field to text, got:\n{}", out.sql
+            "expected the ROW composite to cast the enum field to text, got:\n{}",
+            out.sql
         );
-        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root
-            else { panic!("expected Object shape") };
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape")
+        };
         assert_eq!(pointers.len(), 1);
-        assert!(matches!(
-            &pointers[0],
-            crate::query::ShapeNode::Enum { name, position: 0, enum_type }
-                if name == "gender" && enum_type == "public::Gender"
-        ), "expected Enum-tagged shape, got: {:?}", pointers[0]);
+        assert!(
+            matches!(
+                &pointers[0],
+                crate::query::ShapeNode::Enum { name, position: 0, enum_type }
+                    if name == "gender" && enum_type == "public::Gender"
+            ),
+            "expected Enum-tagged shape, got: {:?}",
+            pointers[0]
+        );
     }
 
     #[test]
@@ -3280,12 +3789,17 @@ mod tests {
         let out = compile_and_emit_with("select default::Gender.Male", &schema);
         assert!(
             out.sql.contains("ROW(v::text) AS result"),
-            "expected ROW(v::text), got:\n{}", out.sql
+            "expected ROW(v::text), got:\n{}",
+            out.sql
         );
-        assert!(matches!(
-            &out.shape.root,
-            crate::query::ShapeNode::Enum { enum_type, .. } if enum_type == "public::Gender"
-        ), "expected Enum-tagged shape, got: {:?}", out.shape.root);
+        assert!(
+            matches!(
+                &out.shape.root,
+                crate::query::ShapeNode::Enum { enum_type, .. } if enum_type == "public::Gender"
+            ),
+            "expected Enum-tagged shape, got: {:?}",
+            out.shape.root
+        );
     }
 
     // ── FOR UPDATE / FOR SHARE row-locking clause ──────────────────────────────
@@ -3299,7 +3813,11 @@ mod tests {
     #[test]
     fn test_for_update_skip_locked() {
         let out = compile_and_emit("SELECT Person FOR UPDATE SKIP LOCKED");
-        assert!(out.sql.trim_end().ends_with("FOR UPDATE SKIP LOCKED"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.trim_end().ends_with("FOR UPDATE SKIP LOCKED"),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3311,7 +3829,11 @@ mod tests {
     #[test]
     fn test_for_no_key_update_skip_locked() {
         let out = compile_and_emit("SELECT Person FOR NO KEY UPDATE SKIP LOCKED");
-        assert!(out.sql.trim_end().ends_with("FOR NO KEY UPDATE SKIP LOCKED"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.trim_end().ends_with("FOR NO KEY UPDATE SKIP LOCKED"),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3323,35 +3845,44 @@ mod tests {
     #[test]
     fn test_for_key_share_nowait() {
         let out = compile_and_emit("SELECT Person FOR KEY SHARE NOWAIT");
-        assert!(out.sql.trim_end().ends_with("FOR KEY SHARE NOWAIT"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.trim_end().ends_with("FOR KEY SHARE NOWAIT"),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_for_update_comes_after_order_by_limit_offset_in_emitted_sql() {
         // Postgres's own grammar places the locking clause last — confirm
         // the emitter matches, not just that all the pieces are present.
-        let out = compile_and_emit(
-            "SELECT Person { name } ORDER BY .name OFFSET 1 LIMIT 5 FOR UPDATE SKIP LOCKED",
-        );
+        let out = compile_and_emit("SELECT Person { name } ORDER BY .name OFFSET 1 LIMIT 5 FOR UPDATE SKIP LOCKED");
         let order_pos = out.sql.find("ORDER BY").unwrap();
         let offset_pos = out.sql.find("OFFSET").unwrap();
         let limit_pos = out.sql.find("LIMIT").unwrap();
         let for_pos = out.sql.find("FOR UPDATE").unwrap();
-        assert!(order_pos < offset_pos && offset_pos < limit_pos && limit_pos < for_pos, "got:\n{}", out.sql);
+        assert!(
+            order_pos < offset_pos && offset_pos < limit_pos && limit_pos < for_pos,
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_for_update_combined_with_distinct_is_rejected() {
         let ast = parse::parse("SELECT DISTINCT Person FOR UPDATE").expect("parse failed");
-        let err = ir::compile(&ast, &make_schema()).err().expect("expected a compile error");
+        let err = ir::compile(&ast, &make_schema())
+            .err()
+            .expect("expected a compile error");
         assert!(err.to_string().contains("DISTINCT"), "unexpected: {err}");
     }
 
     #[test]
     fn test_for_update_combined_with_select_over_insert_is_rejected() {
-        let ast = parse::parse("SELECT (INSERT Person { name := 'Alice' }) { name } FOR UPDATE")
-            .expect("parse failed");
-        let err = ir::compile(&ast, &make_schema()).err().expect("expected a compile error");
+        let ast = parse::parse("SELECT (INSERT Person { name := 'Alice' }) { name } FOR UPDATE").expect("parse failed");
+        let err = ir::compile(&ast, &make_schema())
+            .err()
+            .expect("expected a compile error");
         assert!(err.to_string().contains("INSERT"), "unexpected: {err}");
     }
 
@@ -3359,35 +3890,73 @@ mod tests {
     fn test_for_update_on_an_interface_type_is_rejected() {
         fn id_prop() -> PropertyDescriptor {
             PropertyDescriptor {
-                name: "id".into(), pg_type: "uuid".into(), nullable: false,
-                default_sql: Some("uuidv7()".into()), default_pyql: None, description: None,
-                check_constraints: vec![], is_exclusive: true, is_pk: true, is_readonly: true,
-                rewrites: vec![], tuple_members: None, column_type: None,
+                name: "id".into(),
+                pg_type: "uuid".into(),
+                nullable: false,
+                default_sql: Some("uuidv7()".into()),
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: true,
+                is_readonly: true,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
             }
         }
         let schema = SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
-                    name: "Account".into(), module: "default".into(), table: "Account".into(),
-                    abstract_: true, materialized: true, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Account".into(),
+                    module: "default".into(),
+                    table: "Account".into(),
+                    abstract_: true,
+                    materialized: true,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop()],
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "Individual".into(), module: "default".into(), table: "Individual".into(),
-                    abstract_: false, materialized: true, description: None,
-                    parents: vec![], interfaces: vec!["default::Account".into()],
+                    name: "Individual".into(),
+                    module: "default".into(),
+                    table: "Individual".into(),
+                    abstract_: false,
+                    materialized: true,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec!["default::Account".into()],
                     properties: vec![id_prop()],
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let ast = parse::parse("SELECT Account FOR UPDATE").expect("parse failed");
         let err = ir::compile(&ast, &schema).err().expect("expected a compile error");
@@ -3410,7 +3979,11 @@ mod tests {
         // no-op (already independent); confirm it still compiles cleanly
         // instead of erroring or double-unwrapping.
         let out = compile_and_emit("SELECT DETACHED Person { name }");
-        assert!(out.sql.contains("\"name\""), "expected name column in SQL:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"name\""),
+            "expected name column in SQL:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3447,7 +4020,8 @@ mod tests {
         let out = compile_and_emit("SELECT 1.0");
         assert!(
             out.sql.contains("(1.0::float8)"),
-            "expected explicit float8 cast, got:\n{}", out.sql
+            "expected explicit float8 cast, got:\n{}",
+            out.sql
         );
     }
 
@@ -3503,20 +4077,26 @@ mod tests {
         // the target's own links would never terminate for a cyclic link
         // graph), not just an implicit `{ id }`.
         let out = compile_and_emit("SELECT Person { ** }");
-        assert!(out.sql.contains("\"name\""), "expected Company.name pulled in via .company's ** expansion, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"name\""),
+            "expected Company.name pulled in via .company's ** expansion, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_deep_splat_fetches_multilink_target_properties_not_just_id() {
         let out = compile_and_emit("SELECT Person { ** }");
-        assert!(out.sql.contains("\"title\""), "expected Post.title pulled in via .posts' ** expansion, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"title\""),
+            "expected Post.title pulled in via .posts' ** expansion, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_schema_type_cast_select() {
-        let out = compile_and_emit(
-            "SELECT <default::Person><uuid>'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'",
-        );
+        let out = compile_and_emit("SELECT <default::Person><uuid>'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'");
         assert!(out.sql.contains("FROM \"public\".\"Person\""));
         assert!(out.sql.contains("WHERE"));
         assert!(out.sql.contains("'019ef1bb-0d42-7a9f-8f6b-b38d028a49ba'"));
@@ -3542,58 +4122,120 @@ mod tests {
 
     fn make_schema_with_through() -> SchemaDescriptor {
         let id_prop = || PropertyDescriptor {
-            name: "id".into(), pg_type: "uuid".into(), nullable: false,
-            default_sql: Some("gen_random_uuid()".into()), description: None,
-                        default_pyql: None,
-            check_constraints: vec![], is_exclusive: true, is_pk: true,
-            is_readonly: true, rewrites: vec![],
-        tuple_members: None, column_type: None, };
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: Some("gen_random_uuid()".into()),
+            description: None,
+            default_pyql: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
         let name_prop = || PropertyDescriptor {
-            name: "name".into(), pg_type: "text".into(), nullable: false,
-            default_sql: None, description: None, check_constraints: vec![],
-                        default_pyql: None,
-            is_exclusive: false, is_pk: false, is_readonly: false, rewrites: vec![],
-        tuple_members: None, column_type: None, };
+            name: "name".into(),
+            pg_type: "text".into(),
+            nullable: false,
+            default_sql: None,
+            description: None,
+            check_constraints: vec![],
+            default_pyql: None,
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
-                    name: "Person".into(), module: "default".into(), table: "Person".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Person".into(),
+                    module: "default".into(),
+                    table: "Person".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![MultiLinkDescriptor {
                         name: "friends".into(),
                         target: "default::Person".into(),
                         through: Some("default::PersonFriend".into()),
-                        nullable: false, description: None, default_pyql: None, on_delete: vec![],
+                        nullable: false,
+                        description: None,
+                        default_pyql: None,
+                        on_delete: vec![],
                     }],
-                    computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
                     signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "PersonFriend".into(), module: "default".into(), table: "PersonFriend".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "PersonFriend".into(),
+                    module: "default".into(),
+                    table: "PersonFriend".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop()],
                     links: vec![
                         LinkDescriptor {
-                            name: "person".into(), target: "default::Person".into(),
-                            nullable: false, through: None, description: None, default_pyql: None,
-                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                            name: "person".into(),
+                            target: "default::Person".into(),
+                            nullable: false,
+                            through: None,
+                            description: None,
+                            default_pyql: None,
+                            is_exclusive: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            on_delete: vec![],
                         },
                         LinkDescriptor {
-                            name: "friend".into(), target: "default::Person".into(),
-                            nullable: false, through: None, description: None, default_pyql: None,
-                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                            name: "friend".into(),
+                            target: "default::Person".into(),
+                            nullable: false,
+                            through: None,
+                            description: None,
+                            default_pyql: None,
+                            is_exclusive: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            on_delete: vec![],
                         },
                     ],
-                    multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
                     signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -3619,73 +4261,161 @@ mod tests {
     /// comment on `make_schema_with_through` above.
     fn make_schema_with_junction_backed_link() -> SchemaDescriptor {
         let id_prop = || PropertyDescriptor {
-            name: "id".into(), pg_type: "uuid".into(), nullable: false,
-            default_sql: Some("gen_random_uuid()".into()), description: None,
-            default_pyql: None, check_constraints: vec![], is_exclusive: true,
-            is_pk: true, is_readonly: true, rewrites: vec![],
-        tuple_members: None, column_type: None, };
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: Some("gen_random_uuid()".into()),
+            description: None,
+            default_pyql: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
         let name_prop = || PropertyDescriptor {
-            name: "name".into(), pg_type: "text".into(), nullable: false,
-            default_sql: None, description: None, check_constraints: vec![],
-            default_pyql: None, is_exclusive: false, is_pk: false,
-            is_readonly: false, rewrites: vec![],
-        tuple_members: None, column_type: None, };
+            name: "name".into(),
+            pg_type: "text".into(),
+            nullable: false,
+            default_sql: None,
+            description: None,
+            check_constraints: vec![],
+            default_pyql: None,
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
-                    name: "Person".into(), module: "default".into(), table: "Person".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Person".into(),
+                    module: "default".into(),
+                    table: "Person".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![LinkDescriptor {
                         name: "spouse".into(),
                         target: "default::Org".into(),
                         nullable: true,
                         through: Some("default::Marriage".into()),
-                        description: None, default_pyql: None,
-                        is_exclusive: true, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                        description: None,
+                        default_pyql: None,
+                        is_exclusive: true,
+                        is_readonly: false,
+                        rewrites: vec![],
+                        on_delete: vec![],
                     }],
                     multilinks: vec![],
-                    computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
                     signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "Org".into(), module: "default".into(), table: "Org".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Org".into(),
+                    module: "default".into(),
+                    table: "Org".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop(), name_prop()],
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: false,
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
                     signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "Marriage".into(), module: "default".into(), table: "Person.spouse".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
-                    properties: vec![id_prop(), PropertyDescriptor {
-                        name: "since".into(), pg_type: "int8".into(), nullable: true,
-                        default_sql: None, description: None, check_constraints: vec![],
-                        default_pyql: None, is_exclusive: false, is_pk: false,
-                        is_readonly: false, rewrites: vec![],
-                    tuple_members: None, column_type: None, }],
-                    links: vec![
-                        LinkDescriptor {
-                            name: "source".into(), target: "default::Person".into(),
-                            nullable: false, through: None, description: None, default_pyql: None,
-                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
-                        },
-                        LinkDescriptor {
-                            name: "target".into(), target: "default::Org".into(),
-                            nullable: false, through: None, description: None, default_pyql: None,
-                            is_exclusive: false, is_readonly: false, rewrites: vec![], on_delete: vec![],
+                    name: "Marriage".into(),
+                    module: "default".into(),
+                    table: "Person.spouse".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
+                    properties: vec![
+                        id_prop(),
+                        PropertyDescriptor {
+                            name: "since".into(),
+                            pg_type: "int8".into(),
+                            nullable: true,
+                            default_sql: None,
+                            description: None,
+                            check_constraints: vec![],
+                            default_pyql: None,
+                            is_exclusive: false,
+                            is_pk: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            tuple_members: None,
+                            column_type: None,
                         },
                     ],
-                    multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![], junction: true,
+                    links: vec![
+                        LinkDescriptor {
+                            name: "source".into(),
+                            target: "default::Person".into(),
+                            nullable: false,
+                            through: None,
+                            description: None,
+                            default_pyql: None,
+                            is_exclusive: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            on_delete: vec![],
+                        },
+                        LinkDescriptor {
+                            name: "target".into(),
+                            target: "default::Org".into(),
+                            nullable: false,
+                            through: None,
+                            description: None,
+                            default_pyql: None,
+                            is_exclusive: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            on_delete: vec![],
+                        },
+                    ],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: true,
                     signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -3760,8 +4490,16 @@ mod tests {
             &schema,
         );
         // Replace = clear the existing junction row, then insert the new one.
-        assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
-        assert!(out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""),
+            "got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""),
+            "got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("ON CONFLICT (\"source\") DO UPDATE SET \"target\" = EXCLUDED.\"target\", \"since\" = EXCLUDED.\"since\""), "got:\n{}", out.sql);
         // The paired DELETE must not race the new INSERT for a target that's
         // being kept, but for a single link (PK is `source` alone) ANY
@@ -3783,19 +4521,25 @@ mod tests {
             "INSERT Person { name := $name } \
              UNLESS CONFLICT ON .name ELSE (UPDATE Person SET { \
                 spouse := (SELECT Org FILTER .id = $oid) })",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(ir::compile(&ast, &schema).is_err());
     }
 
     #[test]
     fn test_update_clear_junction_backed_single_link() {
         let schema = make_schema_with_junction_backed_link();
-        let out = compile_and_emit_with(
-            "UPDATE Person FILTER .id = $id SET { spouse := {} }",
-            &schema,
+        let out = compile_and_emit_with("UPDATE Person FILTER .id = $id SET { spouse := {} }", &schema);
+        assert!(
+            out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""),
+            "got:\n{}",
+            out.sql
         );
-        assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
-        assert!(!out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "clearing must not also insert:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""),
+            "clearing must not also insert:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3808,12 +4552,17 @@ mod tests {
         // be a CTE reference, parenthesised subquery, or type path" instead
         // of clearing (confirmed live via the Data Explorer).
         let schema = make_schema_with_junction_backed_link();
-        let out = compile_and_emit_with(
-            "UPDATE Person FILTER .id = $id SET { spouse := <Org>{} }",
-            &schema,
+        let out = compile_and_emit_with("UPDATE Person FILTER .id = $id SET { spouse := <Org>{} }", &schema);
+        assert!(
+            out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""),
+            "got:\n{}",
+            out.sql
         );
-        assert!(out.sql.contains("DELETE FROM \"public\".\"Person.spouse\""), "got:\n{}", out.sql);
-        assert!(!out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""), "clearing must not also insert:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("INSERT INTO \"public\".\"Person.spouse\""),
+            "clearing must not also insert:\n{}",
+            out.sql
+        );
     }
 
     /// Product/Tag/ProductTag — the actual real-world shape link properties
@@ -3825,65 +4574,136 @@ mod tests {
     /// type) — tracked separately, not fixed here.
     fn make_schema_with_through_and_prop() -> SchemaDescriptor {
         let id_prop = || PropertyDescriptor {
-            name: "id".into(), pg_type: "uuid".into(), nullable: false,
-            default_sql: Some("gen_random_uuid()".into()), description: None,
-            default_pyql: None, check_constraints: vec![], is_exclusive: true,
-            is_pk: true, is_readonly: true, rewrites: vec![],
-        tuple_members: None, column_type: None, };
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: Some("gen_random_uuid()".into()),
+            description: None,
+            default_pyql: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
         let name_prop = || PropertyDescriptor {
-            name: "name".into(), pg_type: "text".into(), nullable: false,
-            default_sql: None, description: None, check_constraints: vec![],
-            default_pyql: None, is_exclusive: false, is_pk: false,
-            is_readonly: false, rewrites: vec![],
-        tuple_members: None, column_type: None, };
+            name: "name".into(),
+            pg_type: "text".into(),
+            nullable: false,
+            default_sql: None,
+            description: None,
+            check_constraints: vec![],
+            default_pyql: None,
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
         SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
-                    name: "Product".into(), module: "default".into(), table: "Product".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Product".into(),
+                    module: "default".into(),
+                    table: "Product".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![MultiLinkDescriptor {
                         name: "tags".into(),
                         target: "default::Tag".into(),
                         through: Some("default::ProductTag".into()),
-                        nullable: false, description: None, default_pyql: None, on_delete: vec![],
+                        nullable: false,
+                        description: None,
+                        default_pyql: None,
+                        on_delete: vec![],
                     }],
-                    computed: vec![], constraints: vec![], indexes: vec![], vector_indexes: vec![],
-                    search_indexes: vec![], triggers: vec![], junction: false,
-                    signals: vec![],
-                },
-                TypeDescriptor {
-                    name: "Tag".into(), module: "default".into(), table: "Tag".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
-                    properties: vec![id_prop(), name_prop()],
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
                     junction: false,
                     signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "ProductTag".into(), module: "default".into(), table: "Product.tags".into(),
-                    abstract_: false, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
-                    properties: vec![id_prop(), PropertyDescriptor {
-                        name: "weight".into(), pg_type: "float8".into(), nullable: false,
-                        default_sql: None, default_pyql: None, description: None,
-                        check_constraints: vec![], is_exclusive: false, is_pk: false,
-                        is_readonly: false, rewrites: vec![],
-                    tuple_members: None, column_type: None, }],
+                    name: "Tag".into(),
+                    module: "default".into(),
+                    table: "Tag".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
+                    properties: vec![id_prop(), name_prop()],
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
+                },
+                TypeDescriptor {
+                    name: "ProductTag".into(),
+                    module: "default".into(),
+                    table: "Product.tags".into(),
+                    abstract_: false,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
+                    properties: vec![
+                        id_prop(),
+                        PropertyDescriptor {
+                            name: "weight".into(),
+                            pg_type: "float8".into(),
+                            nullable: false,
+                            default_sql: None,
+                            default_pyql: None,
+                            description: None,
+                            check_constraints: vec![],
+                            is_exclusive: false,
+                            is_pk: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            tuple_members: None,
+                            column_type: None,
+                        },
+                    ],
                     // No declared Link pointers — matches pylon-demo's actual
                     // ProductTag, which relies on multilink_junction_info's
                     // "source"/"target" defaults.
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
                     junction: true,
                     signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -3899,8 +4719,10 @@ mod tests {
         // Re-linking an existing pair with a new weight must update in place,
         // not silently keep the old value (a bare `DO NOTHING` would).
         assert!(
-            out.sql.contains("ON CONFLICT (\"source\", \"target\") DO UPDATE SET \"weight\" = EXCLUDED.\"weight\""),
-            "missing upsert conflict clause:\n{}", out.sql
+            out.sql
+                .contains("ON CONFLICT (\"source\", \"target\") DO UPDATE SET \"weight\" = EXCLUDED.\"weight\""),
+            "missing upsert conflict clause:\n{}",
+            out.sql
         );
     }
 
@@ -3917,10 +4739,19 @@ mod tests {
             }",
             &schema,
         );
-        assert!(out.sql.contains("UNION ALL"), "expected a UNION ALL between the two shaped targets:\n{}", out.sql);
+        assert!(
+            out.sql.contains("UNION ALL"),
+            "expected a UNION ALL between the two shaped targets:\n{}",
+            out.sql
+        );
         // Both branches must select the same "weight" column (with their own
         // value) so the union has a consistent column list.
-        assert_eq!(out.sql.matches("AS \"weight\"").count(), 2, "each union branch must project its own weight:\n{}", out.sql);
+        assert_eq!(
+            out.sql.matches("AS \"weight\"").count(),
+            2,
+            "each union branch must project its own weight:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3932,8 +4763,16 @@ mod tests {
             "UPDATE Product FILTER .id = $id SET { tags += (SELECT Tag FILTER .id = $tid) }",
             &schema,
         );
-        assert!(out.sql.contains("ON CONFLICT DO NOTHING"), "expected plain DO NOTHING when no link properties are set:\n{}", out.sql);
-        assert!(!out.sql.contains("\"weight\""), "unexpected weight column with no link property assignment:\n{}", out.sql);
+        assert!(
+            out.sql.contains("ON CONFLICT DO NOTHING"),
+            "expected plain DO NOTHING when no link properties are set:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("\"weight\""),
+            "unexpected weight column with no link property assignment:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3945,7 +4784,10 @@ mod tests {
         ).unwrap();
         match crate::ir::compile(&ast, &make_schema()) {
             Ok(_) => panic!("expected a compile error for link property on a Standard junction"),
-            Err(e) => assert!(e.to_string().contains("Through"), "expected a Through[...]-related error, got: {e}"),
+            Err(e) => assert!(
+                e.to_string().contains("Through"),
+                "expected a Through[...]-related error, got: {e}"
+            ),
         }
     }
 
@@ -3954,10 +4796,14 @@ mod tests {
         let schema = make_schema_with_through_and_prop();
         let ast = crate::parse::parse(
             "UPDATE Product FILTER .id = $id SET { tags -= (SELECT Tag FILTER .id = $tid) { @weight := <float64>$w } }",
-        ).unwrap();
+        )
+        .unwrap();
         match crate::ir::compile(&ast, &schema) {
             Ok(_) => panic!("expected a compile error for link property on a remove (-=)"),
-            Err(e) => assert!(e.to_string().contains("removing"), "expected a remove-related error, got: {e}"),
+            Err(e) => assert!(
+                e.to_string().contains("removing"),
+                "expected a remove-related error, got: {e}"
+            ),
         }
     }
 
@@ -3973,11 +4819,28 @@ mod tests {
             &schema,
         );
         // The row insert must happen before the junction insert references its id.
-        assert!(out.sql.contains("\"_w__ids\" AS (\nINSERT INTO"), "missing row-insert CTE:\n{}", out.sql);
-        assert!(out.sql.contains("\"_w__ml_add_0\" AS ("), "missing junction-append CTE:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_w__ids\" AS (\nINSERT INTO"),
+            "missing row-insert CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"_w__ml_add_0\" AS ("),
+            "missing junction-append CTE:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("\"weight\""), "missing weight column:\n{}", out.sql);
-        assert!(out.sql.contains("\"_w\" AS (\n    SELECT * FROM \"_w__ids\"\n)"), "missing _w passthrough:\n{}", out.sql);
-        assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_w\" AS (\n    SELECT * FROM \"_w__ids\"\n)"),
+            "missing _w passthrough:\n{}",
+            out.sql
+        );
+        assert_eq!(
+            out.sql.matches("WITH\n").count(),
+            1,
+            "must be a single flat top-level WITH block:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3990,10 +4853,28 @@ mod tests {
             "with insert0 := (insert Product { name := $name, tags := (select Tag filter .id = $tid) }) select insert0",
             &schema,
         );
-        assert!(out.sql.contains("\"insert0__ids\" AS (\nINSERT INTO"), "missing row-insert CTE:\n{}", out.sql);
-        assert!(out.sql.contains("\"insert0__ml_add_0\" AS ("), "missing junction-append CTE:\n{}", out.sql);
-        assert!(out.sql.contains("\"insert0\" AS (\n    SELECT * FROM \"insert0__ids\"\n)"), "missing insert0 passthrough:\n{}", out.sql);
-        assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"insert0__ids\" AS (\nINSERT INTO"),
+            "missing row-insert CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"insert0__ml_add_0\" AS ("),
+            "missing junction-append CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("\"insert0\" AS (\n    SELECT * FROM \"insert0__ids\"\n)"),
+            "missing insert0 passthrough:\n{}",
+            out.sql
+        );
+        assert_eq!(
+            out.sql.matches("WITH\n").count(),
+            1,
+            "must be a single flat top-level WITH block:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4021,17 +4902,14 @@ mod tests {
             scalar_type: "Person".into(),
             required: false,
             default_expr: None,
-            computed_expr: Some(
-                "select default::Person filter .id = global current_user_id".into(),
-            ),
+            computed_expr: Some("select default::Person filter .id = global current_user_id".into()),
         });
-        let out = compile_and_emit_with(
-            "with\n  user := (select global current_user)\nselect user;",
-            &schema,
-        );
+        let out = compile_and_emit_with("with\n  user := (select global current_user)\nselect user;", &schema);
         assert_eq!(
-            out.sql.matches("WITH").count(), 1,
-            "must be a single WITH clause, got:\n{}", out.sql
+            out.sql.matches("WITH").count(),
+            1,
+            "must be a single WITH clause, got:\n{}",
+            out.sql
         );
     }
 
@@ -4057,16 +4935,23 @@ mod tests {
             scalar_type: "Person".into(),
             required: false,
             default_expr: None,
-            computed_expr: Some(
-                "select default::Person filter .id = global current_user_id".into(),
-            ),
+            computed_expr: Some("select default::Person filter .id = global current_user_id".into()),
         });
         let out = compile_and_emit_with(
             "with\n  user := (select global current_user)\nselect user.name;",
             &schema,
         );
-        assert!(out.sql.contains("FROM \"user\""), "expected path traversal from the CTE, got:\n{}", out.sql);
-        assert_eq!(out.sql.matches("WITH").count(), 1, "must be a single WITH clause, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("FROM \"user\""),
+            "expected path traversal from the CTE, got:\n{}",
+            out.sql
+        );
+        assert_eq!(
+            out.sql.matches("WITH").count(),
+            1,
+            "must be a single WITH clause, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4085,10 +4970,9 @@ mod tests {
             &schema,
         );
         assert!(
-            out.sql.contains("<> ALL((SELECT")
-                && out.sql.contains(".\"id\"")
-                && out.sql.contains("FROM \"person\""),
-            "got:\n{}", out.sql
+            out.sql.contains("<> ALL((SELECT") && out.sql.contains(".\"id\"") && out.sql.contains("FROM \"person\""),
+            "got:\n{}",
+            out.sql
         );
     }
 
@@ -4105,7 +4989,8 @@ mod tests {
         );
         assert!(
             out.sql.contains("(SELECT") && out.sql.contains(".\"name\"") && out.sql.contains("FROM \"person\""),
-            "got:\n{}", out.sql
+            "got:\n{}",
+            out.sql
         );
     }
 
@@ -4125,7 +5010,8 @@ mod tests {
         );
         assert!(
             out.sql.contains("(SELECT") && out.sql.contains("\"name\"") && out.sql.contains("\"Company\""),
-            "got:\n{}", out.sql
+            "got:\n{}",
+            out.sql
         );
     }
 
@@ -4142,7 +5028,8 @@ mod tests {
         );
         assert!(
             out.sql.contains("(SELECT") && out.sql.contains("\"id\""),
-            "got:\n{}", out.sql
+            "got:\n{}",
+            out.sql
         );
     }
 
@@ -4152,12 +5039,10 @@ mod tests {
         let ast = parse::parse(
             "with\n  person := (select detached Person filter .id = <uuid>$id)\n\
              select Person filter .name = person.nam;",
-        ).unwrap();
+        )
+        .unwrap();
         match ir::compile(&ast, &schema) {
-            Err(err) => assert!(
-                format!("{err}").contains("Did you mean 'name'"),
-                "got: {err}"
-            ),
+            Err(err) => assert!(format!("{err}").contains("Did you mean 'name'"), "got: {err}"),
             Ok(_) => panic!("expected a compile error"),
         }
     }
@@ -4169,9 +5054,7 @@ mod tests {
         // reference to a free-object CTE (`IrFreeExpr::CtePassthrough`) had
         // its shape hardcoded to `ShapeNode::Scalar` regardless of what the
         // CTE actually held.
-        let out = compile_and_emit(
-            "with\n  test := { test2 := 1.0, test3 := 'str' }\nselect test;",
-        );
+        let out = compile_and_emit("with\n  test := { test2 := 1.0, test3 := 'str' }\nselect test;");
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!("expected Object shape, got {:?}", out.shape.root)
         };
@@ -4186,9 +5069,7 @@ mod tests {
         // "unknown type 'test'" — any absolute path with 2+ steps
         // unconditionally routed to compile_path_select, which only knows
         // how to resolve real schema types, never a free-value CTE.
-        let out = compile_and_emit(
-            "with\n  test := { test2 := 1.0, test3 := 'str' }\nselect test.test2;",
-        );
+        let out = compile_and_emit("with\n  test := { test2 := 1.0, test3 := 'str' }\nselect test.test2;");
         assert!(out.sql.contains("\"test2\" FROM \"test\""), "got:\n{}", out.sql);
     }
 
@@ -4198,11 +5079,14 @@ mod tests {
         // (`test.test3.foo`) must resolve the first hop via the CTE's own
         // materialized column, then extract `foo` as jsonb from that value
         // — the fix must not be hardcoded to exactly 2 path steps.
-        let out = compile_and_emit(
-            "with\n  test := { test2 := 1.0, test3 := { foo := 'bar' } }\nselect test.test3.foo;",
-        );
+        let out =
+            compile_and_emit("with\n  test := { test2 := 1.0, test3 := { foo := 'bar' } }\nselect test.test3.foo;");
         assert!(out.sql.contains("\"test3\" FROM \"test\""), "got:\n{}", out.sql);
-        assert!(out.sql.contains("->'foo'"), "expected jsonb field extraction, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("->'foo'"),
+            "expected jsonb field extraction, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4210,9 +5094,8 @@ mod tests {
         // A typo'd field name anywhere in the chain must still be a compile
         // error, not silently emit SQL that returns NULL at runtime.
         let schema = make_schema();
-        let ast = parse::parse(
-            "with\n  test := { test2 := 1.0, test3 := { foo := 'bar' } }\nselect test.test3.nope;",
-        ).unwrap();
+        let ast = parse::parse("with\n  test := { test2 := 1.0, test3 := { foo := 'bar' } }\nselect test.test3.nope;")
+            .unwrap();
         assert!(ir::compile(&ast, &schema).is_err());
     }
 
@@ -4227,10 +5110,17 @@ mod tests {
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!("expected Object shape")
         };
-        let test_node = pointers.iter()
+        let test_node = pointers
+            .iter()
             .find(|p| matches!(p, ShapeNode::NamedTuple { name, .. } if name == "test"))
             .unwrap_or_else(|| panic!("expected a NamedTuple shape node for 'test', got {:?}", pointers));
-        assert!(matches!(test_node, ShapeNode::NamedTuple { is_free_object: true, .. }));
+        assert!(matches!(
+            test_node,
+            ShapeNode::NamedTuple {
+                is_free_object: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4243,7 +5133,11 @@ mod tests {
             "with\n  test := { test2 := 1.0, test3 := 'str' }\n\
              select default::Person { id, test := test };",
         );
-        assert!(out.sql.contains("jsonb_build_object()"), "expected an empty free object, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("jsonb_build_object()"),
+            "expected an empty free object, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4256,15 +5150,18 @@ mod tests {
              select default::Person { id, test := test { test2 } };",
         );
         assert!(out.sql.contains("jsonb_build_object('test2'"), "got:\n{}", out.sql);
-        assert!(!out.sql.contains("'test3'"), "test3 should not be projected, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("'test3'"),
+            "test3 should not be projected, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_insert_multilink_remove_rejected() {
         let schema = make_schema_with_through_and_prop();
-        let ast = crate::parse::parse(
-            "INSERT Product { name := $name, tags -= (SELECT Tag FILTER .id = $tid) }",
-        ).unwrap();
+        let ast =
+            crate::parse::parse("INSERT Product { name := $name, tags -= (SELECT Tag FILTER .id = $tid) }").unwrap();
         match crate::ir::compile(&ast, &schema) {
             Ok(_) => panic!("expected a compile error for `-=` on a multi-link at insert time"),
             Err(e) => assert!(
@@ -4287,14 +5184,24 @@ mod tests {
             "UPDATE Person FILTER .id = $id SET { friends += (SELECT Person FILTER .id = $fid) }",
             &schema,
         );
-        assert!(out.sql.contains("(\"person\", \"friend\")"), "expected two distinct FK columns:\n{}", out.sql);
-        assert!(!out.sql.contains("(\"person\", \"person\")"), "source/target collapsed to the same column:\n{}", out.sql);
+        assert!(
+            out.sql.contains("(\"person\", \"friend\")"),
+            "expected two distinct FK columns:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("(\"person\", \"person\")"),
+            "source/target collapsed to the same column:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_shape_descriptor_scalars() {
         let out = compile_and_emit("SELECT Person { name, age }");
-        let ShapeNode::Object { pointers, .. } = &out.shape.root else { panic!() };
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
         assert_eq!(pointers.len(), 3); // __type__, name, age
         assert!(matches!(&pointers[0], ShapeNode::Scalar { name, position: 0 } if name == "__type__"));
         assert!(matches!(&pointers[1], ShapeNode::Scalar { name, position: 1 } if name == "name"));
@@ -4304,13 +5211,28 @@ mod tests {
     #[test]
     fn test_shape_descriptor_multi_link() {
         let out = compile_and_emit("SELECT Person { name, posts { title } }");
-        let ShapeNode::Object { pointers, .. } = &out.shape.root else { panic!() };
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
         // pointers: [__type__, name, posts]
         assert_eq!(pointers.len(), 3);
-        let ShapeNode::Array { name, position, element } = &pointers[2] else { panic!() };
+        let ShapeNode::Array {
+            name,
+            position,
+            element,
+        } = &pointers[2]
+        else {
+            panic!()
+        };
         assert_eq!(name, "posts");
         assert_eq!(*position, 2);
-        let ShapeNode::Object { pointers: elem_pointers, .. } = element.as_ref() else { panic!() };
+        let ShapeNode::Object {
+            pointers: elem_pointers,
+            ..
+        } = element.as_ref()
+        else {
+            panic!()
+        };
         // element pointers: [__type__, title]
         assert_eq!(elem_pointers.len(), 2);
     }
@@ -4330,11 +5252,24 @@ mod tests {
         assert!(out.sql.contains("'default::Person'::text"));
         assert!(out.sql.contains(") AS result"));
         // Bare INSERT returns pk only
-        let ShapeNode::Object { cardinality, pointers, .. } = &out.shape.root else { panic!() };
+        let ShapeNode::Object {
+            cardinality, pointers, ..
+        } = &out.shape.root
+        else {
+            panic!()
+        };
         assert_eq!(*cardinality, Cardinality::Required);
         // Only __type__ and id — not name or age
-        assert!(pointers.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "id")));
-        assert!(!pointers.iter().any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name")));
+        assert!(
+            pointers
+                .iter()
+                .any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "id"))
+        );
+        assert!(
+            !pointers
+                .iter()
+                .any(|f| matches!(f, ShapeNode::Scalar { name, .. } if name == "name"))
+        );
     }
 
     #[test]
@@ -4357,8 +5292,16 @@ mod tests {
         // ($N)::jsonb cast resolves the parameter's type from the cast
         // itself instead, matching how e.g. `$1::uuid` already works.
         let out = compile_and_emit("UPDATE Person FILTER .id = $id SET { age := <tuple<x: float64>>$val }");
-        assert!(out.sql.contains(")::jsonb"), "expected a direct ::jsonb cast, got:\n{}", out.sql);
-        assert!(!out.sql.contains("to_jsonb($"), "must not pass a bare param straight into to_jsonb(): got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(")::jsonb"),
+            "expected a direct ::jsonb cast, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("to_jsonb($"),
+            "must not pass a bare param straight into to_jsonb(): got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4387,9 +5330,7 @@ mod tests {
 
     #[test]
     fn test_select_over_insert() {
-        let out = compile_and_emit(
-            "SELECT (INSERT Person { name := $name, age := $age }) { id, name }",
-        );
+        let out = compile_and_emit("SELECT (INSERT Person { name := $name, age := $age }) { id, name }");
         // Must use a CTE
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("INSERT INTO"));
@@ -4401,9 +5342,7 @@ mod tests {
 
     #[test]
     fn test_select_over_update() {
-        let out = compile_and_emit(
-            "SELECT (UPDATE Person FILTER .id = $id SET { name := $name }) { id, name }",
-        );
+        let out = compile_and_emit("SELECT (UPDATE Person FILTER .id = $id SET { name := $name }) { id, name }");
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("UPDATE"));
         assert!(out.sql.contains("RETURNING *"));
@@ -4424,7 +5363,9 @@ mod tests {
     fn test_insert_user_specified_id_allowed_when_configured() {
         let schema = make_schema();
         let ast = parse::parse("INSERT Person { id := <uuid>$id, name := $name, age := $age }").unwrap();
-        let config = ir::SessionConfig { allow_user_specified_id: true };
+        let config = ir::SessionConfig {
+            allow_user_specified_id: true,
+        };
         let ir_out = ir::compile_with_config(&ast, &schema, &config)
             .expect("expected id assignment to be allowed with allow_user_specified_id");
         let out = emit(&ir_out);
@@ -4435,7 +5376,9 @@ mod tests {
     fn test_update_user_specified_id_denied_even_when_configured() {
         let schema = make_schema();
         let ast = parse::parse("UPDATE Person FILTER .name = $name SET { id := <uuid>$id }").unwrap();
-        let config = ir::SessionConfig { allow_user_specified_id: true };
+        let config = ir::SessionConfig {
+            allow_user_specified_id: true,
+        };
         match ir::compile_with_config(&ast, &schema, &config) {
             Err(err) => assert!(err.to_string().contains("cannot assign to property 'id'"), "got: {err}"),
             Ok(_) => panic!("expected UPDATE to always deny reassigning id"),
@@ -4456,17 +5399,38 @@ mod tests {
         let out = compile_and_emit(
             "SELECT (UPDATE Person FILTER .id = $id SET { posts += (SELECT Post FILTER .title = $title) }) { id, name }",
         );
-        assert!(out.sql.contains("\"_dml__ml_add_0\""), "missing junction-append CTE:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_dml__ml_add_0\""),
+            "missing junction-append CTE:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("INSERT INTO"), "missing junction INSERT:\n{}", out.sql);
         // No scalar changes -> the row-source CTE must be a SELECT, not an UPDATE
         // with an empty SET clause.
-        assert!(out.sql.contains("\"_dml__ids\" AS (\nSELECT"), "expected SELECT-based _ids CTE:\n{}", out.sql);
-        assert!(!out.sql.contains("SET\n\nWHERE") && !out.sql.contains("SET \nWHERE"), "empty SET clause regression:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_dml__ids\" AS (\nSELECT"),
+            "expected SELECT-based _ids CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("SET\n\nWHERE") && !out.sql.contains("SET \nWHERE"),
+            "empty SET clause regression:\n{}",
+            out.sql
+        );
         // The junction CTE must be a *sibling* at the top-level WITH, not
         // nested inside another CTE's body — only one "WITH" keyword total.
-        assert_eq!(out.sql.matches("WITH\n").count(), 1, "junction CTE must not be nested in a second WITH:\n{}", out.sql);
+        assert_eq!(
+            out.sql.matches("WITH\n").count(),
+            1,
+            "junction CTE must not be nested in a second WITH:\n{}",
+            out.sql
+        );
         // "_dml" itself must still resolve (as a passthrough) for the outer SELECT.
-        assert!(out.sql.contains("\"_dml\" AS (\n    SELECT * FROM \"_dml__ids\"\n)"), "missing _dml passthrough:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_dml\" AS (\n    SELECT * FROM \"_dml__ids\"\n)"),
+            "missing _dml passthrough:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4477,10 +5441,27 @@ mod tests {
         let out = compile_and_emit(
             "SELECT (UPDATE Person FILTER .id = $id SET { name := $name, posts += (SELECT Post FILTER .title = $title) }) { id, name }",
         );
-        assert!(out.sql.contains("\"_dml__ml_add_0\""), "missing junction-append CTE:\n{}", out.sql);
-        assert!(out.sql.contains("\"_dml__ids\" AS (\nUPDATE"), "expected UPDATE-based _ids CTE:\n{}", out.sql);
-        assert!(out.sql.contains("\"name\" = "), "missing scalar SET assignment:\n{}", out.sql);
-        assert_eq!(out.sql.matches("WITH\n").count(), 1, "junction CTE must not be nested in a second WITH:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_dml__ml_add_0\""),
+            "missing junction-append CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"_dml__ids\" AS (\nUPDATE"),
+            "expected UPDATE-based _ids CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"name\" = "),
+            "missing scalar SET assignment:\n{}",
+            out.sql
+        );
+        assert_eq!(
+            out.sql.matches("WITH\n").count(),
+            1,
+            "junction CTE must not be nested in a second WITH:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4495,20 +5476,40 @@ mod tests {
         let out = compile_and_emit(
             "with insert0 := (insert Post { title := $title }), update0 := (update Person filter .id = $id set { posts += (select insert0) }) select { insert0, update0 }",
         );
-        assert!(out.sql.contains("\"insert0\" AS (\n    INSERT INTO"), "missing insert0 CTE:\n{}", out.sql);
-        assert!(out.sql.contains("\"update0__ml_add_0\""), "missing junction-append CTE for update0:\n{}", out.sql);
-        assert!(out.sql.contains("\"update0__ids\" AS (\nSELECT"), "expected SELECT-based update0 ids CTE (no scalar changes):\n{}", out.sql);
-        assert!(out.sql.contains("\"update0\" AS (\n    SELECT * FROM \"update0__ids\"\n)"), "missing update0 passthrough:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"insert0\" AS (\n    INSERT INTO"),
+            "missing insert0 CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"update0__ml_add_0\""),
+            "missing junction-append CTE for update0:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"update0__ids\" AS (\nSELECT"),
+            "expected SELECT-based update0 ids CTE (no scalar changes):\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("\"update0\" AS (\n    SELECT * FROM \"update0__ids\"\n)"),
+            "missing update0 passthrough:\n{}",
+            out.sql
+        );
         // Exactly one WITH keyword — every CTE (insert0, update0__ids,
         // update0__ml_add_0, update0) must be a top-level sibling.
-        assert_eq!(out.sql.matches("WITH\n").count(), 1, "must be a single flat top-level WITH block:\n{}", out.sql);
+        assert_eq!(
+            out.sql.matches("WITH\n").count(),
+            1,
+            "must be a single flat top-level WITH block:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_select_over_delete() {
-        let out = compile_and_emit(
-            "SELECT (DELETE Person FILTER .id = $id) { id, name }",
-        );
+        let out = compile_and_emit("SELECT (DELETE Person FILTER .id = $id) { id, name }");
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("DELETE FROM"));
         assert!(out.sql.contains("RETURNING *"));
@@ -4525,17 +5526,25 @@ mod tests {
             pg_type: "text".into(),
             nullable: true,
             default_sql: None,
-                        default_pyql: None,
+            default_pyql: None,
             description: None,
             check_constraints: vec![],
             is_exclusive: false,
             is_pk: false,
             is_readonly: false,
             rewrites: vec![
-                RewriteEntry { on: 1, handler: "str_lower(.name)".into() },  // INSERT
-                RewriteEntry { on: 2, handler: "str_lower(.name)".into() },  // UPDATE
+                RewriteEntry {
+                    on: 1,
+                    handler: "str_lower(.name)".into(),
+                }, // INSERT
+                RewriteEntry {
+                    on: 2,
+                    handler: "str_lower(.name)".into(),
+                }, // UPDATE
             ],
-        tuple_members: None, column_type: None, });
+            tuple_members: None,
+            column_type: None,
+        });
         schema
     }
 
@@ -4555,12 +5564,12 @@ mod tests {
     fn test_insert_rewrite_overrides_explicit_assignment() {
         let schema = make_schema_with_rewrite();
         // User explicitly assigns slug — rewrite should win (user assignment dropped)
-        let out = compile_and_emit_with(
-            "INSERT Person { name := $name, age := 30, slug := 'manual' }",
-            &schema,
-        );
+        let out = compile_and_emit_with("INSERT Person { name := $name, age := 30, slug := 'manual' }", &schema);
         // The literal 'manual' must NOT appear — rewrite wins
-        assert!(!out.sql.contains("'manual'"), "rewrite must override explicit slug assignment");
+        assert!(
+            !out.sql.contains("'manual'"),
+            "rewrite must override explicit slug assignment"
+        );
         // The rewrite expression must appear
         assert!(out.sql.contains("lower("), "rewrite expression must be present");
     }
@@ -4568,19 +5577,21 @@ mod tests {
     #[test]
     fn test_update_rewrite_in_set_clause() {
         let schema = make_schema_with_rewrite();
-        let out = compile_and_emit_with(
-            "UPDATE Person FILTER .id = $id SET { name := $name }",
-            &schema,
-        );
+        let out = compile_and_emit_with("UPDATE Person FILTER .id = $id SET { name := $name }", &schema);
         assert!(out.sql.contains("SET"));
         assert!(out.sql.contains("\"slug\""));
         // Rewrite references .name which is also being SET to $name ($2).
         // After substitute_col_refs, the rewrite should use $2, not the pre-update column.
         // $1 = id (filter), $2 = name (assignment)
-        assert!(out.sql.contains("lower($2)"),
-            "rewrite must use new name value ($2), got:\n{}", out.sql);
-        assert!(!out.sql.contains("lower(\"t0\".\"name\")"),
-            "rewrite must not use pre-update column ref");
+        assert!(
+            out.sql.contains("lower($2)"),
+            "rewrite must use new name value ($2), got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("lower(\"t0\".\"name\")"),
+            "rewrite must not use pre-update column ref"
+        );
     }
 
     #[test]
@@ -4589,14 +5600,14 @@ mod tests {
         // the current row value (ColumnRef), not a parameter.
         let schema = make_schema_with_rewrite();
         // SET age only — slug rewrite references .name which is NOT being SET.
-        let out = compile_and_emit_with(
-            "UPDATE Person FILTER .id = $id SET { age := $age }",
-            &schema,
-        );
+        let out = compile_and_emit_with("UPDATE Person FILTER .id = $id SET { age := $age }", &schema);
         assert!(out.sql.contains("\"slug\""));
         // .name is not being SET, so rewrite sees the current row value.
-        assert!(out.sql.contains("lower(\"t0\".\"name\")"),
-            "rewrite must use current row value when name is not being SET, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("lower(\"t0\".\"name\")"),
+            "rewrite must use current row value when name is not being SET, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4614,8 +5625,16 @@ mod tests {
         );
         let set_count = out.sql.matches("\"slug\" =").count();
         assert_eq!(set_count, 1, "slug must appear exactly once in SET, got:\n{}", out.sql);
-        assert!(!out.sql.contains("'manual'"), "rewrite must override explicit slug assignment, got:\n{}", out.sql);
-        assert!(out.sql.contains("lower("), "rewrite expression must be present, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("'manual'"),
+            "rewrite must override explicit slug assignment, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("lower("),
+            "rewrite expression must be present, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4634,11 +5653,22 @@ mod tests {
         let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
         let name_prop = person.properties.iter_mut().find(|p| p.name == "name").unwrap();
         name_prop.default_sql = Some("'untitled'".into());
-        name_prop.rewrites = vec![RewriteEntry { on: 1, handler: ".name ++ ' (new)'".into() }];
+        name_prop.rewrites = vec![RewriteEntry {
+            on: 1,
+            handler: ".name ++ ' (new)'".into(),
+        }];
 
         let out = compile_and_emit_with("INSERT Person { age := 30 }", &schema);
-        assert!(!out.sql.contains("\"t0\""), "must not reference a nonexistent table alias, got:\n{}", out.sql);
-        assert!(out.sql.contains("'untitled'"), "must fall back to the property's own default_sql, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("\"t0\""),
+            "must not reference a nonexistent table alias, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("'untitled'"),
+            "must fall back to the property's own default_sql, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4680,8 +5710,16 @@ mod tests {
              UNLESS CONFLICT ON .name \
              ELSE (UPDATE Person SET { age := .age + 1 })",
         );
-        assert!(out.sql.contains("\"Person\".\"age\""), "self-reference must be qualified with the table's own name, got:\n{}", out.sql);
-        assert!(!out.sql.contains("SET \"age\" = (\"age\""), "must not emit an unqualified (ambiguous) self-reference, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\".\"age\""),
+            "self-reference must be qualified with the table's own name, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("SET \"age\" = (\"age\""),
+            "must not emit an unqualified (ambiguous) self-reference, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4697,9 +5735,7 @@ mod tests {
 
     #[test]
     fn test_select_over_select() {
-        let out = compile_and_emit(
-            "SELECT (SELECT Person FILTER .age > 18) { name }",
-        );
+        let out = compile_and_emit("SELECT (SELECT Person FILTER .age > 18) { name }");
         // Must use a CTE
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         // CTE exposes raw columns via SELECT *
@@ -4714,9 +5750,7 @@ mod tests {
 
     #[test]
     fn test_select_over_select_with_outer_filter() {
-        let out = compile_and_emit(
-            "SELECT (SELECT Person FILTER .age > 18) { name } FILTER .name = $name",
-        );
+        let out = compile_and_emit("SELECT (SELECT Person FILTER .age > 18) { name } FILTER .name = $name");
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("SELECT *"));
         // Both filters present: one inside CTE, one in outer SELECT
@@ -4726,9 +5760,7 @@ mod tests {
 
     #[test]
     fn test_insert_link_subquery() {
-        let out = compile_and_emit(
-            "INSERT Person { name := $name, company := (SELECT Company FILTER .name = $co) }",
-        );
+        let out = compile_and_emit("INSERT Person { name := $name, company := (SELECT Company FILTER .name = $co) }");
         // The company FK column should be assigned via a scalar subquery
         assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
@@ -4741,9 +5773,8 @@ mod tests {
 
     #[test]
     fn test_update_link_subquery() {
-        let out = compile_and_emit(
-            "UPDATE Person FILTER .id = $id SET { company := (SELECT Company FILTER .name = $co) }",
-        );
+        let out =
+            compile_and_emit("UPDATE Person FILTER .id = $id SET { company := (SELECT Company FILTER .name = $co) }");
         assert!(out.sql.contains("\"company_id\""));
         assert!(out.sql.contains("SELECT"));
         assert!(out.sql.contains("FROM \"public\".\"Company\""));
@@ -4761,18 +5792,28 @@ mod tests {
         let out = compile_and_emit(
             "INSERT Person { name := 'Alice', company := (select (insert Company { name := 'Acme' }) { id }) }",
         );
-        assert!(out.sql.starts_with("WITH"), "expected a WITH-hoisted CTE, got:\n{}", out.sql);
+        assert!(
+            out.sql.starts_with("WITH"),
+            "expected a WITH-hoisted CTE, got:\n{}",
+            out.sql
+        );
         assert!(
             out.sql.contains("INSERT INTO \"public\".\"Company\""),
-            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+            "expected the nested insert to be its own CTE, got:\n{}",
+            out.sql,
         );
         // The outer insert must reference the nested CTE's own id, not a
         // freestanding subquery against the Company table.
         assert!(
             out.sql.contains("\"company_id\") SELECT") && out.sql.contains(".\"id\" FROM"),
-            "expected the outer insert to switch from VALUES to SELECT ... FROM <cte>, got:\n{}", out.sql,
+            "expected the outer insert to switch from VALUES to SELECT ... FROM <cte>, got:\n{}",
+            out.sql,
         );
-        assert!(!out.sql.contains("FROM \"public\".\"Company\" AS"), "must not select from the real Company table, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("FROM \"public\".\"Company\" AS"),
+            "must not select from the real Company table, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4780,14 +5821,23 @@ mod tests {
         let out = compile_and_emit(
             "UPDATE Person FILTER .id = $id SET { company := (select (insert Company { name := 'Acme' }) { id }) }",
         );
-        assert!(out.sql.starts_with("WITH"), "expected a WITH-hoisted CTE, got:\n{}", out.sql);
+        assert!(
+            out.sql.starts_with("WITH"),
+            "expected a WITH-hoisted CTE, got:\n{}",
+            out.sql
+        );
         assert!(
             out.sql.contains("INSERT INTO \"public\".\"Company\""),
-            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+            "expected the nested insert to be its own CTE, got:\n{}",
+            out.sql,
         );
         // Plain `UPDATE ... SET ...` has no FROM clause of its own — one
         // must be added so the SET clause can reference the CTE's column.
-        assert!(out.sql.contains("\nFROM \""), "expected a FROM clause referencing the nested CTE, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\nFROM \""),
+            "expected a FROM clause referencing the nested CTE, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("SET \"company_id\" = "), "got:\n{}", out.sql);
     }
 
@@ -4806,13 +5856,19 @@ mod tests {
         assert!(out.sql.starts_with("WITH"), "got:\n{}", out.sql);
         assert!(
             out.sql.contains("INSERT INTO \"public\".\"Company\""),
-            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+            "expected the nested insert to be its own CTE, got:\n{}",
+            out.sql,
         );
         assert!(
             out.sql.contains("\"_ids\" AS (\nUPDATE") && out.sql.contains("\nFROM \""),
-            "expected the _ids UPDATE to gain a FROM clause referencing the nested CTE, got:\n{}", out.sql,
+            "expected the _ids UPDATE to gain a FROM clause referencing the nested CTE, got:\n{}",
+            out.sql,
         );
-        assert!(out.sql.contains("\"_ml_add_0\""), "expected the junction-append CTE to still be present, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_ml_add_0\""),
+            "expected the junction-append CTE to still be present, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4824,61 +5880,125 @@ mod tests {
         // once and referenced from every per-implementor UPDATE branch.
         fn id_prop() -> PropertyDescriptor {
             PropertyDescriptor {
-                name: "id".into(), pg_type: "uuid".into(), nullable: false,
-                default_sql: Some("uuidv7()".into()), default_pyql: None, description: None,
-                check_constraints: vec![], is_exclusive: true, is_pk: true, is_readonly: true,
-                rewrites: vec![], tuple_members: None, column_type: None,
+                name: "id".into(),
+                pg_type: "uuid".into(),
+                nullable: false,
+                default_sql: Some("uuidv7()".into()),
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: true,
+                is_readonly: true,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
             }
         }
         fn text_prop(name: &str) -> PropertyDescriptor {
             PropertyDescriptor {
-                name: name.into(), pg_type: "text".into(), nullable: false,
-                default_sql: None, default_pyql: None, description: None,
-                check_constraints: vec![], is_exclusive: false, is_pk: false,
-                is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
+                name: name.into(),
+                pg_type: "text".into(),
+                nullable: false,
+                default_sql: None,
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: false,
+                is_pk: false,
+                is_readonly: false,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
             }
         }
         fn company_link() -> LinkDescriptor {
             LinkDescriptor {
-                name: "company".into(), target: "default::Company".into(), nullable: true,
-                through: None, description: None, default_pyql: None, is_exclusive: false,
-                is_readonly: false, rewrites: vec![], on_delete: vec![],
+                name: "company".into(),
+                target: "default::Company".into(),
+                nullable: true,
+                through: None,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
             }
         }
         let schema = SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
-                    name: "Company".into(), module: "default".into(), table: "Company".into(),
-                    abstract_: false, materialized: true, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Company".into(),
+                    module: "default".into(),
+                    table: "Company".into(),
+                    abstract_: false,
+                    materialized: true,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop(), text_prop("name")],
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "Account".into(), module: "default".into(), table: "Account".into(),
-                    abstract_: true, materialized: true, description: None,
-                    parents: vec![], interfaces: vec![],
+                    name: "Account".into(),
+                    module: "default".into(),
+                    table: "Account".into(),
+                    abstract_: true,
+                    materialized: true,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
                     properties: vec![id_prop(), text_prop("email")],
                     links: vec![company_link()],
-                    multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "Individual".into(), module: "default".into(), table: "Individual".into(),
-                    abstract_: false, materialized: true, description: None,
-                    parents: vec![], interfaces: vec!["default::Account".into()],
+                    name: "Individual".into(),
+                    module: "default".into(),
+                    table: "Individual".into(),
+                    abstract_: false,
+                    materialized: true,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec!["default::Account".into()],
                     properties: vec![id_prop(), text_prop("email"), text_prop("first_name")],
                     links: vec![company_link()],
-                    multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let out = compile_and_emit_with(
             "UPDATE Account FILTER .email = $email \
@@ -4888,11 +6008,13 @@ mod tests {
         assert!(out.sql.starts_with("WITH"), "got:\n{}", out.sql);
         assert!(
             out.sql.contains("INSERT INTO \"public\".\"Company\""),
-            "expected the nested insert to be its own CTE, got:\n{}", out.sql,
+            "expected the nested insert to be its own CTE, got:\n{}",
+            out.sql,
         );
         assert!(
             out.sql.contains("UPDATE \"public\".\"Individual\"") && out.sql.contains("\nFROM \"_nested_dml_0\""),
-            "expected the per-implementor UPDATE to gain a FROM clause referencing the nested CTE, got:\n{}", out.sql,
+            "expected the per-implementor UPDATE to gain a FROM clause referencing the nested CTE, got:\n{}",
+            out.sql,
         );
     }
 
@@ -4905,7 +6027,11 @@ mod tests {
             return_type: Some("text".into()),
         });
         let out = compile_and_emit_with("SELECT Person { upper_name }", &schema);
-        assert!(out.sql.to_lowercase().contains("upper"), "expected upper() in SQL, got:\n{}", out.sql);
+        assert!(
+            out.sql.to_lowercase().contains("upper"),
+            "expected upper() in SQL, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -4916,63 +6042,122 @@ mod tests {
         // the interface-splat path never even looked at `td.computed`.
         fn id_prop() -> PropertyDescriptor {
             PropertyDescriptor {
-                name: "id".into(), pg_type: "uuid".into(), nullable: false,
-                default_sql: Some("uuidv7()".into()), default_pyql: None, description: None,
-                check_constraints: vec![], is_exclusive: true, is_pk: true, is_readonly: true,
-                rewrites: vec![], tuple_members: None, column_type: None,
+                name: "id".into(),
+                pg_type: "uuid".into(),
+                nullable: false,
+                default_sql: Some("uuidv7()".into()),
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: true,
+                is_readonly: true,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
             }
         }
         let schema = SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
-                    name: "Account".into(), module: "default".into(), table: "Account".into(),
-                    abstract_: true, materialized: false, description: None,
-                    parents: vec![], interfaces: vec![],
-                    properties: vec![id_prop(), PropertyDescriptor {
-                        name: "email".into(), pg_type: "text".into(), nullable: false,
-                        default_sql: None, default_pyql: None, description: None,
-                        check_constraints: vec![], is_exclusive: false, is_pk: false,
-                        is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
-                    }],
-                    links: vec![], multilinks: vec![], computed: vec![], constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    name: "Account".into(),
+                    module: "default".into(),
+                    table: "Account".into(),
+                    abstract_: true,
+                    materialized: false,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec![],
+                    properties: vec![
+                        id_prop(),
+                        PropertyDescriptor {
+                            name: "email".into(),
+                            pg_type: "text".into(),
+                            nullable: false,
+                            default_sql: None,
+                            default_pyql: None,
+                            description: None,
+                            check_constraints: vec![],
+                            is_exclusive: false,
+                            is_pk: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            tuple_members: None,
+                            column_type: None,
+                        },
+                    ],
+                    links: vec![],
+                    multilinks: vec![],
+                    computed: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
                 TypeDescriptor {
-                    name: "Individual".into(), module: "default".into(), table: "Individual".into(),
-                    abstract_: false, materialized: true, description: None,
-                    parents: vec![], interfaces: vec!["default::Account".into()],
-                    properties: vec![id_prop(), PropertyDescriptor {
-                        name: "first_name".into(), pg_type: "text".into(), nullable: false,
-                        default_sql: None, default_pyql: None, description: None,
-                        check_constraints: vec![], is_exclusive: false, is_pk: false,
-                        is_readonly: false, rewrites: vec![], tuple_members: None, column_type: None,
-                    }],
-                    links: vec![], multilinks: vec![],
+                    name: "Individual".into(),
+                    module: "default".into(),
+                    table: "Individual".into(),
+                    abstract_: false,
+                    materialized: true,
+                    description: None,
+                    parents: vec![],
+                    interfaces: vec!["default::Account".into()],
+                    properties: vec![
+                        id_prop(),
+                        PropertyDescriptor {
+                            name: "first_name".into(),
+                            pg_type: "text".into(),
+                            nullable: false,
+                            default_sql: None,
+                            default_pyql: None,
+                            description: None,
+                            check_constraints: vec![],
+                            is_exclusive: false,
+                            is_pk: false,
+                            is_readonly: false,
+                            rewrites: vec![],
+                            tuple_members: None,
+                            column_type: None,
+                        },
+                    ],
+                    links: vec![],
+                    multilinks: vec![],
                     computed: vec![crate::schema::ComputedDescriptor {
                         name: "full_name".into(),
                         expression: "str_upper(.first_name)".into(),
                         return_type: Some("text".into()),
                     }],
                     constraints: vec![],
-                    indexes: vec![], vector_indexes: vec![], search_indexes: vec![],
-                    triggers: vec![], junction: false, signals: vec![],
+                    indexes: vec![],
+                    vector_indexes: vec![],
+                    search_indexes: vec![],
+                    triggers: vec![],
+                    junction: false,
+                    signals: vec![],
                 },
             ],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![],
-            functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
-        let out = compile_and_emit_with(
-            "SELECT Account { *, [is Individual].* }",
-            &schema,
-        );
+        let out = compile_and_emit_with("SELECT Account { *, [is Individual].* }", &schema);
         assert!(
             out.sql.to_lowercase().contains("upper"),
-            "expected the concrete type's computed pointer (str_upper(...)) in the shape, got:\n{}", out.sql
+            "expected the concrete type's computed pointer (str_upper(...)) in the shape, got:\n{}",
+            out.sql
         );
         assert!(
             out.sql.contains("\"first_name\""),
-            "expected the concrete type's stored property too, got:\n{}", out.sql
+            "expected the concrete type's stored property too, got:\n{}",
+            out.sql
         );
     }
 
@@ -4989,25 +6174,41 @@ mod tests {
     #[test]
     fn test_string_index_emits_str_subscript() {
         let out = compile_and_emit("SELECT 'hello'[1]");
-        assert!(out.sql.contains("_pylon.str_subscript"), "expected _pylon.str_subscript() for string index, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("_pylon.str_subscript"),
+            "expected _pylon.str_subscript() for string index, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_string_slice_emits_substr() {
         let out = compile_and_emit("SELECT 'hello'[1:3]");
-        assert!(out.sql.contains("substr"), "expected substr() for string slice, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("substr"),
+            "expected substr() for string slice, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_array_index_emits_subscript() {
         let out = compile_and_emit("SELECT [1, 2, 3][1]");
-        assert!(out.sql.contains("_pylon.array_subscript"), "expected _pylon.array_subscript() for array index, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("_pylon.array_subscript"),
+            "expected _pylon.array_subscript() for array index, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_array_slice_emits_subscript() {
         let out = compile_and_emit("SELECT [1, 2, 3][0:2]");
-        assert!(!out.sql.contains("substr"), "should not use substr for array, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("substr"),
+            "should not use substr for array, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains(")["), "expected array slice syntax, got:\n{}", out.sql);
     }
 
@@ -5031,12 +6232,26 @@ mod tests {
         // Key column referenced
         assert!(out.sql.contains("\"age\""), "expected age column, got:\n{}", out.sql);
         // array_agg for elements
-        assert!(out.sql.contains("array_agg(ROW("), "expected array_agg, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("array_agg(ROW("),
+            "expected array_agg, got:\n{}",
+            out.sql
+        );
         // grouping names array
-        assert!(out.sql.contains("ARRAY['age']"), "expected grouping array, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("ARRAY['age']"),
+            "expected grouping array, got:\n{}",
+            out.sql
+        );
         // shape node is Group
         assert!(matches!(out.shape.root, crate::query::ShapeNode::Group { .. }));
-        if let crate::query::ShapeNode::Group { key_nodes, grouping_position, elements_position, .. } = &out.shape.root {
+        if let crate::query::ShapeNode::Group {
+            key_nodes,
+            grouping_position,
+            elements_position,
+            ..
+        } = &out.shape.root
+        {
             assert_eq!(key_nodes.len(), 1);
             assert!(matches!(&key_nodes[0], crate::query::ShapeNode::Scalar { name, position: 1 } if name == "age"));
             assert_eq!(*grouping_position, 2);
@@ -5048,7 +6263,11 @@ mod tests {
     fn test_group_using_alias() {
         let out = compile_and_emit("group Person using decade := .age // 10 by decade");
         assert!(out.sql.contains("GROUP BY"), "expected GROUP BY, got:\n{}", out.sql);
-        assert!(out.sql.contains("ARRAY['decade']"), "expected grouping array, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("ARRAY['decade']"),
+            "expected grouping array, got:\n{}",
+            out.sql
+        );
         if let crate::query::ShapeNode::Group { key_nodes, .. } = &out.shape.root {
             assert_eq!(key_nodes.len(), 1);
             assert!(matches!(&key_nodes[0], crate::query::ShapeNode::Scalar { name, .. } if name == "decade"));
@@ -5073,7 +6292,11 @@ mod tests {
     #[test]
     fn test_pgvector_cast_emits_vector_type() {
         let out = compile_and_emit("SELECT <pgvector::vector>[1.0, 2.0, 3.0]");
-        assert!(out.sql.contains("::vector"), "expected ::vector cast, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("::vector"),
+            "expected ::vector cast, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("ARRAY["), "expected ARRAY literal, got:\n{}", out.sql);
     }
 
@@ -5113,51 +6336,86 @@ mod tests {
     #[test]
     fn test_crypto_digest_str_and_bytes_overloads_both_use_pgcrypto_digest() {
         let out = compile_and_emit("SELECT crypto::digest('hello', 'sha256')");
-        assert!(out.sql.contains("digest("), "expected pgcrypto's digest(), got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("digest("),
+            "expected pgcrypto's digest(), got:\n{}",
+            out.sql
+        );
 
         let out = compile_and_emit("SELECT crypto::digest(std::from_hex('68656c6c6f'), 'sha256')");
-        assert!(out.sql.contains("digest("), "expected pgcrypto's digest(), got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("digest("),
+            "expected pgcrypto's digest(), got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_crypto_hmac_str_and_bytes_overloads_both_use_pgcrypto_hmac() {
         let out = compile_and_emit("SELECT crypto::hmac('hello', 'key', 'sha256')");
-        assert!(out.sql.contains("hmac("), "expected pgcrypto's hmac(), got:\n{}", out.sql);
-
-        let out = compile_and_emit(
-            "SELECT crypto::hmac(std::from_hex('68656c6c6f'), std::from_hex('6b6579'), 'sha256')",
+        assert!(
+            out.sql.contains("hmac("),
+            "expected pgcrypto's hmac(), got:\n{}",
+            out.sql
         );
-        assert!(out.sql.contains("hmac("), "expected pgcrypto's hmac(), got:\n{}", out.sql);
+
+        let out =
+            compile_and_emit("SELECT crypto::hmac(std::from_hex('68656c6c6f'), std::from_hex('6b6579'), 'sha256')");
+        assert!(
+            out.sql.contains("hmac("),
+            "expected pgcrypto's hmac(), got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_crypto_gen_salt_zero_arg_defaults_to_blowfish() {
         let out = compile_and_emit("SELECT crypto::gen_salt()");
-        assert!(out.sql.contains("gen_salt('bf')"), "expected default 'bf' salt type, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("gen_salt('bf')"),
+            "expected default 'bf' salt type, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_crypto_gen_salt_one_arg_passes_type_through() {
         let out = compile_and_emit("SELECT crypto::gen_salt('xdes')");
-        assert!(out.sql.contains("gen_salt("), "expected gen_salt() call, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("gen_salt("),
+            "expected gen_salt() call, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_crypto_gen_salt_iter_count_casts_to_int4() {
         let out = compile_and_emit("SELECT crypto::gen_salt('xdes', 5)");
-        assert!(out.sql.contains("::int4"), "expected int8 -> int4 narrowing cast, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("::int4"),
+            "expected int8 -> int4 narrowing cast, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_crypto_crypt_uses_pgcrypto_crypt() {
         let out = compile_and_emit("SELECT crypto::crypt('hunter2', crypto::gen_salt())");
-        assert!(out.sql.contains("crypt("), "expected pgcrypto's crypt(), got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("crypt("),
+            "expected pgcrypto's crypt(), got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_postgis_cast_emits_geometry_type() {
         let out = compile_and_emit("SELECT <postgis::geometry>'POINT(1 2)'");
-        assert!(out.sql.contains("::geometry"), "expected ::geometry cast, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("::geometry"),
+            "expected ::geometry cast, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5169,19 +6427,33 @@ mod tests {
     #[test]
     fn test_postgis_area_geometry_and_geography_overloads() {
         let out = compile_and_emit("SELECT postgis::area(<postgis::geometry>'POINT(1 2)')");
-        assert!(out.sql.contains("st_area("), "expected st_area() call, got:\n{}", out.sql);
-
-        let out = compile_and_emit(
-            "SELECT postgis::area(<postgis::geography>'POINT(1 2)', true)",
+        assert!(
+            out.sql.contains("st_area("),
+            "expected st_area() call, got:\n{}",
+            out.sql
         );
-        assert!(out.sql.contains("st_area("), "expected st_area() call, got:\n{}", out.sql);
+
+        let out = compile_and_emit("SELECT postgis::area(<postgis::geography>'POINT(1 2)', true)");
+        assert!(
+            out.sql.contains("st_area("),
+            "expected st_area() call, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_postgis_setsrid_casts_int64_arg_to_int4() {
         let out = compile_and_emit("SELECT postgis::setsrid(<postgis::geometry>'POINT(1 2)', 4326)");
-        assert!(out.sql.contains("st_setsrid("), "expected st_setsrid() call, got:\n{}", out.sql);
-        assert!(out.sql.contains("::int4"), "expected int8 -> int4 narrowing cast, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("st_setsrid("),
+            "expected st_setsrid() call, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("::int4"),
+            "expected int8 -> int4 narrowing cast, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5190,14 +6462,10 @@ mod tests {
         // params; Pylon has no notion of default args, so each arity is
         // its own registered overload — confirm both the 2-arg and 4-arg
         // forms resolve.
-        let out = compile_and_emit(
-            "SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5)",
-        );
+        let out = compile_and_emit("SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5)");
         assert!(out.sql.contains("st_quantizecoordinates("), "got:\n{}", out.sql);
 
-        let out = compile_and_emit(
-            "SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5, 5, 5)",
-        );
+        let out = compile_and_emit("SELECT postgis::quantizecoordinates(<postgis::geometry>'POINT(1 2)', 5, 5, 5)");
         assert!(out.sql.contains("st_quantizecoordinates("), "got:\n{}", out.sql);
     }
 
@@ -5211,7 +6479,11 @@ mod tests {
             "SELECT postgis::op_contains(<postgis::geometry>'POINT(1 2)', <postgis::geometry>'POINT(3 4)')",
         );
         assert!(out.sql.contains(" ~ "), "expected infix ~ operator, got:\n{}", out.sql);
-        assert!(!out.sql.contains("op_contains("), "must not call a literal op_contains function, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("op_contains("),
+            "must not call a literal op_contains function, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5219,12 +6491,20 @@ mod tests {
         let out = compile_and_emit(
             "SELECT postgis::op_overlaps(<postgis::geometry>'POINT(1 2)', <postgis::geometry>'POINT(3 4)')",
         );
-        assert!(out.sql.contains(" && "), "expected infix && operator, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(" && "),
+            "expected infix && operator, got:\n{}",
+            out.sql
+        );
 
         let out = compile_and_emit(
             "SELECT postgis::op_overlaps(<postgis::geography>'POINT(1 2)', <postgis::geography>'POINT(3 4)')",
         );
-        assert!(out.sql.contains(" && "), "expected infix && operator, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(" && "),
+            "expected infix && operator, got:\n{}",
+            out.sql
+        );
     }
 
     // ── User-defined function tests ───────────────────────────────────────────
@@ -5236,8 +6516,14 @@ mod tests {
                 name: "mysum".into(),
                 module: "default".into(),
                 params: vec![
-                    FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() },
-                    FunctionParamDescriptor { name: "b".into(), pg_type: "int8".into() },
+                    FunctionParamDescriptor {
+                        name: "a".into(),
+                        pg_type: "int8".into(),
+                    },
+                    FunctionParamDescriptor {
+                        name: "b".into(),
+                        pg_type: "int8".into(),
+                    },
                 ],
                 return_pg_type: "int8".into(),
                 return_is_object: false,
@@ -5267,9 +6553,18 @@ mod tests {
                 name: "mysum".into(),
                 module: "default".into(),
                 params: vec![
-                    FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() },
-                    FunctionParamDescriptor { name: "b".into(), pg_type: "int8".into() },
-                    FunctionParamDescriptor { name: "c".into(), pg_type: "int8".into() },
+                    FunctionParamDescriptor {
+                        name: "a".into(),
+                        pg_type: "int8".into(),
+                    },
+                    FunctionParamDescriptor {
+                        name: "b".into(),
+                        pg_type: "int8".into(),
+                    },
+                    FunctionParamDescriptor {
+                        name: "c".into(),
+                        pg_type: "int8".into(),
+                    },
                 ],
                 return_pg_type: "int8".into(),
                 return_is_object: false,
@@ -5298,15 +6593,18 @@ mod tests {
         let schema = make_schema_with_fns();
         let out = compile_and_emit_with("SELECT mysum(1, 2, 3)", &schema);
         assert!(
-            out.sql.contains("\"public\".\"mysum\"((1)::int8, (2)::int8, (3)::int8)"),
-            "got:\n{}", out.sql,
+            out.sql
+                .contains("\"public\".\"mysum\"((1)::int8, (2)::int8, (3)::int8)"),
+            "got:\n{}",
+            out.sql,
         );
 
         // The 2-arg call must still resolve to the 2-arg overload.
         let out = compile_and_emit_with("SELECT mysum(1, 2)", &schema);
         assert!(
             out.sql.contains("\"public\".\"mysum\"((1)::int8, (2)::int8)"),
-            "got:\n{}", out.sql,
+            "got:\n{}",
+            out.sql,
         );
     }
 
@@ -5331,16 +6629,17 @@ mod tests {
         // Regression: FunctionSelect as a CTE source must emit SELECT * FROM fn()
         // so the outer query can reference raw columns like t1.age.
         let schema = make_schema_with_fns();
-        let out = compile_and_emit_with(
-            "WITH persons := adults() SELECT persons FILTER .age > 25",
-            &schema,
-        );
+        let out = compile_and_emit_with("WITH persons := adults() SELECT persons FILTER .age > 25", &schema);
         assert!(
             out.sql.contains("SELECT * FROM \"public\".\"adults\"()"),
             "CTE source must be SELECT * FROM fn(), got:\n{}",
             out.sql,
         );
-        assert!(out.sql.contains("\"age\""), "outer filter must reference raw column, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"age\""),
+            "outer filter must reference raw column, got:\n{}",
+            out.sql
+        );
     }
 
     // ── vector::search tests ──────────────────────────────────────────────────
@@ -5368,7 +6667,11 @@ mod tests {
              SELECT search { object { name }, distance }",
             &schema,
         );
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
     }
 
@@ -5380,7 +6683,11 @@ mod tests {
              SELECT search { object { name }, distance }",
             &schema,
         );
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
     }
 
@@ -5392,7 +6699,11 @@ mod tests {
              SELECT search { object { name }, distance }",
             &schema,
         );
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("\"name\""), "expected name filter, got:\n{}", out.sql);
         assert!(out.sql.contains("Alice"), "expected filter value, got:\n{}", out.sql);
         assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
@@ -5406,7 +6717,11 @@ mod tests {
              SELECT search { object { name }, distance }",
             &schema,
         );
-        assert!(out.sql.contains("\"age\""), "expected age pre-filter, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"age\""),
+            "expected age pre-filter, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("18"), "expected filter value 18, got:\n{}", out.sql);
         assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
     }
@@ -5419,9 +6734,21 @@ mod tests {
              SELECT search { object { name }, distance }",
             &schema,
         );
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
-        assert!(out.sql.contains("Alice"), "expected pre-filter value, got:\n{}", out.sql);
-        assert!(out.sql.contains("float8[]"), "expected float8[] cast for deferred vec param, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("Alice"),
+            "expected pre-filter value, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("float8[]"),
+            "expected float8[] cast for deferred vec param, got:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("<=>"), "expected cosine operator, got:\n{}", out.sql);
     }
 
@@ -5429,28 +6756,44 @@ mod tests {
     fn test_count_type_ref_compiles_to_agg_over_query() {
         let out = compile_and_emit("SELECT count(Person)");
         assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_count_qualified_type_ref_compiles_to_agg_over_query() {
         let out = compile_and_emit("SELECT count(default::Person)");
         assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_count_subquery_compiles_to_agg_over_query() {
         let out = compile_and_emit("SELECT count((select Person))");
         assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
-        assert!(out.sql.contains("\"Person\""), "expected Person table, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_count_subquery_with_filter() {
         let out = compile_and_emit("SELECT count((select Person filter .name = 'Alice'))");
         assert!(out.sql.contains("count(*)"), "expected count(*), got:\n{}", out.sql);
-        assert!(out.sql.contains("\"name\""), "expected filter on name, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"name\""),
+            "expected filter on name, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5469,7 +6812,12 @@ mod tests {
     #[test]
     fn test_repeated_positional_param_reuses_slot() {
         let out = compile_and_emit("SELECT Person FILTER .name = $0 OR .name = $0");
-        assert_eq!(out.sql.matches("$1").count(), 2, "both uses must reference $1, got:\n{}", out.sql);
+        assert_eq!(
+            out.sql.matches("$1").count(),
+            2,
+            "both uses must reference $1, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5524,11 +6872,13 @@ mod tests {
         let out = compile_and_emit_with("SELECT <default::Email>'test@test.de'", &schema);
         assert!(
             out.sql.contains("\"public\".\"Email\""),
-            "expected a cast to the scalar's own domain, got:\n{}", out.sql
+            "expected a cast to the scalar's own domain, got:\n{}",
+            out.sql
         );
         assert!(
             !out.sql.to_lowercase().contains("\"person\""),
-            "must not be misrouted to an object-type lookup, got:\n{}", out.sql
+            "must not be misrouted to an object-type lookup, got:\n{}",
+            out.sql
         );
     }
 
@@ -5747,9 +7097,7 @@ mod tests {
 
     #[test]
     fn test_structural_tuple_cast_nested_resolves_to_jsonb() {
-        let out = compile_and_emit(
-            "SELECT <tuple<point: tuple<x: float64, y: float64>, label: str>>$p",
-        );
+        let out = compile_and_emit("SELECT <tuple<point: tuple<x: float64, y: float64>, label: str>>$p");
         assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
     }
 
@@ -5771,8 +7119,16 @@ mod tests {
         // resolve to a real Postgres array (text[]), never jsonb (arrays
         // decode natively via asyncpg, unlike tuples).
         let out = compile_and_emit("SELECT <array<str>>['foo', 'bar']");
-        assert!(out.sql.contains("::text[]") || out.sql.contains("ARRAY["), "got:\n{}", out.sql);
-        assert!(!out.sql.contains("jsonb"), "arrays must not use jsonb, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("::text[]") || out.sql.contains("ARRAY["),
+            "got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("jsonb"),
+            "arrays must not use jsonb, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5808,18 +7164,18 @@ mod tests {
         // overload (str, str), emitting a bogus `strpos(text[], text)` call.
         let out = compile_and_emit("SELECT contains(<array<str>>[1, 2], '2')");
         assert!(out.sql.contains("@> ARRAY["), "got:\n{}", out.sql);
-        assert!(!out.sql.contains("strpos"), "must not fall back to the str/str overload, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("strpos"),
+            "must not fall back to the str/str overload, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_nested_array_type_rejected_at_parse_time() {
         match parse::parse("SELECT <array<array<str>>>$p") {
             Ok(_) => panic!("expected parse error for nested array type"),
-            Err(e) => assert!(
-                e.to_string().contains("nested arrays are not supported"),
-                "got: {}",
-                e
-            ),
+            Err(e) => assert!(e.to_string().contains("nested arrays are not supported"), "got: {}", e),
         }
     }
 
@@ -5839,8 +7195,18 @@ mod tests {
             name: "Point".into(),
             module: "default".into(),
             members: vec![
-                TupleMemberDescriptor { name: Some("x".into()), kind: TupleMemberKind::Scalar { pg_type: "float8".into() } },
-                TupleMemberDescriptor { name: Some("y".into()), kind: TupleMemberKind::Scalar { pg_type: "float8".into() } },
+                TupleMemberDescriptor {
+                    name: Some("x".into()),
+                    kind: TupleMemberKind::Scalar {
+                        pg_type: "float8".into(),
+                    },
+                },
+                TupleMemberDescriptor {
+                    name: Some("y".into()),
+                    kind: TupleMemberKind::Scalar {
+                        pg_type: "float8".into(),
+                    },
+                },
             ],
         });
         let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
@@ -5909,7 +7275,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let out = compile_and_emit_with("SELECT Person { address }", &schema);
         assert!(out.sql.contains("::jsonb"), "got:\n{}", out.sql);
@@ -5996,7 +7363,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let out = compile_and_emit_with("SELECT Person.address", &schema);
         match &out.shape.root {
@@ -6064,7 +7432,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions: vec![],
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         // Regression: a structural (unnamed) tuple property previously failed
         // path traversal with "'address' is a scalar property, not a link —
@@ -6094,19 +7463,14 @@ mod tests {
     fn test_tuple_cast_mixed_named_and_unnamed_elements_rejected() {
         match parse::parse("SELECT <tuple<x: float64, bool>>$p") {
             Ok(_) => panic!("expected parse error for mixed named/unnamed tuple elements"),
-            Err(e) => assert!(
-                e.to_string().contains("all named or all unnamed"),
-                "got: {}",
-                e
-            ),
+            Err(e) => assert!(e.to_string().contains("all named or all unnamed"), "got: {}", e),
         }
     }
 
     #[test]
     fn test_is_with_tuple_type_rejected() {
         let schema = make_schema();
-        let ast = parse::parse("SELECT Person FILTER Person is tuple<x: float64, y: float64>")
-            .unwrap();
+        let ast = parse::parse("SELECT Person FILTER Person is tuple<x: float64, y: float64>").unwrap();
         match ir::compile(&ast, &schema) {
             Ok(_) => panic!("expected error for IS with a tuple type"),
             Err(e) => {
@@ -6157,7 +7521,8 @@ mod tests {
             Ok(_) => panic!("expected out-of-bounds tuple index error"),
             Err(e) => {
                 assert!(
-                    e.to_string().contains("2 is not a member of tuple<std::int64, std::str>"),
+                    e.to_string()
+                        .contains("2 is not a member of tuple<std::int64, std::str>"),
                     "got: {}",
                     e
                 );
@@ -6171,7 +7536,11 @@ mod tests {
         // silently jsonb-wrapped unchanged as a string; it's coerced to
         // int8.
         let out = compile_and_emit("SELECT <tuple<int64, str>>(1, 'x')");
-        assert!(out.sql.contains("jsonb_build_array((1)::int8, ('x')::text)"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("jsonb_build_array((1)::int8, ('x')::text)"),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6180,7 +7549,11 @@ mod tests {
         // int64 and an int literal to str must actually coerce each one, not
         // just pass the raw literal through untouched.
         let out = compile_and_emit("SELECT <tuple<int64, str>>('1', 3)");
-        assert!(out.sql.contains("jsonb_build_array(('1')::int8, (3)::text)"), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("jsonb_build_array(('1')::int8, (3)::text)"),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6225,7 +7598,10 @@ mod tests {
             td.search_indexes.push(SearchIndexDescriptor {
                 index_name: None,
                 backend,
-                pointers: vec![SearchPointerDescriptor { name: "name".into(), weight: SearchWeight::A }],
+                pointers: vec![SearchPointerDescriptor {
+                    name: "name".into(),
+                    weight: SearchWeight::A,
+                }],
             });
         }
         s
@@ -6240,7 +7616,11 @@ mod tests {
             "expected a Meilisearch outbox enqueue CTE, got:\n{}",
             out.sql,
         );
-        assert!(out.sql.contains("INSERT INTO _pylon.\"IndexOutbox\""), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("INSERT INTO _pylon.\"IndexOutbox\""),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6260,7 +7640,11 @@ mod tests {
         // trigger-updated tsvector column — no async worker involved.
         let schema = make_schema_with_search_index(crate::schema::SearchBackend::Postgres);
         let out = compile_and_emit_with("INSERT Person { name := 'Alice', age := 30 }", &schema);
-        assert!(!out.sql.contains("_pylon.\"IndexOutbox\""), "did not expect an outbox enqueue, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("_pylon.\"IndexOutbox\""),
+            "did not expect an outbox enqueue, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6283,7 +7667,11 @@ mod tests {
             "expected a Meilisearch outbox enqueue CTE, got:\n{}",
             out.sql,
         );
-        assert!(out.sql.contains("'delete'"), "expected the delete operation literal, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("'delete'"),
+            "expected the delete operation literal, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6295,15 +7683,22 @@ mod tests {
         let out = compile_and_emit("SELECT std::overlaps(std::range(1, 3), std::range(2, 5))");
         assert!(out.sql.contains("int8range(1, 3)"), "got:\n{}", out.sql);
         assert!(out.sql.contains("int8range(2, 5)"), "got:\n{}", out.sql);
-        assert!(out.sql.contains(" && "), "expected infix && for overlaps, got:\n{}", out.sql);
-        assert!(!out.sql.contains("\"std\""), "must not emit a literal std schema call, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(" && "),
+            "expected infix && for overlaps, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("\"std\""),
+            "must not emit a literal std schema call, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_range_intrinsic_resolves_datetime_to_tstzrange() {
-        let out = compile_and_emit(
-            "SELECT std::range(<datetime>'2024-01-01T00:00:00Z', <datetime>'2024-06-01T00:00:00Z')",
-        );
+        let out =
+            compile_and_emit("SELECT std::range(<datetime>'2024-01-01T00:00:00Z', <datetime>'2024-06-01T00:00:00Z')");
         assert!(out.sql.contains("tstzrange("), "got:\n{}", out.sql);
     }
 
@@ -6311,14 +7706,21 @@ mod tests {
     fn test_range_intrinsic_four_arg_form_computes_bounds_string() {
         let out = compile_and_emit("SELECT std::range(1, 3, true, false)");
         assert!(out.sql.contains("int8range(1, 3,"), "got:\n{}", out.sql);
-        assert!(out.sql.contains("CASE WHEN"), "expected a dynamic bounds-string CASE, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("CASE WHEN"),
+            "expected a dynamic bounds-string CASE, got:\n{}",
+            out.sql
+        );
     }
 
     #[test]
     fn test_multirange_intrinsic_resolves_from_range_element() {
         let out = compile_and_emit("SELECT std::multirange([std::range(1, 3), std::range(5, 7)])");
         assert!(out.sql.contains("int8multirange(VARIADIC "), "got:\n{}", out.sql);
-        assert!(!out.sql.contains("\"std\""), "must not emit a literal std schema call, got:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("\"std\""),
+            "must not emit a literal std schema call, got:\n{}",
+            out.sql
+        );
     }
 }
-

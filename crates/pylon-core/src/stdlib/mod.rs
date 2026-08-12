@@ -19,8 +19,8 @@
 
 use std::sync::OnceLock;
 
-mod registry;
 pub mod ddl;
+mod registry;
 pub use ddl::export_stdlib;
 
 // ── Type system ──────────────────────────────────────────────────────────────

@@ -57,8 +57,12 @@ fn embed_text<'py>(
                 "AnthropicProvider does not support embeddings",
             ));
         }
-        let provider = pylon_providers::OpenAiProvider::new(&api_url, &model, api_key.as_deref()).map_err(providers_err)?;
-        let mut batch = provider.embed_batch(std::slice::from_ref(&text)).await.map_err(providers_err)?;
+        let provider =
+            pylon_providers::OpenAiProvider::new(&api_url, &model, api_key.as_deref()).map_err(providers_err)?;
+        let mut batch = provider
+            .embed_batch(std::slice::from_ref(&text))
+            .await
+            .map_err(providers_err)?;
         Ok(batch.pop().expect("embed_batch returns one vector per input text"))
     })
 }

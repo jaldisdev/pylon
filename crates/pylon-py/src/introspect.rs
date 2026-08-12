@@ -25,8 +25,8 @@ use pyo3::prelude::*;
 
 use pylon_core as core;
 
-use crate::pgcon::{pgcon_err, PgconPool};
 use crate::DbState;
+use crate::pgcon::{PgconPool, pgcon_err};
 
 /// Query pg_catalog and return a `DbState` describing the live database.
 #[pyfunction]

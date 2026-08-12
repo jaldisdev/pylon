@@ -32,16 +32,14 @@
 
 use pylon_core::query;
 use pylon_core::schema::{
-    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor,
-    TriggerDescriptor,
+    LinkDescriptor, MultiLinkDescriptor, PropertyDescriptor, RewriteEntry, SchemaDescriptor, TriggerDescriptor,
 };
 use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::DecodedValue;
 use std::collections::HashMap;
 
 pub fn test_dsn() -> String {
-    std::env::var("PYLON_PGCON_TEST_DSN")
-        .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+    std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
 }
 
 pub async fn test_pool() -> PgPool {
@@ -63,10 +61,7 @@ pub fn unique_module(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}_{nanos}_{seq}")
 }
@@ -142,11 +137,7 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
 /// A multilink backed by an explicit `@pylon.junction` type (`Through[...]`
 /// in the schema DSL) — the junction type itself carries the link
 /// properties, referenced in PyQL via `@propname`.
-pub fn multilink_through(
-    name: &str,
-    target_qname: &str,
-    through_qname: &str,
-) -> MultiLinkDescriptor {
+pub fn multilink_through(name: &str, target_qname: &str, through_qname: &str) -> MultiLinkDescriptor {
     MultiLinkDescriptor {
         name: name.into(),
         target: target_qname.into(),
@@ -187,9 +178,7 @@ pub fn rewrite(on: u8, handler: &str) -> RewriteEntry {
 /// every "no phantom changes after apply" test needs (see
 /// `live_execution_migration_diff.rs`).
 pub async fn assert_zero_further_steps(pool: &PgPool, schema: &SchemaDescriptor) {
-    let live = pylon_core::introspect::introspect_db_state(pool)
-        .await
-        .unwrap();
+    let live = pylon_core::introspect::introspect_db_state(pool).await.unwrap();
     let steps = pylon_core::diff::diff_schema_steps(schema, &live, &HashMap::new()).unwrap();
     assert!(
         steps.is_empty(),

@@ -120,7 +120,9 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             for c in &upd.multi_link_clears {
                 tags.push(qualify(&c.module, &c.junction_table));
             }
-            for m in upd.multi_link_replaces.iter()
+            for m in upd
+                .multi_link_replaces
+                .iter()
                 .chain(&upd.multi_link_appends)
                 .chain(&upd.multi_link_removals)
             {
@@ -253,8 +255,7 @@ fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
     }
     for j in &ps.joins {
         match j {
-            IrPathJoin::Single { target, .. }
-            | IrPathJoin::BacklinkSingle { target, .. } => tags.push(tag_for(target)),
+            IrPathJoin::Single { target, .. } | IrPathJoin::BacklinkSingle { target, .. } => tags.push(tag_for(target)),
             // A junction is involved — a write to it (e.g. re-linking a
             // junction-backed single link, or appending/removing a
             // multi-link target) must also invalidate this query's cache
@@ -263,7 +264,12 @@ fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
                 tags.push(tag_for(target));
                 tag_junction(join, tags);
             }
-            IrPathJoin::BacklinkMulti { junction_table, module, target, .. } => {
+            IrPathJoin::BacklinkMulti {
+                junction_table,
+                module,
+                target,
+                ..
+            } => {
                 tags.push(tag_for(target));
                 tags.push(qualify(module, junction_table));
             }
@@ -298,8 +304,12 @@ fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
 fn tag_junction(join: &IrMultiLinkJoin, tags: &mut Vec<String>) {
     match join {
         IrMultiLinkJoin::Standard { junction_table, module }
-        | IrMultiLinkJoin::Through { junction_table, module, .. }
-        | IrMultiLinkJoin::BacklinkJunction { junction_table, module, .. } => {
+        | IrMultiLinkJoin::Through {
+            junction_table, module, ..
+        }
+        | IrMultiLinkJoin::BacklinkJunction {
+            junction_table, module, ..
+        } => {
             tags.push(qualify(module, junction_table));
         }
         // No junction table involved — the owner table's own tag comes from
@@ -354,7 +364,12 @@ fn collect_array_source(src: &IrArraySource, tags: &mut Vec<String>) {
     match src {
         IrArraySource::Select(sel) => collect_select(sel, tags),
         IrArraySource::PathSelect(ps) => collect_path_select(ps, tags),
-        IrArraySource::RawExpr { source, poly_implementors, expr, .. } => {
+        IrArraySource::RawExpr {
+            source,
+            poly_implementors,
+            expr,
+            ..
+        } => {
             tags.push(tag_for(source));
             for imp in poly_implementors {
                 tags.push(tag_for_implementor(imp));
@@ -454,23 +469,40 @@ mod tests {
     use super::*;
 
     fn src(type_name: &str, table: &str, alias: &str) -> IrSource {
-        IrSource { type_name: type_name.into(), table: table.into(), alias: alias.into() }
+        IrSource {
+            type_name: type_name.into(),
+            table: table.into(),
+            alias: alias.into(),
+        }
     }
 
     fn output(stmt: IrStmt) -> IrOutput {
-        IrOutput { stmt, params: vec![], ctes: vec![], global_ctes: vec![], warnings: vec![] }
+        IrOutput {
+            stmt,
+            params: vec![],
+            ctes: vec![],
+            global_ctes: vec![],
+            warnings: vec![],
+        }
     }
 
     fn scalar_pointer(alias: &str) -> IrShapePointer {
         IrShapePointer::Scalar(IrScalarPointer {
             marker_offset: None,
-            alias: alias.into(), column: alias.into(), pg_type: "text".into(), tuple_shape: None,
+            alias: alias.into(),
+            column: alias.into(),
+            pg_type: "text".into(),
+            tuple_shape: None,
         })
     }
 
     #[test]
     fn bound_select_tags_its_own_table_under_public_for_default_module() {
-        let sel = IrSelect::schema_bound(src("default::Person", "person", "t0"), vec![scalar_pointer("name")], None);
+        let sel = IrSelect::schema_bound(
+            src("default::Person", "person", "t0"),
+            vec![scalar_pointer("name")],
+            None,
+        );
         let out = output(IrStmt::Select(sel));
         assert_eq!(collect_tags(&out), vec!["public.person"]);
     }
@@ -488,7 +520,10 @@ mod tests {
         let link = IrShapePointer::SingleLink(IrSingleLinkPointer {
             marker_offset: None,
             alias: "company".into(),
-            correlation: IrSingleLinkCorrelation::Fk { fk_column: "company_id".into(), target_pk: "id".into() },
+            correlation: IrSingleLinkCorrelation::Fk {
+                fk_column: "company_id".into(),
+                target_pk: "id".into(),
+            },
             subquery: inner,
             link_properties: vec![],
         });
@@ -511,7 +546,10 @@ mod tests {
             marker_offset: None,
             alias: "spouse".into(),
             correlation: IrSingleLinkCorrelation::Junction {
-                join: IrMultiLinkJoin::Standard { junction_table: "person.spouse".into(), module: "default".into() },
+                join: IrMultiLinkJoin::Standard {
+                    junction_table: "person.spouse".into(),
+                    module: "default".into(),
+                },
                 target_pk: "id".into(),
             },
             subquery: inner,
@@ -519,7 +557,10 @@ mod tests {
         });
         let sel = IrSelect::schema_bound(src("default::Person", "person", "t0"), vec![link], None);
         let out = output(IrStmt::Select(sel));
-        assert_eq!(collect_tags(&out), vec!["public.org", "public.person", "public.person.spouse"]);
+        assert_eq!(
+            collect_tags(&out),
+            vec!["public.org", "public.person", "public.person.spouse"]
+        );
     }
 
     #[test]
@@ -532,10 +573,17 @@ mod tests {
             joins: vec![IrPathJoin::Multi {
                 source_alias: "t0".into(),
                 junction_alias: "jt".into(),
-                join: IrMultiLinkJoin::Standard { junction_table: "person.spouse".into(), module: "default".into() },
+                join: IrMultiLinkJoin::Standard {
+                    junction_table: "person.spouse".into(),
+                    module: "default".into(),
+                },
                 target: src("default::Org", "org", "t1"),
             }],
-            result: IrPathResult::Object { alias: "t1".into(), type_name: "default::Org".into(), shape: vec![] },
+            result: IrPathResult::Object {
+                alias: "t1".into(),
+                type_name: "default::Org".into(),
+                shape: vec![],
+            },
             filter: None,
             order_by: vec![],
             offset: None,
@@ -544,7 +592,10 @@ mod tests {
             poly_implementors: vec![],
         };
         let out = output(IrStmt::PathSelect(ps));
-        assert_eq!(collect_tags(&out), vec!["public.org", "public.person", "public.person.spouse"]);
+        assert_eq!(
+            collect_tags(&out),
+            vec!["public.org", "public.person", "public.person.spouse"]
+        );
     }
 
     #[test]
@@ -553,13 +604,19 @@ mod tests {
         let ml = IrShapePointer::MultiLink(IrMultiLinkPointer {
             marker_offset: None,
             alias: "posts".into(),
-            join: IrMultiLinkJoin::Standard { junction_table: "person.posts".into(), module: "default".into() },
+            join: IrMultiLinkJoin::Standard {
+                junction_table: "person.posts".into(),
+                module: "default".into(),
+            },
             subquery: inner,
             link_properties: vec![],
         });
         let sel = IrSelect::schema_bound(src("default::Person", "person", "t0"), vec![ml], None);
         let out = output(IrStmt::Select(sel));
-        assert_eq!(collect_tags(&out), vec!["public.person", "public.person.posts", "public.post"]);
+        assert_eq!(
+            collect_tags(&out),
+            vec!["public.person", "public.person.posts", "public.post"]
+        );
     }
 
     #[test]
@@ -567,8 +624,16 @@ mod tests {
         let mut sel = IrSelect::schema_bound(src("default::Animal", "animal", "t0"), vec![], None);
         sel.polymorphic = true;
         sel.poly_implementors = vec![
-            IrPolyImplementor { type_name: "default::Dog".into(), table: "dog".into(), module: "default".into() },
-            IrPolyImplementor { type_name: "default::Cat".into(), table: "cat".into(), module: "default".into() },
+            IrPolyImplementor {
+                type_name: "default::Dog".into(),
+                table: "dog".into(),
+                module: "default".into(),
+            },
+            IrPolyImplementor {
+                type_name: "default::Cat".into(),
+                table: "cat".into(),
+                module: "default".into(),
+            },
         ];
         let out = output(IrStmt::Select(sel));
         assert_eq!(collect_tags(&out), vec!["public.animal", "public.cat", "public.dog"]);
@@ -590,9 +655,11 @@ mod tests {
                 source_col: "source".into(),
                 target_col: "target".into(),
                 values: IrMultiLinkValues {
-                    source: IrMultiLinkValueSource::Select(Box::new(
-                        IrSelect::schema_bound(src("default::Post", "post", "t1"), vec![], None),
-                    )),
+                    source: IrMultiLinkValueSource::Select(Box::new(IrSelect::schema_bound(
+                        src("default::Post", "post", "t1"),
+                        vec![],
+                        None,
+                    ))),
                     link_props: vec![],
                 },
                 single: false,
@@ -600,7 +667,10 @@ mod tests {
             nested_ctes: vec![],
         };
         let out = output(IrStmt::Insert(ins));
-        assert_eq!(collect_tags(&out), vec!["public.person", "public.person.posts", "public.post"]);
+        assert_eq!(
+            collect_tags(&out),
+            vec!["public.person", "public.person.posts", "public.post"]
+        );
     }
 
     #[test]
@@ -616,7 +686,9 @@ mod tests {
             poly_implementors: vec![],
             poly_columns: vec![],
             multi_link_clears: vec![IrMultiLinkClear {
-                junction_table: "person.posts".into(), module: "default".into(), source_col: "source".into(),
+                junction_table: "person.posts".into(),
+                module: "default".into(),
+                source_col: "source".into(),
             }],
             multi_link_replaces: vec![],
             multi_link_appends: vec![],
@@ -660,12 +732,16 @@ mod tests {
             stmt: IrStmt::Select(cte_sel),
             type_name: "default::Company".into(),
         });
-        out.global_ctes.push(IrGlobalCte::Computed(IrComputedGlobalCte {
-            cte_name: "g".into(),
-            qualified_name: "default::current_user".into(),
-            stmt: IrStmt::Select(IrSelect::schema_bound(src("default::Post", "post", "t2"), vec![], None)),
-        }));
-        assert_eq!(collect_tags(&out), vec!["public.company", "public.person", "public.post"]);
+        out.global_ctes
+            .push(IrGlobalCte::Computed(Box::new(IrComputedGlobalCte {
+                cte_name: "g".into(),
+                qualified_name: "default::current_user".into(),
+                stmt: IrStmt::Select(IrSelect::schema_bound(src("default::Post", "post", "t2"), vec![], None)),
+            })));
+        assert_eq!(
+            collect_tags(&out),
+            vec!["public.company", "public.person", "public.post"]
+        );
     }
 
     #[test]
@@ -675,14 +751,20 @@ mod tests {
         let link1 = IrShapePointer::SingleLink(IrSingleLinkPointer {
             marker_offset: None,
             alias: "a".into(),
-            correlation: IrSingleLinkCorrelation::Fk { fk_column: "a_id".into(), target_pk: "id".into() },
+            correlation: IrSingleLinkCorrelation::Fk {
+                fk_column: "a_id".into(),
+                target_pk: "id".into(),
+            },
             subquery: inner1,
             link_properties: vec![],
         });
         let link2 = IrShapePointer::SingleLink(IrSingleLinkPointer {
             marker_offset: None,
             alias: "b".into(),
-            correlation: IrSingleLinkCorrelation::Fk { fk_column: "b_id".into(), target_pk: "id".into() },
+            correlation: IrSingleLinkCorrelation::Fk {
+                fk_column: "b_id".into(),
+                target_pk: "id".into(),
+            },
             subquery: inner2,
             link_properties: vec![],
         });

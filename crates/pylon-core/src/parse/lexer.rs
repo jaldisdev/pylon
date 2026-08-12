@@ -86,26 +86,26 @@ pub enum Token {
     At,        // @
 
     // Operators
-    ColonEq,   // :=
-    ColonColon,// ::
-    Eq,        // =
-    Ne,        // !=
-    Lt,        // <
-    Le,        // <=
-    Gt,        // >
-    Ge,        // >=
-    Plus,      // +
-    Minus,     // -
-    Star,      // *
-    Slash,     // /
-    SlashSlash,// //
-    Percent,   // %
-    StarStar,  // **
-    QQ,        // ??
-    PlusPlus,  // ++
-    PlusEq,    // +=
-    MinusEq,   // -=
-    Dollar,    // $
+    ColonEq,    // :=
+    ColonColon, // ::
+    Eq,         // =
+    Ne,         // !=
+    Lt,         // <
+    Le,         // <=
+    Gt,         // >
+    Ge,         // >=
+    Plus,       // +
+    Minus,      // -
+    Star,       // *
+    Slash,      // /
+    SlashSlash, // //
+    Percent,    // %
+    StarStar,   // **
+    QQ,         // ??
+    PlusPlus,   // ++
+    PlusEq,     // +=
+    MinusEq,    // -=
+    Dollar,     // $
 
     Eof,
 }
@@ -227,21 +227,37 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Lexer { input: input.as_bytes(), pos: 0, line: 1, col: 1 }
+        Lexer {
+            input: input.as_bytes(),
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<SpannedToken>, PyQLSyntaxError> {
         let mut tokens = Vec::new();
         loop {
             self.skip_whitespace_and_comments();
-            let pos = Position { line: self.line, col: self.col };
+            let pos = Position {
+                line: self.line,
+                col: self.col,
+            };
             let byte_offset = self.pos;
             if self.pos >= self.input.len() {
-                tokens.push(SpannedToken { token: Token::Eof, pos, byte_offset });
+                tokens.push(SpannedToken {
+                    token: Token::Eof,
+                    pos,
+                    byte_offset,
+                });
                 break;
             }
             let tok = self.next_token(pos.clone())?;
-            tokens.push(SpannedToken { token: tok, pos, byte_offset });
+            tokens.push(SpannedToken {
+                token: tok,
+                pos,
+                byte_offset,
+            });
         }
         Ok(tokens)
     }
@@ -318,7 +334,7 @@ impl<'a> Lexer<'a> {
         if ch == b'\'' || ch == b'"' {
             return self.lex_string(pos);
         }
-        if ch == b'r' && self.peek().map_or(false, |c| c == b'\'' || c == b'"') {
+        if ch == b'r' && self.peek().is_some_and(|c| c == b'\'' || c == b'"') {
             self.advance(); // consume 'r'
             return self.lex_raw_string(pos);
         }
@@ -452,8 +468,7 @@ impl<'a> Lexer<'a> {
         }
         // Check for float
         let is_float = self.pos < self.input.len()
-            && ((self.input[self.pos] == b'.'
-                    && self.peek().map_or(false, |c| c.is_ascii_digit()))
+            && ((self.input[self.pos] == b'.' && self.peek().is_some_and(|c| c.is_ascii_digit()))
                 || self.input[self.pos] == b'e'
                 || self.input[self.pos] == b'E');
 
@@ -464,13 +479,9 @@ impl<'a> Lexer<'a> {
                     self.advance();
                 }
             }
-            if self.pos < self.input.len()
-                && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
-            {
+            if self.pos < self.input.len() && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E') {
                 self.advance();
-                if self.pos < self.input.len()
-                    && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
-                {
+                if self.pos < self.input.len() && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-') {
                     self.advance();
                 }
                 while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
@@ -510,7 +521,11 @@ impl<'a> Lexer<'a> {
             if ch == b'`' {
                 break;
             }
-            buf.push(if ch < 0x80 { ch as char } else { self.decode_utf8_char(ch) });
+            buf.push(if ch < 0x80 {
+                ch as char
+            } else {
+                self.decode_utf8_char(ch)
+            });
         }
         if buf.is_empty() {
             return Err(self.err(pos, "backtick identifier must not be empty"));
@@ -529,7 +544,11 @@ impl<'a> Lexer<'a> {
             if ch == quote {
                 break;
             }
-            buf.push(if ch < 0x80 { ch as char } else { self.decode_utf8_char(ch) });
+            buf.push(if ch < 0x80 {
+                ch as char
+            } else {
+                self.decode_utf8_char(ch)
+            });
         }
         Ok(Token::StrLit(buf))
     }
@@ -565,10 +584,10 @@ impl<'a> Lexer<'a> {
                         }
                         let hex = std::str::from_utf8(&self.input[self.pos..self.pos + 4])
                             .map_err(|_| self.err(pos.clone(), "invalid \\u escape"))?;
-                        let code = u32::from_str_radix(hex, 16)
-                            .map_err(|_| self.err(pos.clone(), "invalid \\u escape"))?;
-                        let c = char::from_u32(code)
-                            .ok_or_else(|| self.err(pos.clone(), "invalid unicode codepoint"))?;
+                        let code =
+                            u32::from_str_radix(hex, 16).map_err(|_| self.err(pos.clone(), "invalid \\u escape"))?;
+                        let c =
+                            char::from_u32(code).ok_or_else(|| self.err(pos.clone(), "invalid unicode codepoint"))?;
                         buf.push(c);
                         for _ in 0..4 {
                             self.advance();
@@ -576,18 +595,29 @@ impl<'a> Lexer<'a> {
                     }
                     other => {
                         buf.push('\\');
-                        buf.push(if other < 0x80 { other as char } else { self.decode_utf8_char(other) });
+                        buf.push(if other < 0x80 {
+                            other as char
+                        } else {
+                            self.decode_utf8_char(other)
+                        });
                     }
                 }
             } else {
-                buf.push(if ch < 0x80 { ch as char } else { self.decode_utf8_char(ch) });
+                buf.push(if ch < 0x80 {
+                    ch as char
+                } else {
+                    self.decode_utf8_char(ch)
+                });
             }
         }
         Ok(Token::StrLit(buf))
     }
 
     fn err(&self, pos: Position, msg: &str) -> PyQLSyntaxError {
-        PyQLSyntaxError { message: msg.to_string(), position: pos }
+        PyQLSyntaxError {
+            message: msg.to_string(),
+            position: pos,
+        }
     }
 }
 

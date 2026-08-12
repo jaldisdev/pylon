@@ -45,13 +45,17 @@
 
 use crate::error::{Position, PyQLError, PyQLFragmentError};
 use crate::ir::{
-    compile, compile_expr_in_type, compile_fn_body, compile_scalar_default_typed,
-    compile_trigger_handler, infer_ir_type, types_compatible, IrFreeExpr, IrRowSource, IrStmt,
+    IrFreeExpr, IrRowSource, IrStmt, compile, compile_expr_in_type, compile_fn_body, compile_scalar_default_typed,
+    compile_trigger_handler, infer_ir_type, types_compatible,
 };
 use crate::schema::SchemaDescriptor;
 
 fn mismatch(context: String, message: String) -> PyQLError {
-    PyQLError::Fragment(PyQLFragmentError { message, position: Position { line: 0, col: 0 }, context })
+    PyQLError::Fragment(PyQLFragmentError {
+        message,
+        position: Position { line: 0, col: 0 },
+        context,
+    })
 }
 
 /// Compile every user function body, computed-pointer expression, and
@@ -77,7 +81,9 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             }
         };
         let IrStmt::Select(sel) = &ir_output.stmt else { continue };
-        let [IrRowSource::Free(IrFreeExpr::Scalar(e))] = sel.rows.as_slice() else { continue };
+        let [IrRowSource::Free(IrFreeExpr::Scalar(e))] = sel.rows.as_slice() else {
+            continue;
+        };
         let Some(actual) = infer_ir_type(e) else { continue };
         if !types_compatible(actual, &fd.return_pg_type) {
             errors.push(mismatch(
@@ -129,7 +135,9 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             // authority on default-expression validity itself, this pass
             // only adds a type-consistency check on top of an already-valid
             // one.
-            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else { continue };
+            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
+                continue;
+            };
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, &prop.pg_type) {
                 let context = format!("{}.{} (default)", type_name, prop.name);
@@ -145,7 +153,9 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
 
         for link in &td.links {
             let Some(pyql) = &link.default_pyql else { continue };
-            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else { continue };
+            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
+                continue;
+            };
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, "uuid") {
                 let context = format!("{}.{} (default)", type_name, link.name);
@@ -236,7 +246,9 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
     // (`_python_value_to_sql`), never a PyQL expression, so there's nothing
     // to compile.
     for global in &schema.globals {
-        let Some(computed_expr) = &global.computed_expr else { continue };
+        let Some(computed_expr) = &global.computed_expr else {
+            continue;
+        };
         let parsed = match crate::parse::parse(computed_expr) {
             Ok(ast) => ast,
             Err(e) => {
@@ -255,7 +267,10 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AliasDescriptor, ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor};
+    use crate::schema::{
+        AliasDescriptor, ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor,
+        PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor,
+    };
 
     fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
         let mut props = vec![PropertyDescriptor {
@@ -323,7 +338,8 @@ mod tests {
             named_tuples: vec![],
             globals: vec![],
             functions,
-            aliases: vec![], channels: vec![],
+            aliases: vec![],
+            channels: vec![],
         }
     }
 
@@ -332,7 +348,10 @@ mod tests {
         let fd = FunctionDescriptor {
             name: "myid".into(),
             module: "default".into(),
-            params: vec![FunctionParamDescriptor { name: "a".into(), pg_type: "int8".into() }],
+            params: vec![FunctionParamDescriptor {
+                name: "a".into(),
+                pg_type: "int8".into(),
+            }],
             return_pg_type: "int8".into(),
             body: "a".into(),
             return_is_object: false,
@@ -349,7 +368,10 @@ mod tests {
         let fd = FunctionDescriptor {
             name: "bad".into(),
             module: "default".into(),
-            params: vec![FunctionParamDescriptor { name: "a".into(), pg_type: "text".into() }],
+            params: vec![FunctionParamDescriptor {
+                name: "a".into(),
+                pg_type: "text".into(),
+            }],
             return_pg_type: "int8".into(),
             body: "a".into(),
             return_is_object: false,
@@ -390,7 +412,11 @@ mod tests {
 
     #[test]
     fn computed_return_type_match_passes() {
-        let cd = ComputedDescriptor { name: "double_id".into(), expression: ".id".into(), return_type: Some("uuid".into()) };
+        let cd = ComputedDescriptor {
+            name: "double_id".into(),
+            expression: ".id".into(),
+            return_type: Some("uuid".into()),
+        };
         let td = person_type(vec![cd], vec![]);
         let schema = minimal_schema(vec![td], vec![]);
         assert!(validate_schema_types(&schema).is_ok());
@@ -398,7 +424,11 @@ mod tests {
 
     #[test]
     fn computed_return_type_mismatch_rejected() {
-        let cd = ComputedDescriptor { name: "bad".into(), expression: ".id".into(), return_type: Some("text".into()) };
+        let cd = ComputedDescriptor {
+            name: "bad".into(),
+            expression: ".id".into(),
+            return_type: Some("text".into()),
+        };
         let td = person_type(vec![cd], vec![]);
         let schema = minimal_schema(vec![td], vec![]);
         let errs = validate_schema_types(&schema).unwrap_err();
@@ -431,7 +461,10 @@ mod tests {
     #[test]
     fn rewrite_type_match_passes() {
         let mut prop = base_property("name", "text");
-        prop.rewrites = vec![RewriteEntry { on: 1, handler: "'unnamed'".into() }];
+        prop.rewrites = vec![RewriteEntry {
+            on: 1,
+            handler: "'unnamed'".into(),
+        }];
         let td = person_type(vec![], vec![prop]);
         let schema = minimal_schema(vec![td], vec![]);
         assert!(validate_schema_types(&schema).is_ok());
@@ -440,7 +473,10 @@ mod tests {
     #[test]
     fn rewrite_type_mismatch_rejected() {
         let mut prop = base_property("name", "text");
-        prop.rewrites = vec![RewriteEntry { on: 1, handler: "1".into() }];
+        prop.rewrites = vec![RewriteEntry {
+            on: 1,
+            handler: "1".into(),
+        }];
         let td = person_type(vec![], vec![prop]);
         let schema = minimal_schema(vec![td], vec![]);
         let errs = validate_schema_types(&schema).unwrap_err();
@@ -453,7 +489,11 @@ mod tests {
     #[test]
     fn trigger_handler_compiles_passes() {
         let mut td = person_type(vec![], vec![]);
-        td.triggers = vec![TriggerDescriptor { on: 1, timing: "After".into(), handler: "select Person".into() }];
+        td.triggers = vec![TriggerDescriptor {
+            on: 1,
+            timing: "After".into(),
+            handler: "select Person".into(),
+        }];
         let schema = minimal_schema(vec![td], vec![]);
         assert!(validate_schema_types(&schema).is_ok());
     }
@@ -475,14 +515,22 @@ mod tests {
     fn alias_compiles_passes() {
         let td = person_type(vec![], vec![]);
         let mut schema = minimal_schema(vec![td], vec![]);
-        schema.aliases = vec![AliasDescriptor { name: "all_people".into(), module: "default".into(), expr: "select Person".into() }];
+        schema.aliases = vec![AliasDescriptor {
+            name: "all_people".into(),
+            module: "default".into(),
+            expr: "select Person".into(),
+        }];
         assert!(validate_schema_types(&schema).is_ok());
     }
 
     #[test]
     fn alias_unknown_type_rejected() {
         let mut schema = minimal_schema(vec![], vec![]);
-        schema.aliases = vec![AliasDescriptor { name: "bad".into(), module: "default".into(), expr: "select NoSuchType".into() }];
+        schema.aliases = vec![AliasDescriptor {
+            name: "bad".into(),
+            module: "default".into(),
+            expr: "select NoSuchType".into(),
+        }];
         let errs = validate_schema_types(&schema).unwrap_err();
         assert_eq!(errs.len(), 1);
     }

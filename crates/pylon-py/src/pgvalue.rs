@@ -74,7 +74,11 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
         let days: i32 = value.getattr("days")?.extract()?;
         let seconds: i64 = value.getattr("seconds")?.extract()?;
         let microseconds: i64 = value.getattr("microseconds")?.extract()?;
-        return Ok(DecodedValue::Interval { months: 0, days, microseconds: seconds * 1_000_000 + microseconds });
+        return Ok(DecodedValue::Interval {
+            months: 0,
+            days,
+            microseconds: seconds * 1_000_000 + microseconds,
+        });
     }
     // `datetime.datetime` is a subclass of `datetime.date` — must be checked
     // first, or every datetime would also match the plain-date branch below.
@@ -91,7 +95,10 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
             // format is always UTC microseconds since the PG epoch,
             // regardless of the value's original tzinfo.
             let utc = py.import("datetime")?.getattr("timezone")?.getattr("utc")?;
-            (datetime_cls.call1((2000, 1, 1, 0, 0, 0, 0, &utc))?, value.call_method1("astimezone", (&utc,))?)
+            (
+                datetime_cls.call1((2000, 1, 1, 0, 0, 0, 0, &utc))?,
+                value.call_method1("astimezone", (&utc,))?,
+            )
         };
         let delta = target.call_method1("__sub__", (epoch,))?;
         let days: i64 = delta.getattr("days")?.extract()?;
@@ -113,7 +120,7 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
     if value.is_instance(&py.import("datetime")?.getattr("time")?)? {
         if !value.getattr("tzinfo")?.is_none() {
             return Err(PyValueError::new_err(
-                "cannot bind a timezone-aware datetime.time — PostgreSQL `time` (cal::local_time) has no timezone"
+                "cannot bind a timezone-aware datetime.time — PostgreSQL `time` (cal::local_time) has no timezone",
             ));
         }
         let hour: i64 = value.getattr("hour")?.extract()?;
@@ -128,8 +135,16 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
         let lower = value.getattr("lower")?;
         let upper = value.getattr("upper")?;
         return Ok(DecodedValue::Range {
-            lower: if lower.is_none() { None } else { Some(Box::new(py_to_cached(&lower)?)) },
-            upper: if upper.is_none() { None } else { Some(Box::new(py_to_cached(&upper)?)) },
+            lower: if lower.is_none() {
+                None
+            } else {
+                Some(Box::new(py_to_cached(&lower)?))
+            },
+            upper: if upper.is_none() {
+                None
+            } else {
+                Some(Box::new(py_to_cached(&upper)?))
+            },
             inc_lower: value.getattr("inc_lower")?.extract()?,
             inc_upper: value.getattr("inc_upper")?.extract()?,
             empty,
@@ -155,7 +170,9 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
         return Ok(DecodedValue::Array(items));
     }
     if let Ok(len) = value.len() {
-        let items = (0..len).map(|i| py_to_cached(&value.get_item(i)?)).collect::<PyResult<Vec<_>>>()?;
+        let items = (0..len)
+            .map(|i| py_to_cached(&value.get_item(i)?))
+            .collect::<PyResult<Vec<_>>>()?;
         return Ok(DecodedValue::Composite(items));
     }
     Err(PyValueError::new_err(format!(
@@ -190,7 +207,10 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
             // pylon.Array[pylon.Str]`) is delivered to the caller as-is,
             // with no further node-based decoding to hide the container
             // type. See `Composite` below for the other case.
-            let elems = items.iter().map(|v| cached_to_py(py, v)).collect::<PyResult<Vec<_>>>()?;
+            let elems = items
+                .iter()
+                .map(|v| cached_to_py(py, v))
+                .collect::<PyResult<Vec<_>>>()?;
             PyList::new(py, elems)?.into_any()
         }
         DecodedValue::Composite(items) => {
@@ -198,7 +218,10 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
             // matching `asyncpg.Record`'s own behavior — see
             // `py_to_cached`'s note on why `_decode()` needs this distinct
             // from `Array`/`list`.
-            let elems = items.iter().map(|v| cached_to_py(py, v)).collect::<PyResult<Vec<_>>>()?;
+            let elems = items
+                .iter()
+                .map(|v| cached_to_py(py, v))
+                .collect::<PyResult<Vec<_>>>()?;
             PyTuple::new(py, elems)?.into_any()
         }
         DecodedValue::Object(entries) => {
@@ -208,7 +231,11 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
             }
             d.into_any()
         }
-        DecodedValue::Interval { months, days, microseconds } => {
+        DecodedValue::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
             if *months != 0 {
                 // `datetime.timedelta` has no month/year component (a
                 // "month" isn't a fixed span without a reference date) —
@@ -218,11 +245,13 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
                 // needs a richer Python type this crate doesn't have yet.
                 return Err(PyValueError::new_err(
                     "decoding a cal::relative_duration with nonzero years/months \
-                     is not yet supported"
+                     is not yet supported",
                 ));
             }
             // Positional form: timedelta(days, seconds, microseconds, ...).
-            py.import("datetime")?.getattr("timedelta")?.call1((*days, 0, *microseconds))?
+            py.import("datetime")?
+                .getattr("timedelta")?
+                .call1((*days, 0, *microseconds))?
         }
         DecodedValue::Date(days) => {
             let epoch = py.import("datetime")?.getattr("date")?.call1((2000, 1, 1))?;
@@ -238,7 +267,9 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
             let total_m = total_s.div_euclid(60);
             let minute = total_m.rem_euclid(60);
             let hour = total_m.div_euclid(60);
-            py.import("datetime")?.getattr("time")?.call1((hour, minute, second, microsecond))?
+            py.import("datetime")?
+                .getattr("time")?
+                .call1((hour, minute, second, microsecond))?
         }
         DecodedValue::Timestamp(us) => {
             let epoch = py.import("datetime")?.getattr("datetime")?.call1((2000, 1, 1))?;
@@ -247,11 +278,20 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
         }
         DecodedValue::Timestamptz(us) => {
             let utc = py.import("datetime")?.getattr("timezone")?.getattr("utc")?;
-            let epoch = py.import("datetime")?.getattr("datetime")?.call1((2000, 1, 1, 0, 0, 0, 0, utc))?;
+            let epoch = py
+                .import("datetime")?
+                .getattr("datetime")?
+                .call1((2000, 1, 1, 0, 0, 0, 0, utc))?;
             let delta = py.import("datetime")?.getattr("timedelta")?.call1((0, 0, *us))?;
             epoch.call_method1("__add__", (delta,))?
         }
-        DecodedValue::Range { lower, upper, inc_lower, inc_upper, empty } => {
+        DecodedValue::Range {
+            lower,
+            upper,
+            inc_lower,
+            inc_upper,
+            empty,
+        } => {
             let lower_py = match lower {
                 Some(v) => cached_to_py(py, v)?,
                 None => py.None().into_bound(py),
@@ -260,7 +300,9 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
                 Some(v) => cached_to_py(py, v)?,
                 None => py.None().into_bound(py),
             };
-            py.import("pylon.datatypes")?.getattr("Range")?.call1((lower_py, upper_py, *inc_lower, *inc_upper, *empty))?
+            py.import("pylon.datatypes")?
+                .getattr("Range")?
+                .call1((lower_py, upper_py, *inc_lower, *inc_upper, *empty))?
         }
     })
 }

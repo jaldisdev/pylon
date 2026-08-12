@@ -32,7 +32,7 @@ pub mod wire;
 
 pub use error::{Error, Result};
 pub use listener::PgListener;
-pub use wire::{decode_value, ExtensionOids};
+pub use wire::{ExtensionOids, decode_value};
 
 use pylon_value::DecodedValue;
 
@@ -136,7 +136,12 @@ impl PgPool {
     /// (`pylon-py`'s `record_pool_metrics`), not used on any query path.
     pub fn status(&self) -> PoolStatus {
         let s = self.pool.status();
-        PoolStatus { size: s.size, available: s.available, waiting: s.waiting, max_size: s.max_size }
+        PoolStatus {
+            size: s.size,
+            available: s.available,
+            waiting: s.waiting,
+            max_size: s.max_size,
+        }
     }
 
     /// Executes `sql` with no parameters and returns the raw rows.
@@ -276,7 +281,12 @@ pub struct PgConnection {
 }
 
 impl PgConnection {
-    pub async fn query_typed(&self, sql: &str, params: &[DecodedValue], ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
+    pub async fn query_typed(
+        &self,
+        sql: &str,
+        params: &[DecodedValue],
+        ext: &ExtensionOids,
+    ) -> Result<Vec<DecodedValue>> {
         query_typed_on(&self.client, sql, params, ext).await
     }
 
@@ -321,7 +331,11 @@ pub(crate) async fn query_typed_named_on(
     rows.iter().map(|row| decode_row_named(row, ext)).collect()
 }
 
-pub(crate) async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str, params: &[DecodedValue]) -> Result<u64> {
+pub(crate) async fn execute_typed_on(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[DecodedValue],
+) -> Result<u64> {
     let stmt = client.prepare(sql).await?;
     let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
     let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
@@ -334,14 +348,21 @@ pub(crate) async fn execute_typed_on(client: &tokio_postgres::Client, sql: &str,
 /// via `RawBytes` (see its own doc comment) rather than depending on the
 /// `with-serde_json-1` feature, since `json`'s wire format is just its plain
 /// UTF-8 text (unlike `jsonb`, which prefixes a version byte).
-pub(crate) async fn query_explain_on(client: &tokio_postgres::Client, sql: &str, params: &[DecodedValue]) -> Result<String> {
+pub(crate) async fn query_explain_on(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[DecodedValue],
+) -> Result<String> {
     let wrapped = format!("EXPLAIN (ANALYZE, FORMAT JSON, VERBOSE) {sql}");
     let stmt = client.prepare(&wrapped).await?;
     let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
     let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
         bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
     let rows = client.query(&stmt, &param_refs).await?;
-    let row = rows.into_iter().next().ok_or_else(|| Error::message("EXPLAIN produced no output row".to_string()))?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::message("EXPLAIN produced no output row".to_string()))?;
     let RawBytes(bytes) = row.try_get::<_, RawBytes<'_>>(0)?;
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
@@ -363,7 +384,12 @@ pub struct PgTransaction {
 }
 
 impl PgTransaction {
-    pub async fn query_typed(&self, sql: &str, params: &[DecodedValue], ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
+    pub async fn query_typed(
+        &self,
+        sql: &str,
+        params: &[DecodedValue],
+        ext: &ExtensionOids,
+    ) -> Result<Vec<DecodedValue>> {
         query_typed_on(&self.client, sql, params, ext).await
     }
 
@@ -384,17 +410,23 @@ impl PgTransaction {
     /// the same DDL earlier) can be rolled back to just that step instead
     /// of aborting the whole outer transaction.
     pub async fn savepoint(&self, name: &str) -> Result<()> {
-        self.client.batch_execute(&format!("SAVEPOINT {}", listener::quote_ident(name))).await?;
+        self.client
+            .batch_execute(&format!("SAVEPOINT {}", listener::quote_ident(name)))
+            .await?;
         Ok(())
     }
 
     pub async fn release_savepoint(&self, name: &str) -> Result<()> {
-        self.client.batch_execute(&format!("RELEASE SAVEPOINT {}", listener::quote_ident(name))).await?;
+        self.client
+            .batch_execute(&format!("RELEASE SAVEPOINT {}", listener::quote_ident(name)))
+            .await?;
         Ok(())
     }
 
     pub async fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
-        self.client.batch_execute(&format!("ROLLBACK TO SAVEPOINT {}", listener::quote_ident(name))).await?;
+        self.client
+            .batch_execute(&format!("ROLLBACK TO SAVEPOINT {}", listener::quote_ident(name)))
+            .await?;
         Ok(())
     }
 
@@ -463,8 +495,7 @@ mod tests {
     /// one). Not run by default (`cargo test -- --ignored` to opt in) so
     /// the default test run stays hermetic.
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN")
-            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     #[tokio::test]
@@ -535,7 +566,10 @@ mod tests {
     #[ignore]
     async fn decodes_a_bare_scalar_result_column() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        let rows = pool.query_composite("SELECT 42::int8 AS result", &ExtensionOids::default()).await.unwrap();
+        let rows = pool
+            .query_composite("SELECT 42::int8 AS result", &ExtensionOids::default())
+            .await
+            .unwrap();
         assert_eq!(rows, vec![DecodedValue::I64(42)]);
     }
 
@@ -607,13 +641,18 @@ mod tests {
             '11111111-1111-1111-1111-111111111111'::uuid\
         ) AS result";
         let rows = pool.query_composite(sql, &ExtensionOids::default()).await.unwrap();
-        let DecodedValue::Composite(fields) = &rows[0] else { panic!("expected Composite") };
+        let DecodedValue::Composite(fields) = &rows[0] else {
+            panic!("expected Composite")
+        };
         assert_eq!(fields[0], DecodedValue::Decimal("12.50".to_string()));
         assert_eq!(
             fields[1],
             DecodedValue::Object(vec![
                 ("a".into(), DecodedValue::I64(1)),
-                ("b".into(), DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)])),
+                (
+                    "b".into(),
+                    DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)])
+                ),
             ])
         );
         assert_eq!(fields[2], DecodedValue::Uuid([0x11; 16]));
@@ -623,7 +662,10 @@ mod tests {
     #[ignore]
     async fn decodes_bytea_for_real() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        let rows = pool.query_composite("SELECT '\\xdeadbeef'::bytea AS result", &ExtensionOids::default()).await.unwrap();
+        let rows = pool
+            .query_composite("SELECT '\\xdeadbeef'::bytea AS result", &ExtensionOids::default())
+            .await
+            .unwrap();
         assert_eq!(rows, vec![DecodedValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])]);
     }
 
@@ -638,7 +680,10 @@ mod tests {
                    EXCEPTION WHEN duplicate_object THEN NULL; END $$;";
         pool.query_raw(sql).await.ok();
         let rows = pool
-            .query_composite("SELECT ('a'::pgcon_test_enum::text) AS result", &ExtensionOids::default())
+            .query_composite(
+                "SELECT ('a'::pgcon_test_enum::text) AS result",
+                &ExtensionOids::default(),
+            )
             .await
             .unwrap();
         assert_eq!(rows, vec![DecodedValue::Str("a".to_string())]);
@@ -653,7 +698,10 @@ mod tests {
 
     async fn round_trip(pool: &PgPool, pg_type: &str, param: DecodedValue) -> DecodedValue {
         let sql = format!("SELECT ($1::{pg_type}) AS result");
-        let rows = pool.query_typed(&sql, &[param], &ExtensionOids::default()).await.unwrap();
+        let rows = pool
+            .query_typed(&sql, &[param], &ExtensionOids::default())
+            .await
+            .unwrap();
         rows.into_iter().next().unwrap()
     }
 
@@ -674,7 +722,10 @@ mod tests {
     #[ignore]
     async fn query_explain_binds_params_the_same_way_query_typed_does() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        let raw = pool.query_explain("SELECT $1::int8 + 1", &[DecodedValue::I64(41)]).await.unwrap();
+        let raw = pool
+            .query_explain("SELECT $1::int8 + 1", &[DecodedValue::I64(41)])
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(parsed[0]["Plan"]["Node Type"].is_string());
     }
@@ -683,29 +734,50 @@ mod tests {
     #[ignore]
     async fn round_trips_bool_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        assert_eq!(round_trip(&pool, "bool", DecodedValue::Bool(true)).await, DecodedValue::Bool(true));
-        assert_eq!(round_trip(&pool, "bool", DecodedValue::Bool(false)).await, DecodedValue::Bool(false));
+        assert_eq!(
+            round_trip(&pool, "bool", DecodedValue::Bool(true)).await,
+            DecodedValue::Bool(true)
+        );
+        assert_eq!(
+            round_trip(&pool, "bool", DecodedValue::Bool(false)).await,
+            DecodedValue::Bool(false)
+        );
     }
 
     #[tokio::test]
     #[ignore]
     async fn round_trips_integer_params_at_every_width() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        assert_eq!(round_trip(&pool, "int2", DecodedValue::I64(30)).await, DecodedValue::I64(30));
-        assert_eq!(round_trip(&pool, "int4", DecodedValue::I64(70_000)).await, DecodedValue::I64(70_000));
+        assert_eq!(
+            round_trip(&pool, "int2", DecodedValue::I64(30)).await,
+            DecodedValue::I64(30)
+        );
+        assert_eq!(
+            round_trip(&pool, "int4", DecodedValue::I64(70_000)).await,
+            DecodedValue::I64(70_000)
+        );
         assert_eq!(
             round_trip(&pool, "int8", DecodedValue::I64(9_223_372_036_854_775_807)).await,
             DecodedValue::I64(9_223_372_036_854_775_807)
         );
-        assert_eq!(round_trip(&pool, "int8", DecodedValue::I64(-1)).await, DecodedValue::I64(-1));
+        assert_eq!(
+            round_trip(&pool, "int8", DecodedValue::I64(-1)).await,
+            DecodedValue::I64(-1)
+        );
     }
 
     #[tokio::test]
     #[ignore]
     async fn round_trips_float_params() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        assert_eq!(round_trip(&pool, "float4", DecodedValue::F64(1.5)).await, DecodedValue::F64(1.5));
-        assert_eq!(round_trip(&pool, "float8", DecodedValue::F64(2.25)).await, DecodedValue::F64(2.25));
+        assert_eq!(
+            round_trip(&pool, "float4", DecodedValue::F64(1.5)).await,
+            DecodedValue::F64(1.5)
+        );
+        assert_eq!(
+            round_trip(&pool, "float8", DecodedValue::F64(2.25)).await,
+            DecodedValue::F64(2.25)
+        );
     }
 
     #[tokio::test]
@@ -733,7 +805,10 @@ mod tests {
     async fn round_trips_uuid_param() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let bytes = [0x11u8; 16];
-        assert_eq!(round_trip(&pool, "uuid", DecodedValue::Uuid(bytes)).await, DecodedValue::Uuid(bytes));
+        assert_eq!(
+            round_trip(&pool, "uuid", DecodedValue::Uuid(bytes)).await,
+            DecodedValue::Uuid(bytes)
+        );
     }
 
     #[tokio::test]
@@ -748,7 +823,10 @@ mod tests {
         // with "incorrect binary data format in bind parameter 1".
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let as_string = DecodedValue::Str("11111111-1111-1111-1111-111111111111".to_string());
-        assert_eq!(round_trip(&pool, "uuid", as_string).await, DecodedValue::Uuid([0x11; 16]));
+        assert_eq!(
+            round_trip(&pool, "uuid", as_string).await,
+            DecodedValue::Uuid([0x11; 16])
+        );
     }
 
     #[tokio::test]
@@ -765,7 +843,10 @@ mod tests {
             round_trip(&pool, "jsonb", as_string).await,
             DecodedValue::Object(vec![
                 ("a".into(), DecodedValue::I64(1)),
-                ("b".into(), DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)])),
+                (
+                    "b".into(),
+                    DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)])
+                ),
             ])
         );
     }
@@ -819,7 +900,10 @@ mod tests {
         let param = DecodedValue::Object(vec![
             ("a".into(), DecodedValue::I64(1)),
             ("b".into(), DecodedValue::Str("two".into())),
-            ("c".into(), DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)])),
+            (
+                "c".into(),
+                DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)]),
+            ),
         ]);
         assert_eq!(round_trip(&pool, "jsonb", param.clone()).await, param);
     }
@@ -831,7 +915,11 @@ mod tests {
         // the same shape a real PyQL query with several kwargs produces.
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         let sql = "SELECT ($1::text, $2::int8, $3::bool) AS result";
-        let params = vec![DecodedValue::Str("Alice".into()), DecodedValue::I64(30), DecodedValue::Bool(true)];
+        let params = vec![
+            DecodedValue::Str("Alice".into()),
+            DecodedValue::I64(30),
+            DecodedValue::Bool(true),
+        ];
         let rows = pool.query_typed(sql, &params, &ExtensionOids::default()).await.unwrap();
         assert_eq!(
             rows,
@@ -847,7 +935,13 @@ mod tests {
     #[ignore]
     async fn wrong_param_count_returns_an_error_not_a_panic() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        let result = pool.query_typed("SELECT $1::int8, $2::int8", &[DecodedValue::I64(1)], &ExtensionOids::default()).await;
+        let result = pool
+            .query_typed(
+                "SELECT $1::int8, $2::int8",
+                &[DecodedValue::I64(1)],
+                &ExtensionOids::default(),
+            )
+            .await;
         assert!(result.is_err());
     }
 
@@ -855,7 +949,9 @@ mod tests {
     #[ignore]
     async fn execute_typed_runs_a_mutation_and_reports_affected_rows() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE IF NOT EXISTS pgcon_execute_test (id int8, name text)").await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE IF NOT EXISTS pgcon_execute_test (id int8, name text)")
+            .await
+            .unwrap();
 
         let inserted = pool
             .execute_typed(
@@ -875,7 +971,13 @@ mod tests {
             .unwrap();
         assert_eq!(updated, 1);
 
-        let rows = pool.query_composite("SELECT (name) AS result FROM pgcon_execute_test", &ExtensionOids::default()).await.unwrap();
+        let rows = pool
+            .query_composite(
+                "SELECT (name) AS result FROM pgcon_execute_test",
+                &ExtensionOids::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(rows, vec![DecodedValue::Str("bob".to_string())]);
     }
 
@@ -891,13 +993,21 @@ mod tests {
     #[ignore]
     async fn unique_violation_reports_23505() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_unique_test (id int8 PRIMARY KEY)").await.unwrap();
-        pool.execute_typed("INSERT INTO pgcon_unique_test (id) VALUES ($1::int8)", &[DecodedValue::I64(1)])
+        pool.query_raw("CREATE TEMP TABLE pgcon_unique_test (id int8 PRIMARY KEY)")
             .await
             .unwrap();
+        pool.execute_typed(
+            "INSERT INTO pgcon_unique_test (id) VALUES ($1::int8)",
+            &[DecodedValue::I64(1)],
+        )
+        .await
+        .unwrap();
 
         let err = pool
-            .execute_typed("INSERT INTO pgcon_unique_test (id) VALUES ($1::int8)", &[DecodedValue::I64(1)])
+            .execute_typed(
+                "INSERT INTO pgcon_unique_test (id) VALUES ($1::int8)",
+                &[DecodedValue::I64(1)],
+            )
             .await
             .unwrap_err();
         assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION));
@@ -908,24 +1018,39 @@ mod tests {
     #[ignore]
     async fn foreign_key_violation_reports_23503() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_fk_parent (id int8 PRIMARY KEY)").await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_fk_child (parent_id int8 REFERENCES pgcon_fk_parent(id))").await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_fk_parent (id int8 PRIMARY KEY)")
+            .await
+            .unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_fk_child (parent_id int8 REFERENCES pgcon_fk_parent(id))")
+            .await
+            .unwrap();
 
         let err = pool
-            .execute_typed("INSERT INTO pgcon_fk_child (parent_id) VALUES ($1::int8)", &[DecodedValue::I64(999)])
+            .execute_typed(
+                "INSERT INTO pgcon_fk_child (parent_id) VALUES ($1::int8)",
+                &[DecodedValue::I64(999)],
+            )
             .await
             .unwrap_err();
-        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION));
+        assert_eq!(
+            err.sqlstate(),
+            Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+        );
     }
 
     #[tokio::test]
     #[ignore]
     async fn check_violation_reports_23514() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_check_test (age int8 CHECK (age >= 0))").await.unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_check_test (age int8 CHECK (age >= 0))")
+            .await
+            .unwrap();
 
         let err = pool
-            .execute_typed("INSERT INTO pgcon_check_test (age) VALUES ($1::int8)", &[DecodedValue::I64(-1)])
+            .execute_typed(
+                "INSERT INTO pgcon_check_test (age) VALUES ($1::int8)",
+                &[DecodedValue::I64(-1)],
+            )
             .await
             .unwrap_err();
         assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
@@ -941,12 +1066,19 @@ mod tests {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.query_raw(
             "DO $$ BEGIN CREATE DOMAIN pgcon_rating AS int8 CHECK (VALUE BETWEEN 1 AND 5); \
-             EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-        ).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_domain_check_test (rating pgcon_rating)").await.unwrap();
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+        )
+        .await
+        .unwrap();
+        pool.query_raw("CREATE TEMP TABLE pgcon_domain_check_test (rating pgcon_rating)")
+            .await
+            .unwrap();
 
         let err = pool
-            .execute_typed("INSERT INTO pgcon_domain_check_test (rating) VALUES ($1::pgcon_rating)", &[DecodedValue::I64(99)])
+            .execute_typed(
+                "INSERT INTO pgcon_domain_check_test (rating) VALUES ($1::pgcon_rating)",
+                &[DecodedValue::I64(99)],
+            )
             .await
             .unwrap_err();
         assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
@@ -977,16 +1109,24 @@ mod tests {
     #[ignore]
     async fn committed_transaction_persists_its_writes() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_tx_commit_test (id int8 PRIMARY KEY)").await.unwrap();
-
-        let tx = pool.begin("serializable").await.unwrap();
-        tx.execute_typed("INSERT INTO pgcon_tx_commit_test (id) VALUES ($1::int8)", &[DecodedValue::I64(1)])
+        pool.query_raw("CREATE TEMP TABLE pgcon_tx_commit_test (id int8 PRIMARY KEY)")
             .await
             .unwrap();
+
+        let tx = pool.begin("serializable").await.unwrap();
+        tx.execute_typed(
+            "INSERT INTO pgcon_tx_commit_test (id) VALUES ($1::int8)",
+            &[DecodedValue::I64(1)],
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
 
         let rows = pool
-            .query_composite("SELECT (id) AS result FROM pgcon_tx_commit_test", &ExtensionOids::default())
+            .query_composite(
+                "SELECT (id) AS result FROM pgcon_tx_commit_test",
+                &ExtensionOids::default(),
+            )
             .await
             .unwrap();
         assert_eq!(rows, vec![DecodedValue::I64(1)]);
@@ -996,16 +1136,24 @@ mod tests {
     #[ignore]
     async fn rolled_back_transaction_discards_its_writes() {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("CREATE TEMP TABLE pgcon_tx_rollback_test (id int8 PRIMARY KEY)").await.unwrap();
-
-        let tx = pool.begin("serializable").await.unwrap();
-        tx.execute_typed("INSERT INTO pgcon_tx_rollback_test (id) VALUES ($1::int8)", &[DecodedValue::I64(1)])
+        pool.query_raw("CREATE TEMP TABLE pgcon_tx_rollback_test (id int8 PRIMARY KEY)")
             .await
             .unwrap();
+
+        let tx = pool.begin("serializable").await.unwrap();
+        tx.execute_typed(
+            "INSERT INTO pgcon_tx_rollback_test (id) VALUES ($1::int8)",
+            &[DecodedValue::I64(1)],
+        )
+        .await
+        .unwrap();
         tx.rollback().await.unwrap();
 
         let rows = pool
-            .query_composite("SELECT (id) AS result FROM pgcon_tx_rollback_test", &ExtensionOids::default())
+            .query_composite(
+                "SELECT (id) AS result FROM pgcon_tx_rollback_test",
+                &ExtensionOids::default(),
+            )
             .await
             .unwrap();
         assert!(rows.is_empty());
@@ -1021,7 +1169,12 @@ mod tests {
             ("serializable", "serializable"),
         ] {
             let tx = pool.begin(level).await.unwrap();
-            let rows = tx.query_typed("SELECT (current_setting('transaction_isolation')) AS result", &[], &ExtensionOids::default())
+            let rows = tx
+                .query_typed(
+                    "SELECT (current_setting('transaction_isolation')) AS result",
+                    &[],
+                    &ExtensionOids::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(rows, vec![DecodedValue::Str(expected.to_string())]);
@@ -1071,11 +1224,20 @@ mod tests {
         // aborted server-side and the next query to land on it would
         // immediately fail with "current transaction is aborted".
         let pool = PgPool::connect(&test_dsn(), 2).await.unwrap();
-        pool.query_raw("DROP TABLE IF EXISTS pgcon_tx_failed_commit_test").await.unwrap();
-        pool.query_raw("CREATE TABLE pgcon_tx_failed_commit_test (class int8, value int8)").await.unwrap();
+        pool.query_raw("DROP TABLE IF EXISTS pgcon_tx_failed_commit_test")
+            .await
+            .unwrap();
+        pool.query_raw("CREATE TABLE pgcon_tx_failed_commit_test (class int8, value int8)")
+            .await
+            .unwrap();
         pool.execute_typed(
             "INSERT INTO pgcon_tx_failed_commit_test (class, value) VALUES ($1::int8, $2::int8), ($3::int8, $4::int8)",
-            &[DecodedValue::I64(1), DecodedValue::I64(10), DecodedValue::I64(2), DecodedValue::I64(20)],
+            &[
+                DecodedValue::I64(1),
+                DecodedValue::I64(10),
+                DecodedValue::I64(2),
+                DecodedValue::I64(20),
+            ],
         )
         .await
         .unwrap();
@@ -1083,12 +1245,20 @@ mod tests {
         let tx1 = pool.begin("serializable").await.unwrap();
         let tx2 = pool.begin("serializable").await.unwrap();
 
-        tx1.query_typed("SELECT (sum(value)) AS result FROM pgcon_tx_failed_commit_test WHERE class = 1::int8", &[], &ExtensionOids::default())
-            .await
-            .unwrap();
-        tx2.query_typed("SELECT (sum(value)) AS result FROM pgcon_tx_failed_commit_test WHERE class = 2::int8", &[], &ExtensionOids::default())
-            .await
-            .unwrap();
+        tx1.query_typed(
+            "SELECT (sum(value)) AS result FROM pgcon_tx_failed_commit_test WHERE class = 1::int8",
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
+        tx2.query_typed(
+            "SELECT (sum(value)) AS result FROM pgcon_tx_failed_commit_test WHERE class = 2::int8",
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
         tx1.execute_typed(
             "INSERT INTO pgcon_tx_failed_commit_test (class, value) VALUES (2::int8, $1::int8)",
             &[DecodedValue::I64(10)],
@@ -1125,11 +1295,20 @@ mod tests {
         // rejected with 40001 — this is the exact SQLSTATE `pgcon_err`
         // (pylon-py/src/pgcon.rs) maps to `TransactionSerializationError`.
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("DROP TABLE IF EXISTS pgcon_serialization_test").await.unwrap();
-        pool.query_raw("CREATE TABLE pgcon_serialization_test (class int8, value int8)").await.unwrap();
+        pool.query_raw("DROP TABLE IF EXISTS pgcon_serialization_test")
+            .await
+            .unwrap();
+        pool.query_raw("CREATE TABLE pgcon_serialization_test (class int8, value int8)")
+            .await
+            .unwrap();
         pool.execute_typed(
             "INSERT INTO pgcon_serialization_test (class, value) VALUES ($1::int8, $2::int8), ($3::int8, $4::int8)",
-            &[DecodedValue::I64(1), DecodedValue::I64(10), DecodedValue::I64(2), DecodedValue::I64(20)],
+            &[
+                DecodedValue::I64(1),
+                DecodedValue::I64(10),
+                DecodedValue::I64(2),
+                DecodedValue::I64(20),
+            ],
         )
         .await
         .unwrap();
@@ -1137,12 +1316,20 @@ mod tests {
         let tx1 = pool.begin("serializable").await.unwrap();
         let tx2 = pool.begin("serializable").await.unwrap();
 
-        tx1.query_typed("SELECT (sum(value)) AS result FROM pgcon_serialization_test WHERE class = 1::int8", &[], &ExtensionOids::default())
-            .await
-            .unwrap();
-        tx2.query_typed("SELECT (sum(value)) AS result FROM pgcon_serialization_test WHERE class = 2::int8", &[], &ExtensionOids::default())
-            .await
-            .unwrap();
+        tx1.query_typed(
+            "SELECT (sum(value)) AS result FROM pgcon_serialization_test WHERE class = 1::int8",
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
+        tx2.query_typed(
+            "SELECT (sum(value)) AS result FROM pgcon_serialization_test WHERE class = 2::int8",
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
 
         tx1.execute_typed(
             "INSERT INTO pgcon_serialization_test (class, value) VALUES (2::int8, $1::int8)",
@@ -1159,7 +1346,10 @@ mod tests {
 
         tx1.commit().await.unwrap();
         let err = tx2.commit().await.unwrap_err();
-        assert_eq!(err.sqlstate(), Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE));
+        assert_eq!(
+            err.sqlstate(),
+            Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+        );
     }
 
     #[tokio::test]
@@ -1171,11 +1361,20 @@ mod tests {
         // one of them with 40P01, `pgcon_err`'s other mapped SQLSTATE
         // (-> `TransactionDeadlockError`).
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
-        pool.query_raw("DROP TABLE IF EXISTS pgcon_deadlock_test").await.unwrap();
-        pool.query_raw("CREATE TABLE pgcon_deadlock_test (id int8 PRIMARY KEY, value int8)").await.unwrap();
+        pool.query_raw("DROP TABLE IF EXISTS pgcon_deadlock_test")
+            .await
+            .unwrap();
+        pool.query_raw("CREATE TABLE pgcon_deadlock_test (id int8 PRIMARY KEY, value int8)")
+            .await
+            .unwrap();
         pool.execute_typed(
             "INSERT INTO pgcon_deadlock_test (id, value) VALUES ($1::int8, $2::int8), ($3::int8, $4::int8)",
-            &[DecodedValue::I64(1), DecodedValue::I64(0), DecodedValue::I64(2), DecodedValue::I64(0)],
+            &[
+                DecodedValue::I64(1),
+                DecodedValue::I64(0),
+                DecodedValue::I64(2),
+                DecodedValue::I64(0),
+            ],
         )
         .await
         .unwrap();
@@ -1183,8 +1382,12 @@ mod tests {
         let tx1 = pool.begin("read_committed").await.unwrap();
         let tx2 = pool.begin("read_committed").await.unwrap();
 
-        tx1.execute_typed("UPDATE pgcon_deadlock_test SET value = 1::int8 WHERE id = 1::int8", &[]).await.unwrap();
-        tx2.execute_typed("UPDATE pgcon_deadlock_test SET value = 2::int8 WHERE id = 2::int8", &[]).await.unwrap();
+        tx1.execute_typed("UPDATE pgcon_deadlock_test SET value = 1::int8 WHERE id = 1::int8", &[])
+            .await
+            .unwrap();
+        tx2.execute_typed("UPDATE pgcon_deadlock_test SET value = 2::int8 WHERE id = 2::int8", &[])
+            .await
+            .unwrap();
 
         // Now each blocks on the row the other is holding — issue both
         // concurrently and let Postgres's deadlock detector break the tie.
@@ -1198,6 +1401,10 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, Err(e) if e.sqlstate() == Some(&tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED)))
             .collect();
-        assert_eq!(deadlock_errors.len(), 1, "expected exactly one side to be aborted with 40P01, got {results:?}");
+        assert_eq!(
+            deadlock_errors.len(),
+            1,
+            "expected exactly one side to be aborted with 40P01, got {results:?}"
+        );
     }
 }

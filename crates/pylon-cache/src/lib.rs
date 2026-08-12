@@ -20,4 +20,4 @@
 pub mod store;
 
 pub use pylon_value::{CachedEntry, DecodedValue};
-pub use store::{cache_key, Cache, CacheStats};
+pub use store::{Cache, CacheStats, cache_key};

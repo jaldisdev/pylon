@@ -31,9 +31,9 @@ mod common;
 
 use common::*;
 use pylon_core::export::export_schema;
-use pylon_core::stdlib::ddl::export_stdlib;
 use pylon_core::query;
 use pylon_core::schema::{SchemaDescriptor, SignalEntry, TypeDescriptor};
+use pylon_core::stdlib::ddl::export_stdlib;
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
 
@@ -87,8 +87,14 @@ async fn outbox_rows_for(pool: &pylon_pgcon::PgPool, type_name: &str) -> Vec<Dec
 }
 
 fn field<'a>(row: &'a DecodedValue, name: &str) -> &'a DecodedValue {
-    let DecodedValue::Object(fields) = row else { panic!("expected Object, got {row:?}") };
-    fields.iter().find(|(k, _)| k == name).map(|(_, v)| v).unwrap_or_else(|| panic!("no field {name} in {row:?}"))
+    let DecodedValue::Object(fields) = row else {
+        panic!("expected Object, got {row:?}")
+    };
+    fields
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| panic!("no field {name} in {row:?}"))
 }
 
 #[tokio::test]
@@ -103,8 +109,15 @@ async fn insert_writes_new_row_only() {
     let rows = outbox_rows_for(&pool, &type_name).await;
     assert_eq!(rows.len(), 1, "expected exactly one outbox row, got {rows:?}");
     assert_eq!(field(&rows[0], "operation"), &DecodedValue::Str("INSERT".to_string()));
-    assert_eq!(field(&rows[0], "old_row"), &DecodedValue::Null, "old_row must be NULL for an Insert");
-    assert_eq!(field(field(&rows[0], "new_row"), "name"), &DecodedValue::Str("Alpha".to_string()));
+    assert_eq!(
+        field(&rows[0], "old_row"),
+        &DecodedValue::Null,
+        "old_row must be NULL for an Insert"
+    );
+    assert_eq!(
+        field(field(&rows[0], "new_row"), "name"),
+        &DecodedValue::Str("Alpha".to_string())
+    );
 }
 
 #[tokio::test]
@@ -118,14 +131,28 @@ async fn update_writes_both_old_and_new_row() {
     // Insert alone shouldn't enqueue anything — only Update is registered.
     assert_eq!(outbox_rows_for(&pool, &type_name).await.len(), 0);
 
-    let update = query::compile(&format!("update {module}::Widget filter .name = 'Alpha' set {{ name := 'Beta' }}"), &schema).unwrap();
+    let update = query::compile(
+        &format!("update {module}::Widget filter .name = 'Alpha' set {{ name := 'Beta' }}"),
+        &schema,
+    )
+    .unwrap();
     pool.execute_typed(&update.sql, &[]).await.unwrap();
 
     let rows = outbox_rows_for(&pool, &type_name).await;
-    assert_eq!(rows.len(), 1, "expected exactly one outbox row for the Update, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one outbox row for the Update, got {rows:?}"
+    );
     assert_eq!(field(&rows[0], "operation"), &DecodedValue::Str("UPDATE".to_string()));
-    assert_eq!(field(field(&rows[0], "old_row"), "name"), &DecodedValue::Str("Alpha".to_string()));
-    assert_eq!(field(field(&rows[0], "new_row"), "name"), &DecodedValue::Str("Beta".to_string()));
+    assert_eq!(
+        field(field(&rows[0], "old_row"), "name"),
+        &DecodedValue::Str("Alpha".to_string())
+    );
+    assert_eq!(
+        field(field(&rows[0], "new_row"), "name"),
+        &DecodedValue::Str("Beta".to_string())
+    );
 }
 
 #[tokio::test]
@@ -136,16 +163,31 @@ async fn delete_writes_old_row_only() {
 
     let insert = query::compile(&format!("insert {module}::Widget {{ name := 'Alpha' }}"), &schema).unwrap();
     pool.execute_typed(&insert.sql, &[]).await.unwrap();
-    assert_eq!(outbox_rows_for(&pool, &type_name).await.len(), 0, "Insert shouldn't enqueue when only Delete is registered");
+    assert_eq!(
+        outbox_rows_for(&pool, &type_name).await.len(),
+        0,
+        "Insert shouldn't enqueue when only Delete is registered"
+    );
 
     let delete = query::compile(&format!("delete {module}::Widget filter .name = 'Alpha'"), &schema).unwrap();
     pool.execute_typed(&delete.sql, &[]).await.unwrap();
 
     let rows = outbox_rows_for(&pool, &type_name).await;
-    assert_eq!(rows.len(), 1, "expected exactly one outbox row for the Delete, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one outbox row for the Delete, got {rows:?}"
+    );
     assert_eq!(field(&rows[0], "operation"), &DecodedValue::Str("DELETE".to_string()));
-    assert_eq!(field(&rows[0], "new_row"), &DecodedValue::Null, "new_row must be NULL for a Delete");
-    assert_eq!(field(field(&rows[0], "old_row"), "name"), &DecodedValue::Str("Alpha".to_string()));
+    assert_eq!(
+        field(&rows[0], "new_row"),
+        &DecodedValue::Null,
+        "new_row must be NULL for a Delete"
+    );
+    assert_eq!(
+        field(field(&rows[0], "old_row"), "name"),
+        &DecodedValue::Str("Alpha".to_string())
+    );
 }
 
 #[tokio::test]
@@ -163,10 +205,15 @@ async fn unregistered_operations_on_the_same_type_enqueue_nothing() {
     pool.execute_typed(&insert.sql, &[]).await.unwrap();
     assert_eq!(outbox_rows_for(&pool, &type_name).await.len(), 1);
 
-    let update = query::compile(&format!("update {module}::Widget filter .name = 'Alpha' set {{ name := 'Beta' }}"), &schema).unwrap();
+    let update = query::compile(
+        &format!("update {module}::Widget filter .name = 'Alpha' set {{ name := 'Beta' }}"),
+        &schema,
+    )
+    .unwrap();
     pool.execute_typed(&update.sql, &[]).await.unwrap();
     assert_eq!(
-        outbox_rows_for(&pool, &type_name).await.len(), 1,
+        outbox_rows_for(&pool, &type_name).await.len(),
+        1,
         "the Update must not enqueue anything — On.Insert was the only registered operation"
     );
 }

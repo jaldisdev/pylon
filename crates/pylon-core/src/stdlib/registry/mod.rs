@@ -21,10 +21,9 @@ use super::{FnDescriptor, FnVolatility, ImplStrategy, Param, PylonFnDef, PylonTy
 
 use ImplStrategy::{SqlBuiltin as B, SqlExpression as E, SqlOperator as O, TranspilerIntrinsic as I};
 use PylonType::{
-    Any, AnyOrderable, AnyPoint, Array, BigInt, Bool, Box2D, Box3D, Bytes, Datetime, Decimal,
-    Duration, Float32, Float64, Geography, Geometry, Int16, Int32, Int64, Json, LocalDate,
-    LocalDatetime, LocalTime, Multirange, Optional, Range, RelativeDuration, Set, Str, Tuple, Uuid,
-    Vector,
+    Any, AnyOrderable, AnyPoint, Array, BigInt, Bool, Box2D, Box3D, Bytes, Datetime, Decimal, Duration, Float32,
+    Float64, Geography, Geometry, Int16, Int32, Int64, Json, LocalDate, LocalDatetime, LocalTime, Multirange, Optional,
+    Range, RelativeDuration, Set, Str, Tuple, Uuid, Vector,
 };
 
 mod cal_ns;
@@ -37,48 +36,98 @@ mod sys_ns;
 
 // ── Type helpers ─────────────────────────────────────────────────────────────
 
-fn arr(t: PylonType) -> PylonType { Array(Box::new(t)) }
-fn set_of(t: PylonType) -> PylonType { Set(Box::new(t)) }
-fn opt(t: PylonType) -> PylonType { Optional(Box::new(t)) }
-fn ro(t: PylonType) -> PylonType { Range(Box::new(t)) }
-fn mr(t: PylonType) -> PylonType { Multirange(Box::new(t)) }
-fn tup(ts: Vec<PylonType>) -> PylonType { Tuple(ts) }
+fn arr(t: PylonType) -> PylonType {
+    Array(Box::new(t))
+}
+fn set_of(t: PylonType) -> PylonType {
+    Set(Box::new(t))
+}
+fn opt(t: PylonType) -> PylonType {
+    Optional(Box::new(t))
+}
+fn ro(t: PylonType) -> PylonType {
+    Range(Box::new(t))
+}
+fn mr(t: PylonType) -> PylonType {
+    Multirange(Box::new(t))
+}
+fn tup(ts: Vec<PylonType>) -> PylonType {
+    Tuple(ts)
+}
 
 // ── Param helpers ─────────────────────────────────────────────────────────────
 
-fn p(name: &'static str, ty: PylonType) -> Param { Param { name, ty, variadic: false } }
-fn pv(name: &'static str, ty: PylonType) -> Param { Param { name, ty, variadic: true } }
+fn p(name: &'static str, ty: PylonType) -> Param {
+    Param {
+        name,
+        ty,
+        variadic: false,
+    }
+}
+fn pv(name: &'static str, ty: PylonType) -> Param {
+    Param {
+        name,
+        ty,
+        variadic: true,
+    }
+}
 
 // ── Descriptor helpers ────────────────────────────────────────────────────────
 
 fn f(ns: &'static str, name: &'static str, params: Vec<Param>, ret: PylonType, impl_: ImplStrategy) -> FnDescriptor {
-    FnDescriptor { namespace: ns, name, params, return_type: ret, impl_strategy: impl_, cast_target: false }
+    FnDescriptor {
+        namespace: ns,
+        name,
+        params,
+        return_type: ret,
+        impl_strategy: impl_,
+        cast_target: false,
+    }
 }
 
 fn fc(ns: &'static str, name: &'static str, params: Vec<Param>, ret: PylonType, impl_: ImplStrategy) -> FnDescriptor {
-    FnDescriptor { namespace: ns, name, params, return_type: ret, impl_strategy: impl_, cast_target: true }
+    FnDescriptor {
+        namespace: ns,
+        name,
+        params,
+        return_type: ret,
+        impl_strategy: impl_,
+        cast_target: true,
+    }
 }
 
 // ── PylonFnDef helpers ────────────────────────────────────────────────────────
 
 fn sql(name: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::Sql, volatility: FnVolatility::Immutable,
-        strict: true, returns_override: None, body,
+        name,
+        language: SqlLanguage::Sql,
+        volatility: FnVolatility::Immutable,
+        strict: true,
+        returns_override: None,
+        body,
     })
 }
 
 fn sql_returns(name: &'static str, returns: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::Sql, volatility: FnVolatility::Immutable,
-        strict: true, returns_override: Some(returns), body,
+        name,
+        language: SqlLanguage::Sql,
+        volatility: FnVolatility::Immutable,
+        strict: true,
+        returns_override: Some(returns),
+        body,
     })
 }
 
 fn plpgsql(name: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::PlPgSql, volatility: FnVolatility::Immutable,
-        strict: true, returns_override: None, body,
+        name,
+        language: SqlLanguage::PlPgSql,
+        volatility: FnVolatility::Immutable,
+        strict: true,
+        returns_override: None,
+        body,
     })
 }
 
@@ -86,31 +135,47 @@ fn plpgsql(name: &'static str, body: &'static str) -> ImplStrategy {
 /// may legitimately be NULL when the caller omits it.
 fn plpgsql_stable_nullable(name: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::PlPgSql, volatility: FnVolatility::Stable,
-        strict: false, returns_override: Some("anyarray"), body,
+        name,
+        language: SqlLanguage::PlPgSql,
+        volatility: FnVolatility::Stable,
+        strict: false,
+        returns_override: Some("anyarray"),
+        body,
     })
 }
 
 /// PL/pgSQL STABLE, NOT STRICT, returning `boolean` (for assert 2-arg).
 fn plpgsql_stable_nullable_bool(name: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::PlPgSql, volatility: FnVolatility::Stable,
-        strict: false, returns_override: Some("boolean"), body,
+        name,
+        language: SqlLanguage::PlPgSql,
+        volatility: FnVolatility::Stable,
+        strict: false,
+        returns_override: Some("boolean"),
+        body,
     })
 }
 
 /// PL/pgSQL STABLE, NOT STRICT, returning `anyelement` (for assert_single 2-arg).
 fn plpgsql_stable_nullable_elem(name: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::PlPgSql, volatility: FnVolatility::Stable,
-        strict: false, returns_override: Some("anyelement"), body,
+        name,
+        language: SqlLanguage::PlPgSql,
+        volatility: FnVolatility::Stable,
+        strict: false,
+        returns_override: Some("anyelement"),
+        body,
     })
 }
 
 fn plpgsql_stable_returns(name: &'static str, returns: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
-        name, language: SqlLanguage::PlPgSql, volatility: FnVolatility::Stable,
-        strict: true, returns_override: Some(returns), body,
+        name,
+        language: SqlLanguage::PlPgSql,
+        volatility: FnVolatility::Stable,
+        strict: true,
+        returns_override: Some(returns),
+        body,
     })
 }
 

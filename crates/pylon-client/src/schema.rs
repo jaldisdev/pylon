@@ -53,8 +53,7 @@ mod tests {
     use super::*;
 
     fn test_dsn() -> String {
-        std::env::var("PYLON_PGCON_TEST_DSN")
-            .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
     }
 
     async fn test_pool() -> pylon_pgcon::PgPool {
@@ -75,7 +74,9 @@ mod tests {
         let previous = pylon_core::migrate::read_schema_snapshot(&pool).await.unwrap();
 
         let snapshot = serde_json::to_string(&SchemaDescriptor::default()).unwrap();
-        pylon_core::migrate::write_schema_snapshot(&pool, &snapshot).await.unwrap();
+        pylon_core::migrate::write_schema_snapshot(&pool, &snapshot)
+            .await
+            .unwrap();
 
         assert!(fetch(&pool).await.is_ok());
 

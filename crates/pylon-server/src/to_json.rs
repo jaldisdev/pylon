@@ -38,7 +38,9 @@ fn pg_epoch_date() -> NaiveDate {
 }
 
 fn date_to_iso(days: i32) -> String {
-    (pg_epoch_date() + ChronoDuration::days(i64::from(days))).format("%Y-%m-%d").to_string()
+    (pg_epoch_date() + ChronoDuration::days(i64::from(days)))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn time_to_iso(microseconds: i64) -> String {
@@ -123,7 +125,11 @@ pub fn value_to_json(value: &Value) -> Json {
         // expects a JSON number at a `{"kind": "decimal"}`-tagged shape
         // position, not a string.
         Value::Decimal(s) => s.parse::<f64>().map(Json::from).unwrap_or(Json::Null),
-        Value::Duration { months, days, microseconds } => Json::from(duration_to_iso(*months, *days, *microseconds)),
+        Value::Duration {
+            months,
+            days,
+            microseconds,
+        } => Json::from(duration_to_iso(*months, *days, *microseconds)),
         Value::Date(days) => Json::from(date_to_iso(*days)),
         Value::Time(us) => Json::from(time_to_iso(*us)),
         Value::Timestamp(us) => Json::from(timestamp_to_iso(*us)),

@@ -56,11 +56,17 @@ fn workers_err(err: pylon_workers::Error) -> PyErr {
 /// instead — LMDB refuses a second `Env::open` on the same path within one
 /// process.
 #[pyfunction]
-fn run_cache_invalidation_worker(py: Python<'_>, dsn: String, cache_path: String, max_size_mb: usize) -> PyResult<Bound<'_, PyAny>> {
+fn run_cache_invalidation_worker(
+    py: Python<'_>,
+    dsn: String,
+    cache_path: String,
+    max_size_mb: usize,
+) -> PyResult<Bound<'_, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let worker = pylon_workers::CacheInvalidationWorker::connect(&dsn, std::path::Path::new(&cache_path), max_size_mb)
-            .await
-            .map_err(workers_err)?;
+        let worker =
+            pylon_workers::CacheInvalidationWorker::connect(&dsn, std::path::Path::new(&cache_path), max_size_mb)
+                .await
+                .map_err(workers_err)?;
         worker.run().await;
         Ok(())
     })
@@ -105,7 +111,15 @@ fn run_vector_worker<'py>(
     let provider_map: HashMap<(String, Option<String>), ProviderConfig> = providers
         .into_iter()
         .map(|(type_name, index_name, api_style, api_url, model, api_key)| {
-            ((type_name, index_name), ProviderConfig { api_style, api_url, model, api_key })
+            (
+                (type_name, index_name),
+                ProviderConfig {
+                    api_style,
+                    api_url,
+                    model,
+                    api_key,
+                },
+            )
         })
         .collect();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -134,8 +148,9 @@ fn run_meilisearch_worker<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let schema = schema.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let client = pylon_workers::MeilisearchClient::new(&base_url, api_key.as_deref(), Duration::from_secs_f64(timeout_secs))
-            .map_err(workers_err)?;
+        let client =
+            pylon_workers::MeilisearchClient::new(&base_url, api_key.as_deref(), Duration::from_secs_f64(timeout_secs))
+                .map_err(workers_err)?;
         let worker = pylon_workers::SearchIndexWorker::new(schema, client, "Meilisearch");
         pylon_workers::index_worker::run(&dsn, batch_size, Duration::from_secs_f64(poll_interval_secs), worker)
             .await
@@ -163,7 +178,8 @@ fn run_opensearch_worker<'py>(
     let schema = schema.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let auth = user.as_deref().zip(password.as_deref());
-        let client = pylon_workers::OpenSearchClient::new(&base_url, auth, Duration::from_secs_f64(timeout_secs)).map_err(workers_err)?;
+        let client = pylon_workers::OpenSearchClient::new(&base_url, auth, Duration::from_secs_f64(timeout_secs))
+            .map_err(workers_err)?;
         let worker = pylon_workers::SearchIndexWorker::new(schema, client, "OpenSearch");
         pylon_workers::index_worker::run(&dsn, batch_size, Duration::from_secs_f64(poll_interval_secs), worker)
             .await

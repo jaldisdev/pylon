@@ -89,7 +89,11 @@ pub trait BatchProcessor: Send + Sync {
     /// worker (`"Vector"`, `"OpenSearch"`, `"Meilisearch"`).
     fn index_kind(&self) -> &'static str;
 
-    fn process_batch(&self, listener: &PgListener, rows: &[ClaimedRow]) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn process_batch(
+        &self,
+        listener: &PgListener,
+        rows: &[ClaimedRow],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 /// Starts the claim/drain loop for `processor` on a dedicated LISTEN/NOTIFY
@@ -134,15 +138,25 @@ async fn drain_once<P: BatchProcessor>(listener: &PgListener, batch_size: i64, p
 
         match processor.process_batch(listener, &rows).await {
             Ok(()) => {
-                crate::metrics::JOBS_PROCESSED.with_label_values(&[processor.index_kind()]).inc_by(rows.len() as u64);
+                crate::metrics::JOBS_PROCESSED
+                    .with_label_values(&[processor.index_kind()])
+                    .inc_by(rows.len() as u64);
                 if let Err(e) = listener.execute_typed(MARK_DONE_SQL, &[DecodedValue::Array(ids)]).await {
                     eprintln!("IndexWorker({}): mark_done failed: {e}", processor.index_kind());
                 }
             }
             Err(e) => {
-                crate::metrics::JOBS_FAILED.with_label_values(&[processor.index_kind()]).inc_by(rows.len() as u64);
-                eprintln!("IndexWorker({}): batch failed, scheduling retry: {e}", processor.index_kind());
-                if let Err(e) = listener.execute_typed(MARK_FAILED_SQL, &[DecodedValue::Array(ids)]).await {
+                crate::metrics::JOBS_FAILED
+                    .with_label_values(&[processor.index_kind()])
+                    .inc_by(rows.len() as u64);
+                eprintln!(
+                    "IndexWorker({}): batch failed, scheduling retry: {e}",
+                    processor.index_kind()
+                );
+                if let Err(e) = listener
+                    .execute_typed(MARK_FAILED_SQL, &[DecodedValue::Array(ids)])
+                    .await
+                {
                     eprintln!("IndexWorker({}): mark_failed failed: {e}", processor.index_kind());
                 }
             }
@@ -189,5 +203,10 @@ fn decode_claimed_row(value: &DecodedValue) -> Result<ClaimedRow> {
         _ => return Err(Error::Decode("claim_batch: invalid 'index_name'".into())),
     };
 
-    Ok(ClaimedRow { id, object_id, type_name, index_name })
+    Ok(ClaimedRow {
+        id,
+        object_id,
+        type_name,
+        index_name,
+    })
 }

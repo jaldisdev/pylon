@@ -47,15 +47,22 @@ mod tests {
         let stmt = parse("SELECT Person").unwrap();
         assert!(matches!(
             stmt,
-            Stmt::Select(SelectStmt { result: Expr::Path(_), .. })
+            Stmt::Select(SelectStmt {
+                result: Expr::Path(_),
+                ..
+            })
         ));
     }
 
     #[test]
     fn test_select_with_shape() {
         let stmt = parse("SELECT Person { name, age }").unwrap();
-        let Stmt::Select(sel) = stmt else { panic!("not a select") };
-        let Expr::Shape(shape) = sel.result else { panic!("not a shape") };
+        let Stmt::Select(sel) = stmt else {
+            panic!("not a select")
+        };
+        let Expr::Shape(shape) = sel.result else {
+            panic!("not a shape")
+        };
         assert_eq!(shape.elements.len(), 2);
         assert_eq!(shape.elements[0].path, Path::relative("name"));
         assert_eq!(shape.elements[1].path, Path::relative("age"));
@@ -67,7 +74,9 @@ mod tests {
         let Stmt::Select(sel) = stmt else { panic!() };
         assert!(sel.filter.is_some());
         let filter = sel.filter.unwrap();
-        let Expr::BinOp(binop) = filter else { panic!("not a binop") };
+        let Expr::BinOp(binop) = filter else {
+            panic!("not a binop")
+        };
         assert_eq!(binop.op, BinOpKind::Eq);
         assert!(matches!(binop.left, Expr::Path(Path { partial: true, .. })));
         assert!(matches!(binop.right, Expr::Parameter(_)));
@@ -94,10 +103,16 @@ mod tests {
         let stmt = parse("SELECT Person FILTER .name = $0 AND .age > $1").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
         let filter = sel.filter.unwrap();
-        let Expr::BinOp(outer) = filter else { panic!("not a binop") };
-        let Expr::BinOp(left) = outer.left else { panic!("left not binop") };
+        let Expr::BinOp(outer) = filter else {
+            panic!("not a binop")
+        };
+        let Expr::BinOp(left) = outer.left else {
+            panic!("left not binop")
+        };
         assert!(matches!(left.right, Expr::Parameter(n) if n == "0"));
-        let Expr::BinOp(right) = outer.right else { panic!("right not binop") };
+        let Expr::BinOp(right) = outer.right else {
+            panic!("right not binop")
+        };
         assert!(matches!(right.right, Expr::Parameter(n) if n == "1"));
     }
 
@@ -117,7 +132,9 @@ mod tests {
     fn test_select_set_literal() {
         let stmt = parse("SELECT {1, 2, 3}").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        let Expr::Set(elems) = sel.result else { panic!("expected Set") };
+        let Expr::Set(elems) = sel.result else {
+            panic!("expected Set")
+        };
         assert_eq!(elems.len(), 3);
         assert!(matches!(elems[0], Expr::Literal(Literal::Int(1))));
     }
@@ -126,14 +143,18 @@ mod tests {
     fn test_select_set_literal_single() {
         let stmt = parse("SELECT {42}").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        let Expr::Set(elems) = sel.result else { panic!("expected Set") };
+        let Expr::Set(elems) = sel.result else {
+            panic!("expected Set")
+        };
         assert_eq!(elems.len(), 1);
     }
 
     #[test]
     fn test_analyze_wraps_inner_stmt() {
         let stmt = parse("analyze select Person { name }").unwrap();
-        let Stmt::Analyze(inner) = stmt else { panic!("expected Analyze") };
+        let Stmt::Analyze(inner) = stmt else {
+            panic!("expected Analyze")
+        };
         assert!(matches!(*inner, Stmt::Select(_)));
     }
 
@@ -162,7 +183,9 @@ mod tests {
     fn test_analyze_marker_offsets_mark_root_and_nested_shape_elements() {
         let query = "analyze select Person { name, posts { title } }";
         let stmt = parse(query).unwrap();
-        let Stmt::Analyze(inner) = stmt else { panic!("expected Analyze") };
+        let Stmt::Analyze(inner) = stmt else {
+            panic!("expected Analyze")
+        };
         let Stmt::Select(sel) = *inner else { panic!() };
         let Expr::Shape(shape) = sel.result else { panic!() };
 
@@ -170,14 +193,18 @@ mod tests {
         let root_offset = shape.marker_offset.expect("root shape should carry an offset");
         assert_eq!(&query[root_offset..root_offset + "Person".len()], "Person");
 
-        let name_offset = shape.elements[0].marker_offset.expect("name element should carry an offset");
+        let name_offset = shape.elements[0]
+            .marker_offset
+            .expect("name element should carry an offset");
         assert_eq!(&query[name_offset..name_offset + "name".len()], "name");
 
         let posts = &shape.elements[1];
         let posts_offset = posts.marker_offset.expect("posts element should carry an offset");
         assert_eq!(&query[posts_offset..posts_offset + "posts".len()], "posts");
 
-        let title_offset = posts.nested.as_ref().unwrap()[0].marker_offset.expect("nested element should carry an offset");
+        let title_offset = posts.nested.as_ref().unwrap()[0]
+            .marker_offset
+            .expect("nested element should carry an offset");
         assert_eq!(&query[title_offset..title_offset + "title".len()], "title");
     }
 
@@ -185,7 +212,9 @@ mod tests {
     fn test_select_free_object() {
         let stmt = parse("SELECT { foo := 'bar', n := 42 }").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        let Expr::Shape(sh) = sel.result else { panic!("expected Shape") };
+        let Expr::Shape(sh) = sel.result else {
+            panic!("expected Shape")
+        };
         assert!(sh.expr.is_none());
         assert_eq!(sh.elements.len(), 2);
         assert_eq!(sh.elements[0].path, Path::relative("foo"));
@@ -238,54 +267,94 @@ mod tests {
     fn test_select_for_update_defaults_to_blocking() {
         let stmt = parse("SELECT Person FOR UPDATE").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::Block }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::Update,
+                wait: LockWait::Block
+            })
+        );
     }
 
     #[test]
     fn test_select_for_update_skip_locked() {
         let stmt = parse("SELECT Person FOR UPDATE SKIP LOCKED").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::SkipLocked }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::Update,
+                wait: LockWait::SkipLocked
+            })
+        );
     }
 
     #[test]
     fn test_select_for_update_nowait() {
         let stmt = parse("SELECT Person FOR UPDATE NOWAIT").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::NoWait }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::Update,
+                wait: LockWait::NoWait
+            })
+        );
     }
 
     #[test]
     fn test_select_for_share_skip_locked_is_case_insensitive() {
         let stmt = parse("select Person for share skip locked").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Share, wait: LockWait::SkipLocked }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::Share,
+                wait: LockWait::SkipLocked
+            })
+        );
     }
 
     #[test]
     fn test_select_for_no_key_update() {
         let stmt = parse("SELECT Person FOR NO KEY UPDATE").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::NoKeyUpdate, wait: LockWait::Block }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::NoKeyUpdate,
+                wait: LockWait::Block
+            })
+        );
     }
 
     #[test]
     fn test_select_for_key_share() {
         let stmt = parse("SELECT Person FOR KEY SHARE").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::KeyShare, wait: LockWait::Block }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::KeyShare,
+                wait: LockWait::Block
+            })
+        );
     }
 
     #[test]
     fn test_select_for_update_comes_after_order_by_limit_offset() {
-        let stmt = parse(
-            "SELECT Person { name } ORDER BY .name OFFSET 1 LIMIT 5 FOR UPDATE SKIP LOCKED",
-        ).unwrap();
+        let stmt = parse("SELECT Person { name } ORDER BY .name OFFSET 1 LIMIT 5 FOR UPDATE SKIP LOCKED").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
         assert_eq!(sel.order_by.len(), 1);
         assert!(sel.offset.is_some());
         assert!(sel.limit.is_some());
-        assert_eq!(sel.lock, Some(LockClause { strength: LockStrength::Update, wait: LockWait::SkipLocked }));
+        assert_eq!(
+            sel.lock,
+            Some(LockClause {
+                strength: LockStrength::Update,
+                wait: LockWait::SkipLocked
+            })
+        );
     }
 
     #[test]
@@ -315,10 +384,7 @@ mod tests {
 
     #[test]
     fn test_boolean_operators() {
-        let stmt = parse(
-            "SELECT Person FILTER .active = true AND .age >= 18 OR .admin = true",
-        )
-        .unwrap();
+        let stmt = parse("SELECT Person FILTER .active = true AND .age >= 18 OR .admin = true").unwrap();
         assert!(matches!(stmt, Stmt::Select(_)));
     }
 
@@ -347,8 +413,7 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let stmt =
-            parse("INSERT Person { name := 'Alice', age := 30 }").unwrap();
+        let stmt = parse("INSERT Person { name := 'Alice', age := 30 }").unwrap();
         let Stmt::Insert(ins) = stmt else { panic!() };
         assert_eq!(ins.subject.name, "Person");
         assert_eq!(ins.shape.len(), 2);
@@ -356,8 +421,7 @@ mod tests {
 
     #[test]
     fn test_update() {
-        let stmt =
-            parse("UPDATE Person FILTER .name = 'Alice' SET { age := 31 }").unwrap();
+        let stmt = parse("UPDATE Person FILTER .name = 'Alice' SET { age := 31 }").unwrap();
         assert!(matches!(stmt, Stmt::Update(_)));
     }
 
@@ -371,7 +435,9 @@ mod tests {
     fn test_if_else_postfix() {
         let stmt = parse("SELECT 'yes' IF 1 = 1 ELSE 'no'").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        let Expr::IfElse(ie) = sel.result else { panic!("expected IfElse") };
+        let Expr::IfElse(ie) = sel.result else {
+            panic!("expected IfElse")
+        };
         assert!(matches!(ie.if_expr, Expr::Literal(Literal::Str(_))));
         assert!(matches!(ie.condition, Expr::BinOp(_)));
         assert!(matches!(ie.else_expr, Expr::Literal(Literal::Str(_))));
@@ -381,7 +447,9 @@ mod tests {
     fn test_if_then_else_prefix() {
         let stmt = parse("SELECT IF 1 = 1 THEN 'yes' ELSE 'no'").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        let Expr::IfElse(ie) = sel.result else { panic!("expected IfElse") };
+        let Expr::IfElse(ie) = sel.result else {
+            panic!("expected IfElse")
+        };
         assert!(matches!(ie.if_expr, Expr::Literal(Literal::Str(_))));
         assert!(matches!(ie.condition, Expr::BinOp(_)));
         assert!(matches!(ie.else_expr, Expr::Literal(Literal::Str(_))));
@@ -391,7 +459,9 @@ mod tests {
     fn test_if_then_else_chained() {
         let stmt = parse("SELECT IF 1 = 1 THEN 'a' ELSE IF 2 = 2 THEN 'b' ELSE 'c'").unwrap();
         let Stmt::Select(sel) = stmt else { panic!() };
-        let Expr::IfElse(outer) = sel.result else { panic!("expected IfElse") };
+        let Expr::IfElse(outer) = sel.result else {
+            panic!("expected IfElse")
+        };
         assert!(matches!(outer.else_expr, Expr::IfElse(_)));
     }
 
@@ -403,19 +473,13 @@ mod tests {
         // second `::` dangling to surface as a confusing "unexpected token
         // ColonColon" once the (wrongly 2-segment-terminated) call returned.
         let err = parse("select ext::pgcrypto::digest('encrypt this', 'sha1')").unwrap_err();
-        assert!(
-            err.to_string().contains("too many '::' segments"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("too many '::' segments"), "got: {err}");
     }
 
     #[test]
     fn test_nested_module_path_in_type_expr_is_a_clear_error() {
         let err = parse_expr("x is ext::pgcrypto::SomeType").unwrap_err();
-        assert!(
-            err.to_string().contains("too many '::' segments"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("too many '::' segments"), "got: {err}");
     }
 
     // ── Error message wording ───────────────────────────────────────────────

@@ -103,11 +103,15 @@ fn check_violation_message(err: &pylon_pgcon::Error) -> Option<String> {
     }
     if let Some((schema, datatype)) = err.violated_scalar() {
         let module = if schema == "public" { "default" } else { schema };
-        return Some(format!("value violates a check constraint for scalar type '{module}::{datatype}'"));
+        return Some(format!(
+            "value violates a check constraint for scalar type '{module}::{datatype}'"
+        ));
     }
     if let Some((schema, table)) = err.violated_table() {
         let module = if schema == "public" { "default" } else { schema };
-        return Some(format!("value violates a check constraint for object type '{module}::{table}'"));
+        return Some(format!(
+            "value violates a check constraint for object type '{module}::{table}'"
+        ));
     }
     None
 }
@@ -188,15 +192,15 @@ mod message_format_tests {
 
     #[test]
     fn rewrites_multiple_quoted_pairs() {
-        assert_eq!(
-            pylonize_pg_message(r#""a"."b" and "c"."d""#),
-            "'a::b' and 'c::d'",
-        );
+        assert_eq!(pylonize_pg_message(r#""a"."b" and "c"."d""#), "'a::b' and 'c::d'",);
     }
 
     #[test]
     fn leaves_a_lone_quoted_identifier_untouched() {
-        assert_eq!(pylonize_pg_message(r#"column "name" does not exist"#), r#"column "name" does not exist"#);
+        assert_eq!(
+            pylonize_pg_message(r#"column "name" does not exist"#),
+            r#"column "name" does not exist"#
+        );
     }
 
     #[test]
@@ -273,7 +277,10 @@ impl PgconPool {
         let pool = self.inner.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows = pool.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            let rows = pool
+                .query_typed(&sql, &cached_params, &ExtensionOids::default())
+                .await
+                .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
@@ -282,11 +289,19 @@ impl PgconPool {
     /// Python dict per row) instead of assuming a single `(...) AS result`
     /// column — for hand-written admin SQL that reads named columns
     /// directly, mirroring `PgconListener::query_named`.
-    fn query_named<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_named<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows = pool.query_typed_named(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            let rows = pool
+                .query_typed_named(&sql, &cached_params, &ExtensionOids::default())
+                .await
+                .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
@@ -298,7 +313,12 @@ impl PgconPool {
     /// into `query()`. Here the SQL never leaves Rust-owned memory as a
     /// Python object; only `compiled` (an opaque handle) and the
     /// already-resolved `params` cross the boundary.
-    fn query_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_compiled<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -316,7 +336,12 @@ impl PgconPool {
     /// string-wrapping (`f"SELECT COALESCE(json_agg(q), '[]') FROM
     /// ({sql}) q"`). Still just plain string formatting, but it happens
     /// here instead of in Python, so no Python code ever touches `.sql`.
-    fn query_compiled_json_agg<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_compiled_json_agg<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -331,7 +356,12 @@ impl PgconPool {
     /// Like `query_compiled`, but wraps the compiled SQL in `SELECT
     /// row_to_json(q) FROM (... LIMIT 1) q` — the Rust-side equivalent of
     /// `Client.query_single_json`'s second (JSON-materializing) query.
-    fn query_compiled_row_to_json<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_compiled_row_to_json<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -352,7 +382,12 @@ impl PgconPool {
     /// `SchemaDescriptor::to_json` (`lib.rs`): parse with `json.loads()`
     /// Python-side rather than adding a second Rust-to-Python tree-walking
     /// bridge just for this one payload.
-    fn analyze_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn analyze_compiled<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let path_aliases = compiled.inner.analyze_paths.clone().unwrap_or_default();
@@ -370,7 +405,12 @@ impl PgconPool {
     /// Runs `sql` with positional `params` and discards the result,
     /// returning the number of rows affected — for `INSERT`/`UPDATE`/
     /// `DELETE` with no `RETURNING` clause to decode.
-    fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -380,7 +420,12 @@ impl PgconPool {
 
     /// Like `execute`, but reads the SQL text directly out of an
     /// already-compiled `CompiledQuery` — see `query_compiled`.
-    fn execute_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn execute_compiled<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -399,7 +444,9 @@ impl PgconPool {
         let pool = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let tx = pool.begin(&isolation).await.map_err(pgcon_err)?;
-            Ok(PgconTransaction { inner: Arc::new(AsyncMutex::new(Some(tx))) })
+            Ok(PgconTransaction {
+                inner: Arc::new(AsyncMutex::new(Some(tx))),
+            })
         })
     }
 
@@ -452,12 +499,20 @@ impl PgconTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
-            let rows = tx.query_typed(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            let rows = tx
+                .query_typed(&sql, &cached_params, &ExtensionOids::default())
+                .await
+                .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
 
-    fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -469,7 +524,12 @@ impl PgconTransaction {
 
     /// See `PgconPool::query_compiled` — same "read SQL straight out of an
     /// already-compiled `CompiledQuery`" fusion, on a transaction handle.
-    fn query_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_compiled<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -484,7 +544,12 @@ impl PgconTransaction {
     }
 
     /// See `PgconPool::execute_compiled`.
-    fn execute_compiled<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn execute_compiled<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -498,7 +563,12 @@ impl PgconTransaction {
     }
 
     /// See `PgconPool::query_compiled_json_agg`.
-    fn query_compiled_json_agg<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_compiled_json_agg<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -513,7 +583,12 @@ impl PgconTransaction {
     }
 
     /// See `PgconPool::query_compiled_row_to_json`.
-    fn query_compiled_row_to_json<'py>(&self, py: Python<'py>, compiled: &CompiledQuery, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_compiled_row_to_json<'py>(
+        &self,
+        py: Python<'py>,
+        compiled: &CompiledQuery,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
@@ -590,7 +665,12 @@ impl PgconListener {
         })
     }
 
-    fn execute<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -603,11 +683,19 @@ impl PgconListener {
     /// `query` (which only ever decodes column 0, the convention PyQL-
     /// compiled SQL uses). For hand-written admin/worker queries with
     /// several named columns.
-    fn query_named<'py>(&self, py: Python<'py>, sql: String, params: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    fn query_named<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        params: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows = inner.query_typed_named(&sql, &cached_params, &ExtensionOids::default()).await.map_err(pgcon_err)?;
+            let rows = inner
+                .query_typed_named(&sql, &cached_params, &ExtensionOids::default())
+                .await
+                .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
     }
@@ -624,9 +712,18 @@ fn pgcon_listen(py: Python<'_>, dsn: String) -> PyResult<Bound<'_, PyAny>> {
         let dispatch_callbacks = callbacks.clone();
         let listener = PgListener::connect(&dsn, move |n| {
             Python::attach(|py| {
-                let callback = dispatch_callbacks.lock().unwrap().get(n.channel()).map(|cb| cb.clone_ref(py));
+                let callback = dispatch_callbacks
+                    .lock()
+                    .unwrap()
+                    .get(n.channel())
+                    .map(|cb| cb.clone_ref(py));
                 let Some(callback) = callback else { return };
-                let args = (py.None(), n.process_id(), n.channel().to_string(), n.payload().to_string());
+                let args = (
+                    py.None(),
+                    n.process_id(),
+                    n.channel().to_string(),
+                    n.payload().to_string(),
+                );
                 if let Err(e) = callback.call1(py, args) {
                     e.print(py);
                 }
@@ -634,7 +731,10 @@ fn pgcon_listen(py: Python<'_>, dsn: String) -> PyResult<Bound<'_, PyAny>> {
         })
         .await
         .map_err(pgcon_err)?;
-        Ok(PgconListener { inner: Arc::new(listener), callbacks })
+        Ok(PgconListener {
+            inner: Arc::new(listener),
+            callbacks,
+        })
     })
 }
 

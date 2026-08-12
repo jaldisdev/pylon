@@ -30,7 +30,7 @@
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
 use crate::json::not_found;
 

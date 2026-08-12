@@ -62,7 +62,7 @@
 mod common;
 
 use common::*;
-use pylon_core::diff::{diff_schema, DbState};
+use pylon_core::diff::{DbState, diff_schema};
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{PropertyDescriptor, SchemaDescriptor, TypeConstraint, TypeDescriptor};
@@ -151,8 +151,20 @@ fn account_schema(module: &str) -> SchemaDescriptor {
     SchemaDescriptor {
         types: vec![
             interface_ty("Account", module, vec![id_prop(), exclusive_prop("email", false)]),
-            implementor_ty("Individual", module, &account_q, vec![id_prop(), exclusive_prop("email", false)], vec![text_prop("first_name")]),
-            implementor_ty("Organization", module, &account_q, vec![id_prop(), exclusive_prop("email", false)], vec![text_prop("legal_name")]),
+            implementor_ty(
+                "Individual",
+                module,
+                &account_q,
+                vec![id_prop(), exclusive_prop("email", false)],
+                vec![text_prop("first_name")],
+            ),
+            implementor_ty(
+                "Organization",
+                module,
+                &account_q,
+                vec![id_prop(), exclusive_prop("email", false)],
+                vec![text_prop("legal_name")],
+            ),
         ],
         ..Default::default()
     }
@@ -164,8 +176,20 @@ fn nullable_account_schema(module: &str) -> SchemaDescriptor {
     SchemaDescriptor {
         types: vec![
             interface_ty("Account", module, vec![id_prop(), exclusive_prop("email", true)]),
-            implementor_ty("Individual", module, &account_q, vec![id_prop(), exclusive_prop("email", true)], vec![text_prop("first_name")]),
-            implementor_ty("Organization", module, &account_q, vec![id_prop(), exclusive_prop("email", true)], vec![text_prop("legal_name")]),
+            implementor_ty(
+                "Individual",
+                module,
+                &account_q,
+                vec![id_prop(), exclusive_prop("email", true)],
+                vec![text_prop("first_name")],
+            ),
+            implementor_ty(
+                "Organization",
+                module,
+                &account_q,
+                vec![id_prop(), exclusive_prop("email", true)],
+                vec![text_prop("legal_name")],
+            ),
         ],
         ..Default::default()
     }
@@ -179,19 +203,32 @@ fn nullable_account_schema(module: &str) -> SchemaDescriptor {
 fn composite_account_schema(module: &str) -> SchemaDescriptor {
     let account_q = format!("{module}::Account");
     let mut account = interface_ty(
-        "Account", module,
+        "Account",
+        module,
         vec![id_prop(), text_prop("email"), text_prop("first_name")],
     );
     account.constraints.push(TypeConstraint::Exclusive {
         pointers: vec!["first_name".into(), "email".into()],
         unless: None,
     });
-    let mut individual_a = implementor_ty("IndividualA", module, &account_q, vec![id_prop(), text_prop("email"), text_prop("first_name")], vec![]);
+    let mut individual_a = implementor_ty(
+        "IndividualA",
+        module,
+        &account_q,
+        vec![id_prop(), text_prop("email"), text_prop("first_name")],
+        vec![],
+    );
     individual_a.constraints.push(TypeConstraint::Exclusive {
         pointers: vec!["first_name".into(), "email".into()],
         unless: None,
     });
-    let mut individual_b = implementor_ty("IndividualB", module, &account_q, vec![id_prop(), text_prop("email"), text_prop("first_name")], vec![]);
+    let mut individual_b = implementor_ty(
+        "IndividualB",
+        module,
+        &account_q,
+        vec![id_prop(), text_prop("email"), text_prop("first_name")],
+        vec![],
+    );
     individual_b.constraints.push(TypeConstraint::Exclusive {
         pointers: vec!["first_name".into(), "email".into()],
         unless: None,
@@ -233,10 +270,22 @@ fn employer_account_schema(module: &str) -> SchemaDescriptor {
     let mut account = interface_ty("Account", module, vec![id_prop(), text_prop("name")]);
     account.links.push(employer_link.clone());
 
-    let mut individual = implementor_ty("Individual", module, &account_q, vec![id_prop(), text_prop("name")], vec![]);
+    let mut individual = implementor_ty(
+        "Individual",
+        module,
+        &account_q,
+        vec![id_prop(), text_prop("name")],
+        vec![],
+    );
     individual.links.push(employer_link.clone());
 
-    let mut organization = implementor_ty("Organization", module, &account_q, vec![id_prop(), text_prop("name")], vec![]);
+    let mut organization = implementor_ty(
+        "Organization",
+        module,
+        &account_q,
+        vec![id_prop(), text_prop("name")],
+        vec![],
+    );
     organization.links.push(employer_link);
 
     let company = simple_named_type(module, "Company");
@@ -288,7 +337,9 @@ async fn exec(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Result<()
 
 async fn rows_of(pool: &PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
-    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default()).await.unwrap()
+    pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -298,9 +349,23 @@ async fn same_table_duplicate_is_rejected() {
     let schema = account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
-    let result = exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'B' }}")).await;
-    assert!(result.is_err(), "a second Individual with the same email must be rejected by the per-table UNIQUE index");
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
+    let result = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'B' }}"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a second Individual with the same email must be rejected by the per-table UNIQUE index"
+    );
 }
 
 #[tokio::test]
@@ -310,9 +375,23 @@ async fn cross_table_duplicate_is_rejected() {
     let schema = account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
-    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}")).await;
-    assert!(result.is_err(), "an Organization with the same email as an existing Individual must be rejected by the cross-table constraint trigger");
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
+    let result = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an Organization with the same email as an existing Individual must be rejected by the cross-table constraint trigger"
+    );
 }
 
 #[tokio::test]
@@ -322,9 +401,23 @@ async fn distinct_emails_across_implementors_succeed() {
     let schema = account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
-    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'b@x.com', legal_name := 'Corp' }}")).await;
-    assert!(result.is_ok(), "distinct emails across different implementors must both succeed");
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
+    let result = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Organization {{ email := 'b@x.com', legal_name := 'Corp' }}"),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "distinct emails across different implementors must both succeed"
+    );
 }
 
 #[tokio::test]
@@ -339,10 +432,23 @@ async fn same_transaction_cross_table_duplicate_is_still_caught() {
     let schema = account_schema(&module);
     let pool = setup(&schema).await;
 
-    let insert_individual = query::compile(&format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"), &schema).unwrap();
-    let insert_org = query::compile(&format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}"), &schema).unwrap();
-    let result = pool.batch_execute(&format!("{}\n{}", insert_individual.sql, insert_org.sql)).await;
-    assert!(result.is_err(), "two conflicting inserts across implementors in one transaction must still be rejected");
+    let insert_individual = query::compile(
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+        &schema,
+    )
+    .unwrap();
+    let insert_org = query::compile(
+        &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}"),
+        &schema,
+    )
+    .unwrap();
+    let result = pool
+        .batch_execute(&format!("{}\n{}", insert_individual.sql, insert_org.sql))
+        .await;
+    assert!(
+        result.is_err(),
+        "two conflicting inserts across implementors in one transaction must still be rejected"
+    );
 }
 
 #[tokio::test]
@@ -352,14 +458,31 @@ async fn updating_into_a_cross_table_duplicate_is_rejected() {
     let schema = account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
-    exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'b@x.com', legal_name := 'Corp' }}")).await.unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Organization {{ email := 'b@x.com', legal_name := 'Corp' }}"),
+    )
+    .await
+    .unwrap();
 
     let result = exec(
-        &pool, &schema,
+        &pool,
+        &schema,
         &format!("update {module}::Organization filter .legal_name = 'Corp' set {{ email := 'a@x.com' }}"),
-    ).await;
-    assert!(result.is_err(), "updating Organization's email to collide with an existing Individual's must be rejected");
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "updating Organization's email to collide with an existing Individual's must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -369,12 +492,23 @@ async fn updating_an_unrelated_field_does_not_trigger_the_check() {
     let schema = account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
     let result = exec(
-        &pool, &schema,
+        &pool,
+        &schema,
         &format!("update {module}::Individual filter .email = 'a@x.com' set {{ first_name := 'Renamed' }}"),
-    ).await;
-    assert!(result.is_ok(), "updating a field other than the exclusive one must not run the exclusive check at all");
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "updating a field other than the exclusive one must not run the exclusive check at all"
+    );
 }
 
 #[tokio::test]
@@ -384,9 +518,23 @@ async fn null_values_are_never_considered_duplicates_of_each_other() {
     let schema = nullable_account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ first_name := 'A' }}")).await.unwrap();
-    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ legal_name := 'Corp' }}")).await;
-    assert!(result.is_ok(), "two different implementors both leaving a nullable exclusive property NULL must not collide (matches plain SQL UNIQUE semantics)");
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
+    let result = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Organization {{ legal_name := 'Corp' }}"),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "two different implementors both leaving a nullable exclusive property NULL must not collide (matches plain SQL UNIQUE semantics)"
+    );
 }
 
 #[tokio::test]
@@ -396,12 +544,34 @@ async fn composite_exclusive_constraint_is_enforced_across_implementors() {
     let schema = composite_account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::IndividualA {{ email := 'a@x.com', first_name := 'Alice' }}")).await.unwrap();
-    let result = exec(&pool, &schema, &format!("insert {module}::IndividualB {{ email := 'a@x.com', first_name := 'Alice' }}")).await;
-    assert!(result.is_err(), "the same (first_name, email) pair across implementors must violate the composite exclusive constraint");
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::IndividualA {{ email := 'a@x.com', first_name := 'Alice' }}"),
+    )
+    .await
+    .unwrap();
+    let result = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::IndividualB {{ email := 'a@x.com', first_name := 'Alice' }}"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "the same (first_name, email) pair across implementors must violate the composite exclusive constraint"
+    );
 
-    let ok = exec(&pool, &schema, &format!("insert {module}::IndividualB {{ email := 'a@x.com', first_name := 'Bob' }}")).await;
-    assert!(ok.is_ok(), "a differing first_name means the composite pair no longer collides");
+    let ok = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::IndividualB {{ email := 'a@x.com', first_name := 'Bob' }}"),
+    )
+    .await;
+    assert!(
+        ok.is_ok(),
+        "a differing first_name means the composite pair no longer collides"
+    );
 }
 
 /// Mirrors `live_execution_on_delete.rs`'s
@@ -421,9 +591,23 @@ async fn migration_path_emits_working_exclusive_triggers() {
         pool.batch_execute(op).await.unwrap();
     }
 
-    exec(&pool, &schema, &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}")).await.unwrap();
-    let result = exec(&pool, &schema, &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}")).await;
-    assert!(result.is_err(), "a cross-table duplicate must be rejected via the migration-path-emitted trigger too");
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Individual {{ email := 'a@x.com', first_name := 'A' }}"),
+    )
+    .await
+    .unwrap();
+    let result = exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Organization {{ email := 'a@x.com', legal_name := 'Corp' }}"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a cross-table duplicate must be rejected via the migration-path-emitted trigger too"
+    );
 }
 
 // ── Junction-backed exclusive link (cross-implementor helper view) ─────────────
@@ -435,7 +619,13 @@ async fn junction_backed_cross_table_duplicate_target_is_rejected() {
     let schema = employer_account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Company {{ name := 'Acme' }}"),
+    )
+    .await
+    .unwrap();
     exec(
         &pool, &schema,
         &format!("insert {module}::Individual {{ name := 'Alice', employer := (select {module}::Company filter .name = 'Acme') }}"),
@@ -458,8 +648,20 @@ async fn junction_backed_distinct_targets_across_implementors_succeed() {
     let schema = employer_account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
-    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Globex' }}")).await.unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Company {{ name := 'Acme' }}"),
+    )
+    .await
+    .unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Company {{ name := 'Globex' }}"),
+    )
+    .await
+    .unwrap();
     exec(
         &pool, &schema,
         &format!("insert {module}::Individual {{ name := 'Alice', employer := (select {module}::Company filter .name = 'Acme') }}"),
@@ -468,7 +670,10 @@ async fn junction_backed_distinct_targets_across_implementors_succeed() {
         &pool, &schema,
         &format!("insert {module}::Organization {{ name := 'Beta', employer := (select {module}::Company filter .name = 'Globex') }}"),
     ).await;
-    assert!(result.is_ok(), "distinct employers across different implementors must both succeed");
+    assert!(
+        result.is_ok(),
+        "distinct employers across different implementors must both succeed"
+    );
 }
 
 #[tokio::test]
@@ -478,8 +683,20 @@ async fn junction_backed_updating_into_a_cross_table_duplicate_is_rejected() {
     let schema = employer_account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
-    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Globex' }}")).await.unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Company {{ name := 'Acme' }}"),
+    )
+    .await
+    .unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Company {{ name := 'Globex' }}"),
+    )
+    .await
+    .unwrap();
     exec(
         &pool, &schema,
         &format!("insert {module}::Individual {{ name := 'Alice', employer := (select {module}::Company filter .name = 'Acme') }}"),
@@ -493,7 +710,10 @@ async fn junction_backed_updating_into_a_cross_table_duplicate_is_rejected() {
         &pool, &schema,
         &format!("update {module}::Organization filter .name = 'Beta' set {{ employer := (select {module}::Company filter .name = 'Acme') }}"),
     ).await;
-    assert!(result.is_err(), "updating Organization's employer to collide with Individual's must be rejected");
+    assert!(
+        result.is_err(),
+        "updating Organization's employer to collide with Individual's must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -507,15 +727,30 @@ async fn junction_backed_read_through_the_interface_view_resolves_the_link() {
     let schema = employer_account_schema(&module);
     let pool = setup(&schema).await;
 
-    exec(&pool, &schema, &format!("insert {module}::Company {{ name := 'Acme' }}")).await.unwrap();
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Company {{ name := 'Acme' }}"),
+    )
+    .await
+    .unwrap();
     exec(
         &pool, &schema,
         &format!("insert {module}::Individual {{ name := 'Alice', employer := (select {module}::Company filter .name = 'Acme') }}"),
     ).await.unwrap();
 
-    let rows = rows_of(&pool, &schema, &format!("select {module}::Individual {{ name, employer: {{ name }} }}")).await;
-    let DecodedValue::Composite(fields) = &rows[0] else { panic!("expected Composite, got {:?}", rows[0]) };
+    let rows = rows_of(
+        &pool,
+        &schema,
+        &format!("select {module}::Individual {{ name, employer: {{ name }} }}"),
+    )
+    .await;
+    let DecodedValue::Composite(fields) = &rows[0] else {
+        panic!("expected Composite, got {:?}", rows[0])
+    };
     // fields: [type_tag, name, employer] — employer itself: [type_tag, name].
-    let DecodedValue::Composite(employer_fields) = &fields[2] else { panic!("expected employer to decode as Composite, got {:?}", fields[2]) };
+    let DecodedValue::Composite(employer_fields) = &fields[2] else {
+        panic!("expected employer to decode as Composite, got {:?}", fields[2])
+    };
     assert_eq!(employer_fields[1], DecodedValue::Str("Acme".into()));
 }

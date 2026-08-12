@@ -57,7 +57,10 @@ pub fn python_snippet_for_step(step: &MigrationStep, schema: &SchemaDescriptor) 
             Some(python_snippet_for_scalar(s))
         }
         OpKey::Function(module, name) => {
-            let f = schema.functions.iter().find(|f| &f.module == module && &f.name == name)?;
+            let f = schema
+                .functions
+                .iter()
+                .find(|f| &f.module == module && &f.name == name)?;
             Some(python_snippet_for_function(f))
         }
         OpKey::Module(_) => None,
@@ -97,17 +100,32 @@ fn python_snippet_for_class(td: &TypeDescriptor, decorator: &str) -> String {
 
 fn python_snippet_for_enum(e: &EnumDescriptor) -> String {
     let members: Vec<String> = e.members.iter().map(|m| format!("\"{m}\"")).collect();
-    format!("@pylon.enum({})\nclass {}(pylon.Enum):\n    pass", members.join(", "), e.name)
+    format!(
+        "@pylon.enum({})\nclass {}(pylon.Enum):\n    pass",
+        members.join(", "),
+        e.name
+    )
 }
 
 fn python_snippet_for_scalar(s: &ScalarDescriptor) -> String {
-    format!("@pylon.scalar(pylon.{})\nclass {}(pylon.Scalar):\n    pass", s.base, s.name)
+    format!(
+        "@pylon.scalar(pylon.{})\nclass {}(pylon.Scalar):\n    pass",
+        s.base, s.name
+    )
 }
 
 fn python_snippet_for_function(f: &FunctionDescriptor) -> String {
-    let params: Vec<String> = f.params.iter().map(|p| format!("{}: {}", p.name, python_type_hint(&p.pg_type, None))).collect();
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, python_type_hint(&p.pg_type, None)))
+        .collect();
 
-    let mut return_hint = if f.return_is_object { bare_name(&f.return_pg_type).to_string() } else { python_type_hint(&f.return_pg_type, None) };
+    let mut return_hint = if f.return_is_object {
+        bare_name(&f.return_pg_type).to_string()
+    } else {
+        python_type_hint(&f.return_pg_type, None)
+    };
     if f.return_is_set {
         return_hint = format!("set[{return_hint}]");
     }
@@ -128,7 +146,13 @@ fn python_snippet_for_function(f: &FunctionDescriptor) -> String {
 /// added).
 fn indent_block(text: &str, indent: &str) -> String {
     text.lines()
-        .map(|line| if line.is_empty() { line.to_string() } else { format!("{indent}{line}") })
+        .map(|line| {
+            if line.is_empty() {
+                line.to_string()
+            } else {
+                format!("{indent}{line}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -201,23 +225,43 @@ mod tests {
 
     fn empty_type(module: &str, name: &str, table: &str) -> TypeDescriptor {
         TypeDescriptor {
-            name: name.into(), module: module.into(), table: table.into(),
-            abstract_: false, materialized: false, description: None,
-            parents: vec![], interfaces: vec![],
-            properties: vec![], links: vec![], multilinks: vec![], computed: vec![],
-            constraints: vec![], indexes: vec![],
-            vector_indexes: vec![], search_indexes: vec![], triggers: vec![],
-            junction: false, signals: vec![],
+            name: name.into(),
+            module: module.into(),
+            table: table.into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: vec![],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
         }
     }
 
     fn prop(name: &str, pg_type: &str, nullable: bool) -> crate::schema::PropertyDescriptor {
         crate::schema::PropertyDescriptor {
-            name: name.into(), pg_type: pg_type.into(), nullable,
-            default_sql: None, default_pyql: None, description: None,
-            check_constraints: vec![], is_exclusive: false, is_pk: name == "id",
-            is_readonly: name == "id", rewrites: vec![],
-            tuple_members: None, column_type: None,
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: name == "id",
+            is_readonly: name == "id",
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
         }
     }
 
@@ -229,7 +273,13 @@ mod tests {
         td.properties.push(prop("views", "int8", true));
         let schema = SchemaDescriptor {
             types: vec![td],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let step = type_step(schema.types[0].clone(), Verb::Create);
         let snippet = python_snippet_for_step(&step, &schema).unwrap();
@@ -248,10 +298,19 @@ mod tests {
         td.properties.push(prop("email", "text", false));
         let schema = SchemaDescriptor {
             types: vec![td],
-            scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let step = MigrationStep {
-            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            prompt: String::new(),
+            verb: Verb::Create,
+            object_desc: String::new(),
+            ddl: vec![],
             required_input: vec![],
             op_key: OpKey::View("default".into(), "Account".into()),
         };
@@ -264,26 +323,49 @@ mod tests {
         let schema = SchemaDescriptor {
             types: vec![],
             scalars: vec![],
-            enums: vec![EnumDescriptor { name: "Status".into(), module: "default".into(), members: vec!["Active".into(), "Inactive".into()] }],
-            named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            enums: vec![EnumDescriptor {
+                name: "Status".into(),
+                module: "default".into(),
+                members: vec!["Active".into(), "Inactive".into()],
+            }],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let step = MigrationStep {
-            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            prompt: String::new(),
+            verb: Verb::Create,
+            object_desc: String::new(),
+            ddl: vec![],
             required_input: vec![],
             op_key: OpKey::Scalar("default".into(), "Status".into()),
         };
         let snippet = python_snippet_for_step(&step, &schema).unwrap();
-        assert_eq!(snippet, "@pylon.enum(\"Active\", \"Inactive\")\nclass Status(pylon.Enum):\n    pass");
+        assert_eq!(
+            snippet,
+            "@pylon.enum(\"Active\", \"Inactive\")\nclass Status(pylon.Enum):\n    pass"
+        );
     }
 
     #[test]
     fn renders_a_scalar_function_as_its_pyql_body_not_compiled_sql() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            aliases: vec![],
+            channels: vec![],
             functions: vec![FunctionDescriptor {
                 name: "get_content_type".into(),
                 module: "default".into(),
-                params: vec![crate::schema::FunctionParamDescriptor { name: "uuid_val".into(), pg_type: "uuid".into() }],
+                params: vec![crate::schema::FunctionParamDescriptor {
+                    name: "uuid_val".into(),
+                    pg_type: "uuid".into(),
+                }],
                 return_pg_type: "int2".into(),
                 return_is_object: false,
                 return_is_set: false,
@@ -293,7 +375,10 @@ mod tests {
             }],
         };
         let step = MigrationStep {
-            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            prompt: String::new(),
+            verb: Verb::Create,
+            object_desc: String::new(),
+            ddl: vec![],
             required_input: vec![],
             op_key: OpKey::Function("default".into(), "get_content_type".into()),
         };
@@ -321,7 +406,10 @@ mod tests {
             }],
         };
         let step = MigrationStep {
-            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            prompt: String::new(),
+            verb: Verb::Create,
+            object_desc: String::new(),
+            ddl: vec![],
             required_input: vec![],
             op_key: OpKey::Function("default".into(), "get_content_type".into()),
         };
@@ -341,11 +429,20 @@ mod tests {
         // calls, to catch a mismatch between the OpKey a real diff pass
         // produces and what this renderer looks up.
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            aliases: vec![],
+            channels: vec![],
             functions: vec![FunctionDescriptor {
                 name: "get_content_type".into(),
                 module: "default".into(),
-                params: vec![crate::schema::FunctionParamDescriptor { name: "uuid_val".into(), pg_type: "uuid".into() }],
+                params: vec![crate::schema::FunctionParamDescriptor {
+                    name: "uuid_val".into(),
+                    pg_type: "uuid".into(),
+                }],
                 return_pg_type: "int2".into(),
                 return_is_object: false,
                 return_is_set: false,
@@ -355,20 +452,42 @@ mod tests {
             }],
         };
         let steps = crate::diff::diff_schema_steps_with_renames_and_fills(
-            &schema, &crate::diff::DbState::default(), &[], &[], &[],
-        ).unwrap();
-        let step = steps.iter().find(|s| s.prompt.contains("get_content_type")).expect("expected a step for get_content_type");
+            &schema,
+            &crate::diff::DbState::default(),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let step = steps
+            .iter()
+            .find(|s| s.prompt.contains("get_content_type"))
+            .expect("expected a step for get_content_type");
         let snippet = python_snippet_for_step(step, &schema);
-        assert!(snippet.is_some(), "expected a snippet for the function step, prompt was: {:?}", step.prompt);
+        assert!(
+            snippet.is_some(),
+            "expected a snippet for the function step, prompt was: {:?}",
+            step.prompt
+        );
     }
 
     #[test]
     fn returns_none_for_a_module_step() {
         let schema = SchemaDescriptor {
-            types: vec![], scalars: vec![], enums: vec![], named_tuples: vec![], globals: vec![], functions: vec![], aliases: vec![], channels: vec![],
+            types: vec![],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
         };
         let step = MigrationStep {
-            prompt: String::new(), verb: Verb::Create, object_desc: String::new(), ddl: vec![],
+            prompt: String::new(),
+            verb: Verb::Create,
+            object_desc: String::new(),
+            ddl: vec![],
             required_input: vec![],
             op_key: OpKey::Module("catalog".into()),
         };

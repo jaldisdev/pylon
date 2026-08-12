@@ -54,9 +54,7 @@ impl PyQLError {
             E::Type(e) => ("InvalidQueryError", &e.message, &e.position),
             E::Resolution(R::UnknownType(e)) => ("UnknownTypeError", &e.message, &e.position),
             E::Resolution(R::UnknownField(e)) => ("UnknownLinkError", &e.message, &e.position),
-            E::Resolution(R::UnknownParameter(e)) => {
-                ("UnknownParameterError", &e.message, &e.position)
-            }
+            E::Resolution(R::UnknownParameter(e)) => ("UnknownParameterError", &e.message, &e.position),
             E::Cardinality(e) => ("InvalidQueryError", &e.message, &e.position),
             E::Fragment(e) => ("SchemaError", &e.message, &e.position),
         }

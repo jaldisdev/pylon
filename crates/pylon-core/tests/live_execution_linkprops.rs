@@ -118,11 +118,7 @@ async fn exec(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) {
     pool.execute_typed(&compiled.sql, &[]).await.unwrap();
 }
 
-async fn rows_of(
-    pool: &pylon_pgcon::PgPool,
-    sd: &SchemaDescriptor,
-    pyql: &str,
-) -> Vec<DecodedValue> {
+async fn rows_of(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
     let compiled = query::compile(pyql, sd).unwrap();
     pool.query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
@@ -144,9 +140,7 @@ fn as_f64(v: &DecodedValue) -> f64 {
 }
 
 async fn bootstrap(pool: &pylon_pgcon::PgPool) {
-    pool.batch_execute(&pylon_core::stdlib::export_stdlib())
-        .await
-        .unwrap();
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
 }
 
 #[tokio::test]
@@ -156,16 +150,9 @@ async fn insert_with_link_property_round_trips() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Tag {{ name := 'electronics' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'electronics' }}")).await;
     exec(
         &pool,
         &sd,
@@ -190,10 +177,7 @@ async fn insert_with_link_property_round_trips() {
         panic!("expected an Array for tags, got {:?}", shape[1])
     };
     assert_eq!(tags.len(), 1);
-    assert_eq!(
-        field(&tags[0], 1),
-        &DecodedValue::Str("electronics".to_string())
-    );
+    assert_eq!(field(&tags[0], 1), &DecodedValue::Str("electronics".to_string()));
     assert!(
         (as_f64(field(&tags[0], 2)) - 1.5).abs() < f64::EPSILON,
         "expected weight 1.5, got {:?}",
@@ -211,22 +195,10 @@ async fn append_link_property_upserts_on_reappend() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Tag {{ name := 'sale' }}"),
-    )
-    .await;
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Product {{ name := 'Widget' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'sale' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
 
     exec(
         &pool,
@@ -281,28 +253,11 @@ async fn append_union_lands_distinct_values_on_correct_targets() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Tag {{ name := 'a' }}"),
-    )
-    .await;
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Tag {{ name := 'b' }}"),
-    )
-    .await;
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Product {{ name := 'Widget' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'a' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'b' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
 
     exec(
         &pool,
@@ -349,37 +304,22 @@ async fn remove_link_clears_the_junction_row() {
     let sd = schema(&module);
     let pool = test_pool().await;
     bootstrap(&pool).await;
-    pool.batch_execute(&export_schema(&sd).unwrap())
-        .await
-        .unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
 
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Tag {{ name := 'temp' }}"),
-    )
-    .await;
-    exec(
-        &pool,
-        &sd,
-        &format!("insert {module}::Product {{ name := 'Widget' }}"),
-    )
-    .await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'temp' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
     exec(
         &pool, &sd,
         &format!("update {module}::Product set {{ tags += (select {module}::Tag filter .name = 'temp') {{ @weight := 1.0 }} }}"),
     ).await;
     exec(
-        &pool, &sd,
-        &format!("update {module}::Product set {{ tags -= (select {module}::Tag filter .name = 'temp') }}"),
-    ).await;
-
-    let rows = rows_of(
         &pool,
         &sd,
-        &format!("select {module}::Product {{ tags: {{ name }} }}"),
+        &format!("update {module}::Product set {{ tags -= (select {module}::Tag filter .name = 'temp') }}"),
     )
     .await;
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ tags: {{ name }} }}")).await;
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };

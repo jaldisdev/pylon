@@ -37,7 +37,11 @@ pub enum MigrationError {
     #[error("migration file has malformed header line: {0:?}")]
     MalformedHeader(String),
     #[error("migration ID mismatch in {filename}: header says {header_id}, body hashes to {computed_id}")]
-    IdMismatch { filename: String, header_id: String, computed_id: String },
+    IdMismatch {
+        filename: String,
+        header_id: String,
+        computed_id: String,
+    },
     #[error("migration chain conflict: {0}")]
     ChainConflict(String),
     #[error("migration chain has a fork: both {a} and {b} claim onto {parent}")]
@@ -101,16 +105,18 @@ pub fn compute_short_id(body: &str) -> String {
 pub fn parse(content: &str, filename: &str) -> Result<MigrationFile, MigrationError> {
     let mut lines = content.splitn(3, '\n');
 
-    let migration_line = lines.next()
+    let migration_line = lines
+        .next()
         .ok_or_else(|| MigrationError::MissingHeader(filename.to_string()))?;
-    let onto_line = lines.next()
+    let onto_line = lines
+        .next()
         .ok_or_else(|| MigrationError::MissingHeader(filename.to_string()))?;
     let rest = lines.next().unwrap_or(""); // body (may be empty)
 
     let id = parse_header_line(migration_line, "migration")
         .ok_or_else(|| MigrationError::MalformedHeader(migration_line.to_string()))?;
-    let onto = parse_header_line(onto_line, "onto")
-        .ok_or_else(|| MigrationError::MalformedHeader(onto_line.to_string()))?;
+    let onto =
+        parse_header_line(onto_line, "onto").ok_or_else(|| MigrationError::MalformedHeader(onto_line.to_string()))?;
 
     // The body starts after the second newline.
     // Strip exactly one leading newline that separates headers from body.
@@ -142,7 +148,8 @@ fn parse_squashed_lines(content: &str) -> Vec<String> {
             break; // end of header block
         }
         if let Some(rest) = line.trim().strip_prefix("-- squashed:") {
-            return rest.split(',')
+            return rest
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -180,9 +187,7 @@ pub fn validate_chain(migrations: &[MigrationFile]) -> Result<Vec<&MigrationFile
     use std::collections::HashMap;
 
     // Build a map from ID → migration.
-    let by_id: HashMap<&str, &MigrationFile> = migrations.iter()
-        .map(|m| (m.id.as_str(), m))
-        .collect();
+    let by_id: HashMap<&str, &MigrationFile> = migrations.iter().map(|m| (m.id.as_str(), m)).collect();
 
     // Build a map from onto → child. Detect forks.
     let mut children: HashMap<&str, &MigrationFile> = HashMap::new();
@@ -200,10 +205,12 @@ pub fn validate_chain(migrations: &[MigrationFile]) -> Result<Vec<&MigrationFile
     let roots: Vec<_> = migrations.iter().filter(|m| m.onto == "initial").collect();
     match roots.len() {
         0 => return Err(MigrationError::ChainConflict("no migration with onto=initial".into())),
-        2.. => return Err(MigrationError::ChainConflict(
-            format!("multiple migrations claim onto=initial: {}",
-                roots.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", "))
-        )),
+        2.. => {
+            return Err(MigrationError::ChainConflict(format!(
+                "multiple migrations claim onto=initial: {}",
+                roots.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
         _ => {}
     }
 
@@ -227,10 +234,11 @@ pub fn validate_chain(migrations: &[MigrationFile]) -> Result<Vec<&MigrationFile
 
     // Sanity: chain length should match input length (no orphans/cycles).
     if chain.len() != migrations.len() {
-        return Err(MigrationError::ChainConflict(
-            format!("chain has {} entries but {} files exist — possible cycle or orphan",
-                chain.len(), migrations.len())
-        ));
+        return Err(MigrationError::ChainConflict(format!(
+            "chain has {} entries but {} files exist — possible cycle or orphan",
+            chain.len(),
+            migrations.len()
+        )));
     }
 
     Ok(chain)

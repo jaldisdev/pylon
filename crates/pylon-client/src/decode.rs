@@ -47,33 +47,53 @@ fn decode_inner(shape: &ShapeNode, value: &DecodedValue, position_override: Opti
             cached_to_value(&composite_at(value, position_override.unwrap_or(*position)))
         }
         ShapeNode::RawScalar | ShapeNode::JsonScalar => cached_to_value(value),
-        ShapeNode::Object { type_name, position, pointers, .. } => {
-            decode_object(value, position_override.unwrap_or(*position), type_name.as_deref(), pointers)
-        }
+        ShapeNode::Object {
+            type_name,
+            position,
+            pointers,
+            ..
+        } => decode_object(
+            value,
+            position_override.unwrap_or(*position),
+            type_name.as_deref(),
+            pointers,
+        ),
         ShapeNode::Array { position, element, .. } => {
             decode_array(value, position_override.unwrap_or(*position), element)
         }
-        ShapeNode::NamedTuple { position, type_name, members, .. } => decode_named_tuple(
+        ShapeNode::NamedTuple {
+            position,
+            type_name,
+            members,
+            ..
+        } => decode_named_tuple(
             value,
             position_override.unwrap_or(*position),
             type_name.as_deref(),
             members.as_deref(),
         ),
-        ShapeNode::Enum { position, enum_type, .. } => {
-            decode_enum(value, position_override.unwrap_or(*position), enum_type)
-        }
+        ShapeNode::Enum {
+            position, enum_type, ..
+        } => decode_enum(value, position_override.unwrap_or(*position), enum_type),
         ShapeNode::Tuple { elements, .. } => {
             Value::Tuple(elements.iter().map(|e| decode_inner(e, value, None)).collect())
         }
-        ShapeNode::Group { key_nodes, grouping_position, elements_position, element } => {
-            decode_group(value, key_nodes, *grouping_position, *elements_position, element)
-        }
-        ShapeNode::VectorSearch { object_position, distance_position, object_node } => {
-            decode_vector_search(value, *object_position, *distance_position, object_node)
-        }
-        ShapeNode::FtsSearch { object_position, rank_position, object_node } => {
-            decode_fts_search(value, *object_position, *rank_position, object_node)
-        }
+        ShapeNode::Group {
+            key_nodes,
+            grouping_position,
+            elements_position,
+            element,
+        } => decode_group(value, key_nodes, *grouping_position, *elements_position, element),
+        ShapeNode::VectorSearch {
+            object_position,
+            distance_position,
+            object_node,
+        } => decode_vector_search(value, *object_position, *distance_position, object_node),
+        ShapeNode::FtsSearch {
+            object_position,
+            rank_position,
+            object_node,
+        } => decode_fts_search(value, *object_position, *rank_position, object_node),
     }
 }
 
@@ -131,7 +151,11 @@ fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
 fn decode_object(value: &DecodedValue, position: usize, type_name: Option<&str>, pointers: &[ShapeNode]) -> Value {
     // Root object sits at the top level (`value` IS its own tuple already);
     // a nested one is a sub-tuple at `position` within the enclosing one.
-    let obj_tuple = if position == 0 { value.clone() } else { composite_at(value, position) };
+    let obj_tuple = if position == 0 {
+        value.clone()
+    } else {
+        composite_at(value, position)
+    };
     if matches!(obj_tuple, DecodedValue::Null) {
         return Value::Null;
     }
@@ -150,7 +174,10 @@ fn decode_object(value: &DecodedValue, position: usize, type_name: Option<&str>,
         DecodedValue::Str(s) if !s.is_empty() => s,
         _ => static_name.to_string(),
     });
-    Value::Object(Object { type_name: resolved_type_name, fields })
+    Value::Object(Object {
+        type_name: resolved_type_name,
+        fields,
+    })
 }
 
 fn decode_array(value: &DecodedValue, position: usize, element: &ShapeNode) -> Value {
@@ -213,11 +240,18 @@ fn decode_json_tuple(value: &DecodedValue, type_name: Option<&str>, members: Opt
         .iter()
         .map(|m| {
             let key = m.key.clone().expect("named branch: every member has a key");
-            let raw = obj_fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v).unwrap_or(&DecodedValue::Null);
+            let raw = obj_fields
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+                .unwrap_or(&DecodedValue::Null);
             (key, decode_json_member(raw, m))
         })
         .collect();
-    Value::Object(Object { type_name: type_name.map(str::to_string), fields })
+    Value::Object(Object {
+        type_name: type_name.map(str::to_string),
+        fields,
+    })
 }
 
 fn decode_json_member(value: &DecodedValue, member: &JsonMember) -> Value {
@@ -225,19 +259,23 @@ fn decode_json_member(value: &DecodedValue, member: &JsonMember) -> Value {
         JsonMemberKind::Scalar => cached_to_value(value),
         JsonMemberKind::Enum { enum_type } => match value {
             DecodedValue::Null => Value::Null,
-            DecodedValue::Str(s) => Value::Enum { type_name: pg_schema_qualified_to_pylon(enum_type), value: s.clone() },
+            DecodedValue::Str(s) => Value::Enum {
+                type_name: pg_schema_qualified_to_pylon(enum_type),
+                value: s.clone(),
+            },
             other => cached_to_value(other),
         },
-        JsonMemberKind::Tuple { type_name, members } => {
-            decode_json_tuple(value, type_name.as_deref(), Some(members))
-        }
+        JsonMemberKind::Tuple { type_name, members } => decode_json_tuple(value, type_name.as_deref(), Some(members)),
     }
 }
 
 fn decode_enum(value: &DecodedValue, position: usize, enum_type: &str) -> Value {
     match composite_at(value, position) {
         DecodedValue::Null => Value::Null,
-        DecodedValue::Str(s) => Value::Enum { type_name: pg_schema_qualified_to_pylon(enum_type), value: s },
+        DecodedValue::Str(s) => Value::Enum {
+            type_name: pg_schema_qualified_to_pylon(enum_type),
+            value: s,
+        },
         other => cached_to_value(&other),
     }
 }
@@ -253,7 +291,10 @@ fn decode_group(
         .iter()
         .map(|kn| (pointer_name(kn).to_string(), decode_inner(kn, value, None)))
         .collect();
-    let key = Object { type_name: None, fields: key_fields };
+    let key = Object {
+        type_name: None,
+        fields: key_fields,
+    };
 
     let grouping = match composite_at(value, grouping_position) {
         DecodedValue::Array(items) => items
@@ -271,21 +312,41 @@ fn decode_group(
         _ => vec![],
     };
 
-    Value::Group(Box::new(Group { key, grouping, elements }))
+    Value::Group(Box::new(Group {
+        key,
+        grouping,
+        elements,
+    }))
 }
 
-fn decode_vector_search(value: &DecodedValue, object_position: usize, distance_position: usize, object_node: &ShapeNode) -> Value {
+fn decode_vector_search(
+    value: &DecodedValue,
+    object_position: usize,
+    distance_position: usize,
+    object_node: &ShapeNode,
+) -> Value {
     let obj_tuple = composite_at(value, object_position);
     let distance = as_f64(&composite_at(value, distance_position));
     let object = decode_inner(object_node, &obj_tuple, Some(0));
-    Value::VectorSearch { object: Box::new(object), distance }
+    Value::VectorSearch {
+        object: Box::new(object),
+        distance,
+    }
 }
 
-fn decode_fts_search(value: &DecodedValue, object_position: usize, rank_position: usize, object_node: &ShapeNode) -> Value {
+fn decode_fts_search(
+    value: &DecodedValue,
+    object_position: usize,
+    rank_position: usize,
+    object_node: &ShapeNode,
+) -> Value {
     let obj_tuple = composite_at(value, object_position);
     let score = as_f64(&composite_at(value, rank_position));
     let object = decode_inner(object_node, &obj_tuple, Some(0));
-    Value::FtsSearch { object: Box::new(object), score }
+    Value::FtsSearch {
+        object: Box::new(object),
+        score,
+    }
 }
 
 fn as_f64(value: &DecodedValue) -> f64 {
@@ -310,9 +371,15 @@ fn cached_to_value(value: &DecodedValue) -> Value {
         DecodedValue::Bytes(b) => Value::Bytes(b.clone()),
         DecodedValue::Uuid(bytes) => Value::Uuid(uuid::Uuid::from_bytes(*bytes)),
         DecodedValue::Decimal(s) => Value::Decimal(s.clone()),
-        DecodedValue::Interval { months, days, microseconds } => {
-            Value::Duration { months: *months, days: *days, microseconds: *microseconds }
-        }
+        DecodedValue::Interval {
+            months,
+            days,
+            microseconds,
+        } => Value::Duration {
+            months: *months,
+            days: *days,
+            microseconds: *microseconds,
+        },
         DecodedValue::Date(d) => Value::Date(*d),
         DecodedValue::Time(t) => Value::Time(*t),
         DecodedValue::Timestamp(t) => Value::Timestamp(*t),
@@ -323,7 +390,13 @@ fn cached_to_value(value: &DecodedValue) -> Value {
             type_name: None,
             fields: fields.iter().map(|(k, v)| (k.clone(), cached_to_value(v))).collect(),
         }),
-        DecodedValue::Range { lower, upper, inc_lower, inc_upper, empty } => Value::Range(Box::new(Range {
+        DecodedValue::Range {
+            lower,
+            upper,
+            inc_lower,
+            inc_upper,
+            empty,
+        } => Value::Range(Box::new(Range {
             lower: lower.as_ref().map(|b| cached_to_value(b)),
             upper: upper.as_ref().map(|b| cached_to_value(b)),
             inc_lower: *inc_lower,
@@ -346,19 +419,30 @@ mod tests {
     fn decodes_a_root_object_with_a_scalar_property() {
         // (type_disc, name) — the type discriminator always sits at
         // position 0, matching `build_shape`'s own convention.
-        let value = comp(vec![DecodedValue::Str("default::Person".into()), DecodedValue::Str("Bob".into())]);
+        let value = comp(vec![
+            DecodedValue::Str("default::Person".into()),
+            DecodedValue::Str("Bob".into()),
+        ]);
         let shape = ShapeNode::Object {
             name: String::new(),
             type_name: Some("default::Person".into()),
             position: 0,
             cardinality: Cardinality::Required,
             pointers: vec![
-                ShapeNode::Scalar { name: "__type__".into(), position: 0 },
-                ShapeNode::Scalar { name: "name".into(), position: 1 },
+                ShapeNode::Scalar {
+                    name: "__type__".into(),
+                    position: 0,
+                },
+                ShapeNode::Scalar {
+                    name: "name".into(),
+                    position: 1,
+                },
             ],
         };
         let decoded = decode(&shape, &value);
-        let Value::Object(obj) = decoded else { panic!("expected Object, got {decoded:?}") };
+        let Value::Object(obj) = decoded else {
+            panic!("expected Object, got {decoded:?}")
+        };
         assert_eq!(obj.type_name(), Some("default::Person"));
         assert_eq!(obj.get("name"), Some(&Value::Str("Bob".into())));
         // The injected __type__ pointer at position 0 must not appear as a
@@ -375,9 +459,14 @@ mod tests {
             type_name: Some("default::Account".into()),
             position: 0,
             cardinality: Cardinality::Required,
-            pointers: vec![ShapeNode::Scalar { name: "__type__".into(), position: 0 }],
+            pointers: vec![ShapeNode::Scalar {
+                name: "__type__".into(),
+                position: 0,
+            }],
         };
-        let Value::Object(obj) = decode(&shape, &value) else { panic!("expected Object") };
+        let Value::Object(obj) = decode(&shape, &value) else {
+            panic!("expected Object")
+        };
         assert_eq!(obj.type_name(), Some("default::Individual"));
     }
 
@@ -396,7 +485,10 @@ mod tests {
 
     #[test]
     fn decodes_a_nested_array_of_objects() {
-        let item = comp(vec![DecodedValue::Str("default::Tag".into()), DecodedValue::Str("rust".into())]);
+        let item = comp(vec![
+            DecodedValue::Str("default::Tag".into()),
+            DecodedValue::Str("rust".into()),
+        ]);
         let value = comp(vec![
             DecodedValue::Str("default::Post".into()),
             DecodedValue::Array(vec![item]),
@@ -410,42 +502,72 @@ mod tests {
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: vec![
-                    ShapeNode::Scalar { name: "__type__".into(), position: 0 },
-                    ShapeNode::Scalar { name: "name".into(), position: 1 },
+                    ShapeNode::Scalar {
+                        name: "__type__".into(),
+                        position: 0,
+                    },
+                    ShapeNode::Scalar {
+                        name: "name".into(),
+                        position: 1,
+                    },
                 ],
             }),
         };
-        let Value::Array(items) = decode(&shape, &value) else { panic!("expected Array") };
+        let Value::Array(items) = decode(&shape, &value) else {
+            panic!("expected Array")
+        };
         assert_eq!(items.len(), 1);
-        let Value::Object(tag) = &items[0] else { panic!("expected Object element") };
+        let Value::Object(tag) = &items[0] else {
+            panic!("expected Object element")
+        };
         assert_eq!(tag.get("name"), Some(&Value::Str("rust".into())));
     }
 
     #[test]
     fn enum_translates_public_schema_back_to_default_module() {
         let value = comp(vec![DecodedValue::Str("Male".into())]);
-        let shape = ShapeNode::Enum { name: "gender".into(), position: 0, enum_type: "public::Gender".into() };
+        let shape = ShapeNode::Enum {
+            name: "gender".into(),
+            position: 0,
+            enum_type: "public::Gender".into(),
+        };
         assert_eq!(
             decode(&shape, &value),
-            Value::Enum { type_name: "default::Gender".into(), value: "Male".into() },
+            Value::Enum {
+                type_name: "default::Gender".into(),
+                value: "Male".into()
+            },
         );
     }
 
     #[test]
     fn enum_in_a_non_default_module_is_left_unqualified_untranslated() {
         let value = comp(vec![DecodedValue::Str("Active".into())]);
-        let shape = ShapeNode::Enum { name: "status".into(), position: 0, enum_type: "billing::Status".into() };
+        let shape = ShapeNode::Enum {
+            name: "status".into(),
+            position: 0,
+            enum_type: "billing::Status".into(),
+        };
         assert_eq!(
             decode(&shape, &value),
-            Value::Enum { type_name: "billing::Status".into(), value: "Active".into() },
+            Value::Enum {
+                type_name: "billing::Status".into(),
+                value: "Active".into()
+            },
         );
     }
 
     #[test]
     fn raw_scalar_and_json_scalar_pass_the_value_through_directly() {
         let value = DecodedValue::Array(vec![DecodedValue::I64(1), DecodedValue::I64(2)]);
-        assert_eq!(decode(&ShapeNode::RawScalar, &value), Value::Array(vec![Value::Int64(1), Value::Int64(2)]));
-        assert_eq!(decode(&ShapeNode::JsonScalar, &value), Value::Array(vec![Value::Int64(1), Value::Int64(2)]));
+        assert_eq!(
+            decode(&ShapeNode::RawScalar, &value),
+            Value::Array(vec![Value::Int64(1), Value::Int64(2)])
+        );
+        assert_eq!(
+            decode(&ShapeNode::JsonScalar, &value),
+            Value::Array(vec![Value::Int64(1), Value::Int64(2)])
+        );
     }
 
     #[test]
@@ -454,28 +576,48 @@ mod tests {
         let shape = ShapeNode::Tuple {
             position: 0,
             elements: vec![
-                ShapeNode::Scalar { name: String::new(), position: 0 },
-                ShapeNode::Scalar { name: String::new(), position: 1 },
+                ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 0,
+                },
+                ShapeNode::Scalar {
+                    name: String::new(),
+                    position: 1,
+                },
             ],
         };
-        assert_eq!(decode(&shape, &value), Value::Tuple(vec![Value::Int64(1), Value::Int64(2)]));
+        assert_eq!(
+            decode(&shape, &value),
+            Value::Tuple(vec![Value::Int64(1), Value::Int64(2)])
+        );
     }
 
     #[test]
     fn decodes_a_registered_named_tuple_from_jsonb() {
-        let raw = DecodedValue::Object(vec![("x".into(), DecodedValue::F64(1.0)), ("y".into(), DecodedValue::F64(2.0))]);
+        let raw = DecodedValue::Object(vec![
+            ("x".into(), DecodedValue::F64(1.0)),
+            ("y".into(), DecodedValue::F64(2.0)),
+        ]);
         let value = comp(vec![DecodedValue::Str("default::Person".into()), raw]);
         let shape = ShapeNode::NamedTuple {
             name: "location".into(),
             position: 1,
             type_name: Some("default::Point".into()),
             members: Some(vec![
-                JsonMember { key: Some("x".into()), kind: JsonMemberKind::Scalar },
-                JsonMember { key: Some("y".into()), kind: JsonMemberKind::Scalar },
+                JsonMember {
+                    key: Some("x".into()),
+                    kind: JsonMemberKind::Scalar,
+                },
+                JsonMember {
+                    key: Some("y".into()),
+                    kind: JsonMemberKind::Scalar,
+                },
             ]),
             is_free_object: false,
         };
-        let Value::Object(point) = decode(&shape, &value) else { panic!("expected Object") };
+        let Value::Object(point) = decode(&shape, &value) else {
+            panic!("expected Object")
+        };
         assert_eq!(point.type_name(), Some("default::Point"));
         assert_eq!(point.get("x"), Some(&Value::Float64(1.0)));
         assert_eq!(point.get("y"), Some(&Value::Float64(2.0)));
@@ -490,15 +632,22 @@ mod tests {
             type_name: None,
             members: Some(vec![JsonMember {
                 key: Some("gender".into()),
-                kind: JsonMemberKind::Enum { enum_type: "public::Gender".into() },
+                kind: JsonMemberKind::Enum {
+                    enum_type: "public::Gender".into(),
+                },
             }]),
             is_free_object: false,
         };
-        let Value::Object(obj) = decode(&shape, &raw) else { panic!("expected Object") };
+        let Value::Object(obj) = decode(&shape, &raw) else {
+            panic!("expected Object")
+        };
         assert_eq!(obj.type_name(), None);
         assert_eq!(
             obj.get("gender"),
-            Some(&Value::Enum { type_name: "default::Gender".into(), value: "Female".into() }),
+            Some(&Value::Enum {
+                type_name: "default::Gender".into(),
+                value: "Female".into()
+            }),
         );
     }
 
@@ -513,7 +662,10 @@ mod tests {
             ])]),
         ]);
         let shape = ShapeNode::Group {
-            key_nodes: vec![ShapeNode::Scalar { name: "gender".into(), position: 0 }],
+            key_nodes: vec![ShapeNode::Scalar {
+                name: "gender".into(),
+                position: 0,
+            }],
             grouping_position: 1,
             elements_position: 2,
             element: Box::new(ShapeNode::Object {
@@ -522,22 +674,35 @@ mod tests {
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: vec![
-                    ShapeNode::Scalar { name: "__type__".into(), position: 0 },
-                    ShapeNode::Scalar { name: "name".into(), position: 1 },
+                    ShapeNode::Scalar {
+                        name: "__type__".into(),
+                        position: 0,
+                    },
+                    ShapeNode::Scalar {
+                        name: "name".into(),
+                        position: 1,
+                    },
                 ],
             }),
         };
-        let Value::Group(group) = decode(&shape, &value) else { panic!("expected Group") };
+        let Value::Group(group) = decode(&shape, &value) else {
+            panic!("expected Group")
+        };
         assert_eq!(group.key.get("gender"), Some(&Value::Str("Male".into())));
         assert_eq!(group.grouping, vec!["gender".to_string()]);
         assert_eq!(group.elements.len(), 1);
-        let Value::Object(person) = &group.elements[0] else { panic!("expected Object element") };
+        let Value::Object(person) = &group.elements[0] else {
+            panic!("expected Object element")
+        };
         assert_eq!(person.get("name"), Some(&Value::Str("Bob".into())));
     }
 
     #[test]
     fn decodes_vector_search_result() {
-        let obj = comp(vec![DecodedValue::Str("default::Product".into()), DecodedValue::Str("Widget".into())]);
+        let obj = comp(vec![
+            DecodedValue::Str("default::Product".into()),
+            DecodedValue::Str("Widget".into()),
+        ]);
         let value = comp(vec![DecodedValue::Null, obj, DecodedValue::F64(0.25)]);
         let shape = ShapeNode::VectorSearch {
             object_position: 1,
@@ -548,14 +713,24 @@ mod tests {
                 position: 1,
                 cardinality: Cardinality::Many,
                 pointers: vec![
-                    ShapeNode::Scalar { name: "__type__".into(), position: 0 },
-                    ShapeNode::Scalar { name: "name".into(), position: 1 },
+                    ShapeNode::Scalar {
+                        name: "__type__".into(),
+                        position: 0,
+                    },
+                    ShapeNode::Scalar {
+                        name: "name".into(),
+                        position: 1,
+                    },
                 ],
             }),
         };
-        let Value::VectorSearch { object, distance } = decode(&shape, &value) else { panic!("expected VectorSearch") };
+        let Value::VectorSearch { object, distance } = decode(&shape, &value) else {
+            panic!("expected VectorSearch")
+        };
         assert_eq!(distance, 0.25);
-        let Value::Object(product) = *object else { panic!("expected Object") };
+        let Value::Object(product) = *object else {
+            panic!("expected Object")
+        };
         assert_eq!(product.get("name"), Some(&Value::Str("Widget".into())));
     }
 
@@ -568,7 +743,9 @@ mod tests {
             inc_upper: false,
             empty: false,
         };
-        let Value::Range(range) = cached_to_value(&value) else { panic!("expected Range") };
+        let Value::Range(range) = cached_to_value(&value) else {
+            panic!("expected Range")
+        };
         assert_eq!(range.lower, Some(Value::Int64(1)));
         assert_eq!(range.upper, Some(Value::Int64(10)));
         assert!(range.inc_lower && !range.inc_upper && !range.empty);

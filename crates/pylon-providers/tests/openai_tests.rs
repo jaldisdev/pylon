@@ -71,7 +71,9 @@ async fn chunks_large_batches_at_max_batch_size() {
         .respond_with(|req: &wiremock::Request| {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
             let n = body["input"].as_array().unwrap().len();
-            let data: Vec<_> = (0..n).map(|i| serde_json::json!({"index": i, "embedding": [i as f64]})).collect();
+            let data: Vec<_> = (0..n)
+                .map(|i| serde_json::json!({"index": i, "embedding": [i as f64]}))
+                .collect();
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": data}))
         })
         .expect(2)
@@ -113,7 +115,10 @@ async fn chat_posts_model_and_messages_and_extracts_the_first_choice() {
 
     let provider = OpenAiProvider::new(&server.uri(), "gpt", None).unwrap();
     let reply = provider
-        .chat(&[Message { role: "user".into(), content: "hi".into() }])
+        .chat(&[Message {
+            role: "user".into(),
+            content: "hi".into(),
+        }])
         .await
         .unwrap();
 

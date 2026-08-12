@@ -109,7 +109,11 @@ impl OpenAiProvider {
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
-        Ok(Self { client, base_url: api_url.trim_end_matches('/').to_string(), model: model.to_string() })
+        Ok(Self {
+            client,
+            base_url: api_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+        })
     }
 
     /// Returns one embedding vector per input text, in the same order —
@@ -119,7 +123,10 @@ impl OpenAiProvider {
     pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut results = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(MAX_BATCH) {
-            let body = EmbeddingsRequest { model: &self.model, input: chunk };
+            let body = EmbeddingsRequest {
+                model: &self.model,
+                input: chunk,
+            };
             let response = self
                 .client
                 .post(format!("{}/embeddings", self.base_url))
@@ -137,7 +144,13 @@ impl OpenAiProvider {
     pub async fn chat(&self, messages: &[Message]) -> Result<String> {
         let body = ChatRequest {
             model: &self.model,
-            messages: messages.iter().map(|m| ChatMessage { role: &m.role, content: &m.content }).collect(),
+            messages: messages
+                .iter()
+                .map(|m| ChatMessage {
+                    role: &m.role,
+                    content: &m.content,
+                })
+                .collect(),
         };
         let response = self
             .client

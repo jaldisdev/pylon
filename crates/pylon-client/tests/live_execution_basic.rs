@@ -29,15 +29,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pylon_client::{DecodedValue, Client, Isolation, Value};
+use pylon_client::{Client, DecodedValue, Isolation, Value};
 use pylon_core::export::export_schema;
 use pylon_core::schema::{
     ChannelDescriptor, ChannelPayload, PropertyDescriptor, SchemaDescriptor, TriggerDescriptor, TypeDescriptor,
 };
 
 fn test_dsn() -> String {
-    std::env::var("PYLON_PGCON_TEST_DSN")
-        .expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+    std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
 }
 
 fn unique_module(prefix: &str) -> String {
@@ -154,7 +153,9 @@ async fn setup(schema: &SchemaDescriptor) -> Client {
     // `live_execution_*.rs` file's `bootstrap()` helper).
     pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
-    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap()).await.unwrap();
+    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap())
+        .await
+        .unwrap();
 
     Client::builder(test_dsn()).max_pool_size(5).build().await.unwrap()
 }
@@ -168,7 +169,9 @@ async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
     pylon_core::migrate::ensure_tracking_tables(&pool).await.unwrap();
     pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
-    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap()).await.unwrap();
+    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap())
+        .await
+        .unwrap();
 
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let cache_dir = std::env::temp_dir().join(format!("pylon-client-live-test-cache-{nanos}"));
@@ -195,9 +198,14 @@ async fn query_and_execute_round_trip() {
         .await
         .unwrap();
 
-    let rows = client.query(&format!("select {module}::Person {{ name }}"), &[]).await.unwrap();
+    let rows = client
+        .query(&format!("select {module}::Person {{ name }}"), &[])
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
-    let Value::Object(person) = &rows[0] else { panic!("expected Object, got {:?}", rows[0]) };
+    let Value::Object(person) = &rows[0] else {
+        panic!("expected Object, got {:?}", rows[0])
+    };
     assert_eq!(person.get("name"), Some(&Value::Str("Alice".into())));
     assert_eq!(person.type_name(), Some(format!("{module}::Person").as_str()));
 }
@@ -208,7 +216,13 @@ async fn query_single_enforces_cardinality() {
     let module = unique_module("live_client_single");
     let client = setup(&person_schema(&module)).await;
 
-    assert_eq!(client.query_single(&format!("select {module}::Person"), &[]).await.unwrap(), None);
+    assert_eq!(
+        client
+            .query_single(&format!("select {module}::Person"), &[])
+            .await
+            .unwrap(),
+        None
+    );
 
     client
         .execute(
@@ -225,8 +239,14 @@ async fn query_single_enforces_cardinality() {
         .await
         .unwrap();
 
-    let err = client.query_single(&format!("select {module}::Person"), &[]).await.unwrap_err();
-    assert!(matches!(err, pylon_client::Error::ResultCardinality { got: 2 }), "got: {err:?}");
+    let err = client
+        .query_single(&format!("select {module}::Person"), &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, pylon_client::Error::ResultCardinality { got: 2 }),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -273,7 +293,10 @@ async fn transaction_commits_on_success() {
         .await
         .unwrap();
 
-    let rows = client.query(&format!("select {module}::Person {{ name }}"), &[]).await.unwrap();
+    let rows = client
+        .query(&format!("select {module}::Person {{ name }}"), &[])
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
 }
 
@@ -297,7 +320,8 @@ async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors
                 // An unknown link name is a compile error — not retriable —
                 // so the whole transaction (including the insert above)
                 // must roll back, and the loop must not retry.
-                tx.execute(&format!("select {module}::Person.nonexistent_link"), &[]).await
+                tx.execute(&format!("select {module}::Person.nonexistent_link"), &[])
+                    .await
             })
         })
         .await;
@@ -326,7 +350,9 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     let query = format!("select {module}::Person {{ name }}");
     let first = client.query(&query, &[]).await.unwrap();
     assert_eq!(first.len(), 1);
-    let Value::Object(person) = &first[0] else { panic!("expected Object") };
+    let Value::Object(person) = &first[0] else {
+        panic!("expected Object")
+    };
     assert_eq!(person.get("name"), Some(&Value::Str("Alice".into())));
 
     // Mutate the underlying row directly, bypassing the cache entirely.
@@ -339,7 +365,10 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     // No invalidation listener is running (by design — see Builder::cache's
     // docs), so the second call must still serve the stale cached value.
     let second = client.query(&query, &[]).await.unwrap();
-    assert_eq!(second, first, "a read-through cache hit must return the stale cached value");
+    assert_eq!(
+        second, first,
+        "a read-through cache hit must return the stale cached value"
+    );
 
     // Confirm the cache actually holds an entry (not just a coincidental
     // real re-fetch that happened to match).
@@ -353,7 +382,9 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     // After clearing the cache, the same query now genuinely re-fetches
     // and observes the mutation.
     let third = client.query(&query, &[]).await.unwrap();
-    let Value::Object(person) = &third[0] else { panic!("expected Object") };
+    let Value::Object(person) = &third[0] else {
+        panic!("expected Object")
+    };
     assert_eq!(person.get("name"), Some(&Value::Str("Mutated".into())));
 }
 
@@ -398,7 +429,10 @@ async fn listen_decodes_a_scalar_channel_payload() {
         .await
         .unwrap();
 
-    assert_eq!(recv_with_timeout(&mut listener).await.unwrap(), Value::Str("gadget".to_string()));
+    assert_eq!(
+        recv_with_timeout(&mut listener).await.unwrap(),
+        Value::Str("gadget".to_string())
+    );
 }
 
 #[tokio::test]
@@ -430,10 +464,17 @@ async fn listen_decodes_a_type_channel_payload_as_the_rows_id() {
         .unwrap();
 
     let payload = recv_with_timeout(&mut listener).await.unwrap();
-    let Value::Uuid(id) = payload else { panic!("expected Uuid, got {payload:?}") };
+    let Value::Uuid(id) = payload else {
+        panic!("expected Uuid, got {payload:?}")
+    };
 
-    let rows = client.query(&format!("select {module}::Person {{ id }}"), &[]).await.unwrap();
-    let Value::Object(person) = &rows[0] else { panic!("expected Object") };
+    let rows = client
+        .query(&format!("select {module}::Person {{ id }}"), &[])
+        .await
+        .unwrap();
+    let Value::Object(person) = &rows[0] else {
+        panic!("expected Object")
+    };
     assert_eq!(person.get("id"), Some(&Value::Uuid(id)));
 }
 
@@ -461,13 +502,18 @@ async fn listen_decodes_an_object_channel_payload() {
     client
         .execute(
             &format!("insert {module}::Person {{ name := <str>$name, score := <float64>$score }}"),
-            &[("name", DecodedValue::Str("gadget".into())), ("score", DecodedValue::F64(0.75))],
+            &[
+                ("name", DecodedValue::Str("gadget".into())),
+                ("score", DecodedValue::F64(0.75)),
+            ],
         )
         .await
         .unwrap();
 
     let payload = recv_with_timeout(&mut listener).await.unwrap();
-    let Value::Object(obj) = payload else { panic!("expected Object, got {payload:?}") };
+    let Value::Object(obj) = payload else {
+        panic!("expected Object, got {payload:?}")
+    };
     assert_eq!(obj.get("name"), Some(&Value::Str("gadget".to_string())));
     assert_eq!(obj.get("score"), Some(&Value::Float64(0.75)));
 }
@@ -498,6 +544,8 @@ async fn listen_raises_on_a_malformed_payload() {
         .await
         .unwrap();
 
-    let err = recv_with_timeout(&mut listener).await.err().expect("expected a malformed-payload error");
+    let err = recv_with_timeout(&mut listener)
+        .await
+        .expect_err("expected a malformed-payload error");
     assert!(matches!(err, pylon_client::Error::MalformedPayload(_)), "got: {err:?}");
 }
