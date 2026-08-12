@@ -139,37 +139,51 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
     asyncio.run(run())
 
 
-async def _first_payload(gen, trigger: asyncio.Future | None = None, *, timeout: float = 10.0):
-    """Start consuming *gen*, run *trigger* (if given) once the listener has
-    had a moment to register, and return the first yielded payload.
+async def _first_payload(gen, trigger_factory=None, *, timeout: float = 20.0, retry_every: float = 0.25):
+    """Start consuming *gen*, fire *trigger_factory* until a notification
+    arrives, and return the first yielded payload.
 
-    `client.listen()` is an async *generator* — calling it builds a
-    generator object but runs none of its body (including the
-    `add_listener()` call that actually registers `LISTEN` with Postgres)
-    until something first drives it via `__anext__()`/`async for`. Handing
-    `gen.__anext__()` to `asyncio.create_task()` only *schedules* that; it
-    doesn't run any of it synchronously. So there's no way to know from out
-    here that the subscription is actually registered server-side other
-    than giving the task enough real wall-clock time to reach its first
-    `await queue.get()` — if the trigger fires first, the notification is
-    sent before anyone's listening and never arrives at all.
+    `client.listen()` is an async *generator* — calling it builds a generator
+    object but runs none of its body (including the `add_listener()` call
+    that actually registers `LISTEN` with Postgres) until something first
+    drives it via `__anext__()`/`async for`. Handing `gen.__anext__()` to
+    `asyncio.create_task()` only *schedules* that; it doesn't run any of it
+    synchronously. And there is no way to observe from out here whether
+    another backend's `LISTEN` has registered — Postgres doesn't expose one
+    session's subscriptions to another. A notification sent before
+    registration completes is simply never delivered to anyone.
 
-    A fixed sleep here is inherently a race, just an increasingly generous
-    one — 0.1s flaked under full-suite load, then 0.5s *still* flaked on a
-    heavily loaded machine (confirmed live, not theoretical, both times).
-    There's no clean way to observe "has that other connection's LISTEN
-    actually registered" from out here — Postgres doesn't expose another
-    backend's subscriptions — so this is a wider margin, not a different
-    strategy: 2s is generous enough that a real regression (the
-    subscription genuinely never arriving) still fails loudly via the
-    `wait_for` timeout below, while comfortably covering normal scheduling
-    jitter under load.
+    This used to sleep a fixed 2s and fire once, which is a race by
+    construction: 0.1s flaked under full-suite load, 0.5s flaked on a loaded
+    machine, and 2s flaked in CI. Rather than widen that margin a fourth
+    time, *keep firing* — `trigger_factory` is called repeatedly until the
+    listener actually yields. Whichever notification lands first is the one
+    the test sees, so registration timing stops mattering at all. A genuine
+    regression (the subscription never arriving) still fails loudly, now via
+    the overall deadline.
+
+    `trigger_factory` must be a zero-argument callable returning a fresh
+    awaitable each call — a bare coroutine can only be awaited once. It must
+    also be safe to run more than once; the callers here insert rows whose
+    resulting notification payload is identical every time.
     """
     task = asyncio.create_task(gen.__anext__())
-    await asyncio.sleep(2.0)
-    if trigger is not None:
-        await trigger
-    return await asyncio.wait_for(task, timeout=timeout)
+    if trigger_factory is None:
+        return await asyncio.wait_for(task, timeout=timeout)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        while True:
+            await trigger_factory()
+            done, _pending = await asyncio.wait({task}, timeout=retry_every)
+            if done:
+                return task.result()
+            if loop.time() >= deadline:
+                raise TimeoutError(f'no notification arrived within {timeout}s')
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
@@ -206,7 +220,7 @@ def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
 
         payload = await _first_payload(
             client.listen('Pings'),
-            client.execute(f"insert {module}::Widget {{ name := 'gadget' }}"),
+            lambda: client.execute(f"insert {module}::Widget {{ name := 'gadget' }}"),
         )
         assert payload == 'gadget'
 
@@ -252,12 +266,15 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
 
         payload = await _first_payload(
             client.listen('WidgetUpdates'),
-            client.execute(f"insert {module}::Widget {{ name := 'gadget' }}"),
+            lambda: client.execute(f"insert {module}::Widget {{ name := 'gadget' }}"),
         )
         assert isinstance(payload, uuid.UUID)
 
+        # `_first_payload` fires its trigger until one notification lands, so
+        # there may be several Widgets by now — the guarantee under test is
+        # that the payload is a real inserted row's id, not which one.
         rows = await client.query(f"select {module}::Widget {{ id }} filter .name = 'gadget'")
-        assert payload == rows[0].id
+        assert payload in {r.id for r in rows}
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
@@ -305,7 +322,7 @@ def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
 
         payload = await _first_payload(
             client.listen('WidgetReady'),
-            client.execute(f"insert {module}::Widget {{ name := 'gadget', score := 0.75 }}"),
+            lambda: client.execute(f"insert {module}::Widget {{ name := 'gadget', score := 0.75 }}"),
         )
         assert isinstance(payload, PylonObject)
         assert payload.name == 'gadget'
@@ -355,25 +372,10 @@ def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
         async def send_bad_payload():
             await live_pool.execute(f"SELECT pg_notify('{wire_name}', 'not-a-uuid')", [])
 
-        # A plain `_first_payload()` call here is retried below rather than
-        # given a single attempt — unlike the other listen tests in this
-        # file, `send_bad_payload()` has no state of its own to worry about
-        # duplicating, so a stray timeout (the listener's `add_listener()`
-        # genuinely not having registered by the time `_first_payload`'s own
-        # margin ran out, under heavy concurrent load) can just be retried
-        # outright instead of failing the test.
-        last_timeout: asyncio.TimeoutError | None = None
+        # `_first_payload` keeps firing until a notification lands, so the
+        # outer retry loop this test used to need is gone.
         with pytest.raises(QueryError, match="doesn't match its declared shape"):
-            for _attempt in range(3):
-                try:
-                    await _first_payload(client.listen('Ids'), send_bad_payload())
-                except TimeoutError as exc:
-                    last_timeout = exc
-                    continue
-                else:
-                    break
-            else:
-                raise last_timeout
+            await _first_payload(client.listen('Ids'), send_bad_payload)
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
