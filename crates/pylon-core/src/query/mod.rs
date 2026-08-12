@@ -256,6 +256,118 @@ pub struct CompiledQuery {
     pub analyze_paths: Option<Vec<ShapePathAlias>>,
 }
 
+impl CompiledQuery {
+    /// This query's stable shape id — see `crate::shape_id`.
+    ///
+    /// Independent of the values bound to it, which is what makes it safe as
+    /// a metric label: a query run a million times with different parameters
+    /// reports one label value, not a million.
+    pub fn shape_id(&self) -> String {
+        crate::shape_id::query_shape_id(&self.sql, &format!("{:?}", self.shape))
+    }
+}
+
+/// A coarse bucket for a failed query, for use as a metric label.
+///
+/// Deliberately coarse: an unbounded label (a raw error message, a SQLSTATE,
+/// a constraint name) is exactly the thing that blows up a metrics backend's
+/// cardinality. Anything finer belongs on a span or in a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// A constraint the write violated — unique, foreign key, check, not-null.
+    ConstraintViolation,
+    /// Serialization failure or deadlock: the caller can retry.
+    Contention,
+    /// Statement or lock timeout.
+    Timeout,
+    /// Couldn't reach or stay connected to the database.
+    Connection,
+    /// The query never reached the database — bad PyQL, unknown type/pointer.
+    Compile,
+    Other,
+}
+
+impl ErrorClass {
+    /// The label value. `&'static str` so it can't accidentally become
+    /// unbounded.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            ErrorClass::ConstraintViolation => "constraint_violation",
+            ErrorClass::Contention => "contention",
+            ErrorClass::Timeout => "timeout",
+            ErrorClass::Connection => "connection",
+            ErrorClass::Compile => "compile",
+            ErrorClass::Other => "other",
+        }
+    }
+
+    /// Buckets a SQLSTATE by its two-character class, which is how the
+    /// standard already groups them — so a code this was never written
+    /// against still lands somewhere sensible instead of in `Other`.
+    pub fn from_sqlstate(code: &str) -> Self {
+        match code {
+            "40001" => ErrorClass::Contention,
+            "40P01" => ErrorClass::Contention,
+            "57014" => ErrorClass::Timeout,
+            "55P03" => ErrorClass::Timeout,
+            _ => match code.get(..2) {
+                // 23 = integrity constraint violation.
+                Some("23") => ErrorClass::ConstraintViolation,
+                // 08 = connection exception.
+                Some("08") => ErrorClass::Connection,
+                // 40 = transaction rollback.
+                Some("40") => ErrorClass::Contention,
+                _ => ErrorClass::Other,
+            },
+        }
+    }
+}
+
+/// Whether a query succeeded, and if not, how it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Ok,
+    Error(ErrorClass),
+}
+
+impl Outcome {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Outcome::Ok => "success",
+            Outcome::Error(_) => "error",
+        }
+    }
+}
+
+/// Timing and result facts about one query execution.
+///
+/// Returned alongside the result rather than reported from inside the
+/// execution path, so the caller decides what to do with it — record a
+/// metric, attach it to a span, log it, or ignore it. Keeping the decision
+/// out here is what lets the same execution path serve an instrumented
+/// server and an uninstrumented script.
+#[derive(Debug, Clone)]
+pub struct ExecutionMetadata {
+    /// PyQL → SQL compilation. Zero on a compile-cache hit, which is itself
+    /// the signal that the cache is working.
+    pub compile_duration: std::time::Duration,
+    /// Time in the database, from handing over the SQL to having the rows.
+    pub execute_duration: std::time::Duration,
+    /// See `CompiledQuery::shape_id`.
+    pub query_shape_id: String,
+    /// `None` for a statement that returns no rows, which is distinct from
+    /// `Some(0)` — a query that ran and matched nothing.
+    pub rows_returned: Option<u64>,
+    pub outcome: Outcome,
+}
+
+impl ExecutionMetadata {
+    /// Compile plus execute — what a caller timing "the query" means.
+    pub fn total_duration(&self) -> std::time::Duration {
+        self.compile_duration + self.execute_duration
+    }
+}
+
 /// Compile a PyQL expression string in the context of a named type to a bare SQL
 /// expression suitable for use in an UPDATE SET clause.
 ///

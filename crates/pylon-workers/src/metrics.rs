@@ -30,7 +30,7 @@
 
 use std::sync::LazyLock;
 
-use prometheus::{Encoder, IntCounterVec, IntGaugeVec, TextEncoder};
+use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder};
 
 pub static JOBS_PROCESSED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -168,6 +168,192 @@ pub static QUERIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub fn record_query_result<T, E>(result: &Result<T, E>) {
     let outcome = if result.is_ok() { "success" } else { "error" };
     QUERIES.with_label_values(&["execute", outcome]).inc();
+}
+
+// ── Duration histograms ──────────────────────────────────────────────────
+//
+// Every one of these is labelled by `shape` — the query shape id, which is
+// independent of bound parameter values (see `pylon_core::shape_id`). That
+// is the entire cardinality-control story: without it, labelling by anything
+// query-identifying means one series per distinct parameter value.
+//
+// Buckets are chosen per metric rather than left at the Prometheus default,
+// which starts at 5ms — too coarse for query timings, where the interesting
+// range starts around a hundred microseconds.
+
+/// Seconds spent compiling PyQL to SQL. Sub-millisecond when the compile
+/// cache hits, so the buckets start very low.
+static QUERY_COMPILE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let h = HistogramVec::new(
+        prometheus::histogram_opts!(
+            "pylon_query_compile_duration_seconds",
+            "PyQL to SQL compilation time, by query shape",
+            vec![0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1]
+        ),
+        &["shape"],
+    )
+    .unwrap();
+    prometheus::default_registry().register(Box::new(h.clone())).unwrap();
+    h
+});
+
+/// Seconds for compile plus execute — end to end, as a caller experiences it.
+static QUERY_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let h = HistogramVec::new(
+        prometheus::histogram_opts!(
+            "pylon_query_duration_seconds",
+            "PyQL compile + execute time, by query shape and outcome",
+            vec![
+                0.000_5, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+            ]
+        ),
+        &["shape", "outcome"],
+    )
+    .unwrap();
+    prometheus::default_registry().register(Box::new(h.clone())).unwrap();
+    h
+});
+
+/// Failed queries by coarse cause. Separate from the counter above so a
+/// spike is attributable without making `outcome` itself high-cardinality.
+static QUERY_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let c = IntCounterVec::new(
+        prometheus::opts!(
+            "pylon_query_errors_total",
+            "Failed queries, by query shape and coarse error class"
+        ),
+        &["shape", "error_class"],
+    )
+    .unwrap();
+    prometheus::default_registry().register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Seconds spent waiting for a pooled connection. Distinguishes "the
+/// database is slow" from "the pool is too small", which the pool gauges
+/// alone can't.
+static POOL_WAIT_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let h = HistogramVec::new(
+        prometheus::histogram_opts!(
+            "pylon_pgcon_pool_wait_duration_seconds",
+            "Time spent acquiring a pooled connection, by connection name",
+            vec![0.000_1, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+        ),
+        &["connection"],
+    )
+    .unwrap();
+    prometheus::default_registry().register(Box::new(h.clone())).unwrap();
+    h
+});
+
+/// Seconds to process one outbox batch. `provider` separates a rate-limited
+/// embedding backend from one that is merely slow.
+static INDEX_WORKER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let h = HistogramVec::new(
+        prometheus::histogram_opts!(
+            "pylon_index_worker_duration_seconds",
+            "Time to process one outbox batch, by index kind, provider and outcome",
+            vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
+        ),
+        &["index_kind", "provider", "outcome"],
+    )
+    .unwrap();
+    prometheus::default_registry().register(Box::new(h.clone())).unwrap();
+    h
+});
+
+/// Seconds for one `fts::search` call against the search backend.
+static SEARCH_QUERY_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let h = HistogramVec::new(
+        prometheus::histogram_opts!(
+            "pylon_search_index_query_duration_seconds",
+            "fts::search execution time, by backend and outcome",
+            vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+        ),
+        &["backend", "outcome"],
+    )
+    .unwrap();
+    prometheus::default_registry().register(Box::new(h.clone())).unwrap();
+    h
+});
+
+/// Records one execution's timings and outcome across every query metric.
+///
+/// The single entry point callers need: given an `ExecutionMetadata`, this
+/// applies the right labels to the right instruments, so no call site has to
+/// know the metric names or get the cardinality rules right on its own.
+pub fn record_execution(meta: &pylon_core::query::ExecutionMetadata) {
+    use pylon_core::query::Outcome;
+
+    let shape = meta.query_shape_id.as_str();
+    QUERY_COMPILE_DURATION
+        .with_label_values(&[shape])
+        .observe(meta.compile_duration.as_secs_f64());
+    QUERY_DURATION
+        .with_label_values(&[shape, meta.outcome.as_label()])
+        .observe(meta.total_duration().as_secs_f64());
+    if let Outcome::Error(class) = meta.outcome {
+        QUERY_ERRORS.with_label_values(&[shape, class.as_label()]).inc();
+    }
+}
+
+/// Records one executed query: the counter, the duration histogram, and —
+/// on failure — the coarse error class.
+///
+/// `shape` is `CompiledQuery::shape_id()`. Call sites that don't have a
+/// compiled query (a raw passthrough) have no shape to attribute to and use
+/// `record_query_result` instead.
+pub fn record_query_execution<T>(shape: &str, result: &Result<T, pylon_pgcon::Error>, elapsed: std::time::Duration) {
+    use pylon_core::query::{ErrorClass, Outcome};
+
+    let outcome = match result {
+        Ok(_) => Outcome::Ok,
+        Err(e) => Outcome::Error(match e.sqlstate() {
+            Some(code) => ErrorClass::from_sqlstate(code.code()),
+            // No SQLSTATE means it never reached the server.
+            None => ErrorClass::Connection,
+        }),
+    };
+    QUERIES.with_label_values(&["execute", outcome.as_label()]).inc();
+    QUERY_DURATION
+        .with_label_values(&[shape, outcome.as_label()])
+        .observe(elapsed.as_secs_f64());
+    if let Outcome::Error(class) = outcome {
+        QUERY_ERRORS.with_label_values(&[shape, class.as_label()]).inc();
+    }
+}
+
+/// Records how long a caller waited for a pooled connection.
+pub fn record_pool_wait(connection: &str, waited: std::time::Duration) {
+    POOL_WAIT_DURATION
+        .with_label_values(&[connection])
+        .observe(waited.as_secs_f64());
+}
+
+/// Points `pylon-pgcon`'s pool-wait hook at `record_pool_wait`.
+///
+/// Must be called once at startup by whatever process wants the metric —
+/// `pylon-pgcon` can't call into this crate itself (it's the dependency, not
+/// the dependent), so the wiring is done from this side. Idempotent.
+pub fn install_pool_wait_observer() {
+    pylon_pgcon::set_pool_wait_observer(record_pool_wait);
+}
+
+/// Records one outbox batch's processing time. `provider` is the embedding
+/// provider for a vector batch, or `"-"` for a search batch, which has none.
+pub fn record_index_batch(index_kind: &str, provider: &str, ok: bool, elapsed: std::time::Duration) {
+    let outcome = if ok { "success" } else { "error" };
+    INDEX_WORKER_DURATION
+        .with_label_values(&[index_kind, provider, outcome])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Records one search-backend query.
+pub fn record_search_query(backend: &str, ok: bool, elapsed: std::time::Duration) {
+    let outcome = if ok { "success" } else { "error" };
+    SEARCH_QUERY_DURATION
+        .with_label_values(&[backend, outcome])
+        .observe(elapsed.as_secs_f64());
 }
 
 /// Increments `QUERIES{stage="compile"}` for `outcome` — called from

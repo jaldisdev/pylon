@@ -86,6 +86,11 @@ pub fn spawn(
     cache: Option<Arc<pylon_cache::Cache>>,
     toggles: WorkerToggles,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    // Wires pylon-pgcon's pool-wait hook to the Prometheus histogram. Done
+    // here because this is the first thing a serving process runs that knows
+    // metrics are wanted at all.
+    pylon_workers::metrics::install_pool_wait_observer();
+
     let mut handles = Vec::new();
 
     if toggles.vector == Some(false) {

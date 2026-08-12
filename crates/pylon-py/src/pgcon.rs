@@ -320,9 +320,13 @@ impl PgconPool {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let started = std::time::Instant::now();
             let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
@@ -343,9 +347,13 @@ impl PgconPool {
         let pool = self.inner.clone();
         let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let started = std::time::Instant::now();
             let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
@@ -363,9 +371,13 @@ impl PgconPool {
         let pool = self.inner.clone();
         let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let started = std::time::Instant::now();
             let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
@@ -427,9 +439,13 @@ impl PgconPool {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let started = std::time::Instant::now();
             let result = pool.execute_typed(&sql, &cached_params).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             result.map_err(pgcon_err)
         })
     }
@@ -531,11 +547,15 @@ impl PgconTransaction {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let started = std::time::Instant::now();
             let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
@@ -551,11 +571,15 @@ impl PgconTransaction {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let started = std::time::Instant::now();
             let result = tx.execute_typed(&sql, &cached_params).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             result.map_err(pgcon_err)
         })
     }
@@ -570,11 +594,15 @@ impl PgconTransaction {
         let inner = self.inner.clone();
         let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let started = std::time::Instant::now();
             let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })
@@ -590,11 +618,15 @@ impl PgconTransaction {
         let inner = self.inner.clone();
         let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        // Read before the async block: `compiled` is borrowed, and the
+        // future below outlives this call.
+        let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
+            let started = std::time::Instant::now();
             let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
-            pylon_workers::metrics::record_query_result(&result);
+            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
         })

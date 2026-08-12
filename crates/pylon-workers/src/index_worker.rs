@@ -142,6 +142,14 @@ pub trait BatchProcessor: Send + Sync {
     /// worker (`"Vector"`, `"OpenSearch"`, `"Meilisearch"`).
     fn index_kind(&self) -> &'static str;
 
+    /// Label for the backend doing the work, for the duration histogram —
+    /// the embedding provider for a vector worker. Defaults to `"-"`, which
+    /// is right for a search worker: the backend is already identified by
+    /// `index_kind`, so there is no second axis to report.
+    fn provider_label(&self) -> &'static str {
+        "-"
+    }
+
     fn process_batch(
         &self,
         listener: &PgListener,
@@ -189,7 +197,16 @@ async fn drain_once<P: BatchProcessor>(listener: &PgListener, batch_size: i64, p
         let short_batch = rows.len() < batch_size as usize;
         let ids: Vec<DecodedValue> = rows.iter().map(|r| DecodedValue::Uuid(r.id)).collect();
 
-        match processor.process_batch(listener, &rows).await {
+        let batch_started = std::time::Instant::now();
+        let batch_result = processor.process_batch(listener, &rows).await;
+        crate::metrics::record_index_batch(
+            processor.index_kind(),
+            processor.provider_label(),
+            batch_result.is_ok(),
+            batch_started.elapsed(),
+        );
+
+        match batch_result {
             Ok(()) => {
                 crate::metrics::JOBS_PROCESSED
                     .with_label_values(&[processor.index_kind()])
