@@ -117,7 +117,7 @@ impl PgPool {
     /// first real connection attempt to whenever a caller first acquires
     /// one — this eagerly acquires and immediately releases one connection
     /// before returning, so a bad host/port/database/credentials fails
-    /// right here. That matches `asyncpg.create_pool`'s own eager-connect
+    /// right here. That eager-connect
     /// behavior, which the caller (`Client.ensure_connected`) depends on to
     /// raise `ConnectionFailedError`/`ConnectionTimeoutError` immediately
     /// rather than silently deferring the failure to the first query.
@@ -241,7 +241,7 @@ impl PgPool {
     /// the given isolation level (`"read_uncommitted"`, `"read_committed"`,
     /// `"repeatable_read"`, or `"serializable"` — matching
     /// `AsyncTransaction`'s existing accepted values in `client.py`, itself
-    /// a mirror of `asyncpg.transaction.ISOLATION_LEVELS`). The returned
+    /// the four standard SQL isolation levels). The returned
     /// `PgTransaction` owns the connection until `commit`/`rollback`
     /// consumes it.
     pub async fn begin(&self, isolation: &str) -> Result<PgTransaction> {
@@ -263,7 +263,7 @@ impl PgPool {
     /// Starts a transaction with no explicit isolation level — whatever
     /// Postgres's own session/database default is applies. Used by
     /// migration execution, which (unlike `begin`) never needs a specific
-    /// isolation level — this matches asyncpg's plain `conn.transaction()`
+    /// isolation level — this matches a plain `conn.transaction()`
     /// (no `isolation=` kwarg) that the old Python migration executor used.
     pub async fn begin_default(&self) -> Result<PgTransaction> {
         let client = self.pool.get().await?;
@@ -277,7 +277,7 @@ impl PgPool {
     /// Runs `sql` via the simple query protocol — no bind parameters, but
     /// (unlike `query_typed`/`execute_typed`, which prepare via the extended
     /// protocol and so accept exactly one statement) able to run several
-    /// `;`-separated statements in one call. Matches asyncpg's
+    /// `;`-separated statements in one call. Matches
     /// `Connection.execute(sql)` called with no arguments, which migration
     /// DDL steps rely on (a step's body is whatever raw SQL text sits
     /// between `-- pylon:step` markers, often more than one statement).
@@ -408,7 +408,7 @@ pub(crate) async fn query_explain_on(
 /// An explicit transaction on a single connection checked out of the pool.
 /// `deadpool-postgres`'s default recycling method (`Fast`) does *not* run
 /// any reset query when a connection is returned to the pool — unlike
-/// `asyncpg.Pool.release()`, which always issues `ROLLBACK` itself if the
+/// pool release, which always issues `ROLLBACK` itself if the
 /// released connection still has an open transaction. That safety net has
 /// to be reproduced here explicitly, or a connection released mid- or
 /// aborted-transaction would silently corrupt the next borrower's session.
@@ -525,7 +525,7 @@ fn decode_result_column(row: &tokio_postgres::Row, ext: &ExtensionOids) -> Resul
 }
 
 /// Decodes *every* column of `row`, keyed by name, as a `DecodedValue::Object`
-/// — the general `asyncpg.Record`-equivalent decode path, unlike
+/// — the general named-column decode path, unlike
 /// `decode_result_column` (which only ever decodes column 0, matching
 /// pylon-core's own single-composite-column SQL emission convention). For
 /// hand-written queries with several named columns a caller accesses by
@@ -589,7 +589,7 @@ mod tests {
     async fn connect_fails_eagerly_against_a_nonexistent_database() {
         // A well-formed DSN pointing at a database that doesn't exist must
         // fail right here, not lazily on the first query — matching
-        // `asyncpg.create_pool`'s eager-connect behavior, which
+        // the eager-connect behavior, which
         // `Client.ensure_connected()` depends on to map this straight to
         // `ConnectionFailedError` instead of silently deferring the
         // failure past `ensure_connected()` returning successfully.
@@ -946,7 +946,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn binds_a_plain_string_as_a_uuid_param() {
-        // A JSON API request body (see pylon.server.asgi's /api/<connection>/query
+        // A JSON API request body (see `pylon serve`'s /api/<connection>/query
         // handler) necessarily carries a UUID query parameter as plain text —
         // there's no JSON "uuid" type — so it arrives as `DecodedValue::Str`,
         // not `::Uuid`. Regression test for a real bug: binding that Str
@@ -1116,8 +1116,7 @@ mod tests {
     // ── Error::sqlstate() against real Postgres constraint violations ──
     //
     // Error mapping to Pylon's Python exception hierarchy (a later phase)
-    // classifies on these codes, exactly like asyncpg's own typed
-    // exceptions (`asyncpg.UniqueViolationError.sqlstate == "23505"`, etc.)
+    // classifies on these codes (`"23505"` unique violation, etc.)
     // already do today — verified against a real server response, not
     // assumed from the SQLSTATE spec alone.
 

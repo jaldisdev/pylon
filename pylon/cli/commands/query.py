@@ -448,8 +448,7 @@ def _format_exception(e: BaseException) -> str:
 # --- analyze result formatting --------------------------------------------------
 #
 # Mirrors pylon-ui's analyzeFormat.ts field-for-field, so `analyze <query>`
-# reads identically whether typed here or in the web REPL — see that file's
-# own comment for the exact the upstream engine/PyQL output this reproduces. `root` is the
+# reads identically whether typed here or in the web REPL. `root` is the
 # JSON dict `Client.analyze()` returns (pylon-core's `CoarseGrainedNode`,
 # camelCase-free — its own field names, e.g. `marker_offset`, are used as-is).
 

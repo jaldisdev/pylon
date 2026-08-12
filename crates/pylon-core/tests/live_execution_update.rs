@@ -24,8 +24,7 @@
 //! exercising `IrUpdate::nested_ctes`' WITH-CTE hoisting), and the
 //! `RETURNING id` shape every update implicitly gets (`Compiler::
 //! compile_update` always returns `pk_returning`, same as `DELETE` — see
-//! `live_execution_delete.rs`). Concepts inspired by the upstream engine's own
-//! the upstream update suite, not ported literally — `+=`/`-=` multi-link
+//! `live_execution_delete.rs`). `+=`/`-=` multi-link
 //! append/remove semantics are already covered in depth by
 //! `live_execution_linkprops.rs`, so this file is scoped to plain
 //! scalar/single-link `:=` updates, which had no live coverage of their

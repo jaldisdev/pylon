@@ -106,7 +106,7 @@ impl PgListener {
     /// Like `query_typed`, but decodes every column of every row by name
     /// (`DecodedValue::Object`) instead of assuming column 0 is the whole
     /// result — for hand-written queries with several named columns a
-    /// caller accesses by name, matching `asyncpg.Record`'s behavior.
+    /// caller accesses by name.
     pub async fn query_typed_named(
         &self,
         sql: &str,
@@ -275,7 +275,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn query_typed_named_decodes_every_column_by_name() {
-        // Matches `asyncpg.Record`'s named-column access, which
+        // Named-column access, which
         // pylon.worker/pylon.vector/pylon.search rely on — unlike
         // `query_typed`, which only ever decodes column 0.
         let listener = PgListener::connect(&test_dsn(), |_n| {}).await.unwrap();

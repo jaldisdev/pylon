@@ -28,8 +28,8 @@
 //! shape path it corresponds to (e.g. `root.villains`), plus the source byte
 //! offset to place that path's marker at in the echoed query text.
 //!
-//! Deliberately narrower than a full port of the upstream engine's `ir_analyze.py`: no
-//! general expression-level span tracking, no context-hoisting heuristics —
+//! Deliberately narrow: no general expression-level span tracking and no
+//! context-hoisting heuristics —
 //! just enough structure to build the *coarse-grained* tree the REPL and
 //! Query Editor render (see the crate's `analyze` design notes for why).
 
@@ -166,7 +166,7 @@ fn collect_shape(shape: &[IrShapePointer], parent_path: &str, out: &mut Vec<Shap
 // Postgres's own `EXPLAIN (FORMAT JSON)` output is a JSON array with one
 // element (`[{"Plan": {...}, ...}]`); deliberately modeled on only the
 // handful of fields every plan node kind carries (see postgres/src/backend/
-// commands/explain.c) rather than the upstream engine's ~30-subclass `pg_tree.py` — a v1
+// commands/explain.c) rather than modeling every node kind — a v1
 // coarse-grained tree only needs cost/time/rows/width plus enough identity
 // (`Alias`/`Relation Name`) to correlate against `ShapePathAlias`.
 
@@ -321,9 +321,9 @@ fn build_node(
 /// Walk `raw`'s own subtree, folding nodes into `relations`/this level's
 /// implicit cost — until a child's *subtree* (not just the child node
 /// itself) resolves to a *different* shape path, at which point that whole
-/// child subtree roots its own nested `CoarseGrainedNode` instead (mirrors
-/// the upstream engine's `coarse_grained.py` `_build_shape`/`_scan_relations`, simplified: no
-/// context-hoisting, no fine-grained squash pass first).
+/// child subtree roots its own nested `CoarseGrainedNode` instead. No
+/// context-hoisting and no fine-grained squash pass first — see this
+/// module's own header for why the coarse tree is enough.
 ///
 /// Checking the whole subtree (not just `child.alias`) matters for a
 /// junction-backed link's own correlated subquery: its join always has (at

@@ -1831,7 +1831,7 @@ fn emit_search_indexes(schema: &SchemaDescriptor, out: &mut String) {
 /// ```
 ///
 /// Non-text source fields are cast to `::text`. The query is compiled once at
-/// startup and cached; the worker runs it with `asyncpg.fetch(sql, [ids])`.
+/// startup and cached; the worker runs it with the id array bound as `$1`.
 pub fn compile_index_fetch(
     type_name: &str,
     index_name: Option<&str>,
@@ -2150,7 +2150,7 @@ mod tests {
 
     #[test]
     fn test_trigger_combined_insert_update_cannot_reference_old() {
-        // On.Insert | On.Update = 3 — __new__ legal, __old__ still isn't (the upstream engine's mixed_02 case).
+        // On.Insert | On.Update = 3 — __new__ legal, __old__ still isn't.
         let ok = schema_with_trigger(trig(3, "After", "select Person filter (__new__.age > 0)"));
         assert!(export_schema(&ok).is_ok());
 

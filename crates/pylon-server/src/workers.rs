@@ -29,7 +29,7 @@
 //! exists in a Python process. A user relying on signals runs `pylon
 //! worker start` in its own process alongside `pylon-server` — there's no
 //! way for this binary to launch it in-process the way the old Python ASGI
-//! server (`asgi.py`, since removed) once did.
+//! server once did.
 
 use std::collections::HashMap;
 use std::sync::Arc;

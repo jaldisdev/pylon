@@ -60,7 +60,7 @@ pub enum ShapeNode {
     /// Leaf value; native PG type.
     Scalar { name: String, position: usize },
     /// The `result` column IS the value — not wrapped in ROW(). Used for array literals
-    /// where asyncpg can't decode array OIDs inside anonymous composites.
+    /// where an array is returned as its own top-level column.
     RawScalar,
     /// Like RawScalar but the value is a decoded JSON object (from a <json> cast).
     /// REPL displays it as `Json("...")`.

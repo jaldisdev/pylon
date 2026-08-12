@@ -39,13 +39,12 @@ use crate::pgvalue::{cached_to_py, py_to_cached};
 use crate::{CompiledQuery, PylonPgconError};
 
 /// Maps a `pylon-pgcon` error to the real `pylon.exceptions.*` class the
-/// old asyncpg-based `client.py` already raised for the same situation —
+/// `client.py` has always raised for the same situation —
 /// so once `Client` is wired onto this driver (a later phase), no further
 /// exception translation is needed in Python, and user code catching
 /// `except pylon.exceptions.TransactionSerializationError` (etc.) keeps
-/// working unchanged. Classifies by SQLSTATE exactly like asyncpg's own
-/// typed exceptions do (`asyncpg.SerializationError.sqlstate == "40001"`,
-/// `asyncpg.DeadlockDetectedError.sqlstate == "40P01"`); anything else —
+/// working unchanged. Classifies by SQLSTATE (`"40001"` serialization
+/// failure, `"40P01"` deadlock detected); anything else —
 /// including every other constraint violation — becomes the same generic
 /// `QueryError` `_fmt_pg_error` already produces for those today (the
 /// hierarchy is preserved as-is in this pass, not redesigned).
@@ -74,7 +73,7 @@ pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
             .expect("pylon.exceptions must define the core exception hierarchy");
         match cls.call1((message,)) {
             Ok(instance) => {
-                // Mirrors asyncpg's own `.sqlstate` attribute (present on
+                // The `.sqlstate` attribute (present on
                 // every `PostgresError`) — lets callers branch on a precise
                 // error code (e.g. `42501` insufficient privilege) without
                 // a dedicated exception class per SQLSTATE.
@@ -92,7 +91,7 @@ pub(crate) fn pgcon_err(err: pylon_pgcon::Error) -> PyErr {
 /// `None` for anything else (falls back to `pylonize_pg_message`).
 /// Postgres's own message names the *auto-generated* constraint identifier
 /// (`value for domain "Email" violates check constraint "Email_check"`) —
-/// an internal detail the user never wrote and the upstream engine would never surface —
+/// an internal detail the user never wrote and shouldn't be shown —
 /// so this substitutes the scalar type or object type name instead, using
 /// the structured `DataTypeName`/`TableName` error fields rather than
 /// parsing the message text.
@@ -214,10 +213,9 @@ mod message_format_tests {
 /// transaction use on an *already-established* pool. `Client.ensure_connected()`
 /// depends on connect failures raising `ConnectionFailedError` (or
 /// `ConnectionTimeoutError` for the timeout case), not `QueryError` —
-/// mirroring the old `except asyncpg.InvalidCatalogNameError` / `except
-/// (OSError, asyncpg.CannotConnectNowError)` / `except asyncio.TimeoutError`
-/// triage in `client.py`, which never mapped any connect-time failure to
-/// `QueryError`.
+/// splitting "database does not exist" from "cannot reach the server" from
+/// "timed out" the same way the triage in `client.py` does, which never maps
+/// any connect-time failure to `QueryError`.
 fn pgcon_connect_err(err: pylon_pgcon::Error) -> PyErr {
     let class_name = if matches!(err, pylon_pgcon::Error::Pool(deadpool_postgres::PoolError::Timeout(_))) {
         "ConnectionTimeoutError"
@@ -254,8 +252,8 @@ impl<'py> IntoPyObject<'py> for PyDecodedValue {
     }
 }
 
-/// A connected pool — the Rust-driver equivalent of an `asyncpg.Pool`.
-/// One per `Client` instance, not a process-wide global: `pylon.server.asgi`
+/// A connected pool.
+/// One per `Client` instance, not a process-wide global: `pylon serve`
 /// genuinely holds several independently-configured `Client`s at once (one
 /// per named multi-tenant connection in `pylon.toml`'s `[connections]`),
 /// each against a potentially different database, so a single global pool
@@ -454,7 +452,7 @@ impl PgconPool {
     /// unlike `query`/`execute` (which prepare via the extended protocol
     /// and so accept exactly one statement), this can run several
     /// `;`-separated statements — including `DO $$ ... $$` blocks — in one
-    /// call, matching asyncpg's `Connection.execute(sql)` called with no
+    /// call, matching `Connection.execute(sql)` called with no
     /// arguments. For admin DDL blobs like `export_stdlib()`'s output
     /// (`database initialize`) or a `watch`-computed diff op list, not
     /// something meant to be split and bound.
@@ -633,12 +631,12 @@ impl PgconTransaction {
 
 /// One callback per channel — every real call site in `pylon.worker`/
 /// `pylon.cache` registers exactly one listener per channel on its own
-/// dedicated connection, so this doesn't need to support asyncpg's more
+/// dedicated connection, so this doesn't need to support a more
 /// general multi-callback-per-channel case.
 type CallbackRegistry = Arc<StdMutex<HashMap<String, Py<PyAny>>>>;
 
 /// A dedicated LISTEN/NOTIFY connection, exposed close enough to
-/// asyncpg's `Connection.add_listener`/`remove_listener`/`execute`/`fetch`
+/// the `add_listener`/`remove_listener`/`execute`/`fetch`
 /// that `pylon.worker.IndexWorker` and `pylon.cache.CacheInvalidationWorker`
 /// need minimal changes to run on it (a later phase's job — this phase
 /// only builds and verifies the primitive).
@@ -650,9 +648,9 @@ struct PgconListener {
 
 #[pymethods]
 impl PgconListener {
-    /// Matches `asyncpg.Connection.add_listener(channel, callback)`:
+    /// `add_listener(channel, callback)`:
     /// `callback` is invoked as `callback(None, pid, channel, payload)` —
-    /// `None` stands in for asyncpg's leading `connection` argument, which
+    /// `None` stands in for the leading `connection` argument, which
     /// every existing callback in this codebase already ignores (both are
     /// named `_conn`).
     fn add_listener<'py>(&self, py: Python<'py>, channel: String, callback: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
@@ -679,7 +677,7 @@ impl PgconListener {
     }
 
     /// Like `query`, but decodes every column of every row by name into a
-    /// dict — matching `asyncpg.Record`'s `row["col"]` access, unlike
+    /// dict — supporting `row["col"]` access, unlike
     /// `query` (which only ever decodes column 0, the convention PyQL-
     /// compiled SQL uses). For hand-written admin/worker queries with
     /// several named columns.

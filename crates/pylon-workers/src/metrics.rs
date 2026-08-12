@@ -23,8 +23,8 @@
 //! directly, and `render()` dumps the whole registry as Prometheus text
 //! exposition format. `pylon-py` exposes `render()` to Python as
 //! `render_prometheus_metrics()`, served at `pylon serve`'s `/metrics`
-//! route (`pylon/server/asgi.py`) — since `pylon serve` now launches these
-//! same workers in-process (see `build_worker_tasks` in asgi.py), one
+//! route — since `pylon serve` launches these
+//! same workers in-process, one
 //! scrape target sees both HTTP- and worker-side metrics with no separate
 //! listener needed.
 

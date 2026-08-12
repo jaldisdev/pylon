@@ -19,11 +19,10 @@
 
 //! Live-Postgres tests for `GROUP ... BY` — single-key grouping, a
 //! `USING alias := expr` computed key, composite (multi-key) grouping, and
-//! the implicit `{ id }` shape when none is given. Concepts inspired by
-//! the upstream group suite, not ported literally (the upstream engine's grouping
-//! supports `BY CUBE(...)`/`ROLLUP(...)`/multi-set grouping sets and nested
-//! `GROUP` subqueries; Pylon's `GroupStmt` only supports a flat list of
-//! `BY` keys — see `Compiler::compile_group`).
+//! the implicit `{ id }` shape when none is given. Scoped to what Pylon
+//! supports: `GroupStmt` takes a flat list of `BY` keys, with no
+//! `BY CUBE(...)`/`ROLLUP(...)`, no multi-set grouping sets, and no nested
+//! `GROUP` subqueries — see `Compiler::compile_group`.
 //!
 //! No prior live test in this suite ever executed a `GROUP` query against
 //! real data — `emit_group` (`sql/mod.rs`) has pure unit tests for the

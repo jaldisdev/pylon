@@ -324,9 +324,7 @@ pub fn compile_fn_body(
 /// same shape as `compile_fn_body`, but instead of `fn_params` this binds
 /// `__new__`/`__old__` as the inserted/updated/deleted row (see
 /// `Compiler::special_anchors`'s own doc comment), gated by `on_mask`
-/// (Pylon's `On` bitmask: 1=Insert, 2=Update, 4=Delete) exactly like the upstream engine's
-/// own trigger-anchor binding (`edb/schema/triggers.py::
-/// TriggerCommand.compile_expr_field`): `__old__` is bound whenever
+/// (Pylon's `On` bitmask: 1=Insert, 2=Update, 4=Delete): `__old__` is bound whenever
 /// `on_mask` does *not* include Insert (so Update-only, Delete-only, and
 /// Update+Delete all get it — but never a mask that includes Insert, even
 /// combined with Update, since a shared trigger function has no old row on
@@ -417,10 +415,8 @@ fn dml_event_word(kind: u8) -> &'static str {
 /// itself is declared on. Returns that DML's own event bit (1/2/4) the
 /// first time one is found, so the caller can check it against the
 /// trigger's own `on_mask`: a handler that inserts into its own type only
-/// matters if this trigger *also* fires on Insert (mirrors the upstream engine's own
-/// recursive-trigger check in `edb/schema/triggers.py` — the mask
-/// determines what would actually refire, not just "does it touch itself
-/// at all").
+/// matters if this trigger *also* fires on Insert — the mask determines
+/// what would actually refire, not just "does it touch itself at all".
 ///
 /// Deliberately not exhaustive: covers the direct statement, a `SELECT
 /// (INSERT/UPDATE/DELETE …) { … }` wrapper, and `for x in … union (…)`
@@ -1336,7 +1332,7 @@ impl<'a> Compiler<'a> {
     /// compile sites (`compile_free_expr`/`compile_expr`). A structural tuple
     /// always resolves to jsonb; an array resolves to its element's own pg_type
     /// with a `[]` suffix — a real Postgres array, not jsonb, so it decodes
-    /// natively (asyncpg already returns a Python list) with no per-member
+    /// natively (the driver already returns a Python list) with no per-member
     /// shape-tracking needed the way tuples require; a named type checks enum,
     /// then registered named tuple, then falls back to the built-in
     /// scalar/pgvector/cal type list.
@@ -5956,8 +5952,8 @@ impl<'a> Compiler<'a> {
             // e.g. `__old__` in an Insert-only trigger) `special_anchors`
             // is empty/missing that entry, so this falls through to the
             // explicit error below rather than the generic "absolute
-            // paths" message, matching the upstream engine's `__old__`/`__new__ cannot be
-            // used in this expression`.
+            // paths" message: `__old__`/`__new__` cannot be used in
+            // this expression.
             if p.steps.len() > 1
                 && let ast::PathStep::Name(root) = &p.steps[0]
                 && (root == "__new__" || root == "__old__")
@@ -7850,7 +7846,7 @@ impl<'a> Compiler<'a> {
             // the embedding result into it before executing the query.
             let vec_idx = self.param_index("__deferred_vec__");
             let vec_param = IrExpr::Param { index: vec_idx };
-            // Cast float8[] → vector so asyncpg can encode the Python list[float] natively.
+            // Cast float8[] → vector so a Python list[float] encodes natively.
             let inner_cast = IrExpr::TypeCast(Box::new(IrTypeCast {
                 expr: vec_param,
                 pg_type: "float8[]".to_string(),

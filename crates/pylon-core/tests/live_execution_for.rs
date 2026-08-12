@@ -21,11 +21,11 @@
 //! `emit_for_insert` VALUES-CTE path), a `SELECT` body (the
 //! `CROSS JOIN LATERAL` path), the for-variable composing inside a body
 //! expression (not just a bare assignment), and the empty-iterator no-op
-//! case. Concepts inspired by the upstream for suite, not ported
-//! literally — Pylon's `ForStmt` iterator only supports a scalar `{...}`
-//! set literal (`Compiler::compile_for`'s `IrForIterator::Values`), not
-//! the upstream engine's arbitrary set-returning-expression iterators (e.g. `for x in
-//! Person union (...)`), and `emit_for_stmt` only implements `Insert` and
+//! case. Scoped to what Pylon actually supports: the `ForStmt` iterator
+//! takes a scalar `{...}` set literal only (`Compiler::compile_for`'s
+//! `IrForIterator::Values`), not an arbitrary set-returning expression
+//! (e.g. `for x in Person union (...)`), and `emit_for_stmt` implements
+//! only `Insert` and
 //! `Select`/`PathSelect` bodies — an `UPDATE`/`DELETE` for-loop body hits an
 //! unimplemented `panic!`, so this file doesn't exercise those.
 //!

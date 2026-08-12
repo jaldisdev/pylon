@@ -17,10 +17,10 @@
 // limitations under the License.
 //
 
-//! Live-Postgres tests for schema `Trigger`s — Pylon's analog of the upstream engine's
-//! `create trigger ... do (...)`. Scenarios adapted from the upstream engine's own trigger
-//! test suite (noted per test), narrowed to Pylon's feature surface: no
-//! access policies, no set-scoped ("for all") triggers, always per-row.
+//! Live-Postgres tests for schema `Trigger`s — a handler expression that
+//! runs after an insert, update, or delete on its type. Scoped to Pylon's
+//! feature surface: no access policies, no set-scoped ("for all")
+//! triggers, always per-row.
 //!
 //! Gated behind `#[ignore]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
@@ -104,7 +104,6 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 #[tokio::test]
 #[ignore]
 async fn insert_writes_to_another_type() {
-    // Upstream case:triggers_insert_01
     let module = unique_module("live_trig_insert");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.triggers = vec![trigger(
@@ -145,7 +144,6 @@ async fn insert_writes_to_another_type() {
 #[tokio::test]
 #[ignore]
 async fn delete_reads_old_row() {
-    // Upstream case:triggers_delete_01
     let module = unique_module("live_trig_delete");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.triggers = vec![trigger(
@@ -192,7 +190,6 @@ async fn delete_reads_old_row() {
 #[tokio::test]
 #[ignore]
 async fn update_reads_both_old_and_new() {
-    // Upstream case:triggers_update_01
     let module = unique_module("live_trig_update");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.triggers = vec![trigger(
@@ -240,7 +237,7 @@ async fn update_reads_both_old_and_new() {
 #[tokio::test]
 #[ignore]
 async fn multiple_independent_triggers_all_fire() {
-    // Upstream case:triggers_mixed_01/02 — several triggers on one type,
+    // Several triggers on one type,
     // including one combined-event trigger (Insert|Update|Delete) that
     // legally references *neither* anchor (Insert and Delete are both in
     // its mask — see `compile_trigger_handler`'s doc comment) and instead
@@ -329,7 +326,7 @@ async fn multiple_independent_triggers_all_fire() {
 #[tokio::test]
 #[ignore]
 async fn trigger_updates_a_linked_row_of_another_type() {
-    // Upstream case:triggers_double_01 — not just an audit-log insert,
+    // Not just an audit-log insert,
     // a real cross-type mutation of a *linked* row.
     let module = unique_module("live_trig_double");
     let mut purchase = ty("Purchase", &module, vec![id_prop(), text_prop("total")]);
@@ -378,7 +375,7 @@ async fn trigger_updates_a_linked_row_of_another_type() {
 #[tokio::test]
 #[ignore]
 async fn trigger_chaining_across_types() {
-    // Upstream case:triggers_chain_01 — an insert trigger on A inserts
+    // An insert trigger on A inserts
     // into B, and B's own insert trigger also fires (real Postgres row-
     // trigger cascading, no special Pylon support needed — just correct DDL).
     let module = unique_module("live_trig_chain");

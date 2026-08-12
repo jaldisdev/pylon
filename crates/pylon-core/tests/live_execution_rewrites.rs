@@ -17,9 +17,9 @@
 // limitations under the License.
 //
 
-//! Live-Postgres tests for property `Rewrite`s — Pylon's analog of the upstream engine's
-//! `create rewrite insert|update using (...)`. Scenarios adapted from the upstream engine's
-//! own the upstream rewrites suite (noted per test), narrowed to Pylon's
+//! Live-Postgres tests for property `Rewrite`s — an expression that
+//! recomputes a property's value on every insert and/or update. Narrowed
+//! to Pylon's
 //! feature surface: no `__specified__` (not implemented — a rewrite always
 //! sees the row's actual value, whether it came from an explicit assignment
 //! or a default, with no way to distinguish the two), no access policies.
@@ -105,7 +105,6 @@ async fn bootstrap(pool: &pylon_pgcon::PgPool) {
 #[tokio::test]
 #[ignore]
 async fn insert_rewrite_overrides_assigned_value() {
-    // Upstream case:rewrites_01 (insert half)
     let module = unique_module("live_rw_insert");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].rewrites = vec![rewrite(1, "'inserted'")]; // On.Insert
@@ -137,7 +136,6 @@ async fn insert_rewrite_overrides_assigned_value() {
 #[tokio::test]
 #[ignore]
 async fn update_rewrite_overrides_assigned_value() {
-    // Upstream case:rewrites_01 (update half)
     let module = unique_module("live_rw_update");
     let mut widget = ty("Widget", &module, vec![id_prop(), text_prop("name")]);
     widget.properties[1].rewrites = vec![rewrite(2, "'updated'")]; // On.Update
@@ -177,7 +175,7 @@ async fn update_rewrite_overrides_assigned_value() {
 #[tokio::test]
 #[ignore]
 async fn insert_rewrite_applies_to_defaulted_value() {
-    // Upstream case:rewrites_03 — interaction with a schema-level default:
+    // Interaction with a schema-level default:
     // the rewrite runs on whatever value the property ends up with, whether
     // it came from an explicit assignment or its own Default(...).
     let module = unique_module("live_rw_default");
@@ -219,7 +217,7 @@ async fn insert_rewrite_applies_to_defaulted_value() {
 #[tokio::test]
 #[ignore]
 async fn update_rewrite_references_sibling_property() {
-    // Not a upstream-ported scenario — Pylon-specific: a rewrite expression that
+    // A rewrite expression that
     // reads a *different* property of the same row (via the same `.`-scoped
     // context a computed pointer gets) and calls a stdlib function, and
     // fires even though its own column (`shout`) is never itself assigned.
@@ -338,7 +336,7 @@ async fn multiple_rewrites_on_different_properties_do_not_interfere() {
 #[ignore]
 async fn trigger_observes_rewritten_value_not_original() {
     // Rewrite/Trigger interaction, Pylon-specific (both features exist here,
-    // unlike a straight the upstream engine port): an After-Insert trigger's __new__ must
+    // an After-Insert trigger's __new__ must
     // see the value *after* the insert rewrite has been applied, not the
     // originally-assigned one — the row a trigger reads is whatever
     // actually got persisted.

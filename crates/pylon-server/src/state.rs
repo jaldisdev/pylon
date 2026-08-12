@@ -17,9 +17,8 @@
 // limitations under the License.
 //
 
-//! Shared per-request state — the Rust counterpart of `asgi.py`'s
-//! `clients: dict[str, Client]` (populated lazily, one connected
-//! `pylon_client::Client` per named connection).
+//! Shared per-request state: one lazily-connected `pylon_client::Client`
+//! per named connection.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,8 +29,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 
 /// "main" is the frontend's fixed name for the base `[database]` block,
-/// which `config.connections` stores under `"default"` — matches
-/// `asgi.py`'s own `_MAIN_CONNECTION_ALIAS`.
+/// which `config.connections` stores under `"default"`.
 const MAIN_CONNECTION_ALIAS: &str = "main";
 
 pub struct AppState {
@@ -81,9 +79,9 @@ impl AppState {
         self.static_dir_override.as_deref()
     }
 
-    /// Looks up (or lazily connects) the `Client` for `connection_name` —
-    /// mirrors `asgi.py::_resolve_client`. `Ok(None)` means the name isn't
-    /// a configured connection at all (the caller turns that into a 404).
+    /// Looks up (or lazily connects) the `Client` for `connection_name`.
+    /// `Ok(None)` means the name isn't a configured connection at all (the
+    /// caller turns that into a 404).
     pub async fn resolve_client(
         &self,
         connection_name: &str,
@@ -131,7 +129,9 @@ impl AppState {
     ///
     /// Best-effort — a failure here must not fail the `/metrics` response.
     pub async fn record_outbox_metrics(&self) {
-        let Some(client) = self.clients.lock().await.get(MAIN_CONNECTION_ALIAS).cloned() else {
+        // Keyed by the config name, not the frontend's "main" alias —
+        // `resolve_client` maps the latter onto the former before inserting.
+        let Some(client) = self.clients.lock().await.get("default").cloned() else {
             return;
         };
         let pool = client.raw_connection();

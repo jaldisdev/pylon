@@ -18,7 +18,7 @@
 //
 
 //! Builds `/api/schema`/`/api/globals`'s JSON trees directly from
-//! `SchemaDescriptor` — the Rust port of `pylon/server/asgi.py`'s
+//! `SchemaDescriptor` — the JSON projection used by
 //! `_build_type_entry`/`_classify_pointer`/`_build_named_tuple_entry`/
 //! `_global_type_text`.
 //!

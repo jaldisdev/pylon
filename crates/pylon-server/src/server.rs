@@ -64,15 +64,12 @@ async fn serve(
     let addr = format!("{}:{}", config.webserver.host, config.webserver.port);
     let state = Arc::new(AppState::new(config, static_dir)?);
 
-    // Eagerly connect the base ("default"/"main") connection at startup —
-    // mirrors `asgi.py::_handle_lifespan`'s own lifespan-startup behavior
-    // (a bad DSN/host/credentials fails the whole server at startup there,
-    // not just the first request that happens to touch it); every other
+    // Eagerly connect the base ("default"/"main") connection at startup, so
+    // a bad DSN/host/credentials fails the whole server immediately rather
+    // than on the first request that happens to touch it; every other
     // named connection still connects lazily on first use, same as before.
     // The resulting `SchemaDescriptor` is also what decides which
-    // background workers to spawn (`workers::spawn`), same as
-    // `build_worker_tasks(schema, config, ...)` being called from that
-    // same lifespan-startup handler.
+    // background workers to spawn (`workers::spawn`).
     let main_client = state
         .resolve_client("main")
         .await
@@ -134,8 +131,7 @@ async fn serve(
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("pylon-server: shutting down");
-                // Mirrors `_handle_lifespan`'s own shutdown: cancel every
-                // background worker task before returning.
+                // Cancel every background worker task before returning.
                 for handle in &worker_handles {
                     handle.abort();
                 }
@@ -145,8 +141,8 @@ async fn serve(
     }
 }
 
-/// Splits `"/api/<connection>/<rest>"` into `(connection, "/<rest>")` —
-/// mirrors `asgi.py::_split_connection_path`. `None` for anything that
+/// Splits `"/api/<connection>/<rest>"` into `(connection, "/<rest>")`.
+/// `None` for anything that
 /// isn't at least `/api/<segment>/<segment>`, including the bare
 /// process-level routes (`/api/schema`, `/api/connections`, ...), which
 /// have no connection segment to split off at all.
@@ -158,8 +154,7 @@ fn split_connection_path(path: &str) -> Option<(String, String)> {
     Some((parts[2].to_string(), format!("/{}", parts[3..].join("/"))))
 }
 
-/// Top-level route dispatch — mirrors `asgi.py`'s own `app()` if/elif
-/// chain.
+/// Top-level route dispatch.
 async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();

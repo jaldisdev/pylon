@@ -1001,8 +1001,8 @@ fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
 
 // ── FREE SELECT ─────────────────────────────────────────────────────────────
 
-/// Types that asyncpg cannot decode inside anonymous ROW() composites.
-/// Return them as plain top-level columns instead.
+/// Types returned as plain top-level columns rather than wrapped in the
+/// `result` ROW() composite, so each keeps its own natural top-level shape.
 fn is_integer_expr(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::ColumnRef { pg_type, .. } => matches!(
@@ -1085,12 +1085,12 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
         .iter()
         .map(|item| match item {
             IrFreeExpr::Scalar(expr) => {
-                // Arrays (OID 1007) and jsonb (OID 3802) can't be decoded inside anonymous
-                // ROW() composites by asyncpg. Return them as plain top-level columns instead.
+                // Arrays and jsonb are returned as plain top-level columns
+                // rather than wrapped, so they keep their own shape node.
                 if is_raw_scalar(expr) {
                     format!("SELECT {} AS result", emit_expr(expr))
                 } else {
-                    // `result` is a ROW() composite for top-level asyncpg decoding.
+                    // `result` is a ROW() composite for top-level decoding.
                     // `v` is the unwrapped scalar for use in CteRef expression context.
                     // Wrap in a subquery so volatile functions (nextval, etc.) are called once.
                     // Enum values also need a ::text cast inside the ROW() — same
@@ -1171,7 +1171,7 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
 }
 
 /// Determine whether `expr`'s runtime SQL type is a custom/enum type whose
-/// OID asyncpg can't decode inside an anonymous ROW()/tuple composite — and
+/// OID is assigned by the database rather than fixed — and
 /// if so, the Postgres-schema-qualified enum type name for `ShapeNode::Enum`
 /// tagging (same convention `pg_quoted_to_pylon` expects). Covers both a
 /// column reference to an enum-typed property (quoted pg_type) and a bare
@@ -1188,8 +1188,10 @@ fn enum_type_of_expr(expr: &IrExpr) -> Option<String> {
 }
 
 /// Emit `expr` for use as a free object/tuple field value — casts to
-/// `::text` when it's enum-typed (see `enum_type_of_expr`) so asyncpg's
-/// anonymous composite decoder doesn't choke on an unregistered type OID.
+/// `::text` when it's enum-typed (see `enum_type_of_expr`), which keeps the
+/// value's shape independent of the enum's database-assigned type OID.
+/// (`pylon-pgcon` also discovers enum OIDs at connect time now, so this cast
+/// is belt-and-braces rather than load-bearing for decoding.)
 fn emit_free_field_expr(expr: &IrExpr) -> String {
     if enum_type_of_expr(expr).is_some() {
         format!("{}::text", emit_expr(expr))
@@ -1219,7 +1221,7 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
 /// position (a computed pointer, or a free scalar/tuple/object field) —
 /// `NamedTuple`/`JsonScalar` when the expression produces jsonb (tuple
 /// literals, nested free objects, tuple-typed casts), `RawScalar` when
-/// asyncpg can't decode it inside an anonymous ROW() composite, `Enum` when
+/// it is returned as a bare top-level column, `Enum` when
 /// enum-typed, else a plain `Scalar`.
 fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::ShapeNode;
@@ -1461,7 +1463,7 @@ fn emit_array_source(src: &IrArraySource) -> String {
 }
 
 /// Emit a group-key expression, casting schema-qualified enum ColumnRefs to `::text`
-/// so asyncpg can decode them outside of a typed composite.
+/// so they decode outside of a typed composite.
 fn emit_key_expr(expr: &IrExpr) -> String {
     if let IrExpr::ColumnRef { alias, column, pg_type } = expr
         && pg_type.starts_with('"')
@@ -1637,7 +1639,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 (expr_sql, shape)
             } else {
                 // Schema-qualified types (enums, domains) have unknown OIDs inside ROW() —
-                // cast to text so asyncpg's anonymous_record_decode can handle them.
+                // cast to text so the value's shape doesn't depend on a runtime OID.
                 if let IrExpr::ColumnRef { pg_type, .. } = ir_expr {
                     if pg_type.starts_with('"') {
                         let enum_type = pg_quoted_to_pylon(pg_type);
@@ -2489,7 +2491,7 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
             },
         );
     }
-    // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to asyncpg's
+    // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to a static
     // anonymous_record_decode. Cast to text — the string label is all the decoder needs.
     if f.pg_type.starts_with('"') {
         let enum_type = pg_quoted_to_pylon(&f.pg_type);
@@ -3732,7 +3734,7 @@ mod tests {
     fn test_free_select_object_with_enum_field_casts_to_text_and_tags_shape() {
         // Regression: `select { gender := default::Gender.Male }` failed at
         // runtime with "no decoder for composite type element ... " —
-        // asyncpg can't decode a custom enum OID inside an anonymous ROW()
+        // A custom enum's OID is database-assigned, so inside an anonymous ROW()
         // composite. free_item_shape/emit_free_select always treated every
         // free-object field as a plain untyped Scalar, never casting an
         // enum-valued field to ::text (unlike a schema object's emit_scalar,
@@ -3746,7 +3748,7 @@ mod tests {
         let out = compile_and_emit_with("select { gender := default::Gender.Male }", &schema);
         // The enum value is computed once (`'Male'::"public"."Gender" AS
         // "_f0"`) and reused for both the `result` composite (cast to
-        // `::text` there, since asyncpg can't decode an enum OID inside an
+        // `::text` there, since an enum's OID is database-assigned inside an
         // anonymous ROW()) and the plain per-field column exposed for
         // `IrExpr::CteFieldRef` access — so the `::text` cast now applies
         // to that computed column, not inline on the enum literal itself.
@@ -3779,7 +3781,7 @@ mod tests {
     fn test_free_select_bare_enum_literal_casts_to_text_inside_row() {
         // Same bug, bare scalar form: `select default::Gender.Male;` (no
         // shape/object wrapper) also wraps the value in ROW() for top-level
-        // asyncpg decoding.
+        // top-level decoding.
         let mut schema = make_schema();
         schema.enums.push(crate::schema::EnumDescriptor {
             name: "Gender".into(),
@@ -7117,7 +7119,7 @@ mod tests {
     fn test_array_literal_cast_resolves_to_native_pg_array_not_jsonb() {
         // The exact query reported as failing — must compile now, and must
         // resolve to a real Postgres array (text[]), never jsonb (arrays
-        // decode natively via asyncpg, unlike tuples).
+        // decode natively, unlike tuples).
         let out = compile_and_emit("SELECT <array<str>>['foo', 'bar']");
         assert!(
             out.sql.contains("::text[]") || out.sql.contains("ARRAY["),

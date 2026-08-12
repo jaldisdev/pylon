@@ -22,11 +22,9 @@
 //! (`Compiler::compile_delete` always returns `pk_returning`, never a
 //! user-supplied shape — Pylon's `DeleteStmt` has no shape field at all),
 //! a zero-match filter being a no-op, and an unfiltered delete removing
-//! every row. Concepts inspired by the upstream delete suite, not
-//! ported literally — the upstream engine's suite spends most of its weight on `ON TARGET
-//! DELETE`/`DELETE SOURCE` cascade policies and access-policy interaction,
-//! which are already covered by `live_execution_on_delete.rs` and don't
-//! exist in Pylon respectively; this file is scoped to the delete
+//! every row. Cascade policies (`ON TARGET DELETE`/`DELETE SOURCE`) are
+//! already covered by `live_execution_on_delete.rs`, so this file is
+//! scoped to the delete
 //! statement's own filter/returning behavior, which had no live coverage
 //! anywhere in the suite before this file.
 //!

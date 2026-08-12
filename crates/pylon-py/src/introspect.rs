@@ -18,7 +18,7 @@
 //
 
 //! pyo3 binding over `pylon_core::introspect` — replaces
-//! `pylon.schema._introspect.introspect_db_state`'s asyncpg-based
+//! `pylon.schema._introspect.introspect_db_state`'s Python
 //! implementation with the Rust one.
 
 use pyo3::prelude::*;
