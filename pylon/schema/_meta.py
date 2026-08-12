@@ -63,6 +63,8 @@ class PylonConfig:
     constraints: list[Any] = dataclasses.field(default_factory=list)
     indexes: list[Any] = dataclasses.field(default_factory=list)
     vector_indexes: list[Any] = dataclasses.field(default_factory=list)
+    #: At most one `Partition` per type; `None` for an ordinary table.
+    partition: Any = None
     search_indexes: list[Any] = dataclasses.field(default_factory=list)
     triggers: list[Any] = dataclasses.field(default_factory=list)
     description: str | None = None

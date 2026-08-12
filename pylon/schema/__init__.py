@@ -69,6 +69,7 @@ from ._lazy import lazy
 from ._meta import PointerMeta, PylonConfig
 from ._named_tuples import NamedTuple
 from ._named_tuples import named_tuple_decorator as named_tuple
+from ._partition import Partition, PartitionDescriptor
 from ._pointers import (
     Allow,
     Array,
@@ -172,6 +173,8 @@ __all__ = [
     # Deletion policies
     'OnDelete',
     'OneOf',
+    'Partition',
+    'PartitionDescriptor',
     # Introspection
     'PointerMeta',
     # Pointer annotations

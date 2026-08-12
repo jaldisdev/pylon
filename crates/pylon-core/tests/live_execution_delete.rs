@@ -62,6 +62,7 @@ fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDesc
         computed: vec![],
         constraints: vec![],
         indexes: vec![],
+        partition: None,
         vector_indexes: vec![],
         search_indexes: vec![],
         triggers: vec![],

@@ -276,16 +276,89 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
         lines.push(format!("    {} uuid{}", qi(&format!("{}_id", l.name)), not_null));
     }
 
-    // Primary key
-    let pk_cols: Vec<String> = t.properties.iter().filter(|p| p.is_pk).map(|p| qi(&p.name)).collect();
+    // Primary key. PostgreSQL requires a partitioned table's key to include
+    // its partition column — a uniqueness guarantee it can't enforce across
+    // partitions otherwise — so the partition column is appended here rather
+    // than left to the schema author to remember.
+    let mut pk_cols: Vec<String> = t.properties.iter().filter(|p| p.is_pk).map(|p| qi(&p.name)).collect();
+    if let Some(part) = &t.partition {
+        let key = qi(&part.pointer);
+        if !pk_cols.contains(&key) {
+            pk_cols.push(key);
+        }
+    }
     if !pk_cols.is_empty() {
         lines.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
 
     out.push_str(&lines.join(",\n"));
-    out.push_str("\n);\n\n");
+    out.push_str("\n)");
+    if let Some(part) = &t.partition {
+        out.push_str(&format!(" PARTITION BY RANGE ({})", qi(&part.pointer)));
+    }
+    out.push_str(";\n\n");
+    if let Some(part) = &t.partition {
+        out.push_str(&partman_setup_sql(&t.module, &t.table, part));
+        out.push_str("\n\n");
+    }
     out.push_str(&cache_invalidate_trigger_sql(&qn(&t.module, &t.table)));
     out.push_str("\n\n");
+}
+
+/// Registers a partitioned table with pg_partman.
+///
+/// `create_parent` both records the table in `partman.part_config` and
+/// creates its initial set of partitions, so this is what makes the
+/// `PARTITION BY RANGE` table above actually writable. Guarded by a
+/// `part_config` lookup because `create_parent` errors on a table it has
+/// already adopted, and this DDL is re-run on every schema export.
+///
+/// Retention is applied as a follow-up `UPDATE` rather than a `create_parent`
+/// argument: it's the one setting that deletes data, so it stays visible as
+/// its own statement in the generated migration rather than buried in a
+/// function call's argument list.
+fn partman_setup_sql(module: &str, table: &str, part: &crate::schema::PartitionDescriptor) -> String {
+    let pg_schema = if module == "default" { "public" } else { module };
+    // `create_parent` takes the parent table as a *string*, so this is a
+    // literal, not an identifier — single-quote escaping, not `qi`.
+    let parent = format!("{pg_schema}.{table}").replace('\'', "''");
+    let mut out = String::new();
+
+    out.push_str("DO $$ BEGIN\n");
+    out.push_str(&format!(
+        "    IF NOT EXISTS (SELECT 1 FROM partman.part_config WHERE parent_table = '{parent}') THEN\n"
+    ));
+    out.push_str(&format!(
+        "        PERFORM partman.create_parent(\n\
+         \x20           p_parent_table := '{parent}',\n\
+         \x20           p_control := '{control}',\n\
+         \x20           p_interval := '{interval}',\n\
+         \x20           p_premake := {premake}\n\
+         \x20       );\n",
+        control = part.pointer.replace('\'', "''"),
+        interval = part.interval.as_pg_interval(),
+        premake = part.premake,
+    ));
+    out.push_str("    END IF;\nEND $$;\n");
+
+    match part.retention_interval() {
+        Some(retention) => {
+            out.push_str(&format!(
+                "UPDATE partman.part_config\n\
+                 \x20   SET retention = '{retention}', retention_keep_table = false\n\
+                 \x20   WHERE parent_table = '{parent}';",
+            ));
+        }
+        None => {
+            // Explicitly cleared, so removing a `retention=` from the schema
+            // actually stops the dropping rather than leaving the last value
+            // in place.
+            out.push_str(&format!(
+                "UPDATE partman.part_config\n    SET retention = NULL\n    WHERE parent_table = '{parent}';",
+            ));
+        }
+    }
+    out
 }
 
 /// `CREATE OR REPLACE TRIGGER` statement wiring `qualified_table` into the
@@ -2018,6 +2091,7 @@ mod tests {
             computed: vec![],
             constraints: vec![],
             indexes: vec![],
+            partition: None,
             vector_indexes: vec![],
             search_indexes: vec![],
             triggers: vec![],
@@ -2372,6 +2446,7 @@ mod tests {
                 computed: vec![],
                 constraints: vec![],
                 indexes: vec![],
+                partition: None,
                 vector_indexes: vec![],
                 search_indexes: vec![],
                 triggers: vec![],
@@ -2438,6 +2513,7 @@ mod tests {
             computed: vec![],
             constraints: vec![],
             indexes: vec![],
+            partition: None,
             vector_indexes: vec![],
             search_indexes: vec![],
             triggers: vec![],
@@ -2647,6 +2723,7 @@ mod tests {
             computed: vec![],
             constraints: vec![],
             indexes: vec![],
+            partition: None,
             vector_indexes: vec![],
             search_indexes: vec![],
             triggers: vec![],
@@ -2846,5 +2923,123 @@ mod tests {
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(!ddl.contains("IF TG_OP = 'UPDATE'"), "got:\n{ddl}");
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use crate::schema::{PartitionDescriptor, PartitionInterval, PropertyDescriptor};
+
+    fn prop(name: &str, pg_type: &str, is_pk: bool) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: false,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }
+    }
+
+    fn event_schema(retention: Option<u32>) -> SchemaDescriptor {
+        let mut td = TypeDescriptor {
+            name: "Event".into(),
+            module: "default".into(),
+            table: "Event".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: vec![prop("id", "uuid", true), prop("occurred_at", "timestamptz", false)],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        };
+        td.partition = Some(PartitionDescriptor {
+            pointer: "occurred_at".into(),
+            interval: PartitionInterval::Monthly,
+            premake: 4,
+            retention,
+        });
+        SchemaDescriptor {
+            types: vec![td],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_partitioned_table_declares_its_range_key() {
+        let ddl = export_schema(&event_schema(None)).unwrap();
+        assert!(ddl.contains("PARTITION BY RANGE (\"occurred_at\")"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn the_partition_key_is_added_to_the_primary_key() {
+        // PostgreSQL rejects a partitioned table whose primary key doesn't
+        // include the partition column, so this is not optional.
+        let ddl = export_schema(&event_schema(None)).unwrap();
+        assert!(ddl.contains("PRIMARY KEY (\"id\", \"occurred_at\")"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn an_unpartitioned_table_is_untouched() {
+        let mut schema = event_schema(None);
+        schema.types[0].partition = None;
+        let ddl = export_schema(&schema).unwrap();
+        assert!(!ddl.contains("PARTITION BY"), "got:\n{ddl}");
+        assert!(!ddl.contains("partman"), "got:\n{ddl}");
+        assert!(ddl.contains("PRIMARY KEY (\"id\")"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn registration_is_guarded_so_re_export_is_idempotent() {
+        // `create_parent` errors on a table it has already adopted, and this
+        // DDL is re-run on every export.
+        let ddl = export_schema(&event_schema(None)).unwrap();
+        assert!(
+            ddl.contains("IF NOT EXISTS (SELECT 1 FROM partman.part_config"),
+            "got:\n{ddl}"
+        );
+        assert!(ddl.contains("partman.create_parent("), "got:\n{ddl}");
+        assert!(ddl.contains("p_interval := '1 month'"), "got:\n{ddl}");
+        assert!(ddl.contains("p_premake := 4"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn retention_is_applied_when_declared() {
+        let ddl = export_schema(&event_schema(Some(12))).unwrap();
+        assert!(ddl.contains("SET retention = '12 months'"), "got:\n{ddl}");
+        assert!(ddl.contains("retention_keep_table = false"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn retention_is_cleared_when_not_declared() {
+        // Removing `retention=` from the schema has to actually stop the
+        // dropping, not leave the last value sitting in part_config.
+        let ddl = export_schema(&event_schema(None)).unwrap();
+        assert!(ddl.contains("SET retention = NULL"), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn a_partitioned_schema_requires_the_partman_extension() {
+        let exts = crate::diff::required_extensions(&event_schema(None));
+        assert!(exts.contains(&"pg_partman"), "got: {exts:?}");
     }
 }

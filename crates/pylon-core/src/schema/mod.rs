@@ -221,6 +221,86 @@ impl SearchIndexDescriptor {
     }
 }
 
+/// How a partitioned type's ranges are sized.
+///
+/// Range partitioning on a time column only — the case declarative
+/// partitioning actually pays off for, and the only one that has a sensible
+/// automatic maintenance story (create the next few ranges, drop the ones
+/// past retention). List and hash partitioning need a key set known up
+/// front, which is a different feature, not a parameter of this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PartitionInterval {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+impl PartitionInterval {
+    /// The PostgreSQL interval literal for one partition's width.
+    pub fn as_pg_interval(self) -> &'static str {
+        match self {
+            PartitionInterval::Daily => "1 day",
+            PartitionInterval::Weekly => "1 week",
+            PartitionInterval::Monthly => "1 month",
+            PartitionInterval::Yearly => "1 year",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PartitionInterval::Daily => "daily",
+            PartitionInterval::Weekly => "weekly",
+            PartitionInterval::Monthly => "monthly",
+            PartitionInterval::Yearly => "yearly",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "daily" => Some(PartitionInterval::Daily),
+            "weekly" => Some(PartitionInterval::Weekly),
+            "monthly" => Some(PartitionInterval::Monthly),
+            "yearly" => Some(PartitionInterval::Yearly),
+            _ => None,
+        }
+    }
+}
+
+/// Declarative range partitioning for one type, maintained by pg_partman.
+///
+/// A type carries at most one of these: a table has exactly one partition
+/// key, so a second declaration isn't a refinement, it's a contradiction.
+/// See `validate_partitions`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PartitionDescriptor {
+    /// The property partitioned on. Must be a non-nullable date/timestamp
+    /// property of this type — PostgreSQL requires the partition key to be
+    /// part of the primary key and to never be NULL.
+    pub pointer: String,
+    pub interval: PartitionInterval,
+    /// How many future partitions to keep pre-created. A write landing in a
+    /// range that doesn't exist yet fails, so this is the safety margin
+    /// against maintenance falling behind.
+    pub premake: u32,
+    /// Drop partitions older than this many intervals. `None` keeps
+    /// everything — the safe default, since the alternative silently deletes
+    /// data on a schedule.
+    pub retention: Option<u32>,
+}
+
+impl PartitionDescriptor {
+    /// `retention` as a PostgreSQL interval literal, for `part_config`.
+    pub fn retention_interval(&self) -> Option<String> {
+        self.retention.map(|n| match self.interval {
+            PartitionInterval::Daily => format!("{n} days"),
+            PartitionInterval::Weekly => format!("{n} weeks"),
+            PartitionInterval::Monthly => format!("{n} months"),
+            PartitionInterval::Yearly => format!("{n} years"),
+        })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VectorIndexDescriptor {
     /// `None` = default (bare) index; `Some(name)` = named index.
@@ -316,6 +396,10 @@ pub struct TypeDescriptor {
     pub constraints: Vec<TypeConstraint>,
     /// Non-unique indexes (own + inherited from abstract parents).
     pub indexes: Vec<IndexDescriptor>,
+    /// Declarative range partitioning, at most one per type. `None` for an
+    /// ordinary table.
+    #[serde(default)]
+    pub partition: Option<PartitionDescriptor>,
     /// Vector (embedding) indexes.
     pub vector_indexes: Vec<VectorIndexDescriptor>,
     /// Full-text search indexes.

@@ -53,6 +53,7 @@ fn ty_with_signal(name: &str, module: &str, on: u8) -> TypeDescriptor {
         computed: vec![],
         constraints: vec![],
         indexes: vec![],
+        partition: None,
         vector_indexes: vec![],
         search_indexes: vec![],
         triggers: vec![],

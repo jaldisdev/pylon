@@ -58,12 +58,107 @@ fn mismatch(context: String, message: String) -> PyQLError {
     })
 }
 
+/// Partition-key column types PostgreSQL range partitioning is supported on
+/// here. Range partitioning works on any orderable type, but the automatic
+/// "create the next N ranges, drop past retention" maintenance only makes
+/// sense against time.
+const PARTITIONABLE_PG_TYPES: [&str; 3] = ["timestamptz", "timestamp", "date"];
+
+/// Validates every `Partition` declaration in `schema`.
+///
+/// Each of these is a constraint PostgreSQL itself would reject later — but
+/// later means at migration time, as a raw Postgres error against generated
+/// DDL. Catching them here reports them against the schema the author wrote.
+pub fn validate_partitions(schema: &SchemaDescriptor) -> Vec<PyQLError> {
+    let mut errors = Vec::new();
+
+    for td in &schema.types {
+        let Some(part) = &td.partition else { continue };
+        let type_name = format!("{}::{}", td.module, td.name);
+        let context = format!("{type_name} (partition)");
+
+        // An abstract type has no table, so there is nothing to partition —
+        // its fields flatten into each concrete subtype, and partitioning
+        // each of those is a decision each one has to make for itself.
+        if td.abstract_ && !td.materialized {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "type '{type_name}' is abstract and has no table of its own, so it cannot declare a Partition — \
+                     declare it on each concrete type instead"
+                ),
+            ));
+            continue;
+        }
+        // An interface is a view over its implementors; a view has no
+        // storage to partition either.
+        if td.abstract_ && td.materialized {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "type '{type_name}' is an interface, backed by a view rather than a table, so it cannot declare \
+                     a Partition — declare it on each implementing type instead"
+                ),
+            ));
+            continue;
+        }
+
+        let Some(prop) = td.properties.iter().find(|p| p.name == part.pointer) else {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "Partition on '{type_name}' names pointer '{}', which is not a property of this type",
+                    part.pointer
+                ),
+            ));
+            continue;
+        };
+
+        if !PARTITIONABLE_PG_TYPES.contains(&prop.pg_type.as_str()) {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "Partition on '{type_name}' names property '{}' of type '{}' — the partition key must be a \
+                     datetime or date property",
+                    part.pointer, prop.pg_type
+                ),
+            ));
+        }
+
+        // PostgreSQL rejects a NULL partition key outright: there is no
+        // range for it to land in.
+        if prop.nullable {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "Partition on '{type_name}' names optional property '{}' — a partition key can never be empty",
+                    part.pointer
+                ),
+            ));
+        }
+
+        if part.premake == 0 {
+            errors.push(mismatch(
+                context.clone(),
+                format!(
+                    "Partition on '{type_name}' has premake=0 — with no future partitions pre-created, the first \
+                     write past the current range fails"
+                ),
+            ));
+        }
+    }
+
+    errors
+}
+
 /// Compile every user function body, computed-pointer expression, and
 /// property/link default in `schema`, and collect every declared-vs-actual
 /// return-type mismatch found — not fail-fast, so a caller can report every
-/// problem in the schema at once rather than a fix-one-rerun loop.
+/// problem in the schema at once rather than a fix-one-rerun loop. Partition
+/// declarations (`validate_partitions`) are checked in the same pass, for the
+/// same reason.
 pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLError>> {
-    let mut errors = Vec::new();
+    let mut errors = validate_partitions(schema);
 
     for fd in &schema.functions {
         // Object-returning functions build a row shape, not a single scalar
@@ -272,6 +367,135 @@ mod tests {
         PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor,
     };
 
+    // ── Partition validation ──────────────────────────────────────────
+
+    fn ts_prop(name: &str, nullable: bool) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: "timestamptz".into(),
+            nullable,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }
+    }
+
+    fn partitioned(part: crate::schema::PartitionDescriptor, props: Vec<PropertyDescriptor>) -> SchemaDescriptor {
+        let mut td = person_type(vec![], props);
+        td.partition = Some(part);
+        SchemaDescriptor {
+            types: vec![td],
+            ..Default::default()
+        }
+    }
+
+    fn monthly(pointer: &str) -> crate::schema::PartitionDescriptor {
+        crate::schema::PartitionDescriptor {
+            pointer: pointer.into(),
+            interval: crate::schema::PartitionInterval::Monthly,
+            premake: 4,
+            retention: None,
+        }
+    }
+
+    fn only_error(schema: &SchemaDescriptor) -> String {
+        let errors = validate_partitions(schema);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got {errors:#?}");
+        errors[0].to_string()
+    }
+
+    #[test]
+    fn a_valid_partition_passes() {
+        let schema = partitioned(monthly("occurred_at"), vec![ts_prop("occurred_at", false)]);
+        assert!(validate_partitions(&schema).is_empty());
+    }
+
+    #[test]
+    fn a_partition_on_an_abstract_type_is_rejected() {
+        // An abstract type has no table to partition — its fields flatten
+        // into each concrete subtype.
+        let mut schema = partitioned(monthly("occurred_at"), vec![ts_prop("occurred_at", false)]);
+        schema.types[0].abstract_ = true;
+        schema.types[0].materialized = false;
+        assert!(only_error(&schema).contains("abstract"));
+    }
+
+    #[test]
+    fn a_partition_on_an_interface_is_rejected() {
+        // An interface is a view; a view has no storage either.
+        let mut schema = partitioned(monthly("occurred_at"), vec![ts_prop("occurred_at", false)]);
+        schema.types[0].abstract_ = true;
+        schema.types[0].materialized = true;
+        assert!(only_error(&schema).contains("interface"));
+    }
+
+    #[test]
+    fn a_partition_on_an_unknown_pointer_is_rejected() {
+        let schema = partitioned(monthly("nope"), vec![ts_prop("occurred_at", false)]);
+        assert!(only_error(&schema).contains("not a property"));
+    }
+
+    #[test]
+    fn a_partition_on_a_non_temporal_property_is_rejected() {
+        let mut prop = ts_prop("occurred_at", false);
+        prop.pg_type = "text".into();
+        let schema = partitioned(monthly("occurred_at"), vec![prop]);
+        assert!(only_error(&schema).contains("datetime or date"));
+    }
+
+    #[test]
+    fn a_partition_on_an_optional_property_is_rejected() {
+        // PostgreSQL has no range for a NULL key to land in.
+        let schema = partitioned(monthly("occurred_at"), vec![ts_prop("occurred_at", true)]);
+        assert!(only_error(&schema).contains("can never be empty"));
+    }
+
+    #[test]
+    fn premake_zero_is_rejected() {
+        let mut part = monthly("occurred_at");
+        part.premake = 0;
+        let schema = partitioned(part, vec![ts_prop("occurred_at", false)]);
+        assert!(only_error(&schema).contains("premake=0"));
+    }
+
+    #[test]
+    fn date_and_naive_timestamp_keys_are_accepted() {
+        for pg_type in ["date", "timestamp"] {
+            let mut prop = ts_prop("occurred_at", false);
+            prop.pg_type = pg_type.into();
+            let schema = partitioned(monthly("occurred_at"), vec![prop]);
+            assert!(
+                validate_partitions(&schema).is_empty(),
+                "{pg_type} should be a valid partition key"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_renders_as_a_postgres_interval() {
+        use crate::schema::{PartitionDescriptor, PartitionInterval};
+        let with = |interval, retention| {
+            PartitionDescriptor {
+                pointer: "t".into(),
+                interval,
+                premake: 4,
+                retention: Some(retention),
+            }
+            .retention_interval()
+        };
+        assert_eq!(with(PartitionInterval::Daily, 30), Some("30 days".to_string()));
+        assert_eq!(with(PartitionInterval::Monthly, 12), Some("12 months".to_string()));
+        assert_eq!(with(PartitionInterval::Yearly, 7), Some("7 years".to_string()));
+        assert_eq!(monthly("t").retention_interval(), None);
+    }
+
     fn person_type(computed: Vec<ComputedDescriptor>, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
         let mut props = vec![PropertyDescriptor {
             name: "id".into(),
@@ -304,6 +528,7 @@ mod tests {
             computed,
             constraints: vec![],
             indexes: vec![],
+            partition: None,
             vector_indexes: vec![],
             search_indexes: vec![],
             triggers: vec![],

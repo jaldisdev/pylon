@@ -901,6 +901,33 @@ def _make_vector_index_desc(vi: Any, _core: Any, type_name: str, valid_pointers:
     )
 
 
+def _make_partition_desc(part: Any, _core: Any, type_name: str, effective: dict) -> Any:
+    """Build the Rust `PartitionDescriptor`, checking what only the walker can
+    see — that the named pointer exists on this type and is a required
+    property. (The Rust `validate_partitions` pass re-checks these against the
+    finished schema; catching them here reports them against the class the
+    author actually wrote.)
+    """
+    meta = effective.get(part.pointer)
+    if meta is None:
+        raise SchemaError(f'Partition on {type_name!r}: pointer {part.pointer!r} is not a property of this type')
+    if getattr(meta, 'kind', None) != 'property':
+        raise SchemaError(
+            f'Partition on {type_name!r}: {part.pointer!r} is a {getattr(meta, "kind", "pointer")}, '
+            f'not a property — a partition key must be a stored column'
+        )
+    if getattr(meta, 'nullable', False):
+        raise SchemaError(
+            f'Partition on {type_name!r}: {part.pointer!r} is optional — a partition key can never be empty'
+        )
+    return _core.PartitionDescriptor(
+        pointer=part.pointer,
+        interval=part.interval,
+        premake=part.premake,
+        retention=part.retention,
+    )
+
+
 def _resolve_search_pointer(ref: str, type_name: str, valid_pointers: set[str]) -> str:
     if '.' in ref:
         prefix, pointer = ref.rsplit('.', 1)
@@ -993,6 +1020,7 @@ def _build_type_descriptor(
         _make_search_index_desc(si, _core, cfg.name, set(effective.keys())) for si in cfg.search_indexes
     ]
     trigger_descs = [_make_trigger_desc(t, _core) for t in all_triggers]
+    partition_desc = _make_partition_desc(cfg.partition, _core, cfg.name, effective) if cfg.partition else None
 
     # Combined on= bitmask across every @pylon.signal handler registered
     # for this type — the live handler callables themselves never cross
@@ -1025,6 +1053,7 @@ def _build_type_descriptor(
         expression_constraints=expression_constraints,
         indexes=index_descs,
         vector_indexes=vector_index_descs,
+        partition=partition_desc,
         search_indexes=search_index_descs,
         triggers=trigger_descs,
         junction=cfg.junction,
