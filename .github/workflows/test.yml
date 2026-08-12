@@ -6,6 +6,41 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # --exclude pylon-py: pyo3's linking needs maturin's own build config,
+      # so a plain cargo invocation can't produce that crate's final artifact.
+      # `cargo clippy` still type-checks it, but only via the maturin-built
+      # Python jobs below is it ever actually linked.
+      - name: cargo clippy
+        run: cargo clippy --workspace --exclude pylon-py --all-targets -- -D warnings
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff check
+        run: ruff check pylon tests
+
+      - name: ruff format
+        run: ruff format --check pylon tests
+
   test:
     runs-on: ubuntu-latest
 
@@ -25,6 +60,22 @@ jobs:
 
       - name: Run tests
         run: python -m pytest
+
+  # The non-ignored Rust suite: every parser, IR, SQL-emitter, diff,
+  # migration-parsing and wire-decoder test. Needs no database, so it runs on
+  # its own without the Postgres service container.
+  unit-tests-rust:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust unit tests
+        run: cargo test --workspace --exclude pylon-py
 
   live-tests-rust:
     runs-on: ubuntu-latest
