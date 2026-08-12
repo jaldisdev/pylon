@@ -20,11 +20,14 @@
 //! Migration file parsing, ID computation, and chain validation.
 //!
 //! Every migration file has a two-line header:
-//!   -- migration: m1<38-hex>
-//!   -- onto: m1<38-hex> | initial
+//!   -- migration: m2<38-hex>
+//!   -- onto: m2<38-hex> | initial
 //!
-//! The migration ID is `m1` + first 19 bytes (38 hex chars) of SHA-256(body).
-//! The short ID (used in filenames) is `m1` + first 3 bytes (6 hex chars).
+//! The migration ID is `m2` + 19 bytes (38 hex chars) of a SHA-256 over the
+//! body *and* the migration's position in the chain (`onto`, plus any
+//! squashed IDs). The short ID used in filenames is the same digest cut to 6
+//! bytes (12 hex chars). `m1` — a body-only hash with a 3-byte short form —
+//! is still accepted for files already on disk; see `verify_integrity`.
 
 use sha2::{Digest, Sha256};
 
@@ -57,22 +60,29 @@ pub enum MigrationError {
 /// A parsed migration file.
 #[derive(Debug, Clone)]
 pub struct MigrationFile {
-    /// Full migration ID: `m1` + 38 hex chars.
+    /// Full migration ID: a version prefix (`m2`, or `m1` for a file
+    /// written before the format change) + 38 hex chars.
     pub id: String,
     /// Parent's full ID, or the literal string `"initial"`.
     pub onto: String,
     /// IDs this migration squashes (§12); empty for normal migrations.
     pub squashed: Vec<String>,
-    /// Original filename (stem only, e.g. `00001_m1a3f9bc`).
+    /// Original filename (stem only, e.g. `00001_m2a3f9bc12de4`).
     pub filename: String,
     /// Everything after the two header lines.
     pub body: String,
 }
 
 impl MigrationFile {
-    /// Short ID used in filenames: `m1` + first 6 hex chars of SHA-256(body).
+    /// Short ID used in filenames — the leading prefix of `id`, whose length
+    /// depends on which format wrote the file: `m1` carried 6 hex chars,
+    /// `m2` carries 12 (see `compute_short_id`).
     pub fn short_id(&self) -> &str {
-        &self.id[..8] // "m1" + 6 hex chars
+        if self.id.starts_with("m1") {
+            &self.id[..8]
+        } else {
+            &self.id[..14]
+        }
     }
 
     /// Whether this is the "first" migration (onto == "initial").
@@ -83,20 +93,55 @@ impl MigrationFile {
 
 // ── ID computation ────────────────────────────────────────────────────────────
 
-/// Compute the full migration ID from a body string (§5).
-/// Returns `m1` + first 38 hex chars of SHA-256(body bytes).
-pub fn compute_id(body: &str) -> String {
-    let digest = Sha256::digest(body.as_bytes());
-    let hex = hex::encode(&digest[..19]); // 19 bytes = 38 hex chars
-    format!("m1{}", hex)
+/// Current ID format. `m1` hashed the body alone, which meant two migrations
+/// with identical bodies at different points in the chain collided on one ID
+/// — and `_pylon."Migrations"` keys on that ID, so the second apply
+/// overwrote the first's tracking row. `m2` folds `onto` and the squash list
+/// in, making the ID identify a migration's position in the chain and not
+/// just its text.
+const ID_VERSION: &str = "m2";
+
+/// The digest every ID is derived from: the body, plus the chain position
+/// that body sits at.
+///
+/// Field-separated with a byte that can't occur in any of the inputs, so
+/// `(onto = "a", body = "bc")` and `(onto = "ab", body = "c")` can't hash
+/// alike.
+fn id_digest(body: &str, onto: &str, squashed: &[String]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(onto.as_bytes());
+    for id in squashed {
+        hasher.update([0x1f]);
+        hasher.update(id.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
-/// Compute the short migration ID (filename component) from a body string.
-/// Returns `m1` + first 6 hex chars of SHA-256(body bytes).
-pub fn compute_short_id(body: &str) -> String {
+/// Compute the full migration ID (§5): `m2` + 38 hex chars of the digest.
+pub fn compute_id(body: &str, onto: &str, squashed: &[String]) -> String {
+    let digest = id_digest(body, onto, squashed);
+    let hex = hex::encode(&digest[..19]); // 19 bytes = 38 hex chars
+    format!("{ID_VERSION}{hex}")
+}
+
+/// Compute the short migration ID used as the filename component.
+///
+/// 12 hex chars (48 bits), not the 6 (24 bits) the `m1` format used: at 24
+/// bits two migrations share a filename stem with ~50% probability by the
+/// ~4,800th migration, and a few percent within the first few hundred.
+pub fn compute_short_id(body: &str, onto: &str, squashed: &[String]) -> String {
+    let digest = id_digest(body, onto, squashed);
+    let hex = hex::encode(&digest[..6]); // 6 bytes = 12 hex chars
+    format!("{ID_VERSION}{hex}")
+}
+
+/// The `m1` full ID for `body` — body-only hash, kept solely so migration
+/// files written before the `m2` format still verify.
+fn legacy_compute_id(body: &str) -> String {
     let digest = Sha256::digest(body.as_bytes());
-    let hex = hex::encode(&digest[..3]); // 3 bytes = 6 hex chars
-    format!("m1{}", hex)
+    format!("m1{}", hex::encode(&digest[..19]))
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
@@ -160,9 +205,18 @@ fn parse_squashed_lines(content: &str) -> Vec<String> {
 
 // ── Integrity verification ─────────────────────────────────────────────────────
 
-/// Re-hash a migration's body and verify it matches the ID in the header (§9.2).
+/// Re-hash a migration and verify it matches the ID in the header (§9.2).
+///
+/// Which hash to check against comes from the ID's own version prefix, so a
+/// project with `m1` files on disk keeps verifying against the body-only
+/// hash those files were written with. Only newly created migrations get
+/// `m2` — there is no rewrite step and no flag day.
 pub fn verify_integrity(m: &MigrationFile) -> Result<(), MigrationError> {
-    let computed = compute_id(&m.body);
+    let computed = if m.id.starts_with("m1") {
+        legacy_compute_id(&m.body)
+    } else {
+        compute_id(&m.body, &m.onto, &m.squashed)
+    };
     if computed != m.id {
         return Err(MigrationError::IdMismatch {
             filename: m.filename.clone(),
@@ -264,7 +318,7 @@ pub fn blank_body() -> &'static str {
 /// `body` must include the leading blank line (the separator between header and SQL),
 /// so that `parse` recovers the same bytes that `compute_id` hashed.
 pub fn render_file(onto: &str, body: &str, squashed: &[String]) -> String {
-    let id = compute_id(body);
+    let id = compute_id(body, onto, squashed);
     let mut out = format!("-- migration: {}\n-- onto: {}\n", id, onto);
     if !squashed.is_empty() {
         out.push_str(&format!("-- squashed: {}\n", squashed.join(", ")));
@@ -436,24 +490,65 @@ mod tests {
 
     #[test]
     fn test_compute_id_prefix() {
-        let id = compute_id("hello");
-        assert!(id.starts_with("m1"));
-        assert_eq!(id.len(), 40); // "m1" + 38 hex
+        let id = compute_id("hello", "initial", &[]);
+        assert!(id.starts_with("m2"));
+        assert_eq!(id.len(), 40); // "m2" + 38 hex
     }
 
     #[test]
     fn test_compute_short_id() {
-        let sid = compute_short_id("hello");
-        assert!(sid.starts_with("m1"));
-        assert_eq!(sid.len(), 8); // "m1" + 6 hex
+        let sid = compute_short_id("hello", "initial", &[]);
+        assert!(sid.starts_with("m2"));
+        assert_eq!(sid.len(), 14); // "m2" + 12 hex
     }
 
     #[test]
     fn test_id_is_prefix_of_short_id() {
-        let body = "SELECT 1;";
-        let full = compute_id(body);
-        let short = compute_short_id(body);
+        let full = compute_id("SELECT 1;", "initial", &[]);
+        let short = compute_short_id("SELECT 1;", "initial", &[]);
         assert!(full.starts_with(&short));
+    }
+
+    #[test]
+    fn identical_bodies_at_different_chain_positions_get_different_ids() {
+        // The `m1` collision: same DDL added, reverted, then re-added later
+        // hashed to one ID, and `_pylon."Migrations"` keys on that ID.
+        let body = "ALTER TABLE t ADD COLUMN c int8;";
+        let first = compute_id(body, "initial", &[]);
+        let second = compute_id(body, "m2aaaaaaaaaaaa", &[]);
+        assert_ne!(first, second);
+        assert_ne!(
+            compute_short_id(body, "initial", &[]),
+            compute_short_id(body, "m2aaaaaaaaaaaa", &[])
+        );
+    }
+
+    #[test]
+    fn the_squash_list_is_part_of_the_id() {
+        let body = "SELECT 1;";
+        assert_ne!(
+            compute_id(body, "initial", &[]),
+            compute_id(body, "initial", &["m1abc".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_field_separator_stops_boundary_ambiguity() {
+        // Without a separator these two would hash the same bytes.
+        assert_ne!(compute_id("bc", "a", &[]), compute_id("c", "ab", &[]));
+    }
+
+    #[test]
+    fn a_legacy_m1_file_still_verifies_against_the_body_only_hash() {
+        let body = "\nSELECT 1;\n";
+        let legacy_id = legacy_compute_id(body);
+        let content = format!("-- migration: {legacy_id}\n-- onto: initial\n{body}");
+        let m = parse(&content, "00001_legacy").unwrap();
+        assert!(
+            verify_integrity(&m).is_ok(),
+            "an m1 file written before the format change must keep verifying"
+        );
+        assert_eq!(m.short_id().len(), 8, "m1 short IDs stay 6 hex chars wide");
     }
 
     #[test]
@@ -462,7 +557,7 @@ mod tests {
         let content = render_file("initial", &body, &[]);
         let m = parse(&content, "00001_m1abc123").unwrap();
         assert_eq!(m.onto, "initial");
-        assert!(m.id.starts_with("m1"));
+        assert!(m.id.starts_with("m2"));
         verify_integrity(&m).unwrap();
     }
 

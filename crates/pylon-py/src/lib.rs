@@ -17,6 +17,14 @@
 // limitations under the License.
 //
 
+// Every function in this crate is a `#[pyfunction]`/`#[pymethods]` entry
+// point, so its parameter list *is* the Python-facing signature and its
+// return type *is* what Python receives. Collapsing arguments into a struct
+// or hiding a tuple behind an alias would change that public API to satisfy
+// a lint about Rust-internal ergonomics, so both are allowed crate-wide here
+// rather than suppressed one signature at a time.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use pylon_core as core;
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
@@ -1495,7 +1503,7 @@ impl SchemaDescriptor {
                 Ok(d)
             })
             .collect::<PyResult<_>>()?;
-        Ok(PyList::new(py, items)?)
+        PyList::new(py, items)
     }
 
     /// Serialize the full schema to JSON — the same format written to
@@ -1725,16 +1733,19 @@ fn validate_migration_chain(migrations: Vec<PyRef<MigrationFile>>) -> PyResult<V
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
-/// Compute a migration's full ID from its body.
+/// Compute a migration's full ID from its body and its position in the chain.
 #[pyfunction]
-fn compute_migration_id(body: &str) -> String {
-    core::migration::compute_id(body)
+#[pyo3(signature = (body, onto, squashed = None))]
+fn compute_migration_id(body: &str, onto: &str, squashed: Option<Vec<String>>) -> String {
+    core::migration::compute_id(body, onto, &squashed.unwrap_or_default())
 }
 
-/// Compute a migration's short ID (filename component) from its body.
+/// Compute a migration's short ID (filename component) from its body and its
+/// position in the chain.
 #[pyfunction]
-fn compute_migration_short_id(body: &str) -> String {
-    core::migration::compute_short_id(body)
+#[pyo3(signature = (body, onto, squashed = None))]
+fn compute_migration_short_id(body: &str, onto: &str, squashed: Option<Vec<String>>) -> String {
+    core::migration::compute_short_id(body, onto, &squashed.unwrap_or_default())
 }
 
 /// Render a complete migration file string (header + body).
@@ -1764,7 +1775,7 @@ pub struct DbState {
 /// All index creation uses plain (non-CONCURRENTLY) form — suitable for watch mode.
 #[pyfunction]
 fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<String>> {
-    core::diff::diff_schema(&target.inner, &current.inner).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    core::diff::diff_schema(&target.inner, &current.inner).map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Compute ordered DDL ops with non-transactional markers for migration file creation.
@@ -1774,7 +1785,7 @@ fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<Str
 fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<(String, bool)>> {
     core::diff::diff_schema_ops(&target.inner, &current.inner)
         .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Compute the net DDL to go from `before` to `after` (two live-DB snapshots).
@@ -2008,7 +2019,7 @@ fn diff_schema_steps_with_renames_and_fills(
         &fills,
     )
     .map(|steps| steps.into_iter().map(|inner| MigrationStep { inner }).collect())
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Diff with confirmed renames applied.
@@ -2024,7 +2035,7 @@ fn diff_schema_ops_with_renames(
 ) -> PyResult<Vec<(String, bool)>> {
     core::diff::diff_schema_ops_with_renames(&target.inner, &current.inner, &type_renames, &col_renames)
         .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Compile a PyQL fill expression to a bare SQL expression for use in an UPDATE SET clause.
@@ -2082,7 +2093,7 @@ fn diff_schema_ops_with_renames_and_fills(
         &fills,
     )
     .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Serialize a compiled `SchemaDescriptor` to the `DbState` JSON snapshot format.
@@ -2127,7 +2138,7 @@ fn schema_content_changed(target: &SchemaDescriptor, previous: Option<&SchemaDes
 fn db_state_from_json(json: &str) -> PyResult<DbState> {
     core::diff::db_state_from_json(json)
         .map(|inner| DbState { inner })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Discard all cached compiled queries. Must be called after a schema reload
@@ -2389,14 +2400,14 @@ fn construct_pylon_error(
             let module = py.import("pylon.exceptions")?;
             let cls = module.getattr(class_name)?;
             let kwargs = pyo3::types::PyDict::new(py);
-            if let Some(q) = query {
-                if let Some(offset) = char_offset(q, position.line, position.col) {
-                    kwargs.set_item("query", q)?;
-                    kwargs.set_item("position_start", offset)?;
-                    kwargs.set_item("position_end", offset + 1)?;
-                    kwargs.set_item("line", position.line)?;
-                    kwargs.set_item("col", position.col)?;
-                }
+            if let Some(q) = query
+                && let Some(offset) = char_offset(q, position.line, position.col)
+            {
+                kwargs.set_item("query", q)?;
+                kwargs.set_item("position_start", offset)?;
+                kwargs.set_item("position_end", offset + 1)?;
+                kwargs.set_item("line", position.line)?;
+                kwargs.set_item("col", position.col)?;
             }
             let instance = cls.call_method("_from_transpiler", (message,), Some(&kwargs))?;
             Ok(PyErr::from_value(instance))

@@ -36,6 +36,15 @@ pub enum MigrateError {
     Integrity(#[from] crate::migration::MigrationError),
     #[error(transparent)]
     Db(#[from] pylon_pgcon::Error),
+    #[error(
+        "migration {id} is already recorded as applied onto {recorded_onto}, but the file \
+         being applied claims onto {new_onto} — two different migrations share one ID"
+    )]
+    IdCollision {
+        id: String,
+        recorded_onto: String,
+        new_onto: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MigrateError>;
@@ -58,34 +67,15 @@ fn is_duplicate_object_error(err: &pylon_pgcon::Error) -> bool {
     err.sqlstate().is_some_and(|code| DUPLICATE_OBJECT_CODES.contains(code))
 }
 
+/// Creates the tracking tables if they don't exist yet.
+///
+/// Runs `stdlib::ddl::MIGRATION_TRACKING_DDL` rather than a second copy of
+/// the same statements: the two used to be maintained separately and had
+/// already diverged on the `schema_state` column, so a database bootstrapped
+/// through `export_stdlib` was missing a column `read_tracking` selects.
 pub async fn ensure_tracking_tables(pool: &PgPool) -> Result<()> {
-    pool.batch_execute(
-        r#"
-        CREATE TABLE IF NOT EXISTS _pylon."Migrations" (
-            id          text        PRIMARY KEY,
-            onto        text        NOT NULL,
-            filename    text        NOT NULL,
-            db_state    jsonb       NULL,
-            applied_at  timestamptz NULL
-        );
-        -- Added after the table above already shipped, so existing
-        -- databases need the column bolted on rather than created fresh —
-        -- ADD COLUMN IF NOT EXISTS makes this safe to run again on a
-        -- table that was CREATE'd (not ALTER'd) before this column existed.
-        ALTER TABLE _pylon."Migrations" ADD COLUMN IF NOT EXISTS schema_state jsonb NULL;
-        CREATE TABLE IF NOT EXISTS _pylon."Progress" (
-            id          text        PRIMARY KEY,
-            step_index  integer     NOT NULL,
-            updated_at  timestamptz NOT NULL DEFAULT now()
-        );
-        CREATE TABLE IF NOT EXISTS _pylon."Schema" (
-            singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),
-            snapshot    jsonb       NOT NULL,
-            updated_at  timestamptz NOT NULL DEFAULT now()
-        );
-        "#,
-    )
-    .await?;
+    pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon;").await?;
+    pool.batch_execute(crate::stdlib::ddl::MIGRATION_TRACKING_DDL).await?;
     Ok(())
 }
 
@@ -262,11 +252,50 @@ pub async fn advisory_unlock(conn: pylon_pgcon::PgConnection) -> Result<()> {
     Ok(())
 }
 
+/// Records a migration as applied.
+///
+/// The conflict path updates `onto` and `filename` too, not just
+/// `applied_at`: re-applying the same migration rewrites them with identical
+/// values (free), while leaving them stale would let the applied-tip walk
+/// read an `onto` that doesn't match the migration the ID refers to.
+/// `check_no_id_collision` runs first and rejects the case where they would
+/// genuinely differ.
 const RECORD_APPLIED_SQL: &str = r#"
     INSERT INTO _pylon."Migrations" (id, onto, filename, applied_at)
     VALUES ($1, $2, $3, now())
-    ON CONFLICT (id) DO UPDATE SET applied_at = now()
+    ON CONFLICT (id) DO UPDATE
+        SET applied_at = now(),
+            onto = EXCLUDED.onto,
+            filename = EXCLUDED.filename
 "#;
+
+/// Rejects recording `id` when a *different* migration is already tracked
+/// under it — i.e. one whose parent isn't `onto`.
+///
+/// Under the `m2` ID format this can't arise from two same-bodied migrations
+/// at different chain positions, since `onto` is hashed in. It remains
+/// reachable for `m1`-era IDs (body-only hash), where exactly that collision
+/// silently overwrote the first migration's tracking row and left the chain
+/// walk reading a parent that no longer matched.
+async fn check_no_id_collision(pool: &PgPool, id: &str, onto: &str) -> Result<()> {
+    let rows = pool
+        .query_typed(
+            r#"SELECT (onto) AS result FROM _pylon."Migrations" WHERE id = $1"#,
+            &[DecodedValue::Str(id.to_string())],
+            pool.types(),
+        )
+        .await?;
+    if let Some(DecodedValue::Str(existing_onto)) = rows.into_iter().next()
+        && existing_onto != onto
+    {
+        return Err(MigrateError::IdCollision {
+            id: id.to_string(),
+            recorded_onto: existing_onto,
+            new_onto: onto.to_string(),
+        });
+    }
+    Ok(())
+}
 
 fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<DecodedValue> {
     vec![
@@ -282,6 +311,7 @@ fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<DecodedVal
 /// constituent IDs are already applied under the old chain: no DDL to run,
 /// just mark it applied so future `apply` runs see it as done).
 pub async fn record_applied(pool: &PgPool, id: &str, onto: &str, filename: &str) -> Result<()> {
+    check_no_id_collision(pool, id, onto).await?;
     pool.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename))
         .await?;
     Ok(())
@@ -426,6 +456,9 @@ const DEV_SAVEPOINT: &str = "pylon_dev";
 /// normally.
 pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Result<()> {
     verify_integrity(m)?;
+    // Checked up front rather than at the `record_applied` at the end, so a
+    // colliding ID is rejected before any of this migration's DDL runs.
+    check_no_id_collision(pool, &m.id, &m.onto).await?;
 
     let steps = parse_steps(&m.body);
     let resume_from = read_progress(pool, &m.id).await?.map(|i| i + 1).unwrap_or(0) as usize;

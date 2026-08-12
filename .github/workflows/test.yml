@@ -29,6 +29,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --exclude pylon-py --all-targets -- -D warnings
 
+      # pylon-py can't be *linked* without maturin, but it can be type-checked,
+      # and it must be: it's the only consumer of several pylon-core and
+      # pylon-pgcon APIs, so excluding it entirely lets a signature change
+      # break the Python extension with nothing in CI noticing.
+      - name: cargo clippy (pylon-py)
+        run: cargo clippy -p pylon-py --lib -- -D warnings
+
       - name: cargo fmt
         run: cargo fmt --check
 

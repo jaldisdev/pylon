@@ -40,8 +40,8 @@ pub(crate) async fn fetch(pool: &pylon_pgcon::PgPool) -> Result<SchemaDescriptor
         .await
         .map_err(|e| match e {
             pylon_core::migrate::MigrateError::Db(e) => Error::Db(e),
-            pylon_core::migrate::MigrateError::Integrity(e) => {
-                unreachable!("read_schema_snapshot never returns a migration-integrity error: {e}")
+            other => {
+                unreachable!("read_schema_snapshot only ever fails on the database: {other}")
             }
         })?
         .ok_or(Error::NoSchemaSnapshot)?;

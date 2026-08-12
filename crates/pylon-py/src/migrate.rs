@@ -38,6 +38,9 @@ fn migrate_err(err: core_migrate::MigrateError) -> PyErr {
     match err {
         core_migrate::MigrateError::Integrity(e) => pyo3::exceptions::PyValueError::new_err(e.to_string()),
         core_migrate::MigrateError::Db(e) => pgcon_err(e),
+        // Two migrations sharing one ID is a broken migration set, not a
+        // database fault — same class as an integrity mismatch.
+        e @ core_migrate::MigrateError::IdCollision { .. } => pyo3::exceptions::PyValueError::new_err(e.to_string()),
     }
 }
 
