@@ -2737,6 +2737,16 @@ fn resolve_default(p: &crate::schema::PropertyDescriptor, schema: &SchemaDescrip
     None
 }
 
+/// Test-only accessor so `export` can assert its DDL matches what a
+/// migration would produce for the same property.
+#[cfg(test)]
+pub(crate) fn resolve_default_for_test(
+    p: &crate::schema::PropertyDescriptor,
+    schema: &SchemaDescriptor,
+) -> Option<String> {
+    resolve_default(p, schema)
+}
+
 fn resolve_link_default(l: &crate::schema::LinkDescriptor, schema: &SchemaDescriptor) -> Option<String> {
     if let Some(pyql) = &l.default_pyql {
         return crate::ir::compile_scalar_default(pyql, schema).ok();

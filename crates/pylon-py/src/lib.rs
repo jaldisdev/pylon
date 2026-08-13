@@ -1624,6 +1624,14 @@ impl CompiledQuery {
         pyo3::types::PyList::new(py, &self.inner.tags).unwrap()
     }
 
+    /// True when executing this statement writes to any of `tags` — including
+    /// DML hidden inside a `WITH` binding, a `FOR` body, or a select over a
+    /// DML source.
+    #[getter]
+    fn mutates(&self) -> bool {
+        self.inner.mutates
+    }
+
     /// Returns an `InferencePlan` dict if this query requires a pre-execution model call,
     /// or `None` for pure-SQL queries. The dict always has a `"kind"` key: `"search"` or `"embedding"`.
     #[getter]
@@ -1723,6 +1731,65 @@ fn validate_schema_types(schema: &SchemaDescriptor) -> PyResult<()> {
 #[pyfunction]
 fn export_stdlib() -> String {
     core::stdlib::export_stdlib()
+}
+
+/// Machine-readable view of the stdlib registry, one entry per overload.
+///
+/// `export_stdlib()` above emits installable DDL; this emits the *metadata*
+/// the Python `std`/`math`/`cal` namespaces need to validate calls before a
+/// query ever reaches the compiler (see `pylon.stdlib`).
+///
+/// `namespaces` filters the result — the extension-backed namespaces
+/// (`postgis` alone is several thousand overloads) are opt-in so the common
+/// case doesn't pay to materialize them.
+#[pyfunction]
+#[pyo3(signature = (namespaces = None))]
+fn stdlib_registry<'py>(
+    py: Python<'py>,
+    namespaces: Option<Vec<String>>,
+) -> PyResult<pyo3::Bound<'py, pyo3::types::PyList>> {
+    use pyo3::types::{PyDict, PyList};
+
+    let wanted = namespaces.unwrap_or_else(|| vec!["std".into(), "math".into(), "cal".into(), "sys".into()]);
+    let items: Vec<_> = core::stdlib::registry()
+        .iter()
+        .filter(|d| wanted.iter().any(|n| n == d.namespace))
+        .map(|d| -> PyResult<_> {
+            let params = PyList::new(
+                py,
+                d.params
+                    .iter()
+                    .map(|p| -> PyResult<_> {
+                        let pd = PyDict::new(py);
+                        pd.set_item("name", p.name)?;
+                        pd.set_item("type", p.ty.pyql_name())?;
+                        pd.set_item("variadic", p.variadic)?;
+                        Ok(pd)
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+
+            let e = PyDict::new(py);
+            e.set_item("namespace", d.namespace)?;
+            e.set_item("name", d.name)?;
+            e.set_item("qualified_name", format!("{}::{}", d.namespace, d.name))?;
+            e.set_item("params", params)?;
+            e.set_item("return_type", d.return_type.pyql_name())?;
+            e.set_item("volatility", d.volatility.as_str())?;
+            e.set_item("cast_target", d.cast_target)?;
+            // Pre-computed rather than left for Python to infer from the type
+            // strings — these three drive the context gate (a default wants
+            // volatile but rejects aggregates; a filter is the reverse), and
+            // re-parsing "set<...>" out of a rendered name would be fragile.
+            e.set_item("aggregate", d.is_aggregate())?;
+            e.set_item("returns_set", d.returns_set())?;
+            e.set_item("intrinsic", d.is_intrinsic())?;
+            e.set_item("variadic", d.is_variadic())?;
+            Ok(e)
+        })
+        .collect::<PyResult<_>>()?;
+
+    PyList::new(py, items)
 }
 
 // ── Migration ─────────────────────────────────────────────────────────────────
@@ -2522,6 +2589,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(validate_schema_types, m)?)?;
     m.add_function(wrap_pyfunction!(export_stdlib, m)?)?;
+    m.add_function(wrap_pyfunction!(stdlib_registry, m)?)?;
 
     // Migration
     m.add_class::<MigrationFile>()?;

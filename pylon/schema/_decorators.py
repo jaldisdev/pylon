@@ -313,8 +313,22 @@ def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None
             continue
 
         if meta.kind == 'multilink':
-            # Always an empty list at construction time; the query populates it.
-            setattr(cls, name, dataclasses.field(default_factory=list))
+            # Always empty at construction time; the query populates it. A
+            # LinkSet rather than a plain list so `+=`/`-=` on a new instance
+            # are recorded the same way they are on a fetched one — it is a
+            # list subclass, so it behaves like one everywhere else.
+            #
+            # The pointer is bound in so `LinkSet.add()` can check link
+            # property names against the junction as they're written. `meta`
+            # is bound via a default argument rather than a closure, which
+            # would capture the loop variable and give every field the last
+            # pointer's metadata.
+            from pylon.datatypes import LinkSet
+
+            def _new_link_set(_meta=meta):
+                return LinkSet(pointer=_meta)
+
+            setattr(cls, name, dataclasses.field(default_factory=_new_link_set))
             continue
 
         if meta.default_factory is not MISSING:

@@ -129,33 +129,74 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
-                let prefix = emit_cte_prefix(&ir.ctes);
-                o.sql = format!("{}{}", prefix, o.sql);
+                // The statement emitter may already have opened a `WITH` of
+                // its own (multi-link/junction assignment, FOR-loop insert);
+                // a second one is invalid SQL, so merge into it.
+                o.sql = merge_into_existing_with(&o.sql, &emit_user_cte_parts(&ir.ctes))
+                    .unwrap_or_else(|| format!("{}{}", emit_cte_prefix(&ir.ctes), o.sql));
             }
             o
         }
     };
 
-    // Prepend global CTEs — merged into the existing WITH clause if present.
-    // Two conventions produce a top-level WITH prefix: `emit_cte_prefix`'s
-    // "WITH\n<parts>\n" (used whenever `ir.ctes` is non-empty) and the
-    // inline "WITH <parts>\n" (space, no newline) built directly by a few
-    // statement emitters (e.g. emit_update_stmt's enqueue branch). Both are
-    // exactly 5 bytes before the CTE parts start, so the same slice works
-    // for either — but checking only one (as this used to) means a query
-    // with both user-defined CTEs *and* a global CTE gets a second, stray
-    // `WITH` keyword prepended instead of being merged into the first.
     if !ir.global_ctes.is_empty() {
         let global_parts = emit_global_cte_parts(&ir.global_ctes);
-        let global_str = global_parts.join(",\n     ");
-        if out.sql.starts_with("WITH\n") || out.sql.starts_with("WITH ") {
-            out.sql = format!("WITH {},\n     {}", global_str, &out.sql[5..]);
-        } else {
-            out.sql = format!("WITH {}\n{}", global_str, out.sql);
-        }
+        out.sql = merge_into_existing_with(&out.sql, &global_parts)
+            .unwrap_or_else(|| format!("WITH {}\n{}", global_parts.join(",\n     "), out.sql));
     }
 
     out
+}
+
+/// Merge CTE definitions into a statement that already opens with a top-level
+/// `WITH`, or `None` when it doesn't (the caller then builds a fresh prefix in
+/// its own format).
+///
+/// SQL allows exactly one `WITH` per statement, but CTE parts arrive from
+/// several independent places: a user-written `with` block (`ir.ctes`),
+/// globals (`ir.global_ctes`), and the CTEs some statement emitters build for
+/// themselves — a multi-link or junction-backed link assignment needs
+/// `_w__ids`/`_w__ml_add_*`, and the `FOR`-loop insert path needs its VALUES
+/// alias. Whichever runs second has to merge; blindly prefixing produces
+/// `WITH ... WITH ...`, which PostgreSQL rejects with `syntax error at or
+/// near "WITH"` — and only at execution time, since the PyQL compiles fine.
+///
+/// The merged-in parts go *first*: a non-recursive CTE may only reference
+/// siblings declared before it, and the parts already present are the ones
+/// that reference what's being added (a statement's own CTEs consume the user
+/// binding they were built from).
+///
+/// Two prefix spellings occur — `emit_cte_prefix`'s `"WITH\n"` and the inline
+/// `"WITH "` built by individual emitters. Both are 5 bytes before the parts
+/// begin, so one slice covers either.
+/// The array operand for `= ANY(...)` / `<> ALL(...)`.
+///
+/// `x in std::array_unpack(arr)` is the documented way to test membership of
+/// an array parameter, but `array_unpack` emits `unnest()`, and nesting that
+/// inside `ANY` gives `ANY(unnest(arr))` — a set-returning function in
+/// `WHERE`, which PostgreSQL rejects (`set-returning functions are not
+/// allowed in WHERE`). `ANY` already takes an array, so the `unnest` is both
+/// redundant and invalid: pass its argument straight through.
+///
+/// Falls back to the pre-rendered form for anything else, including
+/// `unnest()` reached by some route other than a direct `array_unpack` call.
+fn unwrap_unnest_for_any(right: &IrExpr, rendered: &str) -> String {
+    if let IrExpr::FunctionCall(call) = right
+        && call.schema.is_none()
+        && call.name == "unnest"
+        && call.sql_template.is_none()
+        && call.args.len() == 1
+    {
+        return emit_expr(&call.args[0]);
+    }
+    rendered.to_string()
+}
+
+fn merge_into_existing_with(sql: &str, parts: &[String]) -> Option<String> {
+    if parts.is_empty() || !(sql.starts_with("WITH\n") || sql.starts_with("WITH ")) {
+        return None;
+    }
+    Some(format!("WITH {},\n     {}", parts.join(",\n     "), &sql[5..]))
 }
 
 // ── Identifier / literal helpers ────────────────────────────────────────────
@@ -2890,8 +2931,13 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 BinOpKind::Ilike => format!("({} ILIKE {})", l, r),
                 BinOpKind::NotLike => format!("({} NOT LIKE {})", l, r),
                 BinOpKind::NotIlike => format!("({} NOT ILIKE {})", l, r),
-                BinOpKind::In => format!("({} = ANY({}))", l, r),
-                BinOpKind::NotIn => format!("({} <> ALL({}))", l, r),
+                // `ANY`/`ALL` take the array directly, so unwrap a
+                // right-hand `std::array_unpack` rather than emitting its
+                // `unnest()` — a set-returning function is not allowed in
+                // `WHERE`, and PostgreSQL rejects it at execution time even
+                // though the PyQL and the SQL both look fine.
+                BinOpKind::In => format!("({} = ANY({}))", l, unwrap_unnest_for_any(&op.right, &r)),
+                BinOpKind::NotIn => format!("({} <> ALL({}))", l, unwrap_unnest_for_any(&op.right, &r)),
                 BinOpKind::Coalesce => format!("COALESCE({}, {})", l, r),
                 BinOpKind::Concat => format!("({} || {})", l, r),
             }
@@ -4073,6 +4119,42 @@ mod tests {
         assert!(out.sql.contains("= ANY(ARRAY['Carol', 'Bob'])"), "got:\n{}", out.sql);
     }
 
+    /// `x IN std::array_unpack(arr)` is the documented way to test membership
+    /// of an array parameter. It used to emit `= ANY(unnest(arr))` — a
+    /// set-returning function inside `WHERE`, which PostgreSQL rejects at
+    /// execution time (`set-returning functions are not allowed in WHERE`)
+    /// even though both the PyQL and the SQL parse cleanly. `ANY` takes the
+    /// array directly, so the `unnest` has to go.
+    #[test]
+    fn test_filter_in_array_unpack_passes_the_array_straight_to_any() {
+        let out = compile_and_emit("SELECT Person { name } FILTER .name IN std::array_unpack(<array<str>>$names)");
+        assert!(
+            !out.sql.contains("ANY(unnest("),
+            "unnest inside ANY is invalid in WHERE:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("= ANY("), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_filter_not_in_array_unpack_passes_the_array_straight_to_all() {
+        let out = compile_and_emit("SELECT Person { name } FILTER .name NOT IN std::array_unpack(<array<str>>$names)");
+        assert!(
+            !out.sql.contains("ALL(unnest("),
+            "unnest inside ALL is invalid in WHERE:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("<> ALL("), "got:\n{}", out.sql);
+    }
+
+    /// A bare `array_unpack` outside `IN` still has to unnest — the unwrap is
+    /// specific to `ANY`/`ALL`, which take an array rather than a set.
+    #[test]
+    fn test_array_unpack_outside_in_still_unnests() {
+        let out = compile_and_emit("SELECT std::array_unpack(<array<str>>$names)");
+        assert!(out.sql.contains("unnest("), "got:\n{}", out.sql);
+    }
+
     #[test]
     fn test_filter_not_in_set_literal_compiles_to_all_array() {
         let out = compile_and_emit("SELECT Person { name } FILTER .name NOT IN {'Carol'}");
@@ -4858,6 +4940,37 @@ mod tests {
             "must be a single flat top-level WITH block:\n{}",
             out.sql
         );
+    }
+
+    /// A user `with` binding *consumed by* a statement that builds CTEs of
+    /// its own. The binding is emitted by the generic `ir.ctes` path while
+    /// the multi-link/junction machinery has already opened its own `WITH`;
+    /// prefixing a second one produced `WITH ... WITH ...`, which compiles
+    /// cleanly and then fails at execution with `syntax error at or near
+    /// "WITH"`. Covers both link kinds, since each reaches the junction
+    /// emitter by a different route.
+    #[test]
+    fn test_user_with_binding_merges_into_a_statements_own_ctes() {
+        let schema = make_schema_with_through_and_prop();
+        for query in [
+            "with t := (select Tag filter .id = $tid) insert Product { name := $name, tags := t }",
+            "with t := (select Tag filter .id = $tid) \
+             update Product filter .name = $name set { tags += t }",
+        ] {
+            let out = compile_and_emit_with(query, &schema);
+            let flat: String = out.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !flat.contains(") WITH "),
+                "a second WITH clause is invalid SQL:\n{}",
+                out.sql
+            );
+            assert_eq!(
+                out.sql.matches("WITH").count(),
+                1,
+                "exactly one WITH keyword expected:\n{}",
+                out.sql
+            );
+        }
     }
 
     #[test]

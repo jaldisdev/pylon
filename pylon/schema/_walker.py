@@ -642,6 +642,8 @@ def _make_default_sql(meta: Any) -> str | None:
     """Return a SQL literal/expression for the property's default, or None."""
     import decimal as _decimal
 
+    from pylon.modelquery import _Node
+
     from ._constraints import Default, _NowType, _SequenceNextType
 
     for c in meta.constraints:
@@ -651,7 +653,7 @@ def _make_default_sql(meta: Any) -> str | None:
                 return 'now()'
             if isinstance(s, _SequenceNextType):
                 return None  # handled separately in _make_property_desc
-            if isinstance(s, str):
+            if isinstance(s, (str, _Node)):
                 return None  # PyQL expression — handled by _make_default_pyql
             if s is None:
                 return 'NULL'
@@ -660,7 +662,11 @@ def _make_default_sql(meta: Any) -> str | None:
                 return 'true' if s else 'false'
             if isinstance(s, (int, float, _decimal.Decimal)):
                 return str(s)
-            return None  # unknown sentinel
+            # Anything else is unrepresentable as SQL. Reported by
+            # `_make_default_pyql`, which sees the same sentinel and is the
+            # one place that can tell "no default here" from "a default that
+            # silently produced nothing".
+            return None
 
     if meta.default is not MISSING and meta.default is not None:
         return _python_value_to_sql(meta.default)
@@ -669,12 +675,39 @@ def _make_default_sql(meta: Any) -> str | None:
 
 
 def _make_default_pyql(meta: Any) -> str | None:
-    """Return a PyQL expression string from Default(str), or None."""
-    from ._constraints import Default
+    """Return a PyQL expression string for `Default(...)`, or None.
+
+    Accepts both the string form (`Default('std::uuid_generate_v7()')`) and
+    an expression built from the `std` namespace
+    (`Default(std.uuid_generate_v7())`), which renders to the same text.
+
+    A sentinel this function can't turn into PyQL *and* that
+    `_make_default_sql` couldn't turn into SQL used to fall through both and
+    emit no default at all — silently, so the column just had no default and
+    nothing said why. Such a sentinel now raises instead.
+    """
+    import decimal as _decimal
+
+    from pylon.modelquery import _Node, render_default_expr
+
+    from ._constraints import Default, _NowType, _SequenceNextType
 
     for c in meta.constraints:
-        if isinstance(c, Default) and isinstance(c.sentinel, str):
-            return c.sentinel
+        if not isinstance(c, Default):
+            continue
+        s = c.sentinel
+        if isinstance(s, str):
+            return s
+        if isinstance(s, _Node):
+            return render_default_expr(s)
+        # Everything `_make_default_sql` handles on the SQL side.
+        if s is None or isinstance(s, (_NowType, _SequenceNextType, bool, int, float, _decimal.Decimal)):
+            return None
+        raise TypeError(
+            f'Default({s!r}) is not a supported default for {meta.name!r} — pass a literal value, '
+            'a PyQL expression string, or a `std`/`math`/`cal` expression such as '
+            'Default(std.uuid_generate_v7())'
+        )
 
     return None
 

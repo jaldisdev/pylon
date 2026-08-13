@@ -129,13 +129,20 @@ fn render_function(desc: &FnDescriptor, def: &PylonFnDef) -> String {
     let volatility = match def.volatility {
         FnVolatility::Immutable => "IMMUTABLE",
         FnVolatility::Stable => "STABLE",
+        FnVolatility::Volatile | FnVolatility::Modifying => "VOLATILE",
+    };
+    // A function that writes (sequence advance/reset) can't run in a parallel
+    // worker — PostgreSQL rejects the plan rather than degrading gracefully.
+    let parallel = match def.volatility {
+        FnVolatility::Modifying => "PARALLEL UNSAFE",
+        _ => "PARALLEL SAFE",
     };
     let strict = if def.strict { " STRICT" } else { "" };
 
     format!(
         "CREATE OR REPLACE FUNCTION _pylon.{name}({params})\n\
          \tRETURNS {returns}\n\
-         \tLANGUAGE {lang} {volatility} PARALLEL SAFE{strict}\n\
+         \tLANGUAGE {lang} {volatility} {parallel}{strict}\n\
          AS $$\n\
          {body}\n\
          $$;\n",

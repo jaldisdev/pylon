@@ -241,11 +241,25 @@ fn emit_tables(schema: &SchemaDescriptor, out: &mut String) {
         if t.abstract_ || t.junction {
             continue;
         }
-        emit_one_table(t, out);
+        emit_one_table(t, Some(schema), out);
     }
 }
 
-fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
+/// The effective SQL DEFAULT for a property.
+///
+/// `default_sql` is used as-is; a `default_pyql` expression
+/// (`Default(std.uuid_generate_v7())`) is compiled through the same IR
+/// compiler the migration path uses, so `export_schema` and `pylon migrate`
+/// can't disagree about what a column's default is.
+fn column_default(p: &crate::schema::PropertyDescriptor, schema: Option<&SchemaDescriptor>) -> Option<String> {
+    if let Some(sql) = &p.default_sql {
+        return Some(sql.clone());
+    }
+    let pyql = p.default_pyql.as_deref()?;
+    crate::ir::compile_scalar_default(pyql, schema?).ok()
+}
+
+fn emit_one_table(t: &TypeDescriptor, schema: Option<&SchemaDescriptor>, out: &mut String) {
     out.push_str(&format!("CREATE TABLE {} (\n", qn(&t.module, &t.table)));
 
     let mut lines: Vec<String> = Vec::new();
@@ -253,9 +267,7 @@ fn emit_one_table(t: &TypeDescriptor, out: &mut String) {
     // Property columns
     for p in &t.properties {
         let not_null = if p.nullable { "" } else { " NOT NULL" };
-        let default = p
-            .default_sql
-            .as_deref()
+        let default = column_default(p, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
         let col_type = p
@@ -2116,10 +2128,59 @@ mod tests {
     #[test]
     fn test_emit_one_table_includes_cache_invalidate_trigger() {
         let mut out = String::new();
-        emit_one_table(&person_type(), &mut out);
+        emit_one_table(&person_type(), None, &mut out);
         assert!(
             out.contains("CREATE OR REPLACE TRIGGER pylon_cache_invalidate\n    AFTER INSERT OR UPDATE OR DELETE ON \"public\".\"Person\""),
             "got:\n{out}"
+        );
+    }
+
+    /// A `default_pyql` expression has to reach the emitted DDL. It didn't
+    /// before: this generator read only `default_sql`, so a
+    /// `Default(std::uuid_generate_v7())` was stored, type-checked, and then
+    /// silently dropped — while the migration path (`diff::resolve_default`)
+    /// compiled it correctly. Two generators disagreeing about the same
+    /// schema is worse than either behaviour alone, so they're pinned
+    /// together here.
+    #[test]
+    fn test_emit_table_compiles_a_pyql_default() {
+        let mut td = person_type();
+        td.properties[1].default_sql = None;
+        td.properties[1].default_pyql = Some("std::uuid_generate_v7()".into());
+        td.properties[1].pg_type = "uuid".into();
+
+        let schema = SchemaDescriptor {
+            types: vec![td.clone()],
+            ..minimal_schema(vec![])
+        };
+
+        let mut out = String::new();
+        emit_one_table(&td, Some(&schema), &mut out);
+        assert!(
+            out.contains("\"age\" uuid NULL DEFAULT uuidv7()") || out.contains("DEFAULT uuidv7()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_export_and_migration_agree_on_a_pyql_default() {
+        let mut td = person_type();
+        td.properties[1].default_sql = None;
+        td.properties[1].default_pyql = Some("std::uuid_generate_v7()".into());
+        td.properties[1].pg_type = "uuid".into();
+        let schema = SchemaDescriptor {
+            types: vec![td.clone()],
+            ..minimal_schema(vec![])
+        };
+
+        let mut out = String::new();
+        emit_one_table(&td, Some(&schema), &mut out);
+        let from_migration = crate::diff::resolve_default_for_test(&td.properties[1], &schema);
+
+        assert_eq!(from_migration.as_deref(), Some("uuidv7()"));
+        assert!(
+            out.contains(&format!("DEFAULT {}", from_migration.unwrap())),
+            "export DDL disagrees with the migration path:\n{out}"
         );
     }
 

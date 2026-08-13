@@ -43,6 +43,8 @@ The query language. Read [`pyql/index.md`](pyql/index.md) first, then:
 
 Built-in functions callable from PyQL, grouped by namespace. See [`stdlib/index.md`](stdlib/index.md), then the per-namespace reference: [`std`](stdlib/std.md), [`math`](stdlib/math.md), [`cal`](stdlib/cal.md), [`sys`](stdlib/sys.md), [`pgvector`](stdlib/pgvector.md), [`crypto`](stdlib/crypto.md), [`postgis`](stdlib/postgis.md).
 
+The same functions are reachable from Python as `from pylon import std` — see [Model API § The `std` namespace](client/model-api.md#the-std-namespace).
+
 ## Operating Pylon
 
 - **[`pylon.toml` configuration](config.md)** — every config key, CLI/env/file precedence

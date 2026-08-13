@@ -23,6 +23,13 @@ from .config import Config, DatabaseConfig, ModelConfig, SearchConfig, UiConfig,
 from .datatypes import Object
 from .exceptions import PylonError
 
+# ── PyQL stdlib namespaces ─────────────────────────────────────────────────────
+# `from pylon import std` — usable both in query-builder expressions
+# (`User.filter(lambda u: std.ilike(u.name, '%bob%'))`) and as a pointer
+# default (`Default(std.uuid_generate_v7())`). `math` deliberately shadows
+# nothing: it is only ever reached via this import, never as a bare name.
+from .namespaces import cal, math, std, sys
+
 # ── Schema decorators ──────────────────────────────────────────────────────────
 # ── Schema base types & introspection ─────────────────────────────────────────
 # ── Pointer annotations ────────────────────────────────────────────────────────
@@ -214,6 +221,8 @@ __all__ = [
     'WebserverConfig',
     # Schema — decorators
     'abstract',
+    # PyQL stdlib namespaces
+    'cal',
     'collect_module_globals',
     'create_async_client',
     'enum',
@@ -223,8 +232,11 @@ __all__ = [
     'interface',
     'junction',
     'lazy',
+    'math',
     'named_tuple',
     'scalar',
     'signal',
+    'std',
+    'sys',
     'type',
 ]

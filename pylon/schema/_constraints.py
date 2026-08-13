@@ -60,11 +60,23 @@ SequenceNext = _SequenceNextType()
 
 
 class Default(_PointerConstraint):
-    """Server-side default. Only Default(Now) is supported in the initial spec.
+    """Server-side default.
 
     At the Python level the pointer is optional and defaults to None; the DDL
-    generator emits DEFAULT NOW() (or the appropriate expression) in the column
-    definition.
+    generator emits the corresponding expression in the column definition.
+
+    Accepts:
+
+    * a sentinel — ``Default(Now)``, ``Default(SequenceNext)``
+    * a literal — ``Default(0)``, ``Default('draft')``, ``Default(False)``
+    * a PyQL expression string — ``Default('std::uuid_generate_v7()')``
+    * a ``std``/``math``/``cal`` expression —
+      ``Default(std.uuid_generate_v7())``
+
+    The last form is checked when the schema is walked: unknown functions and
+    wrong argument counts are rejected there, and so are functions that can't
+    work as a default at all (an aggregate has no set to aggregate over, and a
+    set-returning call can't produce the single value a column needs).
     """
 
     def __init__(self, sentinel: object) -> None:

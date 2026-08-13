@@ -51,6 +51,14 @@ await client.execute("update Person filter .id = <uuid>$id set { age := .age + 1
 
 A result row for a shaped object comes back as a real instance of the corresponding `@pylon.type` Python class, with nested shapes hydrated recursively — not a plain dict.
 
+`query()` and `execute()` also accept a `@pylon.type` class or a `Model.filter(...)` set in place of the PyQL string — see the [Model API](model-api.md):
+
+```python
+people = await client.query(Person)
+bobs = await client.query(Person.filter(name='Bob'))
+await client.execute(Person.filter(id=some_id).delete())
+```
+
 ### `analyze`
 
 ```python
@@ -69,6 +77,8 @@ await client.save(post)          # UPDATE — only if something actually changed
 ```
 
 Accepts any number of `@pylon.type` instances and saves them all in one transaction. An instance that was never hydrated from a query result is `INSERT`ed (its generated `id` is written back onto the object); one that *was* hydrated is diffed against the values it was loaded with and only `UPDATE`d if something changed — an unmodified object is skipped entirely, not re-written as a no-op update.
+
+Links are saved too: assign an instance to a single link, and use `+=` / `-=` on a multi-link. Unsaved link targets are written first, so saving the root of an object graph writes the whole graph in the one transaction. Multi-links are replayed from a recorded operation log rather than diffed, since `+=` on an already-linked member is a server-side no-op and so leaves no state change to diff. See [Model API § Links](model-api.md#links).
 
 ## `listen`
 

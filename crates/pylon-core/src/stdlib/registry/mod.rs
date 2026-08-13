@@ -74,12 +74,25 @@ fn pv(name: &'static str, ty: PylonType) -> Param {
 
 // ── Descriptor helpers ────────────────────────────────────────────────────────
 
+/// Default volatility for a descriptor: a `PylonFunction` already declares
+/// one on its `PylonFnDef`, so mirror it rather than letting the two drift.
+/// Everything else is immutable unless the entry opts out via `.vol(...)` —
+/// the volatile/modifying builtins are a short, explicit list (see
+/// `std_ns`/`crypto_ns`/`sys_ns`).
+fn default_volatility(impl_: &ImplStrategy) -> FnVolatility {
+    match impl_ {
+        ImplStrategy::PylonFunction(def) => def.volatility,
+        _ => FnVolatility::Immutable,
+    }
+}
+
 fn f(ns: &'static str, name: &'static str, params: Vec<Param>, ret: PylonType, impl_: ImplStrategy) -> FnDescriptor {
     FnDescriptor {
         namespace: ns,
         name,
         params,
         return_type: ret,
+        volatility: default_volatility(&impl_),
         impl_strategy: impl_,
         cast_target: false,
     }
@@ -91,8 +104,19 @@ fn fc(ns: &'static str, name: &'static str, params: Vec<Param>, ret: PylonType, 
         name,
         params,
         return_type: ret,
+        volatility: default_volatility(&impl_),
         impl_strategy: impl_,
         cast_target: true,
+    }
+}
+
+impl FnDescriptor {
+    /// Override the derived volatility — for `SqlBuiltin`/`SqlExpression`
+    /// entries that wrap a non-immutable PostgreSQL function and so can't
+    /// have it inferred from a `PylonFnDef`.
+    fn vol(mut self, v: FnVolatility) -> Self {
+        self.volatility = v;
+        self
     }
 }
 

@@ -8,11 +8,29 @@ Most constraints attach inside a `Property[T, ...]`/`Link[T, ...]` annotation. A
 created_at: pylon.Property[pylon.DateTime, pylon.Default(pylon.Now)]
 seq: pylon.Property[pylon.Sequence, pylon.Default(pylon.SequenceNext)]
 score: pylon.Property[pylon.Int64, pylon.Default(0)]
+token: pylon.Property[pylon.UUID, pylon.Default(std.uuid_generate_v7())]
 ```
 
-`Default(Now)` and `Default(SequenceNext)` use the two special sentinels (`pylon.Now`, `pylon.SequenceNext`) that compile to `now()` and `nextval(...)` respectively — the latter only valid on a `pylon.Sequence`-typed property, which additionally provisions a real PostgreSQL `SEQUENCE`. Any other value (a literal, or a PyQL expression string) becomes the column's server-side default, compiled and type-checked the same way a [computed pointer](computed.md) is — see [Validation](validation.md).
+`Default(Now)` and `Default(SequenceNext)` use the two special sentinels (`pylon.Now`, `pylon.SequenceNext`) that compile to `now()` and `nextval(...)` respectively — the latter only valid on a `pylon.Sequence`-typed property, which additionally provisions a real PostgreSQL `SEQUENCE`. Any other value (a literal, or a PyQL expression) becomes the column's server-side default, compiled and type-checked the same way a [computed pointer](computed.md) is — see [Validation](validation.md).
 
 `id` always gets a default (`uuidv7()`) automatically; never declare one yourself.
+
+### Expression defaults
+
+A default can be a [`std`](../client/model-api.md#the-std-namespace) expression, or the equivalent PyQL string:
+
+```python
+from pylon import std
+
+token: pylon.Property[pylon.UUID, pylon.Default(std.uuid_generate_v7())]
+token: pylon.Property[pylon.UUID, pylon.Default('std::uuid_generate_v7()')]   # same thing
+```
+
+Both compile to `DEFAULT uuidv7()`. The object form is checked as you write it — an unknown function or a wrong argument count fails at schema-declaration time, and so does a function that can't work as a default at all: an aggregate has no set to aggregate over, and a set-returning call can't produce the single value a column needs. Volatile functions are exactly what you want here (`std.uuid_generate_v7()`, `std.datetime_current()`).
+
+> **A bare string is a PyQL expression, not a string literal.** `Default('draft')` compiles `draft` as PyQL — an identifier, not the text `"draft"`. For a literal string default, quote it inside the string: `Default("'draft'")`.
+
+A value that is neither a sentinel, a literal, nor a valid expression now raises at declaration time. It used to fall through both paths and emit no default at all, silently.
 
 ## `Exclusive`
 

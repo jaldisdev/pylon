@@ -122,6 +122,37 @@ def _decode_json_tuple(value: Any, node: dict, registry: dict[str, type]) -> Any
     return NamedTupleValue(**kwargs)
 
 
+def _install_link_sets(obj: Any, cls: type, kwargs: dict) -> None:
+    """Give every multi-link on a freshly decoded instance a `LinkSet`.
+
+    A multi-link that *was* requested in the shape gets a hydrated one
+    wrapping the decoded members. One that wasn't gets an unhydrated
+    placeholder rather than being left absent: reading it should say "this
+    wasn't fetched" instead of raising a bare `AttributeError`, and `+=`/`-=`
+    should still work on it, since PyQL applies those server-side without
+    needing the current members.
+
+    Multi-links are excluded from `__pylon_saved__` — they are tracked by the
+    LinkSet's own op log, not by diffing (see `pylon.datatypes.LinkSet`).
+    """
+    from pylon.datatypes import LinkSet
+
+    cfg = getattr(cls, '__pylon_config__', None)
+    if cfg is None:
+        return
+
+    saved = obj.__dict__.get('__pylon_saved__')
+    for name, meta in cfg.pointers.items():
+        if meta.kind != 'multilink':
+            continue
+        if name in kwargs:
+            obj.__dict__[name] = LinkSet(kwargs[name] or (), pointer=meta)
+        else:
+            obj.__dict__[name] = LinkSet(unhydrated=True, pointer=meta)
+        if saved is not None:
+            saved.pop(name, None)
+
+
 def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
     kind = node['kind']
 
@@ -168,6 +199,7 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
                 # Client.save() diff current vs. persisted state instead of
                 # intercepting every __setattr__ (see pylon.modelquery).
                 obj.__dict__['__pylon_saved__'] = dict(kwargs)
+                _install_link_sets(obj, cls, kwargs)
                 return obj
         return kwargs
 

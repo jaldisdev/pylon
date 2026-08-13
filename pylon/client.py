@@ -117,6 +117,12 @@ class AsyncTransaction:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         await self._tx.execute_compiled(compiled, params)
+        # A write inside a transaction still evicts immediately: the cache is
+        # never populated from inside a transaction, so an aborted attempt can
+        # only over-evict, which costs a re-read and never serves stale data.
+        from pylon import cache as _cache
+
+        _cache.invalidate_for(compiled)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -360,6 +366,9 @@ class Client:
         rows = await pool.query_compiled(compiled, params)
         records = [{'result': row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
+        # `client.query("insert ... ")` is a normal way to insert and read the
+        # row back, so a read path can be a write path too.
+        _cache.invalidate_for(compiled)
         return _hydrate(records, compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
@@ -390,6 +399,7 @@ class Client:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
         records = [{'result': row} for row in rows]
         _cache.put(compiled, params, records, self._config.cache)
+        _cache.invalidate_for(compiled)
         if not records:
             return None
         return _hydrate(records, compiled)[0]
@@ -410,6 +420,9 @@ class Client:
         pool = self._require_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         await pool.execute_compiled(compiled, params)
+        from pylon import cache as _cache
+
+        _cache.invalidate_for(compiled)
 
     async def listen(self, channel: str) -> AsyncGenerator[Any]:
         """Listen for `NOTIFY` payloads on a schema-declared `Channel`.
@@ -476,6 +489,7 @@ class Client:
         rows = await pool.query_compiled_json_agg(compiled, params)
         value = rows[0] if rows else '[]'
         _cache.put_json(compiled, params, value, self._config.cache, kind='json_all')
+        _cache.invalidate_for(compiled)
         return value
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
@@ -498,10 +512,12 @@ class Client:
             raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:
             _cache.put_json(compiled, params, None, self._config.cache, kind='json_single')
+            _cache.invalidate_for(compiled)
             return None
         json_rows = await pool.query_compiled_row_to_json(compiled, params)
         value = json_rows[0] if json_rows else None
         _cache.put_json(compiled, params, value, self._config.cache, kind='json_single')
+        _cache.invalidate_for(compiled)
         return value
 
     async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
@@ -556,26 +572,49 @@ class Client:
         # a rolled-back attempt that reruns this same body) see a diff of
         # zero for objects it already "saved" on the failed attempt, and
         # silently skip re-issuing their INSERT/UPDATE.
-        async for tx in self.transaction():
-            async with tx:
-                for obj in objs:
-                    prepared = modelquery.prepare_save(obj)
-                    if prepared is None:
-                        continue
-                    pyql, params = prepared
-                    is_new = '__pylon_saved__' not in obj.__dict__
-                    if is_new:
-                        result = await tx.query_single(pyql, **params)
-                        obj.id = result.id
-                    else:
-                        await tx.execute(pyql, **params)
-        for obj in objs:
-            cfg = type(obj).__pylon_config__
-            obj.__dict__['__pylon_saved__'] = {
-                name: obj.__dict__[name]
-                for name, meta in cfg.pointers.items()
-                if meta.kind == 'property' and name in obj.__dict__
-            }
+        # Unsaved link targets are written before the objects that reference
+        # them, so constructing a graph and saving the root writes the whole
+        # graph. See `modelquery.save_order` for why these stay separate
+        # statements rather than one composed statement.
+        ordered = modelquery.save_order(objs)
+
+        # Generated ids *are* assigned inside the transaction, because a
+        # later statement in the same attempt needs them to reference the
+        # rows earlier statements just wrote. That makes them attempt-local
+        # state: an id from a rolled-back attempt names a row that doesn't
+        # exist, and leaving it in place would make the next attempt render
+        # `insert T { id := <that id>, ... }` — which is rejected outright
+        # unless `allow_user_specified_id` is on, turning a retryable
+        # serialization failure into a hard error. So they're cleared at the
+        # start of every attempt, and again if the whole save gives up.
+        pending_inserts = [obj for obj in ordered if obj.__dict__.get('id') is None]
+
+        def _discard_generated_ids() -> None:
+            for obj in pending_inserts:
+                obj.__dict__['id'] = None
+
+        try:
+            async for tx in self.transaction():
+                _discard_generated_ids()
+                async with tx:
+                    for obj in ordered:
+                        prepared = modelquery.prepare_save(obj)
+                        if prepared is None:
+                            continue
+                        pyql, params = prepared
+                        is_new = '__pylon_saved__' not in obj.__dict__
+                        if is_new:
+                            result = await tx.query_single(pyql, **params)
+                            obj.id = result.id
+                        else:
+                            await tx.execute(pyql, **params)
+        except BaseException:
+            # Nothing committed, so no object should claim a database id.
+            _discard_generated_ids()
+            raise
+
+        for obj in ordered:
+            modelquery.mark_saved(obj)
 
     # ------------------------------------------------------------------
     # Transaction
@@ -940,7 +979,7 @@ async def _install_migrated_schema(pool: PgconPool) -> None:
     `pylon-lsp`'s own graceful-degradation behavior for the same case.
     """
     from pylon._core import SchemaDescriptor, migration_read_schema_snapshot
-    from pylon.exceptions import QueryError
+    from pylon.exceptions import QueryError, SchemaError
     from pylon.query import _set_schema
 
     try:
@@ -949,5 +988,21 @@ async def _install_migrated_schema(pool: PgconPool) -> None:
         if getattr(exc, 'sqlstate', None) == '42P01':  # undefined_table
             return
         raise
-    if snapshot_json is not None:
+    if snapshot_json is None:
+        return
+
+    try:
         _set_schema(SchemaDescriptor.from_json(snapshot_json))
+    except ValueError as exc:
+        # The stored snapshot is written by whichever Pylon last ran
+        # `migration apply`/`watch`. If that was an older version, the JSON
+        # can be missing fields this one requires, and serde reports it as
+        # `missing field 'x' at line 1 column N` — a byte offset into a
+        # blob the reader never sees, with no hint that the fix is to
+        # re-run a migration.
+        raise SchemaError(
+            f'the schema snapshot stored in this database cannot be read by this version of Pylon '
+            f'({exc}). It was written by an older version whose format differs. Re-run '
+            f'`pylon migration apply` (or `pylon migration watch` in development) against this '
+            f'database to rewrite it.'
+        ) from exc

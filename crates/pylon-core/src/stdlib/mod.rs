@@ -68,6 +68,59 @@ pub enum PylonType {
     Tuple(Vec<PylonType>),
 }
 
+impl PylonType {
+    /// PyQL-facing spelling of the type, as a user would write it in a query
+    /// (`str`, `array<int64>`, `range<datetime>`). Distinct from
+    /// `ddl::pg_type`, which renders the PostgreSQL side.
+    pub fn pyql_name(&self) -> String {
+        use PylonType::*;
+        match self {
+            Str => "str".into(),
+            Bool => "bool".into(),
+            Int16 => "int16".into(),
+            Int32 => "int32".into(),
+            Int64 => "int64".into(),
+            Float32 => "float32".into(),
+            Float64 => "float64".into(),
+            Decimal => "decimal".into(),
+            BigInt => "bigint".into(),
+            Uuid => "uuid".into(),
+            Json => "json".into(),
+            Bytes => "bytes".into(),
+            Datetime => "datetime".into(),
+            Duration => "duration".into(),
+            LocalDatetime => "cal::local_datetime".into(),
+            LocalDate => "cal::local_date".into(),
+            LocalTime => "cal::local_time".into(),
+            RelativeDuration => "cal::relative_duration".into(),
+            Vector => "pgvector::vector".into(),
+            Geometry => "postgis::geometry".into(),
+            Geography => "postgis::geography".into(),
+            Box2D => "postgis::box2d".into(),
+            Box3D => "postgis::box3d".into(),
+            Any => "any".into(),
+            AnyOrderable => "anyorderable".into(),
+            AnyPoint => "anypoint".into(),
+            Array(inner) => format!("array<{}>", inner.pyql_name()),
+            Set(inner) => format!("set<{}>", inner.pyql_name()),
+            Optional(inner) => format!("optional<{}>", inner.pyql_name()),
+            Range(inner) => format!("range<{}>", inner.pyql_name()),
+            Multirange(inner) => format!("multirange<{}>", inner.pyql_name()),
+            Tuple(ts) => format!(
+                "tuple<{}>",
+                ts.iter().map(|t| t.pyql_name()).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    /// True for a set-typed position — the marker that distinguishes an
+    /// aggregate parameter (`std::count(set<any>)`) or a set-returning
+    /// result (`std::array_unpack`) from an ordinary scalar one.
+    pub fn is_set(&self) -> bool {
+        matches!(self, PylonType::Set(_))
+    }
+}
+
 // ── PylonFunction definition ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,10 +129,21 @@ pub enum SqlLanguage {
     PlPgSql,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FnVolatility {
+    /// Same arguments always produce the same result — safe anywhere.
     Immutable,
+    /// Result is fixed within a single statement, but may vary between
+    /// statements (session settings, current transaction time).
     Stable,
+    /// Result may differ on every call (`random()`, `uuidv7()`,
+    /// `clock_timestamp()`). Wanted in a pointer default, almost always a
+    /// bug inside a filter predicate.
+    Volatile,
+    /// Volatile *and* side-effecting — advancing or resetting a sequence.
+    /// Never admissible in an expression the caller expects to be a pure
+    /// predicate, since it would fire once per row.
+    Modifying,
 }
 
 /// The SQL definition for one `_pylon` schema function overload.
@@ -148,6 +212,11 @@ pub struct FnDescriptor {
     pub impl_strategy: ImplStrategy,
     /// True when this overload backs a `Function`-strategy type cast entry.
     pub cast_target: bool,
+    /// Call-result stability, independent of `impl_strategy` — a
+    /// `SqlBuiltin` like `uuidv7()` is volatile even though it installs no
+    /// `PylonFnDef` of its own. Consumers gate on this: a pointer default
+    /// *wants* volatile, a filter predicate almost never does.
+    pub volatility: FnVolatility,
 }
 
 // ── Static registry ──────────────────────────────────────────────────────────
@@ -157,6 +226,45 @@ static STDLIB: OnceLock<Vec<FnDescriptor>> = OnceLock::new();
 /// Return the full stdlib registry, initializing it on first call.
 pub fn registry() -> &'static [FnDescriptor] {
     STDLIB.get_or_init(registry::build)
+}
+
+impl FnVolatility {
+    /// Lowercase wire name, as consumed by the Python `std` namespace gate.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FnVolatility::Immutable => "immutable",
+            FnVolatility::Stable => "stable",
+            FnVolatility::Volatile => "volatile",
+            FnVolatility::Modifying => "modifying",
+        }
+    }
+}
+
+impl FnDescriptor {
+    /// True when any parameter is set-typed — i.e. this overload is an
+    /// aggregate and only makes sense over a multilink path or a subquery,
+    /// never over a single scalar pointer.
+    pub fn is_aggregate(&self) -> bool {
+        self.params.iter().any(|p| p.ty.is_set())
+    }
+
+    /// True when the call yields a set rather than a single value
+    /// (`std::array_unpack`) — meaningless inside a filter predicate.
+    pub fn returns_set(&self) -> bool {
+        self.return_type.is_set()
+    }
+
+    /// True for `TranspilerIntrinsic` overloads, which need compile-time type
+    /// context and so can't be validated by arity alone.
+    pub fn is_intrinsic(&self) -> bool {
+        matches!(self.impl_strategy, ImplStrategy::TranspilerIntrinsic(_))
+    }
+
+    /// True when the overload accepts a trailing variadic parameter, so any
+    /// argument count at or above `params.len() - 1` is legal.
+    pub fn is_variadic(&self) -> bool {
+        self.params.last().is_some_and(|p| p.variadic)
+    }
 }
 
 /// Return all overloads for the given namespace + name pair.
@@ -170,4 +278,51 @@ pub fn lookup(namespace: &str, name: &str) -> Vec<&'static FnDescriptor> {
 /// Iterate over every overload that backs a `Function`-strategy cast.
 pub fn cast_targets() -> impl Iterator<Item = &'static FnDescriptor> {
     registry().iter().filter(|f| f.cast_target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Volatility is marked per *overload*, so a multi-overload name is easy
+    /// to half-annotate — `std::sequence_reset` has two, and marking only one
+    /// left the other claiming to be immutable. Callers gate on volatility,
+    /// so a single missed overload is a real hole rather than cosmetic.
+    /// Nothing in the stdlib legitimately varies volatility across overloads
+    /// of one name, so requiring agreement costs nothing and closes the gap.
+    #[test]
+    fn volatility_is_consistent_across_overloads() {
+        let mut seen: HashMap<(&str, &str), FnVolatility> = HashMap::new();
+        for d in registry() {
+            let key = (d.namespace, d.name);
+            match seen.get(&key) {
+                Some(existing) => assert_eq!(
+                    *existing, d.volatility,
+                    "{}::{} declares more than one volatility across its overloads ({:?} vs {:?}) \
+                     — every overload of a name must agree",
+                    d.namespace, d.name, existing, d.volatility,
+                ),
+                None => {
+                    seen.insert(key, d.volatility);
+                }
+            }
+        }
+    }
+
+    /// A `PylonFunction` carries its own volatility for DDL emission; the
+    /// descriptor carries one for the call gate. They describe the same
+    /// function and must not drift apart.
+    #[test]
+    fn descriptor_volatility_matches_pylon_fn_def() {
+        for d in registry() {
+            if let ImplStrategy::PylonFunction(def) = &d.impl_strategy {
+                assert_eq!(
+                    def.volatility, d.volatility,
+                    "{}::{} declares {:?} on its PylonFnDef but {:?} on its descriptor",
+                    d.namespace, d.name, def.volatility, d.volatility,
+                );
+            }
+        }
+    }
 }
