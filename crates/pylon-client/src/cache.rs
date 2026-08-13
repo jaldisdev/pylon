@@ -42,12 +42,28 @@ fn cache_key(kind: &str, sql: &str, params: &[DecodedValue]) -> Result<String> {
     pylon_cache::cache_key(&format!("{kind}\0{sql}"), params).map_err(map_err)
 }
 
+/// Whether a query's result may be served from, or written to, the cache.
+///
+/// A *mutating* statement never may. `client.query("insert Person {...}")`
+/// is a normal way to insert and read the new row back, but its result is
+/// not a function of its inputs: serving a cached one returns a stale id
+/// *and skips the write entirely*, so running the same insert twice
+/// silently produced one row instead of two. Tags alone don't cover this —
+/// a write has tags (the tables it touches), it just must not be cached
+/// under them. Mirrors `pylon/cache.py::_is_cacheable`.
+fn is_cacheable(compiled: &CompiledQuery) -> bool {
+    !compiled.mutates && !compiled.tags.is_empty()
+}
+
 /// Returns cached rows for `compiled`+`params`, or `None` on a cache miss.
 pub(crate) fn get_rows(
     cache: &pylon_cache::Cache,
     compiled: &CompiledQuery,
     params: &[DecodedValue],
 ) -> Result<Option<Vec<DecodedValue>>> {
+    if !is_cacheable(compiled) {
+        return Ok(None);
+    }
     let key = cache_key("rows", &compiled.sql, params)?;
     Ok(cache.get(&key).map_err(map_err)?.map(|entry| entry.rows))
 }
@@ -55,14 +71,14 @@ pub(crate) fn get_rows(
 /// Caches `rows` under a key derived from `compiled`+`params`, tagged with
 /// `compiled.tags` for later invalidation by whatever else is watching
 /// this cache directory. A no-op when there are no tags to key eviction
-/// on — mirrors `pylon/cache.py::put`.
+/// on, or when the statement writes — mirrors `pylon/cache.py::put`.
 pub(crate) fn put_rows(
     cache: &pylon_cache::Cache,
     compiled: &CompiledQuery,
     params: &[DecodedValue],
     rows: &[DecodedValue],
 ) -> Result<()> {
-    if compiled.tags.is_empty() {
+    if !is_cacheable(compiled) {
         return Ok(());
     }
     let key = cache_key("rows", &compiled.sql, params)?;
@@ -79,6 +95,9 @@ pub(crate) fn get_json(
     compiled: &CompiledQuery,
     params: &[DecodedValue],
 ) -> Result<Option<Option<String>>> {
+    if !is_cacheable(compiled) {
+        return Ok(None);
+    }
     let key = cache_key(kind, &compiled.sql, params)?;
     let Some(entry) = cache.get(&key).map_err(map_err)? else {
         return Ok(None);
@@ -99,7 +118,7 @@ pub(crate) fn put_json(
     params: &[DecodedValue],
     value: Option<&str>,
 ) -> Result<()> {
-    if compiled.tags.is_empty() {
+    if !is_cacheable(compiled) {
         return Ok(());
     }
     let key = cache_key(kind, &compiled.sql, params)?;
@@ -120,6 +139,10 @@ mod tests {
     }
 
     fn compiled_with_tags(sql: &str, tags: &[&str]) -> CompiledQuery {
+        compiled(sql, tags, false)
+    }
+
+    fn compiled(sql: &str, tags: &[&str], mutates: bool) -> CompiledQuery {
         CompiledQuery {
             sql: sql.to_string(),
             param_names: vec![],
@@ -130,8 +153,38 @@ mod tests {
             warnings: vec![],
             inference_plan: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            mutates,
             analyze_paths: None,
         }
+    }
+
+    /// A write must never be cached, even though it carries tags. Serving a
+    /// cached INSERT result returns a stale id *and skips the write*, so the
+    /// same insert run twice would produce one row instead of two.
+    #[test]
+    fn a_mutating_statement_is_never_cached() {
+        let (_dir, cache) = open_temp();
+        let insert = compiled("insert person", &["public.person"], true);
+
+        put_rows(&cache, &insert, &[], &[DecodedValue::Str("row".into())]).unwrap();
+        assert_eq!(
+            get_rows(&cache, &insert, &[]).unwrap(),
+            None,
+            "a write must not be served from cache"
+        );
+
+        put_json(&cache, "json_all", &insert, &[], Some("[]")).unwrap();
+        assert_eq!(get_json(&cache, "json_all", &insert, &[]).unwrap(), None);
+    }
+
+    /// The read/write distinction is `mutates`, not the tag list: both carry
+    /// the same tags, and only the read is cacheable.
+    #[test]
+    fn the_same_tags_are_still_cacheable_for_a_read() {
+        let (_dir, cache) = open_temp();
+        let read = compiled("select person", &["public.person"], false);
+        put_rows(&cache, &read, &[], &[DecodedValue::Str("row".into())]).unwrap();
+        assert!(get_rows(&cache, &read, &[]).unwrap().is_some());
     }
 
     #[test]
