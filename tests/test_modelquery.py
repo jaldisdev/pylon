@@ -143,23 +143,23 @@ class TestRenderExpr:
 
     def test_std_function_call(self):
         u = modelquery._FieldPath([])
-        node = std.foo(u.name, 'x')
+        node = std.str_pad_start(u.name, 8, 'x')
         text, params = render_expr(node)
-        assert text == 'std::foo(.name, $__mq_p0)'
-        assert params == {'__mq_p0': 'x'}
+        assert text == 'std::str_pad_start(.name, $__mq_p0, $__mq_p1)'
+        assert params == {'__mq_p0': 8, '__mq_p1': 'x'}
 
     def test_math_and_cal_namespaces_render_their_own_module(self):
         u = modelquery._FieldPath([])
-        text, _ = render_expr(math.sqrt(u.age))
-        assert text == 'math::sqrt(.age)'
-        text, _ = render_expr(cal.today())
-        assert text == 'cal::today()'
+        text, _ = render_expr(math.ln(u.age))
+        assert text == 'math::ln(.age)'
+        text, _ = render_expr(cal.to_local_date(u.created_at))
+        assert text == 'cal::to_local_date(.created_at)'
 
     def test_nested_func_call_inside_comparison(self):
         u = modelquery._FieldPath([])
-        node = std.foo(u.name) == 'x'
+        node = std.str_lower(u.name) == 'x'
         text, _params = render_expr(node)
-        assert text == 'std::foo(.name) = $__mq_p0'
+        assert text == 'std::str_lower(.name) = $__mq_p0'
 
     def test_ilike_renders_as_infix_operator_not_a_function_call(self):
         # std::ilike has no bare callable form in the PyQL stdlib — only

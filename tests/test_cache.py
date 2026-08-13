@@ -31,8 +31,8 @@ from pylon import cache
 from pylon.config import CacheConfig, CacheSetConfig
 
 
-def compiled(sql: str = 'select 1', tags: list[str] | None = None) -> SimpleNamespace:
-    return SimpleNamespace(sql=sql, tags=tags if tags is not None else [])
+def compiled(sql: str = 'select 1', tags: list[str] | None = None, mutates: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(sql=sql, tags=tags if tags is not None else [], mutates=mutates)
 
 
 @pytest.fixture(autouse=True)
@@ -254,3 +254,67 @@ class TestSetOverrides:
 
         cache.put(q, [1], [{'result': 'x'}], config)
         assert cache.get(q, [1], config) is None
+
+
+class TestMutatingQueries:
+    """A mutating statement must never be cached, and must evict what it
+    invalidates.
+
+    Caching one was actively destructive rather than merely stale:
+    `client.query("insert Person { name := $n }")` run twice served the
+    first call's cached row the second time — returning a stale id *and
+    skipping the write*, so two requested inserts produced one row.
+    """
+
+    def _config(self, tmp_path):
+        config = CacheConfig(enabled=True, path=tmp_path / 'cache')
+        cache.init(config)
+        return config
+
+    def test_a_mutating_query_is_never_stored(self, tmp_path):
+        config = self._config(tmp_path)
+        q = compiled(sql='insert ...', tags=['public.person'], mutates=True)
+        cache.put(q, [1], [{'result': 'x'}], config)
+        assert cache.get(q, [1], config) is None
+
+    def test_a_mutating_query_is_never_served(self, tmp_path):
+        # Even an entry written before this rule existed must not be served.
+        config = self._config(tmp_path)
+        readonly = compiled(sql='shared', tags=['public.person'])
+        cache.put(readonly, [1], [{'result': 'stale'}], config)
+        assert cache.get(readonly, [1], config) is not None
+
+        mutating = compiled(sql='shared', tags=['public.person'], mutates=True)
+        assert cache.get(mutating, [1], config) is None
+
+    def test_json_paths_are_guarded_too(self, tmp_path):
+        config = self._config(tmp_path)
+        q = compiled(sql='insert ...', tags=['public.person'], mutates=True)
+        cache.put_json(q, [1], '{"a":1}', config, kind='json_all')
+        assert cache.get_json(q, [1], config, kind='json_all') == (False, None)
+
+    def test_a_write_evicts_the_tables_it_touches(self, tmp_path):
+        config = self._config(tmp_path)
+        read = compiled(sql='select ...', tags=['public.person'])
+        cache.put(read, [1], [{'result': 'before'}], config)
+        assert cache.get(read, [1], config) is not None
+
+        write = compiled(sql='update ...', tags=['public.person'], mutates=True)
+        cache.invalidate_for(write)
+        assert cache.get(read, [1], config) is None
+
+    def test_a_write_leaves_unrelated_tables_alone(self, tmp_path):
+        config = self._config(tmp_path)
+        other = compiled(sql='select ...', tags=['public.company'])
+        cache.put(other, [1], [{'result': 'keep'}], config)
+
+        write = compiled(sql='update ...', tags=['public.person'], mutates=True)
+        cache.invalidate_for(write)
+        assert cache.get(other, [1], config) is not None
+
+    def test_a_read_does_not_evict(self, tmp_path):
+        config = self._config(tmp_path)
+        read = compiled(sql='select ...', tags=['public.person'])
+        cache.put(read, [1], [{'result': 'keep'}], config)
+        cache.invalidate_for(read)
+        assert cache.get(read, [1], config) is not None

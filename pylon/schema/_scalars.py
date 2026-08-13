@@ -141,6 +141,44 @@ PG_TYPE_MAP: dict[type[_PylonScalar], str] = {
     Sequence: 'int8',
 }
 
+#: The same scalars spelled as PyQL type names, for building a cast in
+#: generated query text (`<float64>$p`). Distinct from `PG_TYPE_MAP`: that
+#: names the PostgreSQL column type, this names what a PyQL `<...>` cast
+#: accepts, and the two differ for the `cal::` types among others.
+PYQL_TYPE_MAP: dict[type[_PylonScalar], str] = {
+    Str: 'str',
+    Int16: 'int16',
+    Int32: 'int32',
+    Int64: 'int64',
+    Float32: 'float32',
+    Float64: 'float64',
+    Decimal: 'decimal',
+    Bool: 'bool',
+    DateTime: 'datetime',
+    LocalDateTime: 'cal::local_datetime',
+    LocalDate: 'cal::local_date',
+    LocalTime: 'cal::local_time',
+    Duration: 'duration',
+    UUID: 'uuid',
+    JSON: 'json',
+    Bytes: 'bytes',
+    Sequence: 'int64',
+}
+
+
+def pyql_type_name(scalar_type: Any) -> str | None:
+    """The PyQL type name for a declared scalar, or None if it can't be
+    resolved — a bare annotation (`str`), a built-in scalar class, or a
+    custom scalar, resolved through its base."""
+    if scalar_type in SHORTHAND_MAP:
+        scalar_type = SHORTHAND_MAP[scalar_type]
+    if scalar_type in PYQL_TYPE_MAP:
+        return PYQL_TYPE_MAP[scalar_type]
+    base = getattr(scalar_type, '__pylon_base__', None)
+    if base is not None:
+        return PYQL_TYPE_MAP.get(base)
+    return None
+
 
 # ── Custom scalar base ─────────────────────────────────────────────────────────
 

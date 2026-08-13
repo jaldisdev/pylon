@@ -85,14 +85,29 @@ def _cache_key(compiled: CompiledQuery, params: list[Any], *, kind: str) -> str:
     return cache_key(f'{kind}\x00{compiled.sql}', list(params))
 
 
+def _is_cacheable(compiled: CompiledQuery, config: CacheConfig) -> bool:
+    """Whether this query's result may be stored or served from the cache.
+
+    A *mutating* statement never may. `client.query("insert Person {...}")`
+    is a normal way to insert and read the new row back, but its result is
+    not a function of its inputs: serving a cached one returns a stale id
+    *and skips the write entirely*, so running the same insert twice
+    silently produced one row instead of two.
+    """
+    if not _enabled or not config.enabled:
+        return False
+    if compiled.mutates:
+        return False
+    return not _is_disabled_for_sets(compiled, config)
+
+
 def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list[Any] | None:
     """Returns cached rows, each already wrapped as ``{"result": row}`` so
     the list can be passed straight to `pylon.query.deserialize` exactly
     like a live query result — or ``None`` on a cache miss or when caching
-    is disabled (globally or for the sets this query touches)."""
-    if not _enabled or not config.enabled:
-        return None
-    if _is_disabled_for_sets(compiled, config):
+    is disabled (globally, for a mutating statement, or for the sets this
+    query touches)."""
+    if not _is_cacheable(compiled, config):
         return None
     from pylon._core import cache_get
 
@@ -108,9 +123,7 @@ def put(compiled: CompiledQuery, params: list[Any], records: list[Any], config: 
     derived from *compiled* + *params*, tagged with
     ``compiled.tags`` for later invalidation. No-op if caching is disabled
     or the query has no tags to key eviction on."""
-    if not _enabled or not config.enabled or not compiled.tags:
-        return
-    if _is_disabled_for_sets(compiled, config):
+    if not compiled.tags or not _is_cacheable(compiled, config):
         return
     from pylon._core import cache_put
 
@@ -127,9 +140,7 @@ def get_json(compiled: CompiledQuery, params: list[Any], config: CacheConfig, *,
     *kind* must differ between `query_json` (``"json_all"``) and
     `query_single_json` (``"json_single"``) — same underlying SQL, but a
     JSON array vs. at most one JSON object are different cached values."""
-    if not _enabled or not config.enabled:
-        return False, None
-    if _is_disabled_for_sets(compiled, config):
+    if not _is_cacheable(compiled, config):
         return False, None
     from pylon._core import cache_get
 
@@ -144,14 +155,33 @@ def put_json(compiled: CompiledQuery, params: list[Any], value: str | None, conf
     """Counterpart to `get_json` — stores *value* (or nothing, for a
     legitimately-empty `query_single_json` result) under a key namespaced
     by *kind*. No-op if caching is disabled or the query has no tags."""
-    if not _enabled or not config.enabled or not compiled.tags:
-        return
-    if _is_disabled_for_sets(compiled, config):
+    if not compiled.tags or not _is_cacheable(compiled, config):
         return
     from pylon._core import cache_put
 
     key = _cache_key(compiled, params, kind=kind)
     cache_put(key, list(compiled.tags), [value] if value is not None else [])
+
+
+def invalidate_for(compiled: CompiledQuery) -> None:
+    """Evict this process's cached entries for the tables *compiled* writes to.
+
+    Cross-process invalidation runs over `NOTIFY pylon_cache_invalidate` and
+    needs a listener, but a client's *own* writes must not need one: without
+    this, a process that writes and then re-runs an identical read gets its
+    own pre-write result back, and nothing in a plain script (no worker, no
+    server) ever corrects it.
+
+    Takes no `CacheConfig`: eviction only ever *removes* entries, so it is
+    safe whenever the cache is open, and correctness shouldn't depend on
+    per-set enable flags matching between the write and the read that
+    populated the entry.
+    """
+    if not _enabled or not compiled.mutates or not compiled.tags:
+        return
+    from pylon._core import cache_invalidate
+
+    cache_invalidate(list(compiled.tags))
 
 
 def stat() -> dict[str, int] | None:

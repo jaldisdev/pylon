@@ -20,6 +20,7 @@
 use super::B;
 use super::{Bytes, FnDescriptor, Int64, Str};
 use super::{E, f, p};
+use crate::stdlib::FnVolatility::Volatile;
 
 /// Straight passthrough to PostgreSQL's `pgcrypto` extension (`CREATE
 /// EXTENSION IF NOT EXISTS pgcrypto;` must be run on the target database —
@@ -56,8 +57,8 @@ pub(super) fn build() -> Vec<FnDescriptor> {
             B("hmac"),
         ),
         // Zero-arg form defaults to blowfish ("bf").
-        f("crypto", "gen_salt", vec![], Str, E("gen_salt('bf')")),
-        f("crypto", "gen_salt", vec![p("type", Str)], Str, B("gen_salt")),
+        f("crypto", "gen_salt", vec![], Str, E("gen_salt('bf')")).vol(Volatile),
+        f("crypto", "gen_salt", vec![p("type", Str)], Str, B("gen_salt")).vol(Volatile),
         // pgcrypto's gen_salt(type, iter_count) takes iter_count as int4; Pylon's
         // int64 needs an explicit narrowing cast (PG has no implicit int8 -> int4).
         f(
@@ -66,7 +67,8 @@ pub(super) fn build() -> Vec<FnDescriptor> {
             vec![p("type", Str), p("iter_count", Int64)],
             Str,
             E("gen_salt($1, $2::int4)"),
-        ),
+        )
+        .vol(Volatile),
         f(
             "crypto",
             "crypt",

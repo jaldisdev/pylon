@@ -19,10 +19,11 @@
 
 use super::{Array, FnDescriptor, Int64, Str, Tuple};
 use super::{B, E, f};
+use crate::stdlib::FnVolatility::Stable;
 
 pub(super) fn build() -> Vec<FnDescriptor> {
     vec![
-        f("sys", "get_current_database", vec![], Str, B("current_database")),
+        f("sys", "get_current_database", vec![], Str, B("current_database")).vol(Stable),
         f(
             "sys",
             "get_version_as_str",

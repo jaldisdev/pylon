@@ -2,6 +2,8 @@
 
 Every function below is callable from PyQL, either unqualified (Pylon resolves an unqualified call across every namespace) or module-qualified (`math::sqrt(2.0)`). See [Globals and functions](../pyql/globals-and-functions.md#calling-functions) for general call syntax.
 
+The `std`, `math`, `cal`, and `sys` namespaces are also importable from Python — `from pylon import std` — for use in query-builder expressions and pointer defaults. Names and argument counts are validated against the same registry documented here. See [Model API § The `std` namespace](../client/model-api.md#the-std-namespace).
+
 ## Namespaces
 
 | Namespace | Contents |

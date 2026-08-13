@@ -290,11 +290,14 @@ class TestHydrate:
 # ---------------------------------------------------------------------------
 
 
-def _fake_compiled(sql: str = 'SELECT 1', tags: list[str] | None = None):
+def _fake_compiled(sql: str = 'SELECT 1', tags: list[str] | None = None, mutates: bool = False):
     c = MagicMock()
     c.sql = sql
     c.inference_plan = None
     c.tags = tags if tags is not None else []
+    # Must be set explicitly: a bare MagicMock attribute is truthy, which
+    # would make every fake query look like a mutation and so uncacheable.
+    c.mutates = mutates
     return c
 
 
@@ -900,3 +903,48 @@ class TestRetryingTransaction:
                             pass
 
         run(_run())
+
+
+class TestInstallMigratedSchema:
+    """The schema snapshot stored in the database is written by whichever
+    Pylon last ran a migration. An older writer's format can be unreadable
+    here, and serde's own message (`missing field 'x' at line 1 column N`)
+    points at a byte offset in a blob the reader never sees."""
+
+    def _run_with_snapshot(self, snapshot_json):
+        async def _run():
+            from pylon.client import _install_migrated_schema
+
+            async def fake_read(_pool):
+                return snapshot_json
+
+            with patch('pylon._core.migration_read_schema_snapshot', fake_read):
+                await _install_migrated_schema(MagicMock())
+
+        run(_run())
+
+    def test_an_unreadable_snapshot_names_the_cause_and_the_fix(self):
+        from pylon.exceptions import SchemaError
+
+        # Valid JSON, but missing a field this version requires.
+        stale = '{"types":[],"scalars":[],"enums":[],"named_tuples":[],"globals":[],"functions":[],"aliases":[]}'
+        with pytest.raises(SchemaError) as excinfo:
+            self._run_with_snapshot(stale)
+
+        message = str(excinfo.value)
+        assert 'older version' in message
+        assert 'pylon migration apply' in message
+        # The underlying serde detail is kept, just no longer the whole story.
+        assert 'missing field' in message
+
+    def test_the_original_error_is_chained(self):
+        from pylon.exceptions import SchemaError
+
+        stale = '{"types":[]}'
+        with pytest.raises(SchemaError) as excinfo:
+            self._run_with_snapshot(stale)
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+    def test_no_snapshot_is_a_no_op(self):
+        # An unmigrated database leaves whatever finalize() installed.
+        self._run_with_snapshot(None)

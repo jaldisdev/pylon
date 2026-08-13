@@ -25,6 +25,7 @@ use super::{
     B, E, I, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_stable_nullable, plpgsql_stable_nullable_bool,
     plpgsql_stable_nullable_elem, plpgsql_stable_returns, pv, ro, set_of, sql, sql_returns, tup,
 };
+use crate::stdlib::FnVolatility::{Modifying, Stable, Volatile};
 
 pub(super) fn build() -> Vec<FnDescriptor> {
     vec![
@@ -390,7 +391,7 @@ END"#,
         f("std", "sign", vec![p("n", Decimal)], Decimal, B("sign")),
         f("std", "sqrt", vec![p("n", Float64)], Float64, B("sqrt")),
         f("std", "sqrt", vec![p("n", Decimal)], Decimal, B("sqrt")),
-        f("std", "random", vec![], Float64, B("random")),
+        f("std", "random", vec![], Float64, B("random")).vol(Volatile),
         // ── std:: generic / polymorphic ──────────────────────────────────────
         f("std", "len", vec![p("s", Str)], Int64, B("length")),
         f("std", "len", vec![p("b", Bytes)], Int64, B("length")),
@@ -474,8 +475,8 @@ END"#,
             E("($1 @> ($2::date))"),
         ),
         // ── std:: uuid ───────────────────────────────────────────────────────
-        f("std", "uuid_generate_v4", vec![], Uuid, B("uuidv4")),
-        f("std", "uuid_generate_v7", vec![], Uuid, B("uuidv7")),
+        f("std", "uuid_generate_v4", vec![], Uuid, B("uuidv4")).vol(Volatile),
+        f("std", "uuid_generate_v7", vec![], Uuid, B("uuidv7")).vol(Volatile),
         f(
             "std",
             "uuid_extract_timestamp",
@@ -957,21 +958,25 @@ END"#,
             B("unnest"),
         ),
         // ── std:: datetime ───────────────────────────────────────────────────
-        f("std", "datetime_current", vec![], Datetime, E("clock_timestamp()")),
+        f("std", "datetime_current", vec![], Datetime, E("clock_timestamp()")).vol(Volatile),
+        // Stable, not immutable: fixed for the duration of one transaction /
+        // statement, but different between them.
         f(
             "std",
             "datetime_of_transaction",
             vec![],
             Datetime,
             E("transaction_timestamp()"),
-        ),
+        )
+        .vol(Stable),
         f(
             "std",
             "datetime_of_statement",
             vec![],
             Datetime,
             E("statement_timestamp()"),
-        ),
+        )
+        .vol(Stable),
         // PylonFunction: PG extract requires a keyword field, not a text argument.
         f(
             "std",
@@ -1179,14 +1184,15 @@ END"#,
         // ── std:: sequences ──────────────────────────────────────────────────
         // TranspilerIntrinsic: first arg is a sequence scalar type name resolved
         // by the compiler; emits nextval(...) / setval(...) directly.
-        f("std", "sequence_next", vec![p("seq", Any)], Int64, I("sequence_next")),
-        f("std", "sequence_reset", vec![p("seq", Any)], Int64, I("sequence_reset")),
+        f("std", "sequence_next", vec![p("seq", Any)], Int64, I("sequence_next")).vol(Modifying),
+        f("std", "sequence_reset", vec![p("seq", Any)], Int64, I("sequence_reset")).vol(Modifying),
         f(
             "std",
             "sequence_reset",
             vec![p("seq", Any), p("val", Int64)],
             Int64,
             I("sequence_reset"),
-        ),
+        )
+        .vol(Modifying),
     ]
 }

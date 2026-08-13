@@ -249,6 +249,10 @@ pub struct CompiledQuery {
     /// set of tags to cache this result under; for an INSERT/UPDATE/DELETE,
     /// the set of tags a cache layer must invalidate after the write commits.
     pub tags: Vec<String>,
+    /// True when executing this statement writes to any of `tags`. Lets a
+    /// cache layer act on the invalidation duty described above without
+    /// re-parsing the SQL to guess whether a write happened.
+    pub mutates: bool,
     /// `Some` only for `analyze <query>` — the shape-path↔SQL-alias map an
     /// `analyze` execution needs to correlate Postgres's `EXPLAIN` plan
     /// nodes back to the query's own shape (see `analyze` module). `None`
@@ -466,6 +470,7 @@ fn compile_uncached(
         paths
     });
     let tags = ir::tags::collect_tags(&ir_out);
+    let mutates = stmt_mutates(&ir_out.stmt) || ir_out.ctes.iter().any(|c| stmt_mutates(&c.stmt));
     let sql_out = sql::emit(&ir_out);
     Ok(CompiledQuery {
         sql: sql_out.sql,
@@ -475,8 +480,24 @@ fn compile_uncached(
         warnings: ir_out.warnings,
         inference_plan: sql_out.inference_plan,
         tags,
+        mutates,
         analyze_paths,
     })
+}
+
+/// Whether executing this statement writes to any of its `tags`.
+///
+/// Not just the outermost node: a `FOR` body, a `WITH` binding
+/// (`with c := (insert Company {...}) select c`), and a select over a DML
+/// source (`select (insert Person {...}) { id }`) all write while presenting
+/// as something else.
+fn stmt_mutates(stmt: &ir::IrStmt) -> bool {
+    match stmt {
+        ir::IrStmt::Insert(_) | ir::IrStmt::Update(_) | ir::IrStmt::Delete(_) => true,
+        ir::IrStmt::For(f) => stmt_mutates(&f.body),
+        ir::IrStmt::Select(sel) => sel.dml_source.as_deref().is_some_and(stmt_mutates),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
