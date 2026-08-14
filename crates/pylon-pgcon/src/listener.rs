@@ -31,7 +31,7 @@
 
 use crate::error::Result;
 use crate::wire::ExtensionOids;
-use crate::{execute_typed_on, query_typed_named_on, query_typed_on};
+use crate::{execute_typed_on_raw, query_typed_named_on_raw, query_typed_on_raw};
 use pylon_value::DecodedValue;
 use tokio_postgres::AsyncMessage;
 
@@ -100,7 +100,7 @@ impl PgListener {
         params: &[DecodedValue],
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
-        query_typed_on(&self.client, sql, params, ext).await
+        query_typed_on_raw(&self.client, sql, params, ext).await
     }
 
     /// Like `query_typed`, but decodes every column of every row by name
@@ -113,7 +113,7 @@ impl PgListener {
         params: &[DecodedValue],
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
-        query_typed_named_on(&self.client, sql, params, ext).await
+        query_typed_named_on_raw(&self.client, sql, params, ext).await
     }
 
     /// Runs `sql` via the simple query protocol — no bind parameters, but
@@ -125,7 +125,7 @@ impl PgListener {
     }
 
     pub async fn execute_typed(&self, sql: &str, params: &[DecodedValue]) -> Result<u64> {
-        execute_typed_on(&self.client, sql, params).await
+        execute_typed_on_raw(&self.client, sql, params).await
     }
 }
 

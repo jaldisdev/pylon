@@ -177,7 +177,23 @@ impl PgPool {
     pub async fn refresh_types(&mut self) -> Result<()> {
         let client = self.checkout().await?;
         self.types = discover_types(&client).await?;
+        // A migration is also exactly when a cached prepared statement can
+        // go stale: Postgres invalidates a server-side plan whose result
+        // type changed, and re-executing one raises `0A000 cached plan must
+        // not change result type`. The two always need clearing together.
+        drop(client);
+        self.clear_statement_caches();
         Ok(())
+    }
+
+    /// Drops every pooled connection's prepared-statement cache.
+    ///
+    /// Must be called after any DDL that could change a statement's result
+    /// type or parameter types — `refresh_types` already does, so migration
+    /// paths get this for free. Cheap: it only empties the cache maps, it
+    /// does not touch the connections.
+    pub fn clear_statement_caches(&self) {
+        self.pool.manager().statement_caches.clear();
     }
 
     /// Labels this pool in observability output — see `PoolWaitObserver`.
@@ -383,47 +399,127 @@ impl PgConnection {
     }
 }
 
-pub(crate) async fn query_typed_on(
+/// Binds `params` to an already-prepared `stmt` and decodes the single
+/// `result` column of every row.
+///
+/// Split out from the `*_on` entry points below so the two kinds of
+/// connection this crate holds can each prepare the way that suits them —
+/// a pooled `deadpool_postgres::Object` through its per-connection
+/// statement cache, a bare `tokio_postgres::Client` (the LISTEN/NOTIFY
+/// connection, which is not pooled) through a plain `prepare` — without
+/// either duplicating the binding and decoding below.
+async fn query_with_stmt(
     client: &tokio_postgres::Client,
-    sql: &str,
+    stmt: &tokio_postgres::Statement,
     params: &[DecodedValue],
     ext: &ExtensionOids,
 ) -> Result<Vec<DecodedValue>> {
-    let stmt = client.prepare(sql).await?;
     let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
     let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
         bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
-    let rows = client.query(&stmt, &param_refs).await?;
+    let rows = client.query(stmt, &param_refs).await?;
     rows.iter().map(|row| decode_result_column(row, ext)).collect()
 }
 
-/// Like `query_typed_on`, but decodes every column of every row by name
+/// Like `query_with_stmt`, but decodes every column of every row by name
 /// (`decode_row_named`) instead of assuming column 0 is the whole result —
 /// see `decode_row_named`'s doc comment.
+async fn query_named_with_stmt(
+    client: &tokio_postgres::Client,
+    stmt: &tokio_postgres::Statement,
+    params: &[DecodedValue],
+    ext: &ExtensionOids,
+) -> Result<Vec<DecodedValue>> {
+    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+    let rows = client.query(stmt, &param_refs).await?;
+    rows.iter().map(|row| decode_row_named(row, ext)).collect()
+}
+
+async fn execute_with_stmt(
+    client: &tokio_postgres::Client,
+    stmt: &tokio_postgres::Statement,
+    params: &[DecodedValue],
+) -> Result<u64> {
+    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
+    Ok(client.execute(stmt, &param_refs).await?)
+}
+
+/// Prepares through the pooled connection's own statement cache, so a query
+/// run twice on the same connection costs one round trip rather than two.
+///
+/// `tokio_postgres::Client::prepare` always issues a PARSE/DESCRIBE round
+/// trip; on a query whose execution is itself a single round trip that
+/// doubles the wire cost. `deadpool`'s cache is keyed on the SQL text and
+/// lives as long as the connection, which is exactly the lifetime a
+/// prepared statement has server-side. Any statement it hands back can go
+/// stale if the schema changes underneath it — see
+/// `PgPool::clear_statement_caches`, which every migration path calls.
+pub(crate) async fn query_typed_on(
+    client: &deadpool_postgres::Object,
+    sql: &str,
+    params: &[DecodedValue],
+    ext: &ExtensionOids,
+) -> Result<Vec<DecodedValue>> {
+    let stmt = client.prepare_cached(sql).await?;
+    query_with_stmt(client, &stmt, params, ext).await
+}
+
+/// See `query_typed_on` — same caching, `decode_row_named` decoding.
 pub(crate) async fn query_typed_named_on(
+    client: &deadpool_postgres::Object,
+    sql: &str,
+    params: &[DecodedValue],
+    ext: &ExtensionOids,
+) -> Result<Vec<DecodedValue>> {
+    let stmt = client.prepare_cached(sql).await?;
+    query_named_with_stmt(client, &stmt, params, ext).await
+}
+
+/// See `query_typed_on` — same caching, result discarded.
+pub(crate) async fn execute_typed_on(
+    client: &deadpool_postgres::Object,
+    sql: &str,
+    params: &[DecodedValue],
+) -> Result<u64> {
+    let stmt = client.prepare_cached(sql).await?;
+    execute_with_stmt(client, &stmt, params).await
+}
+
+/// The unpooled counterparts, for the LISTEN/NOTIFY connection — a bare
+/// `tokio_postgres::Client` with no `deadpool` wrapper around it and so no
+/// statement cache to reach. Its query volume is a handful of worker
+/// statements, not the query hot path, so a plain `prepare` is fine here.
+pub(crate) async fn query_typed_on_raw(
     client: &tokio_postgres::Client,
     sql: &str,
     params: &[DecodedValue],
     ext: &ExtensionOids,
 ) -> Result<Vec<DecodedValue>> {
     let stmt = client.prepare(sql).await?;
-    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
-    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
-    let rows = client.query(&stmt, &param_refs).await?;
-    rows.iter().map(|row| decode_row_named(row, ext)).collect()
+    query_with_stmt(client, &stmt, params, ext).await
 }
 
-pub(crate) async fn execute_typed_on(
+pub(crate) async fn query_typed_named_on_raw(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[DecodedValue],
+    ext: &ExtensionOids,
+) -> Result<Vec<DecodedValue>> {
+    let stmt = client.prepare(sql).await?;
+    query_named_with_stmt(client, &stmt, params, ext).await
+}
+
+pub(crate) async fn execute_typed_on_raw(
     client: &tokio_postgres::Client,
     sql: &str,
     params: &[DecodedValue],
 ) -> Result<u64> {
     let stmt = client.prepare(sql).await?;
-    let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
-    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-        bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
-    Ok(client.execute(&stmt, &param_refs).await?)
+    execute_with_stmt(client, &stmt, params).await
 }
 
 /// `EXPLAIN (FORMAT JSON)` returns exactly one row with one column (named
@@ -432,12 +528,12 @@ pub(crate) async fn execute_typed_on(
 /// `with-serde_json-1` feature, since `json`'s wire format is just its plain
 /// UTF-8 text (unlike `jsonb`, which prefixes a version byte).
 pub(crate) async fn query_explain_on(
-    client: &tokio_postgres::Client,
+    client: &deadpool_postgres::Object,
     sql: &str,
     params: &[DecodedValue],
 ) -> Result<String> {
     let wrapped = format!("EXPLAIN (ANALYZE, FORMAT JSON, VERBOSE) {sql}");
-    let stmt = client.prepare(&wrapped).await?;
+    let stmt = client.prepare_cached(&wrapped).await?;
     let bound: Vec<BoundParam<'_>> = params.iter().map(BoundParam).collect();
     let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
         bound.iter().map(|p| p as &(dyn postgres_types::ToSql + Sync)).collect();
