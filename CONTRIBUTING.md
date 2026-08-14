@@ -130,6 +130,49 @@ what goes into that hash, bump the prefix and keep the previous format
 verifying — existing migration files on disk must not stop validating. See
 `crates/pylon-core/src/migration/mod.rs`.
 
+## The internal `_pylon` schema
+
+Everything Pylon keeps for itself — the migration tracking tables, the index
+and signal outboxes, the stdlib functions — lives in the `_pylon` schema, and
+is defined once in `crates/pylon-core/src/stdlib/ddl.rs`.
+
+**Every statement in there must be idempotent**, because
+`migrate::ensure_internal_schema` replays the whole blob on every migration.
+That is what carries an internal change to databases that already exist: a
+new column arrives as `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, a changed
+function as `CREATE OR REPLACE FUNCTION`. A statement that only works against
+an empty database will appear to work in development and fail for everyone
+who upgrades.
+
+`_pylon."Internal".version` records which revision of these structures a
+database carries (`INTERNAL_SCHEMA_VERSION`). Nothing consults it yet — it is
+there for the first change that *cannot* be expressed idempotently, such as a
+column rename or a data backfill, where a repair has to know which databases
+already ran it. Bump it when the structures change in a way a future reader
+would need to distinguish; leave it alone for an ordinary idempotent change.
+
+### Function signatures are append-only
+
+A `_pylon` function can end up **baked into the catalog** — a compiled
+`Trigger`/rewrite body, or a column `DEFAULT` from a PyQL default — and it
+stays there until something rewrites that object.
+
+Changing such a function's *body* is fine, and usually the point: every
+database picks up the fix the next time the blob is replayed. Changing its
+*signature* is not. PostgreSQL does not dependency-track the inside of a
+plpgsql function, so nothing rejects the change and nothing warns; the
+databases that already exist simply start failing at the moment the trigger
+next fires.
+
+So: add an overload or a new name, never repurpose an existing signature.
+`_pylon.array_subscript(anyarray, bigint) RETURNS anyelement` is frozen in
+this sense already — deployed trigger bodies call it.
+
+`only_known_stdlib_functions_reach_persisted_ddl`
+(`crates/pylon-core/src/export/mod.rs`) pins the set of functions this
+applies to, so it can't grow by accident. If it fails, either keep the new
+function out of persisted DDL or accept that its signature is frozen too.
+
 ## Commit messages and PR descriptions
 
 Write commit messages that explain *why*, not just *what* — the diff already

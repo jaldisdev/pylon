@@ -2906,11 +2906,11 @@ mod tests {
         // trigger next fires.
         //
         // That is survivable while the set is tiny and its members are
-        // frozen (see the signature-stability rule in
-        // `docs/internals/pylon-schema.md`). This test exists so the set
-        // cannot grow unnoticed: if it fails, either keep the new function
-        // out of persisted DDL, or accept that its signature is now frozen
-        // too and add it below deliberately.
+        // frozen — see "Function signatures are append-only" in
+        // CONTRIBUTING.md. This test exists so the set cannot grow
+        // unnoticed: if it fails, either keep the new function out of
+        // persisted DDL, or accept that its signature is now frozen too and
+        // add it below deliberately.
         // `tags[0]` is what pulls a stdlib call into the trigger body;
         // the signal entry adds the other persisted-trigger path.
         let mut person = person_type();
