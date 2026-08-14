@@ -354,9 +354,6 @@ async def main() -> None:
                      lambda: native_hydrate(rows, compiled, native_reg), iterations=200)
     t_hydrate = bench('_hydrate() — as shipped (registry + shape + decode)',
                       lambda: _hydrate(rows, compiled), iterations=200)
-    # Finding #8's wrapper is gone; kept as a measurement of what it cost.
-    t_wrap = bench('(removed) per-row dict wrapper, for reference',
-                   lambda: [{'result': r} for r in rows], iterations=2000)
 
     # ── 6. shape_id A/B (finding #1) ─────────────────────────────────────
     print('\nDATABASE ROUND TRIP')
@@ -444,7 +441,6 @@ async def main() -> None:
         ('compiled.inference_plan', t_plan),
         ('cache_key x2', t_key_full * 2),
         ('registry rebuild', t_registry),
-        ('{"result": r} wrapper', t_wrap),
         ('shape_id (query_compiled - query)', max(0.0, t_qc - t_q)),
     ]
     total = sum(v for _, v in breakdown)
