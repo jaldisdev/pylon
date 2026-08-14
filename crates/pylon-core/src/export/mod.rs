@@ -2867,6 +2867,105 @@ mod tests {
         );
     }
 
+    // ── what stdlib reaches persisted DDL ───────────────────────────────────────
+
+    /// Every `_pylon.<name>(` reference in `ddl`, ignoring the stdlib's own
+    /// `CREATE OR REPLACE FUNCTION _pylon.<name>(...)` headers — those are
+    /// definitions, not references.
+    fn referenced_pylon_functions(ddl: &str) -> std::collections::BTreeSet<String> {
+        const DEFINITION: &str = "CREATE OR REPLACE FUNCTION _pylon.";
+        let mut found = std::collections::BTreeSet::new();
+        let mut rest = ddl;
+        while let Some(pos) = rest.find("_pylon.") {
+            let is_definition = rest[..pos]
+                .len()
+                .checked_sub(DEFINITION.len() - "_pylon.".len())
+                .is_some_and(|start| rest[start..pos + "_pylon.".len()].ends_with(DEFINITION));
+            let after = &rest[pos + "_pylon.".len()..];
+            let name_len = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            let name = &after[..name_len];
+            // Only a call — `_pylon."IndexOutbox"` and bare type references
+            // are not function references.
+            if !is_definition && !name.is_empty() && after[name_len..].starts_with('(') {
+                found.insert(name.to_string());
+            }
+            rest = &rest[pos + "_pylon.".len()..];
+        }
+        found
+    }
+
+    #[test]
+    fn only_known_stdlib_functions_reach_persisted_ddl() {
+        // A `_pylon` function named inside emitted DDL is baked into the
+        // catalog — a plpgsql trigger body, a column DEFAULT — and stays
+        // there until something rewrites it. Postgres does not
+        // dependency-track plpgsql bodies, so changing such a function's
+        // *signature* breaks those databases silently, at the moment the
+        // trigger next fires.
+        //
+        // That is survivable while the set is tiny and its members are
+        // frozen (see the signature-stability rule in
+        // `docs/internals/pylon-schema.md`). This test exists so the set
+        // cannot grow unnoticed: if it fails, either keep the new function
+        // out of persisted DDL, or accept that its signature is now frozen
+        // too and add it below deliberately.
+        // `tags[0]` is what pulls a stdlib call into the trigger body;
+        // the signal entry adds the other persisted-trigger path.
+        let mut person = person_type();
+        person.materialized = true;
+        person.properties.push(PropertyDescriptor {
+            name: "tags".into(),
+            pg_type: "text[]".into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        person.triggers = vec![trig(
+            1,
+            "After",
+            "update Person set { age := <std::int64>__new__.tags[0] }",
+        )];
+        person.signals = vec![crate::schema::SignalEntry { on: 1 }];
+        let schema = SchemaDescriptor {
+            types: vec![person],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        };
+
+        let ddl = export_schema(&schema).unwrap();
+        let referenced = referenced_pylon_functions(&ddl);
+        let allowed: std::collections::BTreeSet<String> = ["array_subscript", "notify_cache_invalidate"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            referenced.is_subset(&allowed),
+            "new stdlib functions reached persisted DDL: {:?}\n\
+             see this test's comment before widening the allowlist",
+            referenced.difference(&allowed).collect::<Vec<_>>(),
+        );
+        // The fixture has to actually exercise the path, or this passes vacuously.
+        assert!(
+            referenced.contains("array_subscript"),
+            "fixture no longer bakes a stdlib call; it is not testing anything"
+        );
+    }
+
     // ── content-addressed trigger names ─────────────────────────────────────────
 
     /// `Product.tags -> Org` multilink with a target-side DeleteSource
