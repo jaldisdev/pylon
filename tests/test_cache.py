@@ -78,8 +78,10 @@ class TestGetPutRoundTrip:
         records = [(1, 'alice')]
         cache.put(q, [1], records, config)
 
+        # `cache.get` returns a RowSet — rows still in their undecoded form,
+        # ready to hand to `hydrate` without building Python objects first.
         hit = cache.get(q, [1], config)
-        assert hit == [(1, 'alice')]
+        assert hit.to_list() == [(1, 'alice')]
 
     def test_different_params_are_different_keys(self, tmp_path):
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
@@ -89,8 +91,8 @@ class TestGetPutRoundTrip:
         cache.put(q, [1], ['one'], config)
         cache.put(q, [2], ['two'], config)
 
-        assert cache.get(q, [1], config) == ['one']
-        assert cache.get(q, [2], config) == ['two']
+        assert cache.get(q, [1], config).to_list() == ['one']
+        assert cache.get(q, [2], config).to_list() == ['two']
 
     def test_put_with_no_tags_is_a_noop(self, tmp_path):
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
@@ -176,7 +178,7 @@ class TestJsonCache:
         cache.put(q, [1], ['row-value'], config)
         cache.put_json(q, [1], '"json-value"', config, kind='json_all')
 
-        assert cache.get(q, [1], config) == ['row-value']
+        assert cache.get(q, [1], config).to_list() == ['row-value']
         hit, value = cache.get_json(q, [1], config, kind='json_all')
         assert hit is True
         assert value == '"json-value"'

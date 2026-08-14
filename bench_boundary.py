@@ -288,7 +288,7 @@ async def main() -> None:
     print(f'  (result set: {len(rows)} rows)')
     t_put = bench(
         'cache_put — 50 rows PyObject -> DecodedValue -> rkyv',
-        lambda: cache_put('k', ['t'], list(rows)),
+        lambda: cache_put('k', ['t'], rows),
         iterations=200,
     )
     t_get = bench(
@@ -302,7 +302,7 @@ async def main() -> None:
     # conversion from the storage write.
     t_conv_only = bench(
         '  ...of which py_to_cached alone (via cache_key)',
-        lambda: cache_key('x', list(rows)),
+        lambda: cache_key('x', rows.to_list()),
         iterations=200,
     )
     # Isolate the temporal/uuid import cost specifically.
@@ -346,8 +346,9 @@ async def main() -> None:
 
     prebuilt = build_registry()
     t_registry = bench('registry rebuild alone (per query)', build_registry, iterations=500)
+    plain_rows = rows.to_list()
     t_deser = bench('deserialize() — Python reference walk, 50 rows',
-                    lambda: deserialize(rows, compiled, prebuilt), iterations=200)
+                    lambda: deserialize(plain_rows, compiled, prebuilt), iterations=200)
     native_reg = hydration_registry()
     t_native = bench('_core.hydrate() — native walk, 50 rows',
                      lambda: native_hydrate(rows, compiled, native_reg), iterations=200)

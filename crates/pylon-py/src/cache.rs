@@ -19,23 +19,23 @@
 
 //! pyo3 bindings over `pylon-cache`.
 //!
-//! Thin glue only: encode/decode between Python's already-decoded
-//! `record["result"]` values and `pylon_cache::DecodedValue`, plus a single
-//! process-global `Cache` handle. No shape/type knowledge is needed here —
-//! the cache stores a structural mirror of whatever Python value it was
-//! given and hands back an equivalent one, and the *existing* `_decode()`/
-//! `_hydrate()` in `pylon/query.py` (driven by `CompiledQuery.shape`) does
-//! the real interpretation on both the write and the read side.
+//! Thin glue only: a single process-global `Cache` handle, plus the
+//! conversion for callers that still hand over plain Python values. No
+//! shape/type knowledge is needed here — the cache stores a structural
+//! mirror of the rows it was given and hands back an equivalent one, and
+//! `hydrate` (driven by the compiled query's shape) does the real
+//! interpretation on both the write and the read side.
 
 use std::sync::{Arc, OnceLock, RwLock};
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 
 use pylon_cache::{Cache, cache_key as cache_key_impl};
 
 use crate::PylonCacheError;
-use crate::pgvalue::{cached_to_py, py_to_cached};
+use crate::pgvalue::py_to_cached;
+use crate::rowset::RowSet;
 
 static PYLON_CACHE: OnceLock<RwLock<Option<Arc<Cache>>>> = OnceLock::new();
 
@@ -65,14 +65,18 @@ fn cache_init(path: &str, max_size_mb: usize) -> PyResult<()> {
     Ok(())
 }
 
-/// Returns the cached rows for `key` (each ready to feed directly into
-/// `_decode(row, shape, registry)`), or `None` on a cache miss. The single
+/// Returns the cached rows for `key`, or `None` on a cache miss. The single
 /// choke point every read-through cache lookup goes through — both
 /// `pylon.cache.get` and `.get_json` call this same primitive — so this is
 /// where the hit/miss counters (`pylon_workers::metrics::CACHE_REQUESTS`)
 /// live, rather than duplicated in each Python caller.
+///
+/// Rows come back still in `DecodedValue` form, ready to hand
+/// straight to `hydrate` — the same representation a fresh query produces,
+/// so a cache hit and a live result are the same thing by the time either
+/// reaches hydration, and neither builds an intermediate Python object tree.
 #[pyfunction]
-fn cache_get<'py>(py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyList>>> {
+fn cache_get(key: &str) -> PyResult<Option<RowSet>> {
     let guard = cache_slot().read().unwrap();
     let cache = guard
         .as_ref()
@@ -84,19 +88,23 @@ fn cache_get<'py>(py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyLi
         return Ok(None);
     };
     pylon_workers::metrics::CACHE_REQUESTS.with_label_values(&["hit"]).inc();
-    let rows = entry
-        .rows
-        .iter()
-        .map(|row| cached_to_py(py, row))
-        .collect::<PyResult<Vec<_>>>()?;
-    Ok(Some(PyList::new(py, rows)?))
+    Ok(Some(RowSet::new(entry.rows)))
 }
 
-/// Caches `rows` (each `record["result"]`, already decoded)
-/// under `key`, tagged with `tags` for later invalidation.
+/// Caches `rows` under `key`, tagged with `tags` for later invalidation.
+///
+/// Takes either a `RowSet` (a query result that never left Rust — the hot
+/// path, and free to store) or a plain sequence of Python values (the
+/// JSON-string caches, and tests).
 #[pyfunction]
-fn cache_put(key: &str, tags: Vec<String>, rows: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
-    let rows = rows.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+fn cache_put(key: &str, tags: Vec<String>, rows: &Bound<'_, PyAny>) -> PyResult<()> {
+    let rows = match rows.cast::<RowSet>() {
+        Ok(set) => set.get().rows.clone(),
+        Err(_) => rows
+            .try_iter()?
+            .map(|row| py_to_cached(&row?))
+            .collect::<PyResult<Vec<_>>>()?,
+    };
     let guard = cache_slot().read().unwrap();
     let cache = guard
         .as_ref()

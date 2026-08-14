@@ -36,6 +36,7 @@ use pylon_pgcon::{PgListener, PgPool, PgTransaction};
 use pylon_value::DecodedValue;
 
 use crate::pgvalue::{cached_to_py, py_to_cached};
+use crate::rowset::RowSet;
 use crate::{CompiledQuery, PylonPgconError};
 
 /// Maps a `pylon-pgcon` error to the real `pylon.exceptions.*` class the
@@ -328,7 +329,7 @@ impl PgconPool {
             let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
+            Ok(RowSet::new(rows))
         })
     }
 
@@ -355,7 +356,7 @@ impl PgconPool {
             let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
+            Ok(RowSet::new(rows))
         })
     }
 
@@ -379,7 +380,7 @@ impl PgconPool {
             let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
+            Ok(RowSet::new(rows))
         })
     }
 
@@ -557,7 +558,7 @@ impl PgconTransaction {
             let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
+            Ok(RowSet::new(rows))
         })
     }
 
@@ -604,7 +605,7 @@ impl PgconTransaction {
             let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
+            Ok(RowSet::new(rows))
         })
     }
 
@@ -628,7 +629,7 @@ impl PgconTransaction {
             let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
-            Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
+            Ok(RowSet::new(rows))
         })
     }
 

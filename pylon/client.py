@@ -956,7 +956,10 @@ def _hydrate(rows: list[Any], compiled: CompiledQuery) -> list[Any]:
     try:
         _get_schema()
     except RuntimeError:
-        return rows
+        # Without a schema there is nothing to decode into, so hand back
+        # plain values — converting the RowSet, since callers in this state
+        # expect an ordinary list they can index and iterate.
+        return rows.to_list() if hasattr(rows, 'to_list') else rows
     return _native_hydrate(rows, compiled, hydration_registry())
 
 

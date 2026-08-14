@@ -42,8 +42,41 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
 
 use pylon_core::query::{JsonMember, JsonMemberKind, ShapeNode};
+use pylon_value::DecodedValue;
 
 use crate::CompiledQuery;
+use crate::pgvalue::cached_to_py;
+use crate::rowset::RowSet;
+
+/// The value at `index` within a composite/array row, or `None` if this
+/// value isn't indexable or the index is past the end.
+///
+/// `_decode` expresses this as `value[position]` against a Python tuple; the
+/// same access against the undecoded representation is a slice index.
+fn item(value: &DecodedValue, index: usize) -> Option<&DecodedValue> {
+    match value {
+        DecodedValue::Composite(items) | DecodedValue::Array(items) => items.get(index),
+        _ => None,
+    }
+}
+
+/// The value under `key` in a jsonb object.
+fn field<'a>(value: &'a DecodedValue, key: &str) -> Option<&'a DecodedValue> {
+    match value {
+        DecodedValue::Object(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+        _ => None,
+    }
+}
+
+/// Whether this value is a decoded jsonb container — the condition
+/// `_decode` writes as `isinstance(value, (dict, list))` to tell a
+/// root-level named tuple (already the jsonb value) from a nested one
+/// (sitting at a position inside the parent composite).
+fn is_json_container(value: &DecodedValue) -> bool {
+    matches!(value, DecodedValue::Object(_) | DecodedValue::Array(_))
+}
+
+const NULL: DecodedValue = DecodedValue::Null;
 
 /// Per-class hydration plan, resolved once when the registry is built rather
 /// than per decoded object.
@@ -160,15 +193,22 @@ impl HydrationRegistry {
 }
 
 /// Decodes one value against one shape node. Mirrors `_decode`.
+///
+/// Takes the undecoded `DecodedValue` rather than a Python object: rows
+/// arrive from the driver and from the cache in exactly this form, and the
+/// containers a Python conversion would build (a tuple per composite, a list
+/// per array) are then immediately thrown away by this walk, which only
+/// reads positions out of them. Only the leaves that survive into the result
+/// are converted, by `cached_to_py`.
 fn decode<'py>(
     py: Python<'py>,
-    value: &Bound<'py, PyAny>,
+    value: &DecodedValue,
     node: &ShapeNode,
     reg: &HydrationRegistry,
 ) -> PyResult<Bound<'py, PyAny>> {
     match node {
-        ShapeNode::Scalar { position, .. } => value.get_item(*position),
-        ShapeNode::RawScalar | ShapeNode::JsonScalar => Ok(value.clone()),
+        ShapeNode::Scalar { position, .. } => cached_to_py(py, item(value, *position).unwrap_or(&NULL)),
+        ShapeNode::RawScalar | ShapeNode::JsonScalar => cached_to_py(py, value),
         ShapeNode::Object {
             type_name,
             position,
@@ -181,38 +221,37 @@ fn decode<'py>(
             members,
             ..
         } => {
-            // A root-level named tuple arrives as the raw decoded jsonb value
-            // (a dict for named members, a list for positional ones); a
-            // nested one sits at a position inside the parent composite.
-            let raw = if value.is_none() || value.is_instance_of::<PyDict>() || value.is_instance_of::<PyList>() {
-                value.clone()
+            // A root-level named tuple *is* the decoded jsonb value; a nested
+            // one sits at a position inside the parent composite.
+            let raw = if matches!(value, DecodedValue::Null) || is_json_container(value) {
+                value
             } else {
-                value.get_item(*position)?
+                item(value, *position).unwrap_or(&NULL)
             };
-            decode_json_tuple(py, &raw, type_name.as_deref(), members.as_deref(), reg)
+            decode_json_tuple(py, raw, type_name.as_deref(), members.as_deref(), reg)
         }
         ShapeNode::Enum {
             position, enum_type, ..
         } => {
-            let raw = value.get_item(*position)?;
-            if raw.is_none() {
-                return Ok(raw);
+            let raw = item(value, *position).unwrap_or(&NULL);
+            if matches!(raw, DecodedValue::Null) {
+                return Ok(py.None().into_bound(py));
             }
+            let raw = cached_to_py(py, raw)?;
             match reg.lookup_enum(enum_type) {
                 Some(cls) => cls.bind(py).call1((raw,)),
                 None => Ok(raw),
             }
         }
         ShapeNode::Array { position, element, .. } => {
-            let arr = value.get_item(*position)?;
-            let items = if arr.is_none() {
-                Vec::new()
-            } else {
-                arr.try_iter()?
+            let items = match item(value, *position) {
+                Some(DecodedValue::Array(arr)) => arr
+                    .iter()
                     // Array elements are anonymous records: each decodes as a
                     // root object, i.e. at position 0.
-                    .map(|item| decode_at_root(py, &item?, element, reg))
-                    .collect::<PyResult<Vec<_>>>()?
+                    .map(|el| decode_at_root(py, el, element, reg))
+                    .collect::<PyResult<Vec<_>>>()?,
+                _ => Vec::new(),
             };
             reg.pylon_set.bind(py).call1((PyList::new(py, items)?,))
         }
@@ -233,20 +272,18 @@ fn decode<'py>(
             for kn in key_nodes {
                 key_obj.set_item(shape_node_name(kn), decode(py, value, kn, reg)?)?;
             }
-            let grouping_raw = value.get_item(*grouping_position)?;
-            let grouping = if grouping_raw.is_none() {
-                PyList::empty(py)
-            } else {
-                PyList::new(py, grouping_raw.try_iter()?.collect::<PyResult<Vec<_>>>()?)?
+            let grouping = match item(value, *grouping_position) {
+                Some(DecodedValue::Array(arr)) => {
+                    PyList::new(py, arr.iter().map(|v| cached_to_py(py, v)).collect::<PyResult<Vec<_>>>()?)?
+                }
+                _ => PyList::empty(py),
             };
-            let elements_raw = value.get_item(*elements_position)?;
-            let elements = if elements_raw.is_none() {
-                Vec::new()
-            } else {
-                elements_raw
-                    .try_iter()?
-                    .map(|item| decode_at_root(py, &item?, element, reg))
-                    .collect::<PyResult<Vec<_>>>()?
+            let elements = match item(value, *elements_position) {
+                Some(DecodedValue::Array(arr)) => arr
+                    .iter()
+                    .map(|el| decode_at_root(py, el, element, reg))
+                    .collect::<PyResult<Vec<_>>>()?,
+                _ => Vec::new(),
             };
             let out = PyDict::new(py);
             out.set_item("key", key_obj)?;
@@ -259,10 +296,10 @@ fn decode<'py>(
             distance_position,
             object_node,
         } => {
-            let obj = decode_at_root(py, &value.get_item(*object_position)?, object_node, reg)?;
+            let obj = decode_at_root(py, item(value, *object_position).unwrap_or(&NULL), object_node, reg)?;
             let out = PyDict::new(py);
             out.set_item("object", obj)?;
-            out.set_item("distance", value.get_item(*distance_position)?)?;
+            out.set_item("distance", cached_to_py(py, item(value, *distance_position).unwrap_or(&NULL))?)?;
             Ok(out.into_any())
         }
         ShapeNode::FtsSearch {
@@ -270,48 +307,44 @@ fn decode<'py>(
             rank_position,
             object_node,
         } => {
-            let obj = decode_at_root(py, &value.get_item(*object_position)?, object_node, reg)?;
+            let obj = decode_at_root(py, item(value, *object_position).unwrap_or(&NULL), object_node, reg)?;
             let out = PyDict::new(py);
             out.set_item("object", obj)?;
-            out.set_item("score", value.get_item(*rank_position)?)?;
+            out.set_item("score", cached_to_py(py, item(value, *rank_position).unwrap_or(&NULL))?)?;
             Ok(out.into_any())
         }
     }
 }
 
 /// Decodes `node` as if it sat at position 0 — what `_decode` expresses as
-/// `{**node, "position": 0}`. Only `Object` actually reads `position` in a
-/// way this changes; every other kind that appears in these positions
-/// (array elements, group elements, search results) is decoded whole.
+/// `{**node, "position": 0}`.
 fn decode_at_root<'py>(
     py: Python<'py>,
-    value: &Bound<'py, PyAny>,
+    value: &DecodedValue,
     node: &ShapeNode,
     reg: &HydrationRegistry,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if let ShapeNode::Object {
-        type_name, pointers, ..
-    } = node
-    {
-        return decode_object(py, value, 0, type_name.as_deref(), pointers, reg);
+    match node {
+        ShapeNode::Object {
+            type_name, pointers, ..
+        } => decode_object(py, value, 0, type_name.as_deref(), pointers, reg),
+        ShapeNode::NamedTuple {
+            type_name, members, ..
+        } => {
+            let raw = if matches!(value, DecodedValue::Null) || is_json_container(value) {
+                value
+            } else {
+                item(value, 0).unwrap_or(&NULL)
+            };
+            decode_json_tuple(py, raw, type_name.as_deref(), members.as_deref(), reg)
+        }
+        _ => decode(py, value, node, reg),
     }
-    if let ShapeNode::NamedTuple {
-        type_name, members, ..
-    } = node
-    {
-        let raw = if value.is_none() || value.is_instance_of::<PyDict>() || value.is_instance_of::<PyList>() {
-            value.clone()
-        } else {
-            value.get_item(0)?
-        };
-        return decode_json_tuple(py, &raw, type_name.as_deref(), members.as_deref(), reg);
-    }
-    decode(py, value, node, reg)
 }
 
 fn decode_object<'py>(
     py: Python<'py>,
-    value: &Bound<'py, PyAny>,
+    value: &DecodedValue,
     position: usize,
     type_name: Option<&str>,
     pointers: &[ShapeNode],
@@ -319,11 +352,11 @@ fn decode_object<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     // The root object is the whole tuple; a nested one sits at a position.
     let obj_tuple = if position == 0 {
-        value.clone()
+        value
     } else {
-        value.get_item(position)?
+        item(value, position).unwrap_or(&NULL)
     };
-    if obj_tuple.is_none() {
+    if matches!(obj_tuple, DecodedValue::Null) {
         return Ok(py.None().into_bound(py));
     }
 
@@ -335,7 +368,7 @@ fn decode_object<'py>(
         if shape_node_name(p) == "__type__" && shape_node_position(p) == Some(0) {
             continue;
         }
-        kwargs.set_item(shape_node_name(p), decode(py, &obj_tuple, p, reg)?)?;
+        kwargs.set_item(shape_node_name(p), decode(py, obj_tuple, p, reg)?)?;
     }
 
     // A free object literal (`select { a := 1 }`) has no schema type, so no
@@ -348,19 +381,18 @@ fn decode_object<'py>(
     // The per-row `__type__` is what a polymorphic query needs: for a
     // concrete type it equals the static name, for an interface query it
     // names the real concrete type.
-    let actual = obj_tuple.get_item(0).ok().filter(|v| !v.is_none());
-    let resolved: String = match &actual {
-        Some(v) => v.extract().unwrap_or_else(|_| static_type_name.to_string()),
-        None => static_type_name.to_string(),
+    let resolved: &str = match item(obj_tuple, 0) {
+        Some(DecodedValue::Str(s)) => s,
+        _ => static_type_name,
     };
-    let Some(info) = reg.lookup_class(&resolved) else {
+    let Some(info) = reg.lookup_class(resolved) else {
         return Ok(kwargs.into_any());
     };
 
     let obj = reg.object_new.bind(py).call1((info.cls.bind(py),))?;
     let dict = obj.getattr("__dict__")?.cast_into::<PyDict>()?;
     dict.update(kwargs.as_mapping())?;
-    dict.set_item("__pylon_type__", &resolved)?;
+    dict.set_item("__pylon_type__", resolved)?;
     // Shadow copy of the hydrated values, so `Client.save()` can diff
     // current against persisted state instead of intercepting __setattr__.
     let saved = kwargs.copy()?;
@@ -400,55 +432,42 @@ fn decode_object<'py>(
 /// Mirrors `_decode_json_tuple`.
 fn decode_json_tuple<'py>(
     py: Python<'py>,
-    value: &Bound<'py, PyAny>,
+    value: &DecodedValue,
     type_name: Option<&str>,
     members: Option<&[JsonMember]>,
     reg: &HydrationRegistry,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if value.is_none() {
+    if matches!(value, DecodedValue::Null) {
         return Ok(py.None().into_bound(py));
     }
     let Some(members) = members else {
         // No static member shape: hand back the raw jsonb value, except that
         // a registered nominal type still gets constructed from it.
         if let Some(name) = type_name
-            && value.is_instance_of::<PyDict>()
+            && matches!(value, DecodedValue::Object(_))
             && let Some(info) = reg.classes.get(name)
         {
-            let kwargs = value.cast::<PyDict>()?;
-            return info.cls.bind(py).call((), Some(kwargs));
+            let kwargs = cached_to_py(py, value)?;
+            return info.cls.bind(py).call((), Some(kwargs.cast::<PyDict>()?));
         }
-        return Ok(value.clone());
+        return cached_to_py(py, value);
     };
 
     let positional = members.iter().all(|m| m.key.is_none());
     if positional {
-        let is_list = value.is_instance_of::<PyList>();
         let items = members
             .iter()
             .enumerate()
-            .map(|(i, m)| {
-                let raw = if is_list {
-                    value.get_item(i).unwrap_or_else(|_| py.None().into_bound(py))
-                } else {
-                    py.None().into_bound(py)
-                };
-                decode_json_member(py, &raw, m, reg)
-            })
+            .map(|(i, m)| decode_json_member(py, item(value, i).unwrap_or(&NULL), m, reg))
             .collect::<PyResult<Vec<_>>>()?;
         return Ok(PyTuple::new(py, items)?.into_any());
     }
 
-    let is_dict = value.is_instance_of::<PyDict>();
     let kwargs = PyDict::new(py);
     for m in members {
         let key = m.key.as_deref().unwrap_or_default();
-        let raw = if is_dict {
-            value.get_item(key).unwrap_or_else(|_| py.None().into_bound(py))
-        } else {
-            py.None().into_bound(py)
-        };
-        kwargs.set_item(key, decode_json_member(py, &raw, m, reg)?)?;
+        let raw = field(value, key).unwrap_or(&NULL);
+        kwargs.set_item(key, decode_json_member(py, raw, m, reg)?)?;
     }
     if let Some(name) = type_name
         && let Some(info) = reg.classes.get(name)
@@ -461,20 +480,21 @@ fn decode_json_tuple<'py>(
 /// Mirrors `_decode_json_member`.
 fn decode_json_member<'py>(
     py: Python<'py>,
-    value: &Bound<'py, PyAny>,
+    value: &DecodedValue,
     member: &JsonMember,
     reg: &HydrationRegistry,
 ) -> PyResult<Bound<'py, PyAny>> {
     match &member.kind {
         // "scalar" — jsonb's own native JSON type is already correct.
-        JsonMemberKind::Scalar => Ok(value.clone()),
+        JsonMemberKind::Scalar => cached_to_py(py, value),
         JsonMemberKind::Enum { enum_type } => {
-            if value.is_none() {
-                return Ok(value.clone());
+            if matches!(value, DecodedValue::Null) {
+                return Ok(py.None().into_bound(py));
             }
+            let raw = cached_to_py(py, value)?;
             match reg.lookup_enum(enum_type) {
-                Some(cls) => cls.bind(py).call1((value,)),
-                None => Ok(value.clone()),
+                Some(cls) => cls.bind(py).call1((raw,)),
+                None => Ok(raw),
             }
         }
         JsonMemberKind::Tuple { type_name, members } => {
@@ -511,12 +531,13 @@ fn shape_node_position(node: &ShapeNode) -> Option<usize> {
 #[pyfunction]
 pub(crate) fn hydrate<'py>(
     py: Python<'py>,
-    rows: Vec<Bound<'py, PyAny>>,
+    rows: &RowSet,
     compiled: &CompiledQuery,
     registry: &HydrationRegistry,
 ) -> PyResult<Bound<'py, PyList>> {
     let root = &compiled.inner.shape.root;
     let decoded = rows
+        .rows
         .iter()
         .map(|row| decode(py, row, root, registry))
         .collect::<PyResult<Vec<_>>>()?;

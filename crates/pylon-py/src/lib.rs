@@ -37,6 +37,7 @@ mod migrate;
 mod pgcon;
 mod pgvalue;
 mod providers;
+mod rowset;
 mod workers;
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
@@ -2667,7 +2668,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Cache
     cache::register(m)?;
 
-    // Result hydration
+    // Result rows and hydration
+    rowset::register(m)?;
     hydrate::register(m)?;
 
     // Postgres driver (async) — one persistent multi-threaded tokio
