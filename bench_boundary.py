@@ -329,8 +329,6 @@ async def main() -> None:
     from pylon.schema._registry import named_tuples_snapshot
     from pylon.client import _hydrate
 
-    records = [{'result': row} for row in rows]
-
     def build_registry():
         types, enums, _ = schema_snapshot()
         registry = {t.__name__: t for t in types}
@@ -346,10 +344,11 @@ async def main() -> None:
     prebuilt = build_registry()
     t_registry = bench('registry rebuild alone (per query)', build_registry, iterations=500)
     t_deser = bench('deserialize() — 50 rows, prebuilt registry',
-                    lambda: deserialize(records, compiled, prebuilt), iterations=200)
+                    lambda: deserialize(rows, compiled, prebuilt), iterations=200)
     t_hydrate = bench('_hydrate() — as shipped (registry + shape + decode)',
-                      lambda: _hydrate(records, compiled), iterations=200)
-    t_wrap = bench('[{"result": r} for r in rows] wrapper (finding #8)',
+                      lambda: _hydrate(rows, compiled), iterations=200)
+    # Finding #8's wrapper is gone; kept as a measurement of what it cost.
+    t_wrap = bench('(removed) per-row dict wrapper, for reference',
                    lambda: [{'result': r} for r in rows], iterations=2000)
 
     # ── 6. shape_id A/B (finding #1) ─────────────────────────────────────

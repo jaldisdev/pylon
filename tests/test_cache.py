@@ -75,36 +75,36 @@ class TestGetPutRoundTrip:
 
         assert cache.get(q, [1], config) is None
 
-        records = [{'result': (1, 'alice')}]
+        records = [(1, 'alice')]
         cache.put(q, [1], records, config)
 
         hit = cache.get(q, [1], config)
-        assert hit == [{'result': (1, 'alice')}]
+        assert hit == [(1, 'alice')]
 
     def test_different_params_are_different_keys(self, tmp_path):
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
         cache.init(config)
         q = compiled(tags=['public.person'])
 
-        cache.put(q, [1], [{'result': 'one'}], config)
-        cache.put(q, [2], [{'result': 'two'}], config)
+        cache.put(q, [1], ['one'], config)
+        cache.put(q, [2], ['two'], config)
 
-        assert cache.get(q, [1], config) == [{'result': 'one'}]
-        assert cache.get(q, [2], config) == [{'result': 'two'}]
+        assert cache.get(q, [1], config) == ['one']
+        assert cache.get(q, [2], config) == ['two']
 
     def test_put_with_no_tags_is_a_noop(self, tmp_path):
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
         cache.init(config)
         q = compiled(tags=[])
 
-        cache.put(q, [1], [{'result': 'x'}], config)
+        cache.put(q, [1], ['x'], config)
         assert cache.get(q, [1], config) is None
 
     def test_get_returns_none_when_globally_disabled(self, tmp_path):
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
         cache.init(config)
         q = compiled(tags=['public.person'])
-        cache.put(q, [1], [{'result': 'x'}], config)
+        cache.put(q, [1], ['x'], config)
 
         disabled_config = CacheConfig(enabled=False, path=config.path)
         assert cache.get(q, [1], disabled_config) is None
@@ -113,7 +113,7 @@ class TestGetPutRoundTrip:
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
         cache.init(config)
         q = compiled(tags=['public.person'])
-        cache.put(q, [1], [{'result': 'x'}], config)
+        cache.put(q, [1], ['x'], config)
         assert cache.get(q, [1], config) is not None
 
         from pylon._core import cache_invalidate
@@ -173,10 +173,10 @@ class TestJsonCache:
         cache.init(config)
         q = compiled(tags=['public.person'])
 
-        cache.put(q, [1], [{'result': 'row-value'}], config)
+        cache.put(q, [1], ['row-value'], config)
         cache.put_json(q, [1], '"json-value"', config, kind='json_all')
 
-        assert cache.get(q, [1], config) == [{'result': 'row-value'}]
+        assert cache.get(q, [1], config) == ['row-value']
         hit, value = cache.get_json(q, [1], config, kind='json_all')
         assert hit is True
         assert value == '"json-value"'
@@ -207,16 +207,16 @@ class TestStatAndClear:
 
         assert cache.stat()['entry_count'] == 0
 
-        cache.put(q, [1], [{'result': 'x'}], config)
-        cache.put(q, [2], [{'result': 'y'}], config)
+        cache.put(q, [1], ['x'], config)
+        cache.put(q, [2], ['y'], config)
         assert cache.stat()['entry_count'] == 2
 
     def test_clear_evicts_everything(self, tmp_path):
         config = CacheConfig(enabled=True, path=tmp_path / 'cache')
         cache.init(config)
         q = compiled(tags=['public.person'])
-        cache.put(q, [1], [{'result': 'x'}], config)
-        cache.put(q, [2], [{'result': 'y'}], config)
+        cache.put(q, [1], ['x'], config)
+        cache.put(q, [2], ['y'], config)
 
         cache.clear()
 
@@ -227,8 +227,10 @@ class TestStatAndClear:
 
 class TestSetOverrides:
     def _install_fake_schema(self, monkeypatch):
-        fake_type = SimpleNamespace(name='Order', module='default', table='Order')
-        fake_schema = SimpleNamespace(types=[fake_type])
+        # Mirrors the real `SchemaDescriptor.type_name_for_tag` (Rust-side):
+        # tag -> short type name, with the "default" module mapping to the
+        # "public" Postgres schema.
+        fake_schema = SimpleNamespace(type_name_for_tag=lambda tag: 'Order' if tag == 'public.Order' else None)
         monkeypatch.setattr('pylon.query._get_schema', lambda: fake_schema)
 
     def test_no_sets_configured_never_disables(self, monkeypatch):
@@ -261,7 +263,7 @@ class TestSetOverrides:
         cache.init(config)
         q = compiled(tags=['public.Order'])
 
-        cache.put(q, [1], [{'result': 'x'}], config)
+        cache.put(q, [1], ['x'], config)
         assert cache.get(q, [1], config) is None
 
 
@@ -283,14 +285,14 @@ class TestMutatingQueries:
     def test_a_mutating_query_is_never_stored(self, tmp_path):
         config = self._config(tmp_path)
         q = compiled(sql='insert ...', tags=['public.person'], mutates=True)
-        cache.put(q, [1], [{'result': 'x'}], config)
+        cache.put(q, [1], ['x'], config)
         assert cache.get(q, [1], config) is None
 
     def test_a_mutating_query_is_never_served(self, tmp_path):
         # Even an entry written before this rule existed must not be served.
         config = self._config(tmp_path)
         readonly = compiled(sql='shared', tags=['public.person'])
-        cache.put(readonly, [1], [{'result': 'stale'}], config)
+        cache.put(readonly, [1], ['stale'], config)
         assert cache.get(readonly, [1], config) is not None
 
         mutating = compiled(sql='shared', tags=['public.person'], mutates=True)
@@ -305,7 +307,7 @@ class TestMutatingQueries:
     def test_a_write_evicts_the_tables_it_touches(self, tmp_path):
         config = self._config(tmp_path)
         read = compiled(sql='select ...', tags=['public.person'])
-        cache.put(read, [1], [{'result': 'before'}], config)
+        cache.put(read, [1], ['before'], config)
         assert cache.get(read, [1], config) is not None
 
         write = compiled(sql='update ...', tags=['public.person'], mutates=True)
@@ -315,7 +317,7 @@ class TestMutatingQueries:
     def test_a_write_leaves_unrelated_tables_alone(self, tmp_path):
         config = self._config(tmp_path)
         other = compiled(sql='select ...', tags=['public.company'])
-        cache.put(other, [1], [{'result': 'keep'}], config)
+        cache.put(other, [1], ['keep'], config)
 
         write = compiled(sql='update ...', tags=['public.person'], mutates=True)
         cache.invalidate_for(write)
@@ -324,6 +326,6 @@ class TestMutatingQueries:
     def test_a_read_does_not_evict(self, tmp_path):
         config = self._config(tmp_path)
         read = compiled(sql='select ...', tags=['public.person'])
-        cache.put(read, [1], [{'result': 'keep'}], config)
+        cache.put(read, [1], ['keep'], config)
         cache.invalidate_for(read)
         assert cache.get(read, [1], config) is not None

@@ -1451,6 +1451,9 @@ impl FunctionDescriptor {
 #[pyclass(module = "pylon._core", frozen)]
 pub struct SchemaDescriptor {
     pub(crate) inner: core::schema::SchemaDescriptor,
+    /// Postgres-qualified table tag (`"public.person"`) -> short Pylon type
+    /// name (`"Person"`), built on first use. See `type_name_for_tag`.
+    tag_to_type: std::sync::OnceLock<HashMap<String, String>>,
 }
 
 #[pymethods]
@@ -1482,7 +1485,32 @@ impl SchemaDescriptor {
                 aliases: aliases.unwrap_or_default().iter().map(|a| a.inner.clone()).collect(),
                 channels: channels.unwrap_or_default().iter().map(|c| c.inner.clone()).collect(),
             },
+            tag_to_type: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Short Pylon type name for a schema-qualified table tag
+    /// (`"public.person"` -> `"Person"`), or `None` for a tag with no owning
+    /// type (a junction table, say).
+    ///
+    /// Backed by a map built once per schema. The Python caller
+    /// (`pylon.cache`) used to scan `self.types` per tag per query, and that
+    /// getter clones *every* `TypeDescriptor` into a fresh Python object —
+    /// so resolving one tag allocated a Python object per type in the schema.
+    fn type_name_for_tag(&self, tag: &str) -> Option<&str> {
+        self.tag_to_type
+            .get_or_init(|| {
+                self.inner
+                    .types
+                    .iter()
+                    .map(|t| {
+                        let pg_schema = if t.module == "default" { "public" } else { &t.module };
+                        (format!("{pg_schema}.{}", t.table), t.name.clone())
+                    })
+                    .collect()
+            })
+            .get(tag)
+            .map(String::as_str)
     }
 
     #[getter]
@@ -1573,7 +1601,10 @@ impl SchemaDescriptor {
     #[staticmethod]
     fn from_json(json: &str) -> PyResult<Self> {
         serde_json::from_str(json)
-            .map(|inner| Self { inner })
+            .map(|inner| Self {
+                inner,
+                tag_to_type: std::sync::OnceLock::new(),
+            })
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 }
