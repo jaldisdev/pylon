@@ -1589,8 +1589,9 @@ impl SchemaDescriptor {
     /// Serialize the full schema to JSON — the same format written to
     /// `_pylon."Schema"` by `migration apply`/`watch` (see
     /// `migration_write_schema_snapshot`) and read back by `from_json`.
-    fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.inner).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    fn to_json(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| serde_json::to_string(&self.inner))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Deserializes a `SchemaDescriptor` from `to_json`'s own output —
@@ -1601,8 +1602,8 @@ impl SchemaDescriptor {
     /// see `pylon.finalize()`'s own doc comment for why those two can
     /// legitimately differ until a migration is applied.
     #[staticmethod]
-    fn from_json(json: &str) -> PyResult<Self> {
-        serde_json::from_str(json)
+    fn from_json(py: Python<'_>, json: &str) -> PyResult<Self> {
+        py.detach(|| serde_json::from_str(json))
             .map(|inner| Self {
                 inner,
                 tag_to_type: std::sync::OnceLock::new(),
@@ -1725,11 +1726,22 @@ impl CompiledQuery {
 
 #[pyfunction]
 #[pyo3(signature = (query, schema, *, allow_user_specified_id = false))]
-fn compile(query: &str, schema: &SchemaDescriptor, allow_user_specified_id: bool) -> PyResult<CompiledQuery> {
+fn compile(
+    py: Python<'_>,
+    query: &str,
+    schema: &SchemaDescriptor,
+    allow_user_specified_id: bool,
+) -> PyResult<CompiledQuery> {
     let config = core::ir::SessionConfig {
         allow_user_specified_id,
     };
-    core::query::compile_with_config(query, &schema.inner, &config)
+    // Compilation is pure CPU work that touches no Python object, so the GIL
+    // is released for its duration — on a cache miss that is parse, IR, type
+    // check and SQL emission, long enough that holding the GIL would stall
+    // every other thread in the process. Nothing here needs to be re-checked
+    // afterwards: `compile_with_config` takes only Rust data, and
+    // `pylon_core::query::compile_with_config` synchronizes its own cache.
+    py.detach(|| core::query::compile_with_config(query, &schema.inner, &config))
         .map(|q| CompiledQuery { inner: q })
         .map_err(|e| pyql_err(e, Some(query)))
 }
@@ -1745,8 +1757,8 @@ fn record_query_compile_result(success: bool) {
 }
 
 #[pyfunction]
-fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
-    core::export::export_schema(&schema.inner).map_err(|e| pyql_err(e, None))
+fn export_schema(py: Python<'_>, schema: &SchemaDescriptor) -> PyResult<String> {
+    py.detach(|| core::export::export_schema(&schema.inner)).map_err(|e| pyql_err(e, None))
 }
 
 /// Compiles every user function body, computed-pointer expression, and
@@ -1755,8 +1767,8 @@ fn export_schema(schema: &SchemaDescriptor) -> PyResult<String> {
 /// and its best-effort scope. Every mismatch found is collected and reported
 /// together, joined by newline, as a single `SchemaError`.
 #[pyfunction]
-fn validate_schema_types(schema: &SchemaDescriptor) -> PyResult<()> {
-    core::validate::validate_schema_types(&schema.inner).map_err(|errs| {
+fn validate_schema_types(py: Python<'_>, schema: &SchemaDescriptor) -> PyResult<()> {
+    py.detach(|| core::validate::validate_schema_types(&schema.inner)).map_err(|errs| {
         let message = errs
             .iter()
             .map(|e| e.class_name_message_position().1.to_string())
@@ -1774,8 +1786,8 @@ fn validate_schema_types(schema: &SchemaDescriptor) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn export_stdlib() -> String {
-    core::stdlib::export_stdlib()
+fn export_stdlib(py: Python<'_>) -> String {
+    py.detach(core::stdlib::export_stdlib)
 }
 
 /// Machine-readable view of the stdlib registry, one entry per overload.
@@ -1879,8 +1891,8 @@ impl MigrationFile {
 
 /// Parse a migration file's content. `filename` is for error messages only.
 #[pyfunction]
-fn parse_migration(content: &str, filename: &str) -> PyResult<MigrationFile> {
-    core::migration::parse(content, filename)
+fn parse_migration(py: Python<'_>, content: &str, filename: &str) -> PyResult<MigrationFile> {
+    py.detach(|| core::migration::parse(content, filename))
         .map(|inner| MigrationFile { inner })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -1936,16 +1948,17 @@ pub struct DbState {
 /// Returns a list of SQL strings; empty when nothing needs to change.
 /// All index creation uses plain (non-CONCURRENTLY) form — suitable for watch mode.
 #[pyfunction]
-fn diff_schema(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<String>> {
-    core::diff::diff_schema(&target.inner, &current.inner).map_err(pyo3::exceptions::PyValueError::new_err)
+fn diff_schema(py: Python<'_>, target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<String>> {
+    py.detach(|| core::diff::diff_schema(&target.inner, &current.inner))
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Compute ordered DDL ops with non-transactional markers for migration file creation.
 /// Returns a list of `(sql, non_transactional)` tuples. Indexes on pre-existing tables
 /// use `CREATE INDEX CONCURRENTLY` and are marked `non_transactional=True`.
 #[pyfunction]
-fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<(String, bool)>> {
-    core::diff::diff_schema_ops(&target.inner, &current.inner)
+fn diff_schema_ops(py: Python<'_>, target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<(String, bool)>> {
+    py.detach(|| core::diff::diff_schema_ops(&target.inner, &current.inner))
         .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
@@ -1955,8 +1968,8 @@ fn diff_schema_ops(target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec
 /// and after, then call this to produce a single equivalent migration body.
 /// Returns a list of `(sql, non_transactional)` tuples.
 #[pyfunction]
-fn diff_states(before: &DbState, after: &DbState) -> Vec<(String, bool)> {
-    core::diff::diff_states(&before.inner, &after.inner)
+fn diff_states(py: Python<'_>, before: &DbState, after: &DbState) -> Vec<(String, bool)> {
+    py.detach(|| core::diff::diff_states(&before.inner, &after.inner))
         .into_iter()
         .map(|op| (op.sql, op.non_transactional))
         .collect()
@@ -2262,9 +2275,11 @@ fn diff_schema_ops_with_renames_and_fills(
 /// The result is suitable for storage in `_pylon."Migrations".db_state` and can be
 /// read back as a diff baseline via `db_state_from_json`.
 #[pyfunction]
-fn schema_to_db_state_json(schema: &SchemaDescriptor) -> String {
-    let state = core::diff::schema_to_db_state(&schema.inner);
-    core::diff::db_state_to_json(&state)
+fn schema_to_db_state_json(py: Python<'_>, schema: &SchemaDescriptor) -> String {
+    py.detach(|| {
+        let state = core::diff::schema_to_db_state(&schema.inner);
+        core::diff::db_state_to_json(&state)
+    })
 }
 
 /// `CREATE EXTENSION IF NOT EXISTS` statements for every Postgres extension
@@ -2297,8 +2312,8 @@ fn schema_content_changed(target: &SchemaDescriptor, previous: Option<&SchemaDes
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
 /// Returns a `DbState` object usable as a diff baseline for `diff_schema_ops` etc.
 #[pyfunction]
-fn db_state_from_json(json: &str) -> PyResult<DbState> {
-    core::diff::db_state_from_json(json)
+fn db_state_from_json(py: Python<'_>, json: &str) -> PyResult<DbState> {
+    py.detach(|| core::diff::db_state_from_json(json))
         .map(|inner| DbState { inner })
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
