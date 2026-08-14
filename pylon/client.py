@@ -90,16 +90,36 @@ class AsyncTransaction:
     # Query helpers — identical signatures to Client
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _evict(compiled: Any) -> None:
+        """Drop cache entries a write invalidated.
+
+        Applies to *every* method, not just `execute`: `query("insert ...")`
+        is a normal way to insert and read the new row back, and
+        `Client.save` uses `query_single` for exactly that. A write reaching
+        the database through any of them has to evict, or a later identical
+        read is served the pre-write result forever.
+
+        A transaction never *populates* the cache — those rows aren't
+        committed yet — so an aborted attempt can only over-evict, which
+        costs a re-read and never serves stale data.
+        """
+        from pylon import cache as _cache
+
+        _cache.invalidate_for(compiled)
+
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
+        self._evict(compiled)
         return _hydrate([{'result': row} for row in rows], compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
+        self._evict(compiled)
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
         if not rows:
@@ -117,12 +137,7 @@ class AsyncTransaction:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         await self._tx.execute_compiled(compiled, params)
-        # A write inside a transaction still evicts immediately: the cache is
-        # never populated from inside a transaction, so an aborted attempt can
-        # only over-evict, which costs a re-read and never serves stale data.
-        from pylon import cache as _cache
-
-        _cache.invalidate_for(compiled)
+        self._evict(compiled)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Execute *pyql* and return all results serialised as a JSON string.
@@ -131,12 +146,14 @@ class AsyncTransaction:
         """
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled_json_agg(compiled, params)
+        self._evict(compiled)
         return rows[0] if rows else '[]'
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
+        self._evict(compiled)
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:

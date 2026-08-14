@@ -80,12 +80,14 @@ impl Builder {
     /// (`[cache.sets.<Name>]`) overrides: caching here is a single global
     /// on/off. Omit this entirely for no caching (today's default
     /// behavior). Only `Client`'s own query methods read/write the cache —
-    /// `Transaction` never does, matching `pylon/client.py`'s
+    /// `Transaction` never populates it, since rows read inside a
+    /// transaction aren't committed, matching `pylon/client.py`'s
     /// `AsyncTransaction`.
     ///
-    /// Nothing evicts entries automatically here — pair this with a
-    /// process elsewhere that invalidates the same directory (e.g.
-    /// `pylon worker start`) if the underlying data changes while cached.
+    /// This client's *own* writes evict the tags they touch, from inside a
+    /// transaction too, so a program that writes and then re-reads sees its
+    /// own change. Writes from *other* processes still need a listener on
+    /// the same directory (e.g. `pylon worker start`) to invalidate.
     ///
     /// Opens its own LMDB handle for `path` — `heed` (the LMDB binding this
     /// crate uses) refuses a second `Env::open` on the same canonicalized
@@ -231,7 +233,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }
@@ -245,7 +247,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }
@@ -259,7 +261,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }
@@ -273,7 +275,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }
@@ -314,7 +316,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }
@@ -328,7 +330,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }
@@ -342,7 +344,7 @@ impl Client {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
         .await
     }

@@ -76,24 +76,53 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    // Every *read* method below passes `None` for `exec`'s `cache`
-    // parameter — uncommitted rows must never populate the read-through
-    // cache, matching `pylon/client.py`'s `AsyncTransaction`. `execute` is
-    // the exception: a write has to evict even from inside a transaction.
+    // Every method passes `CacheAccess::evict_only`: uncommitted rows must
+    // never populate the read-through cache (matching `pylon/client.py`'s
+    // `AsyncTransaction`), but a write still has to evict — and a write can
+    // arrive through any of these, not just `execute`. `query("insert ...")`
+    // is a normal way to insert and read the row back, and `Client.save`'s
+    // Python counterpart uses `query_single` for exactly that.
 
     pub async fn query(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
+        exec::query(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
+        )
+        .await
     }
 
     pub async fn query_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<Value>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
+        exec::query_single(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
+        )
+        .await
     }
 
     pub async fn query_required_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Value> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
+        exec::query_required_single(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
+        )
+        .await
     }
 
     /// A write inside a transaction still evicts immediately: the cache is
@@ -108,23 +137,50 @@ impl Transaction {
             &schema,
             &self.config,
             &self.globals,
-            self.cache.as_deref(),
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
         )
         .await
     }
 
     pub async fn query_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_json(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
+        exec::query_json(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
+        )
+        .await
     }
 
     pub async fn query_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<String>> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single_json(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
+        exec::query_single_json(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
+        )
+        .await
     }
 
     pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single_json(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
+        exec::query_required_single_json(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            crate::cache::CacheAccess::evict_only(self.cache.as_deref()),
+        )
+        .await
     }
 }
