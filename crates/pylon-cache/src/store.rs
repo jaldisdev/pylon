@@ -112,13 +112,6 @@ impl Cache {
         Self::open_with_flags(path, max_size_mb, EnvFlags::NO_SYNC)
     }
 
-    /// Opens the cache with LMDB's default durable commits — every write
-    /// fsyncs before `put` returns. Only for measuring what that costs
-    /// (`tests/bench_write_cost.rs`); nothing in Pylon needs it.
-    pub fn open_durable(path: &Path, max_size_mb: usize) -> Result<Self> {
-        Self::open_with_flags(path, max_size_mb, EnvFlags::empty())
-    }
-
     fn open_with_flags(path: &Path, max_size_mb: usize, flags: EnvFlags) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         // SAFETY: LMDB requires the caller to ensure no other process opens
@@ -463,5 +456,107 @@ mod tests {
         let (_dir, cache) = open_temp();
         cache.clear().unwrap();
         assert_eq!(cache.stat().unwrap().entry_count, 0);
+    }
+
+    // ── Write-cost benchmark ────────────────────────────────────────────
+    //
+    // Lives here rather than in `tests/` so it can open a durable
+    // environment through the private `open_with_flags` — the durable mode
+    // is only ever wanted for this comparison, and exposing a public
+    // constructor for it would imply a supported configuration that nothing
+    // in Pylon uses.
+
+    /// A row shaped like a realistic query result: 15 scalars, a nested
+    /// object, and a small array.
+    fn bench_row(i: usize) -> DecodedValue {
+        DecodedValue::Composite(vec![
+            DecodedValue::Str("m::Article".to_string()),
+            DecodedValue::Str(format!("Title {i}")),
+            DecodedValue::Str(format!("slug-{i}")),
+            DecodedValue::Str("body text ".repeat(20)),
+            DecodedValue::Str("summary".into()),
+            DecodedValue::I64(i as i64 * 10),
+            DecodedValue::F64(4.5),
+            DecodedValue::Bool(true),
+            DecodedValue::Timestamptz(1_000_000_000),
+            DecodedValue::Timestamptz(1_000_000_001),
+            DecodedValue::Str("en".into()),
+            DecodedValue::Str("seed".into()),
+            DecodedValue::Str("abc".into()),
+            DecodedValue::I64(500),
+            DecodedValue::I64(3),
+            DecodedValue::Uuid([7; 16]),
+            DecodedValue::Composite(vec![
+                DecodedValue::Str("m::Author".into()),
+                DecodedValue::Str(format!("Author {i}")),
+                DecodedValue::Str(format!("a{i}@example.com")),
+            ]),
+            DecodedValue::Array(vec![DecodedValue::Composite(vec![
+                DecodedValue::Str("m::Tag".into()),
+                DecodedValue::Str("red".into()),
+            ])]),
+        ])
+    }
+
+    fn bench_time(label: &str, iterations: u32, mut f: impl FnMut(u32)) -> f64 {
+        for i in 0..iterations.min(20) {
+            f(i);
+        }
+        let mut best = f64::INFINITY;
+        for round in 0..5 {
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                f(round * iterations + i);
+            }
+            best = best.min(start.elapsed().as_secs_f64() / iterations as f64 * 1e6);
+        }
+        println!("  {label:<54} {best:9.2} µs");
+        best
+    }
+
+    /// What a cache write costs, split into its parts — the rkyv encode, the
+    /// page work, and the fsync on commit. Only the last is avoidable
+    /// without changing what gets stored, and it turns out to be nearly all
+    /// of it. Run with:
+    ///
+    /// ```text
+    /// cargo test --release -p pylon-cache -- --ignored --nocapture write_cost
+    /// ```
+    #[test]
+    #[ignore = "benchmark, not a correctness test"]
+    fn write_cost_breakdown() {
+        let data: Vec<DecodedValue> = (0..49).map(bench_row).collect();
+        let tags = vec!["public.article".to_string()];
+
+        println!("\nSERIALIZATION ONLY");
+        let entry = CachedEntry {
+            rows: data.clone(),
+            tags: tags.clone(),
+        };
+        let encoded = rkyv::to_bytes::<RkyvError>(&entry).unwrap();
+        println!("  (entry encodes to {} bytes)", encoded.len());
+        bench_time("rkyv::to_bytes", 2_000, |_| {
+            std::hint::black_box(rkyv::to_bytes::<RkyvError>(&entry).unwrap());
+        });
+
+        println!("\nFULL PUT, DURABLE COMMIT");
+        let durable_dir = tempfile::tempdir().unwrap();
+        let durable = Cache::open_with_flags(durable_dir.path(), 64, EnvFlags::empty()).unwrap();
+        let t_durable = bench_time("Cache::put", 200, |i| {
+            durable.put(&format!("k{i}"), data.clone(), tags.clone()).unwrap();
+        });
+
+        println!("\nFULL PUT, DEFERRED SYNC (as shipped)");
+        let deferred_dir = tempfile::tempdir().unwrap();
+        let deferred = Cache::open(deferred_dir.path(), 64).unwrap();
+        let t_deferred = bench_time("Cache::put", 200, |i| {
+            deferred.put(&format!("k{i}"), data.clone(), tags.clone()).unwrap();
+        });
+
+        println!(
+            "\n  Deferring the sync saves {:.0} µs per put ({:.1}x).\n",
+            t_durable - t_deferred,
+            t_durable / t_deferred
+        );
     }
 }
