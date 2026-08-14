@@ -59,7 +59,7 @@ mod tests {
     async fn test_pool() -> pylon_pgcon::PgPool {
         let pool = pylon_pgcon::PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
-        pylon_core::migrate::ensure_tracking_tables(&pool).await.unwrap();
+        pylon_core::migrate::ensure_internal_schema(&pool).await.unwrap();
         pool
     }
 

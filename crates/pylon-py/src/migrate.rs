@@ -45,10 +45,10 @@ fn migrate_err(err: core_migrate::MigrateError) -> PyErr {
 }
 
 #[pyfunction]
-fn migration_ensure_tracking_tables<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
+fn migration_ensure_internal_schema<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        core_migrate::ensure_tracking_tables(&pool).await.map_err(migrate_err)
+        core_migrate::ensure_internal_schema(&pool).await.map_err(migrate_err)
     })
 }
 
@@ -210,7 +210,7 @@ fn migration_read_schema_snapshot<'py>(py: Python<'py>, pool: &PgconPool) -> PyR
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(migration_ensure_tracking_tables, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_ensure_internal_schema, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_tracking, m)?)?;
     m.add_function(wrap_pyfunction!(migration_applied_tip, m)?)?;
     m.add_function(wrap_pyfunction!(migration_record_applied, m)?)?;

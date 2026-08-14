@@ -260,7 +260,7 @@ pub const CACHE_INVALIDATE_DDL: &str = concat!(
 /// DDL for the migration tracking tables (§7): `_pylon."Migrations"`,
 /// `_pylon."Progress"`, and `_pylon."Schema"`.
 ///
-/// **The single definition of these tables.** `migrate::ensure_tracking_tables`
+/// **The single definition of these tables.** `migrate::ensure_internal_schema`
 /// runs this same constant rather than carrying its own copy — an earlier
 /// second copy there had already drifted (it grew `schema_state`, this one
 /// never did), so a database bootstrapped through one path was missing a

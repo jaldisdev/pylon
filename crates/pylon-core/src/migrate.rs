@@ -67,15 +67,25 @@ fn is_duplicate_object_error(err: &pylon_pgcon::Error) -> bool {
     err.sqlstate().is_some_and(|code| DUPLICATE_OBJECT_CODES.contains(code))
 }
 
-/// Creates the tracking tables if they don't exist yet.
+/// Brings the whole internal `_pylon` schema up to date — tracking tables,
+/// the index/signal outboxes, the cache-invalidate trigger function, and the
+/// stdlib functions.
 ///
-/// Runs `stdlib::ddl::MIGRATION_TRACKING_DDL` rather than a second copy of
-/// the same statements: the two used to be maintained separately and had
-/// already diverged on the `schema_state` column, so a database bootstrapped
-/// through `export_stdlib` was missing a column `read_tracking` selects.
-pub async fn ensure_tracking_tables(pool: &PgPool) -> Result<()> {
-    pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon;").await?;
-    pool.batch_execute(crate::stdlib::ddl::MIGRATION_TRACKING_DDL).await?;
+/// Runs the *entire* `export_stdlib()` blob, not just the migration tracking
+/// subset. Those blobs carry their own upgrade statements (`ADD COLUMN IF
+/// NOT EXISTS`, `CREATE OR REPLACE FUNCTION`), so which ones a database
+/// receives decides which internal changes ever reach it. Applying only the
+/// tracking subset here meant `_pylon."Migrations".schema_state` arrived on
+/// every database while `_pylon."IndexOutbox".claimed_at` reached only
+/// databases that had been re-initialized — and the index workers on the
+/// rest failed every claim against a column that was never added.
+///
+/// Every statement is idempotent, and `batch_execute` runs them in one
+/// implicit transaction, so this is safe to call on every migration and
+/// cheap enough at that frequency — it is a few dozen statements, not a
+/// schema diff.
+pub async fn ensure_internal_schema(pool: &PgPool) -> Result<()> {
+    pool.batch_execute(&crate::stdlib::export_stdlib()).await?;
     Ok(())
 }
 
@@ -588,7 +598,7 @@ mod tests {
     async fn test_pool() -> PgPool {
         let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
         pool.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
-        ensure_tracking_tables(&pool).await.unwrap();
+        ensure_internal_schema(&pool).await.unwrap();
         pool
     }
 
@@ -629,10 +639,46 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
-    async fn ensure_tracking_tables_is_idempotent() {
+    async fn ensure_internal_schema_is_idempotent() {
         let pool = test_pool().await;
-        ensure_tracking_tables(&pool).await.unwrap();
-        ensure_tracking_tables(&pool).await.unwrap();
+        ensure_internal_schema(&pool).await.unwrap();
+        ensure_internal_schema(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn ensure_internal_schema_repairs_a_database_missing_a_newer_column() {
+        // The failure this whole change exists for: `claimed_at` was added
+        // to `_pylon."IndexOutbox"` with an `ADD COLUMN IF NOT EXISTS`
+        // alongside the worker lease, but that statement lived in a blob
+        // only `database initialize` ever shipped. Databases upgraded via
+        // `migration apply` never received it, and every index-worker claim
+        // failed against a column that was never added.
+        //
+        // Dropping the column reproduces such a database exactly.
+        let pool = test_pool().await;
+        ensure_internal_schema(&pool).await.unwrap();
+        pool.batch_execute(r#"ALTER TABLE _pylon."IndexOutbox" DROP COLUMN IF EXISTS claimed_at;"#)
+            .await
+            .unwrap();
+
+        ensure_internal_schema(&pool).await.unwrap();
+
+        let rows = pool
+            .query_typed(
+                "SELECT (count(*)) AS result FROM information_schema.columns \
+                 WHERE table_schema = '_pylon' AND table_name = 'IndexOutbox' \
+                 AND column_name = 'claimed_at'",
+                &[],
+                pool.types(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.into_iter().next(),
+            Some(DecodedValue::I64(1)),
+            "claimed_at should have been restored"
+        );
     }
 
     #[tokio::test]
