@@ -75,6 +75,31 @@ async fn serve(
         .await
         .map_err(|e| Error::Invalid(format!("failed to connect base [database] connection: {e}")))?
         .ok_or_else(|| Error::Invalid("no [database] connection configured".to_string()))?;
+    // Check the internal `_pylon` schema before starting anything that
+    // depends on it. Deliberately a *check*, not an upgrade: during a
+    // rolling deploy old and new binaries run side by side, and a pod that
+    // silently migrated shared internal structures on startup would change
+    // them at whatever moment it happened to restart, for every other pod
+    // at once. `pylon migration apply` stays the only writer.
+    //
+    // Refusing here is what turns "the index workers fail every claim
+    // against a column that was never added" into a startup error naming
+    // the command that fixes it.
+    if let Some(db) = state.config.connections.get("default") {
+        let pool = pylon_pgcon::PgPool::connect(&db.dsn_string(), 1)
+            .await
+            .map_err(|e| Error::Invalid(format!("failed to connect for the internal schema check: {e}")))?;
+        let internal = pylon_core::migrate::check_internal_schema(&pool)
+            .await
+            .map_err(|e| Error::Invalid(format!("failed to read the internal schema version: {e}")))?;
+        if let Some(message) = internal.message() {
+            if internal.is_fatal() {
+                return Err(Error::Invalid(message));
+            }
+            eprintln!("pylon-server: {message}");
+        }
+    }
+
     let worker_handles = match state.config.connections.get("default") {
         Some(db) => crate::workers::spawn(
             &main_client.schema(),

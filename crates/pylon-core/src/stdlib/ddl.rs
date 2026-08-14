@@ -302,14 +302,14 @@ pub const MIGRATION_TRACKING_DDL: &str = concat!(
     ", updated_at = now();\n",
 );
 
-/// What revision of the internal `_pylon` structures a database carries.
+/// What revision of the internal `_pylon` structures this build writes.
 ///
-/// Nothing reads this yet — every internal change so far has been
-/// expressible as idempotent DDL (`ADD COLUMN IF NOT EXISTS`, `CREATE OR
-/// REPLACE`), which `ensure_internal_schema` simply replays. It exists now
-/// because it is the one thing that cannot be added retroactively: the
-/// moment a change *isn't* expressible that way — a column rename, a data
-/// backfill, a destructive fixup — the repair needs to know which databases
+/// Every internal change so far has been expressible as idempotent DDL
+/// (`ADD COLUMN IF NOT EXISTS`, `CREATE OR REPLACE`), which
+/// `ensure_internal_schema` simply replays — so nothing has yet *needed* to
+/// branch on this. It exists because it cannot be added retroactively: the
+/// moment a change isn't expressible that way — a column rename, a data
+/// backfill, a destructive fixup — a repair has to know which databases
 /// already ran it, and a database deployed without a marker offers nothing
 /// to read.
 ///
@@ -317,6 +317,26 @@ pub const MIGRATION_TRACKING_DDL: &str = concat!(
 /// would need to distinguish. Leaving it alone is correct for a purely
 /// idempotent change.
 pub const INTERNAL_SCHEMA_VERSION: i32 = 1;
+
+/// The oldest internal layout this build can still operate against.
+///
+/// Paired with `INTERNAL_SCHEMA_VERSION` because one number cannot answer
+/// the question that actually matters at startup — *is this mismatch
+/// fatal?* A database one version behind is usually fine (the change was
+/// additive, and this build's SQL never mentions the new parts); a database
+/// behind a change that renamed or removed something is not. Which of those
+/// happened is known when the change is written, not guessable at runtime,
+/// so it is recorded here rather than inferred.
+///
+/// Leave this alone when bumping `INTERNAL_SCHEMA_VERSION` for an additive
+/// change. Raise it to the new version only when this build genuinely
+/// cannot work against the older layout — that turns every older database
+/// into a startup failure until `pylon migration apply` runs, which is
+/// correct for a breaking change and needlessly disruptive for anything
+/// else.
+///
+/// See "The internal `_pylon` schema" in CONTRIBUTING.md.
+pub const MIN_SUPPORTED_INTERNAL_VERSION: i32 = 1;
 
 /// `INTERNAL_SCHEMA_VERSION` as a literal, for splicing into the `concat!`
 /// above — `concat!` takes literals only, so the constant cannot be
