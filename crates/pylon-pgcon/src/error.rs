@@ -32,9 +32,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(transparent)]
+    // Not `transparent`: `tokio_postgres::Error`'s own `Display` renders
+    // every server-side failure as the bare string `"db error"`, with what
+    // the server actually said reachable only through `source()`. Anything
+    // that logged one — `IndexWorker(Vector): claim_batch failed: db error`
+    // — therefore threw away the only useful part. See `pg_message`.
+    #[error("{}", db_error_message(.0))]
     Postgres(#[from] tokio_postgres::Error),
-    #[error(transparent)]
+    #[error("{}", pool_error_message(.0))]
     Pool(#[from] deadpool_postgres::PoolError),
     #[error(transparent)]
     Build(#[from] deadpool_postgres::BuildError),
@@ -75,6 +80,24 @@ pub enum Error {
 impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Error::Other(e)
+    }
+}
+
+/// What the server actually said, for a `tokio_postgres::Error` — falling
+/// back to its own `Display` for a client-side failure (connection reset,
+/// encoding, ...) which has no `DbError` behind it.
+fn db_error_message(err: &tokio_postgres::Error) -> String {
+    match err.as_db_error() {
+        Some(db) => db.message().to_string(),
+        None => err.to_string(),
+    }
+}
+
+/// Same, for a pool error whose backend failure is a `tokio_postgres::Error`.
+fn pool_error_message(err: &deadpool_postgres::PoolError) -> String {
+    match err {
+        deadpool_postgres::PoolError::Backend(e) => db_error_message(e),
+        other => other.to_string(),
     }
 }
 

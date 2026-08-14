@@ -1680,3 +1680,33 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::*;
+
+    /// A server-side failure must render what the server said, not
+    /// `tokio_postgres::Error`'s generic `"db error"` — the regression that
+    /// made `IndexWorker(Vector): claim_batch failed: db error` impossible
+    /// to act on.
+    #[tokio::test]
+    #[ignore = "requires a live database"]
+    async fn a_server_error_renders_the_server_message() {
+        let pool = PgPool::connect(&std::env::var("PYLON_PGCON_TEST_DSN").unwrap(), 2)
+            .await
+            .unwrap();
+        // Deliberately needs no fixture: a missing relation is a
+        // server-side error on any database, so this cannot rot when some
+        // other test's table comes or goes.
+        let err = pool
+            .query_typed("SELECT 1 FROM pylon_no_such_table", &[], pool.types())
+            .await
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("pylon_no_such_table"),
+            "expected the server's own message, got {rendered:?}"
+        );
+        assert_ne!(rendered, "db error");
+    }
+}
