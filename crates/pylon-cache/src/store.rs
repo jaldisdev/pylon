@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use heed::types::{Bytes, Str};
-use heed::{Database, DatabaseFlags, Env, EnvOpenOptions};
+use heed::{Database, DatabaseFlags, Env, EnvFlags, EnvOpenOptions};
 use rkyv::rancor::Error as RkyvError;
 use sha2::{Digest, Sha256};
 
@@ -89,7 +89,37 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// Opens the cache, without fsyncing on every commit.
+    ///
+    /// A durable commit costs ~2.0 ms for a 49-row entry against ~55 µs
+    /// without one — 97% of a cache write, and far more than the query whose
+    /// result is being stored. Paying it makes populating the cache several
+    /// times more expensive than not having a cache at all.
+    ///
+    /// `MDB_NOSYNC` drops the *D* of ACID and keeps the rest: LMDB still
+    /// writes whole pages and flips the meta page atomically, so the database
+    /// stays structurally valid — a system crash can cost the most recent
+    /// commits, not the store. That is the right trade for this data, because
+    /// every entry is a copy of something Postgres can produce again, so
+    /// losing one costs a cache miss. `Drop` flushes, so an ordinary shutdown
+    /// keeps everything anyway; only a power loss or a kill -9 forfeits the
+    /// last writes.
+    ///
+    /// Deliberately *not* combined with `MDB_WRITEMAP`. The two together do
+    /// risk real corruption on a system crash, and the writable mmap buys
+    /// nothing once the fsync is gone.
     pub fn open(path: &Path, max_size_mb: usize) -> Result<Self> {
+        Self::open_with_flags(path, max_size_mb, EnvFlags::NO_SYNC)
+    }
+
+    /// Opens the cache with LMDB's default durable commits — every write
+    /// fsyncs before `put` returns. Only for measuring what that costs
+    /// (`tests/bench_write_cost.rs`); nothing in Pylon needs it.
+    pub fn open_durable(path: &Path, max_size_mb: usize) -> Result<Self> {
+        Self::open_with_flags(path, max_size_mb, EnvFlags::empty())
+    }
+
+    fn open_with_flags(path: &Path, max_size_mb: usize, flags: EnvFlags) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         // SAFETY: LMDB requires the caller to ensure no other process opens
         // this environment with incompatible flags/map size concurrently —
@@ -98,6 +128,7 @@ impl Cache {
             EnvOpenOptions::new()
                 .map_size(max_size_mb * 1024 * 1024)
                 .max_dbs(3)
+                .flags(flags)
                 .open(path)?
         };
 
@@ -158,6 +189,14 @@ impl Cache {
         Ok(())
     }
 
+    /// Forces everything committed so far to disk. Called on `Drop`, so an
+    /// ordinary shutdown loses nothing; call it directly to checkpoint
+    /// sooner.
+    pub fn flush(&self) -> Result<()> {
+        self.env.force_sync()?;
+        Ok(())
+    }
+
     /// Evicts every cache entry tagged with any of `tags` — called from the
     /// LISTEN/NOTIFY invalidation path after a write commits.
     pub fn invalidate(&self, tags: &[String]) -> Result<()> {
@@ -211,6 +250,19 @@ impl Cache {
     }
 }
 
+impl Drop for Cache {
+    /// Flush on the way out, so the deferred sync `open` selects costs
+    /// nothing on an ordinary shutdown — only an abrupt one (power loss,
+    /// SIGKILL) forfeits the most recent writes.
+    ///
+    /// Errors are swallowed deliberately: this runs during teardown, where
+    /// there is nobody left to report to, and a cache that failed to persist
+    /// is a cache miss rather than a fault.
+    fn drop(&mut self) {
+        let _ = self.env.force_sync();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +271,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path(), 10).unwrap();
         (dir, cache)
+    }
+
+    #[test]
+    fn entries_survive_a_close_and_reopen() {
+        // The cache defers its fsync (see `open`), so what makes an ordinary
+        // shutdown lossless is the flush in `Drop`. Without it, entries
+        // written moments before the process exits could be gone on the next
+        // start — a silent, intermittent loss of the whole warm cache.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cache = Cache::open(dir.path(), 10).unwrap();
+            for i in 0..32 {
+                cache
+                    .put(&format!("key{i}"), vec![DecodedValue::I64(i)], vec!["public.person".into()])
+                    .unwrap();
+            }
+        }
+        let cache = Cache::open(dir.path(), 10).unwrap();
+        for i in 0..32 {
+            let entry = cache
+                .get(&format!("key{i}"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("key{i} did not survive the reopen"));
+            assert_eq!(entry.rows, vec![DecodedValue::I64(i)]);
+        }
+    }
+
+    #[test]
+    fn an_explicit_flush_persists_without_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path(), 10).unwrap();
+        cache
+            .put("key1", vec![DecodedValue::I64(7)], vec!["public.person".into()])
+            .unwrap();
+        cache.flush().unwrap();
+        assert!(cache.get("key1").unwrap().is_some());
     }
 
     #[test]
