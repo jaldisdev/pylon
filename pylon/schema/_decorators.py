@@ -401,12 +401,18 @@ def _collect_annotations(cls: type) -> dict[str, Any]:
     """Return the class's own annotations with string annotations resolved.
 
     Uses typing.get_type_hints() with include_extras=True so that
-    Annotated[T, ...] metadata (e.g. pylon.lazy) is preserved. Falls back to
-    the own-annotations dict if resolution fails (e.g. unresolvable forward
-    references at this point in the import cycle).
+    Annotated[T, ...] metadata (e.g. pylon.lazy) is preserved.
 
     Uses _get_own_annotations() instead of cls.__dict__["__annotations__"] for
     Python 3.14 PEP 649 compatibility.
+
+    `get_type_hints` fails for the *whole class* if any single name in it is
+    unresolvable, so a second pass resolves each annotation on its own. That
+    matters because the old behaviour on failure was to return the raw
+    annotation *strings*: a string then fell through `_annotation_to_meta` to
+    the bare-Python-type branch and became a `text` property, so a link whose
+    target could not be resolved silently turned into a text column — and the
+    generated migration created one. See `_unresolved_annotation_error`.
     """
     own = _get_own_annotations(cls)
     own_names = set(own.keys())
@@ -416,7 +422,73 @@ def _collect_annotations(cls: type) -> dict[str, Any]:
         all_hints = typing.get_type_hints(cls, include_extras=True)
         return {k: v for k, v in all_hints.items() if k in own_names}
     except Exception:
-        return own
+        pass
+
+    globalns = getattr(sys.modules.get(cls.__module__), '__dict__', {})
+    # Locals of the frame that declared the class, so a type defined inside a
+    # function can reference a sibling defined in the same function.
+    # `typing.get_type_hints` cannot do this — it only ever sees module
+    # globals and class vars — which is why the wholesale attempt above fails
+    # for that shape even though nothing is genuinely unresolvable.
+    localns = {**_defining_frame_locals(), **vars(cls)}
+    resolved: dict[str, Any] = {}
+    unresolved: dict[str, tuple[str, Exception]] = {}
+    for name, annotation in own.items():
+        if not isinstance(annotation, str):
+            resolved[name] = annotation
+            continue
+        try:
+            resolved[name] = eval(annotation, globalns, localns)  # noqa: S307
+        except Exception as exc:
+            unresolved[name] = (annotation, exc)
+    if unresolved:
+        raise _unresolved_annotation_error(cls, unresolved)
+    return resolved
+
+
+def _defining_frame_locals() -> dict[str, Any]:
+    """Locals of the first frame outside this package — the one that ran the
+    `@pylon.type` decorator, and so the one whose locals a sibling class
+    declared in the same function lives in.
+
+    Returns an empty mapping rather than raising if the stack cannot be
+    walked: this only ever *adds* resolvable names, so failing to find them
+    degrades to the same error the caller would have got anyway.
+    """
+    try:
+        frame = sys._getframe(1)
+    except (AttributeError, ValueError):  # pragma: no cover - no frame support
+        return {}
+    package = __name__.rpartition('.')[0]
+    while frame is not None and frame.f_globals.get('__name__', '').startswith(package):
+        frame = frame.f_back
+    return dict(frame.f_locals) if frame is not None else {}
+
+
+def _unresolved_annotation_error(cls: type, unresolved: dict[str, tuple[str, Any]]) -> Exception:
+    """Explain which annotations could not be resolved, and how to fix it.
+
+    The common cause is ordinary definition order: a type referring to one
+    defined further down the same module, which under
+    `from __future__ import annotations` raises nothing at class-definition
+    time because the annotation is still just a string.
+    """
+    from ._walker import SchemaError
+
+    lines = [
+        f'Type {cls.__name__!r}: could not resolve {len(unresolved)} annotation(s).',
+        '',
+    ]
+    lines += [f'    {name}: {text}    ({type(exc).__name__}: {exc})' for name, (text, exc) in unresolved.items()]
+    lines += [
+        '',
+        'Every referenced type must exist by the time the class is declared. Either',
+        'move the referenced type above this one, or, when the reference is genuinely',
+        'circular, name it through pylon.lazy:',
+        '',
+        "    author: Link[Annotated['Author', pylon.lazy('myapp.models')]]",
+    ]
+    return SchemaError('\n'.join(lines))
 
 
 # ── Core builder ───────────────────────────────────────────────────────────────
