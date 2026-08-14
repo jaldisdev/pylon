@@ -287,12 +287,12 @@ async def main() -> None:
     rows = await pool.query_compiled(compiled, params)
     print(f'  (result set: {len(rows)} rows)')
     t_put = bench(
-        'cache_put — 50 rows PyObject -> DecodedValue -> rkyv',
+        'cache_put — 50 rows, RowSet -> rkyv -> LMDB',
         lambda: cache_put('k', ['t'], rows),
         iterations=200,
     )
     t_get = bench(
-        'cache_get — 50 rows rkyv -> DecodedValue -> PyObject',
+        'cache_get — 50 rows, LMDB -> rkyv -> RowSet',
         lambda: cache_get('k'),
         iterations=200,
     )
