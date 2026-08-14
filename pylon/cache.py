@@ -79,10 +79,17 @@ def _cache_key(compiled: CompiledQuery, params: list[Any], *, kind: str) -> str:
     """*kind* namespaces the hash so different callers compiling the exact
     same PyQL text/params to different cached *value shapes* (a decoded row
     list for `query`/`query_single` vs. a raw JSON string for the
-    `*_json` methods) never collide on the same key."""
+    `*_json` methods) never collide on the same key.
+
+    Keys on ``compiled.shape_id`` rather than ``compiled.sql``: the shape id
+    already identifies the statement (it is a hash of exactly that SQL plus
+    its result shape) and is computed once at compile time, so this no longer
+    copies the whole SQL text into a Python string and re-hashes it — twice
+    per query, once for the lookup and once for the store.
+    """
     from pylon._core import cache_key
 
-    return cache_key(f'{kind}\x00{compiled.sql}', list(params))
+    return cache_key(f'{kind}\x00{compiled.shape_id}', list(params))
 
 
 def _is_cacheable(compiled: CompiledQuery, config: CacheConfig) -> bool:

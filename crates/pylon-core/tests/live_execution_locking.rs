@@ -151,7 +151,8 @@ async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
         &sd,
     )
     .unwrap()
-    .sql;
+    .sql
+    .clone();
 
     let tx1 = pool.begin_default().await.unwrap();
     let rows1 = tx1
@@ -215,13 +216,15 @@ async fn nowait_fails_immediately_instead_of_blocking_on_a_locked_row() {
         &sd,
     )
     .unwrap()
-    .sql;
+    .sql
+    .clone();
     let claim_nowait_sql = query::compile(
         &format!("select {module}::Job {{ priority }} filter .status = 'pending' for update nowait"),
         &sd,
     )
     .unwrap()
-    .sql;
+    .sql
+    .clone();
 
     let tx1 = pool.begin_default().await.unwrap();
     let rows1 = tx1

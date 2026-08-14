@@ -1582,7 +1582,10 @@ impl SchemaDescriptor {
 
 #[pyclass(module = "pylon._core", frozen)]
 pub struct CompiledQuery {
-    pub(crate) inner: core::query::CompiledQuery,
+    /// Shared with the compile cache rather than copied out of it — a cache
+    /// hit hands back a pointer, so wrapping one for Python costs a refcount
+    /// bump instead of a deep clone of the SQL, shape tree and tag list.
+    pub(crate) inner: std::sync::Arc<core::query::CompiledQuery>,
 }
 
 #[pymethods]
@@ -1595,6 +1598,15 @@ impl CompiledQuery {
     #[getter]
     fn sql(&self) -> &str {
         &self.inner.sql
+    }
+
+    /// This query's stable shape id — identifies the statement independently
+    /// of the values bound to it. `pylon.cache` keys on this instead of
+    /// pulling `.sql` across the boundary and re-hashing the whole statement
+    /// on every lookup and every store.
+    #[getter]
+    fn shape_id(&self) -> &str {
+        &self.inner.shape_id
     }
 
     /// Ordered parameter names matching $1, $2, … in the SQL.

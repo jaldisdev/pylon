@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use pylon_core::ir::SessionConfig;
 use pylon_core::query::{CompiledQuery, compile_with_config};
+use std::sync::Arc;
 use pylon_core::schema::SchemaDescriptor;
 use pylon_value::DecodedValue;
 
@@ -84,7 +85,7 @@ pub(crate) fn compile_and_bind(
     schema: &SchemaDescriptor,
     config: &SessionConfig,
     globals: &HashMap<String, DecodedValue>,
-) -> Result<(CompiledQuery, Vec<DecodedValue>)> {
+) -> Result<(Arc<CompiledQuery>, Vec<DecodedValue>)> {
     let compiled = compile_with_config(pyql, schema, config).map_err(Error::Compile)?;
     let bound = compiled
         .param_names
