@@ -288,6 +288,7 @@ class Client:
             from pylon._core import pgcon_connect
 
             self._ref.pool = await pgcon_connect(dsn, self._config.database.pool_max_size)
+            await _check_internal_schema(self._ref.pool)
             from pylon import cache as _cache
 
             _cache.init(self._config.cache)
@@ -950,6 +951,40 @@ def _build_dsn(db: Any) -> str:
     """Construct a DSN string from discrete :class:`~pylon.config.DatabaseConfig` fields."""
     password_part = f':{db.password}' if db.password else ''
     return f'postgresql://{db.user}{password_part}@{db.host}:{db.port}/{db.name}'
+
+
+async def _check_internal_schema(pool: PgconPool) -> None:
+    """Refuse to use a database whose internal `_pylon` schema this build
+    cannot work against.
+
+    Raised rather than warned, and raised *here* rather than left to
+    surface later: a client that connects happily and then fails somewhere
+    deep in a query gives no hint that the real problem is a database one
+    upgrade behind. That is exactly how a missing internal column presents
+    — as an unrelated-looking error, far from its cause. A warning in an
+    application's logs would not be read until someone was already
+    debugging that.
+
+    Deliberately does *not* repair anything. A client holds an application
+    role that may well lack DDL rights, and even where it doesn't, having
+    every process that happens to connect mutate shared internal structures
+    is how a rolling deploy turns into an outage. `pylon migration apply`
+    stays the only writer.
+
+    A database no migration has ever run against reports nothing, matching
+    `_install_migrated_schema`'s own tolerance for that state.
+    """
+    import logging
+
+    from pylon._core import migration_check_internal_schema
+    from pylon.exceptions import ConnectionFailedError
+
+    fatal, message = await migration_check_internal_schema(pool)
+    if message is None:
+        return
+    if fatal:
+        raise ConnectionFailedError(message)
+    logging.getLogger(__name__).warning('%s', message)
 
 
 async def _install_migrated_schema(pool: PgconPool) -> None:

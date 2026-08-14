@@ -144,12 +144,41 @@ function as `CREATE OR REPLACE FUNCTION`. A statement that only works against
 an empty database will appear to work in development and fail for everyone
 who upgrades.
 
+### Versioning
+
 `_pylon."Internal".version` records which revision of these structures a
-database carries (`INTERNAL_SCHEMA_VERSION`). Nothing consults it yet — it is
-there for the first change that *cannot* be expressed idempotently, such as a
-column rename or a data backfill, where a repair has to know which databases
-already ran it. Bump it when the structures change in a way a future reader
-would need to distinguish; leave it alone for an ordinary idempotent change.
+database carries. Two constants in `ddl.rs` govern it:
+
+| Constant | Meaning | When to change it |
+|---|---|---|
+| `INTERNAL_SCHEMA_VERSION` | what this build writes | bump when the structures change in a way a future reader would need to distinguish; leave alone for a purely idempotent change |
+| `MIN_SUPPORTED_INTERNAL_VERSION` | the oldest layout this build still works against | **usually leave alone.** Raise it only when this build genuinely cannot work against the older layout |
+
+Two numbers rather than one, because the question that matters at startup is
+not "do these differ?" but "is this difference fatal?" — and only the person
+writing the change knows whether it was additive. Raising the minimum turns
+every older database into a startup failure until `pylon migration apply`
+runs: correct for a breaking change, needlessly disruptive for anything else.
+
+`migrate::check_internal_schema` classifies a database against those
+constants, and the callers agree on what to do:
+
+* **Too old** — `pylon-server` refuses to start, a client raises at connect.
+  Failing at connect puts the error next to its cause; the alternative is an
+  unrelated-looking failure deep in a later query.
+* **Behind but supported** — reported, nothing else. The upgrade is pending
+  and everything works meanwhile.
+* **Newer than this build** — warned, never fatal. This is what a rollback
+  looks like, and failing closed would turn the recovery lever into a second
+  outage.
+* **No marker at all** — a database no migration has ever run against. Legal;
+  behave exactly as if the check did not exist.
+
+Nothing auto-upgrades. `pylon migration apply` is the only writer, on
+purpose: during a rolling deploy old and new binaries run side by side, and a
+process that silently migrated shared internal structures on startup would
+change them at whatever moment it happened to restart, for every other
+process at once.
 
 ### Function signatures are append-only
 
