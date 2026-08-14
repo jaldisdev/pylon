@@ -25,11 +25,115 @@
 //! `_decode()`/`_hydrate()` in `pylon/query.py` (driven by
 //! `CompiledQuery.shape`) does the real interpretation on both paths.
 
+use std::sync::OnceLock;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::sync::OnceLockExt;
+use pyo3::types::{
+    PyBool, PyBytes, PyDate, PyDateAccess, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
+    PyTimeAccess, PyTuple, PyTzInfo, PyTzInfoAccess, PyType,
+};
 
 use pylon_value::DecodedValue;
+
+/// Days between the Unix epoch (1970-01-01) and the PostgreSQL/Pylon epoch
+/// (2000-01-01), which is what every temporal `DecodedValue` counts from.
+const PG_EPOCH_DAYS_FROM_UNIX: i64 = 10_957;
+
+const US_PER_DAY: i64 = 86_400_000_000;
+
+/// The Python types this module constructs and type-checks against, looked
+/// up once per process instead of once per value.
+///
+/// Every conversion used to re-run `py.import("datetime")?.getattr(...)` —
+/// a `sys.modules` lookup plus an attribute lookup — for *each* value in a
+/// result set, so a row with three temporal columns paid it three times. A
+/// `OnceLock` behind pyo3's `get_or_init_py_attached` (rather than a plain
+/// `OnceLock::get_or_init`) is the deadlock-safe form: initializing calls
+/// arbitrary Python code, which must not block while another thread holds
+/// the same lock.
+/// `datetime`/`date`/`time` are deliberately absent: those are recognised
+/// with pyo3's `cast::<PyDateTime>()` (a C-level `PyDateTime_Check`), which
+/// needs no type object held here.
+struct PyTypes {
+    uuid: Py<PyType>,
+    decimal: Py<PyType>,
+    timedelta: Py<PyType>,
+    range: Py<PyType>,
+}
+
+static PY_TYPES: OnceLock<Option<PyTypes>> = OnceLock::new();
+
+fn py_types(py: Python<'_>) -> PyResult<&'static PyTypes> {
+    // `get_or_init_py_attached` takes an infallible closure, so a failed
+    // import is carried out as `None` and turned back into a `PyErr` here
+    // rather than panicking while holding the lock. In practice this only
+    // fails on a broken interpreter or a half-installed `pylon` package.
+    PY_TYPES
+        .get_or_init_py_attached(py, || {
+            let load = |module: &str, name: &str| -> PyResult<Py<PyType>> {
+                Ok(py.import(module)?.getattr(name)?.cast_into::<PyType>()?.unbind())
+            };
+            Some(PyTypes {
+                uuid: load("uuid", "UUID").ok()?,
+                decimal: load("decimal", "Decimal").ok()?,
+                timedelta: load("datetime", "timedelta").ok()?,
+                range: load("pylon.datatypes", "Range").ok()?,
+            })
+        })
+        .as_ref()
+        .ok_or_else(|| PyValueError::new_err("could not import the stdlib types pylon decodes into"))
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+///
+/// Postgres and Python's `datetime` both use the proleptic Gregorian
+/// calendar, so this is exact for every date either can represent. Doing
+/// the arithmetic here rather than handing `date(2000,1,1) + timedelta(n)`
+/// to Python turns three Python-level calls per value into none.
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe - 719_468
+}
+
+/// Inverse of `days_from_civil` — `(year, month, day)` from a day count
+/// since 1970-01-01.
+fn civil_from_days(z: i64) -> (i32, u8, u8) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    ((y + i64::from(m <= 2)) as i32, m, d)
+}
+
+/// Splits microseconds-since-the-Pylon-epoch into a Unix day count and the
+/// microsecond offset within that day. Euclidean division so pre-2000
+/// timestamps (negative input) land on the right day rather than truncating
+/// toward zero.
+fn split_epoch_micros(us: i64) -> (i64, u32, u8, u8, u8) {
+    let days = us.div_euclid(US_PER_DAY) + PG_EPOCH_DAYS_FROM_UNIX;
+    let within = us.rem_euclid(US_PER_DAY);
+    let microsecond = (within % 1_000_000) as u32;
+    let total_s = within / 1_000_000;
+    (
+        days,
+        microsecond,
+        (total_s / 3600) as u8,
+        ((total_s / 60) % 60) as u8,
+        (total_s % 60) as u8,
+    )
+}
 
 /// Encodes an already-decoded Python value (from
 /// any caller handing us a plain Python value to bind/cache) into
@@ -57,16 +161,17 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
     if let Ok(b) = value.cast::<PyBytes>() {
         return Ok(DecodedValue::Bytes(b.as_bytes().to_vec()));
     }
-    if value.is_instance(&py.import("uuid")?.getattr("UUID")?)? {
+    let types = py_types(py)?;
+    if value.is_instance(types.uuid.bind(py))? {
         let raw: Vec<u8> = value.getattr("bytes")?.extract()?;
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&raw);
         return Ok(DecodedValue::Uuid(bytes));
     }
-    if value.is_instance(&py.import("decimal")?.getattr("Decimal")?)? {
+    if value.is_instance(types.decimal.bind(py))? {
         return Ok(DecodedValue::Decimal(value.str()?.extract()?));
     }
-    if value.is_instance(&py.import("datetime")?.getattr("timedelta")?)? {
+    if value.is_instance(types.timedelta.bind(py))? {
         // `timedelta` only ever carries days/seconds/microseconds (Python
         // normalizes seconds into days+microseconds internally too) — never
         // months, so this always round-trips through `Interval` with
@@ -82,55 +187,51 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
     }
     // `datetime.datetime` is a subclass of `datetime.date` — must be checked
     // first, or every datetime would also match the plain-date branch below.
-    // Epoch math is delegated to Python's own `datetime` subtraction rather
-    // than reimplemented in Rust (proleptic Gregorian calendar arithmetic is
-    // exactly what the stdlib already gets right).
-    if value.is_instance(&py.import("datetime")?.getattr("datetime")?)? {
-        let datetime_cls = py.import("datetime")?.getattr("datetime")?;
-        let tzinfo = value.getattr("tzinfo")?;
-        let (epoch, target) = if tzinfo.is_none() {
-            (datetime_cls.call1((2000, 1, 1))?, value.clone())
+    // Calendar components are read straight off the C struct via
+    // `PyDateAccess`/`PyTimeAccess` and converted here (see
+    // `days_from_civil`), instead of asking Python to subtract two datetimes
+    // and unpack the resulting timedelta.
+    if let Ok(dt) = value.cast::<PyDateTime>() {
+        // A `timestamptz` is always UTC microseconds on the wire regardless
+        // of the value's own tzinfo, so an aware datetime is normalized
+        // first. That single `astimezone` is the only Python-level call left
+        // on this path, and a naive datetime doesn't even pay it.
+        let aware = dt.get_tzinfo().is_some();
+        let normalized;
+        let dt = if aware {
+            normalized = value.call_method1("astimezone", (PyTzInfo::utc(py)?,))?;
+            normalized.cast::<PyDateTime>()?
         } else {
-            // Normalize to UTC first — PostgreSQL's `timestamptz` wire
-            // format is always UTC microseconds since the PG epoch,
-            // regardless of the value's original tzinfo.
-            let utc = py.import("datetime")?.getattr("timezone")?.getattr("utc")?;
-            (
-                datetime_cls.call1((2000, 1, 1, 0, 0, 0, 0, &utc))?,
-                value.call_method1("astimezone", (&utc,))?,
-            )
+            dt
         };
-        let delta = target.call_method1("__sub__", (epoch,))?;
-        let days: i64 = delta.getattr("days")?.extract()?;
-        let seconds: i64 = delta.getattr("seconds")?.extract()?;
-        let microseconds: i64 = delta.getattr("microseconds")?.extract()?;
-        let total_us = days * 86_400_000_000 + seconds * 1_000_000 + microseconds;
-        return Ok(if tzinfo.is_none() {
-            DecodedValue::Timestamp(total_us)
-        } else {
+        let days = days_from_civil(dt.get_year(), dt.get_month().into(), dt.get_day().into())
+            - PG_EPOCH_DAYS_FROM_UNIX;
+        let total_us = days * US_PER_DAY
+            + (i64::from(dt.get_hour()) * 3600 + i64::from(dt.get_minute()) * 60 + i64::from(dt.get_second()))
+                * 1_000_000
+            + i64::from(dt.get_microsecond());
+        return Ok(if aware {
             DecodedValue::Timestamptz(total_us)
+        } else {
+            DecodedValue::Timestamp(total_us)
         });
     }
-    if value.is_instance(&py.import("datetime")?.getattr("date")?)? {
-        let epoch = py.import("datetime")?.getattr("date")?.call1((2000, 1, 1))?;
-        let delta = value.call_method1("__sub__", (epoch,))?;
-        let days: i32 = delta.getattr("days")?.extract()?;
-        return Ok(DecodedValue::Date(days));
+    if let Ok(d) = value.cast::<PyDate>() {
+        let days = days_from_civil(d.get_year(), d.get_month().into(), d.get_day().into()) - PG_EPOCH_DAYS_FROM_UNIX;
+        return Ok(DecodedValue::Date(days as i32));
     }
-    if value.is_instance(&py.import("datetime")?.getattr("time")?)? {
-        if !value.getattr("tzinfo")?.is_none() {
+    if let Ok(t) = value.cast::<PyTime>() {
+        if t.get_tzinfo().is_some() {
             return Err(PyValueError::new_err(
                 "cannot bind a timezone-aware datetime.time — PostgreSQL `time` (cal::local_time) has no timezone",
             ));
         }
-        let hour: i64 = value.getattr("hour")?.extract()?;
-        let minute: i64 = value.getattr("minute")?.extract()?;
-        let second: i64 = value.getattr("second")?.extract()?;
-        let microsecond: i64 = value.getattr("microsecond")?.extract()?;
-        let total_us = ((hour * 60 + minute) * 60 + second) * 1_000_000 + microsecond;
+        let total_us = (i64::from(t.get_hour()) * 3600 + i64::from(t.get_minute()) * 60 + i64::from(t.get_second()))
+            * 1_000_000
+            + i64::from(t.get_microsecond());
         return Ok(DecodedValue::Time(total_us));
     }
-    if value.is_instance(&py.import("pylon.datatypes")?.getattr("Range")?)? {
+    if value.is_instance(types.range.bind(py))? {
         let empty: bool = value.getattr("empty")?.extract()?;
         let lower = value.getattr("lower")?;
         let upper = value.getattr("upper")?;
@@ -181,6 +282,66 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
     )))
 }
 
+#[cfg(test)]
+mod calendar_tests {
+    use super::{PG_EPOCH_DAYS_FROM_UNIX, US_PER_DAY, civil_from_days, days_from_civil, split_epoch_micros};
+
+    #[test]
+    fn the_two_epochs_are_the_documented_distance_apart() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 1, 1), PG_EPOCH_DAYS_FROM_UNIX);
+    }
+
+    #[test]
+    fn round_trips_every_day_across_four_centuries() {
+        // Covers all four century-leap cases (1900 and 2100 not leap, 2000
+        // leap) and every ordinary leap year in between, which is where a
+        // hand-rolled calendar conversion actually breaks.
+        for z in days_from_civil(1800, 1, 1)..=days_from_civil(2200, 1, 1) {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m.into(), d.into()), z, "round trip failed at day {z}");
+        }
+    }
+
+    #[test]
+    fn handles_the_century_leap_rule() {
+        // 2000 is a leap year (divisible by 400); 1900 and 2100 are not.
+        assert_eq!(civil_from_days(days_from_civil(2000, 2, 28) + 1), (2000, 2, 29));
+        assert_eq!(civil_from_days(days_from_civil(1900, 2, 28) + 1), (1900, 3, 1));
+        assert_eq!(civil_from_days(days_from_civil(2100, 2, 28) + 1), (2100, 3, 1));
+    }
+
+    #[test]
+    fn handles_dates_before_the_pylon_epoch() {
+        // Negative microsecond counts are the case truncating division gets
+        // wrong: 1999-12-31T23:59:59.999999 is one microsecond before the
+        // epoch, and must not land on 2000-01-01 or on day -1 at hour 0.
+        let (days, us, h, m, s) = split_epoch_micros(-1);
+        assert_eq!(civil_from_days(days), (1999, 12, 31));
+        assert_eq!((h, m, s, us), (23, 59, 59, 999_999));
+    }
+
+    #[test]
+    fn splits_a_whole_day_before_the_epoch_exactly() {
+        let (days, us, h, m, s) = split_epoch_micros(-US_PER_DAY);
+        assert_eq!(civil_from_days(days), (1999, 12, 31));
+        assert_eq!((h, m, s, us), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn splits_the_epoch_itself() {
+        let (days, us, h, m, s) = split_epoch_micros(0);
+        assert_eq!(civil_from_days(days), (2000, 1, 1));
+        assert_eq!((h, m, s, us), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn covers_the_extremes_python_datetime_can_represent() {
+        assert_eq!(civil_from_days(days_from_civil(1, 1, 1)), (1, 1, 1));
+        assert_eq!(civil_from_days(days_from_civil(9999, 12, 31)), (9999, 12, 31));
+    }
+}
+
 /// Reconstructs a Python value from `DecodedValue`, structurally equivalent
 /// to what the driver decodes — safe to feed into the existing
 /// `_decode()`/`_hydrate()` exactly as if it came from a live query,
@@ -194,12 +355,16 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
         DecodedValue::Str(s) => PyString::new(py, s).into_any(),
         DecodedValue::Bytes(b) => PyBytes::new(py, b).into_any(),
         DecodedValue::Uuid(bytes) => {
-            // Passed as a hex string (not a `bytes` kwarg) to avoid needing
-            // an extra crate just for keyword-argument construction here.
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            py.import("uuid")?.getattr("UUID")?.call1((hex,))?
+            // `UUID(bytes=...)` rather than `UUID(hex)`: the hex path makes
+            // Python strip separators and re-parse base 16, where the bytes
+            // path is a single `int.from_bytes`. The old code also built the
+            // hex string with a `format!` per byte — sixteen allocations for
+            // every UUID in a result set.
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("bytes", PyBytes::new(py, bytes))?;
+            py_types(py)?.uuid.bind(py).call((), Some(&kwargs))?
         }
-        DecodedValue::Decimal(s) => py.import("decimal")?.getattr("Decimal")?.call1((s,))?,
+        DecodedValue::Decimal(s) => py_types(py)?.decimal.bind(py).call1((s.as_str(),))?,
         DecodedValue::Array(items) => {
             // A Postgres array reconstructs as a `list` — matching what
             // a Postgres array has always decoded into, since a
@@ -249,41 +414,39 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
                 ));
             }
             // Positional form: timedelta(days, seconds, microseconds, ...).
-            py.import("datetime")?
-                .getattr("timedelta")?
-                .call1((*days, 0, *microseconds))?
+            py_types(py)?.timedelta.bind(py).call1((*days, 0, *microseconds))?
         }
         DecodedValue::Date(days) => {
-            let epoch = py.import("datetime")?.getattr("date")?.call1((2000, 1, 1))?;
-            let delta = py.import("datetime")?.getattr("timedelta")?.call1((*days,))?;
-            epoch.call_method1("__add__", (delta,))?
+            let (y, m, d) = civil_from_days(i64::from(*days) + PG_EPOCH_DAYS_FROM_UNIX);
+            PyDate::new(py, y, m, d)?.into_any()
         }
         DecodedValue::Time(us) => {
             // PG `time` is always in [0, 86_400_000_000) microseconds —
-            // non-negative, so plain euclidean division/remainder suffices.
-            let microsecond = us.rem_euclid(1_000_000);
-            let total_s = us.div_euclid(1_000_000);
-            let second = total_s.rem_euclid(60);
-            let total_m = total_s.div_euclid(60);
-            let minute = total_m.rem_euclid(60);
-            let hour = total_m.div_euclid(60);
-            py.import("datetime")?
-                .getattr("time")?
-                .call1((hour, minute, second, microsecond))?
+            // non-negative, so plain division/remainder suffices.
+            let microsecond = (us % 1_000_000) as u32;
+            let total_s = us / 1_000_000;
+            PyTime::new(
+                py,
+                (total_s / 3600) as u8,
+                ((total_s / 60) % 60) as u8,
+                (total_s % 60) as u8,
+                microsecond,
+                None,
+            )?
+            .into_any()
         }
         DecodedValue::Timestamp(us) => {
-            let epoch = py.import("datetime")?.getattr("datetime")?.call1((2000, 1, 1))?;
-            let delta = py.import("datetime")?.getattr("timedelta")?.call1((0, 0, *us))?;
-            epoch.call_method1("__add__", (delta,))?
+            let (days, microsecond, hour, minute, second) = split_epoch_micros(*us);
+            let (y, m, d) = civil_from_days(days);
+            PyDateTime::new(py, y, m, d, hour, minute, second, microsecond, None)?.into_any()
         }
         DecodedValue::Timestamptz(us) => {
-            let utc = py.import("datetime")?.getattr("timezone")?.getattr("utc")?;
-            let epoch = py
-                .import("datetime")?
-                .getattr("datetime")?
-                .call1((2000, 1, 1, 0, 0, 0, 0, utc))?;
-            let delta = py.import("datetime")?.getattr("timedelta")?.call1((0, 0, *us))?;
-            epoch.call_method1("__add__", (delta,))?
+            let (days, microsecond, hour, minute, second) = split_epoch_micros(*us);
+            let (y, m, d) = civil_from_days(days);
+            // `PyTzInfo::utc` is itself cached by pyo3, so this is not a
+            // per-value import.
+            let utc = PyTzInfo::utc(py)?;
+            PyDateTime::new(py, y, m, d, hour, minute, second, microsecond, Some(&utc))?.into_any()
         }
         DecodedValue::Range {
             lower,
@@ -300,8 +463,9 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
                 Some(v) => cached_to_py(py, v)?,
                 None => py.None().into_bound(py),
             };
-            py.import("pylon.datatypes")?
-                .getattr("Range")?
+            py_types(py)?
+                .range
+                .bind(py)
                 .call1((lower_py, upper_py, *inc_lower, *inc_upper, *empty))?
         }
     })
