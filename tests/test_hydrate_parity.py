@@ -168,10 +168,36 @@ def _describe(value):
     return value
 
 
+def _rowset(rows: list):
+    """Build a `RowSet` — the undecoded form the driver and the cache both
+    produce — from plain Python rows, by round-tripping them through the
+    cache's own encoder."""
+    import tempfile
+
+    from pylon._core import cache_get, cache_init, cache_put
+
+    global _cache_ready
+    if not _cache_ready:
+        cache_init(tempfile.mkdtemp(), 64)
+        _cache_ready = True
+    cache_put('parity', ['t'], rows)
+    return cache_get('parity')
+
+
+_cache_ready = False
+
+
 def assert_parity(rows: list, compiled):
+    """Run both implementations over the same rows and compare.
+
+    The native walk consumes the undecoded `RowSet`; the reference consumes
+    ordinary Python values. That difference is deliberate — it means this
+    also checks that the two representations of a row agree, not just that
+    the two walks do.
+    """
     from pylon._core import hydrate
 
-    native = hydrate(rows, compiled, hydration_registry())
+    native = hydrate(_rowset(rows), compiled, hydration_registry())
     reference = [_decode(row, compiled.shape, _python_registry()) for row in rows]
     assert [_describe(v) for v in native] == [_describe(v) for v in reference]
     return native

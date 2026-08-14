@@ -18,12 +18,15 @@
 //
 
 //! Conversion between Python objects and `pylon_value::DecodedValue` — the
-//! shared decode target both `pylon-cache` (cache hits) and `pylon-pgcon`
-//! (fresh rows off the wire) produce. One conversion here means a cache
-//! hit and a fresh query result become indistinguishable to Python by the
-//! time either reaches `cached_to_py`: the *existing*, unmodified
-//! `_decode()`/`_hydrate()` in `pylon/query.py` (driven by
-//! `CompiledQuery.shape`) does the real interpretation on both paths.
+//! shared representation both `pylon-cache` (cache hits) and `pylon-pgcon`
+//! (fresh rows off the wire) produce, which is what makes a cache hit and a
+//! live query result the same thing to everything downstream.
+//!
+//! On the query hot path only *leaves* come through `cached_to_py`, called
+//! from `crate::hydrate` as it walks the compiled query's shape; whole rows
+//! are converted only for callers that genuinely want plain Python values
+//! (`RowSet::to_list`, admin SQL, tests). `py_to_cached` is the reverse, for
+//! bound query parameters and for values handed to the cache directly.
 
 use std::sync::OnceLock;
 
@@ -53,6 +56,7 @@ const US_PER_DAY: i64 = 86_400_000_000;
 /// `OnceLock::get_or_init`) is the deadlock-safe form: initializing calls
 /// arbitrary Python code, which must not block while another thread holds
 /// the same lock.
+///
 /// `datetime`/`date`/`time` are deliberately absent: those are recognised
 /// with pyo3's `cast::<PyDateTime>()` (a C-level `PyDateTime_Check`), which
 /// needs no type object held here.
@@ -282,66 +286,6 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
     )))
 }
 
-#[cfg(test)]
-mod calendar_tests {
-    use super::{PG_EPOCH_DAYS_FROM_UNIX, US_PER_DAY, civil_from_days, days_from_civil, split_epoch_micros};
-
-    #[test]
-    fn the_two_epochs_are_the_documented_distance_apart() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(2000, 1, 1), PG_EPOCH_DAYS_FROM_UNIX);
-    }
-
-    #[test]
-    fn round_trips_every_day_across_four_centuries() {
-        // Covers all four century-leap cases (1900 and 2100 not leap, 2000
-        // leap) and every ordinary leap year in between, which is where a
-        // hand-rolled calendar conversion actually breaks.
-        for z in days_from_civil(1800, 1, 1)..=days_from_civil(2200, 1, 1) {
-            let (y, m, d) = civil_from_days(z);
-            assert_eq!(days_from_civil(y, m.into(), d.into()), z, "round trip failed at day {z}");
-        }
-    }
-
-    #[test]
-    fn handles_the_century_leap_rule() {
-        // 2000 is a leap year (divisible by 400); 1900 and 2100 are not.
-        assert_eq!(civil_from_days(days_from_civil(2000, 2, 28) + 1), (2000, 2, 29));
-        assert_eq!(civil_from_days(days_from_civil(1900, 2, 28) + 1), (1900, 3, 1));
-        assert_eq!(civil_from_days(days_from_civil(2100, 2, 28) + 1), (2100, 3, 1));
-    }
-
-    #[test]
-    fn handles_dates_before_the_pylon_epoch() {
-        // Negative microsecond counts are the case truncating division gets
-        // wrong: 1999-12-31T23:59:59.999999 is one microsecond before the
-        // epoch, and must not land on 2000-01-01 or on day -1 at hour 0.
-        let (days, us, h, m, s) = split_epoch_micros(-1);
-        assert_eq!(civil_from_days(days), (1999, 12, 31));
-        assert_eq!((h, m, s, us), (23, 59, 59, 999_999));
-    }
-
-    #[test]
-    fn splits_a_whole_day_before_the_epoch_exactly() {
-        let (days, us, h, m, s) = split_epoch_micros(-US_PER_DAY);
-        assert_eq!(civil_from_days(days), (1999, 12, 31));
-        assert_eq!((h, m, s, us), (0, 0, 0, 0));
-    }
-
-    #[test]
-    fn splits_the_epoch_itself() {
-        let (days, us, h, m, s) = split_epoch_micros(0);
-        assert_eq!(civil_from_days(days), (2000, 1, 1));
-        assert_eq!((h, m, s, us), (0, 0, 0, 0));
-    }
-
-    #[test]
-    fn covers_the_extremes_python_datetime_can_represent() {
-        assert_eq!(civil_from_days(days_from_civil(1, 1, 1)), (1, 1, 1));
-        assert_eq!(civil_from_days(days_from_civil(9999, 12, 31)), (9999, 12, 31));
-    }
-}
-
 /// Reconstructs a Python value from `DecodedValue`, structurally equivalent
 /// to what the driver decodes — safe to feed into the existing
 /// `_decode()`/`_hydrate()` exactly as if it came from a live query,
@@ -469,4 +413,64 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
                 .call1((lower_py, upper_py, *inc_lower, *inc_upper, *empty))?
         }
     })
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::{PG_EPOCH_DAYS_FROM_UNIX, US_PER_DAY, civil_from_days, days_from_civil, split_epoch_micros};
+
+    #[test]
+    fn the_two_epochs_are_the_documented_distance_apart() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 1, 1), PG_EPOCH_DAYS_FROM_UNIX);
+    }
+
+    #[test]
+    fn round_trips_every_day_across_four_centuries() {
+        // Covers all four century-leap cases (1900 and 2100 not leap, 2000
+        // leap) and every ordinary leap year in between, which is where a
+        // hand-rolled calendar conversion actually breaks.
+        for z in days_from_civil(1800, 1, 1)..=days_from_civil(2200, 1, 1) {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m.into(), d.into()), z, "round trip failed at day {z}");
+        }
+    }
+
+    #[test]
+    fn handles_the_century_leap_rule() {
+        // 2000 is a leap year (divisible by 400); 1900 and 2100 are not.
+        assert_eq!(civil_from_days(days_from_civil(2000, 2, 28) + 1), (2000, 2, 29));
+        assert_eq!(civil_from_days(days_from_civil(1900, 2, 28) + 1), (1900, 3, 1));
+        assert_eq!(civil_from_days(days_from_civil(2100, 2, 28) + 1), (2100, 3, 1));
+    }
+
+    #[test]
+    fn handles_dates_before_the_pylon_epoch() {
+        // Negative microsecond counts are the case truncating division gets
+        // wrong: 1999-12-31T23:59:59.999999 is one microsecond before the
+        // epoch, and must not land on 2000-01-01 or on day -1 at hour 0.
+        let (days, us, h, m, s) = split_epoch_micros(-1);
+        assert_eq!(civil_from_days(days), (1999, 12, 31));
+        assert_eq!((h, m, s, us), (23, 59, 59, 999_999));
+    }
+
+    #[test]
+    fn splits_a_whole_day_before_the_epoch_exactly() {
+        let (days, us, h, m, s) = split_epoch_micros(-US_PER_DAY);
+        assert_eq!(civil_from_days(days), (1999, 12, 31));
+        assert_eq!((h, m, s, us), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn splits_the_epoch_itself() {
+        let (days, us, h, m, s) = split_epoch_micros(0);
+        assert_eq!(civil_from_days(days), (2000, 1, 1));
+        assert_eq!((h, m, s, us), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn covers_the_extremes_python_datetime_can_represent() {
+        assert_eq!(civil_from_days(days_from_civil(1, 1, 1)), (1, 1, 1));
+        assert_eq!(civil_from_days(days_from_civil(9999, 12, 31)), (9999, 12, 31));
+    }
 }

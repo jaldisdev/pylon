@@ -295,8 +295,7 @@ async def _execute(
         # `pool.query` already raises the correctly-mapped
         # `pylon.exceptions.*` instance on failure — no translation needed.
         rows = await client._require_pool().query_compiled(compiled, params)
-        records = [{'result': row} for row in rows]
-        results = _hydrate(records, compiled)
+        results = _hydrate(rows, compiled)
     except Exception as e:
         click.echo(_format_exception(e))
         return
