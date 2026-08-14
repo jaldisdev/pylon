@@ -796,6 +796,7 @@ class TestEnsureConnected:
             with (
                 patch('pylon._core.pgcon_connect', new=AsyncMock(return_value=mock_pool)) as mock_connect,
                 patch('pylon._core.migration_read_schema_snapshot', new=AsyncMock(return_value=None)),
+                patch('pylon._core.migration_check_internal_schema', new=AsyncMock(return_value=(False, None))),
             ):
                 client = Client(cfg)
                 await client.ensure_connected()
@@ -820,6 +821,7 @@ class TestEnsureConnected:
             with (
                 patch('pylon._core.pgcon_connect', new=AsyncMock(return_value=mock_pool)) as mock_connect,
                 patch('pylon._core.migration_read_schema_snapshot', new=AsyncMock(return_value=None)),
+                patch('pylon._core.migration_check_internal_schema', new=AsyncMock(return_value=(False, None))),
             ):
                 client = Client(cfg)
                 await client.ensure_connected()
@@ -893,6 +895,64 @@ class TestRetryingTransaction:
                     async for tx in iterator:
                         async with tx:
                             pass
+
+        run(_run())
+
+
+class TestInternalSchemaCheck:
+    """`ensure_connected` refuses a database this build cannot work against.
+
+    Raised rather than warned so the failure lands at connect, next to its
+    cause — the alternative is an unrelated-looking error deep in a later
+    query, which is exactly how a missing internal column presents.
+    """
+
+    def _check(self, fatal, message):
+        async def _run():
+            from pylon.client import _check_internal_schema
+
+            with patch(
+                'pylon._core.migration_check_internal_schema',
+                new=AsyncMock(return_value=(fatal, message)),
+            ):
+                await _check_internal_schema(MagicMock())
+
+        return _run
+
+    def test_an_unsupported_database_raises_at_connect(self):
+        from pylon.exceptions import ConnectionFailedError
+
+        with pytest.raises(ConnectionFailedError, match='pylon migration apply'):
+            run(self._check(True, 'too old; run `pylon migration apply`')())
+
+    def test_a_newer_database_warns_but_connects(self):
+        # A rollback looks like this. Failing closed would turn the recovery
+        # lever into a second outage.
+        with patch('logging.Logger.warning') as warn:
+            run(self._check(False, 'written by a newer version')())
+        warn.assert_called_once()
+
+    def test_a_current_or_unmigrated_database_is_silent(self):
+        with patch('logging.Logger.warning') as warn:
+            run(self._check(False, None)())
+        warn.assert_not_called()
+
+    def test_the_check_never_repairs_anything(self):
+        """A client holds an application role that may lack DDL rights, and
+        having every process that connects mutate shared internal structures
+        is how a rolling deploy becomes an outage."""
+        async def _run():
+            from pylon.client import _check_internal_schema
+
+            with (
+                patch(
+                    'pylon._core.migration_check_internal_schema',
+                    new=AsyncMock(return_value=(False, None)),
+                ),
+                patch('pylon._core.migration_ensure_internal_schema', new=AsyncMock()) as ensure,
+            ):
+                await _check_internal_schema(MagicMock())
+            ensure.assert_not_called()
 
         run(_run())
 

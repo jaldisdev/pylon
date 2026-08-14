@@ -52,6 +52,20 @@ fn migration_ensure_internal_schema<'py>(py: Python<'py>, pool: &PgconPool) -> P
     })
 }
 
+/// Classifies this database's internal `_pylon` schema against what this
+/// build expects, as `(is_fatal, message)` — `message` is `None` when there
+/// is nothing to report (a current database, or one no migration has ever
+/// run against). Returned as a plain pair rather than a mirrored enum
+/// class: the caller only ever branches on `is_fatal` and shows `message`.
+#[pyfunction]
+fn migration_check_internal_schema<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let state = core_migrate::check_internal_schema(&pool).await.map_err(migrate_err)?;
+        Ok((state.is_fatal(), state.message()))
+    })
+}
+
 /// Returns every `_pylon."Migrations"` row as `(id, onto, db_state,
 /// schema_state, applied)` tuples — `applied` is `applied_at IS NOT NULL`;
 /// `db_state` and `schema_state` are raw JSON snapshot text (or `None`),
@@ -211,6 +225,7 @@ fn migration_read_schema_snapshot<'py>(py: Python<'py>, pool: &PgconPool) -> PyR
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migration_ensure_internal_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_check_internal_schema, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_tracking, m)?)?;
     m.add_function(wrap_pyfunction!(migration_applied_tip, m)?)?;
     m.add_function(wrap_pyfunction!(migration_record_applied, m)?)?;
