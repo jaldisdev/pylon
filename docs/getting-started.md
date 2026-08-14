@@ -74,23 +74,13 @@ class Post:
 
 This declares two object types (`blog::Author`, `blog::Post` — module name `blog` comes from the filename), a unique `email` property, a boolean with a literal default, a timestamp defaulting to the current time, and a required link from `Post` to `Author`. See [Object types](schema/types.md), [Properties and scalars](schema/properties-and-scalars.md), [Links](schema/links.md), and [Constraints](schema/constraints.md) for the full picture.
 
-## Install the standard library
-
-Once, per database — installs `_pylon`, the internal schema Pylon's own generated SQL functions live in:
-
-```bash
-pylon database initialize
-```
-
-Safe to re-run; every statement it generates is idempotent.
-
 ## Generate and apply a migration
 
 ```bash
 pylon migration create
 ```
 
-This diffs your schema module(s) against the live database and writes a migration file under `dbschema/migrations/`, prompting interactively if anything is ambiguous (a rename vs. a drop+create, a cast for a changed property type). Then:
+This diffs your schema module(s) against the live database and writes a migration file under `dbschema/migrations/`, prompting interactively if anything is ambiguous (a rename vs. a drop+create, a cast for a changed property type). On its first run against a database it also installs `_pylon`, the internal schema Pylon's own generated SQL functions live in — there's no separate setup step. Then:
 
 ```bash
 pylon migration apply
