@@ -65,7 +65,7 @@ def _build_schema(types, enums, scalars, channels=None):
 
 
 def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, unique_module):
-    from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
 
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
@@ -84,7 +84,7 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
 
         schema_v1 = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema_v1))
-        await migration_ensure_tracking_tables(live_pool)
+        await migration_ensure_internal_schema(live_pool)
         await migration_write_schema_snapshot(live_pool, schema_v1.to_json())
 
         # A freshly-connected client sees the just-migrated (non-readonly)
@@ -187,7 +187,7 @@ async def _first_payload(gen, trigger_factory=None, *, timeout: float = 20.0, re
 
 
 def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
-    from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
 
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
@@ -212,7 +212,7 @@ def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
 
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
-        await migration_ensure_tracking_tables(live_pool)
+        await migration_ensure_internal_schema(live_pool)
         await migration_write_schema_snapshot(live_pool, schema.to_json())
 
         client = Client(cfg)
@@ -233,7 +233,7 @@ def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
 def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, unique_module):
     import uuid
 
-    from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
 
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
@@ -258,7 +258,7 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
 
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
-        await migration_ensure_tracking_tables(live_pool)
+        await migration_ensure_internal_schema(live_pool)
         await migration_write_schema_snapshot(live_pool, schema.to_json())
 
         client = Client(cfg)
@@ -283,7 +283,7 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
 
 
 def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
-    from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
 
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
@@ -314,7 +314,7 @@ def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
 
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
-        await migration_ensure_tracking_tables(live_pool)
+        await migration_ensure_internal_schema(live_pool)
         await migration_write_schema_snapshot(live_pool, schema.to_json())
 
         client = Client(cfg)
@@ -335,7 +335,7 @@ def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
 
 
 def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
-    from pylon._core import export_schema, migration_ensure_tracking_tables, migration_write_schema_snapshot
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
 
     from pylon.client import Client
     from pylon.config import Config, DatabaseConfig
@@ -360,7 +360,7 @@ def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
 
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
-        await migration_ensure_tracking_tables(live_pool)
+        await migration_ensure_internal_schema(live_pool)
         await migration_write_schema_snapshot(live_pool, schema.to_json())
 
         client = Client(cfg)

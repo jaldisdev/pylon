@@ -137,7 +137,7 @@ async def _apply(
     from pylon._core import (
         migration_advisory_lock,
         migration_applied_tip,
-        migration_ensure_tracking_tables,
+        migration_ensure_internal_schema,
         migration_read_tracking,
         migration_record_applied,
         migration_try_advisory_lock,
@@ -154,7 +154,7 @@ async def _apply(
     chain = _ordered_chain(migrations)
 
     pool = await pgcon_connect(_pg_dsn(config), config.database.pool_max_size)
-    await migration_ensure_tracking_tables(pool)
+    await migration_ensure_internal_schema(pool)
 
     # Session-level advisory lock (§9.3)
     if no_wait:
@@ -267,7 +267,7 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
     from pylon._core import (
         introspect_db_state,
         migration_applied_tip,
-        migration_ensure_tracking_tables,
+        migration_ensure_internal_schema,
         migration_read_tracking,
         pgcon_connect,
     )
@@ -280,7 +280,7 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
     chain = _ordered_chain(migrations)
 
     pool = await pgcon_connect(_pg_dsn(config), 2)
-    await migration_ensure_tracking_tables(pool)
+    await migration_ensure_internal_schema(pool)
     tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, schema_state, applied), ...]
     db_state = await introspect_db_state(pool) if dev_mode else None
 
@@ -386,10 +386,10 @@ async def _log(
         chain = _ordered_chain(_load_migrations(d))
         entries = [{'id': m.id, 'onto': m.onto, 'ref': m.filename} for m in chain]
     else:
-        from pylon._core import migration_ensure_tracking_tables, pgcon_connect
+        from pylon._core import migration_ensure_internal_schema, pgcon_connect
 
         pool = await pgcon_connect(_pg_dsn(config), 2)
-        await migration_ensure_tracking_tables(pool)
+        await migration_ensure_internal_schema(pool)
         rows = await pool.query_named(
             """
             SELECT id, onto,
@@ -452,7 +452,7 @@ async def _sync_once(config) -> None:
     from pylon._core import (
         SchemaDescriptor,
         introspect_db_state,
-        migration_ensure_tracking_tables,
+        migration_ensure_internal_schema,
         migration_read_schema_snapshot,
         migration_write_schema_snapshot,
         pgcon_connect,
@@ -479,7 +479,7 @@ async def _sync_once(config) -> None:
     # rest of the DDL that needs it.
     ops = _core_missing_extension_ddl(schema, db_state) + ops
 
-    await migration_ensure_tracking_tables(pool)
+    await migration_ensure_internal_schema(pool)
 
     # DDL-visible changes (`ops` above) aren't the whole story: schema
     # semantics with zero physical DDL footprint (`readonly`, rewrites,
@@ -1049,7 +1049,7 @@ async def _create_from_diff(
         db_state_from_json,
         introspect_db_state,
         migration_applied_tip,
-        migration_ensure_tracking_tables,
+        migration_ensure_internal_schema,
         migration_read_tracking,
         pgcon_connect,
         render_migration_file,
@@ -1080,7 +1080,7 @@ async def _create_from_diff(
     chain_tip = chain[-1].id if chain else 'initial'
 
     pool = await pgcon_connect(_pg_dsn(config), 2)
-    await migration_ensure_tracking_tables(pool)
+    await migration_ensure_internal_schema(pool)
     tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, schema_state, applied), ...]
     applied_tip = migration_applied_tip(tracking)
     chain_ids = [m.id for m in chain]
@@ -1397,7 +1397,7 @@ async def _squash(
     from pylon._core import (
         compute_migration_short_id,
         introspect_db_state,
-        migration_ensure_tracking_tables,
+        migration_ensure_internal_schema,
         pgcon_connect,
         render_migration_file,
     )
@@ -1466,7 +1466,7 @@ async def _squash(
         shadow_dsn = _shadow_dsn(dsn, shadow_name)
         shadow_pool = await pgcon_connect(shadow_dsn, 2)
         await shadow_pool.execute('CREATE SCHEMA IF NOT EXISTS _pylon', [])
-        await migration_ensure_tracking_tables(shadow_pool)
+        await migration_ensure_internal_schema(shadow_pool)
 
         # Apply migrations before the squash range to reach the "before" state.
         pre_range = chain[:range_start]

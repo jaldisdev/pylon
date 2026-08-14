@@ -199,7 +199,7 @@ async def main() -> None:
         cache_key,
         cache_put,
         export_schema,
-        migration_ensure_tracking_tables,
+        migration_ensure_internal_schema,
         migration_write_schema_snapshot,
         pgcon_connect,
     )
@@ -217,7 +217,7 @@ async def main() -> None:
     # schema in `_pylon."Schema"`, so the benchmark schema has to be written
     # there too — otherwise the client compiles against whatever a previous
     # run left behind.
-    await migration_ensure_tracking_tables(pool)
+    await migration_ensure_internal_schema(pool)
     await migration_write_schema_snapshot(pool, schema.to_json())
     _set_schema(schema)
 
