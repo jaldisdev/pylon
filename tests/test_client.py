@@ -85,11 +85,11 @@ class TestDatabaseConfigPoolSize:
 
 
 # ---------------------------------------------------------------------------
-# Helpers — _transpile and _hydrate
+# Helpers — _compile_and_bind and _hydrate
 # ---------------------------------------------------------------------------
 
 
-class TestTranspile:
+class TestCompileAndBind:
     def _make_compiled(self, sql: str = 'SELECT 1', param_names: list[str] | None = None):
         compiled = MagicMock()
         compiled.sql = sql
@@ -97,85 +97,84 @@ class TestTranspile:
         return compiled
 
     def test_non_str_raises_interface_error(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         with pytest.raises(InterfaceError):
-            _transpile(123, {})  # type: ignore[arg-type]
+            _compile_and_bind(123, {})  # type: ignore[arg-type]
 
     def test_calls_pyql_compile(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled('SELECT 42')
         with patch('pylon.query.compile', return_value=compiled):
-            sql, params, returned = _transpile('select 42', {})
+            returned, params = _compile_and_bind('select 42', {})
 
-        assert sql == 'SELECT 42'
-        assert params == []
         assert returned is compiled
+        assert params == []
 
     def test_kwargs_become_positional_params(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled('SELECT $1', param_names=['x'])
         with patch('pylon.query.compile', return_value=compiled):
-            _sql, params, _ = _transpile('select $x', {'x': 99})
+            _, params = _compile_and_bind('select $x', {'x': 99})
 
         assert params == [99]
 
     def test_multiple_kwargs_order_by_param_names(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         # param_names determines order, not kwargs insertion order
         compiled = self._make_compiled('SELECT $1, $2', param_names=['a', 'b'])
         with patch('pylon.query.compile', return_value=compiled):
-            _, params, _ = _transpile('q', {'b': 2, 'a': 1})
+            _, params = _compile_and_bind('q', {'b': 2, 'a': 1})
 
         assert params == [1, 2]
 
     def test_param_names_reorders_kwargs(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         # $1=age, $2=name — even though name comes first in kwargs
         compiled = self._make_compiled('SELECT $1, $2', param_names=['age', 'name'])
         with patch('pylon.query.compile', return_value=compiled):
-            _, params, _ = _transpile('q', {'name': 'Alice', 'age': 30})
+            _, params = _compile_and_bind('q', {'name': 'Alice', 'age': 30})
 
         assert params == [30, 'Alice']
 
     def test_missing_param_raises_interface_error(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled('SELECT $1', param_names=['name'])
         with (
             patch('pylon.query.compile', return_value=compiled),
             pytest.raises(InterfaceError, match='Missing query parameter'),
         ):
-            _transpile('select $name', {})
+            _compile_and_bind('select $name', {})
 
     def test_config_options_thread_allow_user_specified_id(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled('INSERT ...')
         with patch('pylon.query.compile', return_value=compiled) as mock_compile:
-            _transpile('insert ...', {}, config_options={'allow_user_specified_id': True})
+            _compile_and_bind('insert ...', {}, config_options={'allow_user_specified_id': True})
         assert mock_compile.call_args.kwargs['allow_user_specified_id'] is True
 
     def test_missing_config_options_defaults_to_false(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled('INSERT ...')
         with patch('pylon.query.compile', return_value=compiled) as mock_compile:
-            _transpile('insert ...', {})
+            _compile_and_bind('insert ...', {})
         assert mock_compile.call_args.kwargs['allow_user_specified_id'] is False
 
     def test_compile_failure_raises_internal_error(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         with (
             patch('pylon.query.compile', side_effect=RuntimeError('todo')),
             pytest.raises(InternalServerError, match='todo'),
         ):
-            _transpile('select 1', {})
+            _compile_and_bind('select 1', {})
 
 
 class TestMergeArgs:
@@ -205,7 +204,7 @@ class TestMergeArgs:
         assert result['0'] == 'override'
 
 
-class TestTranspilePositional:
+class TestCompileAndBindPositional:
     def _make_compiled(self, param_names):
         c = MagicMock()
         c.sql = 'SELECT $1'
@@ -213,24 +212,24 @@ class TestTranspilePositional:
         return c
 
     def test_positional_arg_bound_by_index_name(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled(['0'])
         with patch('pylon.query.compile', return_value=compiled):
-            _, params, _ = _transpile('select $0', {'0': 'Alice'})
+            _, params = _compile_and_bind('select $0', {'0': 'Alice'})
         assert params == ['Alice']
 
     def test_two_positional_args_in_order(self):
-        from pylon.client import _transpile
+        from pylon.client import _compile_and_bind
 
         compiled = self._make_compiled(['0', '1'])
         with patch('pylon.query.compile', return_value=compiled):
-            _, params, _ = _transpile('select $0, $1', {'0': 'Alice', '1': 30})
+            _, params = _compile_and_bind('select $0, $1', {'0': 'Alice', '1': 30})
         assert params == ['Alice', 30]
 
 
 class TestClientQueryPositional:
-    def test_positional_args_forwarded_to_transpile(self):
+    def test_positional_args_forwarded_to_the_compile_step(self):
         async def _run():
             pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
@@ -359,32 +358,26 @@ def _make_pool(query_result=None, execute_result=None):
 
 
 class TestClientQuery:
-    def _patch_transpile(self, sql='SELECT 1'):
+    def _patch_compile(self, sql='SELECT 1'):
         compiled = _fake_compiled(sql)
 
         async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
             return compiled, list(kwargs.values())
 
-        def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
-            return sql, list(kwargs.values()), compiled
-
         def fake_bind(pyql, kwargs, globals_=None, config_options=None):
             return compiled, list(kwargs.values())
 
         p1 = patch('pylon.client._compile_and_resolve', side_effect=fake_resolve)
-        p2 = patch('pylon.client._transpile', side_effect=fake_transpile)
         p3 = patch('pylon.client._compile_and_bind', side_effect=fake_bind)
 
         class _Both:
             def __enter__(self):
                 p1.__enter__()
-                p2.__enter__()
                 p3.__enter__()
                 return self
 
             def __exit__(self, *a):
                 p3.__exit__(*a)
-                p2.__exit__(*a)
                 p1.__exit__(*a)
 
         return _Both(), compiled
@@ -399,8 +392,8 @@ class TestClientQuery:
             client = _client_with_pool(pool)
             hydrated = [object(), object()]
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, self._patch_hydrate(hydrated):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, self._patch_hydrate(hydrated):
                 result = await client.query('select User')
 
             assert result is hydrated
@@ -412,8 +405,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, self._patch_hydrate([]):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, self._patch_hydrate([]):
                 result = await client.query_single('select User')
 
             assert result is None
@@ -427,8 +420,8 @@ class TestClientQuery:
             client = _client_with_pool(pool)
 
             hydrated_row = object()
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, patch('pylon.client._hydrate', return_value=[hydrated_row]):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, patch('pylon.client._hydrate', return_value=[hydrated_row]):
                 result = await client.query_single('select User')
 
             assert result is hydrated_row
@@ -440,8 +433,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=['r1', 'r2'])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, pytest.raises(ResultCardinalityError):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, pytest.raises(ResultCardinalityError):
                 await client.query_single('select User')
 
         run(_run())
@@ -451,8 +444,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, self._patch_hydrate([]), pytest.raises(NoDataError):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, self._patch_hydrate([]), pytest.raises(NoDataError):
                 await client.query_required_single('select User')
 
         run(_run())
@@ -462,8 +455,8 @@ class TestClientQuery:
             pool = _make_pool()
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch:
+            compile_patch, _ = self._patch_compile()
+            with compile_patch:
                 result = await client.execute("insert User { name := 'x' }")
 
             assert result is None
@@ -476,8 +469,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=['[{"id": 1}]'])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch:
+            compile_patch, _ = self._patch_compile()
+            with compile_patch:
                 result = await client.query_json('select User')
 
             assert result == '[{"id": 1}]'
@@ -489,8 +482,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch:
+            compile_patch, _ = self._patch_compile()
+            with compile_patch:
                 result = await client.query_json('select User')
 
             assert result == '[]'
@@ -502,8 +495,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch:
+            compile_patch, _ = self._patch_compile()
+            with compile_patch:
                 result = await client.query_single_json('select User')
 
             assert result is None
@@ -515,8 +508,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=['r1', 'r2'])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, pytest.raises(ResultCardinalityError):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, pytest.raises(ResultCardinalityError):
                 await client.query_single_json('select User')
 
         run(_run())
@@ -526,8 +519,8 @@ class TestClientQuery:
             pool = _make_pool(query_result=[])
             client = _client_with_pool(pool)
 
-            transpile_patch, _ = self._patch_transpile()
-            with transpile_patch, pytest.raises(NoDataError):
+            compile_patch, _ = self._patch_compile()
+            with compile_patch, pytest.raises(NoDataError):
                 await client.query_required_single_json('select User')
 
         run(_run())
@@ -539,32 +532,26 @@ class TestClientQuery:
 
 
 class TestClientCaching:
-    def _patch_transpile(self, sql='SELECT 1', tags=None):
+    def _patch_compile(self, sql='SELECT 1', tags=None):
         compiled = _fake_compiled(sql, tags=tags)
 
         async def fake_resolve(pyql, kwargs, config, globals_=None, config_options=None):
             return compiled, list(kwargs.values())
 
-        def fake_transpile(pyql, kwargs, globals_=None, config_options=None):
-            return sql, list(kwargs.values()), compiled
-
         def fake_bind(pyql, kwargs, globals_=None, config_options=None):
             return compiled, list(kwargs.values())
 
         p1 = patch('pylon.client._compile_and_resolve', side_effect=fake_resolve)
-        p2 = patch('pylon.client._transpile', side_effect=fake_transpile)
         p3 = patch('pylon.client._compile_and_bind', side_effect=fake_bind)
 
         class _Both:
             def __enter__(self):
                 p1.__enter__()
-                p2.__enter__()
                 p3.__enter__()
                 return self
 
             def __exit__(self, *a):
                 p3.__exit__(*a)
-                p2.__exit__(*a)
                 p1.__exit__(*a)
 
         return _Both(), compiled
@@ -582,9 +569,9 @@ class TestClientCaching:
 
             _cache.init(client._config.cache)
 
-            transpile_patch, _ = self._patch_transpile(tags=['public.person'])
+            compile_patch, _ = self._patch_compile(tags=['public.person'])
             with (
-                transpile_patch,
+                compile_patch,
                 patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 first = await client.query('select Person')
@@ -604,9 +591,9 @@ class TestClientCaching:
 
             _cache.init(client._config.cache)
 
-            transpile_patch, _ = self._patch_transpile(tags=['public.person'])
+            compile_patch, _ = self._patch_compile(tags=['public.person'])
             with (
-                transpile_patch,
+                compile_patch,
                 patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 first = await client.query_single('select Person')
@@ -626,8 +613,8 @@ class TestClientCaching:
 
             _cache.init(client._config.cache)
 
-            transpile_patch, _ = self._patch_transpile(tags=['public.person'])
-            with transpile_patch:
+            compile_patch, _ = self._patch_compile(tags=['public.person'])
+            with compile_patch:
                 first = await client.query_json('select Person')
                 second = await client.query_json('select Person')
 
@@ -650,8 +637,8 @@ class TestClientCaching:
 
             _cache.init(client._config.cache)
 
-            transpile_patch, _ = self._patch_transpile(tags=['public.person'])
-            with transpile_patch:
+            compile_patch, _ = self._patch_compile(tags=['public.person'])
+            with compile_patch:
                 first = await client.query_single_json('select Person')
                 second = await client.query_single_json('select Person')
 
@@ -670,9 +657,9 @@ class TestClientCaching:
 
             _cache.init(client._config.cache)
 
-            transpile_patch, _ = self._patch_transpile(tags=[])
+            compile_patch, _ = self._patch_compile(tags=[])
             with (
-                transpile_patch,
+                compile_patch,
                 patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 await client.query('select 1')
@@ -690,9 +677,9 @@ class TestClientCaching:
             disabled = CacheConfig(enabled=False, path=tmp_path / 'cache')
             client = _client_with_pool(pool, cache_config=disabled)
 
-            transpile_patch, _ = self._patch_transpile(tags=['public.person'])
+            compile_patch, _ = self._patch_compile(tags=['public.person'])
             with (
-                transpile_patch,
+                compile_patch,
                 patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 await client.query('select Person')

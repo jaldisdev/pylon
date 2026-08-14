@@ -926,23 +926,6 @@ def _compile_and_bind(
     return compiled, params
 
 
-def _transpile(
-    pyql: str,
-    kwargs: dict[str, Any],
-    globals_: dict[str, Any] | None = None,
-    config_options: dict[str, Any] | None = None,
-) -> tuple[str, list[Any], CompiledQuery]:
-    """Compile PyQL to SQL text — only for the JSON-wrapping paths
-    (``query_json``/``query_single_json``), which still string-wrap raw SQL
-    in Python until a later phase moves that wrapping into Rust too.
-
-    Returns ``(sql, positional_params, compiled)`` ready for ``pool.query``/
-    ``pool.execute``.
-    """
-    compiled, params = _compile_and_bind(pyql, kwargs, globals_, config_options)
-    return compiled.sql, params, compiled
-
-
 def _hydrate(rows: list[Any], compiled: CompiledQuery) -> list[Any]:
     """Decode raw result rows into Python dataclass instances.
 
