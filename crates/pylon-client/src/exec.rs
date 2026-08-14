@@ -121,6 +121,7 @@ pub(crate) async fn query<E: Executor>(
     }
     let rows = executor.run_query(&compiled.sql, &bound).await.map_err(Error::Db)?;
     if let Some(cache) = cache {
+        crate::cache::invalidate_for(cache, &compiled)?;
         crate::cache::put_rows(cache, &compiled, &bound, &rows)?;
     }
     Ok(rows.iter().map(|row| decode(&compiled.shape.root, row)).collect())
@@ -149,6 +150,7 @@ pub(crate) async fn query_single<E: Executor>(
         return Err(Error::ResultCardinality { got: rows.len() });
     }
     if let Some(cache) = cache {
+        crate::cache::invalidate_for(cache, &compiled)?;
         crate::cache::put_rows(cache, &compiled, &bound, &rows)?;
     }
     Ok(rows.first().map(|row| decode(&compiled.shape.root, row)))
@@ -175,9 +177,13 @@ pub(crate) async fn execute<E: Executor>(
     schema: &SchemaDescriptor,
     config: &SessionConfig,
     globals: &HashMap<String, DecodedValue>,
+    cache: Option<&pylon_cache::Cache>,
 ) -> Result<()> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
     executor.run_execute(&compiled.sql, &bound).await.map_err(Error::Db)?;
+    if let Some(cache) = cache {
+        crate::cache::invalidate_for(cache, &compiled)?;
+    }
     Ok(())
 }
 
@@ -208,6 +214,7 @@ pub(crate) async fn query_json<E: Executor>(
         _ => "[]".to_string(),
     };
     if let Some(cache) = cache {
+        crate::cache::invalidate_for(cache, &compiled)?;
         crate::cache::put_json(cache, "json_all", &compiled, &bound, Some(&value))?;
     }
     Ok(value)
@@ -234,6 +241,7 @@ pub(crate) async fn query_single_json<E: Executor>(
     }
     if rows.is_empty() {
         if let Some(cache) = cache {
+            crate::cache::invalidate_for(cache, &compiled)?;
             crate::cache::put_json(cache, "json_single", &compiled, &bound, None)?;
         }
         return Ok(None);
@@ -245,6 +253,7 @@ pub(crate) async fn query_single_json<E: Executor>(
         _ => None,
     };
     if let Some(cache) = cache {
+        crate::cache::invalidate_for(cache, &compiled)?;
         crate::cache::put_json(cache, "json_single", &compiled, &bound, value.as_deref())?;
     }
     Ok(value)

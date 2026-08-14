@@ -266,7 +266,16 @@ impl Client {
 
     pub async fn execute(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<()> {
         let schema = self.schema.read().unwrap().clone();
-        exec::execute(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::execute(
+            &*self.pool,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
+        )
+        .await
     }
 
     /// Subscribes to a schema-declared [`Channel`](pylon_core::schema::ChannelDescriptor)
@@ -411,6 +420,7 @@ impl Client {
                 schema: self.schema.clone(),
                 config: self.config.clone(),
                 globals: self.globals.clone(),
+                cache: self.cache.clone(),
             };
             let result = body(&tx).await;
             match result {

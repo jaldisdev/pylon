@@ -55,6 +55,24 @@ fn is_cacheable(compiled: &CompiledQuery) -> bool {
     !compiled.mutates && !compiled.tags.is_empty()
 }
 
+/// Evicts every cached entry tagged with a set this statement wrote.
+///
+/// Cross-process invalidation is `NOTIFY`-driven and needs a listener, but a
+/// client's *own* writes must not: without this, a process that writes and
+/// then re-runs an identical read gets its own pre-write result back, and
+/// nothing in a plain program (no worker, no server) ever corrects it.
+/// Mirrors `pylon/cache.py::invalidate_for`.
+///
+/// Eviction only ever *removes* entries, so it's safe whenever the cache is
+/// open — correctness shouldn't depend on the write and the read that
+/// populated the entry agreeing about any per-set enable flag.
+pub(crate) fn invalidate_for(cache: &pylon_cache::Cache, compiled: &CompiledQuery) -> Result<()> {
+    if !compiled.mutates || compiled.tags.is_empty() {
+        return Ok(());
+    }
+    cache.invalidate(&compiled.tags).map_err(map_err)
+}
+
 /// Returns cached rows for `compiled`+`params`, or `None` on a cache miss.
 pub(crate) fn get_rows(
     cache: &pylon_cache::Cache,
@@ -184,6 +202,46 @@ mod tests {
         let (_dir, cache) = open_temp();
         let read = compiled("select person", &["public.person"], false);
         put_rows(&cache, &read, &[], &[DecodedValue::Str("row".into())]).unwrap();
+        assert!(get_rows(&cache, &read, &[]).unwrap().is_some());
+    }
+
+    /// Cross-process invalidation needs a `NOTIFY` listener, but a client's
+    /// own writes must not: without this, a program that reads, writes, then
+    /// repeats the read gets its own pre-write result back forever.
+    #[test]
+    fn a_write_evicts_a_read_sharing_its_tag() {
+        let (_dir, cache) = open_temp();
+        let read = compiled("select person", &["public.person"], false);
+        put_rows(&cache, &read, &[], &[DecodedValue::Str("before".into())]).unwrap();
+        assert!(get_rows(&cache, &read, &[]).unwrap().is_some());
+
+        let write = compiled("update person", &["public.person"], true);
+        invalidate_for(&cache, &write).unwrap();
+
+        assert_eq!(
+            get_rows(&cache, &read, &[]).unwrap(),
+            None,
+            "the read must be evicted by a write to the same set"
+        );
+    }
+
+    #[test]
+    fn a_write_leaves_an_unrelated_tag_alone() {
+        let (_dir, cache) = open_temp();
+        let other = compiled("select company", &["public.company"], false);
+        put_rows(&cache, &other, &[], &[DecodedValue::Str("row".into())]).unwrap();
+
+        invalidate_for(&cache, &compiled("update person", &["public.person"], true)).unwrap();
+        assert!(get_rows(&cache, &other, &[]).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_read_never_evicts() {
+        let (_dir, cache) = open_temp();
+        let read = compiled("select person", &["public.person"], false);
+        put_rows(&cache, &read, &[], &[DecodedValue::Str("row".into())]).unwrap();
+
+        invalidate_for(&cache, &read).unwrap();
         assert!(get_rows(&cache, &read, &[]).unwrap().is_some());
     }
 
