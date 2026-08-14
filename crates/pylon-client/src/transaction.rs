@@ -70,12 +70,16 @@ pub struct Transaction {
     pub(crate) schema: Arc<RwLock<SchemaDescriptor>>,
     pub(crate) config: SessionConfig,
     pub(crate) globals: Arc<HashMap<String, DecodedValue>>,
+    /// Held only to *evict* on a write — see `execute`. Never used to read
+    /// or populate: rows read inside a transaction aren't committed yet.
+    pub(crate) cache: Option<Arc<pylon_cache::Cache>>,
 }
 
 impl Transaction {
-    // Every query method below passes `None` for `exec`'s `cache`
-    // parameter — `pylon/client.py`'s `AsyncTransaction` never reads or
-    // writes the read-through cache either, only `Client` itself does.
+    // Every *read* method below passes `None` for `exec`'s `cache`
+    // parameter — uncommitted rows must never populate the read-through
+    // cache, matching `pylon/client.py`'s `AsyncTransaction`. `execute` is
+    // the exception: a write has to evict even from inside a transaction.
 
     pub async fn query(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Vec<Value>> {
         let schema = self.schema.read().unwrap().clone();
@@ -92,9 +96,21 @@ impl Transaction {
         exec::query_required_single(&self.inner, pyql, params, &schema, &self.config, &self.globals, None).await
     }
 
+    /// A write inside a transaction still evicts immediately: the cache is
+    /// never populated from inside a transaction, so an aborted attempt can
+    /// only over-evict — which costs a re-read and never serves stale data.
     pub async fn execute(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<()> {
         let schema = self.schema.read().unwrap().clone();
-        exec::execute(&self.inner, pyql, params, &schema, &self.config, &self.globals).await
+        exec::execute(
+            &self.inner,
+            pyql,
+            params,
+            &schema,
+            &self.config,
+            &self.globals,
+            self.cache.as_deref(),
+        )
+        .await
     }
 
     pub async fn query_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
