@@ -33,3 +33,18 @@ pub mod shape_id;
 pub mod sql;
 pub mod stdlib;
 pub mod validate;
+
+#[cfg(test)]
+mod sync_assertions {
+    fn assert_sync<T: Sync + Send>() {}
+
+    /// The types `pylon-py` wants to hold across a `py.detach()` — if any of
+    /// these stopped being `Send + Sync`, the GIL-releasing wrappers there
+    /// would stop compiling, and this says why.
+    #[test]
+    fn types_crossed_by_gil_releasing_calls_are_send_and_sync() {
+        assert_sync::<crate::schema::SchemaDescriptor>();
+        assert_sync::<crate::query::CompiledQuery>();
+        assert_sync::<crate::ir::SessionConfig>();
+    }
+}

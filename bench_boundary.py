@@ -400,6 +400,36 @@ async def main() -> None:
     t_e2e_cached = await bench_async('client.query(...) — cache on, warm hit',
                                      lambda: cached_client.query(query_text, min_views=0))
 
+    # ── 9. Compile concurrency (Phase 4) ─────────────────────────────────
+    # Compilation holds no Python object, so `compile()` releases the GIL for
+    # its duration. That is invisible to a single-threaded measurement — the
+    # only way to see it is whether threads scale. Each thread compiles
+    # *distinct* query texts, so every call is a genuine cache miss and does
+    # real parse/IR/typecheck/emit work; on a cache hit there is nothing to
+    # overlap.
+    print('\nCOMPILE CONCURRENCY (distinct queries, forced cache misses)')
+    import concurrent.futures
+
+    from pylon._core import clear_query_cache
+
+    def compile_batch(worker: int, count: int) -> None:
+        for i in range(count):
+            pyql_compile(f'select {module}::Article {{ title }} filter .views > {worker * 100_000 + i}')
+
+    def run_threaded(threads: int, per_thread: int = 150) -> float:
+        clear_query_cache()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool_exec:
+            start = time.perf_counter()
+            list(pool_exec.map(lambda w: compile_batch(w, per_thread), range(threads)))
+            elapsed = time.perf_counter() - start
+        return threads * per_thread / elapsed
+
+    one = run_threaded(1)
+    four = run_threaded(4)
+    print(f'  {"1 thread":<52} {one:9.0f} compiles/s')
+    print(f'  {"4 threads":<52} {four:9.0f} compiles/s')
+    print(f'  {"scaling":<52} {four / one:9.2f}x')
+
     # ── Summary ──────────────────────────────────────────────────────────
     print('\n' + '=' * 72)
     print('PER-QUERY BOUNDARY OVERHEAD (cache-off path)')
