@@ -315,18 +315,18 @@ class TestDeserialize:
     def test_single_record(self):
         shape = _object('', 'default::Person', [_scalar('name', 1), _scalar('age', 2)])
         query = self._make_query(shape)
-        record = {'result': ('default::Person', 'Alice', 30)}
-        result = deserialize([record], query, REGISTRY)
+        row = ('default::Person', 'Alice', 30)
+        result = deserialize([row], query, REGISTRY)
         assert result == [Person(name='Alice', age=30)]
 
     def test_multiple_records(self):
         shape = _object('', 'default::Person', [_scalar('name', 1)])
         query = self._make_query(shape)
-        records = [
-            {'result': ('default::Person', 'Alice')},
-            {'result': ('default::Person', 'Bob')},
+        rows = [
+            ('default::Person', 'Alice'),
+            ('default::Person', 'Bob'),
         ]
-        result = deserialize(records, query, REGISTRY)
+        result = deserialize(rows, query, REGISTRY)
         assert result == [Person(name='Alice'), Person(name='Bob')]
 
 

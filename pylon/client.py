@@ -113,7 +113,7 @@ class AsyncTransaction:
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
         rows = await self._tx.query_compiled(compiled, params)
         self._evict(compiled)
-        return _hydrate([{'result': row} for row in rows], compiled)
+        return _hydrate(rows, compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
@@ -124,7 +124,7 @@ class AsyncTransaction:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
         if not rows:
             return None
-        return _hydrate([{'result': row} for row in rows], compiled)[0]
+        return _hydrate(rows, compiled)[0]
 
     async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Return exactly one result; raise if the set is empty or has >1 row."""
@@ -381,12 +381,11 @@ class Client:
         # `pylon.exceptions.*` instance on failure (see `pgcon_err` in
         # `pgcon.rs`) — no exception translation needed here.
         rows = await pool.query_compiled(compiled, params)
-        records = [{'result': row} for row in rows]
-        _cache.put(compiled, params, records, self._config.cache)
+        _cache.put(compiled, params, rows, self._config.cache)
         # `client.query("insert ... ")` is a normal way to insert and read the
         # row back, so a read path can be a write path too.
         _cache.invalidate_for(compiled)
-        return _hydrate(records, compiled)
+        return _hydrate(rows, compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Execute *pyql* and return at most one result, or ``None``.
@@ -414,12 +413,11 @@ class Client:
         rows = await pool.query_compiled(compiled, params)
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
-        records = [{'result': row} for row in rows]
-        _cache.put(compiled, params, records, self._config.cache)
+        _cache.put(compiled, params, rows, self._config.cache)
         _cache.invalidate_for(compiled)
-        if not records:
+        if not rows:
             return None
-        return _hydrate(records, compiled)[0]
+        return _hydrate(rows, compiled)[0]
 
     async def query_required_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any:
         """Execute *pyql* and return exactly one result.
@@ -945,8 +943,8 @@ def _transpile(
     return compiled.sql, params, compiled
 
 
-def _hydrate(records: list[Any], compiled: CompiledQuery) -> list[Any]:
-    """Decode ``{"result": ...}``-wrapped rows into Python dataclass instances."""
+def _hydrate(rows: list[Any], compiled: CompiledQuery) -> list[Any]:
+    """Decode raw result rows into Python dataclass instances."""
     from pylon.query import _get_schema, deserialize
     from pylon.schema import schema_snapshot
     from pylon.schema._registry import named_tuples_snapshot
@@ -954,7 +952,7 @@ def _hydrate(records: list[Any], compiled: CompiledQuery) -> list[Any]:
     try:
         _get_schema()
     except RuntimeError:
-        return records
+        return rows
     types, enums, _ = schema_snapshot()
     registry: dict[str, type] = {t.__name__: t for t in types}
     for nt in named_tuples_snapshot():
@@ -964,7 +962,7 @@ def _hydrate(records: list[Any], compiled: CompiledQuery) -> list[Any]:
         mod = getattr(en, '__pylon_module__', None) or (en.__module__ or 'default').rpartition('.')[-1] or 'default'
         registry[en.__name__] = en
         registry[f'{mod}::{en.__name__}'] = en
-    return deserialize(records, compiled, registry)
+    return deserialize(rows, compiled, registry)
 
 
 def _build_dsn(db: Any) -> str:

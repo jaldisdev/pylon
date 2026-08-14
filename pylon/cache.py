@@ -49,15 +49,16 @@ def init(config: CacheConfig) -> None:
 
 def _resolve_set_name_for_tag(tag: str) -> str | None:
     """Schema-qualified table tag (e.g. ``"public.person"``) -> short Pylon
-    type name (e.g. ``"Person"``), by scanning the schema singleton's types.
-    Returns None for tags with no owning type (e.g. a junction table)."""
+    type name (e.g. ``"Person"``). Returns None for tags with no owning type
+    (e.g. a junction table).
+
+    Delegates to the Rust-side map rather than scanning ``schema.types``
+    here: that getter rebuilds a Python object for every type in the schema
+    on each access, which this was paying per tag, per query.
+    """
     from pylon.query import _get_schema
 
-    for t in _get_schema().types:
-        pg_schema = 'public' if t.module == 'default' else t.module
-        if f'{pg_schema}.{t.table}' == tag:
-            return t.name
-    return None
+    return _get_schema().type_name_for_tag(tag)
 
 
 def _is_disabled_for_sets(compiled: CompiledQuery, config: CacheConfig) -> bool:
@@ -109,33 +110,27 @@ def _is_cacheable(compiled: CompiledQuery, config: CacheConfig) -> bool:
 
 
 def get(compiled: CompiledQuery, params: list[Any], config: CacheConfig) -> list[Any] | None:
-    """Returns cached rows, each already wrapped as ``{"result": row}`` so
-    the list can be passed straight to `pylon.query.deserialize` exactly
-    like a live query result — or ``None`` on a cache miss or when caching
-    is disabled (globally, for a mutating statement, or for the sets this
-    query touches)."""
+    """Returns the cached rows, ready to pass straight to
+    `pylon.query.deserialize` exactly like a live query result — or ``None``
+    on a cache miss or when caching is disabled (globally, for a mutating
+    statement, or for the sets this query touches)."""
     if not _is_cacheable(compiled, config):
         return None
     from pylon._core import cache_get
 
     key = _cache_key(compiled, params, kind='rows')
-    rows = cache_get(key)
-    if rows is None:
-        return None
-    return [{'result': row} for row in rows]
+    return cache_get(key)
 
 
-def put(compiled: CompiledQuery, params: list[Any], records: list[Any], config: CacheConfig) -> None:
-    """Caches *records* (each a ``{"result": row}`` dict) under a key
-    derived from *compiled* + *params*, tagged with
-    ``compiled.tags`` for later invalidation. No-op if caching is disabled
-    or the query has no tags to key eviction on."""
+def put(compiled: CompiledQuery, params: list[Any], rows: list[Any], config: CacheConfig) -> None:
+    """Caches *rows* under a key derived from *compiled* + *params*, tagged
+    with ``compiled.tags`` for later invalidation. No-op if caching is
+    disabled or the query has no tags to key eviction on."""
     if not compiled.tags or not _is_cacheable(compiled, config):
         return
     from pylon._core import cache_put
 
     key = _cache_key(compiled, params, kind='rows')
-    rows = [record['result'] for record in records]
     cache_put(key, list(compiled.tags), rows)
 
 

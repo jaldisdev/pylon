@@ -52,18 +52,19 @@ def compile(
 
 
 def deserialize(
-    records: list,
+    rows: list,
     query: CompiledQuery,
     registry: dict[str, type],
 ) -> list:
     """Decode rows into Python objects using the shape embedded in query.
 
-    Each record must have a ``result`` column containing the anonymous PostgreSQL
-    record tuple produced by the compiled SQL.  The shape descriptor in ``query``
-    drives the decoding; ``registry`` maps short type names to dataclass types.
+    Each row is the anonymous PostgreSQL record tuple produced by the
+    compiled SQL — the decoded ``result`` column, not a dict wrapping it.
+    The shape descriptor in ``query`` drives the decoding; ``registry`` maps
+    short type names to dataclass types.
     """
     shape = query.shape
-    return [_decode(record['result'], shape, registry) for record in records]
+    return [_decode(row, shape, registry) for row in rows]
 
 
 def _decode_json_member(value: Any, node: dict, registry: dict[str, type]) -> Any:

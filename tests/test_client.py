@@ -580,7 +580,7 @@ class TestClientCaching:
             transpile_patch, _ = self._patch_transpile(tags=['public.person'])
             with (
                 transpile_patch,
-                patch('pylon.client._hydrate', side_effect=lambda records, compiled: [r['result'] for r in records]),
+                patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 first = await client.query('select Person')
                 second = await client.query('select Person')
@@ -602,7 +602,7 @@ class TestClientCaching:
             transpile_patch, _ = self._patch_transpile(tags=['public.person'])
             with (
                 transpile_patch,
-                patch('pylon.client._hydrate', side_effect=lambda records, compiled: [r['result'] for r in records]),
+                patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 first = await client.query_single('select Person')
                 second = await client.query_single('select Person')
@@ -668,7 +668,7 @@ class TestClientCaching:
             transpile_patch, _ = self._patch_transpile(tags=[])
             with (
                 transpile_patch,
-                patch('pylon.client._hydrate', side_effect=lambda records, compiled: [r['result'] for r in records]),
+                patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 await client.query('select 1')
                 await client.query('select 1')
@@ -688,7 +688,7 @@ class TestClientCaching:
             transpile_patch, _ = self._patch_transpile(tags=['public.person'])
             with (
                 transpile_patch,
-                patch('pylon.client._hydrate', side_effect=lambda records, compiled: [r['result'] for r in records]),
+                patch('pylon.client._hydrate', side_effect=lambda rows, compiled: list(rows)),
             ):
                 await client.query('select Person')
                 await client.query('select Person')
