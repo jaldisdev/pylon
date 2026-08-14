@@ -129,11 +129,19 @@ def _resolve_target(
         args = typing.get_args(target)
         inner = args[0]
         lazy_markers = [a for a in args[1:] if isinstance(a, _Lazy)]
-        if lazy_markers and isinstance(inner, str):
-            resolved = _import_from_lazy(lazy_markers[0].module_path, inner, source_cls)
+        # `Annotated['Author', lazy(...)]` does not keep `'Author'` as a plain
+        # string: both `Annotated` itself and `typing.get_type_hints` normalize
+        # a string parameter into a `ForwardRef`. Matching only `str` here
+        # meant the lazy path was never taken and every lazy ref fell through
+        # to the "unresolvable Annotated type" error below — with or without
+        # `from __future__ import annotations`.
+        inner_name = inner if isinstance(inner, str) else getattr(inner, '__forward_arg__', None)
+        if lazy_markers and inner_name is not None:
+            resolved = _import_from_lazy(lazy_markers[0].module_path, inner_name, source_cls)
             if resolved is None or not _is_pylon_type(resolved):
                 raise SchemaError(
-                    f'{label}: lazy ref {inner!r} from {lazy_markers[0].module_path!r} did not resolve to a Pylon type'
+                    f'{label}: lazy ref {inner_name!r} from {lazy_markers[0].module_path!r} '
+                    f'did not resolve to a Pylon type'
                 )
             target = resolved
         elif isinstance(inner, type):
