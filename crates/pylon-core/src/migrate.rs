@@ -89,6 +89,107 @@ pub async fn ensure_internal_schema(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// How a database's internal schema relates to the one this build expects.
+///
+/// The classification is deliberately separate from what any caller *does*
+/// about it: `pylon-server` refuses to start on `TooOld` while a client
+/// raises, and both merely note `Behind`, but the rule for which is which
+/// belongs in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalSchemaState {
+    /// No `_pylon."Internal"` row — a database no migration has ever run
+    /// against. Legal, and not a mismatch: callers should behave exactly as
+    /// they did before this check existed rather than treat it as an error.
+    Unmigrated,
+    /// Older than `MIN_SUPPORTED_INTERNAL_VERSION`: this build cannot work
+    /// against it. The only fix is `pylon migration apply`.
+    TooOld { found: i32, required: i32 },
+    /// Behind this build but still within its supported range — an upgrade
+    /// is pending and everything works meanwhile.
+    Behind { found: i32, current: i32 },
+    /// Exactly what this build writes.
+    Current,
+    /// Written by a *newer* build. Reported, never fatal: this is what a
+    /// rollback looks like, and failing closed would turn the recovery
+    /// lever into a second outage.
+    Newer { found: i32, current: i32 },
+}
+
+impl InternalSchemaState {
+    /// Whether this build should refuse to proceed.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, InternalSchemaState::TooOld { .. })
+    }
+
+    /// A one-line explanation, or `None` when there is nothing to say.
+    pub fn message(&self) -> Option<String> {
+        match self {
+            InternalSchemaState::Unmigrated | InternalSchemaState::Current => None,
+            InternalSchemaState::TooOld { found, required } => Some(format!(
+                "this database's internal schema (version {found}) is older than this \
+                 version of Pylon supports (version {required}); run `pylon migration apply` \
+                 to bring it up to date"
+            )),
+            InternalSchemaState::Behind { found, current } => Some(format!(
+                "this database's internal schema is at version {found}, this version of \
+                 Pylon writes version {current}; `pylon migration apply` will update it"
+            )),
+            InternalSchemaState::Newer { found, current } => Some(format!(
+                "this database's internal schema (version {found}) was written by a newer \
+                 version of Pylon than this one (version {current}); continuing, but this \
+                 build may not understand everything it finds"
+            )),
+        }
+    }
+}
+
+/// Reads `_pylon."Internal".version`, or `None` for a database that has no
+/// such table — one no migration has ever run against.
+pub async fn read_internal_version(pool: &PgPool) -> Result<Option<i32>> {
+    let rows = match pool
+        .query_typed(
+            r#"SELECT (version) AS result FROM _pylon."Internal" WHERE singleton"#,
+            &[],
+            pool.types(),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        // `42P01 undefined_table` is the never-migrated case, not a failure
+        // — same graceful degradation `read_schema_snapshot`'s callers rely
+        // on for `_pylon."Schema"`.
+        Err(e) if e.sqlstate() == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(match rows.into_iter().next() {
+        Some(DecodedValue::I64(v)) => Some(v as i32),
+        _ => None,
+    })
+}
+
+/// Classifies this database against what this build expects — see
+/// `InternalSchemaState`.
+pub async fn check_internal_schema(pool: &PgPool) -> Result<InternalSchemaState> {
+    use crate::stdlib::ddl::{INTERNAL_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_VERSION};
+
+    Ok(match read_internal_version(pool).await? {
+        None => InternalSchemaState::Unmigrated,
+        Some(found) if found < MIN_SUPPORTED_INTERNAL_VERSION => InternalSchemaState::TooOld {
+            found,
+            required: MIN_SUPPORTED_INTERNAL_VERSION,
+        },
+        Some(found) if found < INTERNAL_SCHEMA_VERSION => InternalSchemaState::Behind {
+            found,
+            current: INTERNAL_SCHEMA_VERSION,
+        },
+        Some(found) if found > INTERNAL_SCHEMA_VERSION => InternalSchemaState::Newer {
+            found,
+            current: INTERNAL_SCHEMA_VERSION,
+        },
+        Some(_) => InternalSchemaState::Current,
+    })
+}
+
 /// Upserts the process-wide schema snapshot every client fetches at
 /// startup instead of reading `.pylon/schema.json` — a single row (the
 /// `singleton` PK/CHECK forces at most one), written both by `migration
@@ -643,6 +744,66 @@ mod tests {
         let pool = test_pool().await;
         ensure_internal_schema(&pool).await.unwrap();
         ensure_internal_schema(&pool).await.unwrap();
+    }
+
+    #[test]
+    fn a_database_this_build_cannot_work_against_is_fatal_and_names_the_fix() {
+        let state = InternalSchemaState::TooOld { found: 1, required: 2 };
+        assert!(state.is_fatal());
+        let message = state.message().unwrap();
+        assert!(message.contains("pylon migration apply"), "got: {message}");
+    }
+
+    #[test]
+    fn a_newer_database_is_reported_but_never_fatal() {
+        // A rollback looks exactly like this. Failing closed here would turn
+        // the recovery lever into a second outage.
+        let state = InternalSchemaState::Newer { found: 2, current: 1 };
+        assert!(!state.is_fatal());
+        assert!(state.message().is_some());
+    }
+
+    #[test]
+    fn a_pending_upgrade_is_reported_but_not_fatal() {
+        let state = InternalSchemaState::Behind { found: 1, current: 2 };
+        assert!(!state.is_fatal());
+        assert!(state.message().is_some());
+    }
+
+    #[test]
+    fn an_unmigrated_or_current_database_says_nothing() {
+        // A database no migration has run against is a legal state, not a
+        // mismatch — callers must behave as they did before this existed.
+        for state in [InternalSchemaState::Unmigrated, InternalSchemaState::Current] {
+            assert!(!state.is_fatal());
+            assert_eq!(state.message(), None, "{state:?} should be silent");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_freshly_ensured_database_reads_as_current() {
+        let pool = test_pool().await;
+        ensure_internal_schema(&pool).await.unwrap();
+        assert_eq!(check_internal_schema(&pool).await.unwrap(), InternalSchemaState::Current);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_database_without_the_marker_table_reads_as_unmigrated() {
+        // Not an error: `read_internal_version` has to tell "never migrated"
+        // apart from "migrated, and old", or every brand-new database would
+        // fail the check it is supposed to pass.
+        let pool = test_pool().await;
+        ensure_internal_schema(&pool).await.unwrap();
+        pool.batch_execute(r#"ALTER TABLE _pylon."Internal" RENAME TO "Internal_hidden";"#)
+            .await
+            .unwrap();
+        let state = check_internal_schema(&pool).await;
+        pool.batch_execute(r#"ALTER TABLE _pylon."Internal_hidden" RENAME TO "Internal";"#)
+            .await
+            .unwrap();
+        assert_eq!(state.unwrap(), InternalSchemaState::Unmigrated);
     }
 
     #[tokio::test]
