@@ -51,6 +51,44 @@ def compile(
     )
 
 
+_hydration_registry: tuple[int, Any] | None = None
+
+
+def hydration_registry() -> Any:
+    """The Rust-side `HydrationRegistry` for the currently-registered classes.
+
+    Memoized against `pylon.schema._registry.generation()`, which changes on
+    every type/enum/named-tuple registration and on `clear()` — so this is
+    rebuilt exactly when the class set actually changes, and not once per
+    query as the equivalent dict used to be. Building it also resolves each
+    class's multilinks up front, which is the part that would otherwise
+    re-run per decoded object.
+    """
+    from pylon._core import HydrationRegistry
+    from pylon.schema import schema_snapshot
+    from pylon.schema._registry import generation, named_tuples_snapshot
+
+    global _hydration_registry
+    current = generation()
+    if _hydration_registry is not None and _hydration_registry[0] == current:
+        return _hydration_registry[1]
+
+    types, enums, _ = schema_snapshot()
+    classes: dict[str, type] = {t.__name__: t for t in types}
+    for nt in named_tuples_snapshot():
+        mod = getattr(nt, '__pylon_module__', 'default')
+        classes[f'{mod}::{nt.__name__}'] = nt
+    enum_map: dict[str, type] = {}
+    for en in enums:
+        mod = getattr(en, '__pylon_module__', None) or (en.__module__ or 'default').rpartition('.')[-1] or 'default'
+        enum_map[en.__name__] = en
+        enum_map[f'{mod}::{en.__name__}'] = en
+
+    registry = HydrationRegistry(classes, enum_map)
+    _hydration_registry = (current, registry)
+    return registry
+
+
 def deserialize(
     rows: list,
     query: CompiledQuery,
@@ -62,6 +100,12 @@ def deserialize(
     compiled SQL — the decoded ``result`` column, not a dict wrapping it.
     The shape descriptor in ``query`` drives the decoding; ``registry`` maps
     short type names to dataclass types.
+
+    This is the reference implementation of the decode contract, kept as the
+    thing `pylon._core.hydrate` is checked against (see
+    ``tests/test_hydrate_parity.py``). The client calls the native one; this
+    stays because a contract that only exists as an optimized Rust walk is a
+    contract nobody can read.
     """
     shape = query.shape
     return [_decode(row, shape, registry) for row in rows]

@@ -57,15 +57,35 @@ _named_tuples: list[type] = []
 _functions: list = []
 _signals: list[SignalRegistration] = []
 
+#: Bumped by every mutation below. Lets a consumer that derives something
+#: expensive from the registered classes (`pylon.query.hydration_registry`)
+#: memoize it and know exactly when that memo went stale, rather than
+#: guessing from a length or an identity that can repeat.
+_generation = 0
+
+
+def generation() -> int:
+    """Current registry generation — see `_generation`."""
+    return _generation
+
+
+def _bump() -> None:
+    """Invalidate anything memoized against `generation()`. Call while
+    holding `_lock`."""
+    global _generation
+    _generation += 1
+
 
 def register_type(cls: type) -> None:
     with _lock:
         _types.append(cls)
+        _bump()
 
 
 def register_enum(cls: type) -> None:
     with _lock:
         _enums.append(cls)
+        _bump()
 
 
 def register_scalar(cls: type) -> None:
@@ -76,6 +96,7 @@ def register_scalar(cls: type) -> None:
 def register_named_tuple(cls: type) -> None:
     with _lock:
         _named_tuples.append(cls)
+        _bump()
 
 
 def register_function(func: object) -> None:
@@ -119,3 +140,4 @@ def clear() -> None:
         _named_tuples.clear()
         _functions.clear()
         _signals.clear()
+        _bump()

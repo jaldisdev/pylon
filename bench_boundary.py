@@ -324,6 +324,7 @@ async def main() -> None:
 
     # ── 5. Registry rebuild (finding #6) ─────────────────────────────────
     print('\nHYDRATION')
+    from pylon._core import hydrate as native_hydrate
     from pylon.query import deserialize
     from pylon.schema import schema_snapshot
     from pylon.schema._registry import named_tuples_snapshot
@@ -341,10 +342,15 @@ async def main() -> None:
             registry[f'{mod}::{en.__name__}'] = en
         return registry
 
+    from pylon.query import hydration_registry
+
     prebuilt = build_registry()
     t_registry = bench('registry rebuild alone (per query)', build_registry, iterations=500)
-    t_deser = bench('deserialize() — 50 rows, prebuilt registry',
+    t_deser = bench('deserialize() — Python reference walk, 50 rows',
                     lambda: deserialize(rows, compiled, prebuilt), iterations=200)
+    native_reg = hydration_registry()
+    t_native = bench('_core.hydrate() — native walk, 50 rows',
+                     lambda: native_hydrate(rows, compiled, native_reg), iterations=200)
     t_hydrate = bench('_hydrate() — as shipped (registry + shape + decode)',
                       lambda: _hydrate(rows, compiled), iterations=200)
     # Finding #8's wrapper is gone; kept as a measurement of what it cost.
