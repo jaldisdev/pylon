@@ -215,18 +215,21 @@ mod tests {
     }
 
     fn compiled(sql: &str, tags: &[&str], mutates: bool) -> CompiledQuery {
+        let shape = pylon_core::query::ShapeDescriptor {
+            root: pylon_core::query::ShapeNode::RawScalar,
+        };
+        let shape_id = pylon_core::query::derive_shape_id(sql, &shape);
         CompiledQuery {
             sql: sql.to_string(),
             param_names: vec![],
             params: vec![],
-            shape: pylon_core::query::ShapeDescriptor {
-                root: pylon_core::query::ShapeNode::RawScalar,
-            },
+            shape,
             warnings: vec![],
             inference_plan: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             mutates,
             analyze_paths: None,
+            shape_id,
         }
     }
 

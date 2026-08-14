@@ -32,7 +32,16 @@ from pylon.config import CacheConfig, CacheSetConfig
 
 
 def compiled(sql: str = 'select 1', tags: list[str] | None = None, mutates: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(sql=sql, tags=tags if tags is not None else [], mutates=mutates)
+    # `shape_id` stands in for what the real `CompiledQuery` computes once at
+    # compile time; `pylon.cache` keys on it rather than on `sql`, so a
+    # double with two different `sql` values must produce two different ids
+    # for these tests to keep distinguishing them.
+    return SimpleNamespace(
+        sql=sql,
+        shape_id=f'shape-of-{sql}',
+        tags=tags if tags is not None else [],
+        mutates=mutates,
+    )
 
 
 @pytest.fixture(autouse=True)
