@@ -31,6 +31,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 mod cache;
+mod hydrate;
 mod introspect;
 mod migrate;
 mod pgcon;
@@ -2665,6 +2666,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Cache
     cache::register(m)?;
+
+    // Result hydration
+    hydrate::register(m)?;
 
     // Postgres driver (async) — one persistent multi-threaded tokio
     // runtime for the whole process, built once here rather than per call.

@@ -944,25 +944,20 @@ def _transpile(
 
 
 def _hydrate(rows: list[Any], compiled: CompiledQuery) -> list[Any]:
-    """Decode raw result rows into Python dataclass instances."""
-    from pylon.query import _get_schema, deserialize
-    from pylon.schema import schema_snapshot
-    from pylon.schema._registry import named_tuples_snapshot
+    """Decode raw result rows into Python dataclass instances.
+
+    Runs the native walk (`pylon._core.hydrate`). `pylon.query.deserialize`
+    remains the readable reference implementation of the same contract, and
+    ``tests/test_hydrate_parity.py`` holds the two to it.
+    """
+    from pylon._core import hydrate as _native_hydrate
+    from pylon.query import _get_schema, hydration_registry
 
     try:
         _get_schema()
     except RuntimeError:
         return rows
-    types, enums, _ = schema_snapshot()
-    registry: dict[str, type] = {t.__name__: t for t in types}
-    for nt in named_tuples_snapshot():
-        mod = getattr(nt, '__pylon_module__', 'default')
-        registry[f'{mod}::{nt.__name__}'] = nt
-    for en in enums:
-        mod = getattr(en, '__pylon_module__', None) or (en.__module__ or 'default').rpartition('.')[-1] or 'default'
-        registry[en.__name__] = en
-        registry[f'{mod}::{en.__name__}'] = en
-    return deserialize(rows, compiled, registry)
+    return _native_hydrate(rows, compiled, hydration_registry())
 
 
 def _build_dsn(db: Any) -> str:

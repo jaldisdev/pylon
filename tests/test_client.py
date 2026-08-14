@@ -269,20 +269,25 @@ class TestHydrate:
 
         assert result is records
 
-    def test_returns_deserialized_objects(self):
+    def test_delegates_to_the_native_hydrator(self):
+        """`_hydrate` runs `pylon._core.hydrate`, not the Python reference
+        `deserialize` — see `tests/test_hydrate_parity.py`, which is what
+        holds the two implementations to the same contract."""
         from pylon.client import _hydrate
 
-        records = ['row1']
+        rows = ['row1']
         compiled = self._make_compiled()
+        registry = MagicMock()
         hydrated = [object()]
         with (
             patch('pylon.query._get_schema', return_value=MagicMock()),
-            patch('pylon.schema.schema_snapshot', return_value=([], [], [])),
-            patch('pylon.query.deserialize', return_value=hydrated),
+            patch('pylon.query.hydration_registry', return_value=registry),
+            patch('pylon._core.hydrate', return_value=hydrated) as native,
         ):
-            result = _hydrate(records, compiled)
+            result = _hydrate(rows, compiled)
 
         assert result is hydrated
+        native.assert_called_once_with(rows, compiled, registry)
 
 
 # ---------------------------------------------------------------------------
