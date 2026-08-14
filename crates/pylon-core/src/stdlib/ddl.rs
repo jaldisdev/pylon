@@ -287,8 +287,47 @@ pub const MIGRATION_TRACKING_DDL: &str = concat!(
     "    singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),\n",
     "    snapshot    jsonb       NOT NULL,\n",
     "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
+    ");\n\n",
+    // See `INTERNAL_SCHEMA_VERSION`.
+    "CREATE TABLE IF NOT EXISTS _pylon.\"Internal\" (\n",
+    "    singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),\n",
+    "    version     integer     NOT NULL,\n",
+    "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
     ");\n",
+    "INSERT INTO _pylon.\"Internal\" (singleton, version) VALUES (true, ",
+    internal_schema_version_literal!(),
+    ")\n",
+    "    ON CONFLICT (singleton) DO UPDATE SET version = ",
+    internal_schema_version_literal!(),
+    ", updated_at = now();\n",
 );
+
+/// What revision of the internal `_pylon` structures a database carries.
+///
+/// Nothing reads this yet — every internal change so far has been
+/// expressible as idempotent DDL (`ADD COLUMN IF NOT EXISTS`, `CREATE OR
+/// REPLACE`), which `ensure_internal_schema` simply replays. It exists now
+/// because it is the one thing that cannot be added retroactively: the
+/// moment a change *isn't* expressible that way — a column rename, a data
+/// backfill, a destructive fixup — the repair needs to know which databases
+/// already ran it, and a database deployed without a marker offers nothing
+/// to read.
+///
+/// Bump this when the internal structures change in a way a future reader
+/// would need to distinguish. Leaving it alone is correct for a purely
+/// idempotent change.
+pub const INTERNAL_SCHEMA_VERSION: i32 = 1;
+
+/// `INTERNAL_SCHEMA_VERSION` as a literal, for splicing into the `concat!`
+/// above — `concat!` takes literals only, so the constant cannot be
+/// interpolated directly. Kept adjacent so the two cannot drift; the test
+/// `internal_schema_version_literal_matches_the_constant` enforces it.
+macro_rules! internal_schema_version_literal {
+    () => {
+        "1"
+    };
+}
+use internal_schema_version_literal;
 
 /// Generate the complete `_pylon` schema DDL from the stdlib registry.
 ///
@@ -359,7 +398,7 @@ pub fn export_stdlib() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::export_stdlib;
+    use super::{INTERNAL_SCHEMA_VERSION, export_stdlib};
 
     #[test]
     fn ddl_smoke() {
@@ -402,5 +441,29 @@ mod tests {
         let ddl = export_stdlib();
         assert!(ddl.contains("CREATE OR REPLACE FUNCTION _pylon.notify_cache_invalidate()"));
         assert!(ddl.contains("pg_notify('pylon_cache_invalidate', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME)"));
+    }
+
+    #[test]
+    fn internal_schema_version_literal_matches_the_constant() {
+        // `concat!` accepts literals only, so the version is spelled twice:
+        // once as `INTERNAL_SCHEMA_VERSION` for code to read, once as a
+        // literal for the DDL. They must not drift — a database would then
+        // record a version no reader recognises.
+        assert_eq!(
+            internal_schema_version_literal!(),
+            INTERNAL_SCHEMA_VERSION.to_string(),
+        );
+    }
+
+    #[test]
+    fn the_internal_version_marker_is_created_and_upserted() {
+        let ddl = export_stdlib();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS _pylon.\"Internal\""));
+        // Upsert, not plain insert: an existing database has to have its
+        // recorded version moved forward, not left at whatever it was.
+        assert!(
+            ddl.contains("ON CONFLICT (singleton) DO UPDATE SET version = 1"),
+            "got:\n{ddl}"
+        );
     }
 }
