@@ -2587,14 +2587,40 @@ fn diff_inner(
                         owner_key,
                         verb,
                         desc,
-                        vec![DiffOp {
-                            sql: format!(
-                                "DROP TRIGGER IF EXISTS {} ON {};",
-                                qi(trigger_name),
-                                qn(&cur_table.schema, &cur_table.name)
-                            ),
-                            non_transactional: false,
-                        }],
+                        vec![
+                            DiffOp {
+                                sql: format!(
+                                    "DROP TRIGGER IF EXISTS {} ON {};",
+                                    qi(trigger_name),
+                                    qn(&cur_table.schema, &cur_table.name)
+                                ),
+                                non_transactional: false,
+                            },
+                            // Generated triggers name their function after
+                            // themselves, so dropping one leaves an
+                            // unreferenced function behind. That was rare
+                            // while trigger names were stable; now that a
+                            // name follows its body (see `trigger_names` in
+                            // `export`), every codegen change renames, and
+                            // the orphans would accumulate — and read as
+                            // live triggers to anyone introspecting.
+                            //
+                            // A no-op for triggers that don't follow that
+                            // convention: the cache-invalidate trigger's
+                            // function lives in `_pylon`, and the two
+                            // interface-exclusive triggers (`..._ins`,
+                            // `..._upd`) share one function named after
+                            // neither. Nothing shared is reachable by this
+                            // name, so this can't drop a function another
+                            // trigger still needs.
+                            DiffOp {
+                                sql: format!(
+                                    "DROP FUNCTION IF EXISTS {}();",
+                                    qn(&cur_table.schema, trigger_name)
+                                ),
+                                non_transactional: false,
+                            },
+                        ],
                     );
                 }
             }
@@ -3790,6 +3816,65 @@ mod tests {
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
         assert!(joined.contains("NEW.\"name\""), "got:\n{joined}");
+    }
+
+    #[test]
+    fn a_trigger_emitted_by_an_older_build_is_replaced() {
+        // The delivery half of content-addressed trigger names: because a
+        // trigger's name now hashes its body, a database whose trigger was
+        // written by an older emitter carries a *different* name than the
+        // current one, and that difference is what the diff can see. Before
+        // this, the name was derived from the table and pointer alone, so a
+        // fix to trigger codegen produced no diff at all and the old body
+        // stayed until the table was dropped.
+        //
+        // Simulated by renaming the trigger in the baseline, which is
+        // exactly what an emitter change looks like from the diff's side.
+        let schema = SchemaDescriptor {
+            types: vec![widget_with_trigger(
+                1,
+                "After",
+                "update Widget set { name := __new__.name }",
+            )],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        };
+        let mut stale = schema_to_db_state(&schema);
+        let current_name = stale
+            .tables
+            .iter()
+            .flat_map(|t| t.triggers.iter().cloned())
+            .find(|n| n.starts_with("Widget_"))
+            .expect("the fixture should project a Widget trigger");
+        let stale_name = "Widget_trg_0badc0de".to_string();
+        for table in &mut stale.tables {
+            for trigger in &mut table.triggers {
+                if *trigger == current_name {
+                    *trigger = stale_name.clone();
+                }
+            }
+        }
+
+        let joined = diff_schema(&schema, &stale).unwrap().join("\n");
+        assert!(
+            joined.contains(&format!("DROP TRIGGER IF EXISTS \"{stale_name}\"")),
+            "the stale trigger should be dropped, got:\n{joined}"
+        );
+        assert!(
+            joined.contains(&current_name),
+            "the current trigger should be created, got:\n{joined}"
+        );
+        // The stale trigger's function goes with it — a rename would
+        // otherwise leave a dead function behind on every codegen change.
+        assert!(
+            joined.contains(&format!("DROP FUNCTION IF EXISTS \"public\".\"{stale_name}\"()")),
+            "the orphaned function should be dropped, got:\n{joined}"
+        );
     }
 
     #[test]

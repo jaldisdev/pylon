@@ -117,6 +117,27 @@ fn fnv(parts: &[&str]) -> String {
     format!("{:016x}", h)
 }
 
+/// The generated `(function name, qualified function name)` for one trigger.
+///
+/// **`body` is part of the hash, and has to be.** The migration diff compares
+/// triggers by *name* — `DbTrigger` carries nothing else — so a name derived
+/// only from the table and pointer is stable across a change to what the
+/// trigger actually does. That means a fix to trigger codegen produces no
+/// diff and never reaches a database that already exists: the old body stays
+/// until someone drops the table. Hashing the body instead makes the name
+/// content-addressed, so changing the emitted SQL renames the function, the
+/// diff sees one trigger missing and one unexpected, and the existing
+/// create/drop machinery replaces it.
+///
+/// This is the same trick the CHECK-constraint names already use (their hash
+/// includes the constraint expression); triggers were the outlier.
+fn trigger_names(module: &str, table: &str, pointer: &str, suffix: &str, body: &str) -> (String, String) {
+    let hash = fnv(&[table, pointer, suffix, body]);
+    let fname = format!("{}_{}_{}", table, pointer, &hash[..8]);
+    let fn_qname = qn(module, &fname);
+    (fname, fn_qname)
+}
+
 // ── Trigger event/timing helpers ───────────────────────────────────────────────
 
 fn trigger_events(on: u8) -> String {
@@ -605,9 +626,6 @@ fn link_source_trigger_infos(
             } else {
                 "del_target"
             };
-            let hash = fnv(&[&t.table, &l.name, suffix]);
-            let fname = format!("{}_{}_{}", t.table, l.name, &hash[..8]);
-            let fn_qname = qn(&t.module, &fname);
             let tbl_qname = qn(&t.module, &t.table);
             let tgt_qname = qn(tgt_module, tgt_table);
             let col = qi(&format!("{}_id", l.name));
@@ -619,6 +637,8 @@ fn link_source_trigger_infos(
             } else {
                 format!("    DELETE FROM {tgt_qname} WHERE id = OLD.{col};")
             };
+
+            let (fname, fn_qname) = trigger_names(&t.module, &t.table, &l.name, suffix, &body);
 
             let mut ddl = String::new();
             emit_before_delete_trigger(&fn_qname, &qi(&fname), &tbl_qname, &body, &mut ddl);
@@ -802,9 +822,6 @@ fn push_junction_deletion_triggers(
         } else {
             "del_target"
         };
-        let hash = fnv(&[&t.table, name, suffix]);
-        let fname = format!("{}_{}_{}_{}", t.table, name, suffix, &hash[..8]);
-        let fn_qname = qn(&t.module, &fname);
         let tgt_qname = qn(tgt_module, tgt_table);
 
         let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
@@ -814,6 +831,12 @@ fn push_junction_deletion_triggers(
         } else {
             format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
         };
+
+        // Keeps `suffix` in the rendered name (unlike `trigger_names`), since
+        // both variants below hang off the same table/pointer pair.
+        let hash = fnv(&[&t.table, name, suffix, &body]);
+        let fname = format!("{}_{}_{}_{}", t.table, name, suffix, &hash[..8]);
+        let fn_qname = qn(&t.module, &fname);
 
         let mut ddl = String::new();
         emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
@@ -829,12 +852,11 @@ fn push_junction_deletion_triggers(
     // also delete the source object.
     let tgt_action = policy_for(on_delete, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict);
     if matches!(tgt_action, DeleteAction::DeleteSource) {
-        let hash = fnv(&[&t.table, name, "del_source"]);
-        let fname = format!("{}_{}_{}", t.table, name, &hash[..8]);
-        let fn_qname = qn(&t.module, &fname);
         let src_qname = qn(&t.module, &t.table);
 
         let body = format!("    DELETE FROM {src_qname} WHERE id = OLD.source;");
+        let (fname, fn_qname) = trigger_names(&t.module, &t.table, name, "del_source", &body);
+
         let mut ddl = String::new();
         emit_after_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
         result.push(DeletionTriggerInfo {
@@ -886,9 +908,6 @@ pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInf
 
         let qname = format!("{}::{}", t.module, t.name);
         let qname_literal = format!("'{}'", qname.replace('\'', "''"));
-        let hash = fnv(&[&t.table, "signal"]);
-        let fname = format!("{}_signal_{}", t.table, &hash[..8]);
-        let fn_qname = qn(&t.module, &fname);
         let tbl_qname = qn(&t.module, &t.table);
 
         // Scope the trigger's event list to exactly the operations at
@@ -956,6 +975,13 @@ pub fn signal_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInf
              CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN to_jsonb(NEW) ELSE NULL END\n    \
              );"
         );
+
+        // `events_str` joins the hash too: the trigger's event list is part
+        // of the emitted `CREATE TRIGGER`, so a type gaining an `On.Delete`
+        // handler has to re-emit even though the body is unchanged.
+        let hash = fnv(&[&t.table, "signal", &events_str, &body]);
+        let fname = format!("{}_signal_{}", t.table, &hash[..8]);
+        let fn_qname = qn(&t.module, &fname);
 
         let mut ddl = String::new();
         emit_after_mutation_trigger(&fn_qname, &qi(&fname), &tbl_qname, &events_str, &body, &mut ddl);
@@ -2839,6 +2865,108 @@ mod tests {
             !ddl.contains("BEFORE DELETE ON \"public\".\"Product.tags\""),
             "got:\n{ddl}"
         );
+    }
+
+    // ── content-addressed trigger names ─────────────────────────────────────────
+
+    /// `Product.tags -> Org` multilink with a target-side DeleteSource
+    /// policy, so the junction table carries a generated trigger whose body
+    /// names `owner_table`.
+    fn multilink_trigger_schema(owner_table: &str) -> SchemaDescriptor {
+        let module = "default";
+        let mut owner = org_type(module);
+        owner.name = owner_table.into();
+        owner.table = owner_table.into();
+        owner.multilinks = vec![MultiLinkDescriptor {
+            name: "tags".into(),
+            target: format!("{module}::Org"),
+            through: None,
+            nullable: false,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![OnDeletePolicy {
+                side: DeleteSide::Target,
+                action: DeleteAction::DeleteSource,
+            }],
+        }];
+        SchemaDescriptor {
+            types: vec![org_type(module), owner],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        }
+    }
+
+    fn trigger_names_of(schema: &SchemaDescriptor) -> Vec<String> {
+        let type_map: HashMap<String, (&str, &str)> = schema
+            .types
+            .iter()
+            .map(|t| {
+                (
+                    format!("{}::{}", t.module, t.name),
+                    (t.module.as_str(), t.table.as_str()),
+                )
+            })
+            .collect();
+        let mut names: Vec<String> = deletion_policy_trigger_infos(schema, &type_map)
+            .into_iter()
+            .map(|i| i.trigger_name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_trigger_name_is_stable_for_an_unchanged_schema() {
+        // The other half of the property below: names must not churn when
+        // nothing changed, or every migration would drop and recreate every
+        // trigger in the database.
+        let schema = multilink_trigger_schema("Product");
+        assert_eq!(trigger_names_of(&schema), trigger_names_of(&schema));
+    }
+
+    #[test]
+    fn a_trigger_name_changes_when_its_body_changes() {
+        // The point of hashing the body: the migration diff compares
+        // triggers by name only, so if a change to the emitted body left the
+        // name alone, the diff would report nothing and a database that
+        // already exists would keep running the old body forever. Here the
+        // owner table name is what reaches the body (`DELETE FROM <owner>`).
+        let before = trigger_names_of(&multilink_trigger_schema("Product"));
+        let after = trigger_names_of(&multilink_trigger_schema("Widget"));
+        assert_ne!(before, after, "trigger name did not follow its body");
+    }
+
+    #[test]
+    fn a_signal_trigger_name_follows_its_event_list() {
+        // `events_str` is in the hash as well as the body: a type gaining an
+        // On.Delete handler re-emits `CREATE TRIGGER ... AFTER INSERT OR
+        // DELETE`, even though the function body is byte-identical.
+        let names_for = |on: u8| {
+            let module = "default";
+            let mut t = org_type(module);
+            t.signals = vec![crate::schema::SignalEntry { on }];
+            let schema = SchemaDescriptor {
+                types: vec![t],
+                scalars: vec![],
+                enums: vec![],
+                named_tuples: vec![],
+                globals: vec![],
+                functions: vec![],
+                aliases: vec![],
+                channels: vec![],
+            };
+            signal_trigger_infos(&schema)
+                .into_iter()
+                .map(|i| i.trigger_name)
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(names_for(1), names_for(1 | 4));
+        assert_eq!(names_for(1), names_for(1));
     }
 
     // ── junction-backed single links ────────────────────────────────────────────
