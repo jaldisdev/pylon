@@ -138,7 +138,16 @@ Whole-database operations.
 pylon database initialize
 ```
 
-Installs the `_pylon` schema and every standard-library function as `CREATE OR REPLACE FUNCTION` statements — idempotent, safe to re-run. Run this once per database before the first `pylon migration apply`.
+Installs the internal `_pylon` schema — the migration tracking tables, the
+index and signal outboxes, and every standard-library function — and brings an
+existing one up to date. Idempotent, safe to re-run.
+
+**Not a required step.** Every migration command (`create`, `apply`, `status`,
+`watch`, `squash`) does the same thing before it runs, so an ordinary project
+never needs this and an upgrade picks up new internal structures on the next
+migration. Reach for it when you want the database prepared as its own step —
+provisioning in CI or a container entrypoint, ahead of the code that will use
+it — or with `--dry-run` to read the DDL Pylon would apply.
 
 | Flag | Description |
 |---|---|

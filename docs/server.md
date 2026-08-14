@@ -85,4 +85,4 @@ A typical production deployment is two units:
 
 Both connect to the same PostgreSQL database and read the same `pylon.toml`. Neither needs the other running to function for its own responsibilities — a mutation through `pylon-server` still writes signal-outbox rows correctly even with no dispatcher running; they just won't be drained until one is.
 
-Before either can serve anything, the database itself needs `pylon database initialize` (installs `_pylon` and the standard library) and at least one applied migration (`pylon migration apply`) — see [Migrations](migrations.md).
+Before either can serve anything, the database needs at least one applied migration (`pylon migration apply`, which also sets up the internal `_pylon` schema on first run) — see [Migrations](migrations.md).

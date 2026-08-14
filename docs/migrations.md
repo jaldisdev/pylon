@@ -19,7 +19,9 @@ A migration body with more than one statement can contain `-- pylon:step` marker
 
 ## The tracking table
 
-Postgres itself remembers which migrations have been applied, in `_pylon."Migrations"` (created by `pylon database initialize`). Every `pylon migration apply` run:
+Postgres itself remembers which migrations have been applied, in `_pylon."Migrations"`. Every `pylon migration apply` run:
+
+0. Brings the internal `_pylon` schema up to date — creating the tracking tables on a database that has never seen Pylon, and adding anything a newer Pylon version introduced on one that has. Every migration command does this first, so an upgrade reaches the internal structures without a separate step.
 
 1. Takes a session-level Postgres advisory lock, so concurrent `apply` invocations serialize instead of racing (`--no-wait` fails fast instead of blocking if another one already holds it).
 2. Reads the tracking table's recorded tip and compares it against the on-disk chain. If the recorded tip isn't found in the chain at all, that's treated as **diverged history** and refused outright — Pylon won't guess which side is right.
@@ -123,12 +125,16 @@ The squashed file's header records every migration ID it replaced. This matters 
 
 ## First-time setup
 
-Before any of this works against a fresh database:
+Against a fresh, empty database:
 
 ```bash
-pylon database initialize   # installs _pylon + the standard library
 pylon migration create      # first migration, diffing against an empty db
 pylon migration apply
 ```
+
+No separate install step: both commands set up the `_pylon` schema themselves
+before doing anything else. [`pylon database initialize`](cli.md#pylon-database-initialize)
+does the same thing on its own, for provisioning a database ahead of the code
+that will use it.
 
 See [`pylon database`](cli.md#pylon-database) for `dump`/`restore`/`wipe`, and [Getting started](getting-started.md) for the full walkthrough from an empty project.

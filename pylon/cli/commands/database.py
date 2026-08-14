@@ -79,11 +79,16 @@ async def _user_schemas(pool) -> list[str]:
 @requires_config
 @click.pass_context
 def initialize(ctx: click.Context, dry_run: bool) -> None:
-    """Install the _pylon schema and standard library functions.
+    """Install or update the internal _pylon schema.
 
-    Generates CREATE OR REPLACE FUNCTION statements for every PylonFunction
-    in the stdlib registry and executes them against the configured database.
-    Safe to run multiple times — all statements are idempotent.
+    Creates the migration tracking tables, the index and signal outboxes, and
+    every standard-library function, and brings an existing _pylon schema up
+    to date. Safe to run multiple times — all statements are idempotent.
+
+    Not a required step: every migration command does this before it runs, so
+    an ordinary project never needs it and an upgrade picks up new internal
+    structures on the next migration. Use it to provision a database as its
+    own step, or with --dry-run to read the DDL that would be applied.
     """
     from pylon._core import export_stdlib
 
