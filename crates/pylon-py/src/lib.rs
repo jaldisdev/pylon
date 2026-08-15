@@ -1953,16 +1953,6 @@ fn diff_schema(py: Python<'_>, target: &SchemaDescriptor, current: &DbState) -> 
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
-/// Compute ordered DDL ops with non-transactional markers for migration file creation.
-/// Returns a list of `(sql, non_transactional)` tuples. Indexes on pre-existing tables
-/// use `CREATE INDEX CONCURRENTLY` and are marked `non_transactional=True`.
-#[pyfunction]
-fn diff_schema_ops(py: Python<'_>, target: &SchemaDescriptor, current: &DbState) -> PyResult<Vec<(String, bool)>> {
-    py.detach(|| core::diff::diff_schema_ops(&target.inner, &current.inner))
-        .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
-        .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
 /// Compute the net DDL to go from `before` to `after` (two live-DB snapshots).
 /// Used by the squash command: apply migrations to a shadow DB, introspect before
 /// and after, then call this to produce a single equivalent migration body.
@@ -2197,22 +2187,6 @@ fn diff_schema_steps_with_renames_and_fills(
     .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
-/// Diff with confirmed renames applied.
-/// `type_renames`: list of (old_module, old_table, new_module, new_table).
-/// `col_renames`:  list of (module, table, old_col, new_col).
-/// Returns list of (sql, non_transactional).
-#[pyfunction]
-fn diff_schema_ops_with_renames(
-    target: &SchemaDescriptor,
-    current: &DbState,
-    type_renames: Vec<(String, String, String, String)>,
-    col_renames: Vec<(String, String, String, String)>,
-) -> PyResult<Vec<(String, bool)>> {
-    core::diff::diff_schema_ops_with_renames(&target.inner, &current.inner, &type_renames, &col_renames)
-        .map(|ops| ops.into_iter().map(|op| (op.sql, op.non_transactional)).collect())
-        .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
 /// Compile a PyQL fill expression to a bare SQL expression for use in an UPDATE SET clause.
 /// `type_name` is the qualified type name (e.g. `"blog::Post"`).
 /// `expr_str`  is the PyQL expression (e.g. `"'No content'"`, `".title"`, `"0"`).
@@ -2296,7 +2270,7 @@ fn missing_extension_ddl(target: &SchemaDescriptor, current: &DbState) -> Vec<St
 /// True when `target` differs from `previous` in any way — including
 /// schema semantics with zero physical DDL footprint (`readonly`,
 /// rewrites, computed globals, pub/sub `Channel`s, ...) that
-/// `diff_schema_steps`/`diff_schema_ops`/`missing_extension_ddl` can never
+/// the diff functions above/`missing_extension_ddl` can never
 /// see, since there's no column/constraint/catalog object for those to
 /// introspect. `migration create`/`watch` must treat this as "there is a
 /// change" even when the DDL-step list above comes back empty — otherwise
@@ -2310,7 +2284,8 @@ fn schema_content_changed(target: &SchemaDescriptor, previous: Option<&SchemaDes
 }
 
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
-/// Returns a `DbState` object usable as a diff baseline for `diff_schema_ops` etc.
+/// Returns a `DbState` object usable as a diff baseline for `diff_schema`, the
+/// `diff_schema_*_with_renames_and_fills` pair, and `diff_states`.
 #[pyfunction]
 fn db_state_from_json(py: Python<'_>, json: &str) -> PyResult<DbState> {
     py.detach(|| core::diff::db_state_from_json(json))
@@ -2665,11 +2640,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Guidance>()?;
     m.add_class::<MigrationStep>()?;
     m.add_function(wrap_pyfunction!(diff_schema, m)?)?;
-    m.add_function(wrap_pyfunction!(diff_schema_ops, m)?)?;
     m.add_function(wrap_pyfunction!(diff_states, m)?)?;
     m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
     m.add_function(wrap_pyfunction!(detect_col_renames, m)?)?;
-    m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames, m)?)?;
     m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;
     m.add_function(wrap_pyfunction!(detect_fill_required, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;
