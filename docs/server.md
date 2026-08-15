@@ -26,11 +26,11 @@ Discovers `pylon.toml` the same way the `pylon` CLI does — walking up from the
 
 Giving both forms of the same flag pair (e.g. `--ui` and `--no-ui` together) is an error. See [`[webserver]`/`[ui]`/`[metrics]`/`[cache]`](config.md#webserver) in the configuration reference for the `pylon.toml` keys these flags override.
 
-The `--disable-*-worker` flags exist for deployments that run a given worker in its own process (`pylon worker start`) instead of in-process here, so it isn't double-spawned; the positive form (`--vector-worker`, etc.) opts a worker back in even if schema/config would otherwise cause it to be skipped for lack of a matching declaration.
+The `--disable-*-worker` flags exist for deployments that run a given worker elsewhere, so it isn't double-spawned — another `pylon-server` (typically a `--no-http` worker container) for the index workers, or [`pylon worker start`](cli.md#pylon-worker-start) for the cache-invalidation worker, which is the only one of the three that also runs in Python. The positive form (`--vector-worker`, etc.) opts a worker back in even if schema/config would otherwise cause it to be skipped for lack of a matching declaration.
 
 ## Background workers
 
-On startup, `pylon-server` spawns whatever background workers your schema and `pylon.toml` imply as detached Tokio tasks — mirroring what `pylon worker start` runs as its own process (see [`cli.md`](cli.md#pylon-worker)):
+On startup, `pylon-server` spawns whatever background workers your schema and `pylon.toml` imply as detached Tokio tasks:
 
 - **Vector-index worker** — if the schema declares any `VectorIndex` with a matching `[models.*]` entry.
 - **Search-index worker(s)** — OpenSearch and/or Meilisearch, if the schema declares a matching `SearchIndex(backend=...)` and `[search]` is configured.
@@ -81,8 +81,18 @@ If `[ui].enabled = true` (the default), anything not matching an API route falls
 A typical production deployment is two units:
 
 1. `pylon-server` — HTTP API + UI + every worker except signals.
-2. `pylon worker start` — only needed if the schema has `@pylon.signal` registrations; otherwise optional (`pylon-server` already covers vector/search/cache indexing on its own).
+2. `pylon worker start` — only needed if the schema has `@pylon.signal` registrations; otherwise optional (`pylon-server` already covers vector/search indexing and cache invalidation on its own).
 
 Both connect to the same PostgreSQL database and read the same `pylon.toml`. Neither needs the other running to function for its own responsibilities — a mutation through `pylon-server` still writes signal-outbox rows correctly even with no dispatcher running; they just won't be drained until one is.
 
 Before either can serve anything, the database needs at least one applied migration (`pylon migration apply`, which also sets up the internal `_pylon` schema on first run) — see [Migrations](migrations.md).
+
+### When the application is the server
+
+An application embedding [`pylon.Client`](client/python.md) directly doesn't need `pylon-server` in the request path, but it does still need one *somewhere* if the schema declares a `VectorIndex`, a `SearchIndex`, or a `Partition` — those workers exist only here, and a `--no-http` container is the whole answer to that.
+
+What's left has to be placed deliberately. The signal dispatcher can go anywhere: `pylon worker start` as its own deployment, since claims are arbitrated by the database.
+
+The cache-invalidation worker cannot. `[cache]` is an LMDB file on local disk with no expiry, and the worker evicts from the environment it opens — so it has to reach the same file the application reads through, either by [running inside the application process](client/python.md#running-workers-in-process) or by sharing that directory with it (a second container on the same volume, or a second process on the same machine — LMDB allows concurrent access to one file across processes). A cache-invalidation worker deployed anywhere else evicts a copy nobody reads, and the application keeps serving the write it never saw.
+
+Which is why `pylon worker start` has [`--disable-*` flags](cli.md#pylon-worker-start): one invocation runs the cache worker beside each application, another runs the dispatcher once, centrally.

@@ -7,7 +7,8 @@ whole set, and makes dropping old data an instant metadata operation rather
 than a mass delete.
 
 Partitions are created and dropped by `pg_partman`, driven by a maintenance
-worker Pylon starts for you.
+worker `pylon-server` starts for you (see [Maintenance](#maintenance) for what
+that means if you don't run one).
 
 ```python
 @pylon.type
@@ -63,13 +64,16 @@ then does nothing further on its own. Something has to call
 nothing does, everything works right up until writes reach a range nobody
 created — at which point every insert past that boundary fails at once.
 
-Pylon runs that for you: `pylon serve` starts a `PartitionMaintenanceWorker`
-whenever the schema contains a `Partition`, on an hourly cycle. At the
-shortest supported interval (daily) that is 24 passes per partition, so
-maintenance has to be down for a long time before `premake` runs out.
+`pylon-server` runs that for you: it starts a maintenance worker whenever the
+schema contains a `Partition`, on an hourly cycle. At the shortest supported
+interval (daily) that is 24 passes per partition, so maintenance has to be
+down for a long time before `premake` runs out. A worker-only container
+(`pylon-server --no-http`) starts it too.
 
-If you run `pylon-server` with `--no-http` for a worker-only container, the
-maintenance worker starts there too.
+It is the one worker `pylon worker start` does not run. A deployment whose
+only Pylon process is the Python one — an application embedding `Client`, with
+or without a worker process beside it — therefore has nothing calling
+`run_maintenance`, and needs a `pylon-server --no-http` container as well.
 
 ## Requirements
 

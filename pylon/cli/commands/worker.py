@@ -28,191 +28,21 @@ import click
 from ..config import _print_error, requires_config
 
 
-def _build_providers(schema, config) -> dict:
-    """Resolve the `[models.<name>]` config each schema `VectorIndex` declares.
-
-    Returns ``{(type_name, index_name): ModelConfig}`` — the embedding HTTP
-    call itself happens in Rust now (`run_vector_worker`), so this only does
-    the schema-to-`pylon.toml` lookup, not provider construction.
-    """
-    log = logging.getLogger(__name__)
-    models = config.models_registry
-    providers: dict = {}
-    for td in schema.types:
-        for vi in td.vector_indexes:
-            type_name = f'{td.module}::{td.name}'
-            index_name = vi.index_name
-            model_cfg = models.get(vi.model) or models.get('default')
-            if model_cfg is None:
-                log.warning(
-                    'No [models.%s] entry in pylon.toml for %s (index=%s); skipping',
-                    vi.model,
-                    type_name,
-                    index_name or '<default>',
-                )
-                continue
-            providers[(type_name, index_name)] = model_cfg
-            log.info(
-                'Provider registered: %s  index=%s  →  %s  (%s)',
-                type_name,
-                index_name or '<default>',
-                vi.model,
-                model_cfg.api_style,
-            )
-    return providers
-
-
-def build_worker_tasks(
-    schema,
-    config,
-    *,
-    batch_size: int = 50,
-    poll_interval: float = 30.0,
-    log: logging.Logger | None = None,
-    shared_cache: bool = False,
-) -> list:
-    """Build the list of background-worker coroutines implied by `schema`/`config`.
-
-    Shared between `pylon worker start` (its own process) and `pylon serve`
-    (launched as `asyncio.ensure_future` tasks alongside the ASGI app) — the
-    claim queries every worker below runs (`FOR UPDATE SKIP LOCKED`) are
-    already safe to run from more than one process/task concurrently, so
-    there's no correctness difference between the two call sites, just
-    where the coroutines get awaited from.
-
-    `shared_cache` must be True when the caller's process already has
-    `pylon.cache.init()`-opened LMDB handle (as `pylon serve`'s own
-    read-through cache does) — the cache-invalidation worker then attaches
-    to that same handle instead of opening a second one, which LMDB refuses
-    within a single process.
-    """
-    log = log or logging.getLogger(__name__)
-    db = config.database
-    dsn = db.dsn or f'postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}'
-
-    providers = _build_providers(schema, config)
-    want_opensearch = any(si.backend == 'OpenSearch' for td in schema.types for si in td.search_indexes)
-    want_meilisearch = any(si.backend == 'Meilisearch' for td in schema.types for si in td.search_indexes)
-    from pylon.schema._registry import signals_snapshot
-
-    want_signals = bool(signals_snapshot())
-
-    tasks = []
-
-    if providers:
-        from pylon._core import run_vector_worker
-
-        # Runs entirely in Rust now (`pylon_workers::VectorIndexWorker`)
-        # — claim/embed/write all happen natively; only the resolved
-        # `[models.*]` config crosses into Rust as plain data.
-        provider_list = [
-            (type_name, index_name, model_cfg.api_style, model_cfg.api_url, model_cfg.model, model_cfg.secret)
-            for (type_name, index_name), model_cfg in providers.items()
-        ]
-        log.info(
-            'VectorIndexWorker started  batch_size=%d  poll_interval=%.0fs',
-            batch_size,
-            poll_interval,
-        )
-        tasks.append(run_vector_worker(dsn, schema, provider_list, batch_size, poll_interval))
-
-    if want_opensearch and not config.search_registry:
-        log.warning('SearchIndex(backend=OpenSearch) declared but no [search] config found; skipping')
-    if want_opensearch and config.search_registry:
-        from pylon._core import run_opensearch_worker
-
-        search_cfg = config.search_registry['default']
-        base_url = f'http://{search_cfg.host}:{search_cfg.port}'
-        log.info(
-            'OpenSearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs',
-            base_url,
-            batch_size,
-            poll_interval,
-        )
-        tasks.append(
-            run_opensearch_worker(
-                dsn,
-                schema,
-                base_url,
-                search_cfg.user,
-                search_cfg.password,
-                batch_size,
-                poll_interval,
-            )
-        )
-
-    if want_meilisearch and not config.search_registry:
-        log.warning('SearchIndex(backend=Meilisearch) declared but no [search] config found; skipping')
-    if want_meilisearch and config.search_registry:
-        from pylon._core import run_meilisearch_worker
-
-        search_cfg = config.search_registry['default']
-        base_url = f'http://{search_cfg.host}:{search_cfg.port}'
-        log.info(
-            'MeilisearchWorker started  base_url=%s  batch_size=%d  poll_interval=%.0fs',
-            base_url,
-            batch_size,
-            poll_interval,
-        )
-        tasks.append(
-            run_meilisearch_worker(
-                dsn,
-                schema,
-                base_url,
-                search_cfg.api_key,
-                batch_size,
-                poll_interval,
-            )
-        )
-
-    if config.cache.enabled and shared_cache:
-        from pylon._core import run_cache_invalidation_worker_shared
-        from pylon.cache import NOTIFY_CHANNEL
-
-        # This process (pylon serve) already opened the LMDB handle via
-        # pylon.cache.init() for its own read-through cache — attach to
-        # that same handle rather than opening a second one (LMDB refuses
-        # a second Env::open on the same path within one process).
-        log.info('CacheInvalidationWorker started (shared cache)  channel=%s', NOTIFY_CHANNEL)
-        tasks.append(run_cache_invalidation_worker_shared(dsn))
-    elif config.cache.enabled:
-        from pylon._core import run_cache_invalidation_worker
-        from pylon.cache import NOTIFY_CHANNEL
-
-        # Runs entirely in Rust now (`pylon_workers::CacheInvalidationWorker`)
-        # — it opens its own LMDB handle onto the shared, file-backed
-        # cache at config.cache.path directly, no `pylon.cache.init()`
-        # needed in this process. LMDB supports safe concurrent
-        # multi-process access to one file, so this worker process
-        # evicting entries is immediately visible to every serving
-        # process (e.g. `pylon serve`) mapping the same path.
-        log.info('CacheInvalidationWorker started  channel=%s', NOTIFY_CHANNEL)
-        tasks.append(run_cache_invalidation_worker(dsn, str(config.cache.path), config.cache.max_size_mb))
-
-    if want_signals:
-        from pylon.signals import run_signal_dispatcher
-
-        # The one worker that isn't Rust-native — it needs to hold a
-        # live reference to each registered `@pylon.signal` handler,
-        # which only exists in this Python process.
-        log.info(
-            'Signal dispatcher started  batch_size=%d  poll_interval=%.0fs',
-            batch_size,
-            poll_interval,
-        )
-        tasks.append(run_signal_dispatcher(dsn, batch_size=batch_size, poll_interval=poll_interval))
-
-    return tasks
-
-
 @click.group()
 def worker() -> None:
-    """Manage Pylon background index workers."""
+    """Run Pylon's Python-side background workers and manage the index outbox.
+
+    The outbox subcommands (`failed`, `retry`) administer rows regardless of
+    which process drains them — `pylon-server` does, for the vector and
+    search indexes those rows belong to.
+    """
 
 
 @worker.command()
-@click.option('--batch-size', default=50, show_default=True, help='Number of IndexOutbox rows to claim per cycle.')
+@click.option('--batch-size', default=50, show_default=True, help='Number of SignalOutbox rows to claim per cycle.')
 @click.option('--poll-interval', default=30.0, show_default=True, help='Seconds between polling cycles when idle.')
+@click.option('--disable-cache-worker', is_flag=True, help='Skip the cache-invalidation worker.')
+@click.option('--disable-signal-dispatcher', is_flag=True, help='Skip the signal dispatcher.')
 @click.option(
     '--log-level',
     default='INFO',
@@ -222,13 +52,30 @@ def worker() -> None:
 )
 @requires_config
 @click.pass_context
-def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: str) -> None:
-    """Start index workers for all configured indexes.
+def start(
+    ctx: click.Context,
+    batch_size: int,
+    poll_interval: float,
+    disable_cache_worker: bool,
+    disable_signal_dispatcher: bool,
+    log_level: str,
+) -> None:
+    """Start the background workers that have to run in a Python process.
 
-    Auto-discovers VectorIndex and SearchIndex declarations from the schema
-    and processes IndexOutbox rows until interrupted. `pylon serve` already
-    launches these same workers in-process (see `build_worker_tasks`) — run
-    this separately only if you want workers on their own process/machine.
+    Two do, and they are the two this command runs: the signal dispatcher,
+    because a `@pylon.signal` handler is a live Python callable that exists
+    nowhere else, and cache invalidation, because it evicts from an LMDB
+    file on local disk and so has to reach the cache a nearby process
+    actually reads. Vector and search indexing claim outbox rows the
+    database arbitrates, can run anywhere, and run in `pylon-server`.
+
+    The two `--disable-*` flags split even this pair across processes, for a
+    deployment running the cache invalidator next to each application (which
+    has to share that application's cache directory to evict anything it
+    will ever read) and the signal dispatcher once, somewhere central.
+
+    See `pylon.workers.run_workers` for running either inside an application
+    process instead of this one.
     """
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
@@ -238,37 +85,39 @@ def start(ctx: click.Context, batch_size: int, poll_interval: float, log_level: 
 
     import pylon
     import pylon.query as _q
+    from pylon.workers import build_worker_tasks
 
     pylon.finalize()
     config = ctx.obj['config']
     schema = _q._singleton
 
-    want_search = any(si.backend in ('OpenSearch', 'Meilisearch') for td in schema.types for si in td.search_indexes)
-    if want_search and not config.search_registry:
-        _print_error(
-            'search indexes defined but no [search] config found',
-            'Add [search] host/port/backend to pylon.toml.',
-        )
-        ctx.exit(1)
-        return
+    disabled = [kind for kind, off in (('cache', disable_cache_worker), ('signals', disable_signal_dispatcher)) if off]
 
-    tasks = build_worker_tasks(schema, config, batch_size=batch_size, poll_interval=poll_interval, log=log)
+    tasks = build_worker_tasks(
+        schema,
+        config,
+        batch_size=batch_size,
+        poll_interval=poll_interval,
+        log=log,
+        disabled=disabled,
+    )
     if not tasks:
-        _print_error(
-            'no index workers to start',
-            'Add VectorIndex or SearchIndex(backend=...) to your schema, '
-            'and configure [models.*] / [search] in pylon.toml — or set '
-            '[cache].enabled = true to start the cache-invalidation worker.',
+        hint = (
+            'Set [cache].enabled = true in pylon.toml to start the cache-invalidation '
+            'worker, or register a @pylon.signal handler to start the dispatcher.'
         )
+        if disabled:
+            hint = f'Disabled by flag: {", ".join(disabled)}. {hint}'
+        _print_error('no workers to start', hint)
         ctx.exit(1)
         return
 
     async def run() -> None:
-        # Every Rust-native worker's connection and any HTTP client it owns
-        # are dropped along with the process, matching `worker start`'s own
-        # lifecycle (runs until interrupted). No Python-side cleanup needed
-        # there; the signal dispatcher's own connection is likewise dropped
-        # when its task is cancelled.
+        # The cache worker's connection is dropped along with the process,
+        # matching this command's own lifecycle (runs until interrupted), so
+        # there's no Python-side cleanup to do for it; the signal
+        # dispatcher's connection is likewise dropped when its task is
+        # cancelled.
         await asyncio.gather(*tasks)
 
     try:
@@ -364,7 +213,7 @@ def failed(ctx: click.Context, limit: int) -> None:
 @requires_config
 @click.pass_context
 def retry(ctx: click.Context, index_kind: str | None, yes: bool) -> None:
-    """Requeue failed IndexOutbox rows so workers pick them up again.
+    """Requeue failed IndexOutbox rows so `pylon-server` picks them up again.
 
     Resets `attempts` and clears the backoff, putting each row back to
     Pending. Fix whatever made them fail first — otherwise they will simply

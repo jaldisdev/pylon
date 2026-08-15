@@ -21,12 +21,13 @@
 //! `prometheus` crate's process-global default registry — every worker
 //! (`index_worker::drain_once`, `CacheInvalidationWorker`) increments these
 //! directly, and `render()` dumps the whole registry as Prometheus text
-//! exposition format. `pylon-py` exposes `render()` to Python as
-//! `render_prometheus_metrics()`, served at `pylon serve`'s `/metrics`
-//! route — since `pylon serve` launches these
-//! same workers in-process, one
-//! scrape target sees both HTTP- and worker-side metrics with no separate
-//! listener needed.
+//! exposition format. `pylon-server` serves that straight from its
+//! `/metrics` route; `pylon-py` exposes the same `render()` to Python as
+//! `render_prometheus_metrics()`, for a process running its workers inline
+//! (`pylon.workers`) that wants to expose them on a route of its own. The
+//! registry being process-global is what makes either work: whichever
+//! workers this process happens to run, one scrape target sees all of them,
+//! with no separate listener needed.
 
 use std::sync::LazyLock;
 

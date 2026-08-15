@@ -31,6 +31,45 @@ async with pylon.create_async_client() as client:
 
 `repr(client)` shows connection state and target (`<Client [connected] localhost:5432/mydb>`).
 
+## Running workers in-process
+
+Two of Pylon's background workers have to run in a Python process — cache invalidation and the [signal dispatcher](../schema/signals.md) — and normally do so via [`pylon worker start`](../cli.md#pylon-worker-start). `pylon.workers.run_workers` runs the same pair inside an application that already has an event loop, for a container whose entry point is a web framework and has no room for a second command:
+
+```python
+from contextlib import asynccontextmanager
+
+import pylon
+from pylon.workers import run_workers
+
+client = pylon.create_async_client()
+
+@asynccontextmanager
+async def lifespan(app):
+    await client.ensure_connected()
+    async with run_workers():
+        yield
+```
+
+The workers are cancelled when the block exits. `run_workers` yields the started tasks if you want to inspect them, and takes the same arguments as `pylon worker start`'s flags:
+
+| Argument | Meaning |
+| --- | --- |
+| `batch_size` | SignalOutbox rows claimed per polling cycle (default 50). |
+| `poll_interval` | Seconds between polls when the outbox is empty (default 30). |
+| `disabled` | Worker kinds to skip — either of `'cache'`, `'signals'` (`pylon.workers.WORKER_KINDS`). |
+| `shared_cache` | Attach the cache-invalidation worker to this process's own cache handle. Defaults to `True`, which is what you want here. |
+| `schema`, `config` | Default to the process schema singleton and the `pylon.toml` found from the working tree. |
+
+**Connect before you start them.** Two things depend on that order. The cache handle this process evicts through is opened by `ensure_connected()`, so starting workers first raises `InterfaceError` rather than silently invalidating nothing. And connecting replaces the process schema with the one the database was last migrated to, so resolving it afterwards hands the workers the same schema your queries compile against, instead of whatever your local `.py` files currently declare.
+
+### Why the cache worker is the one that forces the decision
+
+The signal dispatcher drains an outbox table with `FOR UPDATE SKIP LOCKED`. It can run anywhere, in any number, and the database sorts out who gets which row — running it here is a convenience.
+
+Cache invalidation is not like that. `[cache]` is an LMDB file on local disk with no expiry, and the worker evicts from the environment it holds open. It therefore has to reach *your* cache: same process (this API), or same path on the same filesystem (a second process or container sharing the volume). A cache-invalidation worker deployed anywhere else evicts entries nobody reads, and every replica holding the real cache goes on serving the write it never saw for as long as it lives. There is no partial version of this to fall back on — a cache with no invalidator reaching it is wrong, not merely stale.
+
+What this does *not* replace is `pylon-server`. Vector indexing, search indexing, and partition maintenance all run only there. A schema declaring a [`VectorIndex` or `SearchIndex`](../schema/indexes.md) or a [`Partition`](../schema/partitioning.md) needs a `pylon-server --no-http` container somewhere no matter what this process runs — and `run_workers` logs a line at startup when it sees one, since the alternative is a search result that silently never appears.
+
 ## Query methods
 
 | Method | Returns | Raises on wrong cardinality |

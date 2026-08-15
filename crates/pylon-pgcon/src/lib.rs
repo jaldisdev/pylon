@@ -1087,7 +1087,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn binds_a_plain_string_as_a_uuid_param() {
-        // A JSON API request body (see `pylon serve`'s /api/<connection>/query
+        // A JSON API request body (see `pylon-server`'s /api/<connection>/query
         // handler) necessarily carries a UUID query parameter as plain text —
         // there's no JSON "uuid" type — so it arrives as `DecodedValue::Str`,
         // not `::Uuid`. Regression test for a real bug: binding that Str

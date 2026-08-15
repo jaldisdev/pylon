@@ -42,13 +42,13 @@ use pylon_workers::{
 
 use crate::config::{ApiStyle, Config};
 
-/// Matches `build_worker_tasks`'s own defaults (`pylon/cli/commands/
-/// worker.py`) — `pylon serve` never overrides these, only the `worker
-/// start` CLI's `--batch-size`/`--poll-interval` flags do.
+/// How the index workers claim and poll. Not configurable: this server is
+/// the only thing that runs them, so there's no second implementation for
+/// these to drift against and nothing yet that needs them tuned per
+/// deployment.
 const BATCH_SIZE: i64 = 50;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// Matches `run_meilisearch_worker`/`run_opensearch_worker`'s own default
-/// `timeout_secs` (`pylon-py/src/workers.rs`).
+/// Per-request timeout for the search backends' HTTP clients.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-worker override, set via `pylon-server`'s `--<worker>-worker` /

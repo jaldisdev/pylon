@@ -47,6 +47,17 @@ def init(config: CacheConfig) -> None:
     _enabled = True
 
 
+def is_initialized() -> bool:
+    """Whether `init` has opened the process-global LMDB handle.
+
+    False both when caching is off and when nothing has connected yet — the
+    caller that cares about the difference (`pylon.workers`, deciding
+    whether it can attach a worker to this process's cache) already knows
+    `config.cache.enabled` itself.
+    """
+    return _enabled
+
+
 def _resolve_set_name_for_tag(tag: str) -> str | None:
     """Schema-qualified table tag (e.g. ``"public.person"``) -> short Pylon
     type name (e.g. ``"Person"``). Returns None for tags with no owning type

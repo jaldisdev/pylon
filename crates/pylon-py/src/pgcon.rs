@@ -254,12 +254,12 @@ impl<'py> IntoPyObject<'py> for PyDecodedValue {
 }
 
 /// A connected pool.
-/// One per `Client` instance, not a process-wide global: `pylon serve`
+/// One per `Client` instance, not a process-wide global: an application
 /// genuinely holds several independently-configured `Client`s at once (one
-/// per named multi-tenant connection in `pylon.toml`'s `[connections]`),
-/// each against a potentially different database, so a single global pool
-/// slot (this module's earlier design, before any Python code depended on
-/// it) can't represent that.
+/// per named `[database.<name>]` connection in `pylon.toml`), each against
+/// a potentially different database, so a single global pool slot (this
+/// module's earlier design, before any Python code depended on it) can't
+/// represent that.
 #[pyclass(module = "pylon._core", frozen)]
 pub struct PgconPool {
     pub(crate) inner: PgPool,
