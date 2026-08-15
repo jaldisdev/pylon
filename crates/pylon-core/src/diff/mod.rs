@@ -1225,76 +1225,6 @@ pub fn detect_col_renames(
     candidates
 }
 
-/// Like `diff_schema_ops` but incorporates confirmed renames: emits
-/// ALTER TABLE RENAME (for types) and ALTER TABLE RENAME COLUMN (for columns)
-/// instead of DROP + CREATE pairs for renamed objects.
-///
-/// `type_renames`: `(old_module, old_table, new_module, new_table)` tuples.
-/// `col_renames`:  `(module, table, old_col, new_col)` tuples.
-pub fn diff_schema_ops_with_renames(
-    target: &SchemaDescriptor,
-    current: &DbState,
-    type_renames: &[(String, String, String, String)],
-    col_renames: &[(String, String, String, String)],
-) -> Result<Vec<DiffOp>, String> {
-    let mut ops: Vec<DiffOp> = Vec::new();
-    let mut modified = current.clone();
-
-    // ── Emit type rename DDL and update modified state ────────────────────────
-    for (old_mod, old_table, new_mod, new_table) in type_renames {
-        if old_mod == new_mod {
-            push_tx(
-                &mut ops,
-                format!("ALTER TABLE {} RENAME TO {};", qn(old_mod, old_table), qi(new_table)),
-            );
-        } else {
-            push_tx(
-                &mut ops,
-                format!("ALTER TABLE {} SET SCHEMA {};", qn(old_mod, old_table), qi(new_mod)),
-            );
-            push_tx(
-                &mut ops,
-                format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, old_table), qi(new_table)),
-            );
-        }
-        // Make diff_inner think the new name already exists (with old columns).
-        if let Some(t) = modified
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == old_mod && &t.name == old_table)
-        {
-            t.schema = new_mod.clone();
-            t.name = new_table.clone();
-        }
-    }
-
-    // ── Emit column rename DDL and update modified state ──────────────────────
-    for (module, table, old_col, new_col) in col_renames {
-        push_tx(
-            &mut ops,
-            format!(
-                "ALTER TABLE {} RENAME COLUMN {} TO {};",
-                qn(module, table),
-                qi(old_col),
-                qi(new_col)
-            ),
-        );
-        if let Some(t) = modified
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == module && &t.name == table)
-            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
-        {
-            col.name = new_col.clone();
-        }
-    }
-
-    // ── Run the standard diff against the modified state ──────────────────────
-    let mut diff_ops = flatten_ops(diff_inner(target, &modified, true, &HashMap::new())?);
-    ops.append(&mut diff_ops);
-    Ok(ops)
-}
-
 /// Detect all properties that are being made NOT NULL but whose existing rows
 /// may contain NULL values and therefore require a fill expression.
 ///
@@ -1394,6 +1324,43 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
     result
 }
 
+/// Rewrite `state` as though the confirmed renames had already happened, so
+/// the diff that follows sees the new names as present and reports only the
+/// differences that aren't the rename.
+///
+/// The rename DDL itself is *not* emitted here, because its two callers
+/// disagree about who owns it: the flat-`DiffOp` form emits it alongside
+/// this, while the `MigrationStep` form leaves it to whoever resolved the
+/// renames in the first place. What they can't disagree about is this edit
+/// — it has to describe exactly what the rename DDL does, or the diff
+/// re-derives as a DROP + CREATE the very rename it was told about.
+fn apply_renames(
+    state: &mut DbState,
+    type_renames: &[(String, String, String, String)],
+    col_renames: &[(String, String, String, String)],
+) {
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        if let Some(t) = state
+            .tables
+            .iter_mut()
+            .find(|t| &t.schema == old_mod && &t.name == old_table)
+        {
+            t.schema = new_mod.clone();
+            t.name = new_table.clone();
+        }
+    }
+    for (module, table, old_col, new_col) in col_renames {
+        if let Some(t) = state
+            .tables
+            .iter_mut()
+            .find(|t| &t.schema == module && &t.name == table)
+            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
+        {
+            col.name = new_col.clone();
+        }
+    }
+}
+
 /// Full diff with confirmed renames and fill expressions applied.
 ///
 /// `type_renames`: `(old_module, old_table, new_module, new_table)`.
@@ -1417,7 +1384,7 @@ pub fn diff_schema_ops_with_renames_and_fills(
     let mut ops: Vec<DiffOp> = Vec::new();
     let mut modified = current.clone();
 
-    // ── Apply type renames ────────────────────────────────────────────────────
+    // ── Emit the rename DDL ───────────────────────────────────────────────────
     for (old_mod, old_table, new_mod, new_table) in type_renames {
         if old_mod == new_mod {
             push_tx(
@@ -1434,17 +1401,7 @@ pub fn diff_schema_ops_with_renames_and_fills(
                 format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, old_table), qi(new_table)),
             );
         }
-        if let Some(t) = modified
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == old_mod && &t.name == old_table)
-        {
-            t.schema = new_mod.clone();
-            t.name = new_table.clone();
-        }
     }
-
-    // ── Apply column renames ──────────────────────────────────────────────────
     for (module, table, old_col, new_col) in col_renames {
         push_tx(
             &mut ops,
@@ -1455,15 +1412,10 @@ pub fn diff_schema_ops_with_renames_and_fills(
                 qi(new_col)
             ),
         );
-        if let Some(t) = modified
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == module && &t.name == table)
-            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
-        {
-            col.name = new_col.clone();
-        }
     }
+
+    // ── ...and make the baseline match what that DDL will have done ───────────
+    apply_renames(&mut modified, type_renames, col_renames);
 
     // ── Build fill index so emit_column_diff can defer NOT NULL for fills ─────
     let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -1519,27 +1471,7 @@ pub fn diff_schema_steps_with_renames_and_fills(
     fills: &[(String, String, String, String)],
 ) -> Result<Vec<MigrationStep>, String> {
     let mut modified = current.clone();
-
-    for (old_mod, old_table, new_mod, new_table) in type_renames {
-        if let Some(t) = modified
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == old_mod && &t.name == old_table)
-        {
-            t.schema = new_mod.clone();
-            t.name = new_table.clone();
-        }
-    }
-    for (module, table, old_col, new_col) in col_renames {
-        if let Some(t) = modified
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == module && &t.name == table)
-            && let Some(col) = t.columns.iter_mut().find(|c| &c.name == old_col)
-        {
-            col.name = new_col.clone();
-        }
-    }
+    apply_renames(&mut modified, type_renames, col_renames);
 
     let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for (module, table, col, _) in fills {
