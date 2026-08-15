@@ -48,11 +48,11 @@ fn cache_err<E: std::fmt::Display>(e: E) -> PyErr {
 }
 
 /// The process-global `Cache` handle `cache_init` opened, if any — shared
-/// with `workers::run_cache_invalidation_worker_shared` so `pylon serve`
-/// (which now also runs the cache-invalidation worker in-process, see
-/// `pylon serve`) evicts through the *same* open LMDB environment
-/// its own read-through cache uses, rather than a second `Cache::open` on
-/// the same path — LMDB refuses that within one process.
+/// with `workers::run_cache_invalidation_worker_shared` so an application
+/// running the cache-invalidation worker inline (`pylon.workers`) evicts
+/// through the *same* open LMDB environment its own read-through cache
+/// reads, rather than a second `Cache::open` on the same path — LMDB
+/// refuses that within one process.
 pub(crate) fn shared_cache() -> Option<Arc<Cache>> {
     cache_slot().read().unwrap().clone()
 }

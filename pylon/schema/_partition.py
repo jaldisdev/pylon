@@ -36,8 +36,11 @@ class Partition:
     """Declare a type's table as range-partitioned on a time property.
 
     Partitions are created and dropped by ``pg_partman``, driven by the
-    ``PartitionMaintenanceWorker`` that ``pylon serve`` starts automatically
-    for any schema containing a ``Partition``.
+    maintenance worker ``pylon-server`` starts automatically for any schema
+    containing a ``Partition`` — including under ``--no-http``, for a
+    worker-only container. It is the one worker ``pylon worker start`` does
+    not run, so a deployment with no ``pylon-server`` process at all has
+    nothing creating the next ranges.
 
     Usage::
 

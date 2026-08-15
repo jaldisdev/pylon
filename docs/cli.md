@@ -197,13 +197,28 @@ Evicts every entry.
 pylon worker start
 ```
 
-Starts every background worker your schema/config imply, in one process, and runs until interrupted: vector-index embedding, OpenSearch/Meilisearch indexing, cache invalidation, and — the one worker that only exists here, never in `pylon-server` — the [signal dispatcher](schema/signals.md). See [Server](server.md) for why signals specifically need this command run separately even when `pylon-server` is otherwise handling everything else.
+Starts the two background workers that have to run in a Python process, and runs until interrupted: the [signal dispatcher](schema/signals.md), because a `@pylon.signal` handler is a live Python callable that exists nowhere else, and cache invalidation, because it evicts from an LMDB file on local disk and so has to reach the cache a nearby process actually reads.
+
+Vector and search indexing are not here. They claim outbox rows the database arbitrates, so they can run anywhere, and they run in [`pylon-server`](server.md) — including under `--no-http`, for a worker-only container. If your schema declares a `VectorIndex` or `SearchIndex`, this command logs a line at startup saying so, since nothing it starts will drain those rows.
 
 | Flag | Description |
 |---|---|
-| `--batch-size N` | Rows claimed per polling cycle (default 50). |
+| `--batch-size N` | SignalOutbox rows claimed per polling cycle (default 50). |
 | `--poll-interval SECONDS` | Seconds between polls when idle (default 30). |
+| `--disable-cache-worker` | Skip the cache-invalidation worker. |
+| `--disable-signal-dispatcher` | Skip the signal dispatcher. |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Logging verbosity (default `INFO`). |
+
+The two `--disable-*` flags split even this pair across processes. The reason to disable one is that some *other* process is covering it, and for the cache-invalidation worker that is a stronger claim than it looks: it evicts from the LMDB environment it opens at `[cache].path`, and the cache has no expiry, so it only keeps a cache correct if it can reach that exact directory. A worker on another machine or in another container, pointed at its own empty copy of the path, evicts nothing anyone reads while every reader of the real cache keeps serving the write it never saw. Either share the directory (a second process or container on the same volume) or run the worker inside the application process ([`pylon.workers`](client/python.md#running-workers-in-process)).
+
+The signal dispatcher has no such constraint — one anywhere in the deployment is enough. So the usual split is a cache invalidator per application and a dispatcher once, centrally:
+
+```bash
+pylon worker start --disable-signal-dispatcher   # beside each application, sharing its cache directory
+pylon worker start --disable-cache-worker        # once, anywhere
+```
+
+Exiting with nothing to do is an error, so a flag combination that disables everything fails loudly instead of idling.
 
 ## `pylon info`
 

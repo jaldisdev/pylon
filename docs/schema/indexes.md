@@ -37,7 +37,7 @@ class Product:
     )
 ```
 
-A deferred embedding index — writes to the indexed pointers enqueue a job; a background worker (the vector-index worker, run via [`pylon worker start`](../cli.md#pylon-worker) or in-process by [`pylon-server`](../server.md)) generates the embedding via the model configured under `[models.*]` in `pylon.toml` and writes it back. `VectorPointer('TypeName.pointer_name')` — the type prefix is validated against the enclosing type at `finalize()` time. `metric` (`"cosine"` (default), `"euclidean"`, or `"inner_product"`) and `dimensions` (default `1024`) are keyword-only.
+A deferred embedding index — writes to the indexed pointers enqueue a job; a background worker (the vector-index worker, run by [`pylon-server`](../server.md) — including under `--no-http`, for a worker-only container) generates the embedding via the model configured under `[models.*]` in `pylon.toml` and writes it back. `VectorPointer('TypeName.pointer_name')` — the type prefix is validated against the enclosing type at `finalize()` time. `metric` (`"cosine"` (default), `"euclidean"`, or `"inner_product"`) and `dimensions` (default `1024`) are keyword-only.
 
 Query it via [`vector::search`](../pyql/globals-and-functions.md) in PyQL.
 

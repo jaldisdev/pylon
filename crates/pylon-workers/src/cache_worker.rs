@@ -70,10 +70,10 @@ impl CacheInvalidationWorker {
 
     /// Like `connect`, but attaches to an already-open `cache` instead of
     /// opening its own LMDB handle — for a process that already has one
-    /// open (e.g. `pylon serve`'s own read-through cache, see
-    /// `pylon_py::cache::shared_cache`), since LMDB refuses a second
-    /// `Env::open` on the same path within one process, unlike across
-    /// processes (which is what `connect` is for).
+    /// open for its own read-through cache (an application running this
+    /// worker inline, see `pylon_py::cache::shared_cache`), since LMDB
+    /// refuses a second `Env::open` on the same path within one process,
+    /// unlike across processes (which is what `connect` is for).
     pub async fn connect_with_cache(dsn: &str, cache: Arc<Cache>) -> Result<Self> {
         let cache_for_listener = cache.clone();
         let listener = PgListener::connect(dsn, move |n| {
