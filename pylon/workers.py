@@ -29,7 +29,10 @@ anywhere, and runs in `pylon-server`.
 `pylon worker start` runs both of these in a process of its own. This module
 is the same pair as an importable API, for an application that already has
 an event loop and would rather run them beside it than deploy a second
-process. `run_workers` is the entry point:
+process. Which entry point you want depends on how your framework exposes
+the process lifetime: `run_workers` for a single bracketing hook, as an
+ASGI lifespan gives you, and `BackgroundWorkers` for a startup callback and
+a shutdown callback that don't share a scope.
 
     @asynccontextmanager
     async def lifespan(app):
@@ -59,7 +62,7 @@ if TYPE_CHECKING:
     from pylon._core import SchemaDescriptor
     from pylon.config import Config
 
-__all__ = ['WORKER_KINDS', 'build_worker_tasks', 'run_workers']
+__all__ = ['WORKER_KINDS', 'BackgroundWorkers', 'build_worker_tasks', 'run_workers']
 
 #: Every worker this module can start, as accepted by the `disabled`
 #: argument of `build_worker_tasks`/`run_workers` (and mirrored by
@@ -239,6 +242,104 @@ def build_worker_tasks(
     return tasks
 
 
+class BackgroundWorkers:
+    """A started/stopped handle on the workers, for a framework whose startup
+    and shutdown are two separate callbacks.
+
+    Plenty of frameworks expose the process lifetime as a pair of hooks
+    rather than as one bracket around it, and a pair has nowhere for an
+    `async with` to suspend. Hold one of these instead:
+
+        workers = BackgroundWorkers()
+
+        @app.on_startup
+        async def _start():
+            await client.ensure_connected()
+            await workers.start()
+
+        @app.on_shutdown
+        async def _stop():
+            await workers.stop()
+
+    Arguments are `build_worker_tasks`'s, except that `shared_cache`
+    defaults to True — a process running its workers inline is one that
+    holds a `Client`, and therefore one that already has the cache open.
+
+    Where the framework does give you a single bracketing hook, prefer
+    `run_workers`, which is this class with the pairing already done.
+    """
+
+    def __init__(
+        self,
+        schema: SchemaDescriptor | None = None,
+        config: Config | None = None,
+        *,
+        batch_size: int = 50,
+        poll_interval: float = 30.0,
+        log: logging.Logger | None = None,
+        shared_cache: bool = True,
+        disabled: Collection[str] = (),
+    ) -> None:
+        self._kwargs = {
+            'schema': schema,
+            'config': config,
+            'batch_size': batch_size,
+            'poll_interval': poll_interval,
+            'log': log,
+            'shared_cache': shared_cache,
+            'disabled': disabled,
+        }
+        self._tasks: list[asyncio.Task] = []
+
+    @property
+    def tasks(self) -> list[asyncio.Task]:
+        """The running tasks — empty before `start`, and again after `stop`."""
+        return list(self._tasks)
+
+    async def start(self) -> None:
+        """Build the workers and schedule them on the running loop.
+
+        Async, and deliberately so: the workers must be bound to the loop
+        that will actually serve, and requiring a running one here is what
+        makes binding them to some other loop impossible rather than merely
+        unlikely.
+
+        Nothing is scheduled if the configuration implies no workers, which
+        is not an error — an application with no cache and no signal
+        handlers has nothing for this to run, and should not have to know
+        that to call it.
+        """
+        if self._tasks:
+            from pylon.exceptions import InterfaceError
+
+            raise InterfaceError('workers are already started; call stop() before starting them again')
+        # Deliberately not resolved in __init__: schema resolution has to
+        # happen after the client connects (see `_resolve`), and an instance
+        # built at import time would have captured the pre-migration schema.
+        coros = build_worker_tasks(**self._kwargs)
+        self._tasks = [asyncio.ensure_future(c) for c in coros]
+
+    async def stop(self) -> None:
+        """Cancel the workers and wait for them to finish.
+
+        A no-op if they were never started, so a shutdown hook doesn't have
+        to guard against a startup hook that failed before reaching
+        `start`. A worker that ended in an exception rather than in
+        cancellation re-raises here — one that died silently at startup is
+        a cache that quietly stopped being invalidated, and the shutdown
+        path is the last chance anyone has to hear about it.
+        """
+        tasks, self._tasks = self._tasks, []
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [r for r in results if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)]
+        if failures:
+            raise failures[0]
+
+
 @asynccontextmanager
 async def run_workers(
     schema: SchemaDescriptor | None = None,
@@ -252,8 +353,8 @@ async def run_workers(
 ) -> AsyncIterator[list[asyncio.Task]]:
     """Run the background workers for the duration of the `async with` block.
 
-    Built for an ASGI lifespan, where the framework owns the entry point and
-    the workers have to live beside it:
+    Shaped for an ASGI lifespan, which brackets the process lifetime in a
+    single hook:
 
         @asynccontextmanager
         async def lifespan(app):
@@ -261,16 +362,16 @@ async def run_workers(
             async with run_workers():
                 yield
 
-    Arguments are `build_worker_tasks`'s, except that `shared_cache`
-    defaults to True here — a process running its workers inline is one that
-    holds a `Client`, and therefore one that already has the cache open.
+        app = FastAPI(lifespan=lifespan)
 
-    Yields the started tasks, for a caller that wants to inspect them. They
-    are cancelled and awaited on the way out; a worker that raised rather
-    than being cancelled re-raises here, since a worker that died silently
-    at startup is a cache that quietly stops being invalidated.
+    Arguments are `BackgroundWorkers`'s, which is what this wraps. Where a
+    framework splits startup and shutdown into two separate callbacks
+    instead, there is nothing here for the `yield` to suspend inside — hold
+    a `BackgroundWorkers` across the pair.
+
+    Yields the started tasks, for a caller that wants to inspect them.
     """
-    coros = build_worker_tasks(
+    workers = BackgroundWorkers(
         schema,
         config,
         batch_size=batch_size,
@@ -279,13 +380,8 @@ async def run_workers(
         shared_cache=shared_cache,
         disabled=disabled,
     )
-    tasks = [asyncio.ensure_future(c) for c in coros]
+    await workers.start()
     try:
-        yield tasks
+        yield workers.tasks
     finally:
-        for task in tasks:
-            task.cancel()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        failures = [r for r in results if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)]
-        if failures:
-            raise failures[0]
+        await workers.stop()

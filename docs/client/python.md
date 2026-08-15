@@ -33,7 +33,11 @@ async with pylon.create_async_client() as client:
 
 ## Running workers in-process
 
-Two of Pylon's background workers have to run in a Python process — cache invalidation and the [signal dispatcher](../schema/signals.md) — and normally do so via [`pylon worker start`](../cli.md#pylon-worker-start). `pylon.workers.run_workers` runs the same pair inside an application that already has an event loop, for a container whose entry point is a web framework and has no room for a second command:
+Two of Pylon's background workers have to run in a Python process — cache invalidation and the [signal dispatcher](../schema/signals.md) — and normally do so via [`pylon worker start`](../cli.md#pylon-worker-start). `pylon.workers` runs the same pair inside an application that already has an event loop, for a container whose entry point is a web framework and has no room for a second command.
+
+Which entry point you want depends on how your framework hands you the process lifetime.
+
+**One bracketing hook** — an ASGI lifespan, and the common case. `run_workers` is an async context manager, so the workers start before the first request and are cancelled when the block exits:
 
 ```python
 from contextlib import asynccontextmanager
@@ -48,9 +52,30 @@ async def lifespan(app):
     await client.ensure_connected()
     async with run_workers():
         yield
+
+app = FastAPI(lifespan=lifespan)   # Starlette, Litestar, Quart: same shape
 ```
 
-The workers are cancelled when the block exits. `run_workers` yields the started tasks if you want to inspect them, and takes the same arguments as `pylon worker start`'s flags:
+**Two separate callbacks** — a startup hook and a shutdown hook with no shared scope, which a context manager has nowhere to suspend inside. Hold a `BackgroundWorkers` across the pair instead:
+
+```python
+import pylon
+from pylon.workers import BackgroundWorkers
+
+client = pylon.create_async_client()
+workers = BackgroundWorkers()
+
+@app.on_startup
+async def start_workers():
+    await client.ensure_connected()
+    await workers.start()
+
+@app.on_shutdown
+async def stop_workers():
+    await workers.stop()
+```
+
+`stop()` is a no-op if `start()` never ran, so a shutdown hook doesn't have to guard against a startup that failed before reaching it. `run_workers` yields the started tasks if you want to inspect them, and `BackgroundWorkers.tasks` exposes the same. Both take the same arguments, mirroring `pylon worker start`'s flags:
 
 | Argument | Meaning |
 | --- | --- |
@@ -61,6 +86,10 @@ The workers are cancelled when the block exits. `run_workers` yields the started
 | `schema`, `config` | Default to the process schema singleton and the `pylon.toml` found from the working tree. |
 
 **Connect before you start them.** Two things depend on that order. The cache handle this process evicts through is opened by `ensure_connected()`, so starting workers first raises `InterfaceError` rather than silently invalidating nothing. And connecting replaces the process schema with the one the database was last migrated to, so resolving it afterwards hands the workers the same schema your queries compile against, instead of whatever your local `.py` files currently declare.
+
+**Count your processes first.** A server running N worker processes runs its startup hook N times, so this gives you N cache invalidators, N `LISTEN` connections, and N signal dispatchers per container — all doing the same work against the same database. They are all correct (the dispatcher claims with `FOR UPDATE SKIP LOCKED`, and the invalidators evict from copies of one file), just redundant. Above one process per container, a single [`pylon worker start`](../cli.md#pylon-worker-start) sharing the cache directory does that job once and every worker process sees it. Running them in-process is the simpler choice when the container holds one process and you scale by adding containers.
+
+If you run them here anyway, `disabled=['signals']` is usually right: the dispatcher has no locality constraint, so one somewhere in the deployment is enough rather than one per process.
 
 ### Why the cache worker is the one that forces the decision
 

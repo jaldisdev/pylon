@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -71,9 +72,22 @@ def no_signal_handlers(monkeypatch):
 
 
 def with_signal_handler(monkeypatch):
+    """Make the build produce exactly one worker, and make it inert.
+
+    The registry patch is what puts a dispatcher in the list; stubbing the
+    dispatcher itself keeps these tests from depending on a task being
+    cancelled before it reaches its first `await` — a real one would try to
+    connect there.
+    """
+    from pylon import signals
     from pylon.schema import _registry
 
     monkeypatch.setattr(_registry, 'signals_snapshot', lambda: {('default::Doc', 'insert'): [object()]})
+
+    async def stub_dispatcher(dsn, *, batch_size=50, poll_interval=30.0):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(signals, 'run_signal_dispatcher', stub_dispatcher)
 
 
 class TestCheckDisabled:
@@ -139,6 +153,70 @@ class TestSharedCacheOrdering:
             shared_cache=True,
         )
         assert tasks == []
+
+
+class TestBackgroundWorkers:
+    """The start/stop handle, for frameworks whose lifetime is two callbacks.
+
+    Every case here configures no workers at all, so `start()` schedules an
+    empty list — enough to exercise the handle's own bookkeeping without a
+    worker that would want a database on its first poll.
+    """
+
+    def handle(self, tmp_path) -> workers.BackgroundWorkers:
+        return workers.BackgroundWorkers(schema_double(), config_double(tmp_path, cache_enabled=False))
+
+    def test_start_then_stop(self, tmp_path):
+        async def scenario():
+            handle = self.handle(tmp_path)
+            assert handle.tasks == []
+            await handle.start()
+            await handle.stop()
+            assert handle.tasks == []
+
+        asyncio.run(scenario())
+
+    def test_stop_without_start_is_a_noop(self, tmp_path):
+        # A startup hook that raised before reaching start() still leaves the
+        # shutdown hook to run; it shouldn't have to guard against that.
+        asyncio.run(self.handle(tmp_path).stop())
+
+    def test_double_stop_is_a_noop(self, tmp_path):
+        async def scenario():
+            handle = self.handle(tmp_path)
+            await handle.start()
+            await handle.stop()
+            await handle.stop()
+
+        asyncio.run(scenario())
+
+    def test_start_twice_raises(self, tmp_path, monkeypatch):
+        with_signal_handler(monkeypatch)  # so start() actually schedules something
+
+        async def scenario():
+            handle = self.handle(tmp_path)
+            await handle.start()
+            try:
+                with pytest.raises(InterfaceError, match='already started'):
+                    await handle.start()
+            finally:
+                await handle.stop()
+
+        asyncio.run(scenario())
+
+    def test_run_workers_yields_its_tasks(self, tmp_path, monkeypatch):
+        with_signal_handler(monkeypatch)
+
+        async def scenario():
+            async with workers.run_workers(
+                schema_double(),
+                config_double(tmp_path, cache_enabled=False),
+            ) as tasks:
+                assert len(tasks) == 1
+                started = tasks[0]
+            assert started.cancelled()
+
+        asyncio.run(scenario())
 
 
 class TestUnclaimedIndexWarning:
