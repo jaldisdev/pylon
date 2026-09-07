@@ -67,6 +67,23 @@ client.transaction(pylon_client::Isolation::Serializable, |tx| Box::pin(async mo
 
 `Client::transaction`/`transaction_with_attempts` re-run the closure once per attempt against a fresh `Transaction` (exposing the same query methods as `Client`, minus `analyze`); commits automatically on `Ok`, rolls back and retries (0ms, 100ms, 200ms, ... back-off) on a serialization failure/deadlock, up to the attempt budget (default 3 via `transaction`; `transaction_with_attempts` takes an explicit count) — rolls back and propagates immediately on anything else. Write closures accordingly: idempotent, no side effects outside the transaction itself, since a retried attempt reruns the whole body.
 
+### Deliberate rollback
+
+```rust
+let committed: Option<()> = client
+    .transaction_opt(pylon_client::Isolation::Serializable, |tx| Box::pin(async move {
+        tx.execute("insert Person { name := <str>$name }", &[("name", "Ada".into())]).await?;
+        assert_eq!(tx.query("select Person filter .name = 'Ada'", &[]).await?.len(), 1);
+        Err(pylon_client::Error::Rollback)
+    }))
+    .await?;
+assert!(committed.is_none());
+```
+
+Returning `Error::Rollback` rolls the transaction back and is never retried — a decision, not a failure. Everything the closure wrote is visible to the closure's own queries and to nothing else, which is what makes it useful for tests and dry runs that need real writes without leaving rows behind. This is the counterpart of the [Python client's `Rollback`](python.md#deliberate-rollback).
+
+The sentinel travels in `Error` because the closure's return type is `Result<T>` and a path that deliberately produces nothing has no `T` to hand back. `transaction`/`transaction_with_attempts` therefore still return it as `Err(Error::Rollback)` (check it with `Error::is_rollback()`); `transaction_opt`/`transaction_opt_with_attempts` are the same calls with the sentinel folded into `Ok(None)`, so a rollback needs no error handling at the call site — the closest Rust gets to the Python version, where the exception is simply swallowed and the loop ends.
+
 ## `listen`
 
 ```rust
@@ -108,8 +125,9 @@ Every method returns `pylon_client::Result<T>` (`= std::result::Result<T, Error>
 | `Error::UnknownChannel` | `listen(name)` — no `Channel` in the schema matches *name*. |
 | `Error::MalformedPayload` | A `listen()` NOTIFY payload didn't match its Channel's declared shape. |
 | `Error::Cache` | An LMDB cache open/get/put failure. |
+| `Error::Rollback` | Not a failure — a transaction closure asking to be [rolled back](#deliberate-rollback) rather than committed. |
 
-`Error::is_serialization_error()` / `is_deadlock()` / `is_retriable()` identify the two conditions `transaction()`'s retry loop handles automatically.
+`Error::is_serialization_error()` / `is_deadlock()` / `is_retriable()` identify the two conditions `transaction()`'s retry loop handles automatically; `is_rollback()` identifies the one "error" that isn't one.
 
 ## Differences from the Python client
 
@@ -119,4 +137,5 @@ Every method returns `pylon_client::Result<T>` (`= std::result::Result<T, Error>
 | `save()` (diff-and-upsert a hydrated object) | Yes | Not yet — hand-write the `insert`/`update` |
 | `with_globals`/`with_config` | Per-call view, same pool | Same (`Client::with_globals`/`Client::with_config`) |
 | `listen()` | Typed async generator | `recv()`-based `ChannelListener` handle |
+| Deliberate rollback | `raise Rollback` (suppressed; loop ends) | `Err(Error::Rollback)` — `Ok(None)` via `transaction_opt` |
 | Config source | Auto-loads `pylon.toml` | DSN passed explicitly — never parses `pylon.toml` |

@@ -336,6 +336,72 @@ async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_body_returning_rollback_sees_its_own_writes_and_leaves_nothing_behind() {
+    let module = unique_module("live_client_tx_deliberate_rollback");
+    let client = setup(&person_schema(&module)).await;
+
+    let mut attempts = 0;
+    let committed: Option<()> = client
+        .transaction_opt(Isolation::Serializable, |tx| {
+            attempts += 1;
+            let module = module.clone();
+            Box::pin(async move {
+                tx.execute(
+                    &format!("insert {module}::Person {{ name := <str>$name }}"),
+                    &[("name", DecodedValue::Str("Ghost".into()))],
+                )
+                .await?;
+                // The write is visible to the transaction that made it ...
+                let seen = tx.query(&format!("select {module}::Person {{ name }}"), &[]).await?;
+                assert_eq!(seen.len(), 1);
+                Err(pylon_client::Error::Rollback)
+            })
+        })
+        .await
+        .unwrap();
+
+    // ... and nowhere else. A deliberate abort is an outcome, not an error,
+    // and must not burn the attempt budget re-running the body.
+    assert!(committed.is_none());
+    assert_eq!(attempts, 1, "a deliberate rollback must not be retried");
+
+    let rows = client.query(&format!("select {module}::Person"), &[]).await.unwrap();
+    assert!(rows.is_empty(), "the insert must have been rolled back, got: {rows:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn rollback_still_propagates_as_an_error_through_plain_transaction() {
+    let module = unique_module("live_client_tx_rollback_err");
+    let client = setup(&person_schema(&module)).await;
+
+    let result: Result<(), pylon_client::Error> = client
+        .transaction(Isolation::Serializable, |tx| {
+            let module = module.clone();
+            Box::pin(async move {
+                tx.execute(
+                    &format!("insert {module}::Person {{ name := <str>$name }}"),
+                    &[("name", DecodedValue::Str("Ghost".into()))],
+                )
+                .await?;
+                Err(pylon_client::Error::Rollback)
+            })
+        })
+        .await;
+
+    // `transaction` has no `T` to invent, so the sentinel comes back as an
+    // error the caller can recognise — `transaction_opt` is the variant
+    // that folds it into `Ok(None)`.
+    let err = result.expect_err("Rollback must reach the caller here");
+    assert!(err.is_rollback());
+    assert!(!err.is_retriable());
+
+    let rows = client.query(&format!("select {module}::Person"), &[]).await.unwrap();
+    assert!(rows.is_empty(), "the insert must have been rolled back, got: {rows:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     let module = unique_module("live_client_cache");
     let client = setup_with_cache(&person_schema(&module)).await;
