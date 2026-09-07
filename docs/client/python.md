@@ -178,6 +178,22 @@ On a serialization failure or deadlock, the loop **retries automatically** — u
 
 `isolation` accepts `"serializable"` (default), `"repeatable_read"`, or `"read_committed"`.
 
+### Deliberate rollback
+
+```python
+from pylon import Rollback
+
+async for tx in client.transaction():
+    async with tx:
+        await tx.execute('insert Person { name := "Ada" }')
+        assert await tx.query('select Person filter .name = "Ada"')
+        raise Rollback
+```
+
+Raising `Rollback` inside the block rolls the transaction back and exits quietly: the exception is suppressed at the end of the `async with`, so execution continues after the loop, and the retry loop treats the attempt as finished rather than re-running the body. Everything written inside the block is visible to the block's own queries and to nothing else — which is what makes it useful for tests and dry runs that need real writes without leaving rows behind.
+
+`Rollback` deliberately sits outside the `PylonError` hierarchy (it subclasses `Exception` directly), so an `except PylonError` inside the block won't swallow it.
+
 ## Per-call customization
 
 Both return a new `Client` sharing the same underlying connection pool — cheap, and safe to build per-request.
@@ -225,4 +241,4 @@ Every method raises a `pylon.exceptions.PylonError` subclass — never a raw dri
 | `ConstraintViolationError` | A database constraint (exclusivity, check, etc.) was violated. |
 | `InternalServerError` | Anything else — a genuine bug, not a caller mistake. |
 
-See `pylon/exceptions.py` for the complete class hierarchy (it also includes `MigrationError`/`MigrationConflictError`, raised by the migration tooling rather than `Client`).
+See `pylon/exceptions.py` for the complete class hierarchy (it also includes `MigrationError`/`MigrationConflictError`, raised by the migration tooling rather than `Client`). The one exception in that module that is *not* a `PylonError` is [`Rollback`](#deliberate-rollback) — it signals a decision, not a failure.

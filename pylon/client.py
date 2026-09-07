@@ -34,6 +34,7 @@ from pylon.exceptions import (
     NoDataError,
     PylonError,
     ResultCardinalityError,
+    Rollback,
     TransactionDeadlockError,
     TransactionSerializationError,
 )
@@ -58,6 +59,9 @@ class AsyncTransaction:
     ``_retry_exc`` is set by ``__aexit__`` when the failure is retriable
     (serialisation failure or deadlock).  :class:`RetryingTransaction`
     inspects this flag in ``__anext__`` to decide whether to loop again.
+
+    Raising :class:`~pylon.exceptions.Rollback` inside the block rolls back
+    and exits quietly — the exception is suppressed and the loop ends.
     """
 
     def __init__(self, tx: PgconTransaction) -> None:
@@ -81,6 +85,12 @@ class AsyncTransaction:
         else:
             # Always roll back on any error.
             await self._tx.rollback()
+            if isinstance(exc, Rollback):
+                # A deliberate abort, not a failure: swallow it so the
+                # caller's code continues past the block, and leave
+                # `_retry_exc` unset so the loop stops instead of re-running
+                # a body that asked not to be committed.
+                return True
             if isinstance(exc, (TransactionSerializationError, TransactionDeadlockError)):
                 self._retry_exc = exc  # type: ignore[assignment]
 
@@ -181,7 +191,8 @@ class RetryingTransaction:
     an :class:`AsyncTransaction`.  After ``async with tx:`` exits, the
     iterator inspects ``tx._retry_exc``:
 
-    - ``None``  → committed successfully → ``StopAsyncIteration``
+    - ``None``  → committed successfully (or deliberately rolled back with
+      :class:`~pylon.exceptions.Rollback`) → ``StopAsyncIteration``
     - retriable exception → back-off and yield a new transaction
     - budget exhausted → re-raise the last retriable exception
 
@@ -666,6 +677,15 @@ class Client:
             async for tx in client.transaction(attempts=5, isolation="repeatable_read"):
                 async with tx:
                     ...
+
+        Raise :class:`~pylon.exceptions.Rollback` to discard the work
+        instead of committing it — useful for a test that wants to write,
+        read its own writes, and leave nothing behind::
+
+            async for tx in client.transaction():
+                async with tx:
+                    await tx.execute('insert Person { name := "Ada" }')
+                    raise Rollback
         """
         if attempts < 1:
             raise InterfaceError('attempts must be >= 1.')
