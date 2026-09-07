@@ -899,6 +899,71 @@ class TestRetryingTransaction:
         run(_run())
 
 
+class TestRollback:
+    """`raise Rollback` aborts the attempt without failing the caller."""
+
+    def test_aexit_rolls_back_and_suppresses(self):
+        async def _run():
+            from pylon.client import AsyncTransaction
+            from pylon.exceptions import Rollback
+
+            pgcon_tx = MagicMock()
+            pgcon_tx.commit = AsyncMock()
+            pgcon_tx.rollback = AsyncMock()
+
+            tx = AsyncTransaction(pgcon_tx)
+            suppressed = await tx.__aexit__(Rollback, Rollback(), None)
+
+            assert suppressed is True
+            pgcon_tx.rollback.assert_awaited_once()
+            pgcon_tx.commit.assert_not_awaited()
+            # Not a retriable failure — the loop must stop, not re-run.
+            assert tx._retry_exc is None
+
+        run(_run())
+
+    def test_loop_ends_and_execution_continues(self):
+        async def _run():
+            from pylon.client import RetryingTransaction
+            from pylon.exceptions import Rollback
+
+            pgcon_tx = MagicMock()
+            pgcon_tx.commit = AsyncMock()
+            pgcon_tx.rollback = AsyncMock()
+
+            pool = MagicMock()
+            pool.transaction = AsyncMock(return_value=pgcon_tx)
+
+            bodies = 0
+            async for tx in RetryingTransaction(pool, attempts=3, isolation='serializable'):
+                async with tx:
+                    bodies += 1
+                    raise Rollback
+
+            reached_end = True
+
+            assert bodies == 1
+            assert reached_end
+            assert pool.transaction.await_count == 1
+            pgcon_tx.rollback.assert_awaited_once()
+            pgcon_tx.commit.assert_not_awaited()
+
+        run(_run())
+
+    def test_is_not_a_pylon_error(self):
+        """`except PylonError` around the body must not swallow the abort."""
+        from pylon.exceptions import PylonError, Rollback
+
+        assert not issubclass(Rollback, PylonError)
+        assert issubclass(Rollback, Exception)
+
+    def test_exported_from_the_package_root(self):
+        import pylon
+        from pylon.exceptions import Rollback
+
+        assert pylon.Rollback is Rollback
+
+
 class TestInternalSchemaCheck:
     """`ensure_connected` refuses a database this build cannot work against.
 

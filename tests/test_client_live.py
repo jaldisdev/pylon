@@ -381,3 +381,54 @@ def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
     asyncio.run(run())
+
+
+def test_rollback_discards_the_transactions_writes(live_pool, unique_module):
+    """`raise Rollback` leaves the block quietly and leaves no rows behind.
+
+    The point of the exception is a transaction that can write, read its own
+    writes, and then vanish — so both halves are asserted here: the row is
+    visible to the transaction that inserted it, and gone once the block
+    exits. The attempt counter guards the other half of the contract: a
+    deliberate abort is not a retriable failure, so the loop must run the
+    body exactly once and then fall through instead of re-running it.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.exceptions import Rollback
+
+    module = unique_module('live_tx_rollback')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Widget')
+        class Widget:
+            name: str
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        attempts = 0
+        async for tx in client.transaction():
+            async with tx:
+                attempts += 1
+                await tx.execute(f"insert {module}::Widget {{ name := 'ghost' }}")
+                assert await tx.query(f'select {module}::Widget {{ name }}')
+                raise Rollback
+
+        assert attempts == 1
+        assert await client.query(f'select {module}::Widget {{ name }}') == []
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())

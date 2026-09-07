@@ -337,6 +337,28 @@ class TransactionDeadlockError(TransactionError):
     """Deadlock detected; transaction was rolled back."""
 
 
+class Rollback(Exception):
+    """Raise inside ``async with tx:`` to roll back and leave the block quietly.
+
+    Control flow, not a failure — which is why it sits outside the
+    :class:`PylonError` hierarchy: a blanket ``except PylonError`` around
+    the loop body must not swallow it, and it carries none of
+    `PylonError`'s query/caret rendering. The transaction rolls back, the
+    exception is suppressed by ``AsyncTransaction.__aexit__``, and the
+    retry loop ends normally rather than treating it as an attempt worth
+    repeating.
+
+    The intended use is a test or a dry run that wants real writes and real
+    reads-back of them, without leaving the rows behind::
+
+        async for tx in client.transaction():
+            async with tx:
+                await tx.execute('insert Person { name := "Ada" }')
+                assert await tx.query('select Person filter .name = "Ada"')
+                raise Rollback
+    """
+
+
 # ---------------------------------------------------------------------------
 # Query / execution
 # ---------------------------------------------------------------------------

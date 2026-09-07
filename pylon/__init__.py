@@ -21,7 +21,7 @@ from ._finalize import finalize
 from .client import AsyncTransaction, Client, create_async_client
 from .config import Config, DatabaseConfig, ModelConfig, SearchConfig, UiConfig, WebserverConfig
 from .datatypes import Object
-from .exceptions import PylonError
+from .exceptions import PylonError, Rollback
 
 # ── PyQL stdlib namespaces ─────────────────────────────────────────────────────
 # `from pylon import std` — usable both in query-builder expressions
@@ -200,6 +200,7 @@ __all__ = [
     'Readonly',
     'Regexp',
     'Restrict',
+    'Rollback',
     'Scalar',
     'SearchBackend',
     'SearchConfig',
