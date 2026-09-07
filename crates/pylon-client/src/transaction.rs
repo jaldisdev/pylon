@@ -27,6 +27,12 @@
 //! rolls back and propagates on anything else. `Transaction` itself has no
 //! public `commit`/`rollback` — that decision is made for the caller by
 //! the closure's own return value.
+//!
+//! That includes a deliberate abort: returning [`crate::Error::Rollback`]
+//! rolls back without retrying, and
+//! [`Client::transaction_opt`](crate::Client::transaction_opt) reports it
+//! as `Ok(None)` instead of an error. It is the Rust counterpart of
+//! `pylon.Rollback` in `pylon/client.py`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

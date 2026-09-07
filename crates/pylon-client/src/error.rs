@@ -74,6 +74,16 @@ pub enum Error {
     /// declared scalar type, a missing Object field, ...).
     #[error("payload doesn't match its declared Channel shape: {0}")]
     MalformedPayload(String),
+    /// Not a failure: a transaction body asking to be rolled back instead
+    /// of committed. The Rust counterpart of `pylon.Rollback` — a body that
+    /// wants to write, read its own writes and then leave nothing behind
+    /// (a test, a dry run) returns this. It rides in `Error` because the
+    /// body's return type is `Result<T>` and there is no `T` to hand back
+    /// on a path that deliberately produced nothing; [`Client::transaction_opt`]
+    /// turns it into `Ok(None)` for callers who would rather not see an
+    /// error at all.
+    #[error("transaction rolled back at the request of its body")]
+    Rollback,
 }
 
 impl Error {
@@ -102,5 +112,14 @@ impl Error {
     /// (`transaction.rs`) automatically retries on.
     pub fn is_retriable(&self) -> bool {
         self.is_serialization_error() || self.is_deadlock()
+    }
+
+    /// A deliberate abort ([`Error::Rollback`]) rather than a failure —
+    /// worth distinguishing when a caller drives
+    /// [`Client::transaction_with_attempts`](crate::Client::transaction_with_attempts)
+    /// directly instead of going through
+    /// [`Client::transaction_opt`](crate::Client::transaction_opt).
+    pub fn is_rollback(&self) -> bool {
+        matches!(self, Error::Rollback)
     }
 }

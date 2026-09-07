@@ -386,6 +386,11 @@ impl Client {
     /// returns a serialization-failure/deadlock error, up to the attempt
     /// budget. Any other error rolls back and propagates immediately.
     ///
+    /// A body that returns [`Error::Rollback`] rolls back and is never
+    /// retried — a decision, not a failure. It still propagates here (there
+    /// is no `T` to return); [`Client::transaction_opt`] is the same call
+    /// with that sentinel folded into `Ok(None)`.
+    ///
     /// ```no_run
     /// # use pylon_client::DecodedValue;
     /// # async fn go(client: pylon_client::Client) -> pylon_client::Result<()> {
@@ -399,6 +404,56 @@ impl Client {
         F: for<'a> FnMut(&'a Transaction) -> TxFuture<'a, T>,
     {
         self.transaction_with_attempts(isolation, 3, body).await
+    }
+
+    /// [`Client::transaction`], but a body that deliberately rolls back is
+    /// an outcome rather than an error: `Ok(Some(value))` when it committed,
+    /// `Ok(None)` when it returned [`Error::Rollback`]. Real failures still
+    /// propagate as `Err`.
+    ///
+    /// This is the closest Rust gets to `pylon.Rollback` in the Python
+    /// client, where the exception is simply swallowed and the loop ends.
+    /// Everything the body wrote is visible to the body's own queries and
+    /// to nothing else — the point being a test or dry run that needs real
+    /// writes without leaving rows behind.
+    ///
+    /// ```no_run
+    /// # use pylon_client::{DecodedValue, Error};
+    /// # async fn go(client: pylon_client::Client) -> pylon_client::Result<()> {
+    /// let committed: Option<()> = client
+    ///     .transaction_opt(pylon_client::Isolation::Serializable, |tx| Box::pin(async move {
+    ///         tx.execute("insert Person { name := <str>$name }", &[("name", DecodedValue::Str("Bob".into()))]).await?;
+    ///         // ... assert on what the transaction can see, then discard it.
+    ///         Err(Error::Rollback)
+    ///     }))
+    ///     .await?;
+    /// assert!(committed.is_none());
+    /// # Ok(()) }
+    /// ```
+    pub async fn transaction_opt<T, F>(&self, isolation: Isolation, body: F) -> Result<Option<T>>
+    where
+        F: for<'a> FnMut(&'a Transaction) -> TxFuture<'a, T>,
+    {
+        self.transaction_opt_with_attempts(isolation, 3, body).await
+    }
+
+    /// [`Client::transaction_opt`] with an explicit attempt budget — the
+    /// `Ok(None)`-on-rollback counterpart to
+    /// [`Client::transaction_with_attempts`].
+    pub async fn transaction_opt_with_attempts<T, F>(
+        &self,
+        isolation: Isolation,
+        max_attempts: u32,
+        body: F,
+    ) -> Result<Option<T>>
+    where
+        F: for<'a> FnMut(&'a Transaction) -> TxFuture<'a, T>,
+    {
+        match self.transaction_with_attempts(isolation, max_attempts, body).await {
+            Ok(value) => Ok(Some(value)),
+            Err(Error::Rollback) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn transaction_with_attempts<T, F>(
@@ -433,6 +488,11 @@ impl Client {
                 Err(e) if e.is_retriable() && attempt < max_attempts => {
                     let _ = tx.inner.rollback().await;
                 }
+                // `Error::Rollback` is not retriable, so a body that asks to
+                // be discarded lands here and is rolled back once rather
+                // than re-run — re-running a body that already said "don't
+                // keep this" would just repeat its writes to throw them away
+                // again.
                 Err(e) => {
                     let _ = tx.inner.rollback().await;
                     return Err(e);
