@@ -5846,13 +5846,18 @@ impl<'a> Compiler<'a> {
     }
 
     /// Shared lookup for a bare 1-step name: for-loop variable, CTE binding,
-    /// or (free-context only, per existing behavior) a function parameter.
-    /// Used by both `compile_path`'s schema-bound prefix and
-    /// `compile_free_path`. `allow_fn_param` is `false` from `compile_path`
-    /// and `true` from `compile_free_path` — this preserves the existing
-    /// behavior gap where `fn_params` lookup only ever happened in free
-    /// context; `compile_path` never checked it (not fixed here, flagged as
-    /// a follow-up in the merge plan).
+    /// or function parameter. Used by both `compile_path`'s schema-bound
+    /// prefix and `compile_free_path`.
+    ///
+    /// `allow_fn_param` used to be `false` from `compile_path`, so a parameter
+    /// resolved only in free context. An object-returning body like
+    /// `select Item filter .rank = v` compiles its filter against a schema
+    /// anchor, so it never consulted `fn_params` and rejected the bare `v` as
+    /// "absolute paths are not valid in expression context" — while the same
+    /// parameter in a scalar-returning body worked, which is why the gap went
+    /// unnoticed. A bare one-step name can only be a variable, CTE binding or
+    /// parameter in either context (a property is always written `.name`), so
+    /// there is nothing here for a parameter to shadow.
     fn resolve_name_ref(&self, name: &str, allow_fn_param: bool) -> Option<IrExpr> {
         if self.for_vars.contains_key(name) {
             return Some(IrExpr::ForVar { name: name.to_string() });
@@ -5894,7 +5899,7 @@ impl<'a> Compiler<'a> {
             if p.steps.len() == 1
                 && let ast::PathStep::Name(n) = &p.steps[0]
             {
-                if let Some(ir) = self.resolve_name_ref(n, false) {
+                if let Some(ir) = self.resolve_name_ref(n, true) {
                     return Ok(ir);
                 }
                 // __type__ without a leading dot still means the current object's type.
