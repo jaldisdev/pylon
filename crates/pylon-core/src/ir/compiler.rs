@@ -524,6 +524,28 @@ pub fn compile_scalar_default(pyql: &str, schema: &SchemaDescriptor) -> Result<S
 /// Like `compile_scalar_default`, but also returns the compiled `IrExpr` —
 /// used by schema-type-consistency validation (`crate::validate`) to infer
 /// the default's actual produced type via `infer_ir_type`.
+/// Compile a PyQL boolean expression in a type's context into the SQL a CHECK
+/// constraint needs.
+///
+/// Columns emit unqualified (via `compile_expr_unaliased`), which is what a
+/// table-level CHECK wants — it has no alias to qualify against.
+pub fn compile_constraint_expr(
+    pyql: &str,
+    type_name: &str,
+    schema: &SchemaDescriptor,
+) -> Result<String, crate::error::PyQLError> {
+    use crate::parse::ast::Stmt;
+    let ast = crate::parse::parse(&format!("SELECT {pyql}"))?;
+    let Stmt::Select(sel) = &ast else {
+        return Err(PyQLError::Type(PyQLTypeError {
+            message: "constraint expression must be an expression".into(),
+            position: Position { line: 0, col: 0 },
+        }));
+    };
+    let (ir, _params) = compile_expr_unaliased(&sel.result, type_name, schema)?;
+    Ok(crate::sql::emit_expr(&ir))
+}
+
 pub fn compile_scalar_default_typed(pyql: &str, schema: &SchemaDescriptor) -> Result<(String, IrExpr), String> {
     use crate::parse::ast::Stmt;
     let full = format!("SELECT {}", pyql);

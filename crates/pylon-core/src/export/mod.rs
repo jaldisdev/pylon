@@ -70,7 +70,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_interface_link_triggers(schema, &mut out);
     emit_signal_triggers(schema, &mut out);
     emit_unique_indexes(schema, &mut out);
-    emit_check_constraints(schema, &mut out);
+    emit_check_constraints(schema, &mut out)?;
     emit_plain_indexes(schema, &mut out);
     emit_triggers(schema, &mut out)?;
     emit_interface_views(schema, &mut out);
@@ -1395,40 +1395,70 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
 
 // ── Phase 8: check constraints ─────────────────────────────────────────────────
 
-fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) {
-    let mut emitted = false;
+/// `(module, table, constraint name, DDL)` for every CHECK the schema implies.
+///
+/// Shared by `export_schema` and the migration diff, which previously had no
+/// check-constraint phase at all: `pylon migration apply` built databases whose
+/// `MaxLen`/`MinValue`/`Regexp`/`OneOf`/`Expression` constraints simply did not
+/// exist, so a 200-character value went happily into a `MaxLen(24)` column.
+///
+/// A property's `check_constraints` are already SQL (the Python side renders
+/// them from `MaxLen` and friends). A `TypeConstraint::Expression` is user
+/// PyQL and has to be compiled — emitting it verbatim produced SQL containing
+/// `exists (.recipient)`, which no PostgreSQL will accept.
+pub fn check_constraints(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String, String)>, PyQLError> {
+    let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction {
             continue;
         }
         let qname = qn(&t.module, &t.table);
-
         for p in &t.properties {
             for expr in &p.check_constraints {
                 let hash = fnv(&[&t.table, &p.name, expr.as_str()]);
-                let cname = qi(&format!("{}_{}_{}_check", t.table, p.name, &hash[..8]));
-                out.push_str(&format!(
-                    "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});\n",
-                    qname, cname, expr,
+                let cname = format!("{}_{}_{}_check", t.table, p.name, &hash[..8]);
+                result.push((
+                    t.module.clone(),
+                    t.table.clone(),
+                    cname.clone(),
+                    format!("ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});", qname, qi(&cname), expr),
                 ));
-                emitted = true;
             }
         }
         for c in &t.constraints {
             if let TypeConstraint::Expression { expr } = c {
+                let qualified = format!("{}::{}", t.module, t.name);
+                let sql = crate::ir::compile_constraint_expr(expr, &qualified, schema).map_err(|e| {
+                    PyQLError::Fragment(PyQLFragmentError {
+                        message: format!("error in constraint on '{}': {}", qualified, e),
+                        context: qualified.clone(),
+                        position: crate::error::Position { line: 0, col: 0 },
+                    })
+                })?;
                 let hash = fnv(&[&t.table, expr.as_str()]);
-                let cname = qi(&format!("{}_{}_check", t.table, &hash[..8]));
-                out.push_str(&format!(
-                    "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});\n",
-                    qname, cname, expr,
+                let cname = format!("{}_{}_check", t.table, &hash[..8]);
+                result.push((
+                    t.module.clone(),
+                    t.table.clone(),
+                    cname.clone(),
+                    format!("ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});", qname, qi(&cname), sql),
                 ));
-                emitted = true;
             }
         }
     }
-    if emitted {
+    Ok(result)
+}
+
+fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
+    let constraints = check_constraints(schema)?;
+    for (_, _, _, ddl) in &constraints {
+        out.push_str(ddl);
         out.push('\n');
     }
+    if !constraints.is_empty() {
+        out.push('\n');
+    }
+    Ok(())
 }
 
 // ── Phase 9: non-unique indexes ────────────────────────────────────────────────
