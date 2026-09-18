@@ -785,6 +785,17 @@ pub enum OpKey {
     Table(String, String),
     Function(String, String),
     View(String, String),
+    /// A table's foreign keys, deliberately *not* folded into `Table`.
+    ///
+    /// Steps render in insertion order and same-key ops merge into the step
+    /// that already exists, so an FK keyed by its own table would be emitted
+    /// inside that table's `CREATE TABLE` step — before any table created
+    /// later. That made correctness depend on `topo_sort_types` finding a
+    /// perfect order, which it cannot when links form a cycle (a
+    /// self-referencing optional link is enough). Giving foreign keys their
+    /// own key puts every one of them after every table, so the order of the
+    /// table steps stops mattering.
+    ForeignKey(String, String),
 }
 
 #[derive(Debug)]
@@ -1957,9 +1968,36 @@ fn diff_inner(
         let mut local: Vec<DiffOp> = Vec::new();
         emit_fk_diff(td, existing, &type_map, &polymorphic, &mut local);
         steps.extend(
-            OpKey::Table(td.module.clone(), td.table.clone()),
+            OpKey::ForeignKey(td.module.clone(), td.table.clone()),
             verb,
             verbosename_type(&td.module, &td.name),
+            local,
+        );
+    }
+
+    // ── Phase 6b: junction target FKs ─────────────────────────────────────────
+    // Keyed by the junction table rather than its owner, so these land in a
+    // step of their own after every `CREATE TABLE` — the target of a junction
+    // is an unrelated type whose table the owner's own step cannot depend on.
+    for (jt_module, jt_name, cname, ddl) in crate::export::junction_fk_constraints(target, &type_map) {
+        let already_there = cur_tables
+            .get(&(jt_module.as_str(), jt_name.as_str()))
+            .map(|t| t.foreign_keys.iter().any(|fk| fk.constraint_name == cname))
+            .unwrap_or(false);
+        if already_there {
+            continue;
+        }
+        let verb = if cur_tables.contains_key(&(jt_module.as_str(), jt_name.as_str())) {
+            Verb::Alter
+        } else {
+            Verb::Create
+        };
+        let mut local: Vec<DiffOp> = Vec::new();
+        push_tx(&mut local, ddl);
+        steps.extend(
+            OpKey::ForeignKey(jt_module.clone(), jt_name.clone()),
+            verb,
+            format!("link table '{}.{}'", jt_module, jt_name),
             local,
         );
     }
@@ -1988,10 +2026,7 @@ fn diff_inner(
                 emit_junction_table(
                     td,
                     &ml.name,
-                    &ml.target,
                     ml.through.as_deref(),
-                    &ml.on_delete,
-                    &type_map,
                     target,
                     false,
                     false,
@@ -2011,10 +2046,7 @@ fn diff_inner(
                 emit_junction_table(
                     td,
                     &l.name,
-                    &l.target,
                     l.through.as_deref(),
-                    &l.on_delete,
-                    &type_map,
                     target,
                     true,
                     l.is_exclusive,
@@ -3147,57 +3179,21 @@ fn emit_fk_diff(
 fn emit_junction_table(
     td: &TypeDescriptor,
     ml_name: &str,
-    ml_target: &str,
     through: Option<&str>,
-    on_delete: &[crate::schema::OnDeletePolicy],
-    type_map: &HashMap<String, (&str, &str)>,
     schema: &SchemaDescriptor,
     single: bool,
     exclusive: bool,
     ops: &mut Vec<DiffOp>,
 ) {
-    use crate::schema::{DeleteAction, DeleteSide};
-
     let jt_name = format!("{}.{}", td.table, ml_name);
     let src_on_delete = " ON DELETE CASCADE";
-    // See the identical comment in `emit_fk_diff` above / `export::needs_deferred_target_fk`.
-    let needs_deferred = crate::export::needs_deferred_target_fk(on_delete);
-    let tgt_on_delete = on_delete
-        .iter()
-        .find(|p| p.side == DeleteSide::Target)
-        .map(|p| match &p.action {
-            DeleteAction::Restrict if needs_deferred => " DEFERRABLE INITIALLY DEFERRED",
-            DeleteAction::Restrict => " ON DELETE RESTRICT",
-            DeleteAction::DeferredRestrict => " DEFERRABLE INITIALLY DEFERRED",
-            DeleteAction::Allow => " ON DELETE CASCADE",
-            DeleteAction::DeleteSource => " ON DELETE CASCADE",
-            _ => " ON DELETE RESTRICT",
-        })
-        .unwrap_or(if needs_deferred {
-            " DEFERRABLE INITIALLY DEFERRED"
-        } else {
-            " ON DELETE RESTRICT"
-        });
-
-    let mut col_lines = if crate::export::polymorphic_types(schema).contains(ml_target) {
-        format!(
-            "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL",
-            qn(&td.module, &td.table),
-            src_on_delete,
-        )
-    } else {
-        let tgt_ref = type_map
-            .get(ml_target)
-            .map(|(m, t)| qn(m, t))
-            .unwrap_or_else(|| qi(ml_target));
-        format!(
-            "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){}",
-            qn(&td.module, &td.table),
-            src_on_delete,
-            tgt_ref,
-            tgt_on_delete,
-        )
-    };
+    // The target FK is added by the FK pass below, not inline — the target's
+    // own table may not exist yet. See `export::junction_fk_constraints`.
+    let mut col_lines = format!(
+        "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL",
+        qn(&td.module, &td.table),
+        src_on_delete,
+    );
 
     // Extra columns from the through junction type.
     if let Some(through_qname) = through

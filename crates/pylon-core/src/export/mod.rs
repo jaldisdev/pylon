@@ -64,7 +64,8 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_tables(schema, &mut out);
     emit_fk_constraints(schema, &type_map, &mut out);
     emit_link_source_triggers(schema, &type_map, &mut out);
-    emit_junction_tables(schema, &type_map, &mut out);
+    emit_junction_tables(schema, &mut out);
+    emit_junction_fk_constraints(schema, &type_map, &mut out);
     emit_multilink_deletion_triggers(schema, &type_map, &mut out);
     emit_interface_link_triggers(schema, &mut out);
     emit_signal_triggers(schema, &mut out);
@@ -539,6 +540,77 @@ fn emit_fk_constraints(schema: &SchemaDescriptor, type_map: &HashMap<String, (&s
     }
 }
 
+/// `(module, junction table, constraint name, ddl)` for every junction's
+/// target-side FK.
+///
+/// A junction table is created inside its *source* type's step, but its target
+/// FK points at a completely unrelated type whose own table may be created much
+/// later — `"account"."Account.tags"` referencing `"account"."Tag"` failed
+/// exactly that way. Emitting the FK inline therefore imposes an ordering the
+/// migration engine has no way to satisfy in general, so the column is created
+/// bare and the constraint added in a later pass, exactly as a single link's
+/// already is. A link to an interface gets no FK at all (see
+/// `polymorphic_types`).
+pub fn junction_fk_constraints(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+) -> Vec<(String, String, String, String)> {
+    let polymorphic = polymorphic_types(schema);
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if t.abstract_ || t.junction {
+            continue;
+        }
+        let pointers = t
+            .multilinks
+            .iter()
+            .map(|ml| (ml.name.as_str(), &ml.target, &ml.on_delete))
+            .chain(
+                t.links
+                    .iter()
+                    .filter(|l| l.is_junction_backed())
+                    .map(|l| (l.name.as_str(), &l.target, &l.on_delete)),
+            );
+        for (name, target, on_delete) in pointers {
+            if polymorphic.contains(target) {
+                continue;
+            }
+            let Some((tgt_module, tgt_table)) = type_map.get(target) else {
+                continue;
+            };
+            let jt_name = format!("{}.{}", t.table, name);
+            // `{table}_{link}_target_fkey`, not the dotted junction table name:
+            // this is the convention the rest of the engine already expects for
+            // a junction's foreign keys.
+            let cname = format!("{}_{}_target_fkey", t.table, name);
+            let ddl = format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY (target) REFERENCES {}(id){};",
+                qn(&t.module, &jt_name),
+                qi(&cname),
+                qn(tgt_module, tgt_table),
+                target_jt_fk_suffix(on_delete),
+            );
+            result.push((t.module.clone(), jt_name, cname, ddl));
+        }
+    }
+    result
+}
+
+fn emit_junction_fk_constraints(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+    out: &mut String,
+) {
+    let constraints = junction_fk_constraints(schema, type_map);
+    for (_, _, _, ddl) in &constraints {
+        out.push_str(ddl);
+        out.push('\n');
+    }
+    if !constraints.is_empty() {
+        out.push('\n');
+    }
+}
+
 // ── Trigger emit helper ────────────────────────────────────────────────────────
 
 fn emit_before_delete_trigger(fn_qname: &str, trigger_name: &str, table_qname: &str, body: &str, out: &mut String) {
@@ -736,7 +808,7 @@ fn emit_link_source_triggers(schema: &SchemaDescriptor, type_map: &HashMap<Strin
 
 // ── Phase 6: junction tables for multi-links ───────────────────────────────────
 
-fn emit_junction_tables(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
+fn emit_junction_tables(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types {
         if t.abstract_ || t.junction {
             continue;
@@ -744,10 +816,8 @@ fn emit_junction_tables(schema: &SchemaDescriptor, type_map: &HashMap<String, (&
         for ml in &t.multilinks {
             emit_one_junction_table(
                 schema,
-                type_map,
                 t,
                 &ml.name,
-                &ml.target,
                 &ml.on_delete,
                 ml.through.as_deref(),
                 false,
@@ -766,10 +836,8 @@ fn emit_junction_tables(schema: &SchemaDescriptor, type_map: &HashMap<String, (&
             }
             emit_one_junction_table(
                 schema,
-                type_map,
                 t,
                 &l.name,
-                &l.target,
                 &l.on_delete,
                 l.through.as_deref(),
                 true,
@@ -785,10 +853,8 @@ fn emit_junction_tables(schema: &SchemaDescriptor, type_map: &HashMap<String, (&
 #[allow(clippy::too_many_arguments)]
 fn emit_one_junction_table(
     schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
     t: &TypeDescriptor,
     name: &str,
-    target: &str,
     on_delete: &[OnDeletePolicy],
     through: Option<&str>,
     single: bool,
@@ -803,17 +869,10 @@ fn emit_one_junction_table(
         qn(&t.module, &t.table),
         src_suffix,
     ));
-    let target_is_polymorphic = polymorphic_types(schema).contains(target);
-    if let Some((tgt_module, tgt_table)) = type_map.get(target).filter(|_| !target_is_polymorphic) {
-        let tgt_suffix = target_jt_fk_suffix(on_delete);
-        out.push_str(&format!(
-            "    target uuid NOT NULL REFERENCES {}(id){},\n",
-            qn(tgt_module, tgt_table),
-            tgt_suffix,
-        ));
-    } else {
-        out.push_str("    target uuid NOT NULL,\n");
-    }
+    // No inline `REFERENCES`: the target table may not exist yet, so the FK is
+    // added afterwards by `emit_junction_fk_constraints`, the same way a single
+    // link's FK waits for `emit_fk_constraints`. See that function for why.
+    out.push_str("    target uuid NOT NULL,\n");
 
     // Extra property columns from a junction through type.
     if let Some(through_qname) = through {

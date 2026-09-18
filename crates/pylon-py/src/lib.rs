@@ -2088,7 +2088,8 @@ impl MigrationStep {
             .collect()
     }
 
-    /// One of "module", "scalar", "table", "function", "view" — the kind of
+    /// One of "module", "scalar", "table", "function", "view", "foreign_key"
+    /// — the kind of
     /// object this step's identity refers to. Lets a caller correlate steps
     /// (e.g. an interface's "view" step with its implementors' "table"
     /// steps) without parsing `prompt`/`object_desc` display text.
@@ -2100,6 +2101,7 @@ impl MigrationStep {
             core::diff::OpKey::Table(_, _) => "table",
             core::diff::OpKey::Function(_, _) => "function",
             core::diff::OpKey::View(_, _) => "view",
+            core::diff::OpKey::ForeignKey(_, _) => "foreign_key",
         }
     }
 
@@ -2114,7 +2116,10 @@ impl MigrationStep {
             core::diff::OpKey::Scalar(m, n) | core::diff::OpKey::Function(m, n) | core::diff::OpKey::View(m, n) => {
                 Some(format!("{m}::{n}"))
             }
-            core::diff::OpKey::Table(m, table) => schema
+            // A foreign-key step names the table it hangs off, so it resolves
+            // the same way — except a junction's, keyed by `Type.link`, which
+            // matches no type and correctly yields `None`.
+            core::diff::OpKey::Table(m, table) | core::diff::OpKey::ForeignKey(m, table) => schema
                 .inner
                 .types
                 .iter()
