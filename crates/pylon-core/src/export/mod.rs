@@ -73,7 +73,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_plain_indexes(schema, &mut out);
     emit_triggers(schema, &mut out)?;
     emit_interface_views(schema, &mut out);
-    emit_junction_excl_views(schema, &mut out);
+    emit_interface_junction_views(schema, &mut out);
     emit_interface_exclusive_triggers(schema, &mut out);
     emit_object_functions(schema, &mut out)?;
     emit_vector_columns(schema, &mut out);
@@ -1565,32 +1565,27 @@ pub fn interface_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, 
 /// `{table}.{name}` convention an ordinary junction table already uses
 /// (e.g. `"Product.tags"`), just one level up (per-interface instead of
 /// per-implementor).
-fn junction_excl_view_name(iface_table: &str, link_name: &str) -> String {
+fn interface_junction_view_name(iface_table: &str, link_name: &str) -> String {
     format!("{}.{}", iface_table, link_name)
 }
 
-/// A junction-backed exclusive link has no `{name}_id`/`{name}` column on
-/// the owner row at all (see `PropertyDescriptor`'s object-view analogue,
-/// `emit_one_interface_view`) — its data instead lives one level down, in
-/// each implementor's own physically separate junction table (`emit_one_
-/// junction_table`'s `jt_name = "{impl.table}.{name}"`; a `through()` type
-/// only ever contributes extra property columns, never a shared physical
-/// table, so *every* implementor gets its own). Cross-implementor
-/// exclusivity therefore needs its own helper view unioning `(source,
-/// target)` across every implementor's own junction table for this link —
-/// this returns one `(module, view_name, ddl)` per (interface, junction-
-/// backed exclusive link), for `make_excl_junction_info` to query and for
-/// the migration diff engine to create/hash-diff/drop exactly like
-/// `interface_view_ddl_with_names`'s object views.
-pub fn junction_excl_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
-    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
-    for t in &schema.types {
-        if !t.abstract_ {
-            for iface in &t.interfaces {
-                implementors.entry(iface.clone()).or_default().push(t);
-            }
-        }
-    }
+/// Union views over each implementor's junction table, one per (interface,
+/// multi-link or junction-backed link).
+///
+/// A multi-link's rows never live on the owner row — they live one level down
+/// in a junction table, and because abstract pointers are flattened, *every*
+/// implementor gets its own (`emit_one_junction_table`'s
+/// `jt_name = "{impl.table}.{name}"`). Nothing physical therefore exists at the
+/// interface's own `"{iface.table}.{name}"`, which is exactly the relation the
+/// query compiler addresses when a multi-link is traversed from a polymorphic
+/// root — `select Account { emails }` compiled to SQL against
+/// `"Account.emails"` and failed with `relation does not exist`. These views
+/// supply it.
+///
+/// Also what `make_excl_junction_info` queries for cross-implementor
+/// exclusivity, which is the narrower case this started as.
+pub fn interface_junction_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
+    let implementors = interface_implementors(schema);
     let mut result = Vec::new();
     for t in &schema.types {
         if !(t.abstract_ && t.materialized) {
@@ -1601,16 +1596,42 @@ pub fn junction_excl_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(Stri
         if impls.is_empty() {
             continue;
         }
-        for l in &t.links {
-            if !(l.is_exclusive && l.is_junction_backed()) {
-                continue;
+
+        // Every junction-shaped pointer on the interface: multi-links always,
+        // single links only when a `through()` type puts them in a junction.
+        let pointers: Vec<(&str, Option<&str>)> = t
+            .multilinks
+            .iter()
+            .map(|ml| (ml.name.as_str(), ml.through.as_deref()))
+            .chain(
+                t.links
+                    .iter()
+                    .filter(|l| l.is_junction_backed())
+                    .map(|l| (l.name.as_str(), l.through.as_deref())),
+            )
+            .collect();
+
+        for (link_name, through) in pointers {
+            // A `through()` type's own properties are real columns on each
+            // junction table, so the view has to carry them or `@propname`
+            // would be unreachable through the interface.
+            let mut columns = vec!["source".to_string(), "target".to_string()];
+            if let Some(through_qname) = through
+                && let Some(td) = schema
+                    .types
+                    .iter()
+                    .find(|td| format!("{}::{}", td.module, td.name) == through_qname && td.junction)
+            {
+                columns.extend(td.properties.iter().filter(|p| p.name != "id").map(|p| qi(&p.name)));
             }
-            let view_name = junction_excl_view_name(&t.table, &l.name);
+            let column_list = columns.join(", ");
+
+            let view_name = interface_junction_view_name(&t.table, link_name);
             let selects: Vec<String> = impls
                 .iter()
                 .map(|impl_t| {
-                    let jt_name = format!("{}.{}", impl_t.table, l.name);
-                    format!("    SELECT source, target FROM {}", qn(&impl_t.module, &jt_name))
+                    let jt_name = format!("{}.{}", impl_t.table, link_name);
+                    format!("    SELECT {} FROM {}", column_list, qn(&impl_t.module, &jt_name))
                 })
                 .collect();
             let ddl = format!(
@@ -1624,8 +1645,8 @@ pub fn junction_excl_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(Stri
     result
 }
 
-fn emit_junction_excl_views(schema: &SchemaDescriptor, out: &mut String) {
-    for (_, _, ddl) in junction_excl_view_ddl_with_names(schema) {
+fn emit_interface_junction_views(schema: &SchemaDescriptor, out: &mut String) {
+    for (_, _, ddl) in interface_junction_view_ddl_with_names(schema) {
         out.push_str(&ddl);
         out.push_str("\n\n");
     }
@@ -1812,13 +1833,13 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
 /// value being deduplicated (`target`) lives in each implementor's own
 /// separate junction table (`"{impl.table}.{link_name}"`), never on the
 /// owner row itself, so both the trigger's own query (against
-/// `junction_excl_view_ddl_with_names`'s helper view) and the constraint
+/// `interface_junction_view_ddl_with_names`'s helper view) and the constraint
 /// trigger's attachment point (the junction table, not `impl_t` itself)
 /// differ from the plain-property/plain-link case.
 fn make_excl_junction_info(iface: &TypeDescriptor, link_name: &str, impl_t: &TypeDescriptor) -> ExclTriggerInfo {
     let fn_name = excl_fn_name(&iface.table, std::slice::from_ref(&link_name.to_string()));
     let fn_qname = format!("{}.{}", pg_schema(&iface.module), qi(&fn_name));
-    let view_qname = qn(&iface.module, &junction_excl_view_name(&iface.table, link_name));
+    let view_qname = qn(&iface.module, &interface_junction_view_name(&iface.table, link_name));
     let jt_name = format!("{}.{}", impl_t.table, link_name);
     let jt_qname = qn(&impl_t.module, &jt_name);
 
@@ -1921,7 +1942,7 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             // on the owner row — its value lives one level down, in each
             // implementor's own separate junction table (a `through()`
             // type only ever contributes extra property columns, never a
-            // shared physical table — see `junction_excl_view_ddl_with_
+            // shared physical table — see `interface_junction_view_ddl_with_
             // names`'s own doc comment) — so it needs the junction-specific
             // helper view + trigger builder instead of the plain
             // object-column path every other exclusive pointer here uses.
@@ -2499,6 +2520,43 @@ mod tests {
             triggers: vec![],
             junction: false,
             signals: vec![],
+        }
+    }
+
+    #[test]
+    fn test_multilink_on_an_interface_gets_a_union_view_over_the_implementors() {
+        // The query compiler addresses `"Iface.link"` when a multi-link is
+        // traversed from a polymorphic root, but the pointer is flattened so
+        // only per-implementor junction tables physically exist. Without this
+        // view `select Account { emails }` compiled fine and then failed at
+        // runtime with `relation "Account.emails" does not exist`.
+        let mut schema = interface_schema(vec![referencing_type("Email", vec![], vec![])]);
+        for t in schema.types.iter_mut() {
+            if t.name == "Account" || t.name == "Individual" || t.name == "Organization" {
+                t.multilinks.push(MultiLinkDescriptor {
+                    name: "emails".into(),
+                    target: "default::Email".into(),
+                    through: None,
+                    nullable: true,
+                    description: None,
+                    default_pyql: None,
+                    on_delete: vec![],
+                });
+            }
+        }
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("CREATE VIEW \"public\".\"Account.emails\""),
+            "no union view for the interface's multi-link, got:\n{}",
+            ddl
+        );
+        for implementor in ["Individual", "Organization"] {
+            assert!(
+                ddl.contains(&format!("FROM \"public\".\"{}.emails\"", implementor)),
+                "union view misses {}, got:\n{}",
+                implementor,
+                ddl
+            );
         }
     }
 
@@ -3227,7 +3285,7 @@ mod tests {
             }
         }
 
-        let views = junction_excl_view_ddl_with_names(&schema);
+        let views = interface_junction_view_ddl_with_names(&schema);
         assert_eq!(views.len(), 1, "expected exactly one helper view, got: {views:?}");
         let (view_module, view_name, view_ddl) = &views[0];
         assert_eq!(view_module, "default");

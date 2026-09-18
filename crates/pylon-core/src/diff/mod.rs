@@ -2194,12 +2194,12 @@ fn diff_inner(
 
     // ── Phase 10.5: junction-backed exclusive link cross-implementor views ───
     // Same add/hash-diff treatment as Phase 10's interface object views —
-    // see `export::junction_excl_view_ddl_with_names`'s own doc comment for
+    // see `export::interface_junction_view_ddl_with_names`'s own doc comment for
     // why a junction-backed exclusive link needs its own helper view at
     // all (its value lives in each implementor's own separate junction
     // table, never on the owner row). Must run before Phase 11.5, which
     // queries these views from the trigger functions it emits.
-    for (module, name, ddl) in crate::export::junction_excl_view_ddl_with_names(target) {
+    for (module, name, ddl) in crate::export::interface_junction_view_ddl_with_names(target) {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
             cur_views
