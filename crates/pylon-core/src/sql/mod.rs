@@ -4042,6 +4042,30 @@ mod tests {
     }
 
     #[test]
+    fn test_detached_subquery_correlates_against_the_outer_row() {
+        // The anti-join idiom: "the Person with no other Person of the same
+        // name that is younger". `detached` is what makes the inner `Person` a
+        // different row from the outer one, so the bare `Person.name` inside
+        // has to resolve to the *outer* alias. It used to be stripped as a
+        // no-op, which compiled to `t1.name = t1.name` — a tautology that
+        // quietly matched every row instead of erroring.
+        let out = compile_and_emit(
+            "SELECT Person { name } FILTER NOT EXISTS (\
+             SELECT DETACHED Person FILTER .name = Person.name AND .age > Person.age)",
+        );
+        assert!(
+            out.sql.contains("\"t1\".\"name\" = \"t0\".\"name\""),
+            "the inner row should be compared against the outer one:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("\"t1\".\"name\" = \"t1\".\"name\""),
+            "self-comparison means the correlation was lost:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_free_select_tuple() {
         let schema = make_schema();
         let ast = parse::parse("SELECT (1, 2)").unwrap();
