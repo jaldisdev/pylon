@@ -427,9 +427,13 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         }
     }
 
-    // Views (interface types)
+    // Views (interface types), both the object views and the per-multi-link
+    // junction views. Leaving the junction ones out here made them absent from
+    // the recorded state, so every subsequent `migration create` believed they
+    // were missing and re-emitted all of them.
     let views: Vec<DbView> = crate::export::interface_view_ddl_with_names(schema)
         .into_iter()
+        .chain(crate::export::interface_junction_view_ddl_with_names(schema))
         .map(|(module, name, ddl)| DbView {
             schema: module,
             name,
