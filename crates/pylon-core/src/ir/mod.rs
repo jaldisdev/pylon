@@ -27,6 +27,7 @@ mod compiler;
 pub mod tags;
 
 pub use compiler::compile;
+pub use compiler::compile_constraint_expr;
 pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_scalar_default;

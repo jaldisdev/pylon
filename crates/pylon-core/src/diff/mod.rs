@@ -203,6 +203,10 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .collect();
 
     let expected_trigger_names = expected_triggers(schema, &type_map);
+    let mut expected_checks: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (module, table, cname, _) in crate::export::check_constraints(schema).unwrap_or_default() {
+        expected_checks.entry((module, table)).or_default().push(cname);
+    }
     let mut tables: Vec<DbTable> = Vec::new();
 
     for td in &schema.types {
@@ -359,23 +363,16 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             });
         }
 
-        // CHECK constraints — names are hash-based in the real schema; approximate here.
-        let mut checks: Vec<DbCheck> = Vec::new();
-        for p in &td.properties {
-            for (i, _) in p.check_constraints.iter().enumerate() {
-                checks.push(DbCheck {
-                    constraint_name: format!("{}_{}_check_{}", td.table, p.name, i),
-                });
-            }
-        }
-        for (i, constraint) in td.constraints.iter().enumerate() {
-            use crate::schema::TypeConstraint;
-            if let TypeConstraint::Expression { .. } = constraint {
-                checks.push(DbCheck {
-                    constraint_name: format!("{}_expr_check_{}", td.table, i),
-                });
-            }
-        }
+        // CHECK constraints, named exactly as `export::check_constraints` names
+        // them — an approximation here would never match what was emitted, so
+        // every diff would try to add them again.
+        let checks: Vec<DbCheck> = expected_checks
+            .get(&(td.module.clone(), td.table.clone()))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|constraint_name| DbCheck { constraint_name })
+            .collect();
 
         let triggers: Vec<String> = expected_trigger_names
             .get(&(td.module.clone(), td.table.clone()))
@@ -2025,6 +2022,35 @@ fn diff_inner(
         );
     }
 
+    // ── Phase 6c: CHECK constraints ───────────────────────────────────────────
+    // This phase did not exist. `export_schema` emitted every CHECK the schema
+    // implies and the migration path emitted none, so `pylon migration apply`
+    // produced databases with no `MaxLen`/`MinValue`/`Regexp`/`OneOf`/
+    // `Expression` enforcement at all — a 200-character value went straight
+    // into a `MaxLen(24)` column.
+    for (module, table, cname, ddl) in crate::export::check_constraints(target).map_err(|e| e.to_string())? {
+        let already_there = cur_tables
+            .get(&(module.as_str(), table.as_str()))
+            .map(|t| t.checks.iter().any(|c| c.constraint_name == cname))
+            .unwrap_or(false);
+        if already_there {
+            continue;
+        }
+        let verb = if cur_tables.contains_key(&(module.as_str(), table.as_str())) {
+            Verb::Alter
+        } else {
+            Verb::Create
+        };
+        let mut local: Vec<DiffOp> = Vec::new();
+        push_tx(&mut local, ddl);
+        steps.extend(
+            OpKey::ForeignKey(module.clone(), format!("{table}#checks")),
+            verb,
+            verbosename_type(&module, &table),
+            local,
+        );
+    }
+
     // ── Phase 7: junction tables for new multi-links (and junction-backed
     // single links, which share the exact same junction-table machinery,
     // just capped to one row per source) — folded into the owning type's
@@ -2046,15 +2072,7 @@ fn diff_inner(
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
                 let mut local: Vec<DiffOp> = Vec::new();
-                emit_junction_table(
-                    td,
-                    &ml.name,
-                    ml.through.as_deref(),
-                    target,
-                    false,
-                    false,
-                    &mut local,
-                );
+                emit_junction_table(td, &ml.name, ml.through.as_deref(), target, false, false, &mut local);
                 steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
@@ -2606,10 +2624,7 @@ fn diff_inner(
                             // name, so this can't drop a function another
                             // trigger still needs.
                             DiffOp {
-                                sql: format!(
-                                    "DROP FUNCTION IF EXISTS {}();",
-                                    qn(&cur_table.schema, trigger_name)
-                                ),
+                                sql: format!("DROP FUNCTION IF EXISTS {}();", qn(&cur_table.schema, trigger_name)),
                                 non_transactional: false,
                             },
                         ],
