@@ -904,12 +904,24 @@ def _make_multilink_desc(name: str, meta: Any, _core: Any) -> Any:
 
 
 def _make_computed_desc(name: str, meta: Any, _core: Any) -> Any:
+    from ._pointers import LinkAnnotation, MultiLinkAnnotation
+
+    # An object-valued computed — `Computed[MultiLink[Order], "(select
+    # .orders limit 5)"]` — has no scalar type to declare. Passing it through
+    # `_to_pg_type` would fall off the end of every branch and land on the
+    # `"text"` fallback, which then gets compared against what the expression
+    # actually produces and rejected as a mismatch. `None` means "nothing to
+    # check", which is exactly the truth here; the pointer's real shape comes
+    # from the link it selects.
+    declared = meta.scalar_type
+    if isinstance(declared, (LinkAnnotation, MultiLinkAnnotation)) or _is_pylon_type(declared):
+        return _core.ComputedDescriptor(name=name, expression=meta.expression, return_type=None)
     return _core.ComputedDescriptor(
         name=name,
         expression=meta.expression,
         # The user's own declared `Computed[ReturnType, "expr"]` type — same
         # helper _make_property_desc uses for a plain property's pg_type.
-        return_type=_to_pg_type(meta.scalar_type),
+        return_type=_to_pg_type(declared),
     )
 
 

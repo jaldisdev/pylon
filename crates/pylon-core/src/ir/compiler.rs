@@ -515,7 +515,7 @@ pub fn compile_computed_in_type(
     let td = c.resolve_type(type_name)?;
     let module = td.module.clone();
     let alias = c.fresh_alias();
-    match c.compile_declared_computed(cd, td, &alias, &module, None)? {
+    match c.compile_declared_computed(cd, td, &alias, &module, None, &[])? {
         IrShapePointer::Computed(p) => Ok(Some(p.expr)),
         _ => Ok(None),
     }
@@ -2469,6 +2469,33 @@ impl<'a> Compiler<'a> {
                 continue;
             }
 
+            // A computed pointer declared on the type reached so far — the
+            // expression is inlined against that step's own alias, exactly
+            // as it would be in a shape over the same type. Only valid as
+            // the last step: a computed has no stored column for a further
+            // join to hang off.
+            if let Some(cd) = current_td.computed.iter().find(|c| c.name == step_name).cloned() {
+                if !is_last(0) {
+                    return Err(self.type_err(&format!(
+                        "'{step_name}' is a computed pointer — it has no stored column to traverse further through"
+                    )));
+                }
+                let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+                let expr = self.compile_expr(&expr_ast, current_td, &current_alias)?;
+                let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                return Ok(IrPathSelect {
+                    root,
+                    joins,
+                    result: IrPathResult::Scalar(expr, None),
+                    filter,
+                    order_by,
+                    offset,
+                    limit,
+                    distinct,
+                    poly_implementors: vec![],
+                });
+            }
+
             return Err(self.field_err(step_name, &format!("{}::{}", current_td.module, current_td.name)));
         }
 
@@ -4370,7 +4397,7 @@ impl<'a> Compiler<'a> {
             .collect();
 
         for cd in &td.computed.clone() {
-            pointers.push(self.compile_declared_computed(cd, td, alias, module, None)?);
+            pointers.push(self.compile_declared_computed(cd, td, alias, module, None, &[])?);
         }
 
         if matches!(splat, ast::Splat::Deep) {
@@ -4731,7 +4758,7 @@ impl<'a> Compiler<'a> {
     fn compile_type_intersection_expr(
         &mut self,
         steps: &[ast::PathStep],
-        _td: &TypeDescriptor,
+        td: &TypeDescriptor,
         parent_alias: &str,
     ) -> Result<IrExpr, PyQLError> {
         use ast::PathStep;
@@ -4739,7 +4766,21 @@ impl<'a> Compiler<'a> {
             Some(PathStep::TypeIntersection(tr)) => tr.clone(),
             _ => return Err(self.type_err("expected type intersection")),
         };
-        self.compile_type_intersection_expr_steps(&type_ref, &steps[1..], parent_alias)
+        // The fast path reads one stored column off the narrowed type.
+        // Anything else — a computed, a link, further traversal — falls
+        // through to the general builder, rooted at the narrowed type
+        // (whose rows share the interface row's id).
+        match self.compile_type_intersection_expr_steps(&type_ref, &steps[1..], parent_alias) {
+            Ok(ir) => Ok(ir),
+            Err(fast_path_err) => {
+                let p = ast::Path {
+                    steps: steps.to_vec(),
+                    partial: true,
+                };
+                self.compile_partial_path_as_subquery(&p, td, parent_alias)
+                    .map_err(|_| fast_path_err)
+            }
+        }
     }
 
     /// Shared: build scalar subquery for `[is ConcreteType]` + tail pointer steps.
@@ -4843,59 +4884,19 @@ impl<'a> Compiler<'a> {
 
         // Computed override: `pointer := expr`
         if let Some(compexpr) = &el.compexpr {
-            // `alias := .multilink` → rename a multilink, same semantics as a regular pointer
-            if let Expr::Path(p) = compexpr {
-                if p.partial
-                    && p.steps.len() == 1
-                    && let ast::PathStep::Name(ml_name) = &p.steps[0]
-                    && Self::resolve_multilink(td, ml_name).is_some()
-                {
-                    let ml_name = ml_name.clone();
-                    return self.compile_multilink_pointer(pointer_name, &ml_name, td, alias, module, el);
-                }
-                // `alias := .<backlink[is Type]` (no shape) → a backlink
-                // used as a computed pointer.
-                if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
-                    let current_qname = format!("{}::{}", td.module, td.name);
-                    return self.compile_backlink_pointer(pointer_name, p, &current_qname, &[], el.marker_offset, None);
-                }
-            }
-
-            // `pointer := (select .link … )` — a sub-select over one of this
-            // type's own link pointers, which is the only way to attach
-            // FILTER/ORDER BY/OFFSET/LIMIT to a *named* computed link (the
-            // `:=` grammar has no trailing-modifier form of its own). Builds
-            // the same correlated subquery the bare `pointer: { … } filter …`
-            // inclusion does; anything else falls through to be compiled as
-            // an ordinary expression below.
-            if let Some(ptr) =
-                self.try_compile_subquery_pointer(pointer_name, compexpr, td, alias, module, el.marker_offset)?
-            {
+            // A link-valued RHS (`.multilink`, `.<backlink[is T] { … }`,
+            // `(select .link filter … limit 1)`) is a pointer in its own
+            // right, not an expression — see `try_compile_pointer_expr`.
+            if let Some(ptr) = self.try_compile_pointer_expr(
+                pointer_name,
+                compexpr,
+                td,
+                alias,
+                module,
+                el.marker_offset,
+                el.nested.as_deref().unwrap_or(&[]),
+            )? {
                 return Ok(ptr);
-            }
-            // `alias := .<backlink[is Type] { shape }` — the parser's `:=`
-            // grammar always parses the RHS as a single expression
-            // (`parse_expr`), which greedily folds a trailing `{ }` into
-            // the expression itself as `Expr::Shape` rather than into
-            // `el.nested` (that field is only ever populated by the
-            // separate no-`:=` "bare inclusion with nested shape" parse
-            // path — see `parse_shape_element`). So the shape case has to
-            // be unwrapped here rather than read off `el.nested` the way
-            // `compile_multilink_pointer`'s bare (non-computed) call site does.
-            if let Expr::Shape(sh) = compexpr
-                && let Some(Expr::Path(p)) = &sh.expr
-                && p.partial
-                && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_)))
-            {
-                let current_qname = format!("{}::{}", td.module, td.name);
-                return self.compile_backlink_pointer(
-                    pointer_name,
-                    p,
-                    &current_qname,
-                    &sh.elements,
-                    el.marker_offset,
-                    None,
-                );
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
             // Cross-scope TypeIs: promote to set-valued shape pointer.
@@ -5002,7 +5003,14 @@ impl<'a> Compiler<'a> {
 
         // Schema-defined computed pointer
         if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name).cloned() {
-            return self.compile_declared_computed(&cd, td, alias, module, el.marker_offset);
+            return self.compile_declared_computed(
+                &cd,
+                td,
+                alias,
+                module,
+                el.marker_offset,
+                el.nested.as_deref().unwrap_or(&[]),
+            );
         }
 
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
@@ -5283,9 +5291,12 @@ impl<'a> Compiler<'a> {
         alias: &str,
         module: &str,
         marker_offset: Option<usize>,
+        nested: &[ShapeElement],
     ) -> Result<IrShapePointer, PyQLError> {
         let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
-        if let Some(ptr) = self.try_compile_subquery_pointer(&cd.name, &expr_ast, td, alias, module, marker_offset)? {
+        if let Some(ptr) =
+            self.try_compile_pointer_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)?
+        {
             return Ok(ptr);
         }
         let ir = self.compile_expr(&expr_ast, td, alias)?;
@@ -5310,22 +5321,55 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// `pointer := (select .multilink { … } filter … limit N)` and
-    /// `pointer := (select .<backlink[is T] … )` — a sub-select in
-    /// computed-pointer position whose subject is one of the current type's
-    /// own link pointers.
+    /// Peel a computed pointer's right-hand side down to the path it names,
+    /// the shape attached to it, and the sub-select carrying its modifiers
+    /// (if any): `.posts` / `.posts { title }` / `(select .posts limit 1)` /
+    /// `(select .posts { title } limit 1)` / `(select .posts limit 1) { title }`.
+    fn pointer_subject(e: &Expr) -> Option<(&ast::Path, &[ShapeElement], Option<&ast::SelectStmt>)> {
+        match e {
+            Expr::Path(p) => Some((p, &[], None)),
+            Expr::SubQuery(stmt) => match stmt.as_ref() {
+                Stmt::Select(sel) => {
+                    let (p, inner) = Self::split_path_result(&sel.result)?;
+                    Some((p, inner, Some(sel)))
+                }
+                _ => None,
+            },
+            Expr::Shape(sh) => {
+                let (path, inner, modifiers) = Self::pointer_subject(sh.expr.as_ref()?)?;
+                let nested = if sh.elements.is_empty() {
+                    inner
+                } else {
+                    sh.elements.as_slice()
+                };
+                Some((path, nested, modifiers))
+            }
+            _ => None,
+        }
+    }
+
+    /// A computed pointer whose right-hand side names a *link* rather than
+    /// computing a value — `pointer := .multilink`, `:= .multilink { … }`,
+    /// `:= .<backlink[is T] { … }`, and any of those wrapped in a sub-select
+    /// carrying FILTER/ORDER BY/OFFSET/LIMIT.
     ///
-    /// The inner select's modifiers are exactly the per-link modifiers the
-    /// bare `pointer: { … } filter … limit N` inclusion already carries, so
-    /// this re-uses the same pointer builders with a synthesized shape
-    /// element instead of compiling the sub-select as an expression — which
-    /// keeps the result a real object pointer (array of hydrated objects)
-    /// rather than the bare id a scalar subquery would yield.
+    /// These are pointers in their own right, so they route to the same
+    /// builders a bare `pointer: { … } filter … limit N` inclusion uses and
+    /// come back as real object pointers (arrays of hydrated objects) rather
+    /// than the bare id or EXISTS boolean that compiling them as an
+    /// expression would produce. A sub-select's modifiers are exactly the
+    /// per-link modifiers that inclusion form already carries, which is what
+    /// makes the re-use exact — the `:=` grammar has no trailing-modifier
+    /// form of its own.
     ///
-    /// `Ok(None)` means "not that shape": the caller compiles `compexpr` as
+    /// Shared by inline `pointer := …` shape elements and schema-declared
+    /// computeds, so both kinds behave identically.
+    ///
+    /// `Ok(None)` means "not a link-valued RHS": the caller compiles it as
     /// an ordinary expression, which is where `(select …).field` — a scalar
     /// — is handled.
-    fn try_compile_subquery_pointer(
+    #[allow(clippy::too_many_arguments)]
+    fn try_compile_pointer_expr(
         &mut self,
         pointer_name: &str,
         compexpr: &Expr,
@@ -5333,41 +5377,44 @@ impl<'a> Compiler<'a> {
         alias: &str,
         module: &str,
         marker_offset: Option<usize>,
+        nested_override: &[ShapeElement],
     ) -> Result<Option<IrShapePointer>, PyQLError> {
-        // The nested shape can sit either inside the parens (`(select .posts
-        // { title })`) or after them (`(select .posts) { title }`) — the
-        // parser folds a trailing `{ }` into an `Expr::Shape` wrapping the
-        // whole sub-select.
-        let (stmt, outer_els) = match compexpr {
-            Expr::SubQuery(stmt) => (stmt.as_ref(), [].as_slice()),
-            Expr::Shape(sh) => match &sh.expr {
-                Some(Expr::SubQuery(stmt)) => (stmt.as_ref(), sh.elements.as_slice()),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        let Stmt::Select(sel) = stmt else {
-            return Ok(None);
-        };
-        let Some((path, inner_els)) = Self::split_path_result(&sel.result) else {
+        // A nested shape can sit inside the parens (`(select .posts
+        // { title })`) or after them (`(select .posts) { title }`, `.posts
+        // { title }`) — the parser folds a trailing `{ }` into an
+        // `Expr::Shape` wrapping whatever precedes it, never into
+        // `el.nested` (that field is only populated by the separate no-`:=`
+        // "bare inclusion with nested shape" parse path).
+        let Some((path, declared_nested, modifiers)) = Self::pointer_subject(compexpr) else {
             return Ok(None);
         };
         if !path.partial {
             return Ok(None);
         }
-        let nested = if outer_els.is_empty() { inner_els } else { outer_els };
+        // A shape written at the point of use (`authors { name }` on a
+        // declared computed) wins over the one the declaration itself
+        // carries, which acts as the default.
+        let nested = if nested_override.is_empty() {
+            declared_nested
+        } else {
+            nested_override
+        };
 
         // Only a link pointer of the current type becomes an object pointer;
-        // a property (`x := (select .name)`) is a scalar and belongs on the
-        // expression path.
+        // a property (`x := .name`, `x := (select .name)`) is a scalar and
+        // belongs on the expression path.
         let ml_name = match path.steps.as_slice() {
             [ast::PathStep::Name(n)] if Self::resolve_multilink(td, n).is_some() => n.clone(),
-            [ast::PathStep::Backlink(_), ..] => {
+            // `.<link[is Owner]` — the objects on the other side of the
+            // link. Traversing *past* the intersection (`.<link[is
+            // Owner].name`) is a value, not an object pointer, so it goes
+            // the expression route instead.
+            [ast::PathStep::Backlink(_)] | [ast::PathStep::Backlink(_), ast::PathStep::TypeIntersection(_)] => {
                 let current_qname = format!("{}::{}", td.module, td.name);
                 let path = path.clone();
                 let nested = nested.to_vec();
                 return self
-                    .compile_backlink_pointer(pointer_name, &path, &current_qname, &nested, marker_offset, Some(sel))
+                    .compile_backlink_pointer(pointer_name, &path, &current_qname, &nested, marker_offset, modifiers)
                     .map(Some);
             }
             _ => return Ok(None),
@@ -5379,10 +5426,10 @@ impl<'a> Compiler<'a> {
             nested: Some(nested.to_vec()),
             compexpr: None,
             op: ast::ShapeOp::Assign,
-            filter: sel.filter.clone(),
-            order_by: sel.order_by.clone(),
-            offset: sel.offset.clone(),
-            limit: sel.limit.clone(),
+            filter: modifiers.and_then(|s| s.filter.clone()),
+            order_by: modifiers.map(|s| s.order_by.clone()).unwrap_or_default(),
+            offset: modifiers.and_then(|s| s.offset.clone()),
+            limit: modifiers.and_then(|s| s.limit.clone()),
             marker_offset,
         };
         self.compile_multilink_pointer(pointer_name, &ml_name, td, alias, module, &synthetic)
@@ -5469,27 +5516,23 @@ impl<'a> Compiler<'a> {
 
         let mut ps = self.compile_path_select(sel, &full_path, &[], false)?;
         if let Some(outer_alias) = correlate {
-            let correlation = IrExpr::BinOp(Box::new(IrBinOp {
-                left: IrExpr::ColumnRef {
-                    alias: ps.root.alias.clone(),
-                    column: "id".to_string(),
-                    pg_type: "uuid".to_string(),
-                },
-                op: ast::BinOpKind::Eq,
-                right: IrExpr::ColumnRef {
-                    alias: outer_alias,
-                    column: "id".to_string(),
-                    pg_type: "uuid".to_string(),
-                },
-            }));
-            ps.filter = Some(match ps.filter.take() {
-                Some(existing) => IrExpr::BinOp(Box::new(IrBinOp {
-                    left: correlation,
-                    op: ast::BinOpKind::And,
-                    right: existing,
-                })),
-                None => correlation,
-            });
+            Self::correlate_path_select(&mut ps, &outer_alias);
+        }
+        // `limit 1` is what makes a sub-select over a multi-link single-
+        // valued — that is the whole point of `(select .emails filter
+        // .primary limit 1).address`. Any other limit, or none, still stands
+        // for a set, so it comes back as an array rather than a subquery
+        // Postgres would reject the moment a second row showed up.
+        let single = matches!(&sel.limit, Some(Expr::Literal(ast::Literal::Int(1))));
+        let multi = match &full_path.steps[0] {
+            ast::PathStep::Name(root) => {
+                let root_td = self.resolve_type(root)?;
+                self.path_crosses_multi(root_td, &full_path.steps[1..])
+            }
+            _ => false,
+        };
+        if multi && !single && matches!(ps.result, IrPathResult::Scalar(..)) {
+            return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(ps))));
         }
         Ok(IrExpr::PathSubquery(Box::new(ps)))
     }
@@ -5596,6 +5639,124 @@ impl<'a> Compiler<'a> {
             limit,
             distinct: false,
         }))))
+    }
+
+    /// True when traversing `steps` from `td` crosses a multi-valued step —
+    /// a multi-link or a backlink. Such a path stands for a *set*, so in
+    /// expression position it has to come back as an array rather than a
+    /// scalar subquery (which Postgres would reject at run time the moment a
+    /// second row showed up).
+    fn path_crosses_multi(&self, td: &TypeDescriptor, steps: &[ast::PathStep]) -> bool {
+        let mut current = td;
+        for step in steps {
+            match step {
+                ast::PathStep::Backlink(_) => return true,
+                ast::PathStep::TypeIntersection(tr) => {
+                    let name = match &tr.module {
+                        Some(m) => format!("{}::{}", m, tr.name),
+                        None => tr.name.clone(),
+                    };
+                    match self.resolve_type(&name) {
+                        Ok(t) => current = t,
+                        Err(_) => return false,
+                    }
+                }
+                ast::PathStep::Name(n) => {
+                    if Self::resolve_multilink(current, n).is_some() {
+                        return true;
+                    }
+                    match Self::resolve_link(current, n).map(|l| l.target.clone()) {
+                        Some(target) => match self.resolve_type(&target) {
+                            Ok(t) => current = t,
+                            Err(_) => return false,
+                        },
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Compile a relative path that the step-by-step expression rules can't
+    /// resolve on their own — deeper than two steps, a computed pointer on a
+    /// linked type, anything following a backlink — as a single correlated
+    /// subquery over the whole traversal.
+    ///
+    /// `compile_path_select` already implements the general case (forward
+    /// links, multi-links, backlinks, junction-backed links, type
+    /// intersections, nested tuple fields, "did you mean" on a typo), so the
+    /// work here is only to root the path at the enclosing type and
+    /// correlate it back to the enclosing row by primary key.
+    ///
+    /// A leading type intersection is rooted at the *intersected* type
+    /// instead: `[is Concrete].col` has to read from Concrete's own table,
+    /// which shares the interface row's id.
+    fn compile_partial_path_as_subquery(
+        &mut self,
+        p: &ast::Path,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let (root_name, rest) = match p.steps.first() {
+            Some(ast::PathStep::TypeIntersection(tr)) => {
+                let name = match &tr.module {
+                    Some(m) => format!("{}::{}", m, tr.name),
+                    None => tr.name.clone(),
+                };
+                (name, &p.steps[1..])
+            }
+            _ => (format!("{}::{}", td.module, td.name), &p.steps[..]),
+        };
+        let root_td = self.resolve_type(&root_name)?;
+        let multi = self.path_crosses_multi(root_td, rest);
+
+        let mut steps = vec![ast::PathStep::Name(root_name)];
+        steps.extend(rest.iter().cloned());
+        let full_path = ast::Path { steps, partial: false };
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(full_path.clone()),
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            lock: None,
+        };
+        let mut ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
+        Self::correlate_path_select(&mut ps, alias);
+        if multi && matches!(ps.result, IrPathResult::Scalar(..)) {
+            Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(ps))))
+        } else {
+            Ok(IrExpr::PathSubquery(Box::new(ps)))
+        }
+    }
+
+    /// Tie a path select's root row to the enclosing row by primary key —
+    /// what makes a relative path's subquery see only the current object's
+    /// side of the graph.
+    fn correlate_path_select(ps: &mut IrPathSelect, outer_alias: &str) {
+        let correlation = IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef {
+                alias: ps.root.alias.clone(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+            op: ast::BinOpKind::Eq,
+            right: IrExpr::ColumnRef {
+                alias: outer_alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+        }));
+        ps.filter = Some(match ps.filter.take() {
+            Some(existing) => IrExpr::BinOp(Box::new(IrBinOp {
+                left: correlation,
+                op: ast::BinOpKind::And,
+                right: existing,
+            })),
+            None => correlation,
+        });
     }
 
     fn subquery_expr_err(&self) -> PyQLError {
@@ -6627,11 +6788,10 @@ impl<'a> Compiler<'a> {
             return self.compile_path_2step(p, td, alias);
         }
 
+        // Three or more steps: no single column to read, so the whole
+        // traversal becomes one correlated subquery.
         if p.steps.len() != 1 {
-            return Err(PyQLError::Type(PyQLTypeError {
-                message: "path traversal deeper than 2 steps is not yet supported".into(),
-                position: Position { line: 0, col: 0 },
-            }));
+            return self.compile_partial_path_as_subquery(p, td, alias);
         }
 
         let pointer_name = match &p.steps[0] {
@@ -6785,18 +6945,16 @@ impl<'a> Compiler<'a> {
                     }))),
                 ))));
             }
-            let target_name = link.target.clone();
-            return Err(self.field_err(pointer_name, &target_name));
+            // Not a stored column on the target — a computed pointer, or a
+            // further link. The general traversal builder resolves both.
+            return self.compile_partial_path_as_subquery(p, td, alias);
         }
 
+        // A multi-link path stands for a set of values. Inside a comparison
+        // it has already been rewritten to an EXISTS (`try_multilink_exists`,
+        // which runs first); everywhere else it is an array.
         if Self::resolve_multilink(td, link_name).is_some() {
-            return Err(PyQLError::Type(PyQLTypeError {
-                message: format!(
-                    "multi-link path '.{link_name}.{pointer_name}' must be used inside a comparison, \
-                     e.g.: filter .{link_name}.{pointer_name} = value"
-                ),
-                position: Position { line: 0, col: 0 },
-            }));
+            return self.compile_partial_path_as_subquery(p, td, alias);
         }
 
         Err(self.field_err(link_name, &format!("{}::{}", td.module, td.name)))

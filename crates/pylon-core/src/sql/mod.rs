@@ -1479,8 +1479,15 @@ fn emit_array_source(src: &IrArraySource) -> String {
                 IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
             };
             let from_sql = emit_path_joins(&ps.root, &ps.joins);
-            let mut sql = format!("SELECT {} FROM {}", scalar, from_sql);
+            let mut sql = format!(
+                "SELECT {}{} FROM {}",
+                if ps.distinct { "DISTINCT " } else { "" },
+                scalar,
+                from_sql
+            );
             append_filter(&mut sql, &ps.filter);
+            append_order_by(&mut sql, &ps.order_by);
+            append_offset_limit(&mut sql, &ps.offset, &ps.limit);
             format!("ARRAY({})", sql)
         }
         IrArraySource::RawExpr {
@@ -4430,6 +4437,156 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_link_path_outside_a_comparison_is_an_array() {
+        // It stands for a set of values — as a scalar subquery Postgres
+        // would reject it the moment a Person had two posts.
+        let out = compile_and_emit("SELECT Person { t := .posts.title }");
+        assert!(out.sql.contains("ARRAY(SELECT \"t2\".\"title\""), "{}", out.sql);
+        assert!(out.sql.contains("(\"t1\".\"id\" = \"t0\".\"id\")"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_multi_link_path_inside_a_comparison_is_still_exists() {
+        let out = compile_and_emit("SELECT Person { name } filter .posts.title = 'x'");
+        assert!(out.sql.contains("WHERE EXISTS("), "{}", out.sql);
+        assert!(!out.sql.contains("ARRAY("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_path_traversal_deeper_than_two_steps() {
+        let schema = make_schema_with_through();
+        let out = compile_and_emit_with("SELECT Person { t := .friends.friends.name }", &schema);
+        // Two junction hops, then the property — one subquery, not an error.
+        assert_eq!(out.sql.matches("\"public\".\"PersonFriend\"").count(), 2, "{}", out.sql);
+        assert!(out.sql.contains("ARRAY(SELECT \"t4\".\"name\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_traversal_after_a_backlink() {
+        let out = compile_and_emit("SELECT Post { t := .<posts[is Person].name }");
+        assert!(out.sql.contains("ARRAY(SELECT \"t2\".\"name\""), "{}", out.sql);
+        assert!(out.sql.contains("\"t3\".\"target\" = \"t1\".\"id\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_computed_pointer_on_a_linked_type_is_reachable() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let company = schema.types.iter_mut().find(|t| t.name == "Company").unwrap();
+        company.computed = vec![ComputedDescriptor {
+            name: "shout".into(),
+            expression: ".name ++ '!'".into(),
+            return_type: Some("text".into()),
+        }];
+        // `.company.shout` used to report "has no link or property 'shout'"
+        // while helpfully suggesting 'shout' — path traversal never looked
+        // at the target type's computed pointers.
+        let out = compile_and_emit_with("SELECT Person { t := .company.shout }", &schema);
+        assert!(out.sql.contains("(\"t2\".\"name\" || '!')"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_computed_pointer_behind_a_type_intersection() {
+        let schema = make_interface_schema();
+        let out = compile_and_emit_with("SELECT Account { n := [is Individual].full_name }", &schema);
+        assert!(out.sql.contains("upper(\"t1\".\"first_name\")"), "{}", out.sql);
+        assert!(out.sql.contains("FROM \"public\".\"Individual\""), "{}", out.sql);
+        assert!(out.sql.contains("(\"t1\".\"id\" = \"t0\".\"id\")"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_computed_pointer_cannot_be_traversed_through() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let company = schema.types.iter_mut().find(|t| t.name == "Company").unwrap();
+        company.computed = vec![ComputedDescriptor {
+            name: "shout".into(),
+            expression: ".name ++ '!'".into(),
+            return_type: Some("text".into()),
+        }];
+        let ast = parse::parse("SELECT Person { t := .company.shout.nope }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("is a computed pointer"), "{err}");
+    }
+
+    #[test]
+    fn test_sub_select_over_a_multi_link_path_keeps_its_modifiers() {
+        let out = compile_and_emit("SELECT Person { t := (select .posts.title order by .title desc limit 2) }");
+        assert!(out.sql.contains("ARRAY(SELECT"), "{}", out.sql);
+        assert!(out.sql.contains("ORDER BY \"t2\".\"title\" DESC"), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 2"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_limit_one_over_a_multi_link_path_stays_a_scalar() {
+        // `limit 1` is what makes the set single-valued, so this one is a
+        // scalar subquery rather than a one-element array.
+        let out = compile_and_emit("SELECT Person { t := (select .posts.title limit 1) }");
+        assert!(!out.sql.contains("ARRAY("), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_computed_multilink_can_carry_a_nested_shape() {
+        let out = compile_and_emit("SELECT Person { p := .posts { title } }");
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        let ShapeNode::Array { name, element, .. } = &pointers[1] else {
+            panic!("{:?}", pointers[1])
+        };
+        assert_eq!(name, "p");
+        let ShapeNode::Object {
+            pointers: elem_pointers,
+            ..
+        } = element.as_ref()
+        else {
+            panic!()
+        };
+        assert!(matches!(&elem_pointers[1], ShapeNode::Scalar { name, .. } if name == "title"));
+    }
+
+    #[test]
+    fn test_schema_declared_backlink_computed_is_an_object_pointer() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let post = schema.types.iter_mut().find(|t| t.name == "Post").unwrap();
+        post.computed = vec![ComputedDescriptor {
+            name: "authors".into(),
+            expression: ".<posts[is Person]".into(),
+            return_type: None,
+        }];
+        // A backlink computed used to compile as an EXISTS boolean here —
+        // the pointer builders were only reachable from an inline `:=`.
+        let out = compile_and_emit_with("SELECT Post { authors { name } }", &schema);
+        assert!(out.sql.contains("array_agg(ROW("), "{}", out.sql);
+        assert!(out.sql.contains("\"t1\".\"name\"::text"), "{}", out.sql);
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "authors"));
+    }
+
+    #[test]
+    fn test_schema_declared_multilink_computed_defaults_to_ids_without_a_shape() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        schema.types[0].computed = vec![ComputedDescriptor {
+            name: "everything".into(),
+            expression: ".posts".into(),
+            return_type: None,
+        }];
+        let out = compile_and_emit_with("SELECT Person { everything }", &schema);
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "everything"));
+    }
+
+    #[test]
     fn test_schema_declared_computed_sub_select_is_a_link_pointer() {
         use crate::schema::ComputedDescriptor;
         let mut schema = make_schema();
@@ -6444,12 +6601,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_type_intersection_splat_includes_concrete_computed_pointers() {
-        // `[is Concrete].*` must expand to the concrete type's own computed
-        // pointers too (e.g. `full_name`), not just its stored properties —
-        // querying `Individual` directly with `*` already included them, but
-        // the interface-splat path never even looked at `td.computed`.
+    /// Interface `Account` (non-materialized) with one implementor,
+    /// `Individual`, carrying a stored property and a computed pointer.
+    fn make_interface_schema() -> SchemaDescriptor {
         fn id_prop() -> PropertyDescriptor {
             PropertyDescriptor {
                 name: "id".into(),
@@ -6467,7 +6621,7 @@ mod tests {
                 column_type: None,
             }
         }
-        let schema = SchemaDescriptor {
+        SchemaDescriptor {
             types: vec![
                 TypeDescriptor {
                     name: "Account".into(),
@@ -6559,7 +6713,16 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn test_type_intersection_splat_includes_concrete_computed_pointers() {
+        // `[is Concrete].*` must expand to the concrete type's own computed
+        // pointers too (e.g. `full_name`), not just its stored properties —
+        // querying `Individual` directly with `*` already included them, but
+        // the interface-splat path never even looked at `td.computed`.
+        let schema = make_interface_schema();
         let out = compile_and_emit_with("SELECT Account { *, [is Individual].* }", &schema);
         assert!(
             out.sql.to_lowercase().contains("upper"),
