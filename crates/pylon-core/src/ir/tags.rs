@@ -483,6 +483,7 @@ mod tests {
             ctes: vec![],
             global_ctes: vec![],
             warnings: vec![],
+            uses_globals_arg: false,
         }
     }
 
