@@ -1705,6 +1705,7 @@ fn diff_inner(
             )
         })
         .collect();
+    let polymorphic = crate::export::polymorphic_types(target);
 
     // Every kind of top-level declaration can live in a module of its own,
     // including one with no types/scalars/enums at all (see the matching
@@ -1950,7 +1951,7 @@ fn diff_inner(
             Verb::Alter
         };
         let mut local: Vec<DiffOp> = Vec::new();
-        emit_fk_diff(td, existing, &type_map, &mut local);
+        emit_fk_diff(td, existing, &type_map, &polymorphic, &mut local);
         steps.extend(
             OpKey::Table(td.module.clone(), td.table.clone()),
             verb,
@@ -3068,6 +3069,7 @@ fn emit_fk_diff(
     td: &TypeDescriptor,
     existing: Option<&DbTable>,
     type_map: &HashMap<String, (&str, &str)>,
+    polymorphic: &HashSet<String>,
     ops: &mut Vec<DiffOp>,
 ) {
     use crate::schema::{DeleteAction, DeleteSide};
@@ -3078,6 +3080,11 @@ fn emit_fk_diff(
 
     for l in &td.links {
         if l.is_junction_backed() {
+            continue;
+        }
+        // Enforced by `export::interface_link_trigger_infos` instead: the
+        // target is a view, and PostgreSQL will not reference one.
+        if polymorphic.contains(&l.target) {
             continue;
         }
         let cname = format!("{}_{}_fkey", td.table, l.name);
@@ -3168,18 +3175,25 @@ fn emit_junction_table(
             " ON DELETE RESTRICT"
         });
 
-    let tgt_ref = type_map
-        .get(ml_target)
-        .map(|(m, t)| qn(m, t))
-        .unwrap_or_else(|| qi(ml_target));
-
-    let mut col_lines = format!(
-        "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){}",
-        qn(&td.module, &td.table),
-        src_on_delete,
-        tgt_ref,
-        tgt_on_delete,
-    );
+    let mut col_lines = if crate::export::polymorphic_types(schema).contains(ml_target) {
+        format!(
+            "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL",
+            qn(&td.module, &td.table),
+            src_on_delete,
+        )
+    } else {
+        let tgt_ref = type_map
+            .get(ml_target)
+            .map(|(m, t)| qn(m, t))
+            .unwrap_or_else(|| qi(ml_target));
+        format!(
+            "    source uuid NOT NULL REFERENCES {}(id){},\n    target uuid NOT NULL REFERENCES {}(id){}",
+            qn(&td.module, &td.table),
+            src_on_delete,
+            tgt_ref,
+            tgt_on_delete,
+        )
+    };
 
     // Extra columns from the through junction type.
     if let Some(through_qname) = through
