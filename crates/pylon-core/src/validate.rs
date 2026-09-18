@@ -197,15 +197,13 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         for cd in &td.computed {
             let Some(declared) = &cd.return_type else { continue };
             let context = format!("{}.{} (computed)", type_name, cd.name);
-            let expr_ast = match crate::parse::parse_expr(&cd.expression) {
-                Ok(e) => e,
-                Err(e) => {
-                    errors.push(PyQLError::Syntax(e));
-                    continue;
-                }
-            };
-            let ir = match compile_expr_in_type(&expr_ast, &type_name, schema) {
-                Ok((ir, _params)) => ir,
+            // Compiled as the pointer it is, not as a bare expression: a
+            // computed that selects objects (`(select .emails limit 1)`)
+            // legitimately has no scalar type, and compiling it as an
+            // expression would reject it instead of skipping the check.
+            let ir = match crate::ir::compile_computed_in_type(cd, &type_name, schema) {
+                Ok(Some(ir)) => ir,
+                Ok(None) => continue,
                 Err(e) => {
                     errors.push(e);
                     continue;

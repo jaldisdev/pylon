@@ -54,5 +54,6 @@ Before this, each of these only ever got compiled the first time something actua
 ## What isn't checked
 
 - A **computed global**'s declared type isn't compared against its expression's actual output — only its compile-validity is checked (see above). Its declared type is a PyQL type-name string for client-side typing, not a Postgres type the compiler's `infer_ir_type`/`types_compatible` machinery (built around Postgres type strings) can currently bridge to safely.
+- An **object-valued computed pointer** — one whose expression is a [sub-select over a link](computed.md#sub-selects), like `"(select .orders limit 5)"` — has no scalar type to compare its declared `MultiLink[...]`/`Link[...]` against, so only its compile-validity is checked. A computed that *projects* a property off such a sub-select (`"(select .orders limit 1).total"`) is scalar and is checked normally.
 - A **link-level `Rewrite`** isn't checked at all — nothing compiles it, because nothing in the compiler reads `LinkDescriptor.rewrites` yet regardless of validation. See the caveat in [Triggers and rewrites](triggers-and-rewrites.md#rewrite).
 - Anything the best-effort type inference (above) can't classify is skipped, not flagged — a wrong return type hidden behind a function call or binary operation won't be caught by this pass.

@@ -158,29 +158,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
                 collect_expr(e, tags);
             }
         }
-        IrStmt::FunctionSelect(fs) => {
-            for imp in &fs.poly_implementors {
-                tags.push(tag_for_implementor(imp));
-            }
-            for a in &fs.fn_args {
-                collect_expr(a, tags);
-            }
-            for p in &fs.shape {
-                collect_shape_pointer(p, tags);
-            }
-            if let Some(f) = &fs.filter {
-                collect_expr(f, tags);
-            }
-            for s in &fs.order_by {
-                collect_expr(&s.expr, tags);
-            }
-            if let Some(e) = &fs.offset {
-                collect_expr(e, tags);
-            }
-            if let Some(e) = &fs.limit {
-                collect_expr(e, tags);
-            }
-        }
+        IrStmt::FunctionSelect(fs) => collect_function_select(fs, tags),
         IrStmt::VectorSearch(vs) => {
             tags.push(tag_for(&vs.source));
             collect_expr(&vs.query_expr, tags);
@@ -461,6 +439,31 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
             }
         }
         IrExpr::PathSubquery(ps) => collect_path_select(ps, tags),
+        IrExpr::FnSubquery(fs) => collect_function_select(fs, tags),
+    }
+}
+
+fn collect_function_select(fs: &IrFunctionSelect, tags: &mut Vec<String>) {
+    for imp in &fs.poly_implementors {
+        tags.push(tag_for_implementor(imp));
+    }
+    for a in &fs.fn_args {
+        collect_expr(a, tags);
+    }
+    for p in &fs.shape {
+        collect_shape_pointer(p, tags);
+    }
+    if let Some(f) = &fs.filter {
+        collect_expr(f, tags);
+    }
+    for s in &fs.order_by {
+        collect_expr(&s.expr, tags);
+    }
+    if let Some(e) = &fs.offset {
+        collect_expr(e, tags);
+    }
+    if let Some(e) = &fs.limit {
+        collect_expr(e, tags);
     }
 }
 
