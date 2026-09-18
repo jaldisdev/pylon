@@ -21,7 +21,7 @@ use crate::error::{PyQLError, PyQLFragmentError};
 use crate::schema::{
     DeleteAction, DeleteSide, FunctionDescriptor, OnDeletePolicy, SchemaDescriptor, TypeConstraint, TypeDescriptor,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub mod python_snippet;
 
@@ -66,6 +66,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_link_source_triggers(schema, &type_map, &mut out);
     emit_junction_tables(schema, &type_map, &mut out);
     emit_multilink_deletion_triggers(schema, &type_map, &mut out);
+    emit_interface_link_triggers(schema, &mut out);
     emit_signal_triggers(schema, &mut out);
     emit_unique_indexes(schema, &mut out);
     emit_check_constraints(schema, &mut out);
@@ -406,6 +407,40 @@ fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
     )
 }
 
+// ── Interface (polymorphic target) helpers ─────────────────────────────────────
+
+/// Qualified names of the polymorphic interfaces in `schema` — the types
+/// `emit_interface_views` renders as a `UNION ALL` view instead of a table.
+///
+/// A link pointing at one of these has no single table to reference, and
+/// PostgreSQL rejects a foreign key whose referenced relation is a view
+/// ("referenced relation is not a table"). Such links therefore carry no FK
+/// at all; their deletion policy is enforced by the per-implementor triggers
+/// `interface_link_trigger_infos` builds instead.
+pub(crate) fn polymorphic_types(schema: &SchemaDescriptor) -> HashSet<String> {
+    schema
+        .types
+        .iter()
+        .filter(|t| t.abstract_ && t.materialized)
+        .map(|t| format!("{}::{}", t.module, t.name))
+        .collect()
+}
+
+/// Interface qualified name → the concrete types implementing it, in schema
+/// order. Shared by the view emitter and the interface-link triggers so the
+/// set of tables a polymorphic link can point into is derived in one place.
+pub(crate) fn interface_implementors(schema: &SchemaDescriptor) -> HashMap<String, Vec<&TypeDescriptor>> {
+    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
+    for t in &schema.types {
+        if !t.abstract_ {
+            for iface in &t.interfaces {
+                implementors.entry(iface.clone()).or_default().push(t);
+            }
+        }
+    }
+    implementors
+}
+
 // ── Deletion policy helpers ────────────────────────────────────────────────────
 
 fn policy_for<'a>(policies: &'a [OnDeletePolicy], side: &DeleteSide) -> Option<&'a DeleteAction> {
@@ -470,6 +505,7 @@ fn target_jt_fk_suffix(policies: &[OnDeletePolicy]) -> String {
 // ── Phase 5: FK constraints for single links ───────────────────────────────────
 
 fn emit_fk_constraints(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
+    let polymorphic = polymorphic_types(schema);
     let mut emitted = false;
     for t in &schema.types {
         if t.abstract_ || t.junction {
@@ -477,6 +513,9 @@ fn emit_fk_constraints(schema: &SchemaDescriptor, type_map: &HashMap<String, (&s
         }
         for l in &t.links {
             if l.is_junction_backed() {
+                continue;
+            }
+            if polymorphic.contains(&l.target) {
                 continue;
             }
             let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else {
@@ -572,6 +611,28 @@ fn emit_after_mutation_trigger(
     ));
 }
 
+/// The physical table(s) a link target resolves to, qualified and ready to
+/// interpolate. A concrete target is exactly one table; a polymorphic one is
+/// every implementor of the interface, since the view itself is not deletable
+/// (a `UNION ALL` view is not auto-updatable). `None` when the target resolves
+/// to nothing at all, or to an interface that nothing implements.
+fn target_table_qnames(
+    target: &str,
+    type_map: &HashMap<String, (&str, &str)>,
+    polymorphic: &HashSet<String>,
+    implementors: &HashMap<String, Vec<&TypeDescriptor>>,
+) -> Option<Vec<String>> {
+    if polymorphic.contains(target) {
+        let impls = implementors.get(target)?;
+        if impls.is_empty() {
+            return None;
+        }
+        return Some(impls.iter().map(|i| qn(&i.module, &i.table)).collect());
+    }
+    let (tgt_module, tgt_table) = type_map.get(target)?;
+    Some(vec![qn(tgt_module, tgt_table)])
+}
+
 // ── Phase 5.5: source-side deletion triggers for single links ──────────────────
 
 /// Structured description of one deletion-policy trigger (either a
@@ -599,6 +660,8 @@ fn link_source_trigger_infos(
     schema: &SchemaDescriptor,
     type_map: &HashMap<String, (&str, &str)>,
 ) -> Vec<DeletionTriggerInfo> {
+    let polymorphic = polymorphic_types(schema);
+    let implementors = interface_implementors(schema);
     let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction {
@@ -618,24 +681,36 @@ fn link_source_trigger_infos(
                 DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan => {}
                 _ => continue,
             }
-            let Some((tgt_module, tgt_table)) = type_map.get(&l.target) else {
-                continue;
-            };
             let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
                 "del_orphan"
             } else {
                 "del_target"
             };
             let tbl_qname = qn(&t.module, &t.table);
-            let tgt_qname = qn(tgt_module, tgt_table);
             let col = qi(&format!("{}_id", l.name));
+            let Some(tgt_qnames) = target_table_qnames(&l.target, type_map, &polymorphic, &implementors) else {
+                continue;
+            };
+            let deletes = tgt_qnames
+                .iter()
+                .map(|tgt_qname| format!("DELETE FROM {tgt_qname} WHERE id = OLD.{col};"))
+                .collect::<Vec<_>>();
 
             let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+                let indented = deletes
+                    .iter()
+                    .map(|d| format!("        {d}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!(
-                    "    IF NOT EXISTS (\n        SELECT 1 FROM {tbl_qname} WHERE {col} = OLD.{col} AND id != OLD.id\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.{col};\n    END IF;"
+                    "    IF NOT EXISTS (\n        SELECT 1 FROM {tbl_qname} WHERE {col} = OLD.{col} AND id != OLD.id\n    ) THEN\n{indented}\n    END IF;"
                 )
             } else {
-                format!("    DELETE FROM {tgt_qname} WHERE id = OLD.{col};")
+                deletes
+                    .iter()
+                    .map(|d| format!("    {d}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             };
 
             let (fname, fn_qname) = trigger_names(&t.module, &t.table, &l.name, suffix, &body);
@@ -728,7 +803,8 @@ fn emit_one_junction_table(
         qn(&t.module, &t.table),
         src_suffix,
     ));
-    if let Some((tgt_module, tgt_table)) = type_map.get(target) {
+    let target_is_polymorphic = polymorphic_types(schema).contains(target);
+    if let Some((tgt_module, tgt_table)) = type_map.get(target).filter(|_| !target_is_polymorphic) {
         let tgt_suffix = target_jt_fk_suffix(on_delete);
         out.push_str(&format!(
             "    target uuid NOT NULL REFERENCES {}(id){},\n",
@@ -778,13 +854,24 @@ fn multilink_deletion_trigger_infos(
     schema: &SchemaDescriptor,
     type_map: &HashMap<String, (&str, &str)>,
 ) -> Vec<DeletionTriggerInfo> {
+    let polymorphic = polymorphic_types(schema);
+    let implementors = interface_implementors(schema);
     let mut result = Vec::new();
     for t in &schema.types {
         if t.abstract_ || t.junction {
             continue;
         }
         for ml in &t.multilinks {
-            push_junction_deletion_triggers(t, &ml.name, &ml.target, &ml.on_delete, type_map, &mut result);
+            push_junction_deletion_triggers(
+                t,
+                &ml.name,
+                &ml.target,
+                &ml.on_delete,
+                type_map,
+                &polymorphic,
+                &implementors,
+                &mut result,
+            );
         }
         // A junction-backed single link's junction table has the same
         // source/target columns as a multi-link's, so the same
@@ -793,18 +880,30 @@ fn multilink_deletion_trigger_infos(
             if !l.is_junction_backed() {
                 continue;
             }
-            push_junction_deletion_triggers(t, &l.name, &l.target, &l.on_delete, type_map, &mut result);
+            push_junction_deletion_triggers(
+                t,
+                &l.name,
+                &l.target,
+                &l.on_delete,
+                type_map,
+                &polymorphic,
+                &implementors,
+                &mut result,
+            );
         }
     }
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_junction_deletion_triggers(
     t: &TypeDescriptor,
     name: &str,
     target: &str,
     on_delete: &[OnDeletePolicy],
     type_map: &HashMap<String, (&str, &str)>,
+    polymorphic: &HashSet<String>,
+    implementors: &HashMap<String, Vec<&TypeDescriptor>>,
     result: &mut Vec<DeletionTriggerInfo>,
 ) {
     let jt_name = format!("{}.{}", t.table, name);
@@ -815,21 +914,33 @@ fn push_junction_deletion_triggers(
     if matches!(
         src_action,
         DeleteAction::DeleteTarget | DeleteAction::DeleteTargetIfOrphan
-    ) && let Some((tgt_module, tgt_table)) = type_map.get(target)
+    ) && let Some(tgt_qnames) = target_table_qnames(target, type_map, polymorphic, implementors)
     {
         let suffix = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
             "del_orphan"
         } else {
             "del_target"
         };
-        let tgt_qname = qn(tgt_module, tgt_table);
+        let deletes = tgt_qnames
+            .iter()
+            .map(|tgt_qname| format!("DELETE FROM {tgt_qname} WHERE id = OLD.target;"))
+            .collect::<Vec<_>>();
 
         let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
+            let indented = deletes
+                .iter()
+                .map(|d| format!("        {d}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             format!(
-                "    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n        DELETE FROM {tgt_qname} WHERE id = OLD.target;\n    END IF;"
+                "    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n{indented}\n    END IF;"
             )
         } else {
-            format!("    DELETE FROM {tgt_qname} WHERE id = OLD.target;")
+            deletes
+                .iter()
+                .map(|d| format!("    {d}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
 
         // Keeps `suffix` in the rendered name (unlike `trigger_names`), since
@@ -868,6 +979,161 @@ fn push_junction_deletion_triggers(
     }
 }
 
+// ── Phase 6.6: target-side enforcement for polymorphic links ───────────────────
+
+/// Emits, for one link whose target is an interface, the trigger that stands
+/// in for the foreign key such a link cannot have.
+///
+/// `referencing` is the table holding the pointer (the owner table for a
+/// single link, the junction table for a multi-link) and `column` the column
+/// within it. One function is generated per (referencing table, pointer) and
+/// shared by a `CREATE TRIGGER` on every implementor, mirroring how
+/// `make_excl_info` shares one function across an interface's implementors.
+#[allow(clippy::too_many_arguments)]
+fn push_interface_link_triggers(
+    module: &str,
+    referencing: &str,
+    column: &str,
+    pointer: &str,
+    src_table: &str,
+    via_junction: bool,
+    on_delete: &[OnDeletePolicy],
+    impls: &[&TypeDescriptor],
+    result: &mut Vec<DeletionTriggerInfo>,
+) {
+    let action = policy_for(on_delete, &DeleteSide::Target).unwrap_or(&DeleteAction::Restrict);
+    let col = qi(column);
+
+    // A Source-side cascade deletes the target from a BEFORE DELETE trigger on
+    // the owner row, which still exists at that point — the same conflict
+    // `needs_deferred_target_fk` documents for a real FK. Deferring the check
+    // to commit lets both deletes land first.
+    let deferred = matches!(action, DeleteAction::DeferredRestrict) || needs_deferred_target_fk(on_delete);
+
+    let body = match action {
+        DeleteAction::Allow if via_junction => {
+            // Junction row: `Allow` drops the membership, matching the
+            // ON DELETE CASCADE the junction's target FK used to carry.
+            format!("    DELETE FROM {referencing} WHERE {col} = OLD.id;")
+        }
+        DeleteAction::Allow => format!("    UPDATE {referencing} SET {col} = NULL WHERE {col} = OLD.id;"),
+        DeleteAction::DeleteSource => format!("    DELETE FROM {referencing} WHERE {col} = OLD.id;"),
+        _ => format!(
+            "    IF EXISTS (SELECT 1 FROM {referencing} WHERE {col} = OLD.id) THEN\n\
+             \x20       RAISE foreign_key_violation\n\
+             \x20         USING MESSAGE = 'update or delete on table \"' || TG_TABLE_NAME || '\" violates foreign key constraint on table {src_table}',\n\
+             \x20               DETAIL = format('Key (id)=(%s) is still referenced from table \"{src_table}\".', OLD.id);\n\
+             \x20   END IF;"
+        ),
+    };
+
+    let suffix = match action {
+        DeleteAction::Allow => "ifl_allow",
+        DeleteAction::DeleteSource => "ifl_del_source",
+        _ => "ifl_restrict",
+    };
+
+    for impl_t in impls {
+        let hash = fnv(&[&impl_t.table, src_table, pointer, suffix, &body]);
+        let fname = format!("_ifl_{}_{}_{}", src_table, pointer, &hash[..8]);
+        let fn_qname = qn(module, &fname);
+        let impl_qname = qn(&impl_t.module, &impl_t.table);
+
+        let mut ddl = String::new();
+        if deferred {
+            // A constraint trigger can only fire AFTER, so the referencing
+            // rows are checked once the whole statement (or transaction) has
+            // settled rather than mid-delete.
+            ddl.push_str(&format!(
+                "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+                 RETURNS trigger LANGUAGE plpgsql AS $$\n\
+                 BEGIN\n{body}\n    RETURN NULL;\nEND;\n$$;\n\n\
+                 CREATE CONSTRAINT TRIGGER {}\n\
+                 AFTER DELETE ON {impl_qname}\n\
+                 DEFERRABLE INITIALLY DEFERRED\n\
+                 FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n",
+                qi(&fname),
+            ));
+        } else {
+            emit_before_delete_trigger(&fn_qname, &qi(&fname), &impl_qname, &body, &mut ddl);
+        }
+
+        result.push(DeletionTriggerInfo {
+            table_module: impl_t.module.clone(),
+            table_name: impl_t.table.clone(),
+            trigger_name: fname,
+            ddl,
+        });
+    }
+}
+
+/// Target-side deletion enforcement for every link and multi-link pointing at
+/// an interface. These carry the integrity the suppressed foreign keys would
+/// otherwise have provided — see `polymorphic_types`.
+fn interface_link_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInfo> {
+    let polymorphic = polymorphic_types(schema);
+    let implementors = interface_implementors(schema);
+    let mut result = Vec::new();
+
+    for t in &schema.types {
+        if t.abstract_ || t.junction {
+            continue;
+        }
+        for l in &t.links {
+            if !polymorphic.contains(&l.target) {
+                continue;
+            }
+            let Some(impls) = implementors.get(&l.target) else {
+                continue;
+            };
+            let via_junction = l.is_junction_backed();
+            let (referencing, column) = if via_junction {
+                (qn(&t.module, &format!("{}.{}", t.table, l.name)), "target".to_string())
+            } else {
+                (qn(&t.module, &t.table), format!("{}_id", l.name))
+            };
+            push_interface_link_triggers(
+                &t.module,
+                &referencing,
+                &column,
+                &l.name,
+                &t.table,
+                via_junction,
+                &l.on_delete,
+                impls,
+                &mut result,
+            );
+        }
+        for ml in &t.multilinks {
+            if !polymorphic.contains(&ml.target) {
+                continue;
+            }
+            let Some(impls) = implementors.get(&ml.target) else {
+                continue;
+            };
+            let referencing = qn(&t.module, &format!("{}.{}", t.table, ml.name));
+            push_interface_link_triggers(
+                &t.module,
+                &referencing,
+                "target",
+                &ml.name,
+                &t.table,
+                true,
+                &ml.on_delete,
+                impls,
+                &mut result,
+            );
+        }
+    }
+    result
+}
+
+fn emit_interface_link_triggers(schema: &SchemaDescriptor, out: &mut String) {
+    for info in interface_link_trigger_infos(schema) {
+        out.push_str(&info.ddl);
+    }
+}
+
 fn emit_multilink_deletion_triggers(
     schema: &SchemaDescriptor,
     type_map: &HashMap<String, (&str, &str)>,
@@ -886,6 +1152,7 @@ pub fn deletion_policy_trigger_infos(
 ) -> Vec<DeletionTriggerInfo> {
     let mut result = link_source_trigger_infos(schema, type_map);
     result.extend(multilink_deletion_trigger_infos(schema, type_map));
+    result.extend(interface_link_trigger_infos(schema));
     result
 }
 
@@ -1429,14 +1696,7 @@ fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &
 }
 
 fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
-    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
-    for t in &schema.types {
-        if !t.abstract_ {
-            for iface in &t.interfaces {
-                implementors.entry(iface.clone()).or_default().push(t);
-            }
-        }
-    }
+    let implementors = interface_implementors(schema);
     for t in &schema.types {
         if !(t.abstract_ && t.materialized) {
             continue;
@@ -2149,6 +2409,272 @@ mod tests {
             aliases: vec![],
             channels: vec![],
         }
+    }
+
+    // ── Polymorphic (interface) link targets ───────────────────────────────
+
+    /// `Account` as an interface, `Individual`/`Organization` implementing it,
+    /// plus whatever referencing types the caller supplies.
+    fn interface_schema(referencing: Vec<TypeDescriptor>) -> SchemaDescriptor {
+        fn bare(name: &str, interfaces: Vec<String>, abstract_: bool, materialized: bool) -> TypeDescriptor {
+            TypeDescriptor {
+                name: name.into(),
+                module: "default".into(),
+                table: name.into(),
+                abstract_,
+                materialized,
+                description: None,
+                parents: vec![],
+                interfaces,
+                properties: vec![],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                partition: None,
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+                signals: vec![],
+            }
+        }
+        let mut types = vec![
+            bare("Account", vec![], true, true),
+            bare("Individual", vec!["default::Account".into()], false, false),
+            bare("Organization", vec!["default::Account".into()], false, false),
+        ];
+        types.extend(referencing);
+        SchemaDescriptor {
+            types,
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        }
+    }
+
+    fn link_to_account(name: &str, on_delete: Vec<OnDeletePolicy>, through: Option<String>) -> LinkDescriptor {
+        LinkDescriptor {
+            name: name.into(),
+            target: "default::Account".into(),
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete,
+            through,
+        }
+    }
+
+    fn referencing_type(
+        name: &str,
+        links: Vec<LinkDescriptor>,
+        multilinks: Vec<MultiLinkDescriptor>,
+    ) -> TypeDescriptor {
+        TypeDescriptor {
+            name: name.into(),
+            module: "default".into(),
+            table: name.into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: vec![],
+            links,
+            multilinks,
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }
+    }
+
+    #[test]
+    fn test_link_to_interface_emits_no_foreign_key() {
+        // PostgreSQL rejects a FK whose referenced relation is a view, and an
+        // interface is exactly that — so the link must carry no FK at all.
+        let schema = interface_schema(vec![referencing_type(
+            "Session",
+            vec![link_to_account("account", vec![], None)],
+            vec![],
+        )]);
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            !ddl.contains("Session_account_fkey"),
+            "a link targeting an interface must not get a FK, got:\n{}",
+            ddl
+        );
+        assert!(ddl.contains("CREATE VIEW \"public\".\"Account\""), "got:\n{}", ddl);
+    }
+
+    #[test]
+    fn test_link_to_interface_enforces_restrict_on_every_implementor() {
+        let schema = interface_schema(vec![referencing_type(
+            "Session",
+            vec![link_to_account("account", vec![], None)],
+            vec![],
+        )]);
+        let ddl = export_schema(&schema).unwrap();
+        for implementor in ["Individual", "Organization"] {
+            assert!(
+                ddl.contains(&format!("BEFORE DELETE ON \"public\".\"{}\"", implementor)),
+                "missing enforcement trigger on {}, got:\n{}",
+                implementor,
+                ddl
+            );
+        }
+        assert!(ddl.contains("RAISE foreign_key_violation"), "got:\n{}", ddl);
+        assert!(
+            ddl.contains("SELECT 1 FROM \"public\".\"Session\" WHERE \"account_id\" = OLD.id"),
+            "got:\n{}",
+            ddl
+        );
+    }
+
+    #[test]
+    fn test_interface_link_allow_nulls_the_column_but_clears_a_junction_row() {
+        // `Allow` on a plain link is ON DELETE SET NULL; on a multi-link it is
+        // the junction's ON DELETE CASCADE. The trigger stand-ins must keep
+        // that distinction — both sides are a qualified name containing a dot,
+        // so they can't be told apart by inspecting the table name.
+        let allow = vec![OnDeletePolicy {
+            side: DeleteSide::Target,
+            action: DeleteAction::Allow,
+        }];
+        let schema = interface_schema(vec![
+            referencing_type(
+                "AuditEntry",
+                vec![link_to_account("actor", allow.clone(), None)],
+                vec![],
+            ),
+            referencing_type(
+                "Watchlist",
+                vec![],
+                vec![MultiLinkDescriptor {
+                    name: "watched".into(),
+                    target: "default::Account".into(),
+                    through: None,
+                    nullable: true,
+                    description: None,
+                    default_pyql: None,
+                    on_delete: allow,
+                }],
+            ),
+        ]);
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("UPDATE \"public\".\"AuditEntry\" SET \"actor_id\" = NULL WHERE \"actor_id\" = OLD.id;"),
+            "single link Allow must null the column, got:\n{}",
+            ddl
+        );
+        assert!(
+            ddl.contains("DELETE FROM \"public\".\"Watchlist.watched\" WHERE \"target\" = OLD.id;"),
+            "multi-link Allow must drop the junction row, got:\n{}",
+            ddl
+        );
+    }
+
+    #[test]
+    fn test_multilink_to_interface_junction_target_has_no_reference() {
+        let schema = interface_schema(vec![referencing_type(
+            "Watchlist",
+            vec![],
+            vec![MultiLinkDescriptor {
+                name: "watched".into(),
+                target: "default::Account".into(),
+                through: None,
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                on_delete: vec![],
+            }],
+        )]);
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("    target uuid NOT NULL,\n"),
+            "junction target must be a bare uuid column, got:\n{}",
+            ddl
+        );
+        assert!(
+            !ddl.contains("target uuid NOT NULL REFERENCES \"public\".\"Account\""),
+            "got:\n{}",
+            ddl
+        );
+    }
+
+    #[test]
+    fn test_source_side_cascade_deletes_from_implementors_not_the_view() {
+        // `DELETE FROM` a UNION ALL view is not auto-updatable, so the cascade
+        // has to name each implementor table.
+        let schema = interface_schema(vec![referencing_type(
+            "Session",
+            vec![link_to_account(
+                "account",
+                vec![OnDeletePolicy {
+                    side: DeleteSide::Source,
+                    action: DeleteAction::DeleteTarget,
+                }],
+                None,
+            )],
+            vec![],
+        )]);
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("DELETE FROM \"public\".\"Individual\" WHERE id = OLD.\"account_id\";"),
+            "got:\n{}",
+            ddl
+        );
+        assert!(
+            ddl.contains("DELETE FROM \"public\".\"Organization\" WHERE id = OLD.\"account_id\";"),
+            "got:\n{}",
+            ddl
+        );
+        assert!(
+            !ddl.contains("DELETE FROM \"public\".\"Account\" WHERE id ="),
+            "must never delete through the interface view, got:\n{}",
+            ddl
+        );
+    }
+
+    #[test]
+    fn test_link_to_concrete_type_still_gets_its_foreign_key() {
+        // Guard against the suppression leaking onto ordinary links.
+        let mut schema = interface_schema(vec![referencing_type(
+            "Session",
+            vec![LinkDescriptor {
+                name: "owner".into(),
+                target: "default::Individual".into(),
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+                through: None,
+            }],
+            vec![],
+        )]);
+        schema.types.retain(|t| t.name != "Organization");
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("FOREIGN KEY (\"owner_id\") REFERENCES \"public\".\"Individual\"(id)"),
+            "got:\n{}",
+            ddl
+        );
     }
 
     #[test]
