@@ -6716,10 +6716,14 @@ impl<'a> Compiler<'a> {
             });
         }
         if let Some(t) = self.cte_types.get(name) {
+            // A scalar binding records its pg type here (see `cte_stmt_type`);
+            // an object binding records a `module::Type` name, which is not a
+            // pg type and must not be handed to type inference.
             let scalar = !t.contains("::");
             return Some(IrExpr::CteRef {
                 name: name.to_string(),
                 scalar,
+                pg_type: (scalar && !t.is_empty()).then(|| literal_sentinel_to_pg(t).to_string()),
             });
         }
         if allow_fn_param && let Some(pg_type) = self.fn_params.get(name) {
@@ -8424,6 +8428,7 @@ impl<'a> Compiler<'a> {
                     IrExpr::CteRef {
                         name: name.clone(),
                         scalar: false,
+                        pg_type: None,
                     }
                 } else {
                     return Err(self.notify_type_payload_err(&full_channel_name, qname));
@@ -9530,6 +9535,9 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::NamedTuple { .. } => Some("jsonb"),
         IrExpr::GlobalParam { pg_type, .. } => Some(pg_type.as_str()),
+        // A `with`-bound scalar is typed by what it binds, so a call over one
+        // resolves to the same overload the bare value would.
+        IrExpr::CteRef { pg_type, .. } => pg_type.as_deref(),
         // A correlated path subquery is typed by whatever it projects — the
         // scalar column at the end of the path. An object-valued one yields
         // an id, which no operator should silently compare against.

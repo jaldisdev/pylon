@@ -3173,7 +3173,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
 
-        IrExpr::CteRef { name, scalar } => {
+        IrExpr::CteRef { name, scalar, .. } => {
             // scalar CTEs emit `ROW(expr) AS result, expr AS v`; use `v` for
             // expression context so we get the plain scalar type, not record.
             let col = if *scalar { "v" } else { "id" };
@@ -4530,6 +4530,18 @@ mod tests {
             panic!()
         };
         assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "authors"));
+    }
+
+    #[test]
+    fn test_with_bound_scalar_is_typed_for_overload_resolution() {
+        // A `with`-bound value had no inferred type, so a call over one fell
+        // back to the first registered overload and needed an explicit cast.
+        let out = compile_and_emit("WITH xs := (select Person.name) SELECT contains(xs, 'a')");
+        assert!(
+            out.sql.contains("strpos((SELECT \"v\" FROM \"xs\"), 'a')"),
+            "{}",
+            out.sql
+        );
     }
 
     #[test]
