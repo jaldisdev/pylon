@@ -553,6 +553,15 @@ struct Compiler<'a> {
     cte_free_items: HashMap<String, IrFreeExpr>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
+    /// The schema-bound selects currently being compiled, innermost last.
+    ///
+    /// Only consulted for `detached`: an absolute `TypeName.prop` inside a
+    /// detached select means the *enclosing* select's row, so the innermost
+    /// entry is skipped and the next matching one used.
+    anchors: Vec<SelectAnchor>,
+    /// Set when `compile_stmt` strips a select-level `detached`, and taken by
+    /// the `compile_path_modifiers` that compiles that select's own clauses.
+    pending_detached: bool,
     /// True while compiling a `@pylon.function` body. A session global cannot
     /// be a query parameter there — a `CREATE FUNCTION` body has nothing to
     /// bind one to — so it is read out of the `__pylon_json_globals__`
@@ -601,6 +610,14 @@ struct Compiler<'a> {
     /// User-configurable session options — see `SessionConfig`. Always
     /// `default()` for every entry point except `compile_with_config`.
     config: crate::ir::SessionConfig,
+}
+
+/// One schema-bound select in the enclosing chain — see `Compiler::anchors`.
+struct SelectAnchor {
+    type_name: String,
+    qualified: String,
+    alias: String,
+    detached: bool,
 }
 
 /// The synthetic argument carrying session globals into a function body.
@@ -654,6 +671,8 @@ impl<'a> Compiler<'a> {
             nested_cte_counter: 0,
             warnings: vec![],
             config,
+            anchors: Vec::new(),
+            pending_detached: false,
             in_fn_body: false,
             fns_needing_globals: None,
             used_globals_arg: false,
@@ -1609,9 +1628,18 @@ impl<'a> Compiler<'a> {
             Stmt::Select(s) => {
                 let (distinct, result) = match &s.result {
                     Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => (true, &u.operand),
-                    // detached at select level is a no-op: CTEs and top-level selects
-                    // are already independent — strip the wrapper and compile normally.
-                    Expr::Detached(inner) => (false, inner.as_ref()),
+                    // `detached` marks this select as independent of the one
+                    // enclosing it. At the top level that is already true, but
+                    // for a select nested in a filter it is the whole point:
+                    // it is what lets `select X filter not exists (select
+                    // detached X filter .k = X.k)` mean "no *other* X", rather
+                    // than comparing the inner row with itself. Stripping the
+                    // wrapper outright made that anti-join a tautology
+                    // (`"t1"."label" = "t1"."label"`) with no error.
+                    Expr::Detached(inner) => {
+                        self.pending_detached = true;
+                        (false, inner.as_ref())
+                    }
                     other => (false, other),
                 };
 
@@ -2402,6 +2430,23 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
     ) -> Result<SelectModifiers, PyQLError> {
+        self.anchors.push(SelectAnchor {
+            type_name: td.name.clone(),
+            qualified: format!("{}::{}", td.module, td.name),
+            alias: alias.to_string(),
+            detached: std::mem::take(&mut self.pending_detached),
+        });
+        let result = self.compile_path_modifiers_inner(sel, td, alias);
+        self.anchors.pop();
+        result
+    }
+
+    fn compile_path_modifiers_inner(
+        &mut self,
+        sel: &ast::SelectStmt,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<SelectModifiers, PyQLError> {
         let filter = sel
             .filter
             .as_ref()
@@ -3099,31 +3144,41 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
         };
 
-        let shape = self.compile_shape(shape_elements, td, &alias, &td.module)?;
-
-        let filter = sel
-            .filter
-            .as_ref()
-            .map(|f| self.compile_expr(f, td, &alias))
-            .transpose()?;
-
-        let order_by = sel
-            .order_by
-            .iter()
-            .map(|s| self.compile_sort(s, td, &alias))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let offset = sel
-            .offset
-            .as_ref()
-            .map(|e| self.compile_expr(e, td, &alias))
-            .transpose()?;
-
-        let limit = sel
-            .limit
-            .as_ref()
-            .map(|e| self.compile_expr(e, td, &alias))
-            .transpose()?;
+        // On the stack for as long as this select's own clauses are being
+        // compiled, so a `detached` select nested in one of them can find the
+        // row it is being compared against. See `enclosing_anchor`.
+        self.anchors.push(SelectAnchor {
+            type_name: td.name.clone(),
+            qualified: format!("{}::{}", td.module, td.name),
+            alias: alias.clone(),
+            detached: std::mem::take(&mut self.pending_detached),
+        });
+        let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
+            let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
+            let filter = sel
+                .filter
+                .as_ref()
+                .map(|f| compiler.compile_expr(f, td, &alias))
+                .transpose()?;
+            let order_by = sel
+                .order_by
+                .iter()
+                .map(|s| compiler.compile_sort(s, td, &alias))
+                .collect::<Result<Vec<_>, _>>()?;
+            let offset = sel
+                .offset
+                .as_ref()
+                .map(|e| compiler.compile_expr(e, td, &alias))
+                .transpose()?;
+            let limit = sel
+                .limit
+                .as_ref()
+                .map(|e| compiler.compile_expr(e, td, &alias))
+                .transpose()?;
+            Ok((shape, filter, order_by, offset, limit))
+        })(self);
+        self.anchors.pop();
+        let (shape, filter, order_by, offset, limit) = clauses?;
 
         // Compile the inner DML if this is a SELECT-over-DML / SELECT-over-SELECT.
         let dml_source = inner_stmt.map(|s| self.compile_stmt(s).map(Box::new)).transpose()?;
@@ -5998,6 +6053,25 @@ impl<'a> Compiler<'a> {
         None
     }
 
+    /// The `(qualified type, alias)` an absolute `root.prop` should resolve
+    /// against when the innermost select is `detached`.
+    ///
+    /// `None` in the ordinary case — the innermost select is not detached, or
+    /// nothing outside it binds that type, in which case naming the type still
+    /// means the current row.
+    fn enclosing_anchor(&self, root: &str) -> Option<(String, String)> {
+        let innermost = self.anchors.last()?;
+        if !innermost.detached || (innermost.type_name != root && innermost.qualified != root) {
+            return None;
+        }
+        self.anchors
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|a| a.type_name == root || a.qualified == root)
+            .map(|a| (a.qualified.clone(), a.alias.clone()))
+    }
+
     fn compile_path(&mut self, p: &ast::Path, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
         if !p.partial {
             if p.steps.len() == 1
@@ -6111,6 +6185,13 @@ impl<'a> Compiler<'a> {
                         steps: p.steps[1..].to_vec(),
                         partial: true,
                     };
+                    // Inside a `detached` select, naming its own type means the
+                    // enclosing select's row — that is what makes an anti-join
+                    // compare two different rows.
+                    if let Some((outer_qualified, outer_alias)) = self.enclosing_anchor(root) {
+                        let outer_td = self.resolve_type(&outer_qualified)?.clone();
+                        return self.compile_path(&relative, &outer_td, &outer_alias);
+                    }
                     return self.compile_path(&relative, td, alias);
                 }
             }
