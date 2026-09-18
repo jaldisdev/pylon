@@ -1602,7 +1602,16 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         .collect::<Vec<_>>()
         .join(", ");
     outer_parts.push(format!("ARRAY[{}]::text[]", key_names_sql));
-    outer_parts.push(format!("array_agg(ROW(\n            {}\n        )::record)", elem_row));
+    let elem_order = if grp.order_by.is_empty() {
+        String::new()
+    } else {
+        let s: Vec<_> = grp.order_by.iter().map(emit_sort_clause).collect();
+        format!(" ORDER BY {}", s.join(", "))
+    };
+    outer_parts.push(format!(
+        "array_agg(ROW(\n            {}\n        )::record{})",
+        elem_row, elem_order
+    ));
 
     let outer_tuple = outer_parts.join(",\n    ");
 
@@ -1613,13 +1622,45 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let sql = format!(
-        "SELECT (\n    {}\n) AS \"result\"\nFROM {} AS {}\nGROUP BY {}",
-        outer_tuple,
-        source_ref(&grp.source),
-        qi(alias),
-        group_by_sql,
-    );
+    // A per-group OFFSET/LIMIT can't be a plain LIMIT — that would cut whole
+    // groups. Rank the rows within each key first and keep the wanted slice.
+    let (from_sql, rank_filter) = if grp.limit.is_some() || grp.offset.is_some() {
+        let order = if elem_order.is_empty() {
+            String::new()
+        } else {
+            elem_order.clone()
+        };
+        let ranked = format!(
+            "(SELECT {}.*, row_number() OVER (PARTITION BY {}{}) AS \"__rk\"\n    FROM {} AS {}{}) AS {}",
+            qi(alias),
+            group_by_sql,
+            order,
+            source_ref(&grp.source),
+            qi(alias),
+            grp.filter
+                .as_ref()
+                .map(|f| format!("\n    WHERE {}", emit_expr(f)))
+                .unwrap_or_default(),
+            qi(alias),
+        );
+        let lower = grp.offset.as_ref().map(emit_expr).unwrap_or_else(|| "0".to_string());
+        let mut conds = vec![format!("\"__rk\" > {}", lower)];
+        if let Some(l) = &grp.limit {
+            conds.push(format!("\"__rk\" <= {} + {}", lower, emit_expr(l)));
+        }
+        (ranked, Some(conds.join(" AND ")))
+    } else {
+        (
+            format!("{} AS {}", source_ref(&grp.source), qi(alias)),
+            grp.filter.as_ref().map(emit_expr),
+        )
+    };
+
+    let mut sql = format!("SELECT (\n    {}\n) AS \"result\"\nFROM {}", outer_tuple, from_sql,);
+    if let Some(cond) = rank_filter {
+        sql.push_str(&format!("\nWHERE {}", cond));
+    }
+    sql.push_str(&format!("\nGROUP BY {}", group_by_sql));
 
     // ShapeNode for each element (Object with the selected pointers).
     let element_node = ShapeNode::Object {
@@ -6968,6 +7009,65 @@ mod tests {
             assert_eq!(key_nodes.len(), 1);
             assert!(matches!(&key_nodes[0], crate::query::ShapeNode::Scalar { name, .. } if name == "decade"));
         }
+    }
+
+    #[test]
+    fn test_group_orders_elements_within_each_group() {
+        let out = compile_and_emit("group Person { name } by .age order by .name desc");
+        assert!(
+            out.sql.contains(")::record ORDER BY \"t0\".\"name\" DESC NULLS LAST)"),
+            "{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("row_number()"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_group_limit_trims_each_group_not_the_result() {
+        // The newest row per key: a trailing LIMIT would drop whole groups,
+        // so the rows are ranked within each key instead.
+        let out = compile_and_emit("group Person { name } by .age order by .name desc limit 1");
+        assert!(
+            out.sql
+                .contains("row_number() OVER (PARTITION BY \"t0\".\"age\" ORDER BY \"t0\".\"name\" DESC NULLS LAST)"),
+            "{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("WHERE \"__rk\" > 0 AND \"__rk\" <= 0 + 1"),
+            "{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("\nLIMIT"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_group_by_two_keys_with_a_per_group_limit() {
+        let out = compile_and_emit(
+            "group Person { name } by .age, .name filter .age > 18 order by .name desc offset 1 limit 2",
+        );
+        assert!(
+            out.sql.contains("PARTITION BY \"t0\".\"age\", \"t0\".\"name\""),
+            "{}",
+            out.sql
+        );
+        // The filter picks which rows are grouped, so it sits inside the
+        // ranking subquery — ranking must not see rows the filter excluded.
+        let where_pos = out.sql.find("WHERE (\"t0\".\"age\" > 18)").expect("filter");
+        let rank_pos = out.sql.find("WHERE \"__rk\"").expect("rank filter");
+        assert!(where_pos < rank_pos, "{}", out.sql);
+        assert!(
+            out.sql.contains("GROUP BY \"t0\".\"age\", \"t0\".\"name\""),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_group_filter_without_a_limit_is_a_plain_where() {
+        let out = compile_and_emit("group Person { name } by .age filter .age > 18");
+        assert!(out.sql.contains("WHERE (\"t0\".\"age\" > 18)"), "{}", out.sql);
+        assert!(!out.sql.contains("row_number()"), "{}", out.sql);
     }
 
     #[test]

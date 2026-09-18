@@ -48,6 +48,15 @@ pub struct GroupStmt {
     pub using: Vec<(String, Expr)>,
     /// `BY expr, ...` — each item is an Ident (using-alias ref) or a partial Path (.prop).
     pub by: Vec<Expr>,
+    /// `FILTER expr` — restricts the rows that are grouped, applied before
+    /// grouping (so it decides membership, not which groups survive).
+    pub filter: Option<Expr>,
+    /// `ORDER BY ...` / `OFFSET` / `LIMIT` — these apply *within* each
+    /// group, to its elements: `group Reading by .sensor order by .taken_at
+    /// desc limit 1` is the newest reading per sensor.
+    pub order_by: Vec<SortExpr>,
+    pub offset: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -533,11 +533,44 @@ impl Parser {
             }
         }
 
+        // Trailing modifiers, in the same order a SELECT takes them. FILTER
+        // picks which rows are grouped at all; ORDER BY/OFFSET/LIMIT apply
+        // within each group, to its own elements.
+        let filter = if matches!(self.current(), Token::Filter) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let order_by = if matches!(self.current(), Token::Order) {
+            self.advance();
+            self.eat(&Token::By)?;
+            self.parse_sort_list()?
+        } else {
+            vec![]
+        };
+        let offset = if matches!(self.current(), Token::Offset) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let limit = if matches!(self.current(), Token::Limit) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         Ok(Stmt::Group(crate::parse::ast::GroupStmt {
             subject,
             shape,
             using,
             by,
+            filter,
+            order_by,
+            offset,
+            limit,
         }))
     }
 

@@ -3576,7 +3576,29 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        Ok(IrGroup { source, shape, keys })
+        // `filter` restricts the grouped rows; `order by`/`offset`/`limit`
+        // apply within each group, so they're compiled against the same
+        // element scope the shape is.
+        let td = self.resolve_type(&type_name)?;
+        let synthetic = ast::SelectStmt {
+            result: g.subject.clone(),
+            filter: g.filter.clone(),
+            order_by: g.order_by.clone(),
+            offset: g.offset.clone(),
+            limit: g.limit.clone(),
+            lock: None,
+        };
+        let (filter, order_by, offset, limit) = self.compile_path_modifiers(&synthetic, td, &alias)?;
+
+        Ok(IrGroup {
+            source,
+            shape,
+            keys,
+            filter,
+            order_by,
+            offset,
+            limit,
+        })
     }
 
     /// Extract the target type name from a DML or inner SELECT statement.
