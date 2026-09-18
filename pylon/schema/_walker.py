@@ -744,6 +744,12 @@ def _field_checks_and_exclusive(
         Regexp,
     )
 
+    # Quoted: a pointer may legitimately be named after a SQL keyword, and an
+    # unquoted one silently changes what the CHECK means — a property called
+    # `default` produced `CHECK (char_length(default) <= 1024)`, which
+    # PostgreSQL rejects with "DEFAULT is not allowed in this context".
+    col = f'"{col.replace(chr(34), chr(34) * 2)}"'
+
     checks: list[str] = []
     is_exclusive = False
 
