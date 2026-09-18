@@ -21,10 +21,17 @@ A computed pointer:
 
 ## Sub-selects
 
-`filter`, `order by`, `offset` and `limit` need a `select` of their own — an expression is not a statement, so they can't trail a bare path. Wrap the path in parentheses:
+A computed's expression may carry `filter`, `order by`, `offset` and `limit` directly — it stands alone, so there is no enclosing statement for them to belong to and no ambiguity about what they modify. All three spellings below mean the same thing:
 
 ```python
+recent_orders: pylon.Computed[pylon.MultiLink[Order], ".orders order by .created_at desc limit 5"]
+recent_orders: pylon.Computed[pylon.MultiLink[Order], "select .orders order by .created_at desc limit 5"]
 recent_orders: pylon.Computed[pylon.MultiLink[Order], "(select .orders order by .created_at desc limit 5)"]
+```
+
+The parenthesised form is the one to reach for when the sub-select is only part of a larger expression:
+
+```python
 primary_email: pylon.Computed[pylon.Str, "(select .emails filter .primary = True limit 1).address"]
 ```
 
@@ -34,6 +41,23 @@ The two produce different kinds of pointer, and which one you get follows from w
 - Projecting a property off it (`(select .emails … ).address`) makes it a scalar — one correlated subquery per row, returning that column.
 
 A sub-select over a [function](functions.md) that returns objects works the same way, as long as it projects a property: `"(select account::owner(.id) limit 1).name"`. The call itself stays object-valued, so it can't be the whole expression.
+
+## Reading through a computed pointer
+
+A path may continue through a computed pointer that names a link. The computed has no column of its own to join on, so its path takes that step's place and its filter joins the traversal's — which makes it worth factoring a shared subset out once and reading attributes off it:
+
+```python
+@pylon.type
+class Product:
+    translations: MultiLink[Translation]
+    current: Computed[MultiLink[Translation], "(select .translations filter .language = global::language)"]
+    title: Computed[str, "(select .current filter .attribute = 'Title' limit 1).value"]
+    subtitle: Computed[str, "(select .current filter .attribute = 'Subtitle' limit 1).value"]
+```
+
+Computeds chain, each contributing its own filter. A computed that carries its own `order by`/`offset`/`limit` is the exception: those can't be folded into a flat traversal, so a path cannot continue through one — select it and project from that instead.
+
+A computed declared on an [interface](types.md#pyloninterface--polymorphic-view) is visible from every type implementing it, the same as the interface's stored pointers.
 
 ## Return-type checking
 

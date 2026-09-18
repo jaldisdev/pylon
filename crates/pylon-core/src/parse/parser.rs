@@ -583,6 +583,64 @@ impl Parser {
         self.parse_union()
     }
 
+    /// `parse_expr`, plus the trailing modifiers a standalone schema
+    /// fragment is allowed to carry without writing `select` around them.
+    /// With any of them present the result is the sub-select they imply, so
+    /// everything downstream sees the parenthesised spelling.
+    pub fn parse_pointer_expr(&mut self) -> Result<Expr, PyQLSyntaxError> {
+        // A fragment may also *start* with a statement keyword, unbracketed:
+        // `"select .orders limit 5"` means the same as `"(select .orders
+        // limit 5)"`. Statements that can't stand in for a value still parse
+        // here, so they fail with what they are rather than a syntax error.
+        if matches!(
+            self.current(),
+            Token::Select | Token::With | Token::For | Token::Insert | Token::Update | Token::Delete
+        ) {
+            let stmt = self.parse_inner_stmt()?;
+            return Ok(Expr::SubQuery(Box::new(stmt)));
+        }
+        let result = self.parse_union()?;
+        if !matches!(
+            self.current(),
+            Token::Filter | Token::Order | Token::Offset | Token::Limit
+        ) {
+            return Ok(result);
+        }
+        let filter = if matches!(self.current(), Token::Filter) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let order_by = if matches!(self.current(), Token::Order) {
+            self.advance();
+            self.eat(&Token::By)?;
+            self.parse_sort_list()?
+        } else {
+            vec![]
+        };
+        let offset = if matches!(self.current(), Token::Offset) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let limit = if matches!(self.current(), Token::Limit) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Expr::SubQuery(Box::new(Stmt::Select(SelectStmt {
+            result,
+            filter,
+            order_by,
+            offset,
+            limit,
+            lock: None,
+        }))))
+    }
+
     fn parse_union(&mut self) -> Result<Expr, PyQLSyntaxError> {
         let mut left = self.parse_if_else()?;
         loop {
