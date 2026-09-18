@@ -3119,6 +3119,40 @@ mod tests {
     }
 
     #[test]
+    fn test_object_function_can_reference_its_own_parameter() {
+        // An object-returning body compiles its filter against a schema anchor,
+        // which used not to consult `fn_params` — so the bare `min_age` was
+        // rejected as "absolute paths are not valid in expression context",
+        // while the identical reference in a scalar-returning body worked.
+        let fd = FunctionDescriptor {
+            name: "older_than".into(),
+            module: "default".into(),
+            params: vec![FunctionParamDescriptor {
+                name: "min_age".into(),
+                pg_type: "int8".into(),
+            }],
+            return_pg_type: "default::Person".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Person filter .age > min_age".into(),
+        };
+        let schema = minimal_schema(vec![fd.clone()]);
+        let ddl = emit_one_function(&fd, &schema).unwrap();
+        assert!(
+            ddl.contains("\"min_age\" int8"),
+            "parameter missing from the signature, got:\n{}",
+            ddl
+        );
+        assert!(
+            ddl.contains("\"min_age\")") || ddl.contains("= \"min_age\"") || ddl.contains("> \"min_age\""),
+            "parameter not referenced in the body, got:\n{}",
+            ddl
+        );
+    }
+
+    #[test]
     fn test_emit_sequence_scalar_ddl() {
         use crate::schema::ScalarDescriptor;
         let schema = SchemaDescriptor {
