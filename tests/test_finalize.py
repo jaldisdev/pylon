@@ -722,6 +722,31 @@ class TestWalkIntegration:
         schema = walk(types, enums, scalars, [])
         assert schema.type_count == 2
 
+    def test_object_valued_computed_declares_no_scalar_return_type(self):
+        """A `Computed[MultiLink[X], ...]` has no scalar type to check against.
+
+        It used to fall through `_to_pg_type`'s branches onto the `"text"`
+        fallback, which validation then compared against what the expression
+        actually produced — rejecting every link-valued computed as a return
+        type mismatch.
+        """
+        from pylon.schema._walker import walk
+
+        @pylon.type(module='cmp', name='Item')
+        class Item:
+            label: str
+
+        @pylon.type(module='cmp', name='Box')
+        class Box:
+            items: pylon.MultiLink[Item]
+            recent: pylon.Computed[pylon.MultiLink[Item], '(select .items limit 2)']
+            first_label: pylon.Computed[str, '(select .items limit 1).label']
+
+        assert Box.__pylon_config__.pointers['recent'].kind == 'computed'
+        types, enums, scalars = snapshot()
+        schema = walk(types, enums, scalars, [])
+        assert schema.type_count == 2
+
     def test_inheritance_flattened(self):
         from pylon.schema._walker import walk
 
