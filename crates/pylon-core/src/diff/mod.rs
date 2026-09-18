@@ -628,6 +628,25 @@ impl DbState {
 /// present — making `migration create` propose recreating every single
 /// one of them, forever, even with zero schema changes (confirmed live
 /// against the demo project).
+/// True when a junction type's physical table belongs to a link declared on an
+/// interface.
+///
+/// A junction type's own `table` is the join table of the link that references
+/// it (`"Account.notifications"`). When that link is declared on an interface
+/// the pointer is flattened, so the only join tables that exist are the
+/// implementors' (`"Individual.notifications"`) — nothing is ever created at
+/// the interface's own name, and expecting a trigger there makes every
+/// subsequent diff think one is missing.
+fn junction_table_belongs_to_an_interface(schema: &SchemaDescriptor, td: &TypeDescriptor) -> bool {
+    let Some((owner_table, _)) = td.table.rsplit_once('.') else {
+        return false;
+    };
+    schema
+        .types
+        .iter()
+        .any(|t| t.abstract_ && t.module == td.module && t.table == owner_table)
+}
+
 pub fn expected_triggers(
     schema: &SchemaDescriptor,
     type_map: &HashMap<String, (&str, &str)>,
@@ -662,7 +681,7 @@ pub fn expected_triggers(
     // see the cache layer plan's design decision).
     let mut cache_trigger_tables: HashSet<(String, String)> = HashSet::new();
     for td in &schema.types {
-        if td.abstract_ {
+        if td.abstract_ || junction_table_belongs_to_an_interface(schema, td) {
             continue;
         }
         cache_trigger_tables.insert((td.module.clone(), td.table.clone()));
@@ -2502,7 +2521,7 @@ fn diff_inner(
         // `CREATE TRIGGER` statement twice for that table.
         let mut cache_trigger_tables: HashSet<(String, String)> = HashSet::new();
         for td in &target.types {
-            if td.abstract_ {
+            if td.abstract_ || junction_table_belongs_to_an_interface(target, td) {
                 continue;
             }
             cache_trigger_tables.insert((td.module.clone(), td.table.clone()));

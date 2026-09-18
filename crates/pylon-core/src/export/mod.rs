@@ -596,11 +596,7 @@ pub fn junction_fk_constraints(
     result
 }
 
-fn emit_junction_fk_constraints(
-    schema: &SchemaDescriptor,
-    type_map: &HashMap<String, (&str, &str)>,
-    out: &mut String,
-) {
+fn emit_junction_fk_constraints(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
     let constraints = junction_fk_constraints(schema, type_map);
     for (_, _, _, ddl) in &constraints {
         out.push_str(ddl);
