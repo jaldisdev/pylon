@@ -2097,12 +2097,19 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
     let body_sql = emit_fn_body(&ir_output);
 
     // Parameter list: "name" pg_type, ...
-    let params_sql = fd
-        .params
-        .iter()
-        .map(|p| format!("{} {}", qi(&p.name), p.pg_type))
-        .collect::<Vec<_>>()
-        .join(", ");
+    //
+    // A body that reads a session global (or calls something that does) takes
+    // the globals argument first — see `ir::compiler::GLOBALS_ARG`. It is added
+    // only when needed rather than to every function, so the `id` default's
+    // `generate_typed_id` and friends stay two-argument calls on the insert
+    // path; the cost is that gaining or losing the *first* global in a body
+    // changes the signature.
+    let mut param_parts: Vec<String> = Vec::with_capacity(fd.params.len() + 1);
+    if ir_output.uses_globals_arg {
+        param_parts.push(format!("{} jsonb", qi(crate::ir::GLOBALS_ARG)));
+    }
+    param_parts.extend(fd.params.iter().map(|p| format!("{} {}", qi(&p.name), p.pg_type)));
+    let params_sql = param_parts.join(", ");
 
     // RETURNS clause.
     let returns_sql = if fd.return_is_object {
@@ -3148,6 +3155,124 @@ mod tests {
         assert!(
             ddl.contains("\"min_age\")") || ddl.contains("= \"min_age\"") || ddl.contains("> \"min_age\""),
             "parameter not referenced in the body, got:\n{}",
+            ddl
+        );
+    }
+
+    #[test]
+    fn test_a_function_reading_a_global_takes_the_globals_argument() {
+        // A session global is a query parameter everywhere else, which a
+        // `CREATE FUNCTION` body cannot bind — it used to emit a bare `$1`.
+        use crate::schema::GlobalDescriptor;
+        let reader = FunctionDescriptor {
+            name: "cutoff".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "timestamptz".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "global snapshot_at ?? datetime_of_transaction()".into(),
+        };
+        let plain = FunctionDescriptor {
+            name: "bump".into(),
+            module: "default".into(),
+            params: vec![FunctionParamDescriptor {
+                name: "n".into(),
+                pg_type: "int8".into(),
+            }],
+            return_pg_type: "int8".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+            body: "n + 1".into(),
+        };
+        let mut schema = minimal_schema(vec![reader.clone(), plain.clone()]);
+        schema.globals.push(GlobalDescriptor {
+            name: "snapshot_at".into(),
+            module: "default".into(),
+            scalar_type: "datetime".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        });
+
+        let reader_ddl = emit_one_function(&reader, &schema).unwrap();
+        assert!(
+            reader_ddl.contains("\"__pylon_json_globals__\" jsonb"),
+            "the global reader should take the argument, got:\n{}",
+            reader_ddl
+        );
+        assert!(
+            reader_ddl.contains("__pylon_json_globals__ ->> 'default::snapshot_at'"),
+            "the body should read the global out of it, got:\n{}",
+            reader_ddl
+        );
+        assert!(
+            !reader_ddl.contains("$1"),
+            "no parameter placeholder should survive, got:\n{}",
+            reader_ddl
+        );
+
+        // A function with no globals anywhere in reach keeps its own signature
+        // — this is the deliberate difference from the upstream engine, which adds the
+        // argument to every function.
+        let plain_ddl = emit_one_function(&plain, &schema).unwrap();
+        assert!(
+            !plain_ddl.contains("__pylon_json_globals__"),
+            "a function that cannot reach a global should be untouched, got:\n{}",
+            plain_ddl
+        );
+    }
+
+    #[test]
+    fn test_the_globals_argument_is_forwarded_to_a_callee_that_needs_it() {
+        use crate::schema::GlobalDescriptor;
+        let reader = FunctionDescriptor {
+            name: "cutoff".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "timestamptz".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "global snapshot_at ?? datetime_of_transaction()".into(),
+        };
+        let caller = FunctionDescriptor {
+            name: "is_past".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "bool".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "cutoff() < datetime_of_transaction()".into(),
+        };
+        let mut schema = minimal_schema(vec![reader, caller.clone()]);
+        schema.globals.push(GlobalDescriptor {
+            name: "snapshot_at".into(),
+            module: "default".into(),
+            scalar_type: "datetime".into(),
+            required: false,
+            default_expr: None,
+            computed_expr: None,
+        });
+
+        // `is_past` reads no global itself; it needs the argument only because
+        // what it calls does, which is why the analysis has to be a fixpoint.
+        let ddl = emit_one_function(&caller, &schema).unwrap();
+        assert!(
+            ddl.contains("\"__pylon_json_globals__\" jsonb"),
+            "a caller of a global reader needs the argument too, got:\n{}",
+            ddl
+        );
+        assert!(
+            ddl.contains("cutoff\"((__pylon_json_globals__))") || ddl.contains("__pylon_json_globals__)"),
+            "it should forward the argument, got:\n{}",
             ddl
         );
     }

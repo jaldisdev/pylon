@@ -90,6 +90,7 @@ pub fn compile_with_config(
                 ctes: vec![],
                 global_ctes: c.global_ctes,
                 warnings: c.warnings,
+                uses_globals_arg: c.used_globals_arg,
             });
         }
         // Special case: `with search := fts::search(…); select search { … } …`
@@ -100,6 +101,7 @@ pub fn compile_with_config(
                 ctes: vec![],
                 global_ctes: c.global_ctes,
                 warnings: c.warnings,
+                uses_globals_arg: c.used_globals_arg,
             });
         }
 
@@ -125,6 +127,7 @@ pub fn compile_with_config(
         ctes,
         global_ctes: c.global_ctes,
         warnings: c.warnings,
+        uses_globals_arg: c.used_globals_arg,
     })
 }
 
@@ -265,6 +268,35 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
     c.compile_stmt(&Stmt::Select(fake_sel))
 }
 
+/// Qualified names of the functions that take `GLOBALS_ARG`.
+///
+/// A function needs it when its body reads a session global, *or* when it calls
+/// a function that needs it — so this is a fixpoint, not a single pass: the
+/// first pass finds the direct readers, later passes find their callers. A body
+/// that fails to compile is skipped; that failure is reported by validation,
+/// and guessing at its globals here would only produce a second, worse error.
+pub fn functions_needing_globals(schema: &SchemaDescriptor) -> std::collections::HashSet<String> {
+    let mut needs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let mut changed = false;
+        for fd in &schema.functions {
+            let qualified = format!("{}::{}", fd.module, fd.name);
+            if needs.contains(&qualified) {
+                continue;
+            }
+            if let Ok(out) = compile_fn_body_with(fd, schema, &needs)
+                && out.uses_globals_arg
+            {
+                needs.insert(qualified);
+                changed = true;
+            }
+        }
+        if !changed {
+            return needs;
+        }
+    }
+}
+
 /// Compile the PyQL body of a user-defined function for DDL emission.
 ///
 /// Sets `fn_params` on the compiler so that parameter names resolve as `FnParam`
@@ -272,6 +304,16 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
 pub fn compile_fn_body(
     fn_desc: &crate::schema::FunctionDescriptor,
     schema: &SchemaDescriptor,
+) -> Result<super::IrOutput, crate::error::PyQLError> {
+    compile_fn_body_with(fn_desc, schema, &functions_needing_globals(schema))
+}
+
+/// `compile_fn_body` with the globals-argument set supplied, so the fixpoint in
+/// `functions_needing_globals` can call this without recursing into itself.
+pub fn compile_fn_body_with(
+    fn_desc: &crate::schema::FunctionDescriptor,
+    schema: &SchemaDescriptor,
+    fns_needing_globals: &std::collections::HashSet<String>,
 ) -> Result<super::IrOutput, crate::error::PyQLError> {
     use crate::parse;
     use crate::parse::ast::Stmt;
@@ -289,6 +331,8 @@ pub fn compile_fn_body(
 
     let ast = parse::parse(&body)?;
     let mut c = Compiler::new(schema);
+    c.in_fn_body = true;
+    c.fns_needing_globals = Some(fns_needing_globals.clone());
     for p in &fn_desc.params {
         c.fn_params.insert(p.name.clone(), p.pg_type.clone());
     }
@@ -317,6 +361,7 @@ pub fn compile_fn_body(
         ctes,
         global_ctes: c.global_ctes,
         warnings: c.warnings,
+        uses_globals_arg: c.used_globals_arg,
     })
 }
 
@@ -398,6 +443,7 @@ pub fn compile_trigger_handler(
         ctes,
         global_ctes: c.global_ctes,
         warnings: c.warnings,
+        uses_globals_arg: c.used_globals_arg,
     })
 }
 
@@ -507,6 +553,23 @@ struct Compiler<'a> {
     cte_free_items: HashMap<String, IrFreeExpr>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
+    /// True while compiling a `@pylon.function` body. A session global cannot
+    /// be a query parameter there — a `CREATE FUNCTION` body has nothing to
+    /// bind one to — so it is read out of the `__pylon_json_globals__`
+    /// argument instead. See `GLOBALS_ARG`.
+    in_fn_body: bool,
+    /// Qualified names of functions that take the globals argument, so a call
+    /// to one can be given it.
+    ///
+    /// Computed on first use rather than up front: working it out means
+    /// compiling every function body in the schema, and the overwhelming
+    /// majority of queries never call a user function at all. Function-body
+    /// compilation seeds it explicitly (`compile_fn_body_with`), which is also
+    /// what keeps the fixpoint from recursing into itself.
+    fns_needing_globals: Option<std::collections::HashSet<String>>,
+    /// Set when this body read a global or forwarded the argument to a callee
+    /// — i.e. when the function being compiled needs the argument itself.
+    used_globals_arg: bool,
     /// User-defined function parameters in scope (only set during body compilation).
     fn_params: HashMap<String, String>,
     /// `__new__`/`__old__` row-context bindings, only set during trigger-handler
@@ -540,6 +603,37 @@ struct Compiler<'a> {
     config: crate::ir::SessionConfig,
 }
 
+/// The synthetic argument carrying session globals into a function body.
+///
+/// A session global is normally a query parameter, which a `CREATE FUNCTION`
+/// body cannot have — it would emit a bare `$1` nothing binds. Following the upstream engine's
+/// `__edb_json_globals__`, the caller packs the globals into one jsonb value
+/// and passes it as a leading argument. One opaque argument rather than one
+/// per global keeps the function's signature independent of which globals its
+/// body happens to mention, so editing a body does not churn its signature
+/// (and, with PostgreSQL overloading, leave a stale one behind).
+pub const GLOBALS_ARG: &str = "__pylon_json_globals__";
+
+/// SQL reading one global out of `GLOBALS_ARG`.
+fn globals_arg_read(qualified: &str, pg_type: &str) -> String {
+    let key = qualified.replace('\'', "''");
+    if let Some(element) = pg_type.strip_suffix("[]") {
+        // `->>` would hand back the JSON array's text, not an array, so the
+        // elements are unpacked instead. The `jsonb_typeof` guard matters: an
+        // unset global arrives as JSON null, and unpacking that raises "cannot
+        // extract elements from a scalar". The `coalesce` keeps an empty array
+        // an empty array rather than letting `array_agg` turn it into NULL.
+        format!(
+            "(case when jsonb_typeof({GLOBALS_ARG} -> '{key}') = 'array' \
+             then coalesce((select array_agg(value::{element}) \
+             from jsonb_array_elements_text({GLOBALS_ARG} -> '{key}') as value), '{{}}'::{pg_type}) \
+             else null end)"
+        )
+    } else {
+        format!("(({GLOBALS_ARG} ->> '{key}')::{pg_type})")
+    }
+}
+
 impl<'a> Compiler<'a> {
     fn new(schema: &'a SchemaDescriptor) -> Self {
         Self::with_config(schema, crate::ir::SessionConfig::default())
@@ -560,6 +654,9 @@ impl<'a> Compiler<'a> {
             nested_cte_counter: 0,
             warnings: vec![],
             config,
+            in_fn_body: false,
+            fns_needing_globals: None,
+            used_globals_arg: false,
         }
     }
 
@@ -1048,6 +1145,13 @@ impl<'a> Compiler<'a> {
                     stmt: inner_stmt,
                 })));
             Ok(IrExpr::GlobalRef { cte_name })
+        } else if self.in_fn_body {
+            // Inside a function body there is no parameter to bind, so the
+            // value is read out of the `__pylon_json_globals__` argument the
+            // caller packs. Mirrors the upstream engine's `__edb_json_globals__`.
+            let pg_type = self.resolve_global_pg_type(&global.scalar_type);
+            self.used_globals_arg = true;
+            Ok(IrExpr::RawSql(globals_arg_read(&qualified, &pg_type)))
         } else {
             // Session global — allocate parameter slot
             let pg_type = self.resolve_global_pg_type(&global.scalar_type);
@@ -7128,7 +7232,7 @@ impl<'a> Compiler<'a> {
     /// Look up `name` in the stdlib (namespace = `module` or `"std"`) and produce
     /// the correct `IrExpr::FunctionCall` based on the matching `ImplStrategy`.
     /// Falls through to a plain call if no overload is found (unknown / PG built-in).
-    fn resolve_fn_call(&self, module: Option<&str>, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
+    fn resolve_fn_call(&mut self, module: Option<&str>, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
         use crate::stdlib::{ImplStrategy, lookup};
 
         let ns = module.unwrap_or("std");
@@ -7216,10 +7320,17 @@ impl<'a> Compiler<'a> {
                         }))
                     })
                     .collect();
+                let qualified = format!("{}::{}", fd.module, fd.name);
+                let fn_module = fd.module.clone();
+                let fn_name = fd.name.clone();
+                let mut call_args: Vec<IrExpr> = cast_args;
+                if let Some(globals) = self.globals_arg_for_call(&qualified)? {
+                    call_args.insert(0, globals);
+                }
                 return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
-                    schema: Some(fd.module.clone()),
-                    name: fd.name.clone(),
-                    args: cast_args,
+                    schema: Some(fn_module),
+                    name: fn_name,
+                    args: call_args,
                     sql_template: None,
                 }));
             }
@@ -7665,6 +7776,46 @@ impl<'a> Compiler<'a> {
         }))
     }
 
+    /// The `GLOBALS_ARG` value to pass when calling `qualified`, or `None` if
+    /// that function does not take one.
+    ///
+    /// Inside a function body the caller's own argument is forwarded verbatim;
+    /// at the top level every session global is packed, rather than just the
+    /// ones the callee happens to read. Packing the whole set costs one small
+    /// jsonb per call and keeps the caller from having to know anything about
+    /// the callee's body.
+    fn globals_arg_for_call(&mut self, qualified: &str) -> Result<Option<IrExpr>, PyQLError> {
+        if self.fns_needing_globals.is_none() {
+            self.fns_needing_globals = Some(functions_needing_globals(self.schema));
+        }
+        if !self.fns_needing_globals.as_ref().is_some_and(|s| s.contains(qualified)) {
+            return Ok(None);
+        }
+        if self.in_fn_body {
+            self.used_globals_arg = true;
+            return Ok(Some(IrExpr::RawSql(GLOBALS_ARG.to_string())));
+        }
+        let session_globals: Vec<String> = self
+            .schema
+            .globals
+            .iter()
+            .filter(|g| g.computed_expr.is_none())
+            .map(|g| format!("{}::{}", g.module, g.name))
+            .collect();
+        let mut args = Vec::with_capacity(session_globals.len() * 2);
+        for name in session_globals {
+            let value = self.compile_global(&name)?;
+            args.push(IrExpr::Literal(IrLiteral::Str(name)));
+            args.push(value);
+        }
+        Ok(Some(IrExpr::FunctionCall(super::IrFunctionCall {
+            schema: None,
+            name: "jsonb_build_object".to_string(),
+            args,
+            sql_template: None,
+        })))
+    }
+
     // ── User-defined function helpers ─────────────────────────────────────────────
 
     /// Try to compile `fn(args) { shape }` as a `FunctionSelect` for an object-returning
@@ -7702,11 +7853,15 @@ impl<'a> Compiler<'a> {
         let return_type_name = fd.return_pg_type.clone(); // qualified type name for object returns
         let polymorphic = fd.return_is_polymorphic;
 
-        let fn_args = fc
+        let mut fn_args = fc
             .args
             .iter()
             .map(|a| self.compile_free_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
+        let qualified = format!("{}::{}", fn_module, fn_name);
+        if let Some(globals) = self.globals_arg_for_call(&qualified)? {
+            fn_args.insert(0, globals);
+        }
 
         let alias = self.fresh_alias();
 

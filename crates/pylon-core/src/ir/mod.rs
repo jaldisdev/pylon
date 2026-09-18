@@ -29,7 +29,6 @@ pub mod tags;
 pub use compiler::compile;
 pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
-pub use compiler::compile_fn_body;
 pub use compiler::compile_scalar_default;
 pub use compiler::compile_scalar_default_typed;
 pub use compiler::compile_trigger_handler;
@@ -37,6 +36,7 @@ pub use compiler::compile_with_config;
 pub(crate) use compiler::infer_ir_type;
 pub use compiler::pg_type_to_pyql;
 pub(crate) use compiler::types_compatible;
+pub use compiler::{GLOBALS_ARG, compile_fn_body, functions_needing_globals};
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 
@@ -1050,6 +1050,10 @@ pub struct IrOutput {
     pub global_ctes: Vec<IrGlobalCte>,
     /// Non-fatal warnings produced during compilation.
     pub warnings: Vec<String>,
+    /// True when this is a function body that reads a session global, or
+    /// forwards the globals argument to a callee that does — i.e. when the
+    /// function needs `GLOBALS_ARG` in its signature.
+    pub uses_globals_arg: bool,
 }
 
 #[cfg(test)]
