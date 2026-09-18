@@ -721,6 +721,11 @@ pub enum IrExpr {
     CteRef {
         name: String,
         scalar: bool,
+        /// The bound value's PostgreSQL type when it is a scalar, so
+        /// overload resolution and operator type-checking can see through
+        /// the binding — without it, `contains(xs, 'a')` over a `with`-bound
+        /// value matched no overload and needed an explicit cast.
+        pg_type: Option<String>,
     },
     /// A single-field access on a WITH-bound free object: `with x := { a
     /// := 1 } select x.a`. The CTE body exposes each free-object field as

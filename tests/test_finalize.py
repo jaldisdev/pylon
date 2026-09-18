@@ -722,6 +722,28 @@ class TestWalkIntegration:
         schema = walk(types, enums, scalars, [])
         assert schema.type_count == 2
 
+    def test_link_default_selecting_an_object_is_rejected(self):
+        """`DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run.
+
+        It used to be emitted anyway, so the failure surfaced as a raw
+        Postgres error against generated DDL at migration time.
+        """
+        from pylon.exceptions import SchemaError as CoreSchemaError
+        from pylon.schema import Default, Link
+        from pylon.schema._walker import walk
+
+        @pylon.type(module='dl', name='Team')
+        class Team:
+            name: str
+
+        @pylon.type(module='dl', name='Member')
+        class Member:
+            team: Link[Team, Default('(select Team limit 1)')] | None
+
+        types, enums, scalars = snapshot()
+        with pytest.raises(CoreSchemaError, match='column DEFAULT cannot contain'):
+            walk(types, enums, scalars, [])
+
     def test_pointer_level_expression_lands_on_its_own_type(self):
         import json
 
