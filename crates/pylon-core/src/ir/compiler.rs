@@ -2581,6 +2581,79 @@ impl<'a> Compiler<'a> {
                     continue;
                 }
 
+                // A computed backed by an object-returning function —
+                // `translation := latest(.id)`. There is no path to splice
+                // in, so the call itself becomes the next row source: a
+                // LATERAL join, since its arguments read the alias the
+                // traversal has reached.
+                if let Some((fc, modifiers)) = Self::function_subject(&expr_ast)
+                    && let Some(fd) = self.resolve_object_fn(fc)
+                {
+                    if fd.params.len() != fc.args.len() {
+                        return Err(self.type_err(&format!(
+                            "function '{}::{}' expects {} argument(s), got {}",
+                            fd.module,
+                            fd.name,
+                            fd.params.len(),
+                            fc.args.len()
+                        )));
+                    }
+                    let (fn_module, fn_name, return_type_name) =
+                        (fd.module.clone(), fd.name.clone(), fd.return_pg_type.clone());
+                    let mut args = fc
+                        .args
+                        .iter()
+                        .map(|a| self.compile_expr(a, current_td, &current_alias))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let qualified = format!("{fn_module}::{fn_name}");
+                    if let Some(globals) = self.globals_arg_for_call(&qualified)? {
+                        args.insert(0, globals);
+                    }
+                    let target_td = self.resolve_type(&return_type_name)?;
+                    let target_alias = self.fresh_alias();
+                    let target = IrSource {
+                        type_name: format!("{}::{}", target_td.module, target_td.name),
+                        table: target_td.table.clone(),
+                        alias: target_alias.clone(),
+                    };
+                    joins.push(IrPathJoin::Function {
+                        fn_module,
+                        fn_name,
+                        args,
+                        target,
+                    });
+                    if let Some(f) = modifiers.and_then(|m| m.filter.clone()) {
+                        let cond = self.compile_expr(&f, target_td, &target_alias)?;
+                        extra_conditions.push(cond);
+                    }
+                    if is_last(0) {
+                        let shape =
+                            self.compile_shape(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                        let result = IrPathResult::Object {
+                            alias: target_alias.clone(),
+                            type_name: format!("{}::{}", target_td.module, target_td.name),
+                            shape,
+                        };
+                        let (filter, order_by, offset, limit) =
+                            self.compile_path_modifiers(sel, target_td, &target_alias)?;
+                        return Ok(IrPathSelect {
+                            root,
+                            joins,
+                            result,
+                            filter: and_conditions(filter, extra_conditions),
+                            order_by,
+                            offset,
+                            limit,
+                            distinct,
+                            poly_implementors: vec![],
+                        });
+                    }
+                    current_td = target_td;
+                    current_alias = target_alias;
+                    idx += 1;
+                    continue;
+                }
+
                 if !is_last(0) {
                     return Err(self.type_err(&format!(
                         "'{step_name}' is a computed pointer — it has no stored column to traverse further through"
@@ -5486,6 +5559,31 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Peel a computed pointer's right-hand side down to the function call
+    /// it names and the sub-select's modifiers, if that is its shape:
+    /// `latest(.id)` / `(select latest(.id) filter …)`.
+    fn function_subject(e: &Expr) -> Option<(&ast::FunctionCall, Option<&ast::SelectStmt>)> {
+        match e {
+            Expr::FunctionCall(fc) => Some((fc, None)),
+            Expr::SubQuery(stmt) => match stmt.as_ref() {
+                Stmt::Select(sel) => match &sel.result {
+                    Expr::FunctionCall(fc) => Some((fc, Some(sel))),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The object-returning user function `fc` names, if any.
+    fn resolve_object_fn(&self, fc: &ast::FunctionCall) -> Option<&'a FunctionDescriptor> {
+        self.schema.functions.iter().find(|f| {
+            let module_matches = fc.module.as_deref().map(|m| m == f.module.as_str()).unwrap_or(true);
+            module_matches && f.name == fc.name && f.return_is_object
+        })
+    }
+
     /// Peel a computed pointer's right-hand side down to the path it names,
     /// the shape attached to it, and the sub-select carrying its modifiers
     /// (if any): `.posts` / `.posts { title }` / `(select .posts limit 1)` /
@@ -5898,20 +5996,33 @@ impl<'a> Compiler<'a> {
                         }
                         continue;
                     }
-                    // A computed pointer stands for its own path.
+                    // A computed pointer stands for its own path, or for the
+                    // object-returning function it calls.
                     if depth > 0
                         && let Some(cd) = self.resolve_computed(current, n)
                         && let Ok(expr) = crate::parse::parse_pointer_expr(&cd.expression)
-                        && let Some((p, _, _)) = Self::pointer_subject(&expr)
-                        && p.partial
                     {
-                        let (m, t) = self.walk_path_types(current, &p.steps, depth - 1);
-                        multi = multi || m;
-                        match t {
-                            Some(t) => current = t,
-                            None => return (multi, None),
+                        if let Some((p, _, _)) = Self::pointer_subject(&expr)
+                            && p.partial
+                        {
+                            let (m, t) = self.walk_path_types(current, &p.steps, depth - 1);
+                            multi = multi || m;
+                            match t {
+                                Some(t) => current = t,
+                                None => return (multi, None),
+                            }
+                            continue;
                         }
-                        continue;
+                        if let Some((fc, _)) = Self::function_subject(&expr)
+                            && let Some(fd) = self.resolve_object_fn(fc)
+                        {
+                            multi = multi || fd.return_is_set;
+                            match self.resolve_type(&fd.return_pg_type) {
+                                Ok(t) => current = t,
+                                Err(_) => return (multi, None),
+                            }
+                            continue;
+                        }
                     }
                     // A property (or something unresolvable): the walk ends.
                     return (multi, None);

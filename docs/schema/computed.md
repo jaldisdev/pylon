@@ -57,6 +57,13 @@ class Product:
 
 Computeds chain, each contributing its own filter. A computed that carries its own `order by`/`offset`/`limit` is the exception: those can't be folded into a flat traversal, so a path cannot continue through one — select it and project from that instead.
 
+A computed backed by an object-returning [function](functions.md) is traversable the same way. It has no path to stand in for, so the call itself becomes the next row source — a `LATERAL` join, since its arguments read the row the traversal has reached:
+
+```python
+current: Computed[MultiLink[Translation], 'latest_translations(.id)']
+title: Computed[str, "(select .current filter .attribute = 'Title' limit 1).value"]
+```
+
 A computed declared on an [interface](types.md#pyloninterface--polymorphic-view) is visible from every type implementing it, the same as the interface's stored pointers.
 
 ## Return-type checking

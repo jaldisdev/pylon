@@ -255,6 +255,12 @@ fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
                 tags.push(tag_for(target));
                 tags.push(qualify(module, junction_table));
             }
+            IrPathJoin::Function { args, target, .. } => {
+                tags.push(tag_for(target));
+                for a in args {
+                    collect_expr(a, tags);
+                }
+            }
         }
     }
     match &ps.result {

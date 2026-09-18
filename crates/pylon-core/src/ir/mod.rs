@@ -170,6 +170,16 @@ pub enum IrPathJoin {
         fk_col: String,
         target: IrSource,
     },
+    /// An object-returning user function as the next row source —
+    /// `translation := latest(.id)` traversed as `.translation.value`.
+    /// Emitted as a `CROSS JOIN LATERAL`, since `args` reference the alias
+    /// the traversal has reached so far.
+    Function {
+        fn_module: String,
+        fn_name: String,
+        args: Vec<IrExpr>,
+        target: IrSource,
+    },
     /// Reverse of a multi-link: traverse the junction table in reverse.
     BacklinkMulti {
         source_alias: String,
