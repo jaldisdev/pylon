@@ -1170,7 +1170,15 @@ impl<'a> Compiler<'a> {
             // caller packs. Mirrors the upstream engine's `__edb_json_globals__`.
             let pg_type = self.resolve_global_pg_type(&global.scalar_type);
             self.used_globals_arg = true;
-            Ok(IrExpr::RawSql(globals_arg_read(&qualified, &pg_type)))
+            // Wrapped in a cast rather than returned bare: `RawSql` carries no
+            // type, so overload resolution fell back to text and picked the
+            // `str` `find` for an `array<str>` global (`strpos(text[], text)
+            // does not exist`).
+            Ok(IrExpr::TypeCast(Box::new(super::IrTypeCast {
+                expr: IrExpr::RawSql(globals_arg_read(&qualified, &pg_type)),
+                pg_type,
+                tuple_shape: None,
+            })))
         } else {
             // Session global — allocate parameter slot
             let pg_type = self.resolve_global_pg_type(&global.scalar_type);
