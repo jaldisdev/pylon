@@ -121,6 +121,8 @@ pub fn compile_with_config(
         (vec![], c.compile_stmt(stmt)?)
     };
 
+    let mut ctes = ctes;
+    ctes.extend(std::mem::take(&mut c.hoisted_ctes));
     Ok(IrOutput {
         stmt: ir,
         params: c.params,
@@ -382,6 +384,8 @@ pub fn compile_fn_body_with(
         (vec![], c.compile_stmt(&ast)?)
     };
 
+    let mut ctes = ctes;
+    ctes.extend(std::mem::take(&mut c.hoisted_ctes));
     Ok(super::IrOutput {
         stmt: ir,
         params: c.params,
@@ -464,6 +468,8 @@ pub fn compile_trigger_handler(
         }));
     }
 
+    let mut ctes = ctes;
+    ctes.extend(std::mem::take(&mut c.hoisted_ctes));
     Ok(super::IrOutput {
         stmt: ir,
         params: c.params,
@@ -630,6 +636,15 @@ struct Compiler<'a> {
     /// detached select means the *enclosing* select's row, so the innermost
     /// entry is skipped and the next matching one used.
     anchors: Vec<SelectAnchor>,
+    /// CTE definitions a nested `with` contributed from somewhere the
+    /// emitter has no WITH clause of its own — an expression, say. They are
+    /// appended to the statement's own CTEs at the top-level boundary.
+    hoisted_ctes: Vec<IrCteDef>,
+    /// `(through type, junction alias)` of the multi-link whose own
+    /// modifiers are being compiled — what a bare `@prop` in `filter
+    /// (@primary = true)` resolves against. `None` on the stack means a link
+    /// with no through type, which has no link properties at all.
+    link_prop_scope: Vec<Option<(String, String)>>,
     /// Set when `compile_stmt` strips a select-level `detached`, and taken by
     /// the `compile_path_modifiers` that compiles that select's own clauses.
     pending_detached: bool,
@@ -743,6 +758,8 @@ impl<'a> Compiler<'a> {
             warnings: vec![],
             config,
             anchors: Vec::new(),
+            link_prop_scope: Vec::new(),
+            hoisted_ctes: Vec::new(),
             pending_detached: false,
             in_fn_body: false,
             fns_needing_globals: None,
@@ -1700,6 +1717,46 @@ impl<'a> Compiler<'a> {
         td.multilinks.iter().find(|m| m.name == name)
     }
 
+    /// `@prop` read off the junction row of the multi-link currently in
+    /// scope (`link_prop_scope`). Only its own modifiers put one there —
+    /// anywhere else there is no junction row to read.
+    fn compile_link_prop_ref(&mut self, prop_name: &str) -> Result<IrExpr, PyQLError> {
+        let Some(scope) = self.link_prop_scope.last().cloned() else {
+            return Err(self.type_err(&format!(
+                "'@{prop_name}' is a link property, so it is only valid in the modifiers or shape of the \
+                 link it belongs to, e.g. 'locators: {{ … }} filter @{prop_name}'"
+            )));
+        };
+        let Some((through_qname, junction_alias)) = scope else {
+            return Err(self.type_err(&format!(
+                "this link has no link properties, so '@{prop_name}' cannot be read — \
+                 declare the link with a `Through[...]` type to give it some"
+            )));
+        };
+        let through_td = self.resolve_type(&through_qname)?;
+        let Some(prop) = Self::resolve_property(through_td, prop_name) else {
+            return Err(self.field_err(prop_name, &through_qname));
+        };
+        Ok(IrExpr::ColumnRef {
+            alias: junction_alias,
+            column: prop.name.clone(),
+            pg_type: prop.pg_type.clone(),
+        })
+    }
+
+    /// Whether a link declared with `target` reaches the type named
+    /// `current_qname` — directly, or because that type implements the
+    /// interface the link points at. A link to an interface accepts every
+    /// implementor, so a backlink from one is exactly as valid as a backlink
+    /// from the interface itself.
+    fn link_target_reaches(&self, target: &str, current_qname: &str) -> bool {
+        if target == current_qname {
+            return true;
+        }
+        self.resolve_type(current_qname)
+            .is_ok_and(|td| td.interfaces.iter().any(|i| i == target))
+    }
+
     /// A computed pointer visible on `td` — its own, or one declared on an
     /// interface it implements. An interface's computeds are not copied into
     /// its implementors the way its stored pointers are, so without the
@@ -2145,6 +2202,9 @@ impl<'a> Compiler<'a> {
         // against the type that step lands on once the loop reaches it.
         let mut pending_filters: Vec<(usize, Expr)> = vec![];
         let mut extra_conditions: Vec<IrExpr> = vec![];
+        // The junction the traversal last crossed, for a bare `@prop` in the
+        // select's own modifiers.
+        let mut junction_scope: Option<(String, String)> = None;
         let mut splices = 0usize;
         let mut idx = 0;
         while idx < steps.len() {
@@ -2191,14 +2251,13 @@ impl<'a> Compiler<'a> {
                     };
                     let td = self.resolve_type(&type_name)?;
                     let current_qname = format!("{}::{}", current_td.module, current_td.name);
-                    let link_targets_current = td
-                        .links
-                        .iter()
-                        .any(|l| l.name == *link_name && l.target == current_qname)
-                        || td
-                            .multilinks
+                    let link_targets_current =
+                        td.links
                             .iter()
-                            .any(|ml| ml.name == *link_name && ml.target == current_qname);
+                            .any(|l| l.name == *link_name && self.link_target_reaches(&l.target, &current_qname))
+                            || td.multilinks.iter().any(|ml| {
+                                ml.name == *link_name && self.link_target_reaches(&ml.target, &current_qname)
+                            });
                     if !link_targets_current {
                         return Err(self.type_err(&format!(
                             "link '{}::{}' does not target '{}'; backlink is not valid here",
@@ -2215,10 +2274,10 @@ impl<'a> Compiler<'a> {
                         .find(|t| {
                             t.links
                                 .iter()
-                                .any(|l| l.name == *link_name && l.target == current_qname)
-                                || t.multilinks
-                                    .iter()
-                                    .any(|ml| ml.name == *link_name && ml.target == current_qname)
+                                .any(|l| l.name == *link_name && self.link_target_reaches(&l.target, &current_qname))
+                                || t.multilinks.iter().any(|ml| {
+                                    ml.name == *link_name && self.link_target_reaches(&ml.target, &current_qname)
+                                })
                         })
                         .ok_or_else(|| {
                             self.type_err(&format!(
@@ -2288,7 +2347,7 @@ impl<'a> Compiler<'a> {
                         shape,
                     };
                     let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers(sel, owner_td, &target_alias)?;
+                        self.compile_path_modifiers_scoped(sel, owner_td, &target_alias, junction_scope.clone())?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -2336,8 +2395,12 @@ impl<'a> Compiler<'a> {
                                 field,
                             };
                         }
-                        let (filter, order_by, offset, limit) =
-                            self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                        let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                            sel,
+                            current_td,
+                            &current_alias,
+                            junction_scope.clone(),
+                        )?;
                         return Ok(IrPathSelect {
                             root,
                             joins,
@@ -2363,7 +2426,8 @@ impl<'a> Compiler<'a> {
                     },
                     tuple_shape,
                 );
-                let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                let (filter, order_by, offset, limit) =
+                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -2393,6 +2457,7 @@ impl<'a> Compiler<'a> {
                     // extra cardinality handling is needed here.
                     let join = self.build_multilink_join(current_td, &l.name, &l.target, &l.through)?;
                     let junction_alias = self.fresh_alias();
+                    junction_scope = l.through.clone().map(|t| (t, junction_alias.clone()));
                     joins.push(IrPathJoin::Multi {
                         source_alias: current_alias.clone(),
                         junction_alias,
@@ -2415,7 +2480,7 @@ impl<'a> Compiler<'a> {
                         shape,
                     };
                     let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers(sel, target_td, &target_alias)?;
+                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone())?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -2496,6 +2561,7 @@ impl<'a> Compiler<'a> {
                         module: current_td.module.clone(),
                     }
                 };
+                junction_scope = ml.through.clone().map(|t| (t, junction_alias.clone()));
                 joins.push(IrPathJoin::Multi {
                     source_alias: current_alias.clone(),
                     junction_alias,
@@ -2511,7 +2577,7 @@ impl<'a> Compiler<'a> {
                         shape,
                     };
                     let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers(sel, target_td, &target_alias)?;
+                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone())?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -2635,7 +2701,7 @@ impl<'a> Compiler<'a> {
                             shape,
                         };
                         let (filter, order_by, offset, limit) =
-                            self.compile_path_modifiers(sel, target_td, &target_alias)?;
+                            self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone())?;
                         return Ok(IrPathSelect {
                             root,
                             joins,
@@ -2660,7 +2726,8 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 let expr = self.compile_expr(&expr_ast, current_td, &current_alias)?;
-                let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, current_td, &current_alias)?;
+                let (filter, order_by, offset, limit) =
+                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -2679,6 +2746,28 @@ impl<'a> Compiler<'a> {
 
         // Should be unreachable: steps is non-empty (we checked len > 1 before dispatch).
         Err(self.type_err("empty path traversal"))
+    }
+
+    /// `compile_path_modifiers` with the junction the traversal last crossed
+    /// in scope, so a bare `@prop` in the select's own FILTER/ORDER BY can
+    /// read it. Pushes nothing when there is no junction, leaving `@prop` to
+    /// report that it has no link to belong to.
+    fn compile_path_modifiers_scoped(
+        &mut self,
+        sel: &ast::SelectStmt,
+        td: &TypeDescriptor,
+        alias: &str,
+        junction: Option<(String, String)>,
+    ) -> Result<SelectModifiers, PyQLError> {
+        let pushed = junction.is_some();
+        if pushed {
+            self.link_prop_scope.push(junction);
+        }
+        let result = self.compile_path_modifiers(sel, td, alias);
+        if pushed {
+            self.link_prop_scope.pop();
+        }
+        result
     }
 
     fn compile_path_modifiers(
@@ -5334,6 +5423,33 @@ impl<'a> Compiler<'a> {
             }
         };
 
+        // `@prop` in this link's own modifiers reads the junction row, so
+        // the through type has to be in scope while they compile.
+        self.link_prop_scope
+            .push(ml.through.clone().map(|t| (t, "jt".to_string())));
+        let modifiers = (|c: &mut Self| -> Result<SelectModifiers, PyQLError> {
+            Ok((
+                el.filter
+                    .as_ref()
+                    .map(|f| c.compile_expr(f, target_td, &sub_alias))
+                    .transpose()?,
+                el.order_by
+                    .iter()
+                    .map(|s| c.compile_sort(s, target_td, &sub_alias))
+                    .collect::<Result<_, _>>()?,
+                el.offset
+                    .as_ref()
+                    .map(|e| c.compile_expr(e, target_td, &sub_alias))
+                    .transpose()?,
+                el.limit
+                    .as_ref()
+                    .map(|e| c.compile_expr(e, target_td, &sub_alias))
+                    .transpose()?,
+            ))
+        })(self);
+        self.link_prop_scope.pop();
+        let (filter, order_by, offset, limit) = modifiers?;
+
         let subquery = IrSelect {
             rows: vec![IrRowSource::Bound {
                 source: IrSource {
@@ -5343,26 +5459,10 @@ impl<'a> Compiler<'a> {
                 },
                 shape: sub_shape,
             }],
-            filter: el
-                .filter
-                .as_ref()
-                .map(|f| self.compile_expr(f, target_td, &sub_alias))
-                .transpose()?,
-            order_by: el
-                .order_by
-                .iter()
-                .map(|s| self.compile_sort(s, target_td, &sub_alias))
-                .collect::<Result<_, _>>()?,
-            offset: el
-                .offset
-                .as_ref()
-                .map(|e| self.compile_expr(e, target_td, &sub_alias))
-                .transpose()?,
-            limit: el
-                .limit
-                .as_ref()
-                .map(|e| self.compile_expr(e, target_td, &sub_alias))
-                .transpose()?,
+            filter,
+            order_by,
+            offset,
+            limit,
             distinct: false,
             dml_source: None,
             polymorphic: false,
@@ -5434,7 +5534,7 @@ impl<'a> Compiler<'a> {
         let join = if let Some(l) = owner_td
             .links
             .iter()
-            .find(|l| l.name == backlink_name && l.target == current_qname)
+            .find(|l| l.name == backlink_name && self.link_target_reaches(&l.target, current_qname))
         {
             if l.is_junction_backed() {
                 let (junction_table, module, owner_col, current_col, _) = self.link_junction_info(owner_td, l)?;
@@ -5452,7 +5552,7 @@ impl<'a> Compiler<'a> {
         } else if let Some(ml) = owner_td
             .multilinks
             .iter()
-            .find(|ml| ml.name == backlink_name && ml.target == current_qname)
+            .find(|ml| ml.name == backlink_name && self.link_target_reaches(&ml.target, current_qname))
             .cloned()
         {
             let (junction_table, module, _, _, _) = self.multilink_junction_info(owner_td, &ml)?;
@@ -5724,6 +5824,23 @@ impl<'a> Compiler<'a> {
         extra_fields: &[String],
         ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
+        // `(with x := … select …)` — the bindings have nowhere to live in
+        // expression position, so they're hoisted to the enclosing
+        // statement's own WITH clause and the inner statement takes over.
+        if let Stmt::With(w) = stmt {
+            for alias in &w.aliases {
+                let ir_stmt = compile_cte_binding(self, &alias.expr)?;
+                let type_name = self.register_cte(&alias.name, &ir_stmt);
+                self.hoisted_ctes.push(IrCteDef {
+                    name: alias.name.clone(),
+                    stmt: ir_stmt,
+                    type_name,
+                });
+            }
+            let inner = (*w.stmt).clone();
+            return self.compile_subquery_expr(&inner, extra_fields, ctx);
+        }
+
         let Stmt::Select(sel) = stmt else {
             return Err(self.subquery_expr_err(stmt));
         };
@@ -5764,6 +5881,22 @@ impl<'a> Compiler<'a> {
                  assign it to a computed pointer instead, or project a property \
                  off it, e.g. '(select .emails limit 1).address'",
             ));
+        }
+
+        // `(with c := … select c)` — the result is the binding itself, which
+        // is a value already, not something to traverse from.
+        if !path.partial
+            && let [ast::PathStep::Name(name)] = path.steps.as_slice()
+            && self.cte_types.get(name).is_some_and(|t| !t.contains("::"))
+        {
+            let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
+            for field in extra_fields {
+                ir = IrExpr::JsonbField {
+                    expr: Box::new(ir),
+                    field: field.clone(),
+                };
+            }
+            return Ok(ir);
         }
 
         // `(select Company filter .name = 'Acme' limit 1)` — a bare type
@@ -7148,6 +7281,16 @@ impl<'a> Compiler<'a> {
             }));
         }
 
+        // A bare `@prop` — the junction row of the multi-link whose own
+        // modifiers are being compiled. Read from the junction alias the
+        // emitter puts in scope there ("jt"), the same one a `@prop` in the
+        // nested shape reads.
+        if p.partial
+            && let [ast::PathStep::LinkProp(prop_name)] = p.steps.as_slice()
+        {
+            return self.compile_link_prop_ref(prop_name);
+        }
+
         // Type intersection in expression: [is Type].name — scalar subquery
         if p.partial && matches!(p.steps.first(), Some(ast::PathStep::TypeIntersection(_))) {
             return self.compile_type_intersection_expr(&p.steps, td, alias);
@@ -7423,7 +7566,7 @@ impl<'a> Compiler<'a> {
         let join_cond = if let Some(l) = target_td
             .links
             .iter()
-            .find(|l| l.name == backlink_name && l.target == current_qname)
+            .find(|l| l.name == backlink_name && self.link_target_reaches(&l.target, current_qname))
         {
             if l.is_junction_backed() {
                 // Same junction-table EXISTS shape the multi-link branch
@@ -7491,7 +7634,7 @@ impl<'a> Compiler<'a> {
         } else if let Some(ml) = target_td
             .multilinks
             .iter()
-            .find(|ml| ml.name == backlink_name && ml.target == current_qname)
+            .find(|ml| ml.name == backlink_name && self.link_target_reaches(&ml.target, current_qname))
             .cloned()
         {
             // Junction row connects t_alias (as the multi-link's owner/
