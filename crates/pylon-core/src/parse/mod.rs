@@ -37,6 +37,21 @@ pub fn parse_expr(input: &str) -> Result<Expr, PyQLSyntaxError> {
     parser::Parser::new(tokens).parse_expr()
 }
 
+/// Parse the body of a computed pointer, default, or any other schema-level
+/// PyQL fragment that stands alone rather than sitting inside a statement.
+///
+/// Identical to `parse_expr`, except that trailing `FILTER`/`ORDER BY`/
+/// `OFFSET`/`LIMIT` are allowed without an enclosing `select`: a fragment
+/// has no statement around it to hang them off, so
+/// `".orders order by .created_at desc limit 5"` used to be a bare syntax
+/// error ("expected an expression, found 'order'") and had to be written as
+/// `"(select .orders order by …)"`. Both spellings now parse, to the same
+/// sub-select.
+pub fn parse_pointer_expr(input: &str) -> Result<Expr, PyQLSyntaxError> {
+    let tokens = lexer::Lexer::new(input).tokenize()?;
+    parser::Parser::new(tokens).parse_pointer_expr()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

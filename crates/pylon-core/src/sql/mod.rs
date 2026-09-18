@@ -4544,6 +4544,174 @@ mod tests {
         );
     }
 
+    /// `Person` with a translation-style computed model: one computed
+    /// resolves a filtered subset of a multi-link, others read through it.
+    fn make_schema_with_computed_links() -> SchemaDescriptor {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed = vec![
+            ComputedDescriptor {
+                name: "published".into(),
+                expression: "(select .posts filter .title != '')".into(),
+                return_type: None,
+            },
+            ComputedDescriptor {
+                name: "plain".into(),
+                expression: ".posts".into(),
+                return_type: None,
+            },
+            ComputedDescriptor {
+                name: "featured".into(),
+                expression: "(select .published filter .title != 'draft')".into(),
+                return_type: None,
+            },
+            ComputedDescriptor {
+                name: "looper".into(),
+                expression: "(select .looper)".into(),
+                return_type: None,
+            },
+            ComputedDescriptor {
+                name: "capped".into(),
+                expression: "(select .posts limit 1)".into(),
+                return_type: None,
+            },
+        ];
+        schema
+    }
+
+    #[test]
+    fn test_path_traverses_through_a_computed_pointer() {
+        // `.published` is itself computed, so it has no column to join on —
+        // its own path takes the step's place and its filter rides along.
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person { t := .published.title }", &schema);
+        assert!(out.sql.contains("\"public\".\"Person.posts\""), "{}", out.sql);
+        assert!(
+            out.sql
+                .contains("(\"t1\".\"id\" = \"t0\".\"id\") AND (\"t2\".\"title\" <> '')"),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_sub_select_over_a_computed_pointer_projects_a_property() {
+        // The shape the jaldis translation model is built on:
+        // `(select .translation filter .attribute = X limit 1).value`.
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with(
+            "SELECT Person { t := (select .published filter .title = 'a' limit 1).title }",
+            &schema,
+        );
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+        // Both the computed's own filter and the use-site one apply.
+        assert!(out.sql.contains("\"t2\".\"title\" = 'a'"), "{}", out.sql);
+        assert!(out.sql.contains("\"t2\".\"title\" <> ''"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_chained_computed_pointers_each_contribute_their_filter() {
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person { t := .featured.title }", &schema);
+        assert_eq!(out.sql.matches("\"public\".\"Person.posts\"").count(), 1, "{}", out.sql);
+        assert!(out.sql.contains("\"t2\".\"title\" <> 'draft'"), "{}", out.sql);
+        assert!(out.sql.contains("\"t2\".\"title\" <> ''"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_computed_pointer_naming_a_bare_link_is_traversable() {
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person { t := .plain.title }", &schema);
+        assert!(out.sql.contains("ARRAY(SELECT \"t2\".\"title\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_cycle_of_computed_pointers_is_reported_not_hung_on() {
+        let schema = make_schema_with_computed_links();
+        let ast = parse::parse("SELECT Person { t := .looper.title }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("expands into itself"), "{err}");
+    }
+
+    #[test]
+    fn test_traversing_through_a_limited_computed_points_at_the_workaround() {
+        let schema = make_schema_with_computed_links();
+        let ast = parse::parse("SELECT Person { t := .capped.title }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("order/offset/limit of its own"), "{err}");
+    }
+
+    #[test]
+    fn test_computed_declared_on_an_interface_is_visible_from_an_implementor() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_interface_schema();
+        let account = schema.types.iter_mut().find(|t| t.name == "Account").unwrap();
+        account.computed = vec![ComputedDescriptor {
+            name: "tier".into(),
+            expression: "'gold'".into(),
+            return_type: None,
+        }];
+        let individual = schema.types.iter_mut().find(|t| t.name == "Individual").unwrap();
+        individual.computed = vec![];
+        // Reported as "has no link or property 'tier'. Did you mean 'tier'?"
+        // — the suggester searched interfaces, the resolver didn't.
+        for q in ["SELECT Individual { tier }", "SELECT Individual { t := .tier }"] {
+            let out = compile_and_emit_with(q, &schema);
+            assert!(out.sql.contains("'gold'"), "{q}: {}", out.sql);
+        }
+    }
+
+    #[test]
+    fn test_computed_may_carry_trailing_modifiers_without_a_select() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed = vec![ComputedDescriptor {
+            name: "recent".into(),
+            expression: ".posts order by .title desc limit 5".into(),
+            return_type: None,
+        }];
+        // A schema fragment has no statement around it to hang modifiers
+        // off, so this used to be "expected an expression, found 'order'".
+        let out = compile_and_emit_with("SELECT Person { recent { title } }", &schema);
+        assert!(out.sql.contains("LIMIT 5"), "{}", out.sql);
+        assert!(out.sql.contains("ORDER BY \"t1\".\"title\" DESC"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_computed_may_lead_with_a_bare_select() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed = vec![ComputedDescriptor {
+            name: "recent".into(),
+            expression: "select .posts order by .title desc limit 5".into(),
+            return_type: None,
+        }];
+        let out = compile_and_emit_with("SELECT Person { recent { title } }", &schema);
+        assert!(out.sql.contains("LIMIT 5"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_select_with_a_shape_may_project_a_property_off_it() {
+        let out = compile_and_emit("SELECT Person { t := (select .posts { title } limit 1).title }");
+        assert!(out.sql.contains("\"t2\".\"title\""), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_statement_error_names_what_it_got() {
+        let err = compile_err("SELECT Person { t := (insert Company { name := 'a' }) }");
+        assert!(err.contains("an insert cannot stand in for a value"), "{err}");
+    }
+
     #[test]
     fn test_with_bound_scalar_path_select_emits_a_real_select() {
         // The CTE body used to be just the FROM clause — `"xs" AS (
@@ -4792,12 +4960,15 @@ mod tests {
     #[test]
     fn test_dml_sub_statement_in_expression_position_still_rejected() {
         let err = compile_err("SELECT Person { x := (insert Company { name := 'c' }).name }");
-        assert!(err.contains("used as expression"), "{err}");
+        assert!(err.contains("an insert cannot stand in for a value"), "{err}");
     }
 
     #[test]
     fn test_sub_select_with_a_shape_in_expression_position_is_rejected() {
-        let err = compile_err("SELECT Person { x := (select .posts { title }).title }");
+        // Only when the shape *is* the result — projecting a property off
+        // it is fine, since the shape then says nothing the projection
+        // doesn't (see test_sub_select_with_a_shape_may_project_a_property_off_it).
+        let err = compile_err("SELECT Person { name } filter (select .posts { title }) = 1");
         assert!(err.contains("sub-select with a shape"), "{err}");
     }
 

@@ -225,6 +225,26 @@ fn try_compile_fts_with_pattern(c: &mut Compiler<'_>, w: &ast::WithStmt) -> Resu
     }
 }
 
+/// How many times a path may expand a computed pointer into its own path
+/// before we call it a cycle. Chains are normal (a computed over a computed);
+/// a chain this long is a schema that refers to itself.
+/// AND a path traversal's own FILTER together with whatever conditions the
+/// computed pointers spliced into it contributed. Every join in a path
+/// select is inner, so a spliced computed's filter means the same thing as a
+/// WHERE condition on the whole traversal.
+fn and_conditions(filter: Option<IrExpr>, extra: Vec<IrExpr>) -> Option<IrExpr> {
+    extra.into_iter().fold(filter, |acc, cond| match acc {
+        Some(existing) => Some(IrExpr::BinOp(Box::new(IrBinOp {
+            left: existing,
+            op: ast::BinOpKind::And,
+            right: cond,
+        }))),
+        None => Some(cond),
+    })
+}
+
+const MAX_COMPUTED_SPLICES: usize = 32;
+
 fn cte_stmt_type(stmt: &IrStmt) -> String {
     match stmt {
         IrStmt::Insert(ins) => ins.target.type_name.clone(),
@@ -1680,6 +1700,22 @@ impl<'a> Compiler<'a> {
         td.multilinks.iter().find(|m| m.name == name)
     }
 
+    /// A computed pointer visible on `td` — its own, or one declared on an
+    /// interface it implements. An interface's computeds are not copied into
+    /// its implementors the way its stored pointers are, so without the
+    /// second lookup `.account.tier` reported that `tier` was missing while
+    /// suggesting `tier` (the suggester already searched interfaces).
+    fn resolve_computed(&self, td: &TypeDescriptor, name: &str) -> Option<crate::schema::ComputedDescriptor> {
+        if let Some(cd) = td.computed.iter().find(|c| c.name == name) {
+            return Some(cd.clone());
+        }
+        td.interfaces
+            .iter()
+            .filter_map(|iface| self.resolve_type(iface).ok())
+            .find_map(|itd| itd.computed.iter().find(|c| c.name == name))
+            .cloned()
+    }
+
     // ── Statement dispatch ────────────────────────────────────────────────────────
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<IrStmt, PyQLError> {
@@ -2101,11 +2137,29 @@ impl<'a> Compiler<'a> {
         let mut current_td = root_td;
         let mut current_alias = root_alias;
 
-        let steps = &path.steps[1..];
+        // Owned rather than borrowed: traversing *through* a computed
+        // pointer splices that computed's own path in place of the step
+        // naming it (see the computed branch at the bottom of the loop).
+        let mut steps: Vec<PathStep> = path.steps[1..].to_vec();
+        // `(step index, filter)` a spliced computed contributed, to compile
+        // against the type that step lands on once the loop reaches it.
+        let mut pending_filters: Vec<(usize, Expr)> = vec![];
+        let mut extra_conditions: Vec<IrExpr> = vec![];
+        let mut splices = 0usize;
         let mut idx = 0;
         while idx < steps.len() {
-            let step = &steps[idx];
-            let is_last = |extra: usize| idx + extra == steps.len() - 1;
+            let owned_step = steps[idx].clone();
+            let step = &owned_step;
+            let n_steps = steps.len();
+            let is_last = |extra: usize| idx + extra == n_steps - 1;
+
+            // A spliced computed's own filter belongs to the step it landed
+            // on, which is the one just processed.
+            while let Some(pos) = pending_filters.iter().position(|(i, _)| *i + 1 == idx) {
+                let (_, f) = pending_filters.remove(pos);
+                let cond = self.compile_expr(&f, current_td, &current_alias)?;
+                extra_conditions.push(cond);
+            }
 
             // Type intersection standalone (not after backlink): narrows current_td.
             if let PathStep::TypeIntersection(type_ref) = step {
@@ -2239,7 +2293,7 @@ impl<'a> Compiler<'a> {
                         root,
                         joins,
                         result,
-                        filter,
+                        filter: and_conditions(filter, extra_conditions),
                         order_by,
                         offset,
                         limit,
@@ -2288,7 +2342,7 @@ impl<'a> Compiler<'a> {
                             root,
                             joins,
                             result: IrPathResult::Scalar(ir, None),
-                            filter,
+                            filter: and_conditions(filter, extra_conditions),
                             order_by,
                             offset,
                             limit,
@@ -2314,7 +2368,7 @@ impl<'a> Compiler<'a> {
                     root,
                     joins,
                     result,
-                    filter,
+                    filter: and_conditions(filter, extra_conditions),
                     order_by,
                     offset,
                     limit,
@@ -2366,7 +2420,7 @@ impl<'a> Compiler<'a> {
                         root,
                         joins,
                         result,
-                        filter,
+                        filter: and_conditions(filter, extra_conditions),
                         order_by,
                         offset,
                         limit,
@@ -2462,7 +2516,7 @@ impl<'a> Compiler<'a> {
                         root,
                         joins,
                         result,
-                        filter,
+                        filter: and_conditions(filter, extra_conditions),
                         order_by,
                         offset,
                         limit,
@@ -2476,25 +2530,69 @@ impl<'a> Compiler<'a> {
                 continue;
             }
 
-            // A computed pointer declared on the type reached so far — the
-            // expression is inlined against that step's own alias, exactly
-            // as it would be in a shape over the same type. Only valid as
-            // the last step: a computed has no stored column for a further
-            // join to hang off.
-            if let Some(cd) = current_td.computed.iter().find(|c| c.name == step_name).cloned() {
+            // A computed pointer declared on the type reached so far (or on
+            // an interface it implements).
+            if let Some(cd) = self.resolve_computed(current_td, step_name) {
+                let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+
+                // Traversing *through* it: a computed has no stored column
+                // for a join to hang off, but if it just names a link — with
+                // or without a filter — its own path can take the step's
+                // place, and its filter rides along on the spliced segment.
+                // Chaining computeds this way is routine, so the splice
+                // re-enters the loop and expands again if it lands on
+                // another one.
+                if !is_last(0)
+                    && let Some((p, _, modifiers)) = Self::pointer_subject(&expr_ast)
+                    && p.partial
+                    && !p.steps.is_empty()
+                {
+                    if let Some(m) = modifiers
+                        && (m.limit.is_some() || m.offset.is_some() || !m.order_by.is_empty())
+                    {
+                        return Err(self.type_err(&format!(
+                            "computed pointer '{step_name}' takes an order/offset/limit of its own, so a path \
+                             cannot continue through it — select it and project from that instead, e.g. \
+                             '(select .{step_name} …).field'"
+                        )));
+                    }
+                    splices += 1;
+                    if splices > MAX_COMPUTED_SPLICES {
+                        return Err(self.type_err(&format!(
+                            "computed pointer '{step_name}' expands into itself — \
+                             a path cannot be resolved through a cycle of computed pointers"
+                        )));
+                    }
+                    let filter = modifiers.and_then(|m| m.filter.clone());
+                    let spliced = p.steps.clone();
+                    let landing = idx + spliced.len() - 1;
+                    steps.splice(idx..idx + 1, spliced);
+                    // Every filter already queued for a later step shifts
+                    // along with it.
+                    let shift = landing - idx;
+                    for (i, _) in pending_filters.iter_mut() {
+                        if *i > idx {
+                            *i += shift;
+                        }
+                    }
+                    if let Some(f) = filter {
+                        pending_filters.push((landing, f));
+                    }
+                    continue;
+                }
+
                 if !is_last(0) {
                     return Err(self.type_err(&format!(
                         "'{step_name}' is a computed pointer — it has no stored column to traverse further through"
                     )));
                 }
-                let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
                 let expr = self.compile_expr(&expr_ast, current_td, &current_alias)?;
                 let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, current_td, &current_alias)?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
                     result: IrPathResult::Scalar(expr, None),
-                    filter,
+                    filter: and_conditions(filter, extra_conditions),
                     order_by,
                     offset,
                     limit,
@@ -4693,7 +4791,7 @@ impl<'a> Compiler<'a> {
                     pg_type: "uuid".to_string(),
                 },
             }));
-            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+            let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
             let inner_ir = self.compile_expr(&expr_ast, concrete_td, &sub_alias)?;
             let subquery = IrSelect::schema_bound(
                 IrSource {
@@ -5069,7 +5167,7 @@ impl<'a> Compiler<'a> {
         }
 
         // Schema-defined computed pointer
-        if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name).cloned() {
+        if let Some(cd) = self.resolve_computed(td, pointer_name) {
             return self.compile_declared_computed(
                 &cd,
                 td,
@@ -5360,7 +5458,7 @@ impl<'a> Compiler<'a> {
         marker_offset: Option<usize>,
         nested: &[ShapeElement],
     ) -> Result<IrShapePointer, PyQLError> {
-        let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+        let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
         if let Some(ptr) =
             self.try_compile_pointer_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)?
         {
@@ -5529,7 +5627,7 @@ impl<'a> Compiler<'a> {
         ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
         let Stmt::Select(sel) = stmt else {
-            return Err(self.subquery_expr_err());
+            return Err(self.subquery_expr_err(stmt));
         };
         let has_modifiers =
             sel.filter.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() || sel.limit.is_some();
@@ -5547,7 +5645,7 @@ impl<'a> Compiler<'a> {
             // expression itself — but only when there are no modifiers to
             // honour, since there is no row set for them to apply to.
             if has_modifiers {
-                return Err(self.subquery_expr_err());
+                return Err(self.subquery_expr_err(stmt));
             }
             let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
             for field in extra_fields {
@@ -5558,10 +5656,15 @@ impl<'a> Compiler<'a> {
             }
             return Ok(ir);
         };
-        if !shape_els.is_empty() {
+        // A shape only matters when the sub-select's own value is the
+        // result. `(select .emails { address } limit 1).address` projects a
+        // column straight back out of it, so the shape says nothing the
+        // projection doesn't — the same reading PyQL gives it.
+        if !shape_els.is_empty() && extra_fields.is_empty() {
             return Err(self.type_err(
                 "a sub-select with a shape is not valid in expression context — \
-                 assign it to a computed pointer instead",
+                 assign it to a computed pointer instead, or project a property \
+                 off it, e.g. '(select .emails limit 1).address'",
             ));
         }
 
@@ -5747,10 +5850,28 @@ impl<'a> Compiler<'a> {
     /// scalar subquery (which Postgres would reject at run time the moment a
     /// second row showed up).
     fn path_crosses_multi(&self, td: &TypeDescriptor, steps: &[ast::PathStep]) -> bool {
+        self.walk_path_types(td, steps, MAX_COMPUTED_SPLICES).0
+    }
+
+    /// Walk `steps` from `td` without compiling anything, reporting whether
+    /// any step is multi-valued and what type the walk ends on. A computed
+    /// pointer is expanded into the path it stands for — the same splice
+    /// `compile_path_select` performs — so `.published.title` is recognized
+    /// as multi-valued when `published` resolves to a multi-link.
+    ///
+    /// Gives up (`None` target) rather than guessing on anything it can't
+    /// resolve; the real compile reports the error.
+    fn walk_path_types(
+        &self,
+        td: &'a TypeDescriptor,
+        steps: &[ast::PathStep],
+        depth: usize,
+    ) -> (bool, Option<&'a TypeDescriptor>) {
         let mut current = td;
+        let mut multi = false;
         for step in steps {
             match step {
-                ast::PathStep::Backlink(_) => return true,
+                ast::PathStep::Backlink(_) => return (true, None),
                 ast::PathStep::TypeIntersection(tr) => {
                     let name = match &tr.module {
                         Some(m) => format!("{}::{}", m, tr.name),
@@ -5758,25 +5879,47 @@ impl<'a> Compiler<'a> {
                     };
                     match self.resolve_type(&name) {
                         Ok(t) => current = t,
-                        Err(_) => return false,
+                        Err(_) => return (multi, None),
                     }
                 }
                 ast::PathStep::Name(n) => {
-                    if Self::resolve_multilink(current, n).is_some() {
-                        return true;
-                    }
-                    match Self::resolve_link(current, n).map(|l| l.target.clone()) {
-                        Some(target) => match self.resolve_type(&target) {
+                    if let Some(ml) = Self::resolve_multilink(current, n) {
+                        multi = true;
+                        match self.resolve_type(&ml.target) {
                             Ok(t) => current = t,
-                            Err(_) => return false,
-                        },
-                        None => return false,
+                            Err(_) => return (multi, None),
+                        }
+                        continue;
                     }
+                    if let Some(target) = Self::resolve_link(current, n).map(|l| l.target.clone()) {
+                        match self.resolve_type(&target) {
+                            Ok(t) => current = t,
+                            Err(_) => return (multi, None),
+                        }
+                        continue;
+                    }
+                    // A computed pointer stands for its own path.
+                    if depth > 0
+                        && let Some(cd) = self.resolve_computed(current, n)
+                        && let Ok(expr) = crate::parse::parse_pointer_expr(&cd.expression)
+                        && let Some((p, _, _)) = Self::pointer_subject(&expr)
+                        && p.partial
+                    {
+                        let (m, t) = self.walk_path_types(current, &p.steps, depth - 1);
+                        multi = multi || m;
+                        match t {
+                            Some(t) => current = t,
+                            None => return (multi, None),
+                        }
+                        continue;
+                    }
+                    // A property (or something unresolvable): the walk ends.
+                    return (multi, None);
                 }
-                _ => return false,
+                _ => return (multi, None),
             }
         }
-        false
+        (multi, Some(current))
     }
 
     /// Compile a relative path that the step-by-step expression rules can't
@@ -5859,12 +6002,23 @@ impl<'a> Compiler<'a> {
         });
     }
 
-    fn subquery_expr_err(&self) -> PyQLError {
-        self.type_err(
-            "sub-statement (SELECT/INSERT/UPDATE/DELETE) used as expression is \
-             only valid as the subject of a SELECT result, or as a SELECT over a \
-             path — e.g. '(select .emails filter .primary limit 1).address'",
-        )
+    /// Names the kind of sub-statement that can't stand in for a value, so
+    /// the message points at the actual blocker instead of listing every
+    /// statement keyword.
+    fn subquery_expr_err(&self, stmt: &Stmt) -> PyQLError {
+        let what = match stmt {
+            Stmt::Insert(_) => "an insert",
+            Stmt::Update(_) => "an update",
+            Stmt::Delete(_) => "a delete",
+            Stmt::With(_) => "a `with` block",
+            Stmt::For(_) => "a `for` loop",
+            Stmt::Group(_) => "a `group`",
+            _ => "this sub-statement",
+        };
+        self.type_err(&format!(
+            "{what} cannot stand in for a value — a sub-statement is only valid in expression \
+             position as a select over a path, e.g. '(select .emails filter .primary limit 1).address'"
+        ))
     }
 
     // ── Expression compilation ────────────────────────────────────────────────────
@@ -6943,8 +7097,8 @@ impl<'a> Compiler<'a> {
         }
 
         // Schema-defined computed pointer: inline the expression in place.
-        if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name) {
-            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+        if let Some(cd) = self.resolve_computed(td, pointer_name) {
+            let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
             return self.compile_expr(&expr_ast, td, alias);
         }
 
@@ -7061,7 +7215,13 @@ impl<'a> Compiler<'a> {
             return self.compile_partial_path_as_subquery(p, td, alias);
         }
 
-        Err(self.field_err(link_name, &format!("{}::{}", td.module, td.name)))
+        // Not a stored pointer at all — a computed one, most likely, which
+        // the general builder can traverse through by splicing in the path
+        // it stands for. It raises the same "no link or property" error this
+        // used to when the name really is unknown (which is what made a
+        // computed head read as `has no link or property 'x'. Did you mean
+        // 'x'?` — the suggester could see it, the resolver couldn't).
+        self.compile_partial_path_as_subquery(p, td, alias)
     }
 
     // ── Backlink compilation ─────────────────────────────────────────────────────
