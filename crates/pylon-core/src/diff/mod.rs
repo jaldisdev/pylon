@@ -1543,7 +1543,20 @@ fn qn(schema: &str, name: &str) -> String {
 
 // ── Topological sort (referenced types before referencing) ────────────────────
 
-fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
+/// Referenced types before referencing ones, best-effort.
+///
+/// **A cycle here is not an error.** `emit_create_table` emits plain `uuid`
+/// link columns with no `REFERENCES` clause — every FK is added afterwards, in
+/// Phase 6, once all the tables exist — so no link actually constrains
+/// creation order, and a cycle of them constrains nothing either. This used to
+/// reject any back-edge, which failed on perfectly ordinary shapes: a
+/// self-referencing optional link (`WorkflowAction.parent -> WorkflowAction`,
+/// `QuestionnaireChapter.parent -> QuestionnaireChapter`) is a tree, not an
+/// impossibility. The cycle that *is* impossible — one made of *required*
+/// links, which no INSERT could ever satisfy — is rejected by the schema
+/// walker at `pylon.finalize()` time, with a message naming the cycle and how
+/// to break it. Back-edges are simply skipped, leaving the ordering a hint.
+fn topo_sort_types(types: &[TypeDescriptor], polymorphic: &HashSet<String>) -> Vec<usize> {
     let idx_of: HashMap<String, usize> = types
         .iter()
         .enumerate()
@@ -1558,42 +1571,33 @@ fn topo_sort_types(types: &[TypeDescriptor]) -> Result<Vec<usize>, String> {
         i: usize,
         types: &[TypeDescriptor],
         idx_of: &HashMap<String, usize>,
+        polymorphic: &HashSet<String>,
         colour: &mut Vec<u8>,
         order: &mut Vec<usize>,
-    ) -> Result<(), String> {
-        match colour[i] {
-            2 => return Ok(()), // already fully processed
-            1 => {
-                return Err(format!(
-                    // back-edge → cycle
-                    "circular type dependency involving '{}::{}'",
-                    types[i].module, types[i].name
-                ));
-            }
-            _ => {}
+    ) {
+        if colour[i] != 0 {
+            return; // already done, or a back-edge we are deliberately ignoring
         }
         colour[i] = 1;
-        // Dependencies: FK links only. Multilinks — and junction-backed
-        // single links, which are stored the same way — don't create FK
-        // columns on the source table (the junction table does), so
-        // neither is an ordering constraint for the source type itself.
+        // Multilinks — and junction-backed single links, stored the same way —
+        // keep their columns on the junction table, and a link to an interface
+        // gets no FK at all, so none of those order anything either.
         for l in &types[i].links {
-            if l.is_junction_backed() {
+            if l.is_junction_backed() || polymorphic.contains(&l.target) {
                 continue;
             }
             if let Some(&dep) = idx_of.get(&l.target) {
-                visit(dep, types, idx_of, colour, order)?;
+                visit(dep, types, idx_of, polymorphic, colour, order);
             }
         }
         colour[i] = 2;
         order.push(i);
-        Ok(())
     }
 
     for i in 0..types.len() {
-        visit(i, types, &idx_of, &mut colour, &mut order)?;
+        visit(i, types, &idx_of, polymorphic, &mut colour, &mut order);
     }
-    Ok(order)
+    order
 }
 
 /// A property's actual DDL column type: its own registered-scalar DOMAIN
@@ -1891,7 +1895,7 @@ fn diff_inner(
     }
 
     // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
-    let sort_order = topo_sort_types(&target.types)?;
+    let sort_order = topo_sort_types(&target.types, &polymorphic);
 
     // Track which tables are created in this diff (needed for CONCURRENTLY decision).
     let mut new_tables: HashSet<(String, String)> = HashSet::new();
