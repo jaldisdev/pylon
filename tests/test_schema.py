@@ -665,6 +665,34 @@ class TestClassBodyConstraints:
     def test_description_does_not_leak_into_constraints(self):
         assert not any(isinstance(c, Description) for c in Product.__pylon_config__.constraints)
 
+    def test_pointer_level_expression_does_not_leak_onto_the_next_type(self):
+        """An `Expression` inside `Property[...]` belongs to its own type.
+
+        `Expression.__init__` registers itself so a bare one in a class body
+        is picked up as type-level. Under `from __future__ import
+        annotations` the annotation isn't evaluated when the class body runs
+        but when something later resolves it — so a pointer-level one used to
+        be drained by whatever *other* class was under construction at that
+        moment, landing a check on a type with no such property.
+        """
+
+        @pylon.type
+        class Rate:
+            currency: Property[str, Expression("__subject__.currency != ''")]
+
+        # Force the lazy annotation to resolve, then build another type.
+        assert 'currency' in Rate.__pylon_config__.pointers
+
+        @pylon.type
+        class Unrelated:
+            label: str
+
+        assert Unrelated.__pylon_config__.constraints == []
+        assert not any(isinstance(c, Expression) for c in Rate.__pylon_config__.constraints)
+        assert any(
+            isinstance(c, Expression) for c in Rate.__pylon_config__.pointers['currency'].constraints
+        )
+
 
 # ---------------------------------------------------------------------------
 # Class-body indexes

@@ -432,7 +432,11 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 } else {
                     format!("{} AS {}", source_ref(source), qi(&source.alias))
                 };
-                let mut sql = format!("    SELECT * FROM {}", from);
+                let mut sql = format!(
+                    "    SELECT {}* FROM {}",
+                    if inner.distinct { "DISTINCT " } else { "" },
+                    from
+                );
                 append_filter(&mut sql, &inner.filter);
                 append_order_by(&mut sql, &inner.order_by);
                 append_offset_limit(&mut sql, &inner.offset, &inner.limit);
@@ -460,10 +464,34 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             unreachable!("cannot appear as a CTE source")
         }
         IrStmt::PathSelect(ps) => {
-            // Path select as CTE: emit a flat SELECT that exposes an `id` column.
-            let mut sql = emit_path_joins(&ps.root, &ps.joins);
+            // A path traversal as a CTE body. What it projects depends on
+            // where the path ends: a scalar becomes a `result` column (which
+            // is what `IrExpr::CteRef { scalar: true }` reads back), an
+            // object exposes its raw columns so the outer query can both
+            // traverse it (`@cte:` source) and read its `id`.
+            let distinct = if ps.distinct { "DISTINCT " } else { "" };
+            let projection = match &ps.result {
+                // Same two-column convention a free scalar binding uses:
+                // `result` is the ROW() composite top-level decoding wants,
+                // `v` the bare value `IrExpr::CteRef { scalar: true }` reads.
+                IrPathResult::Scalar(e, _) => format!("{}{} AS v", distinct, emit_expr(e)),
+                IrPathResult::Object { alias, .. } => format!("{}{}.*", distinct, qi(alias)),
+            };
+            let mut sql = format!(
+                "SELECT {}\n    FROM {}",
+                projection,
+                emit_path_joins(&ps.root, &ps.joins)
+            );
             append_filter(&mut sql, &ps.filter);
-            sql
+            append_order_by(&mut sql, &ps.order_by);
+            append_offset_limit(&mut sql, &ps.offset, &ps.limit);
+            match &ps.result {
+                IrPathResult::Scalar(e, _) => {
+                    let row_value = if enum_type_of_expr(e).is_some() { "v::text" } else { "v" };
+                    format!("    SELECT ROW({row_value}) AS result, v FROM ({sql}) AS _scalar")
+                }
+                IrPathResult::Object { .. } => format!("    {sql}"),
+            }
         }
     }
 }
@@ -1754,11 +1782,42 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────
 
+/// The loop's iterator as a relation with a single column named `v`, in both
+/// the forms the two body kinds need: one for a `FROM` clause, one for a CTE.
+fn emit_for_iterator(it: &IrForIterator, iter_alias: &str) -> (String, String) {
+    match it {
+        IrForIterator::Values { exprs, pg_type } => {
+            let rows: Vec<String> = exprs
+                .iter()
+                .map(|e| format!("({}::{})", emit_expr(e), pg_type))
+                .collect();
+            (
+                format!("(VALUES {}) AS {}(\"v\")", rows.join(", "), qi(iter_alias)),
+                format!("{}(\"v\") AS (VALUES {})", qi(iter_alias), rows.join(", ")),
+            )
+        }
+        IrForIterator::Query { stmt, scalar } => {
+            let inner = emit_dml_as_cte_source(stmt);
+            // A scalar-yielding select already exposes `v` (the same
+            // convention a scalar `with` binding uses); an object-yielding
+            // one exposes its raw columns, so the loop variable binds `id`.
+            let body = if *scalar {
+                inner
+            } else {
+                format!("    SELECT \"id\" AS v FROM (\n{}\n    ) AS _src", inner)
+            };
+            (
+                format!("(\n{}\n) AS {}", body, qi(iter_alias)),
+                format!("{} AS (\n{}\n)", qi(iter_alias), body),
+            )
+        }
+    }
+}
+
 fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
-    let IrForIterator::Values { exprs, pg_type } = &f.iterator;
     let iter_alias = format!("_for_{}", f.var_name);
 
-    if exprs.is_empty() {
+    if matches!(&f.iterator, IrForIterator::Values { exprs, .. } if exprs.is_empty()) {
         let empty = SqlOutput {
             sql: "SELECT NULL AS result WHERE FALSE".to_string(),
             shape: ShapeDescriptor {
@@ -1772,13 +1831,10 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
         return empty;
     }
 
-    let rows: Vec<String> = exprs
-        .iter()
-        .map(|e| format!("({}::{})", emit_expr(e), pg_type))
-        .collect();
+    let (values_from, iter_cte) = emit_for_iterator(&f.iterator, &iter_alias);
 
     match f.body.as_ref() {
-        IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &rows, user_ctes),
+        IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &iter_cte, user_ctes),
         body => {
             let body_out = match body {
                 IrStmt::Select(sel) => emit_select_stmt(sel, user_ctes),
@@ -1787,7 +1843,6 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
                 // body kind with a PyQL error before an `IrFor` is built.
                 other => unreachable!("for-loop body should have been rejected at compile time: {other:?}"),
             };
-            let values_from = format!("(VALUES {}) AS {}(\"v\")", rows.join(", "), qi(&iter_alias));
             let indent_body = body_out.sql.replace('\n', "\n    ");
             let cte_prefix = if !user_ctes.is_empty() {
                 emit_cte_prefix(user_ctes)
@@ -1807,7 +1862,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
     }
 }
 
-fn emit_for_insert(ins: &IrInsert, iter_alias: &str, rows: &[String], user_ctes: &[IrCteDef]) -> SqlOutput {
+fn emit_for_insert(ins: &IrInsert, iter_alias: &str, iter_cte: &str, user_ctes: &[IrCteDef]) -> SqlOutput {
     let rewrite_cols: std::collections::HashSet<&str> = ins.rewrites.iter().map(|r| r.column.as_str()).collect();
 
     let cols: Vec<String> = ins
@@ -1826,7 +1881,7 @@ fn emit_for_insert(ins: &IrInsert, iter_alias: &str, rows: &[String], user_ctes:
         .collect();
 
     let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
-    cte_parts.push(format!("{}(\"v\") AS (VALUES {})", qi(iter_alias), rows.join(", ")));
+    cte_parts.push(iter_cte.to_string());
 
     let mut sql = format!(
         "WITH {}\nINSERT INTO {} ({})\nSELECT {} FROM {}",
@@ -4434,6 +4489,72 @@ mod tests {
             panic!()
         };
         assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "authors"));
+    }
+
+    #[test]
+    fn test_with_bound_scalar_path_select_emits_a_real_select() {
+        // The CTE body used to be just the FROM clause — `"xs" AS (
+        // "public"."Person" AS "t0" )` — which is not SQL at all.
+        let out = compile_and_emit("WITH xs := (select Person.name) SELECT Person { name }");
+        assert!(
+            out.sql
+                .contains("SELECT ROW(v) AS result, v FROM (SELECT \"t0\".\"name\" AS v"),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_with_bound_scalar_path_select_is_typed_as_its_result() {
+        // Binding `Person.name` binds text, not `default::Person`, so a
+        // reference to it reads the CTE's value column rather than an `id`.
+        let out = compile_and_emit("WITH xs := (select Person.name) SELECT Person { name } FILTER .name IN xs");
+        assert!(out.sql.contains("ANY((SELECT \"v\" FROM \"xs\"))"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_distinct_survives_a_with_binding() {
+        let out = compile_and_emit("WITH xs := (select distinct Person.name) SELECT Person { name }");
+        assert!(out.sql.contains("SELECT DISTINCT \"t0\".\"name\" AS v"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_over_a_derived_set_iterates_every_row() {
+        // A non-literal iterator used to be wrapped in a one-row VALUES, so
+        // the body ran once against a scalar subquery instead of per row.
+        let out = compile_and_emit("FOR x IN (select Person.name) UNION (SELECT Person { name } FILTER .name = x)");
+        assert!(!out.sql.contains("VALUES"), "{}", out.sql);
+        assert!(out.sql.contains(") AS \"_for_x\""), "{}", out.sql);
+        assert!(out.sql.contains("CROSS JOIN LATERAL"), "{}", out.sql);
+        assert!(out.sql.contains("\"t1\".\"name\" = \"_for_x\".\"v\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_insert_over_a_derived_set_uses_it_as_the_cte() {
+        let out = compile_and_emit("FOR x IN (select Person.name) UNION (INSERT Company { name := x })");
+        assert!(out.sql.starts_with("WITH \"_for_x\" AS ("), "{}", out.sql);
+        assert!(
+            out.sql.contains("SELECT \"_for_x\".\"v\" FROM \"_for_x\""),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_for_over_objects_binds_their_id() {
+        let out = compile_and_emit("FOR p IN (select Person) UNION (INSERT Company { name := <str>p })");
+        assert!(out.sql.contains("SELECT \"id\" AS v FROM ("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_over_a_non_select_statement_is_rejected() {
+        let ast = parse::parse("FOR x IN (INSERT Company { name := 'a' }) UNION (SELECT Person { name })").unwrap();
+        let schema = make_schema();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("only a select can be iterated"), "{err}");
     }
 
     #[test]

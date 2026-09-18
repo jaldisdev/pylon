@@ -23,7 +23,6 @@ import typing
 from typing import Any
 
 from . import _collector
-from ._constraints import Description
 
 # ── Deletion policy types ──────────────────────────────────────────────────────
 
@@ -187,16 +186,26 @@ class Through:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-def _consume_descriptions(params: list[Any]) -> list[Any]:
-    """Unregister any Description instances from the collector.
+def _consume_registered(params: list[Any]) -> list[Any]:
+    """Pull every self-registering constraint in *params* off the pending list.
 
-    Description.__init__ always registers; when a Description appears inside
-    Property[T, ...] or Link[T, ...] it belongs to the pointer, not the type,
-    so we pull it back out of the pending list.
+    `Description`, `Exclusive(...)` and `Expression(...)` all register
+    themselves on construction so a bare one in a class body is picked up as
+    type-level. Inside `Property[T, ...]`/`Link[T, ...]` they belong to the
+    pointer instead, so they have to come back off the list.
+
+    Leaving one on it was actively wrong under `from __future__ import
+    annotations`: the annotation isn't evaluated when the class body runs but
+    when something later resolves it, so the stray constraint was drained by
+    whichever *other* class happened to be under construction at that moment
+    — landing, say, an `ExchangeRate.currency` check on an unrelated type
+    that has no `currency` property at all.
+
+    `unregister` is a no-op for anything not on the list, so this is safe to
+    call over every parameter.
     """
     for p in params:
-        if isinstance(p, Description):
-            _collector.unregister(p)
+        _collector.unregister(p)
     return params
 
 
@@ -220,7 +229,7 @@ class Property:
         if not isinstance(params, tuple):
             params = (params,)
         scalar_type = params[0]
-        constraints = _consume_descriptions(list(params[1:]))
+        constraints = _consume_registered(list(params[1:]))
         return PropertyAnnotation(scalar_type=scalar_type, constraints=constraints)
 
 
@@ -252,7 +261,7 @@ class Link:
                 on_delete.append(p)
             else:
                 remaining.append(p)
-        constraints = _consume_descriptions(remaining)
+        constraints = _consume_registered(remaining)
         return LinkAnnotation(
             target_type=target_type, constraints=constraints, on_delete=on_delete, through_type=through_type
         )
