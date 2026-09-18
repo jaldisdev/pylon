@@ -732,6 +732,8 @@ def _field_checks_and_exclusive(
     col: str,
 ) -> tuple[list[str], bool]:
     """Return (check_sql_list, is_exclusive) for the pointer's constraints."""
+    import enum as _enum
+
     from ._constraints import (
         Exclusive,
         MaxExValue,
@@ -772,7 +774,11 @@ def _field_checks_and_exclusive(
             escaped = c.pattern.replace("'", "''")
             checks.append(f"{col} ~ '{escaped}'")
         elif isinstance(c, OneOf):
-            literals = ', '.join("'" + str(v).replace("'", "''") + "'" for v in c.values)
+            # `str()` on an enum member gives "Type.Member", not the value the
+            # column actually holds, so the comparison never matched (and the
+            # literal was rejected outright for an enum-typed column).
+            values = [v.value if isinstance(v, _enum.Enum) else v for v in c.values]
+            literals = ', '.join("'" + str(v).replace("'", "''") + "'" for v in values)
             checks.append(f'{col} IN ({literals})')
 
     return checks, is_exclusive
