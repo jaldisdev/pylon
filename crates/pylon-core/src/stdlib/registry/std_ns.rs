@@ -359,6 +359,16 @@ END"#,
             Int64,
             E("strpos($1, $2) - 1"),
         ),
+        // Same over an array. `array_position` is 1-based like `strpos`, but
+        // yields NULL rather than 0 when the element is absent, so the miss
+        // has to be folded to -1 explicitly.
+        f(
+            "std",
+            "find",
+            vec![p("haystack", arr(Any)), p("needle", Any)],
+            Int64,
+            E("coalesce(array_position($1, $2) - 1, -1)"),
+        ),
         // ── std:: numeric ────────────────────────────────────────────────────
         f("std", "abs", vec![p("n", Int16)], Int16, B("abs")),
         f("std", "abs", vec![p("n", Int32)], Int32, B("abs")),
