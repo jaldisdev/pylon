@@ -240,7 +240,14 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
             }
             _ => String::new(),
         },
-        IrStmt::PathSelect(ps) => ps.root.type_name.clone(),
+        // What a path select *yields*, not what it starts from: `with xs :=
+        // (select Person.name)` binds text, not `default::Person`, and the
+        // difference decides whether a reference to it reads the CTE's
+        // `result` column or its `id` (see `resolve_name_ref`).
+        IrStmt::PathSelect(ps) => match &ps.result {
+            IrPathResult::Scalar(expr, _) => infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default(),
+            IrPathResult::Object { type_name, .. } => type_name.clone(),
+        },
         IrStmt::For(f) => cte_stmt_type(&f.body),
         IrStmt::Group(g) => g.source.type_name.clone(),
         IrStmt::FunctionSelect(fs) => fs.type_name.clone(),
@@ -3381,20 +3388,58 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_for(&mut self, f: &ast::ForStmt) -> Result<IrFor, PyQLError> {
-        // Compile the iterator expression to determine scalar type and VALUES list.
-        let (exprs, pg_type) = match &f.iterator {
+        // Compile the iterator to determine what one loop variable binds to.
+        let (iterator, pg_type) = match &f.iterator {
             Expr::Set(elems) => {
                 let compiled: Result<Vec<_>, _> = elems.iter().map(|e| self.compile_free_expr(e)).collect();
-                let compiled = compiled?;
-                let raw = compiled.first().and_then(|e| infer_ir_type(e)).unwrap_or("text");
+                let exprs = compiled?;
+                let raw = exprs.first().and_then(|e| infer_ir_type(e)).unwrap_or("text");
                 let pg_type = literal_sentinel_to_pg(raw).to_string();
-                (compiled, pg_type)
+                (
+                    IrForIterator::Values {
+                        exprs,
+                        pg_type: pg_type.clone(),
+                    },
+                    pg_type,
+                )
+            }
+            // A derived set — every row of it, not the single value a scalar
+            // subquery in a one-row `VALUES` would collapse it to.
+            Expr::SubQuery(stmt) => {
+                let inner = self.compile_stmt(stmt)?;
+                if !matches!(inner, IrStmt::Select(_) | IrStmt::PathSelect(_)) {
+                    return Err(self.type_err(
+                        "for-loop iterator: only a select can be iterated over — \
+                         bind the statement in a `with` first",
+                    ));
+                }
+                let yielded = cte_stmt_type(&inner);
+                let scalar = !yielded.contains("::");
+                let pg_type = if scalar {
+                    let raw = if yielded.is_empty() { "text" } else { yielded.as_str() };
+                    literal_sentinel_to_pg(raw).to_string()
+                } else {
+                    "uuid".to_string()
+                };
+                (
+                    IrForIterator::Query {
+                        stmt: Box::new(inner),
+                        scalar,
+                    },
+                    pg_type,
+                )
             }
             other => {
                 let e = self.compile_free_expr(other)?;
                 let raw = infer_ir_type(&e).unwrap_or("text");
                 let pg_type = literal_sentinel_to_pg(raw).to_string();
-                (vec![e], pg_type)
+                (
+                    IrForIterator::Values {
+                        exprs: vec![e],
+                        pg_type: pg_type.clone(),
+                    },
+                    pg_type,
+                )
             }
         };
 
@@ -3431,7 +3476,7 @@ impl<'a> Compiler<'a> {
 
         Ok(IrFor {
             var_name: f.var.clone(),
-            iterator: IrForIterator::Values { exprs, pg_type },
+            iterator,
             body: Box::new(body),
         })
     }
@@ -5496,6 +5541,39 @@ impl<'a> Compiler<'a> {
                 "a sub-select with a shape is not valid in expression context — \
                  assign it to a computed pointer instead",
             ));
+        }
+
+        // `(select Company filter .name = 'Acme' limit 1)` — a bare type
+        // select has nothing to traverse; in expression position it stands
+        // for the object's primary key, which is what a link's value is.
+        if !path.partial
+            && extra_fields.is_empty()
+            && let [ast::PathStep::Name(type_name)] = path.steps.as_slice()
+            && let Ok(root_td) = self.resolve_type(type_name)
+        {
+            let alias = self.fresh_alias();
+            let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, root_td, &alias)?;
+            let source = IrSource {
+                type_name: format!("{}::{}", root_td.module, root_td.name),
+                table: root_td.table.clone(),
+                alias,
+            };
+            // Never `pk_returning` here: an empty shape is how the emitter
+            // spells an EXISTS inner, so a type with no declared pk would
+            // quietly become `SELECT 1` instead of a key.
+            let pk = root_td.properties.iter().find(|p| p.is_pk);
+            let shape = vec![IrShapePointer::Scalar(IrScalarPointer {
+                marker_offset: None,
+                alias: "id".to_string(),
+                column: pk.map(|p| p.name.clone()).unwrap_or_else(|| "id".to_string()),
+                pg_type: pk.map(|p| p.pg_type.clone()).unwrap_or_else(|| "uuid".to_string()),
+                tuple_shape: None,
+            })];
+            let mut select = IrSelect::schema_bound(source, shape, filter);
+            select.order_by = order_by;
+            select.offset = offset;
+            select.limit = limit;
+            return Ok(IrExpr::Subquery(Box::new(select)));
         }
 
         let mut steps = path.steps.clone();

@@ -98,6 +98,16 @@ pub struct IrFor {
 pub enum IrForIterator {
     /// Set literal of scalar values → SQL VALUES clause.
     Values { exprs: Vec<IrExpr>, pg_type: String },
+    /// A derived set — `for x in (select Item.label)`. Emitted as a
+    /// one-column relation (column `v`, the same name the `VALUES` form
+    /// uses) that the loop body cross-joins against, so the body runs once
+    /// per row rather than once for the whole set.
+    Query {
+        stmt: Box<IrStmt>,
+        /// True when the statement yields scalars. When false it yields
+        /// objects and the loop variable binds their `id`.
+        scalar: bool,
+    },
 }
 
 // ── GROUP ─────────────────────────────────────────────────────────────────────────

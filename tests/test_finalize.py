@@ -722,6 +722,26 @@ class TestWalkIntegration:
         schema = walk(types, enums, scalars, [])
         assert schema.type_count == 2
 
+    def test_pointer_level_expression_lands_on_its_own_type(self):
+        import json
+
+        from pylon.schema import Expression, Property
+        from pylon.schema._walker import walk
+
+        @pylon.type(module='fx', name='Rate')
+        class Rate:
+            currency: Property[str, Expression("__subject__.currency != ''")]
+
+        @pylon.type(module='fx', name='Unrelated')
+        class Unrelated:
+            label: str
+
+        types, enums, scalars = snapshot()
+        schema = json.loads(walk(types, enums, scalars, []).to_json())
+        by_name = {t['name']: t for t in schema['types']}
+        assert by_name['Rate']['constraints'] == [{'Expression': {'expr': "__subject__.currency != ''"}}]
+        assert by_name['Unrelated']['constraints'] == []
+
     def test_object_valued_computed_declares_no_scalar_return_type(self):
         """A `Computed[MultiLink[X], ...]` has no scalar type to check against.
 

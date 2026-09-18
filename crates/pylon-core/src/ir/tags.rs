@@ -143,9 +143,13 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             }
         }
         IrStmt::For(f) => {
-            let IrForIterator::Values { exprs, .. } = &f.iterator;
-            for e in exprs {
-                collect_expr(e, tags);
+            match &f.iterator {
+                IrForIterator::Values { exprs, .. } => {
+                    for e in exprs {
+                        collect_expr(e, tags);
+                    }
+                }
+                IrForIterator::Query { stmt, .. } => collect_stmt(stmt, tags),
             }
             collect_stmt(&f.body, tags);
         }

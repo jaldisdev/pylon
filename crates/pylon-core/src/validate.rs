@@ -50,6 +50,47 @@ use crate::ir::{
 };
 use crate::schema::SchemaDescriptor;
 
+/// What in `expr` disqualifies it from being a column DEFAULT, if anything.
+///
+/// PostgreSQL evaluates a column default with no row and no query in scope,
+/// so it rejects a sub-select outright ("cannot use subquery in DEFAULT
+/// expression") and has nothing to resolve another column's name against.
+/// Catching it here turns DDL the database refuses to run into an error that
+/// names the pointer that caused it.
+fn default_blocker(expr: &crate::ir::IrExpr) -> Option<&'static str> {
+    use crate::ir::IrExpr as E;
+    match expr {
+        E::Subquery(_)
+        | E::PathSubquery(_)
+        | E::FnSubquery(_)
+        | E::ArrayFromSelect(_)
+        | E::AggOverQuery { .. }
+        | E::AggOverSet { .. }
+        | E::CteRef { .. }
+        | E::CteFieldRef { .. }
+        | E::GlobalRef { .. } => Some("a sub-select"),
+        E::ColumnRef { .. } => Some("a reference to another pointer"),
+        E::Param { .. } | E::GlobalParam { .. } => Some("a query parameter"),
+        E::ForVar { .. } => Some("a for-loop variable"),
+        E::FnParam { .. } => Some("a function parameter"),
+        E::BinOp(b) => default_blocker(&b.left).or_else(|| default_blocker(&b.right)),
+        E::UnaryOp(u) => default_blocker(&u.operand),
+        E::TypeCast(c) => default_blocker(&c.expr),
+        E::IfElse(i) => default_blocker(&i.condition)
+            .or_else(|| default_blocker(&i.if_))
+            .or_else(|| default_blocker(&i.else_)),
+        E::FunctionCall(f) => f.args.iter().find_map(default_blocker),
+        E::Array(items) | E::Tuple(items) => items.iter().find_map(default_blocker),
+        E::NamedTuple { fields, .. } => fields.iter().find_map(|(_, e)| default_blocker(e)),
+        E::Subscript { expr, index, .. } => default_blocker(expr).or_else(|| default_blocker(index)),
+        E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } => default_blocker(expr),
+        E::Slice { expr, lower, upper, .. } => default_blocker(expr)
+            .or_else(|| lower.as_deref().and_then(default_blocker))
+            .or_else(|| upper.as_deref().and_then(default_blocker)),
+        E::Literal(_) | E::Null | E::EnumLiteral { .. } | E::RawSql(_) => None,
+    }
+}
+
 fn mismatch(context: String, message: String) -> PyQLError {
     PyQLError::Fragment(PyQLFragmentError {
         message,
@@ -231,6 +272,17 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
                 continue;
             };
+            if let Some(blocker) = default_blocker(&ir) {
+                let context = format!("{}.{} (default)", type_name, prop.name);
+                errors.push(mismatch(
+                    context.clone(),
+                    format!(
+                        "default for '{context}' is {blocker}, which a column DEFAULT cannot contain — \
+                         PostgreSQL evaluates it with no row and no query in scope."
+                    ),
+                ));
+                continue;
+            }
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, &prop.pg_type) {
                 let context = format!("{}.{} (default)", type_name, prop.name);
@@ -249,6 +301,18 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
                 continue;
             };
+            if let Some(blocker) = default_blocker(&ir) {
+                let context = format!("{}.{} (default)", type_name, link.name);
+                errors.push(mismatch(
+                    context.clone(),
+                    format!(
+                        "default for '{context}' is {blocker}, which a column DEFAULT cannot contain — \
+                         PostgreSQL evaluates it with no row and no query in scope. Assign the link \
+                         explicitly on insert instead."
+                    ),
+                ));
+                continue;
+            }
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, "uuid") {
                 let context = format!("{}.{} (default)", type_name, link.name);
@@ -362,7 +426,7 @@ mod tests {
     use super::*;
     use crate::schema::{
         AliasDescriptor, ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor,
-        PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor,
+        LinkDescriptor, PropertyDescriptor, RewriteEntry, TriggerDescriptor, TypeDescriptor,
     };
 
     // ── Partition validation ──────────────────────────────────────────
@@ -679,6 +743,49 @@ mod tests {
         assert_eq!(errs.len(), 1);
         let (_, msg, _) = errs[0].class_name_message_position();
         assert!(msg.contains("Person.score"), "{msg}");
+    }
+
+    #[test]
+    fn link_default_selecting_an_object_is_rejected() {
+        // `DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run; it used to
+        // be emitted anyway (or silently dropped when it failed to compile).
+        let mut td = person_type(vec![], vec![base_property("name", "text")]);
+        td.links = vec![LinkDescriptor {
+            name: "manager".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            through: None,
+            description: None,
+            default_pyql: Some("(select Person filter .name = 'boss' limit 1)".into()),
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        }];
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("Person.manager"), "{msg}");
+        assert!(msg.contains("sub-select"), "{msg}");
+    }
+
+    #[test]
+    fn link_default_that_is_a_constant_passes() {
+        let mut td = person_type(vec![], vec![base_property("name", "text")]);
+        td.links = vec![LinkDescriptor {
+            name: "manager".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            through: None,
+            description: None,
+            default_pyql: Some("<uuid>'00000000-0000-0000-0000-000000000000'".into()),
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        }];
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
     }
 
     #[test]

@@ -1077,9 +1077,17 @@ def _build_type_descriptor(
     all_indexes = inherited_indexes + list(cfg.indexes)
     all_triggers = inherited_triggers + list(cfg.triggers)
 
+    # An `Expression` written inside `Property[T, ...]`/`Link[T, ...]` is a
+    # CHECK on this type's table just like one written in the class body —
+    # what it being on the pointer settles is only *which* type owns it.
+    pointer_expressions = [
+        c for meta in effective.values() for c in getattr(meta, 'constraints', ()) if isinstance(c, Expression)
+    ]
     exclusive_constraints = [_make_exclusive_constraint(c, _core) for c in all_constraints if isinstance(c, Exclusive)]
     expression_constraints = [
-        _make_expression_constraint(c, _core) for c in all_constraints if isinstance(c, Expression)
+        _make_expression_constraint(c, _core)
+        for c in all_constraints + pointer_expressions
+        if isinstance(c, Expression)
     ]
     index_descs = [_make_index_desc(idx, _core) for idx in all_indexes]
     vector_index_descs = [
