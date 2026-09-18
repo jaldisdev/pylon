@@ -27,6 +27,7 @@ mod compiler;
 pub mod tags;
 
 pub use compiler::compile;
+pub use compiler::compile_computed_in_type;
 pub use compiler::compile_constraint_expr;
 pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
@@ -772,6 +773,12 @@ pub enum IrExpr {
         upper: Option<Box<IrExpr>>,
         is_array: bool,
     },
+    /// An object-returning user function projected down to one of its
+    /// columns: `(SELECT alias."col" FROM module.fn(args) AS alias …)`.
+    /// `shape` always holds exactly one pointer — the projected column —
+    /// which is what makes an otherwise object-valued call usable inside a
+    /// larger expression.
+    FnSubquery(Box<IrFunctionSelect>),
     /// Detached path as a scalar subquery: `(SELECT scalar FROM root [JOINs])`.
     /// Used when `detached TypeName.prop` appears in a schema-bound expression context.
     PathSubquery(Box<IrPathSelect>),

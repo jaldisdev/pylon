@@ -2786,13 +2786,58 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
         where_parts.push(emit_expr(filter));
     }
 
-    let sql = format!(
-        "(SELECT COALESCE(\n        array_agg(ROW(\n            {}\n        )::record{}),\n        ARRAY[]::record[]\n    )\n    {}\n    WHERE {})",
-        row,
-        order_sql,
-        from_sql,
-        where_parts.join(" AND "),
-    );
+    let sql = if sub.limit.is_some() || sub.offset.is_some() {
+        // OFFSET/LIMIT cut the *rows* that go into the array, so they can't
+        // sit next to the aggregate — the aggregate collapses them to one
+        // row first. Select the row's parts (and any sort keys) in a derived
+        // table that carries the modifiers, then aggregate over that.
+        let mut cols: Vec<String> = row_parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| format!("{} AS \"c{}\"", part, i))
+            .collect();
+        let agg_row: Vec<String> = (0..row_parts.len()).map(|i| format!("\"__lim\".\"c{}\"", i)).collect();
+        let mut agg_order: Vec<String> = vec![];
+        for (i, s) in sub.order_by.iter().enumerate() {
+            cols.push(format!("{} AS \"s{}\"", emit_expr(&s.expr), i));
+            agg_order.push(emit_sort_clause(&IrSort {
+                expr: IrExpr::ColumnRef {
+                    alias: "__lim".to_string(),
+                    column: format!("s{}", i),
+                    pg_type: String::new(),
+                },
+                direction: s.direction.clone(),
+                nulls: s.nulls.clone(),
+            }));
+        }
+        let mut inner = format!(
+            "SELECT {}\n    {}\n    WHERE {}",
+            cols.join(",\n        "),
+            from_sql,
+            where_parts.join(" AND "),
+        );
+        append_order_by(&mut inner, &sub.order_by);
+        append_offset_limit(&mut inner, &sub.offset, &sub.limit);
+        let agg_order_sql = if agg_order.is_empty() {
+            String::new()
+        } else {
+            format!(" ORDER BY {}", agg_order.join(", "))
+        };
+        format!(
+            "(SELECT COALESCE(\n        array_agg(ROW(\n            {}\n        )::record{}),\n        ARRAY[]::record[]\n    )\n    FROM ({}) AS \"__lim\")",
+            agg_row.join(",\n            "),
+            agg_order_sql,
+            inner,
+        )
+    } else {
+        format!(
+            "(SELECT COALESCE(\n        array_agg(ROW(\n            {}\n        )::record{}),\n        ARRAY[]::record[]\n    )\n    {}\n    WHERE {})",
+            row,
+            order_sql,
+            from_sql,
+            where_parts.join(" AND "),
+        )
+    };
 
     let node = ShapeNode::Array {
         name: f.alias.clone(),
@@ -3124,14 +3169,43 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::FnParam { name, .. } => qi(name),
 
+        IrExpr::FnSubquery(fs) => {
+            let scalar = match fs.shape.as_slice() {
+                [IrShapePointer::Computed(c)] => emit_expr(&c.expr),
+                _ => unreachable!("a function scalar subquery always projects exactly one computed pointer"),
+            };
+            let args_sql = fs.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+            let mut sql = format!(
+                "(SELECT {}{}\nFROM {}.{}({}) AS {}",
+                if fs.distinct { "DISTINCT " } else { "" },
+                scalar,
+                pg_schema(&fs.fn_module),
+                qi(&fs.fn_name),
+                args_sql,
+                qi(&fs.alias),
+            );
+            append_filter(&mut sql, &fs.filter);
+            append_order_by(&mut sql, &fs.order_by);
+            append_offset_limit(&mut sql, &fs.offset, &fs.limit);
+            sql.push(')');
+            sql
+        }
+
         IrExpr::PathSubquery(ps) => {
             let scalar = match &ps.result {
                 IrPathResult::Scalar(e, _) => emit_expr(e),
                 IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
             };
             let from_sql = emit_path_joins(&ps.root, &ps.joins);
-            let mut sql = format!("(SELECT {}\nFROM {}", scalar, from_sql);
+            let mut sql = format!(
+                "(SELECT {}{}\nFROM {}",
+                if ps.distinct { "DISTINCT " } else { "" },
+                scalar,
+                from_sql
+            );
             append_filter(&mut sql, &ps.filter);
+            append_order_by(&mut sql, &ps.order_by);
+            append_offset_limit(&mut sql, &ps.offset, &ps.limit);
             sql.push(')');
             sql
         }
@@ -4235,6 +4309,167 @@ mod tests {
         assert!(out.sql.contains("\"Person.posts\""));
     }
 
+    fn compile_err(query: &str) -> String {
+        let schema = make_schema();
+        let ast = parse::parse(query).expect("parse failed");
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    #[test]
+    fn test_multi_link_limit_cuts_rows_before_aggregating() {
+        let out = compile_and_emit("SELECT Person { posts: { title } filter .title = 'x' limit 1 }");
+        // The LIMIT has to sit on the row source, not next to array_agg —
+        // the aggregate has already collapsed the rows by then.
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+        assert!(out.sql.contains("AS \"__lim\""), "{}", out.sql);
+        let agg = out.sql.find("array_agg").unwrap();
+        let limit = out.sql.find("LIMIT 1").unwrap();
+        assert!(agg < limit, "{}", out.sql);
+        assert!(out.sql.contains("\"t1\".\"title\"::text AS \"c1\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_multi_link_order_by_with_limit_orders_the_aggregate_too() {
+        let out = compile_and_emit("SELECT Person { posts: { title } order by .title desc offset 1 limit 2 }");
+        // The sort key rides along as its own column so the array keeps the
+        // derived table's order rather than relying on aggregation order.
+        assert!(out.sql.contains("\"t1\".\"title\" AS \"s0\""), "{}", out.sql);
+        assert!(
+            out.sql.contains("ORDER BY \"__lim\".\"s0\" DESC NULLS LAST"),
+            "{}",
+            out.sql
+        );
+        assert!(out.sql.contains("OFFSET 1"), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 2"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_multi_link_without_limit_keeps_the_flat_aggregate() {
+        let out = compile_and_emit("SELECT Person { posts: { title } filter .title = 'x' }");
+        assert!(!out.sql.contains("__lim"), "{}", out.sql);
+        assert!(out.sql.contains("array_agg(ROW("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_select_as_computed_pointer_is_a_link_pointer() {
+        let out = compile_and_emit("SELECT Person { recent := (select .posts filter .title = 'x' limit 1) { title } }");
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        // Named after the pointer, not after the link it selects from.
+        let ShapeNode::Array { name, element, .. } = &pointers[1] else {
+            panic!("{:?}", pointers[1])
+        };
+        assert_eq!(name, "recent");
+        let ShapeNode::Object {
+            pointers: elem_pointers,
+            ..
+        } = element.as_ref()
+        else {
+            panic!()
+        };
+        assert!(matches!(&elem_pointers[1], ShapeNode::Scalar { name, .. } if name == "title"));
+        assert!(out.sql.contains("\"jt\".source = \"t0\".id"), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_select_shape_inside_the_parens_is_equivalent() {
+        let outer = compile_and_emit("SELECT Person { recent := (select .posts limit 1) { title } }");
+        let inner = compile_and_emit("SELECT Person { recent := (select .posts { title } limit 1) }");
+        assert_eq!(outer.sql, inner.sql);
+    }
+
+    #[test]
+    fn test_sub_select_field_access_is_a_correlated_scalar_subquery() {
+        let out = compile_and_emit("SELECT Person { t := (select .posts filter .title = 'x' limit 1).title }");
+        // Rooted at the enclosing type and correlated back to its row, so
+        // the subquery only ever sees this Person's posts.
+        assert!(out.sql.contains("(\"t1\".\"id\" = \"t0\".\"id\")"), "{}", out.sql);
+        assert!(out.sql.contains("\"t2\".\"title\""), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        assert!(matches!(&pointers[1], ShapeNode::Scalar { name, .. } if name == "t"));
+    }
+
+    #[test]
+    fn test_sub_select_field_access_over_a_single_link() {
+        let out = compile_and_emit("SELECT Person { c := (select .company).name }");
+        assert!(out.sql.contains("\"t1\".\"company_id\" = \"t2\".\"id\""), "{}", out.sql);
+        assert!(out.sql.contains("(\"t1\".\"id\" = \"t0\".\"id\")"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_select_field_access_in_a_filter() {
+        let out = compile_and_emit("SELECT Person { name } filter (select .posts limit 1).title = 'x'");
+        assert!(out.sql.contains("WHERE ((SELECT \"t2\".\"title\""), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1) = 'x')"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_select_over_an_absolute_path_is_not_correlated() {
+        let out = compile_and_emit("SELECT Person { n := (select Company.name limit 1) }");
+        assert!(out.sql.contains("FROM \"public\".\"Company\""), "{}", out.sql);
+        assert!(!out.sql.contains("= \"t0\".\"id\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_backlink_sub_select_carries_its_modifiers() {
+        let out = compile_and_emit("SELECT Post { authors := (select .<posts[is Person] { name } limit 2) }");
+        assert!(out.sql.contains("LIMIT 2"), "{}", out.sql);
+        assert!(out.sql.contains("AS \"__lim\""), "{}", out.sql);
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "authors"));
+    }
+
+    #[test]
+    fn test_schema_declared_computed_sub_select_is_a_link_pointer() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        schema.types[0].computed = vec![
+            ComputedDescriptor {
+                name: "recent".into(),
+                expression: "(select .posts order by .title desc limit 1)".into(),
+                return_type: None,
+            },
+            ComputedDescriptor {
+                name: "recent_title".into(),
+                expression: "(select .posts order by .title desc limit 1).title".into(),
+                return_type: Some("text".into()),
+            },
+        ];
+        let out = compile_and_emit_with("SELECT Person { recent { title }, recent_title }", &schema);
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!()
+        };
+        // A declared computed gets the same treatment as one written inline:
+        // object-valued when it selects a link, scalar when it projects one.
+        assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "recent"));
+        assert!(matches!(&pointers[2], ShapeNode::Scalar { name, .. } if name == "recent_title"));
+        assert!(out.sql.contains("\"jt\".source = \"t0\".id"), "{}", out.sql);
+        assert_eq!(out.sql.matches("LIMIT 1").count(), 2, "{}", out.sql);
+        crate::validate::validate_schema_types(&schema).expect("schema should validate");
+    }
+
+    #[test]
+    fn test_dml_sub_statement_in_expression_position_still_rejected() {
+        let err = compile_err("SELECT Person { x := (insert Company { name := 'c' }).name }");
+        assert!(err.contains("used as expression"), "{err}");
+    }
+
+    #[test]
+    fn test_sub_select_with_a_shape_in_expression_position_is_rejected() {
+        let err = compile_err("SELECT Person { x := (select .posts { title }).title }");
+        assert!(err.contains("sub-select with a shape"), "{err}");
+    }
+
     fn make_schema_with_through() -> SchemaDescriptor {
         let id_prop = || PropertyDescriptor {
             name: "id".into(),
@@ -4376,6 +4611,24 @@ mod tests {
     /// type (Org) rather than a self-link, for the same reason
     /// `test_select_through_multi_link` avoids Person-to-Person — see the
     /// comment on `make_schema_with_through` above.
+    #[test]
+    fn test_limited_multi_link_keeps_a_nested_multi_link_in_scope() {
+        // The nested pointer's own correlated subquery moves inside the
+        // derived table the LIMIT sits on, where its alias is still bound.
+        let schema = make_schema_with_through();
+        let ast = crate::parse::parse("SELECT Person { friends: { name, friends { name } } limit 1 }").unwrap();
+        let ir = crate::ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert_eq!(out.sql.matches("array_agg(ROW(").count(), 2, "{}", out.sql);
+        let derived = out.sql.find("AS \"__lim\"").unwrap();
+        let nested = out.sql.rfind("array_agg(ROW(").unwrap();
+        assert!(
+            nested < derived,
+            "nested aggregate must sit inside the derived table:\n{}",
+            out.sql
+        );
+    }
+
     fn make_schema_with_junction_backed_link() -> SchemaDescriptor {
         let id_prop = || PropertyDescriptor {
             name: "id".into(),
@@ -6781,6 +7034,48 @@ mod tests {
         let out = compile_and_emit_with("SELECT adults() { name }", &schema);
         assert!(out.sql.contains("\"public\".\"adults\"()"), "got:\n{}", out.sql);
         assert!(out.sql.contains("\"name\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_object_fn_projected_to_a_property_inside_an_expression() {
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with("SELECT Person { n := adults().name }", &schema);
+        assert!(out.sql.contains("FROM \"public\".\"adults\"() AS"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\".\"name\"\n"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_object_fn_sub_select_carries_its_modifiers() {
+        let schema = make_schema_with_fns();
+        let out = compile_and_emit_with(
+            "SELECT Person { n := (select adults() filter .age > 21 limit 1).name }",
+            &schema,
+        );
+        assert!(out.sql.contains("FROM \"public\".\"adults\"() AS"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"age\" > 21"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_object_fn_without_a_property_still_explains_the_restriction() {
+        let schema = make_schema_with_fns();
+        let ast = parse::parse("SELECT Person { n := adults() + 1 }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("returns objects"), "{err}");
+    }
+
+    #[test]
+    fn test_object_fn_projected_to_an_unknown_property_is_rejected() {
+        let schema = make_schema_with_fns();
+        let ast = parse::parse("SELECT Person { n := adults().nope }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[test]

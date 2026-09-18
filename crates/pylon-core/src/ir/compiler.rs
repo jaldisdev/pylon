@@ -499,6 +499,28 @@ pub fn compile_expr_in_type(
     Ok((ir, c.params))
 }
 
+/// Compile a schema-declared computed pointer the same way a shape that
+/// included it would, for validation.
+///
+/// Returns the scalar expression when the computed is scalar-valued, and
+/// `None` when it compiles to an object (link) pointer — `(select .emails
+/// filter .primary limit 1)` and friends, which have no scalar type for a
+/// declared return type to be checked against.
+pub fn compile_computed_in_type(
+    cd: &crate::schema::ComputedDescriptor,
+    type_name: &str,
+    schema: &SchemaDescriptor,
+) -> Result<Option<IrExpr>, PyQLError> {
+    let mut c = Compiler::new(schema);
+    let td = c.resolve_type(type_name)?;
+    let module = td.module.clone();
+    let alias = c.fresh_alias();
+    match c.compile_declared_computed(cd, td, &alias, &module, None)? {
+        IrShapePointer::Computed(p) => Ok(Some(p.expr)),
+        _ => Ok(None),
+    }
+}
+
 /// Like `compile_expr_in_type` but uses an empty table alias, so that column
 /// references emit as bare column names (`"col"` rather than `"a1"."col"`).
 /// Used for fill expressions in migration UPDATE SET clauses.
@@ -4348,13 +4370,7 @@ impl<'a> Compiler<'a> {
             .collect();
 
         for cd in &td.computed.clone() {
-            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
-            let ir = self.compile_expr(&expr_ast, td, alias)?;
-            pointers.push(IrShapePointer::Computed(IrComputedPointer {
-                marker_offset: None,
-                alias: cd.name.clone(),
-                expr: ir,
-            }));
+            pointers.push(self.compile_declared_computed(cd, td, alias, module, None)?);
         }
 
         if matches!(splat, ast::Splat::Deep) {
@@ -4841,8 +4857,21 @@ impl<'a> Compiler<'a> {
                 // used as a computed pointer.
                 if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
                     let current_qname = format!("{}::{}", td.module, td.name);
-                    return self.compile_backlink_pointer(pointer_name, p, &current_qname, &[], el.marker_offset);
+                    return self.compile_backlink_pointer(pointer_name, p, &current_qname, &[], el.marker_offset, None);
                 }
+            }
+
+            // `pointer := (select .link … )` — a sub-select over one of this
+            // type's own link pointers, which is the only way to attach
+            // FILTER/ORDER BY/OFFSET/LIMIT to a *named* computed link (the
+            // `:=` grammar has no trailing-modifier form of its own). Builds
+            // the same correlated subquery the bare `pointer: { … } filter …`
+            // inclusion does; anything else falls through to be compiled as
+            // an ordinary expression below.
+            if let Some(ptr) =
+                self.try_compile_subquery_pointer(pointer_name, compexpr, td, alias, module, el.marker_offset)?
+            {
+                return Ok(ptr);
             }
             // `alias := .<backlink[is Type] { shape }` — the parser's `:=`
             // grammar always parses the RHS as a single expression
@@ -4859,7 +4888,14 @@ impl<'a> Compiler<'a> {
                 && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_)))
             {
                 let current_qname = format!("{}::{}", td.module, td.name);
-                return self.compile_backlink_pointer(pointer_name, p, &current_qname, &sh.elements, el.marker_offset);
+                return self.compile_backlink_pointer(
+                    pointer_name,
+                    p,
+                    &current_qname,
+                    &sh.elements,
+                    el.marker_offset,
+                    None,
+                );
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
             // Cross-scope TypeIs: promote to set-valued shape pointer.
@@ -4965,14 +5001,8 @@ impl<'a> Compiler<'a> {
         }
 
         // Schema-defined computed pointer
-        if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name) {
-            let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
-            let ir = self.compile_expr(&expr_ast, td, alias)?;
-            return Ok(IrShapePointer::Computed(IrComputedPointer {
-                marker_offset: el.marker_offset,
-                alias: pointer_name.to_string(),
-                expr: ir,
-            }));
+        if let Some(cd) = td.computed.iter().find(|c| c.name == pointer_name).cloned() {
+            return self.compile_declared_computed(&cd, td, alias, module, el.marker_offset);
         }
 
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
@@ -5120,6 +5150,7 @@ impl<'a> Compiler<'a> {
         current_qname: &str,
         nested_elements: &[ShapeElement],
         marker_offset: Option<usize>,
+        modifiers: Option<&ast::SelectStmt>,
     ) -> Result<IrShapePointer, PyQLError> {
         use ast::PathStep;
 
@@ -5198,13 +5229,18 @@ impl<'a> Compiler<'a> {
         let sub_alias = self.fresh_alias();
         let sub_shape = self.compile_shape(nested_elements, owner_td, &sub_alias, &owner_td.module.clone())?;
 
-        // No filter/order_by/offset/limit here: the `pointer := expr`
-        // grammar (`parse_shape_element`'s `:=` branch) never parses
-        // trailing FILTER/ORDER BY/OFFSET/LIMIT after the RHS expression —
-        // those per-link modifiers only exist on the separate no-`:=`
-        // "bare inclusion with nested shape" parse path that
-        // `compile_multilink_pointer`'s other call site reads `el.filter`
-        // etc. from.
+        // The `pointer := expr` grammar (`parse_shape_element`'s `:=`
+        // branch) never parses trailing FILTER/ORDER BY/OFFSET/LIMIT after
+        // the RHS expression — those per-link modifiers only exist on the
+        // separate no-`:=` "bare inclusion with nested shape" parse path
+        // that `compile_multilink_pointer`'s other call site reads
+        // `el.filter` etc. from. Writing the RHS as a sub-select
+        // (`pointer := (select .<link[is T] { … } filter … limit 1)`) is the
+        // way to get them here, and `modifiers` carries that inner select.
+        let (filter, order_by, offset, limit) = match modifiers {
+            Some(sel) => self.compile_path_modifiers(sel, owner_td, &sub_alias)?,
+            None => (None, vec![], None, None),
+        };
         let subquery = IrSelect {
             rows: vec![IrRowSource::Bound {
                 source: IrSource {
@@ -5214,10 +5250,10 @@ impl<'a> Compiler<'a> {
                 },
                 shape: sub_shape,
             }],
-            filter: None,
-            order_by: vec![],
-            offset: None,
-            limit: None,
+            filter,
+            order_by,
+            offset,
+            limit,
             distinct: false,
             dml_source: None,
             polymorphic: false,
@@ -5233,6 +5269,341 @@ impl<'a> Compiler<'a> {
             link_properties: vec![],
             marker_offset,
         }))
+    }
+
+    /// Compile a pointer the *schema* declares as computed (as opposed to one
+    /// written inline in the query). A declared computed whose expression is
+    /// a sub-select over a link — `(select .emails filter .primary limit 1)`
+    /// — is an object pointer, exactly as if it had been written inline, so
+    /// it takes the same route; everything else is a scalar expression.
+    fn compile_declared_computed(
+        &mut self,
+        cd: &crate::schema::ComputedDescriptor,
+        td: &TypeDescriptor,
+        alias: &str,
+        module: &str,
+        marker_offset: Option<usize>,
+    ) -> Result<IrShapePointer, PyQLError> {
+        let expr_ast = crate::parse::parse_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+        if let Some(ptr) = self.try_compile_subquery_pointer(&cd.name, &expr_ast, td, alias, module, marker_offset)? {
+            return Ok(ptr);
+        }
+        let ir = self.compile_expr(&expr_ast, td, alias)?;
+        Ok(IrShapePointer::Computed(IrComputedPointer {
+            marker_offset,
+            alias: cd.name.clone(),
+            expr: ir,
+        }))
+    }
+
+    /// Split a sub-select's result into the path it traverses and the nested
+    /// shape attached to it: `select .posts { title }` → `.posts` + `{ title }`,
+    /// `select .posts` → `.posts` + no shape.
+    fn split_path_result(result: &Expr) -> Option<(&ast::Path, &[ShapeElement])> {
+        match result {
+            Expr::Path(p) => Some((p, &[])),
+            Expr::Shape(sh) => match &sh.expr {
+                Some(Expr::Path(p)) => Some((p, sh.elements.as_slice())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `pointer := (select .multilink { … } filter … limit N)` and
+    /// `pointer := (select .<backlink[is T] … )` — a sub-select in
+    /// computed-pointer position whose subject is one of the current type's
+    /// own link pointers.
+    ///
+    /// The inner select's modifiers are exactly the per-link modifiers the
+    /// bare `pointer: { … } filter … limit N` inclusion already carries, so
+    /// this re-uses the same pointer builders with a synthesized shape
+    /// element instead of compiling the sub-select as an expression — which
+    /// keeps the result a real object pointer (array of hydrated objects)
+    /// rather than the bare id a scalar subquery would yield.
+    ///
+    /// `Ok(None)` means "not that shape": the caller compiles `compexpr` as
+    /// an ordinary expression, which is where `(select …).field` — a scalar
+    /// — is handled.
+    fn try_compile_subquery_pointer(
+        &mut self,
+        pointer_name: &str,
+        compexpr: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+        module: &str,
+        marker_offset: Option<usize>,
+    ) -> Result<Option<IrShapePointer>, PyQLError> {
+        // The nested shape can sit either inside the parens (`(select .posts
+        // { title })`) or after them (`(select .posts) { title }`) — the
+        // parser folds a trailing `{ }` into an `Expr::Shape` wrapping the
+        // whole sub-select.
+        let (stmt, outer_els) = match compexpr {
+            Expr::SubQuery(stmt) => (stmt.as_ref(), [].as_slice()),
+            Expr::Shape(sh) => match &sh.expr {
+                Some(Expr::SubQuery(stmt)) => (stmt.as_ref(), sh.elements.as_slice()),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Stmt::Select(sel) = stmt else {
+            return Ok(None);
+        };
+        let Some((path, inner_els)) = Self::split_path_result(&sel.result) else {
+            return Ok(None);
+        };
+        if !path.partial {
+            return Ok(None);
+        }
+        let nested = if outer_els.is_empty() { inner_els } else { outer_els };
+
+        // Only a link pointer of the current type becomes an object pointer;
+        // a property (`x := (select .name)`) is a scalar and belongs on the
+        // expression path.
+        let ml_name = match path.steps.as_slice() {
+            [ast::PathStep::Name(n)] if Self::resolve_multilink(td, n).is_some() => n.clone(),
+            [ast::PathStep::Backlink(_), ..] => {
+                let current_qname = format!("{}::{}", td.module, td.name);
+                let path = path.clone();
+                let nested = nested.to_vec();
+                return self
+                    .compile_backlink_pointer(pointer_name, &path, &current_qname, &nested, marker_offset, Some(sel))
+                    .map(Some);
+            }
+            _ => return Ok(None),
+        };
+
+        let synthetic = ShapeElement {
+            path: path.clone(),
+            splat: None,
+            nested: Some(nested.to_vec()),
+            compexpr: None,
+            op: ast::ShapeOp::Assign,
+            filter: sel.filter.clone(),
+            order_by: sel.order_by.clone(),
+            offset: sel.offset.clone(),
+            limit: sel.limit.clone(),
+            marker_offset,
+        };
+        self.compile_multilink_pointer(pointer_name, &ml_name, td, alias, module, &synthetic)
+            .map(Some)
+    }
+
+    /// A sub-statement used as an expression: `(select .emails filter
+    /// .primary limit 1).email`, `(select .posts order by .created desc
+    /// limit 1).title`.
+    ///
+    /// Compiles the inner select as a flat path traversal
+    /// (`compile_path_select` — the same builder a top-level `select
+    /// Person.company.name` uses, so forward links, multi-links, backlinks,
+    /// junction-backed links and type intersections all come along) and
+    /// returns it as one correlated scalar subquery.
+    ///
+    /// A *partial* subject path (`.emails`) is relative to the enclosing
+    /// object, so it is rooted at the enclosing type and correlated back to
+    /// the enclosing row by primary key; an absolute one (`Person.name`) is
+    /// independent and needs no correlation.
+    ///
+    /// `extra_fields` are the `.field` steps of an enclosing field-access
+    /// chain. They are spliced onto the subject path rather than applied to
+    /// its result, so the subquery projects the scalar column itself instead
+    /// of an opaque object id.
+    fn compile_subquery_expr(
+        &mut self,
+        stmt: &Stmt,
+        extra_fields: &[String],
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<IrExpr, PyQLError> {
+        let Stmt::Select(sel) = stmt else {
+            return Err(self.subquery_expr_err());
+        };
+        let has_modifiers =
+            sel.filter.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() || sel.limit.is_some();
+
+        let Some((path, shape_els)) = Self::split_path_result(&sel.result) else {
+            // `(select account::owner(.id) filter … limit 1).name` — the
+            // function call is the row source the modifiers apply to.
+            if let Expr::FunctionCall(fc) = &sel.result {
+                let fc = fc.clone();
+                if let Some(ir) = self.try_compile_fn_scalar_subquery(&fc, extra_fields, Some(sel), ctx)? {
+                    return Ok(ir);
+                }
+            }
+            // `(select <expression>)` with nothing to traverse is just the
+            // expression itself — but only when there are no modifiers to
+            // honour, since there is no row set for them to apply to.
+            if has_modifiers {
+                return Err(self.subquery_expr_err());
+            }
+            let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
+            for field in extra_fields {
+                ir = IrExpr::JsonbField {
+                    expr: Box::new(ir),
+                    field: field.clone(),
+                };
+            }
+            return Ok(ir);
+        };
+        if !shape_els.is_empty() {
+            return Err(self.type_err(
+                "a sub-select with a shape is not valid in expression context — \
+                 assign it to a computed pointer instead",
+            ));
+        }
+
+        let mut steps = path.steps.clone();
+        let correlate = if path.partial {
+            let Some((td, alias)) = ctx else {
+                return Err(self.type_err(
+                    "a relative path in a sub-select needs an enclosing object — \
+                     write the type name explicitly, e.g. '(select Person.name)'",
+                ));
+            };
+            steps.insert(0, ast::PathStep::Name(format!("{}::{}", td.module, td.name)));
+            Some(alias.to_string())
+        } else {
+            None
+        };
+        steps.extend(extra_fields.iter().map(|f| ast::PathStep::Name(f.clone())));
+        let full_path = ast::Path { steps, partial: false };
+
+        let mut ps = self.compile_path_select(sel, &full_path, &[], false)?;
+        if let Some(outer_alias) = correlate {
+            let correlation = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: ps.root.alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ColumnRef {
+                    alias: outer_alias,
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+            }));
+            ps.filter = Some(match ps.filter.take() {
+                Some(existing) => IrExpr::BinOp(Box::new(IrBinOp {
+                    left: correlation,
+                    op: ast::BinOpKind::And,
+                    right: existing,
+                })),
+                None => correlation,
+            });
+        }
+        Ok(IrExpr::PathSubquery(Box::new(ps)))
+    }
+
+    /// `account::owner(.id).name` and `(select account::owner(.id) filter …
+    /// limit 1).name` — an object-returning user function used inside a
+    /// larger expression, projected down to one of its return type's
+    /// columns.
+    ///
+    /// The call itself stays object-valued (there is no way to inline a
+    /// function that returns a row set), so it becomes the FROM clause of a
+    /// scalar subquery and `field` becomes what that subquery selects. Only
+    /// a property of the return type can be projected — reaching further
+    /// (`fn(x).company.name`) would need joins the function row source has
+    /// no way to express.
+    ///
+    /// `Ok(None)` when `fc` doesn't name an object-returning function, so
+    /// the caller can fall through to ordinary function-call resolution.
+    fn try_compile_fn_scalar_subquery(
+        &mut self,
+        fc: &ast::FunctionCall,
+        fields: &[String],
+        modifiers: Option<&ast::SelectStmt>,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let fd = self.schema.functions.iter().find(|f| {
+            let module_matches = fc.module.as_deref().map(|m| m == f.module.as_str()).unwrap_or(true);
+            module_matches && f.name == fc.name && f.return_is_object
+        });
+        let Some(fd) = fd else { return Ok(None) };
+        let (fn_module, fn_name, return_type_name, polymorphic, params) = (
+            fd.module.clone(),
+            fd.name.clone(),
+            fd.return_pg_type.clone(),
+            fd.return_is_polymorphic,
+            fd.params.clone(),
+        );
+
+        let qualified = format!("{fn_module}::{fn_name}");
+        let [field] = fields else {
+            return Err(self.type_err(&format!(
+                "function '{qualified}' returns objects, so using it inside an expression needs \
+                 one of its properties, e.g. '{qualified}(…).name'"
+            )));
+        };
+        if params.len() != fc.args.len() {
+            return Err(self.type_err(&format!(
+                "function '{qualified}' expects {} argument(s), got {}",
+                params.len(),
+                fc.args.len()
+            )));
+        }
+
+        let mut fn_args = fc
+            .args
+            .iter()
+            .map(|a| self.compile_expr_ctx(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(globals) = self.globals_arg_for_call(&qualified)? {
+            fn_args.insert(0, globals);
+        }
+
+        let td = self.resolve_type(&return_type_name)?;
+        let alias = self.fresh_alias();
+        let Some(prop) = Self::resolve_property(td, field) else {
+            return Err(self.field_err(field, &return_type_name));
+        };
+        let projected = IrShapePointer::Computed(IrComputedPointer {
+            marker_offset: None,
+            alias: field.clone(),
+            expr: IrExpr::ColumnRef {
+                alias: alias.clone(),
+                column: prop.name.clone(),
+                pg_type: prop.pg_type.clone(),
+            },
+        });
+
+        let (poly_implementors, poly_columns) = if polymorphic {
+            self.collect_poly_info(&return_type_name)
+        } else {
+            (vec![], vec![])
+        };
+        let (filter, order_by, offset, limit) = match modifiers {
+            Some(sel) => {
+                let td = self.resolve_type(&return_type_name)?;
+                self.compile_path_modifiers(sel, td, &alias)?
+            }
+            None => (None, vec![], None, None),
+        };
+
+        Ok(Some(IrExpr::FnSubquery(Box::new(IrFunctionSelect {
+            fn_module,
+            fn_name,
+            fn_args,
+            alias,
+            type_name: return_type_name,
+            polymorphic,
+            poly_implementors,
+            poly_columns,
+            shape: vec![projected],
+            filter,
+            order_by,
+            offset,
+            limit,
+            distinct: false,
+        }))))
+    }
+
+    fn subquery_expr_err(&self) -> PyQLError {
+        self.type_err(
+            "sub-statement (SELECT/INSERT/UPDATE/DELETE) used as expression is \
+             only valid as the subject of a SELECT result, or as a SELECT over a \
+             path — e.g. '(select .emails filter .primary limit 1).address'",
+        )
     }
 
     // ── Expression compilation ────────────────────────────────────────────────────
@@ -5697,6 +6068,23 @@ impl<'a> Compiler<'a> {
                     })?;
                     return self.compile_expr_ctx(val, ctx);
                 }
+                // `(select .emails filter .primary limit 1).address` — the
+                // field chain is spliced onto the sub-select's own path so
+                // the subquery projects that column, rather than being read
+                // as jsonb extraction off an object id.
+                let (base, fields) = Self::peel_field_access_chain(expr);
+                if let Expr::SubQuery(stmt) = base {
+                    let stmt = stmt.as_ref().clone();
+                    return self.compile_subquery_expr(&stmt, &fields, ctx);
+                }
+                // `account::owner(.id).name` — an object-returning function
+                // projected to one of its columns.
+                if let Expr::FunctionCall(fc) = base {
+                    let fc = fc.clone();
+                    if let Some(ir) = self.try_compile_fn_scalar_subquery(&fc, &fields, None, ctx)? {
+                        return Ok(ir);
+                    }
+                }
                 let ir = self.compile_expr_ctx(inner, ctx)?;
                 Ok(IrExpr::JsonbField {
                     expr: Box::new(ir),
@@ -5867,18 +6255,17 @@ impl<'a> Compiler<'a> {
                 position: Position { line: 0, col: 0 },
             })),
 
-            // Strict improvement over the pre-merge free side: SubQuery/
-            // Union/Except previously fell through free's generic "not
-            // valid in free SELECT context" catch-all. These explicit,
+            // A `select` over a path compiles to a correlated subquery; DML
+            // and everything else still has no expression-position meaning.
+            // Union/Except previously fell through free's generic "not valid
+            // in free SELECT context" catch-all — these explicit,
             // purpose-written messages (already used schema-bound) apply
             // equally well with no schema in scope, so they're unconditional
             // here rather than ctx-gated.
-            Expr::SubQuery(_) => Err(PyQLError::Type(PyQLTypeError {
-                message: "sub-statement (SELECT/INSERT/UPDATE/DELETE) used as expression is \
-                           only valid as the subject of a SELECT result"
-                    .into(),
-                position: Position { line: 0, col: 0 },
-            })),
+            Expr::SubQuery(stmt) => {
+                let stmt = stmt.as_ref().clone();
+                self.compile_subquery_expr(&stmt, &[], ctx)
+            }
 
             Expr::Union(_, _) => Err(PyQLError::Type(PyQLTypeError {
                 message: "union is not valid in expression context".into(),
@@ -8885,6 +9272,13 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::NamedTuple { .. } => Some("jsonb"),
         IrExpr::GlobalParam { pg_type, .. } => Some(pg_type.as_str()),
+        // A correlated path subquery is typed by whatever it projects — the
+        // scalar column at the end of the path. An object-valued one yields
+        // an id, which no operator should silently compare against.
+        IrExpr::PathSubquery(ps) => match &ps.result {
+            IrPathResult::Scalar(e, _) => infer_ir_type(e),
+            IrPathResult::Object { .. } => None,
+        },
         _ => None,
     }
 }
