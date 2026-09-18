@@ -41,7 +41,11 @@ use crate::schema::{EnumDescriptor, FunctionDescriptor, ScalarDescriptor, Schema
 /// the module doc comment).
 pub fn python_snippet_for_step(step: &MigrationStep, schema: &SchemaDescriptor) -> Option<String> {
     match &step.op_key {
-        OpKey::Table(module, table) => {
+        // A foreign key belongs to a link on the owning type, so its snippet is
+        // that type's own declaration. A junction's FK is keyed by the junction
+        // table (`Type.link`), which matches no type — the lookup yields `None`,
+        // which is the right answer for it.
+        OpKey::Table(module, table) | OpKey::ForeignKey(module, table) => {
             let td = schema.types.iter().find(|t| &t.module == module && &t.table == table)?;
             Some(python_snippet_for_class(td, "@pylon.type"))
         }
