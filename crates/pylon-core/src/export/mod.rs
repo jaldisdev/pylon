@@ -3278,6 +3278,41 @@ mod tests {
     }
 
     #[test]
+    fn test_calling_an_object_function_in_an_expression_says_why() {
+        // It is only usable as a select's subject, but the resolver simply
+        // skipped it and reported "does not exist" — for a function that
+        // plainly does — and, for an unqualified call, named a `default::`
+        // module the caller never wrote.
+        let fd = FunctionDescriptor {
+            name: "adults".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Person".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Person filter .age > 18".into(),
+        };
+        let schema = minimal_schema(vec![fd]);
+        let ast = crate::parse::parse("select Person { x := adults() }").unwrap();
+        let err = match crate::ir::compile(&ast, &schema) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected the call to be rejected"),
+        };
+        assert!(
+            err.contains("returns objects") && err.contains("subject of a select"),
+            "expected an explanation of the restriction, got: {}",
+            err
+        );
+        assert!(
+            !err.contains("does not exist"),
+            "the function does exist; the message should not claim otherwise: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_emit_sequence_scalar_ddl() {
         use crate::schema::ScalarDescriptor;
         let schema = SchemaDescriptor {
