@@ -859,6 +859,21 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
 /// SQL fragment for a single path join (used in multilink values emission).
 fn emit_path_join_sql(join: &IrPathJoin) -> String {
     match join {
+        IrPathJoin::Function {
+            fn_module,
+            fn_name,
+            args,
+            target,
+        } => {
+            let args_sql = args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+            format!(
+                " CROSS JOIN LATERAL {}.{}({}) AS {}",
+                pg_schema(fn_module),
+                qi(fn_name),
+                args_sql,
+                qi(&target.alias),
+            )
+        }
         IrPathJoin::Single {
             source_alias,
             fk_col,
@@ -1451,6 +1466,24 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
                     qi(&target.alias),
                     qi(fk_col),
                     qi(source_alias),
+                ));
+            }
+            // LATERAL, not a plain join: the arguments read from the alias
+            // the traversal has reached, which a non-lateral function call
+            // in FROM cannot see.
+            IrPathJoin::Function {
+                fn_module,
+                fn_name,
+                args,
+                target,
+            } => {
+                let args_sql = args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+                parts.push(format!(
+                    "CROSS JOIN LATERAL {}.{}({}) AS {}",
+                    pg_schema(fn_module),
+                    qi(fn_name),
+                    args_sql,
+                    qi(&target.alias),
                 ));
             }
             IrPathJoin::BacklinkMulti {
@@ -4578,6 +4611,110 @@ mod tests {
             },
         ];
         schema
+    }
+
+    /// `Person.recent` computed from an object-returning function call, the
+    /// shape jaldis's translation model uses.
+    fn make_schema_with_object_fn_computed() -> SchemaDescriptor {
+        use crate::schema::{ComputedDescriptor, FunctionDescriptor, FunctionParamDescriptor};
+        let mut schema = make_schema();
+        schema.functions = vec![FunctionDescriptor {
+            name: "latest".into(),
+            module: "default".into(),
+            params: vec![FunctionParamDescriptor {
+                name: "owner".into(),
+                pg_type: "uuid".into(),
+            }],
+            return_pg_type: "default::Post".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: String::new(),
+        }];
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed = vec![
+            ComputedDescriptor {
+                name: "recent".into(),
+                expression: "latest(.id)".into(),
+                return_type: None,
+            },
+            ComputedDescriptor {
+                name: "vetted".into(),
+                expression: "(select latest(.id) filter .title != '')".into(),
+                return_type: None,
+            },
+        ];
+        schema
+    }
+
+    #[test]
+    fn test_path_traverses_through_a_function_backed_computed() {
+        // `recent := latest(.id)` has no path to splice in, so the call
+        // itself becomes the next row source — LATERAL, because its
+        // arguments read the alias the traversal has reached.
+        let schema = make_schema_with_object_fn_computed();
+        let out = compile_and_emit_with("SELECT Person { t := .recent.title }", &schema);
+        assert!(
+            out.sql
+                .contains("CROSS JOIN LATERAL \"public\".\"latest\"(\"t1\".\"id\") AS \"t2\""),
+            "{}",
+            out.sql
+        );
+        // The function returns a set, so the traversal is multi-valued.
+        assert!(out.sql.contains("ARRAY(SELECT \"t2\".\"title\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_sub_select_over_a_function_backed_computed() {
+        // The jaldis translation model, minimal: a function-backed computed
+        // resolves the set, a scalar computed picks an attribute out of it.
+        let schema = make_schema_with_object_fn_computed();
+        let out = compile_and_emit_with(
+            "SELECT Person { t := (select .recent filter .title = 'x' limit 1).title }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("CROSS JOIN LATERAL \"public\".\"latest\""),
+            "{}",
+            out.sql
+        );
+        assert!(out.sql.contains("\"t2\".\"title\" = 'x'"), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+        assert!(!out.sql.contains("ARRAY("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_function_backed_computed_carries_its_own_filter() {
+        let schema = make_schema_with_object_fn_computed();
+        let out = compile_and_emit_with(
+            "SELECT Person { t := (select .vetted filter .title = 'x' limit 1).title }",
+            &schema,
+        );
+        assert!(
+            out.sql
+                .contains("(\"t2\".\"title\" = 'x') AND (\"t2\".\"title\" <> '')"),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_function_backed_computed_checks_its_argument_count() {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema_with_object_fn_computed();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed = vec![ComputedDescriptor {
+            name: "recent".into(),
+            expression: "latest()".into(),
+            return_type: None,
+        }];
+        let ast = parse::parse("SELECT Person { t := .recent.title }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("expects 1 argument(s), got 0"), "{err}");
     }
 
     #[test]
