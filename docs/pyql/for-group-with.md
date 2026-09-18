@@ -19,7 +19,15 @@ group Person using decade := .age // 10 by decade
 group Person { name } by .age
 ```
 
-`group <subject> [{ shape }] [using alias := expr, ...] by expr, ...`. `using` binds one or more named expressions computed per row; `by` names the grouping key(s) — either a `using` alias or a bare property path. An optional shape restricts which fields appear on each grouped element (same shape grammar as `select`).
+`group <subject> [{ shape }] [using alias := expr, ...] by expr, ... [filter expr] [order by ...] [offset n] [limit n]`. `using` binds one or more named expressions computed per row; `by` names the grouping key(s) — either a `using` alias or a bare property path. An optional shape restricts which fields appear on each grouped element (same shape grammar as `select`).
+
+`filter` decides which rows are grouped at all, before grouping. `order by`, `offset` and `limit` apply *within* each group, to its own elements — so "the newest reading per sensor" is one query, and "the newest per (sensor, kind) pair" just adds a key:
+
+```pyql
+group Reading { value, taken_at } by .sensor, .kind order by .taken_at desc limit 1
+```
+
+A per-group `limit` compiles to a `row_number()` window partitioned by the keys, not a trailing `LIMIT` — a trailing one would cut whole groups instead of trimming each.
 
 Each result row decodes to `{"key": {...}, "grouping": [...], "elements": [...]}`:
 

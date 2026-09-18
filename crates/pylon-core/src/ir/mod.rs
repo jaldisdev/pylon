@@ -119,6 +119,15 @@ pub struct IrGroup {
     pub shape: Vec<IrShapePointer>,
     /// Ordered list of (key_name, key_expr) — what we GROUP BY.
     pub keys: Vec<(String, IrExpr)>,
+    /// Restricts which rows are grouped (a `WHERE`, applied before grouping).
+    pub filter: Option<IrExpr>,
+    /// Orders the elements *within* each group.
+    pub order_by: Vec<IrSort>,
+    /// Caps the elements within each group — "the newest row per key".
+    /// Emitted as a `row_number()` window partitioned by the keys, since a
+    /// plain `LIMIT` would cut whole groups instead.
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
 }
 
 // ── PATH SELECT (type-rooted path traversal) ────────────────────────────────────
