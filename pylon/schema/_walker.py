@@ -87,9 +87,13 @@ def _build_type_index(
 # ── Lazy ref resolution ────────────────────────────────────────────────────────
 
 
-def _import_from_lazy(module_path: str, class_name: str, anchor_cls: type) -> type | None:
-    """Import a class by resolving a relative module path from anchor_cls.__module__."""
-    anchor = anchor_cls.__module__ or ''
+def _import_from_lazy(module_path: str, class_name: str, anchor: Any) -> type | None:
+    """Import a class by resolving a relative module path from the anchor's module.
+
+    `anchor` is whatever declared the reference — a class for a link target, a
+    function for a return annotation. Only its `__module__` is read.
+    """
+    anchor = getattr(anchor, '__module__', '') or ''
     try:
         if module_path.startswith('.'):
             level = len(module_path) - len(module_path.lstrip('.'))
@@ -1289,6 +1293,7 @@ def _parse_return_annotation(
     annotation: Any,
     type_map: dict[str, Any],
     class_to_qname: dict[int, str],
+    anchor: Any = None,
 ) -> tuple[str, bool, bool, bool]:
     """Parse a return type annotation into (return_pg_type, is_object, is_set, is_polymorphic).
 
@@ -1321,10 +1326,31 @@ def _parse_return_annotation(
             if len(inner_args) == 1:
                 annotation = inner_args[0]
 
-    # Unwrap Annotated[T, lazy(...)]
+    # Unwrap Annotated[T, lazy(...)].
+    #
+    # A lazy reference has to be resolved here, not just unwrapped: its inner
+    # value is a ForwardRef (both `Annotated` and `get_type_hints` normalize a
+    # string parameter into one), so leaving it alone meant the annotation was
+    # never recognised as an object type and the function silently came out as
+    # `RETURNS text` instead of `RETURNS TABLE(...)`. Only a *directly
+    # referenced* class hit the object path, which is why this survived — a
+    # schema whose modules import each other has to use `lazy`.
     if _typing.get_origin(annotation) is _typing.Annotated:
+        from ._lazy import _Lazy
+
         a_args = _typing.get_args(annotation)
-        annotation = a_args[0]
+        inner = a_args[0]
+        lazy_markers = [a for a in a_args[1:] if isinstance(a, _Lazy)]
+        inner_name = inner if isinstance(inner, str) else getattr(inner, '__forward_arg__', None)
+        if lazy_markers and inner_name is not None and anchor is not None:
+            resolved = _import_from_lazy(lazy_markers[0].module_path, inner_name, anchor)
+            if resolved is None or not _is_pylon_type(resolved):
+                raise SchemaError(
+                    f'lazy ref {inner_name!r} from {lazy_markers[0].module_path!r} did not resolve to a Pylon type'
+                )
+            annotation = resolved
+        else:
+            annotation = inner
 
     # Check if this is a Pylon object type
     if isinstance(annotation, type) and hasattr(annotation, '__pylon_config__'):
@@ -1378,11 +1404,34 @@ def _build_function_descriptor(
     import typing as _typing
 
     config = func.__pylon_function__
-    hints = {}
+    # `get_type_hints` evaluates annotations in the function's own module
+    # globals, which will not contain a type the module deliberately does not
+    # import — the whole point of `pylon.lazy` is to avoid that import. Offer
+    # every unambiguously-named Pylon type as a local so those resolve; an
+    # ambiguous short name is left out on purpose rather than guessed at, and
+    # its `lazy` marker carries the module anyway.
+    localns: dict[str, Any] = {}
+    ambiguous: set[str] = set()
+    for qname, cls in type_map.items():
+        short = qname.split('::')[-1]
+        if short in localns and localns[short] is not cls:
+            ambiguous.add(short)
+        localns[short] = cls
+    for short in ambiguous:
+        localns.pop(short, None)
+
     try:
-        hints = _typing.get_type_hints(func, include_extras=True)
-    except Exception:
-        hints = getattr(func, '__annotations__', {})
+        hints = _typing.get_type_hints(func, include_extras=True, localns=localns)
+    except Exception as exc:
+        # Falling back to the raw `__annotations__` strings used to be silent,
+        # and a string annotation matches none of the object-type checks below
+        # — so an unresolvable name did not fail, it quietly produced a scalar
+        # `RETURNS text` function whose body still selected objects.
+        raise SchemaError(
+            f"function '{config.module}::{config.name}': cannot resolve its type "
+            f'annotations ({exc}). A type referenced only through `pylon.lazy` '
+            f'must still be importable by name, or referenced unambiguously.'
+        ) from exc
 
     # Build parameter descriptors
     sig = __import__('inspect').signature(func)
@@ -1413,7 +1462,7 @@ def _build_function_descriptor(
     if return_annotation is __import__('inspect').Parameter.empty:
         raise SchemaError(f"function '{config.module}::{config.name}' has no return type annotation")
     return_pg_type, return_is_object, return_is_set, return_is_polymorphic = _parse_return_annotation(
-        return_annotation, type_map, class_to_qname
+        return_annotation, type_map, class_to_qname, anchor=func
     )
 
     if return_is_object and not return_is_set:
