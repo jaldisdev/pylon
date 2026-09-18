@@ -1327,6 +1327,21 @@ fn emit_signal_triggers(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
+/// The column a composite constraint's pointer name refers to.
+///
+/// A link stores its value in `{name}_id`, not `{name}`. The single-pointer
+/// paths already append that suffix; the composite ones used to pass the
+/// pointer name straight through, so an `Exclusive(("order", "parent"))` over a
+/// link called `parent` produced `OLD."parent"` in its trigger and
+/// `("parent")` in its unique index — neither of which is a real column.
+fn constraint_column(t: &TypeDescriptor, pointer: &str) -> String {
+    if t.links.iter().any(|l| l.name == pointer && !l.is_junction_backed()) {
+        format!("{}_id", pointer)
+    } else {
+        pointer.to_string()
+    }
+}
+
 // ── Phase 7: unique indexes ────────────────────────────────────────────────────
 
 fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
@@ -1362,7 +1377,7 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
                 unless,
             } = c
             {
-                let cols: Vec<String> = fields.iter().map(|f| qi(f)).collect();
+                let cols: Vec<String> = fields.iter().map(|f| qi(&constraint_column(t, f))).collect();
                 let where_clause = unless
                     .as_deref()
                     .map(|u| format!(" WHERE NOT ({})", u))
@@ -1810,19 +1825,24 @@ fn excl_fn_name(iface_table: &str, fields: &[String]) -> String {
     format!("_excl_{}_{}", iface_table, fields.join("_"))
 }
 
-fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescriptor) -> ExclTriggerInfo {
+fn make_excl_info(
+    iface: &TypeDescriptor,
+    fields: &[String],
+    columns: &[String],
+    impl_t: &TypeDescriptor,
+) -> ExclTriggerInfo {
     let fn_name = excl_fn_name(&iface.table, fields);
     let fn_qname = format!("{}.{}", pg_schema(&iface.module), qi(&fn_name));
     let view_qname = qn(&iface.module, &iface.table);
     let tbl_qname = qn(&impl_t.module, &impl_t.table);
 
-    let field_conds: Vec<String> = fields.iter().map(|f| format!("{} = NEW.{}", qi(f), qi(f))).collect();
+    let field_conds: Vec<String> = columns.iter().map(|c| format!("{} = NEW.{}", qi(c), qi(c))).collect();
     let where_clause = format!("{} AND \"id\" <> NEW.\"id\"", field_conds.join(" AND "));
 
-    let detail_keys = fields.join(", ");
-    let detail_vals = fields
+    let detail_keys = columns.join(", ");
+    let detail_vals = columns
         .iter()
-        .map(|f| format!("NEW.{}::text", qi(f)))
+        .map(|c| format!("NEW.{}::text", qi(c)))
         .collect::<Vec<_>>()
         .join(" || ', ' || ");
 
@@ -1846,10 +1866,10 @@ fn make_excl_info(iface: &TypeDescriptor, fields: &[String], impl_t: &TypeDescri
 
     let ins_trigger_name = format!("{}_ins", fn_name);
     let upd_trigger_name = format!("{}_upd", fn_name);
-    let of_cols = fields.iter().map(|f| qi(f)).collect::<Vec<_>>().join(", ");
-    let when_clause = fields
+    let of_cols = columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+    let when_clause = columns
         .iter()
-        .map(|f| format!("OLD.{} IS DISTINCT FROM NEW.{}", qi(f), qi(f)))
+        .map(|c| format!("OLD.{} IS DISTINCT FROM NEW.{}", qi(c), qi(c)))
         .collect::<Vec<_>>()
         .join(" OR ");
 
@@ -1990,7 +2010,7 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             }
             let fields = vec![p.name.clone()];
             for impl_t in impls {
-                result.push(make_excl_info(t, &fields, impl_t));
+                result.push(make_excl_info(t, &fields, &fields, impl_t));
             }
         }
         for l in &t.links {
@@ -2013,13 +2033,14 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             }
             let fields = vec![format!("{}_id", l.name)];
             for impl_t in impls {
-                result.push(make_excl_info(t, &fields, impl_t));
+                result.push(make_excl_info(t, &fields, &fields, impl_t));
             }
         }
         for c in &t.constraints {
             if let TypeConstraint::Exclusive { pointers: fields, .. } = c {
+                let columns: Vec<String> = fields.iter().map(|f| constraint_column(t, f)).collect();
                 for impl_t in impls {
-                    result.push(make_excl_info(t, fields, impl_t));
+                    result.push(make_excl_info(t, fields, &columns, impl_t));
                 }
             }
         }
