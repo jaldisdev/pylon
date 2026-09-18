@@ -7372,7 +7372,6 @@ impl<'a> Compiler<'a> {
             // (confirmed live: a 2-arg call to an overload set whose
             // first-declared member takes 1 arg reported "expects 1
             // argument(s), got 2" even though a 2-arg overload existed).
-            let effective_module = module.unwrap_or("default");
             let candidates: Vec<&FunctionDescriptor> = self
                 .schema
                 .functions
@@ -7423,7 +7422,26 @@ impl<'a> Compiler<'a> {
                     sql_template: None,
                 }));
             }
-            let qualified = format!("{}::{}", effective_module, name);
+            // An object-returning function is deliberately not a candidate
+            // above — it compiles through `try_compile_fn_object_select`, which
+            // only runs when the call is a select's subject. Saying "does not
+            // exist" for one that plainly does (and naming `default::` for a
+            // call the user wrote unqualified) sent people looking for a typo
+            // instead of at the restriction.
+            if let Some(fd) = self.schema.functions.iter().find(|f| {
+                let module_matches = module.map(|m| m == f.module.as_str()).unwrap_or(true);
+                module_matches && f.name == name && f.return_is_object
+            }) {
+                return Err(self.type_err(&format!(
+                    "function '{}::{}' returns objects, so it can only be the subject of a \
+                     select (`select {}::{}(…) {{ … }}`), not part of a larger expression",
+                    fd.module, fd.name, fd.module, fd.name
+                )));
+            }
+            let qualified = match module {
+                Some(m) => format!("{m}::{name}"),
+                None => name.to_string(),
+            };
             return Err(self.type_err(&format!("function '{qualified}' does not exist")));
         };
 
