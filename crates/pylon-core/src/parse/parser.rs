@@ -131,6 +131,44 @@ impl Parser {
         }
     }
 
+    /// True for a keyword that can legally be a bare name in expression
+    /// position, because nothing in the grammar lets it *begin* an
+    /// expression. Deliberately excludes the ones that can (`select`,
+    /// `not`, `exists`, `distinct`, `if`, `detached`, `true`/`false`, and
+    /// the statement keywords), so this only ever accepts input that was a
+    /// syntax error before.
+    fn keyword_is_never_expression_start(&self) -> bool {
+        matches!(
+            self.current(),
+            Token::Filter
+                | Token::Order
+                | Token::By
+                | Token::Asc
+                | Token::Desc
+                | Token::First
+                | Token::Last
+                | Token::Limit
+                | Token::Offset
+                | Token::In
+                | Token::Then
+                | Token::Else
+                | Token::Set
+                | Token::Is
+                | Token::Optional
+                | Token::Required
+                | Token::Unless
+                | Token::Conflict
+                | Token::Using
+                | Token::Like
+                | Token::Ilike
+                | Token::And
+                | Token::Or
+                | Token::Union
+                | Token::Except
+                | Token::Intersect
+        )
+    }
+
     fn err(&self, msg: &str) -> PyQLSyntaxError {
         PyQLSyntaxError {
             message: msg.to_string(),
@@ -1285,7 +1323,49 @@ impl Parser {
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
+                self.parse_name_expr(name)
+            }
 
+            Token::Detached => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                Ok(Expr::Detached(Box::new(inner)))
+            }
+
+            // A bare link property: `filter @primary = true` inside a
+            // multi-link's own modifiers, where the link being filtered is
+            // already what's in scope. (`x@prop` — a property read off a
+            // named path — is the postfix form, parsed in `parse_postfix`.)
+            Token::At => {
+                self.advance();
+                let name = self.eat_ident()?;
+                Ok(Expr::Path(Path {
+                    steps: vec![PathStep::LinkProp(name)],
+                    partial: true,
+                }))
+            }
+
+            // A keyword that can't begin an expression is a name here — the
+            // lexer is case-insensitive, so a `with` binding (or a type)
+            // called `order` arrives as `Token::Order` and would otherwise
+            // read as "expected an expression, found 'order'". Both the
+            // binding site (`eat_ident`) and this one go through
+            // `keyword_as_ident`, so they agree on the spelling.
+            _ if self.keyword_is_never_expression_start() => {
+                let name = self.keyword_as_ident().expect("checked by the guard");
+                self.advance();
+                self.parse_name_expr(name)
+            }
+
+            other => Err(self.err(&format!("expected an expression, found {other}"))),
+        }
+    }
+
+    /// Everything a bare name can turn into once consumed: a session global,
+    /// a qualified reference, a function call, or a path rooted at it.
+    fn parse_name_expr(&mut self, name: String) -> Result<Expr, PyQLSyntaxError> {
+        {
+            {
                 // `global name` or `global module::name` → Expr::Global
                 if name == "global" {
                     if let Token::Ident(gname) = self.current().clone() {
@@ -1338,14 +1418,6 @@ impl Parser {
                 // Bare identifier → absolute path (type name or let-binding)
                 Ok(Expr::Path(Path::absolute(name)))
             }
-
-            Token::Detached => {
-                self.advance();
-                let inner = self.parse_expr()?;
-                Ok(Expr::Detached(Box::new(inner)))
-            }
-
-            other => Err(self.err(&format!("expected an expression, found {other}"))),
         }
     }
 

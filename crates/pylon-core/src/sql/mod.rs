@@ -4786,6 +4786,91 @@ mod tests {
     }
 
     #[test]
+    fn test_backlink_from_a_type_whose_interface_the_link_targets() {
+        use crate::schema::{LinkDescriptor, TypeDescriptor};
+        let mut schema = make_interface_schema();
+        let individual = schema.types.iter().find(|t| t.name == "Individual").unwrap().clone();
+        schema.types.push(TypeDescriptor {
+            name: "Note".into(),
+            module: "default".into(),
+            table: "Note".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: individual.properties[..1].to_vec(),
+            // Targets the *interface*, which `Individual` implements.
+            links: vec![LinkDescriptor {
+                name: "owner".into(),
+                target: "default::Account".into(),
+                nullable: true,
+                through: None,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+            }],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+        // Reported "link 'Note::owner' does not target 'Individual'" — but a
+        // link to an interface accepts every implementor, and they share ids.
+        let out = compile_and_emit_with("SELECT Individual { notes := .<owner[is Note] }", &schema);
+        assert!(out.sql.contains("\"public\".\"Note\""), "{}", out.sql);
+        assert!(out.sql.contains("\"owner_id\" = \"t0\".id"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_with_block_in_expression_position_hoists_its_bindings() {
+        // A `with` has nowhere to put its CTEs mid-expression, so they move
+        // to the enclosing statement's own WITH clause.
+        let out = compile_and_emit("SELECT Person { t := (with c := (select Company.name limit 1) select c) }");
+        assert!(out.sql.starts_with("WITH\n\"c\" AS ("), "{}", out.sql);
+        assert!(out.sql.contains("(SELECT \"v\" FROM \"c\")"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_hoisted_binding_is_usable_in_the_expression_around_it() {
+        let out =
+            compile_and_emit("SELECT Person { t := (with c := (select Company.name limit 1) select .name ++ c) }");
+        assert!(
+            out.sql.contains("(\"t0\".\"name\" || (SELECT \"v\" FROM \"c\"))"),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_hoisted_binding_joins_the_statements_own_with_clause() {
+        let out = compile_and_emit(
+            "WITH top := (select Person.name limit 1) \
+             SELECT Person { t := (with c := (select Company.name limit 1) select c) }",
+        );
+        let top = out.sql.find("\"top\" AS (").expect("top-level binding");
+        let inner = out.sql.find("\"c\" AS (").expect("hoisted binding");
+        assert!(top < inner, "the statement's own bindings come first:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_binding_named_after_a_keyword_is_usable() {
+        // The lexer is case-insensitive, so `order` arrives as the ORDER
+        // token and read as "expected an expression, found 'order'".
+        let out = compile_and_emit("WITH order := (select Person.name) SELECT Person { name } FILTER .name = order");
+        assert!(out.sql.contains("(SELECT \"v\" FROM \"Order\")"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_computed_declared_on_an_interface_is_visible_from_an_implementor() {
         use crate::schema::ComputedDescriptor;
         let mut schema = make_interface_schema();
@@ -5720,6 +5805,61 @@ mod tests {
             aliases: vec![],
             channels: vec![],
         }
+    }
+
+    #[test]
+    fn test_link_property_in_a_links_own_filter() {
+        // `filter @weight > x` reads the junction row of the link being
+        // filtered — `@prop` used to parse only as a postfix on a named
+        // path, so a bare one was "expected an expression, found '@'".
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with("SELECT Product { tags: { } filter @weight > 0.5 }", &schema);
+        assert!(out.sql.contains("\"jt\".\"weight\" > (0.5::float8)"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_link_property_in_a_computed_link_filter() {
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "SELECT Product { best := (select .tags filter @weight > 0.5 limit 1) { @weight } }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"jt\".\"weight\" > (0.5::float8)"), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_link_property_in_a_projected_sub_select_reads_the_junction() {
+        // The flat-join form names the junction with an ordinary alias
+        // rather than "jt", so the scope has to carry the alias too.
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with(
+            "SELECT Product { t := (select .tags filter @weight > 0.5 limit 1).id }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"t3\".\"weight\" > (0.5::float8)"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_unknown_link_property_names_the_through_type() {
+        let schema = make_schema_with_through_and_prop();
+        let ast = parse::parse("SELECT Product { tags: { } filter @nope > 0.5 }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("default::ProductTag") && err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn test_link_property_outside_a_link_says_where_it_belongs() {
+        let schema = make_schema_with_through_and_prop();
+        let ast = parse::parse("SELECT Product { t := @weight }").unwrap();
+        let err = match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected a compile error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("is a link property"), "{err}");
     }
 
     #[test]
