@@ -137,6 +137,17 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_may_declare_a_parameter_cardinality() {
+        for query in ["<optional std::str>$token", "<required std::str>$token"] {
+            let expr = parse_expr(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(matches!(expr, Expr::TypeCast(_)), "{query}");
+        }
+        // Still a comparison, not a cast.
+        let expr = parse_expr("1 < 2").unwrap();
+        assert!(matches!(expr, Expr::BinOp(_)));
+    }
+
+    #[test]
     fn test_keyword_used_as_a_name_keeps_its_written_casing() {
         let expr = parse_expr(".<order[is OrderAttribute]").unwrap();
         let Expr::Path(path) = expr else { panic!("not a path") };

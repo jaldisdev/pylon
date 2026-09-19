@@ -961,6 +961,13 @@ impl Parser {
             // A type cast is `<Ident>` or `<Module::Ident>` followed by `>`.
             if self.is_type_cast_ahead() {
                 self.advance(); // consume `<`
+                // `<optional str>$token` / `<required str>$token` — the
+                // cardinality a parameter is declared with. A Postgres
+                // parameter is nullable either way, which is what `optional`
+                // already means; `required` is not enforced.
+                if matches!(self.current(), Token::Optional | Token::Required) {
+                    self.advance();
+                }
                 let ty = self.parse_type_expr()?;
                 self.eat(&Token::Gt)?;
                 let expr = self.parse_type_cast()?;
@@ -976,6 +983,13 @@ impl Parser {
         let n = self.tokens.len();
         if i >= n {
             return false;
+        }
+        // A parameter's cardinality may lead the type: `<optional str>$token`.
+        if matches!(self.tokens[i].token, Token::Optional | Token::Required) {
+            i += 1;
+            if i >= n {
+                return false;
+            }
         }
         // must start with an identifier
         if !matches!(self.tokens[i].token, Token::Ident(_)) {
