@@ -8162,6 +8162,34 @@ mod tests {
     }
 
     #[test]
+    fn test_any_over_a_multilink_comparison_does_not_warn() {
+        // Regression: the warning fired whether or not the comparison was
+        // wrapped, so `any()` -- the very thing it asks for -- did not silence
+        // it. The argument is compiled before the call is resolved, so the
+        // suppression has to be in place while the argument is compiled.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER any(.posts.title = 'x')").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        assert!(
+            !ir.warnings.iter().any(|w| w.contains("FILTER clause")),
+            "any() states the intent, so nothing should warn: {:?}",
+            ir.warnings
+        );
+    }
+
+    #[test]
+    fn test_bare_multilink_comparison_still_warns() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person FILTER .posts.title = 'x'").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        assert!(
+            ir.warnings.iter().any(|w| w.contains("FILTER clause")),
+            "an unwrapped set-valued comparison still warns: {:?}",
+            ir.warnings
+        );
+    }
+
+    #[test]
     fn test_multi_sort_with_then_emits_two_order_keys() {
         let out = compile_and_emit("SELECT Person { name } ORDER BY .name THEN .age DESC");
         assert!(out.sql.contains("ORDER BY"), "expected ORDER BY");
