@@ -2340,7 +2340,26 @@ impl<'a> Compiler<'a> {
                     Some(m) => format!("{}::{}", m, type_ref.name),
                     None => type_ref.name.clone(),
                 };
-                current_td = self.resolve_type(&type_name)?;
+                let narrowed = self.resolve_type(&type_name)?;
+                // An interface is a view over the columns its implementors
+                // share, so narrowing to one of them has to move to that
+                // implementor's own table — the view has no column to read.
+                // The row is the same row, so the two are joined on their id.
+                if current_td.abstract_ && current_td.materialized && narrowed.table != current_td.table {
+                    let target_alias = self.fresh_alias();
+                    let target = IrSource {
+                        type_name: format!("{}::{}", narrowed.module, narrowed.name),
+                        table: narrowed.table.clone(),
+                        alias: target_alias.clone(),
+                    };
+                    joins.push(IrPathJoin::Single {
+                        source_alias: current_alias.clone(),
+                        fk_col: "id".to_string(),
+                        target,
+                    });
+                    current_alias = target_alias;
+                }
+                current_td = narrowed;
                 idx += 1;
                 continue;
             }
