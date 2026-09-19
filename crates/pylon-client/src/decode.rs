@@ -270,7 +270,13 @@ fn decode_json_member(value: &DecodedValue, member: &JsonMember) -> Value {
 }
 
 fn decode_enum(value: &DecodedValue, position: usize, enum_type: &str) -> Value {
-    match composite_at(value, position) {
+    // An enum inside an array arrives as the label itself rather than as a
+    // field of a record -- the same distinction `decode_named_tuple` draws.
+    let raw = match value {
+        DecodedValue::Composite(_) => composite_at(value, position),
+        other => other.clone(),
+    };
+    match raw {
         DecodedValue::Null => Value::Null,
         DecodedValue::Str(s) => Value::Enum {
             type_name: pg_schema_qualified_to_pylon(enum_type),
