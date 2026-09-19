@@ -4425,6 +4425,19 @@ mod tests {
     }
 
     #[test]
+    fn test_a_sub_selects_filter_stays_on_its_own_subject_when_a_field_chain_projects_off_it() {
+        // `(select Person filter .id = $a).company.name` filters People, not
+        // Companies. The merge that splices the field chain onto the inner
+        // select used to leave the filter to bind against the last step.
+        let out = compile_and_emit_with("SELECT (SELECT Person FILTER .name = $n).company.name", &make_schema());
+        assert!(
+            out.sql.contains("WHERE (\"t0\".\"name\" = $1)"),
+            "the inner filter belongs to the Person alias:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
