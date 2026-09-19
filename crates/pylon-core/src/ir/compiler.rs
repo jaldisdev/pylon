@@ -2170,7 +2170,12 @@ impl<'a> Compiler<'a> {
             Stmt::With(w) => {
                 for alias in &w.aliases {
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
-                    self.register_cte(&alias.name, &ir_inner);
+                    let type_name = self.register_cte(&alias.name, &ir_inner);
+                    self.hoisted_ctes.push(IrCteDef {
+                        name: alias.name.clone(),
+                        stmt: ir_inner,
+                        type_name,
+                    });
                 }
                 self.compile_stmt(&w.stmt)
             }
@@ -4170,7 +4175,9 @@ impl<'a> Compiler<'a> {
 
         // Register the for variable so the body can reference it.
         let prev = self.for_vars.insert(f.var.clone(), pg_type.clone());
+        let hoisted_before = self.hoisted_ctes.len();
         let body = self.compile_stmt(&f.body)?;
+        let body_ctes: Vec<IrCteDef> = self.hoisted_ctes.split_off(hoisted_before);
         // Restore previous for-var (or remove if none existed).
         match prev {
             Some(old) => {
@@ -4203,6 +4210,7 @@ impl<'a> Compiler<'a> {
             var_name: f.var.clone(),
             iterator,
             body: Box::new(body),
+            body_ctes,
         })
     }
 
