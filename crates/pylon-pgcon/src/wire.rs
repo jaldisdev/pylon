@@ -151,16 +151,32 @@ pub struct ExtensionOids {
     /// Domain OID to the OID of the type it wraps. A domain's wire format is
     /// its base type's, so these decode by recursing on the base.
     pub domains: std::collections::HashMap<u32, u32>,
+    /// Array types whose element is one of the enums or domains above. The
+    /// element OID travels in the array's own binary header, so recognising
+    /// the array OID is all `decode_array` needs; without this an
+    /// `AuthenticationMethod[]` column is an `UnknownTypeOid` even though
+    /// every value in it would decode.
+    pub arrays: std::collections::HashSet<u32>,
 }
 
 /// One round trip that classifies every non-builtin type in the database:
-/// the `vector` extension type, all enums, and all domains with the base
-/// type each resolves to.
+/// the `vector` extension type, all enums, all domains with the base type
+/// each resolves to, and the array types over any of those.
+///
+/// Arrays are reported with a `'A'` in the typtype column. Postgres never
+/// uses that letter itself (`b`, `c`, `d`, `e`, `m`, `p`, `r` are the real
+/// ones) -- it is `typcategory`'s letter for an array, borrowed here so the
+/// four-column shape holds for every row.
 pub(crate) const TYPE_DISCOVERY_SQL: &str = "\
 SELECT t.oid::int8, t.typtype::text, COALESCE(b.oid, 0)::int8, t.typname::text \
 FROM pg_type t \
 LEFT JOIN pg_type b ON b.oid = t.typbasetype \
-WHERE t.typtype IN ('e', 'd') OR t.typname = 'vector'";
+WHERE t.typtype IN ('e', 'd') OR t.typname = 'vector' \
+UNION ALL \
+SELECT a.oid::int8, 'A', e.oid::int8, a.typname::text \
+FROM pg_type a \
+JOIN pg_type e ON e.oid = a.typelem \
+WHERE a.typcategory = 'A' AND e.typtype IN ('e', 'd')";
 
 impl ExtensionOids {
     /// Builds a registry from `TYPE_DISCOVERY_SQL`'s rows, given as
@@ -174,6 +190,9 @@ impl ExtensionOids {
                 }
                 "d" if base_oid != 0 => {
                     out.domains.insert(oid, base_oid);
+                }
+                "A" => {
+                    out.arrays.insert(oid);
                 }
                 _ => {}
             }
@@ -237,6 +256,9 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Decode
             // An enum's binary representation is its label, as text.
             Ok(DecodedValue::Str(std::str::from_utf8(data)?.to_string()))
         }
+        // The element OID is in the array's own header, so this only has to
+        // recognise that the type is an array at all.
+        _ if ext.arrays.contains(&oid) => decode_array(data, ext),
         _ => match ext.domains.get(&oid) {
             // A domain is a constrained alias: same wire format as its base.
             Some(&base_oid) => decode_value(base_oid, data, ext),
@@ -1082,6 +1104,45 @@ mod tests {
         assert!(ext.enums.contains(&50_001));
         assert_eq!(ext.domains.get(&50_002), Some(&OID_INT8));
         assert!(!ext.domains.contains_key(&50_003));
+    }
+
+    #[test]
+    fn discovery_rows_record_array_types() {
+        let ext = ExtensionOids::from_discovery_rows([
+            (50_001, "e".to_string(), 0, "status".to_string()),
+            (50_010, "A".to_string(), 50_001, "_status".to_string()),
+        ]);
+        assert!(ext.enums.contains(&50_001));
+        assert!(ext.arrays.contains(&50_010));
+    }
+
+    #[test]
+    fn decodes_an_array_of_a_discovered_enum() {
+        // An `AuthenticationMethod[]` column: the array's own OID is
+        // database-assigned, so without discovery it is an UnknownTypeOid
+        // even though the element OID travels in the array header and every
+        // label in it decodes.
+        let ext = ExtensionOids {
+            enums: std::collections::HashSet::from([50_001]),
+            arrays: std::collections::HashSet::from([50_010]),
+            ..Default::default()
+        };
+        let encoded = encode_array(50_001, &[Some(b"Password"), Some(b"Passkey")]);
+        assert_eq!(
+            decode_value(50_010, &encoded, &ext).unwrap(),
+            DecodedValue::Array(vec![
+                DecodedValue::Str("Password".to_string()),
+                DecodedValue::Str("Passkey".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_array_of_an_undiscovered_type_is_still_an_error() {
+        let ext = ExtensionOids::default();
+        let encoded = encode_array(50_001, &[Some(b"Password")]);
+        let err = decode_value(50_010, &encoded, &ext).unwrap_err();
+        assert!(matches!(err, Error::UnknownTypeOid { oid: 50_010 }), "got {err:?}");
     }
 
     #[test]
