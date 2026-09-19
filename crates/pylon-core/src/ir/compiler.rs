@@ -4122,6 +4122,38 @@ impl<'a> Compiler<'a> {
                     pg_type,
                 )
             }
+            // A WITH binding names a set, so the loop runs once per row of
+            // it — not once over the single value a scalar subquery would
+            // collapse it to.
+            Expr::Path(p)
+                if !p.partial
+                    && p.steps.len() == 1
+                    && matches!(&p.steps[0], ast::PathStep::Name(n) if self.cte_types.contains_key(n.as_str())) =>
+            {
+                let ast::PathStep::Name(name) = &p.steps[0] else {
+                    unreachable!("checked by the guard")
+                };
+                let yielded = self.cte_types.get(name.as_str()).cloned().unwrap_or_default();
+                let scalar = !yielded.contains("::");
+                let pg_type = if scalar {
+                    let raw = if yielded.is_empty() { "text" } else { yielded.as_str() };
+                    literal_sentinel_to_pg(raw).to_string()
+                } else {
+                    "uuid".to_string()
+                };
+                let source = IrSource {
+                    type_name: yielded,
+                    table: format!("@cte:{name}"),
+                    alias: self.fresh_alias(),
+                };
+                (
+                    IrForIterator::Query {
+                        stmt: Box::new(IrStmt::Select(IrSelect::schema_bound(source, vec![], None))),
+                        scalar,
+                    },
+                    pg_type,
+                )
+            }
             other => {
                 let e = self.compile_free_expr(other)?;
                 let raw = infer_ir_type(&e).unwrap_or("text");
