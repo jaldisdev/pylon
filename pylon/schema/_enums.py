@@ -38,7 +38,17 @@ class Enum(str, _stdlib_enum.Enum):
 
         Status.Active          # <Status.Active: 'Active'>
         Status.Active.value    # 'Active'
+        str(Status.Active)     # 'Active'
     """
+
+    # A `str`-mixin enum inherits `Enum.__str__`, which renders `Status.Active`
+    # while everything else about the value renders `Active`: `==`, every
+    # inherited `str` method, and `json.dumps`, which sees a `str` subclass.
+    # Leaving that split in place makes `str(status) == 'Active'` quietly false
+    # wherever `status == 'Active'` is true, so the display paths are pointed
+    # back at the value, exactly as `enum.StrEnum` does.
+    __str__ = str.__str__
+    __format__ = str.__format__
 
 
 def enum_decorator(*members: str) -> Any:
