@@ -4386,6 +4386,23 @@ mod tests {
     }
 
     #[test]
+    fn test_select_over_an_update_on_a_with_binding() {
+        // A bare `with` binding as an update's subject names rows, not a
+        // type. The top-level form already knew that; wrapping it in a select
+        // asked what type the statement yields and got the binding's name,
+        // reported as "unknown type 'p'".
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person FILTER .id = $a LIMIT 1) SELECT (UPDATE p SET { name := $n }) { id }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("UPDATE \"public\".\"Person\""),
+            "expected the update to resolve to the bound type's table:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

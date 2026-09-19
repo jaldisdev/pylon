@@ -4546,6 +4546,17 @@ impl<'a> Compiler<'a> {
         {
             return Ok(format!("{}::{}", target.module, target.name));
         }
+        // A subject that is just a `with` binding names rows, not a type, so
+        // the type is the one the binding was bound to. `compile_update`
+        // wants the binding's own name (it narrows the update to those rows);
+        // a reader asking what type the statement yields wants this.
+        if let Expr::Path(p) = subject
+            && !p.partial
+            && let [ast::PathStep::Name(root)] = p.steps.as_slice()
+            && let Some(bound) = self.cte_object_type(root)
+        {
+            return Ok(bound);
+        }
         self.expr_as_type_name(subject)
     }
 
