@@ -10441,7 +10441,11 @@ impl<'a> Compiler<'a> {
             .iter()
             .find(|t| format!("{}::{}", t.module, t.name) == type_name)
         {
-            td.properties.iter().map(|p| p.name.clone()).collect()
+            // The same set the DML path fans out (`poly_dml_columns`): the
+            // interface's single-link FKs belong in it too, or reading
+            // `.profile` off an interface-typed source finds no
+            // `profile_id` column in the union it was fanned out into.
+            Self::poly_dml_columns(td)
         } else {
             vec![]
         };
