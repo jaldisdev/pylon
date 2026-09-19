@@ -248,6 +248,24 @@ fn source_ref(src: &IrSource) -> String {
     }
 }
 
+/// A junction table, or the CTE standing in for one. Same `@cte:` sentinel
+/// `source_ref` honours: a multi-link populated by the statement's own nested
+/// DML reads the junction rows back out of the CTE that wrote them, since
+/// Postgres does not show them in the table yet.
+/// The name the emitter gives the CTE wrapping a `SELECT (INSERT/UPDATE …)`'s
+/// own mutation, and the stem of the junction CTEs beside it
+/// (`_dml__ml_add_0`). Public because the compiler has to name those same
+/// CTEs when it points a shape at them — see
+/// `read_nested_links_from_their_ctes`.
+pub const DML_CTE: &str = "_dml";
+
+fn junction_ref(module: &str, junction_table: &str) -> String {
+    match junction_table.strip_prefix("@cte:") {
+        Some(cte_name) => qi(cte_name),
+        None => qn(module, junction_table),
+    }
+}
+
 /// The discriminator for a path select's object result.
 ///
 /// The terminal row source is the one the result came from, so that is the one
@@ -390,8 +408,8 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
     // SELECT-over-DML: wrap inner statement in a CTE, select from it.
     let from_clause = if let Some(dml) = &sel.dml_source {
         let mut cte_parts = match dml.as_ref() {
-            IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, "_dml"),
-            IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, "_dml"),
+            IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, DML_CTE),
+            IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, DML_CTE),
             // Nested DML the row's values read from: hoisted ahead of the row
             // itself, since a data-modifying WITH only works at the top level.
             IrStmt::Insert(ins) if !ins.nested_ctes.is_empty() => {
@@ -1102,15 +1120,21 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
             target,
         } => {
             let (jt_ref, src_col, tgt_col) = match ml_join {
-                IrMultiLinkJoin::Standard { junction_table, module } => {
-                    (qn(module, junction_table), "source".to_string(), "target".to_string())
-                }
+                IrMultiLinkJoin::Standard { junction_table, module } => (
+                    junction_ref(module, junction_table),
+                    "source".to_string(),
+                    "target".to_string(),
+                ),
                 IrMultiLinkJoin::Through {
                     junction_table,
                     module,
                     source_col,
                     target_col,
-                } => (qn(module, junction_table), source_col.clone(), target_col.clone()),
+                } => (
+                    junction_ref(module, junction_table),
+                    source_col.clone(),
+                    target_col.clone(),
+                ),
                 // A forward `IrPathJoin::Multi` step is always built from a
                 // real multi-link (`compile_path_select`'s middle-step
                 // handling), never a backlink — the Backlink* variants only
@@ -1158,7 +1182,7 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
         } => {
             format!(
                 " JOIN {} AS {} ON {}.{} = {}.\"id\" JOIN {} AS {} ON {}.\"id\" = {}.{}",
-                qn(module, junction_table),
+                junction_ref(module, junction_table),
                 qi(junction_alias),
                 qi(junction_alias),
                 qi(current_col),
@@ -1685,7 +1709,7 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
                     IrMultiLinkJoin::Standard { junction_table, module } => {
                         parts.push(format!(
                             "JOIN {} AS {} ON {}.\"source\" = {}.\"id\"",
-                            qn(module, junction_table),
+                            junction_ref(module, junction_table),
                             qi(junction_alias),
                             qi(junction_alias),
                             qi(source_alias),
@@ -1706,7 +1730,7 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
                     } => {
                         parts.push(format!(
                             "JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                            qn(module, junction_table),
+                            junction_ref(module, junction_table),
                             qi(junction_alias),
                             qi(junction_alias),
                             qi(source_col),
@@ -1787,7 +1811,7 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
             } => {
                 parts.push(format!(
                     "JOIN {} AS {} ON {}.{} = {}.\"id\"",
-                    qn(module, junction_table),
+                    junction_ref(module, junction_table),
                     qi(junction_alias),
                     qi(junction_alias),
                     qi(current_col),
@@ -3135,7 +3159,7 @@ fn emit_single_link(f: &IrSingleLinkPointer, parent_alias: &str, pos: usize) -> 
             IrMultiLinkJoin::Standard { junction_table, module } => {
                 let from = format!(
                     "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".target",
-                    qn(module, junction_table),
+                    junction_ref(module, junction_table),
                     source_ref(source),
                     qi(sub_alias),
                     qi(sub_alias),
@@ -3151,7 +3175,7 @@ fn emit_single_link(f: &IrSingleLinkPointer, parent_alias: &str, pos: usize) -> 
             } => {
                 let from = format!(
                     "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
-                    qn(module, junction_table),
+                    junction_ref(module, junction_table),
                     source_ref(source),
                     qi(sub_alias),
                     qi(sub_alias),
@@ -3230,7 +3254,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
         IrMultiLinkJoin::Standard { junction_table, module } => {
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".target",
-                qn(module, junction_table),
+                junction_ref(module, junction_table),
                 source_ref(source),
                 qi(sub_alias),
                 qi(sub_alias),
@@ -3246,7 +3270,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
         } => {
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
-                qn(module, junction_table),
+                junction_ref(module, junction_table),
                 source_ref(source),
                 qi(sub_alias),
                 qi(sub_alias),
@@ -3274,7 +3298,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
         } => {
             let from = format!(
                 "FROM {} AS \"jt\"\n    INNER JOIN {} AS {}\n    ON {}.id = \"jt\".{}",
-                qn(module, junction_table),
+                junction_ref(module, junction_table),
                 source_ref(source),
                 qi(sub_alias),
                 qi(sub_alias),
@@ -4433,6 +4457,51 @@ mod tests {
         assert!(
             out.sql.contains("WHERE (\"t0\".\"name\" = $1)"),
             "the inner filter belongs to the Person alias:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_reading_back_a_nested_insert_through_its_own_statement() {
+        let out = compile_and_emit_with(
+            "SELECT (INSERT Person { name := $n, posts := (INSERT Post { title := $t }) }) { id, posts: { title } }",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("__ml_add_0"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_reading_back_a_nested_insert_within_its_own_statement() {
+        // Postgres does not show one statement's CTE writes to the rest of
+        // that statement, so reading the link back off the base tables found
+        // nothing and it hydrated as empty/None (confirmed live).
+        let out = compile_and_emit_with(
+            "SELECT (INSERT Person { name := $n, posts := (INSERT Post { title := $t }) }) \
+             { id, posts: { title } }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("FROM \"_dml__ml_add_0\" AS \"jt\""),
+            "the junction rows must come from the CTE that wrote them:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"_nested_dml_0\""),
+            "and the targets from the nested insert's own CTE:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_nested_single_link_insert_reads_back_from_its_cte() {
+        let out = compile_and_emit_with(
+            "SELECT (INSERT Person { name := $n, company := (INSERT Company { name := $c }) }) \
+             { id, company: { name } }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("FROM \"_nested_dml_0\""),
+            "the linked row must be read from the CTE that inserted it:\n{}",
             out.sql
         );
     }

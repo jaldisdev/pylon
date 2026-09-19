@@ -4146,6 +4146,14 @@ impl<'a> Compiler<'a> {
 
         // Compile the inner DML if this is a SELECT-over-DML / SELECT-over-SELECT.
         let dml_source = inner_stmt.map(|s| self.compile_stmt(s).map(Box::new)).transpose()?;
+        let mut shape = shape;
+        if let Some(dml) = &dml_source {
+            // `SELECT (INSERT …)` has no user-written CTE name: the emitter
+            // wraps the DML in one of its own (`sql::DML_CTE`), and the
+            // junction CTEs are named after it.
+            let dml_cte = cte_name.as_deref().unwrap_or(crate::sql::DML_CTE);
+            Self::read_nested_links_from_their_ctes(dml, Some(dml_cte), &mut shape);
+        }
 
         let polymorphic = td.abstract_ && td.materialized;
         let (poly_implementors, poly_columns) = if polymorphic {
@@ -10414,6 +10422,85 @@ impl<'a> Compiler<'a> {
     /// Shared by compile_select (read path) and the IrUpdate/IrDelete
     /// builders (write path) so a DML-as-CTE fan-out (sql/mod.rs) can expose
     /// the same columns a polymorphic select would.
+    /// Point a shape's single-link sub-selects at the nested-DML CTE that
+    /// supplied their foreign key.
+    ///
+    /// `insert Account { credentials := (insert Credentials { … }) } { ** }`
+    /// runs the nested insert as a data-modifying CTE, and Postgres does not
+    /// show one statement's CTE writes to the rest of that statement: reading
+    /// `access."Credentials"` back finds nothing, so the link hydrated as
+    /// `None` even though the row was there on the next statement (confirmed
+    /// live). The CTE itself is in scope, and `RETURNING *` gives it every
+    /// column the shape asks for, so the sub-select reads that instead.
+    fn read_nested_links_from_their_ctes(dml: &IrStmt, dml_cte: Option<&str>, shape: &mut [IrShapePointer]) {
+        let (assignments, nested_ctes, appends) = match dml {
+            IrStmt::Insert(ins) => (&ins.assignments, &ins.nested_ctes, &ins.multi_link_appends),
+            IrStmt::Update(upd) => (&upd.assignments, &upd.nested_ctes, &upd.multi_link_appends),
+            _ => return,
+        };
+        // A multi-link's junction rows are written by this statement too, in
+        // a CTE the emitter names after the DML's own — see
+        // `emit_insert_multilink_ctes`. The targets themselves come from the
+        // append's value source, which for a nested insert is one of
+        // `nested_ctes`.
+        if let Some(dml_cte) = dml_cte {
+            for pointer in shape.iter_mut() {
+                let IrShapePointer::MultiLink(link) = pointer else {
+                    continue;
+                };
+                let IrMultiLinkJoin::Standard { junction_table, .. } = &mut link.join else {
+                    continue;
+                };
+                let Some(index) = appends.iter().position(|a| a.junction_table == *junction_table) else {
+                    continue;
+                };
+                *junction_table = format!("@cte:{dml_cte}__ml_add_{index}");
+                if let IrMultiLinkValueSource::CteRef(target_cte) = &appends[index].values.source {
+                    for row in &mut link.subquery.rows {
+                        if let IrRowSource::Bound { source, .. } = row {
+                            source.table = format!("@cte:{target_cte}");
+                            source.poly = None;
+                        }
+                    }
+                }
+            }
+        }
+        if nested_ctes.is_empty() {
+            return;
+        }
+        let from_cte: HashMap<&str, &str> = assignments
+            .iter()
+            .filter_map(|(column, expr)| match expr {
+                IrExpr::ColumnRef { alias, column: c, .. }
+                    if c == "id" && nested_ctes.iter().any(|cte| cte.name == *alias) =>
+                {
+                    Some((column.as_str(), alias.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        if from_cte.is_empty() {
+            return;
+        }
+        for pointer in shape {
+            let IrShapePointer::SingleLink(link) = pointer else {
+                continue;
+            };
+            let IrSingleLinkCorrelation::Fk { fk_column, .. } = &link.correlation else {
+                continue;
+            };
+            let Some(cte_name) = from_cte.get(fk_column.as_str()) else {
+                continue;
+            };
+            for row in &mut link.subquery.rows {
+                if let IrRowSource::Bound { source, .. } = row {
+                    source.table = format!("@cte:{cte_name}");
+                    source.poly = None;
+                }
+            }
+        }
+    }
+
     fn poly_dml_columns(td: &TypeDescriptor) -> Vec<String> {
         td.properties
             .iter()
