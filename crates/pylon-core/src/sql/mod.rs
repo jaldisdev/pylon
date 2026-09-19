@@ -1400,6 +1400,13 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
         .iter()
         .map(|item| match item {
             IrFreeExpr::Scalar(expr) => {
+                // An object standing as the whole result is already the
+                // composite row `result` is meant to be — wrapping it in
+                // another ROW() would bury its columns one level down from
+                // where its shape node says they are.
+                if matches!(expr, IrExpr::ObjectSubquery(_)) {
+                    return format!("SELECT v AS result, v FROM (SELECT {} AS v) AS _obj", emit_expr(expr));
+                }
                 // Arrays and jsonb are returned as plain top-level columns
                 // rather than wrapped, so they keep their own shape node.
                 if is_raw_scalar(expr) {
@@ -1556,7 +1563,20 @@ fn emit_free_field_expr(expr: &IrExpr) -> String {
 /// Shape node for one free scalar/object/tuple field — `Enum` when the
 /// value is enum-typed (see `enum_type_of_expr`), else a plain `Scalar`.
 fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
-    use crate::query::ShapeNode;
+    use crate::query::{Cardinality, ShapeNode};
+    if let IrExpr::ObjectSubquery(sel) = expr {
+        let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
+            unreachable!("an object subquery is always schema-bound")
+        };
+        let (_, nodes) = build_shape(shape, &source.alias);
+        return ShapeNode::Object {
+            name: name.to_string(),
+            type_name: Some(source.type_name.clone()),
+            position,
+            cardinality: Cardinality::Optional,
+            pointers: prepend_type(nodes),
+        };
+    }
     match enum_type_of_shape_expr(expr) {
         Some(qualified) => qualified.shape_node(name.to_string(), position),
         None => ShapeNode::Scalar {
@@ -3748,6 +3768,27 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             sql
         }
 
+        IrExpr::ObjectSubquery(sel) => {
+            let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
+                unreachable!("an object subquery is always schema-bound")
+            };
+            let alias = &source.alias;
+            let (sub_exprs, _) = build_shape(shape, alias);
+            let mut row_parts = vec![source_type_disc(source)];
+            row_parts.extend(sub_exprs);
+            let mut sql = format!(
+                "(SELECT (\n        {}\n    )\n    FROM {} AS {}",
+                row_parts.join(",\n        "),
+                source_ref(source),
+                qi(alias),
+            );
+            append_filter(&mut sql, &sel.filter);
+            append_order_by(&mut sql, &sel.order_by);
+            append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+            sql.push(')');
+            sql
+        }
+
         IrExpr::Subquery(sel) => {
             let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
                 unreachable!("scalar/exists subquery is always schema-bound")
@@ -4502,6 +4543,42 @@ mod tests {
         assert!(
             out.sql.contains("FROM \"_nested_dml_0\""),
             "the linked row must be read from the CTE that inserted it:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_free_object_field_holding_an_object_keeps_it_an_object() {
+        // Gel compiles a free shape into a real object type whose fields are
+        // real pointers, so an object field stays an object. Pylon used to
+        // build the free object as jsonb, which flattened it to the bare id.
+        let out = compile_and_emit_with(
+            "WITH c := (SELECT Company LIMIT 1) SELECT { co := c { name }, n := 1 }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("'default::Company'::text"),
+            "the field must carry the object's own row:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_projecting_an_object_off_a_free_object() {
+        // `.co` is a path step through a pointer, not jsonb extraction, so
+        // what comes back is the object with its shape.
+        let out = compile_and_emit_with(
+            "WITH c := (SELECT Company LIMIT 1) SELECT { co := c { name }, n := 1 }.co",
+            &make_schema(),
+        );
+        assert!(
+            !out.sql.contains("jsonb_build_object"),
+            "projecting a pointer must not go through jsonb:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("SELECT v AS result, v FROM"),
+            "the object row is already the result row:\n{}",
             out.sql
         );
     }

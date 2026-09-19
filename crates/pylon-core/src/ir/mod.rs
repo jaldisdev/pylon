@@ -809,6 +809,12 @@ pub enum IrExpr {
         fields: Vec<(String, IrExpr)>,
         is_free_object: bool,
     },
+    /// An object, with its shape, standing as a value — a free object's
+    /// object-valued field (`{ device := d { id } }`). Gel models a free shape
+    /// as a real object type whose fields are real pointers, so an object
+    /// field stays an object rather than degrading to its id; this is the
+    /// same composite row a single link emits, just uncorrelated.
+    ObjectSubquery(Box<IrSelect>),
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
     Tuple(Vec<IrExpr>),
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.

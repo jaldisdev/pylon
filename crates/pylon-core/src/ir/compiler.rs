@@ -1067,6 +1067,28 @@ impl<'a> Compiler<'a> {
         Ok(Some(ir))
     }
 
+    /// Reading one field off a free object. Gel compiles a free shape into a
+    /// real object type, so `{ device := d { id }, … }.device` is an ordinary
+    /// path step through a pointer and yields whatever that pointer holds —
+    /// an object stays an object. Extracting it out of the jsonb the free
+    /// object would otherwise build flattens it back to raw JSON. Any field
+    /// left unread still runs: a mutation among them is a data-modifying CTE,
+    /// which Postgres executes whether or not the outer query reads it.
+    fn project_free_object_field(expr: IrExpr, field: &str) -> IrExpr {
+        if let IrExpr::NamedTuple {
+            fields,
+            is_free_object: true,
+        } = &expr
+            && let Some((_, value)) = fields.iter().find(|(name, _)| name == field)
+        {
+            return value.clone();
+        }
+        IrExpr::JsonbField {
+            expr: Box::new(expr),
+            field: field.to_string(),
+        }
+    }
+
     /// Peel nested `Expr::FieldAccess` layers (`X.a.b` parses as
     /// `FieldAccess{FieldAccess{X, "a"}, "b"}`) into the innermost root
     /// expression plus the ordered chain of field names.
@@ -3790,10 +3812,51 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// A free object's field holding an object with a shape (`{ device := d
+    /// { id } }`). Gel compiles a free shape into a real object type whose
+    /// fields are real pointers, so an object field stays an object; without
+    /// this it would compile to the object's bare id, which is not what was
+    /// asked for.
+    fn free_object_link_field(&mut self, expr: &Expr) -> Result<Option<IrExpr>, PyQLError> {
+        let Expr::Shape(sh) = expr else {
+            return Ok(None);
+        };
+        let Some(Expr::Path(p)) = sh.expr.as_ref() else {
+            return Ok(None);
+        };
+        if p.partial {
+            return Ok(None);
+        }
+        let [ast::PathStep::Name(name)] = p.steps.as_slice() else {
+            return Ok(None);
+        };
+        let cte_name = self.cte_object_type(name).map(|_| name.clone());
+        let Ok(td) = self.resolve_path_root(name) else {
+            return Ok(None);
+        };
+        let alias = self.fresh_alias();
+        let source = IrSource {
+            poly: self.poly_fanout_for(&format!("{}::{}", td.module, td.name)),
+            type_name: format!("{}::{}", td.module, td.name),
+            table: match &cte_name {
+                Some(cte) => format!("@cte:{cte}"),
+                None => td.table.clone(),
+            },
+            alias: alias.clone(),
+        };
+        let shape = self.compile_shape(&sh.elements, td, &alias, &td.module)?;
+        Ok(Some(IrExpr::ObjectSubquery(Box::new(IrSelect::schema_bound(
+            source, shape, None,
+        )))))
+    }
+
     /// One field of a free object written as a whole SELECT's result. A
     /// mutation is allowed here for the same reason it is allowed as an item
     /// of a free set — see `dml_as_value`.
     fn free_object_field(&mut self, expr: &Expr) -> Result<IrExpr, PyQLError> {
+        if let Some(object) = self.free_object_link_field(expr)? {
+            return Ok(object);
+        }
         match expr {
             Expr::SubQuery(stmt) if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
                 self.dml_as_value(stmt.as_ref())
@@ -6791,19 +6854,13 @@ impl<'a> Compiler<'a> {
                 }
                 let mut ir = IrExpr::ScalarSubquery(Box::new(select));
                 for field in extra_fields {
-                    ir = IrExpr::JsonbField {
-                        expr: Box::new(ir),
-                        field: field.clone(),
-                    };
+                    ir = Self::project_free_object_field(ir, field);
                 }
                 return Ok(ir);
             }
             let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
             for field in extra_fields {
-                ir = IrExpr::JsonbField {
-                    expr: Box::new(ir),
-                    field: field.clone(),
-                };
+                ir = Self::project_free_object_field(ir, field);
             }
             return Ok(ir);
         };
@@ -6867,10 +6924,7 @@ impl<'a> Compiler<'a> {
         {
             let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
             for field in extra_fields {
-                ir = IrExpr::JsonbField {
-                    expr: Box::new(ir),
-                    field: field.clone(),
-                };
+                ir = Self::project_free_object_field(ir, field);
             }
             return Ok(ir);
         }
@@ -7864,10 +7918,7 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 let ir = self.compile_expr_ctx(inner, ctx)?;
-                Ok(IrExpr::JsonbField {
-                    expr: Box::new(ir),
-                    field: field.clone(),
-                })
+                Ok(Self::project_free_object_field(ir, field))
             }
 
             Expr::TupleIndex { expr: inner, index } => {
@@ -7983,7 +8034,10 @@ impl<'a> Compiler<'a> {
                             {
                                 self.dml_as_value(stmt.as_ref())?
                             }
-                            other => self.compile_expr_ctx(other, ctx)?,
+                            other => match self.free_object_link_field(other)? {
+                                Some(object) => object,
+                                None => self.compile_expr_ctx(other, ctx)?,
+                            },
                         };
                         Ok((name, compiled))
                     })

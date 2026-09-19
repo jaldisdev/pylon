@@ -422,6 +422,7 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
             collect_expr(&ie.else_, tags);
         }
         IrExpr::Subquery(sel) => collect_select(sel, tags),
+        IrExpr::ObjectSubquery(sel) => collect_select(sel, tags),
         IrExpr::Array(elems) | IrExpr::Tuple(elems) => {
             for e in elems {
                 collect_expr(e, tags);
