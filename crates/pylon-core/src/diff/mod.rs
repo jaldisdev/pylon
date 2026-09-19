@@ -2304,6 +2304,29 @@ fn diff_inner(
         }
     }
 
+    // ── Phase 10.6: drop views the schema no longer declares ─────────────────
+    // An interface demoted to a mixin, or one whose junction-backed exclusive
+    // link is gone, leaves a view nothing recreates — the same reasoning
+    // Phase 12 applies to a table the schema stopped declaring.
+    let target_views: HashSet<(String, String)> = crate::export::interface_view_ddl_with_names(target)
+        .into_iter()
+        .chain(crate::export::interface_junction_view_ddl_with_names(target))
+        .map(|(module, name, _)| (module, name))
+        .collect();
+    for view in &current.views {
+        if !target_views.contains(&(view.schema.clone(), view.name.clone())) {
+            steps.push(
+                OpKey::View(view.schema.clone(), view.name.clone()),
+                Verb::Drop,
+                verbosename_interface(&view.schema, &view.name),
+                DiffOp {
+                    sql: format!("DROP VIEW IF EXISTS {};", qn(&view.schema, &view.name)),
+                    non_transactional: false,
+                },
+            );
+        }
+    }
+
     // ── Phase 11: object-returning functions (after tables and views exist) ──
     let obj_fn_ddls = crate::export::object_function_ddl_with_names(target).map_err(|e| e.to_string())?;
     for (module, name, ddl) in obj_fn_ddls {
@@ -4498,6 +4521,33 @@ mod tests {
             ops.iter().all(|op| !op.contains("ALTER COLUMN")),
             "expected no ALTER COLUMN ops, got: {:?}",
             ops
+        );
+    }
+
+    #[test]
+    fn test_demoting_an_interface_to_a_mixin_drops_its_view() {
+        // A mixin is flattened onto its implementors and has no relation of
+        // its own, so the view the interface had must go with it.
+        let mut individual = simple_type("default", "Individual", "Individual");
+        individual.properties = vec![prop("id", "uuid", false)];
+        let schema = SchemaDescriptor {
+            types: vec![individual],
+            ..SchemaDescriptor::default()
+        };
+        let state = DbState {
+            tables: vec![],
+            views: vec![DbView {
+                schema: "public".into(),
+                name: "Account".into(),
+                body_hash: "whatever".into(),
+            }],
+            ..DbState::default()
+        };
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("DROP VIEW IF EXISTS \"public\".\"Account\""),
+            "got:\n{joined}"
         );
     }
 
