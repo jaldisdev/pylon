@@ -2716,14 +2716,50 @@ impl<'a> Compiler<'a> {
                     && p.partial
                     && !p.steps.is_empty()
                 {
+                    // Order/offset/limit of its own pick one row *per source
+                    // row*, which no plain join expresses — so the computed's
+                    // own traversal becomes a correlated LATERAL and the path
+                    // continues from its result.
                     if let Some(m) = modifiers
                         && (m.limit.is_some() || m.offset.is_some() || !m.order_by.is_empty())
                     {
-                        return Err(self.type_err(&format!(
-                            "computed pointer '{step_name}' takes an order/offset/limit of its own, so a path \
-                             cannot continue through it — select it and project from that instead, e.g. \
-                             '(select .{step_name} …).field'"
-                        )));
+                        let mut inner_steps =
+                            vec![PathStep::Name(format!("{}::{}", current_td.module, current_td.name))];
+                        inner_steps.extend(p.steps.iter().cloned());
+                        let inner_path = ast::Path {
+                            steps: inner_steps,
+                            partial: false,
+                        };
+                        let inner_sel = ast::SelectStmt {
+                            result: Expr::Path(inner_path.clone()),
+                            filter: m.filter.clone(),
+                            order_by: m.order_by.clone(),
+                            offset: m.offset.clone(),
+                            limit: m.limit.clone(),
+                            lock: None,
+                        };
+                        let mut inner = self.compile_path_select(&inner_sel, &inner_path, &[], false)?;
+                        Self::correlate_path_select(&mut inner, &current_alias);
+                        let IrPathResult::Object { type_name, .. } = &inner.result else {
+                            return Err(self.type_err(&format!(
+                                "computed pointer '{step_name}' is a scalar — a path cannot continue through it"
+                            )));
+                        };
+                        let target_td = self.resolve_type(&type_name.clone())?;
+                        let target_alias = self.fresh_alias();
+                        let target = IrSource {
+                            type_name: format!("{}::{}", target_td.module, target_td.name),
+                            table: target_td.table.clone(),
+                            alias: target_alias.clone(),
+                        };
+                        joins.push(IrPathJoin::Lateral {
+                            inner: Box::new(inner),
+                            target,
+                        });
+                        current_td = target_td;
+                        current_alias = target_alias;
+                        idx += 1;
+                        continue;
                     }
                     splices += 1;
                     if splices > MAX_COMPUTED_SPLICES {
@@ -6414,11 +6450,15 @@ impl<'a> Compiler<'a> {
                         && let Some(cd) = self.resolve_computed(current, n)
                         && let Ok(expr) = crate::parse::parse_pointer_expr(&cd.expression)
                     {
-                        if let Some((p, _, _)) = Self::pointer_subject(&expr)
+                        if let Some((p, _, modifiers)) = Self::pointer_subject(&expr)
                             && p.partial
                         {
                             let (m, t) = self.walk_path_types(current, &p.steps, depth - 1);
-                            multi = multi || m;
+                            // `limit 1` of its own caps the computed at one
+                            // row however many its path crosses.
+                            let capped = modifiers
+                                .is_some_and(|m| matches!(&m.limit, Some(Expr::Literal(ast::Literal::Int(1)))));
+                            multi = multi || (m && !capped);
                             match t {
                                 Some(t) => current = t,
                                 None => return (multi, None),
