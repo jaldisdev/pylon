@@ -3267,7 +3267,11 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 UnaryOpKind::Not => format!("(NOT {})", inner),
                 UnaryOpKind::Minus => format!("(-{})", inner),
                 UnaryOpKind::Exists => format!("EXISTS({})", inner),
-                UnaryOpKind::Distinct => format!("DISTINCT {}", inner),
+                // A value that reached expression position is a single one,
+                // and a single value is already distinct — `DISTINCT x` is not
+                // an SQL expression. Set-valued operands carry their own
+                // DISTINCT, applied where the set is built.
+                UnaryOpKind::Distinct => inner,
             }
         }
         IrExpr::FunctionCall(f) => {
@@ -4192,6 +4196,13 @@ mod tests {
             "an aggregate in WHERE needs its own query:\n{}",
             out.sql
         );
+    }
+
+    #[test]
+    fn test_distinct_over_a_single_value_is_that_value() {
+        let out = compile_and_emit("SELECT Person { n := (DISTINCT .name) }");
+        assert!(out.sql.contains("\"name\""), "{}", out.sql);
+        assert!(!out.sql.contains("DISTINCT \""), "{}", out.sql);
     }
 
     #[test]

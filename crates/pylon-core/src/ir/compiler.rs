@@ -7241,6 +7241,33 @@ impl<'a> Compiler<'a> {
 
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => self.compile_exists_ctx(&u.operand, ctx),
 
+            // `distinct` in expression position: a set-producing operand
+            // dedupes its own rows, and a single value — an array, a global, a
+            // column — is already distinct, so it stands for itself. (A
+            // statement-level `select distinct …` never reaches here; it is
+            // unwrapped into the select's own `distinct` flag.)
+            Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Distinct => {
+                let operand = self.compile_expr_ctx(&u.operand, ctx)?;
+                Ok(match operand {
+                    IrExpr::PathSubquery(mut ps) => {
+                        ps.distinct = true;
+                        IrExpr::PathSubquery(ps)
+                    }
+                    IrExpr::ArrayFromSelect(src) => IrExpr::ArrayFromSelect(Box::new(match *src {
+                        IrArraySource::Select(mut sel) => {
+                            sel.distinct = true;
+                            IrArraySource::Select(sel)
+                        }
+                        IrArraySource::PathSelect(mut ps) => {
+                            ps.distinct = true;
+                            IrArraySource::PathSelect(ps)
+                        }
+                        other => other,
+                    })),
+                    other => other,
+                })
+            }
+
             Expr::UnaryOp(u) => {
                 let operand = self.compile_expr_ctx(&u.operand, ctx)?;
                 Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
