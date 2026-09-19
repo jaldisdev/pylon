@@ -7599,17 +7599,49 @@ impl<'a> Compiler<'a> {
             Some(PathStep::Backlink(n)) => n.clone(),
             _ => return Err(self.type_err("internal: expected backlink step")),
         };
-        let type_ref = match steps.get(1) {
-            Some(PathStep::TypeIntersection(tr)) => tr,
-            _ => {
-                return Err(PyQLError::Type(PyQLTypeError {
-                    message: format!(
-                        "backlink '.< {backlink_name}' requires a type intersection, \
-                     e.g.: .< {backlink_name}[is SomeType]"
-                    ),
-                    position: Position { line: 0, col: 0 },
-                }));
+        // Without a type intersection the backlink spans every type that
+        // declares the link at this target, so the row qualifies if any one of
+        // them points at it.
+        let Some(PathStep::TypeIntersection(type_ref)) = steps.get(1) else {
+            let schema = self.schema;
+            let owners: Vec<&'a TypeDescriptor> = schema
+                .types
+                .iter()
+                .filter(|t| !t.abstract_)
+                .filter(|t| {
+                    t.links
+                        .iter()
+                        .any(|l| l.name == backlink_name && self.link_target_reaches(&l.target, current_qname))
+                        || t.multilinks
+                            .iter()
+                            .any(|ml| ml.name == backlink_name && self.link_target_reaches(&ml.target, current_qname))
+                })
+                .collect();
+            if owners.is_empty() {
+                return Err(self.type_err(&format!(
+                    "no type has a link or multi-link '{backlink_name}' pointing to {current_qname}"
+                )));
             }
+            let mut combined: Option<IrExpr> = None;
+            for owner_td in owners {
+                let one = self.backlink_exists_for_owner(
+                    owner_td,
+                    &backlink_name,
+                    &steps[1..],
+                    comparison.clone(),
+                    current_qname,
+                    alias,
+                )?;
+                combined = Some(match combined {
+                    None => one,
+                    Some(previous) => IrExpr::BinOp(Box::new(IrBinOp {
+                        left: previous,
+                        op: ast::BinOpKind::Or,
+                        right: one,
+                    })),
+                });
+            }
+            return Ok(combined.expect("owners is non-empty"));
         };
 
         let type_name = match &type_ref.module {
@@ -7617,6 +7649,23 @@ impl<'a> Compiler<'a> {
             None => type_ref.name.clone(),
         };
         let target_td = self.resolve_type(&type_name)?;
+        self.backlink_exists_for_owner(target_td, &backlink_name, &steps[2..], comparison, current_qname, alias)
+    }
+
+    /// One owner type's half of `compile_backlink_as_exists`: EXISTS over the
+    /// rows of `target_td` that link back to `alias`, plus whatever the
+    /// remaining path steps and comparison require of them.
+    #[allow(clippy::too_many_arguments)]
+    fn backlink_exists_for_owner(
+        &mut self,
+        target_td: &'a TypeDescriptor,
+        backlink_name: &str,
+        rest: &[ast::PathStep],
+        comparison: Option<(ast::BinOpKind, IrExpr, bool)>,
+        current_qname: &str,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let backlink_name = backlink_name.to_string();
         let target_qname = format!("{}::{}", target_td.module, target_td.name);
         let target_table = target_td.table.clone();
         let t_alias = self.fresh_alias();
@@ -7759,7 +7808,6 @@ impl<'a> Compiler<'a> {
             }));
         };
 
-        let rest = &steps[2..];
         let tail_cond = self.compile_backlink_tail(rest, comparison, &target_qname, &t_alias)?;
 
         let filter = match tail_cond {
