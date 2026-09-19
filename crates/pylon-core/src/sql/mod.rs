@@ -1650,6 +1650,11 @@ fn emit_array_source(src: &IrArraySource) -> String {
             append_filter(&mut sql, &s.filter);
             format!("ARRAY({})", sql)
         }
+        IrArraySource::StmtColumn { stmt, column } => format!(
+            "ARRAY(SELECT {} FROM (\n{}\n) AS \"_rows\")",
+            qi(column),
+            emit_dml_as_cte_source(stmt),
+        ),
         IrArraySource::PathSelect(ps) => {
             let scalar = match &ps.result {
                 IrPathResult::Scalar(e, _) => emit_expr(e),
@@ -4129,6 +4134,27 @@ mod tests {
     fn test_with_binding_in_a_computed_reads_the_enclosing_object() {
         let out = compile_and_emit("SELECT Person { n := (WITH own := .name SELECT own) }");
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_assert_over_an_object_set_returns_rows() {
+        let out = compile_and_emit("SELECT std::assert_distinct((SELECT Person))");
+        assert!(
+            out.sql.contains("\"assert_distinct\"(ARRAY(SELECT \"id\""),
+            "{}",
+            out.sql
+        );
+        assert!(out.sql.contains("= ANY("), "{}", out.sql);
+        assert!(out.sql.contains("\"Person\" AS \"t1\""), "{}", out.sql);
+        assert!(!out.sql.contains("unnest("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_assert_over_a_for_union_reads_its_rows() {
+        let out =
+            compile_and_emit("SELECT std::assert_distinct((FOR n IN {1, 2} UNION (SELECT Person FILTER .age = n)))");
+        assert!(out.sql.contains("CROSS JOIN LATERAL"), "{}", out.sql);
+        assert!(out.sql.contains("= ANY("), "{}", out.sql);
     }
 
     #[test]

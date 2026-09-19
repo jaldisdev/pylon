@@ -355,6 +355,7 @@ fn collect_free_expr(item: &IrFreeExpr, tags: &mut Vec<String>) {
 fn collect_array_source(src: &IrArraySource, tags: &mut Vec<String>) {
     match src {
         IrArraySource::Select(sel) => collect_select(sel, tags),
+        IrArraySource::StmtColumn { stmt, .. } => collect_stmt(stmt, tags),
         IrArraySource::PathSelect(ps) => collect_path_select(ps, tags),
         IrArraySource::RawExpr {
             source,
