@@ -540,7 +540,9 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 ));
             }
             append_filter(&mut sql, &upd.filter);
-            sql.push_str("\n    RETURNING *");
+            // Qualified: past a FROM, a bare `*` carries the joined relation's
+            // columns too, and a reader of this CTE then finds two `id`s.
+            sql.push_str(&format!("\n    RETURNING {}.*", qi(alias)));
             sql
         }
         IrStmt::Delete(del) => {
@@ -828,7 +830,9 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
             ));
         }
         append_filter(&mut upd_sql, &upd.filter);
-        upd_sql.push_str("\nRETURNING *");
+        // See `emit_dml_as_cte_source`: past a FROM, a bare `*` would carry the
+        // joined relation's columns into this CTE beside the target's.
+        upd_sql.push_str(&format!("\nRETURNING {}.*", qi(alias)));
         parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, upd_sql));
     } else {
         let mut sel = format!(
@@ -4419,6 +4423,22 @@ mod tests {
     }
 
     #[test]
+    fn test_an_update_past_a_from_returns_only_its_own_columns() {
+        // `UPDATE … FROM cte … RETURNING *` returns the joined relation's
+        // columns as well, so a CTE built that way carries two `id`s and any
+        // later reference to one is ambiguous.
+        let out = compile_and_emit(
+            "SELECT { (UPDATE Person FILTER .name = 'a' SET { company := (INSERT Company { name := 'c' }) }) }",
+        );
+        assert!(out.sql.contains("FROM \"_nested_dml_0\""), "{}", out.sql);
+        assert!(
+            out.sql.contains("RETURNING \"t0\".*"),
+            "the update names its own target:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_nested_insert_in_a_mutation_written_as_a_free_set() {
         let out = compile_and_emit(
             "SELECT { (UPDATE Person FILTER .name = 'a' SET { company := (INSERT Company { name := 'c' }) }) }",
@@ -7436,7 +7456,7 @@ select owner { posts := (select owner.posts.title) };",
         let out = compile_and_emit("SELECT (UPDATE Person FILTER .id = $id SET { name := $name }) { id, name }");
         assert!(out.sql.contains("WITH\n\"_dml\" AS ("));
         assert!(out.sql.contains("UPDATE"));
-        assert!(out.sql.contains("RETURNING *"));
+        assert!(out.sql.contains("RETURNING \"t1\".*"), "{}", out.sql);
         assert!(out.sql.contains("\"name\"::text"));
     }
 
