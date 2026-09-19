@@ -1397,12 +1397,39 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
 /// appear as a free scalar/object/tuple field, which (unlike a schema
 /// object's `emit_scalar`) has no dedicated per-pointer descriptor to carry
 /// this, so it must be recovered from the expression itself.
-fn enum_type_of_expr(expr: &IrExpr) -> Option<String> {
+fn enum_type_of_expr(expr: &IrExpr) -> Option<QualifiedPgType> {
     match expr {
-        IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with('"') => Some(pg_quoted_to_pylon(pg_type)),
-        IrExpr::EnumLiteral { pg_type, .. } => Some(pg_quoted_to_pylon(pg_type)),
+        IrExpr::ColumnRef { pg_type, .. } => QualifiedPgType::of(pg_type),
+        IrExpr::EnumLiteral { pg_type, .. } => Some(QualifiedPgType {
+            name: pg_quoted_to_pylon(pg_type),
+            is_array: false,
+        }),
         _ => None,
     }
+}
+
+/// The enum type a shape position decodes as — wider than `enum_type_of_expr`,
+/// which only answers for the values that need a `::text` cast emitting.
+///
+/// `[is Concrete].*` wraps each of the concrete type's properties in a
+/// correlated subquery of its own, so the enum sits a level down and the
+/// subquery's own emission has already cast it. Without looking through to it
+/// the outer shape stays a plain `Scalar` and the label is handed back as a
+/// bare string rather than the enum member.
+fn enum_type_of_shape_expr(expr: &IrExpr) -> Option<QualifiedPgType> {
+    if let Some(qualified) = enum_type_of_expr(expr) {
+        return Some(qualified);
+    }
+    let IrExpr::Subquery(select) = expr else {
+        return None;
+    };
+    let [IrRowSource::Bound { shape, .. }] = select.rows.as_slice() else {
+        return None;
+    };
+    let [IrShapePointer::Scalar(scalar)] = shape.as_slice() else {
+        return None;
+    };
+    QualifiedPgType::of(&scalar.pg_type)
 }
 
 /// Emit `expr` for use as a free object/tuple field value — casts to
@@ -1411,10 +1438,9 @@ fn enum_type_of_expr(expr: &IrExpr) -> Option<String> {
 /// (`pylon-pgcon` also discovers enum OIDs at connect time now, so this cast
 /// is belt-and-braces rather than load-bearing for decoding.)
 fn emit_free_field_expr(expr: &IrExpr) -> String {
-    if enum_type_of_expr(expr).is_some() {
-        format!("{}::text", emit_expr(expr))
-    } else {
-        emit_expr(expr)
+    match enum_type_of_expr(expr) {
+        Some(qualified) => format!("{}{}", emit_expr(expr), qualified.text_cast()),
+        None => emit_expr(expr),
     }
 }
 
@@ -1422,12 +1448,8 @@ fn emit_free_field_expr(expr: &IrExpr) -> String {
 /// value is enum-typed (see `enum_type_of_expr`), else a plain `Scalar`.
 fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::ShapeNode;
-    match enum_type_of_expr(expr) {
-        Some(enum_type) => ShapeNode::Enum {
-            name: name.to_string(),
-            position,
-            enum_type,
-        },
+    match enum_type_of_shape_expr(expr) {
+        Some(qualified) => qualified.shape_node(name.to_string(), position),
         None => ShapeNode::Scalar {
             name: name.to_string(),
             position,
@@ -1731,14 +1753,14 @@ fn emit_array_source(src: &IrArraySource) -> String {
 /// so they decode outside of a typed composite.
 fn emit_key_expr(expr: &IrExpr) -> String {
     if let IrExpr::ColumnRef { alias, column, pg_type } = expr
-        && pg_type.starts_with('"')
+        && let Some(qualified) = QualifiedPgType::of(pg_type)
     {
         let col_ref = if alias.is_empty() {
             qi(column)
         } else {
             format!("{}.{}", qi(alias), qi(column))
         };
-        return format!("{}::text", col_ref);
+        return format!("{}{}", col_ref, qualified.text_cast());
     }
     emit_expr(expr)
 }
@@ -1763,15 +1785,10 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
     for (i, (key_name, key_expr)) in grp.keys.iter().enumerate() {
         let pos = i + 1;
         if let IrExpr::ColumnRef { pg_type, .. } = key_expr
-            && pg_type.starts_with('"')
+            && let Some(qualified) = QualifiedPgType::of(pg_type)
         {
             key_exprs_sql.push(emit_key_expr(key_expr));
-            let enum_type = pg_quoted_to_pylon(pg_type);
-            key_nodes.push(ShapeNode::Enum {
-                name: key_name.clone(),
-                position: pos,
-                enum_type,
-            });
+            key_nodes.push(qualified.shape_node(key_name.clone(), pos));
             continue;
         }
         key_exprs_sql.push(emit_expr(key_expr));
@@ -1947,14 +1964,10 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 // Schema-qualified types (enums, domains) have unknown OIDs inside ROW() —
                 // cast to text so the value's shape doesn't depend on a runtime OID.
                 if let IrExpr::ColumnRef { pg_type, .. } = ir_expr {
-                    if pg_type.starts_with('"') {
-                        let enum_type = pg_quoted_to_pylon(pg_type);
-                        let expr = format!("ROW({}::text) AS result", emit_expr(ir_expr));
-                        let shape = ShapeNode::Enum {
-                            name: String::new(),
-                            position: 0,
-                            enum_type,
-                        };
+                    if let Some(qualified) = QualifiedPgType::of(pg_type) {
+                        let expr =
+                            format!("ROW({}{}) AS result", emit_expr(ir_expr), qualified.text_cast());
+                        let shape = qualified.shape_node(String::new(), 0);
                         (expr, shape)
                     } else {
                         let expr = format!("ROW({}) AS result", emit_expr(ir_expr));
@@ -2829,6 +2842,63 @@ fn pg_quoted_to_pylon(pg_type: &str) -> String {
     }
 }
 
+/// A schema-qualified custom type (an enum or a domain) named in a property's
+/// `pg_type`, together with whether the column holds an array of it.
+///
+/// Both forms are emitted as text -- `::text` for a scalar, `::text[]` for an
+/// array -- so a value's shape never depends on an OID the database assigns
+/// when the migration creating the type runs. The array case has to be told
+/// apart from the scalar one: `"access"."AuthenticationMethod"[]` starts with a
+/// quote just as `"account"."InterfaceAppearance"` does, and reading it as a
+/// scalar enum casts a whole array to a single `text` (`'{MagicLink}'`) and
+/// shapes it as one enum value.
+struct QualifiedPgType {
+    /// Pylon-qualified name of the element type, e.g. `access::AuthenticationMethod`.
+    name: String,
+    is_array: bool,
+}
+
+impl QualifiedPgType {
+    fn of(pg_type: &str) -> Option<Self> {
+        let (element, is_array) = match pg_type.strip_suffix("[]") {
+            Some(element) => (element, true),
+            None => (pg_type, false),
+        };
+        element.starts_with('"').then(|| Self {
+            name: pg_quoted_to_pylon(element),
+            is_array,
+        })
+    }
+
+    /// The cast that carries this value back as text.
+    fn text_cast(&self) -> &'static str {
+        if self.is_array { "::text[]" } else { "::text" }
+    }
+
+    /// How the decoded value is shaped: a single enum, or a list of them.
+    fn shape_node(&self, name: String, position: usize) -> ShapeNode {
+        let element = ShapeNode::Enum {
+            name: name.clone(),
+            position,
+            enum_type: self.name.clone(),
+        };
+        if !self.is_array {
+            return element;
+        }
+        ShapeNode::Array {
+            name,
+            // Each element arrives as the label itself rather than as a field
+            // of a record, which the decoders read at position 0.
+            element: Box::new(ShapeNode::Enum {
+                name: String::new(),
+                position: 0,
+                enum_type: self.name.clone(),
+            }),
+            position,
+        }
+    }
+}
+
 fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, ShapeNode) {
     if let Some(nt_name) = f.pg_type.strip_prefix("__nt__:") {
         let sql = if table_alias.is_empty() {
@@ -2849,21 +2919,14 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
     }
     // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to a static
     // anonymous_record_decode. Cast to text — the string label is all the decoder needs.
-    if f.pg_type.starts_with('"') {
-        let enum_type = pg_quoted_to_pylon(&f.pg_type);
+    if let Some(qualified) = QualifiedPgType::of(&f.pg_type) {
+        let cast = qualified.text_cast();
         let sql = if table_alias.is_empty() {
-            format!("{}::text", qi(&f.column))
+            format!("{}{}", qi(&f.column), cast)
         } else {
-            format!("{}.{}::text", qi(table_alias), qi(&f.column))
+            format!("{}.{}{}", qi(table_alias), qi(&f.column), cast)
         };
-        return (
-            sql,
-            ShapeNode::Enum {
-                name: f.alias.clone(),
-                position: pos,
-                enum_type,
-            },
-        );
+        return (sql, qualified.shape_node(f.alias.clone(), pos));
     }
     // A structural pylon.Tuple[...]-typed property — same jsonb column shape
     // as the nominal `__nt__:` case above, just with no registered dataclass
@@ -7891,6 +7954,155 @@ mod tests {
             out.sql.contains("\"first_name\""),
             "expected the concrete type's stored property too, got:\n{}",
             out.sql
+        );
+    }
+
+    #[test]
+    fn test_enum_array_property_casts_to_text_array_and_shapes_as_a_list() {
+        // Regression: an `array<enum>` property's pg_type is
+        // `"module"."Type"[]`, which starts with a quote exactly as a scalar
+        // enum's does. Read as a scalar it was cast to a single `::text`,
+        // so `{MagicLink}` -- Postgres's text rendering of the whole array --
+        // came back as one enum value, and the polymorphic path, which casts
+        // nothing, failed outright with "no decoder for PostgreSQL type OID".
+        let mut schema = make_schema();
+        schema.enums.push(crate::schema::EnumDescriptor {
+            name: "Gender".into(),
+            module: "default".into(),
+            members: vec!["Male".into(), "Female".into()],
+        });
+        schema.types[0].properties.push(crate::schema::PropertyDescriptor {
+            name: "genders".into(),
+            pg_type: r#""default"."Gender"[]"#.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+
+        let out = compile_and_emit_with("SELECT Person { genders }", &schema);
+        assert!(
+            out.sql.contains(r#""genders"::text[]"#),
+            "expected a text[] cast, got:\n{}",
+            out.sql
+        );
+
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape, got {:?}", out.shape.root)
+        };
+        let genders = pointers
+            .iter()
+            .find(|node| matches!(node, crate::query::ShapeNode::Array { name, .. } if name == "genders"))
+            .unwrap_or_else(|| panic!("expected an Array-shaped pointer, got {pointers:?}"));
+        let crate::query::ShapeNode::Array { element, .. } = genders else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                element.as_ref(),
+                crate::query::ShapeNode::Enum { enum_type, position: 0, .. }
+                    if enum_type == "default::Gender"
+            ),
+            "expected the elements to be enum-shaped, got {element:?}",
+        );
+    }
+
+    #[test]
+    fn test_scalar_enum_property_still_casts_to_a_single_text() {
+        let mut schema = make_schema();
+        schema.enums.push(crate::schema::EnumDescriptor {
+            name: "Gender".into(),
+            module: "default".into(),
+            members: vec!["Male".into(), "Female".into()],
+        });
+        schema.types[0].properties.push(crate::schema::PropertyDescriptor {
+            name: "gender".into(),
+            pg_type: r#""default"."Gender""#.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+
+        let out = compile_and_emit_with("SELECT Person { gender }", &schema);
+        assert!(
+            out.sql.contains(r#""gender"::text"#) && !out.sql.contains(r#""gender"::text[]"#),
+            "expected a plain text cast, got:\n{}",
+            out.sql
+        );
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape")
+        };
+        assert!(
+            pointers.iter().any(|node| matches!(
+                node,
+                crate::query::ShapeNode::Enum { name, enum_type, .. }
+                    if name == "gender" && enum_type == "default::Gender"
+            )),
+            "expected an Enum-shaped pointer, got {pointers:?}",
+        );
+    }
+
+    #[test]
+    fn test_type_intersection_splat_keeps_enum_pointers_enum_shaped() {
+        // Regression: `[is Concrete].*` wraps each property in a correlated
+        // subquery, so the outer shape saw an `IrExpr::Subquery` rather than a
+        // column and fell back to a plain Scalar — handing back `'System'`
+        // where a direct select gave `InterfaceAppearance.System`.
+        let mut schema = make_interface_schema();
+        schema.enums.push(crate::schema::EnumDescriptor {
+            name: "Gender".into(),
+            module: "default".into(),
+            members: vec!["Male".into(), "Female".into()],
+        });
+        // An enum that lives only on the concrete type, so it can only be
+        // reached through the intersection.
+        let individual = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Individual")
+            .expect("the interface schema has an Individual type");
+        individual.properties.push(crate::schema::PropertyDescriptor {
+            name: "gender".into(),
+            pg_type: r#""default"."Gender""#.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+
+        let out = compile_and_emit_with("SELECT Account { [is Individual].* }", &schema);
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape, got {:?}", out.shape.root)
+        };
+        assert!(
+            pointers.iter().any(|node| matches!(
+                node,
+                crate::query::ShapeNode::Enum { name, enum_type, .. }
+                    if name == "gender" && enum_type == "default::Gender"
+            )),
+            "expected the enum property to stay enum-shaped through the intersection, got {pointers:?}",
         );
     }
 
