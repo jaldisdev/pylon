@@ -717,6 +717,10 @@ struct Compiler<'a> {
     nested_cte_counter: usize,
     /// Non-fatal warnings collected during compilation.
     warnings: Vec<String>,
+    /// Depth of `any()`/`all()` arguments currently being compiled. Wrapping a
+    /// set-valued comparison in one of those *is* the explicit intent the
+    /// multi-link FILTER warning asks for, so the warning stays quiet inside.
+    explicit_set_depth: usize,
     /// User-configurable session options — see `SessionConfig`. Always
     /// `default()` for every entry point except `compile_with_config`.
     config: crate::ir::SessionConfig,
@@ -780,6 +784,7 @@ impl<'a> Compiler<'a> {
             pending_nested_ctes: vec![],
             nested_cte_counter: 0,
             warnings: vec![],
+            explicit_set_depth: 0,
             config,
             anchors: Vec::new(),
             link_prop_scope: Vec::new(),
@@ -7407,12 +7412,25 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
+                // `any(...)`/`all(...)` say outright that the argument is a
+                // set, so the comparison inside must not also be warned about.
+                // The argument is compiled before `resolve_fn_call` ever sees
+                // which function this is, which is why the guard goes here.
+                let is_explicit_set = f.module.as_deref().unwrap_or("std") == "std"
+                    && matches!(f.name.as_str(), "any" | "all")
+                    && f.args.len() == 1;
+                if is_explicit_set {
+                    self.explicit_set_depth += 1;
+                }
                 let args = f
                     .args
                     .iter()
                     .map(|a| self.compile_expr_ctx(a, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.resolve_fn_call(f.module.as_deref(), &f.name, args)
+                    .collect::<Result<Vec<_>, _>>();
+                if is_explicit_set {
+                    self.explicit_set_depth -= 1;
+                }
+                self.resolve_fn_call(f.module.as_deref(), &f.name, args?)
             }
 
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => self.compile_exists_ctx(&u.operand, ctx),
@@ -8789,7 +8807,7 @@ impl<'a> Compiler<'a> {
 
         // Warn: multi-link traversal in a comparison returns a set, not a single boolean.
         // The query works (compiled as EXISTS), but `any()` makes the intent explicit.
-        {
+        if self.explicit_set_depth == 0 {
             let pointer_path: Vec<_> = path_steps
                 .iter()
                 .map(|s| match s {
