@@ -660,6 +660,10 @@ struct Compiler<'a> {
     /// 1).plan.tier`: the subject's landing row is what FILTER/ORDER BY/LIMIT
     /// scope to, not the type the whole path ends on.
     modifier_anchor: Option<(String, String)>,
+    /// WITH bindings that name a path off the enclosing object. They read that
+    /// object's alias, which a CTE emitted ahead of the FROM clause cannot
+    /// see, so they stand in for their value wherever the name is used.
+    inline_bindings: std::collections::HashMap<String, IrExpr>,
     /// True while compiling a `@pylon.function` body. A session global cannot
     /// be a query parameter there — a `CREATE FUNCTION` body has nothing to
     /// bind one to — so it is read out of the `__pylon_json_globals__`
@@ -774,6 +778,7 @@ impl<'a> Compiler<'a> {
             hoisted_ctes: Vec::new(),
             pending_detached: false,
             modifier_anchor: None,
+            inline_bindings: std::collections::HashMap::new(),
             in_fn_body: false,
             fns_needing_globals: None,
             used_globals_arg: false,
@@ -784,6 +789,24 @@ impl<'a> Compiler<'a> {
     /// empty string for a free binding) in `cte_types`, and — when it's a
     /// single free row — its `IrFreeExpr` in `cte_free_items` so a later
     /// `name.field` reference can resolve to `IrExpr::CteFieldRef`.
+    /// True when `name` is bound to a value rather than to an object set —
+    /// a scalar WITH binding, or one inlined by `bind_inline_if_correlated`.
+    fn is_value_binding(&self, name: &str) -> bool {
+        self.inline_bindings.contains_key(name) || self.cte_types.get(name).is_some_and(|t| !t.contains("::"))
+    }
+
+    /// Bind `name` to the value of a relative path off the enclosing object —
+    /// `with handle_id := .id`. Returns false when the binding is anything
+    /// else, which the caller hoists into a CTE as usual.
+    fn bind_inline_if_correlated(&mut self, name: &str, expr: &Expr) -> Result<bool, PyQLError> {
+        if self.anchors.is_empty() || !matches!(expr, Expr::Path(p) if p.partial) {
+            return Ok(false);
+        }
+        let ir = self.compile_free_expr(expr)?;
+        self.inline_bindings.insert(name.to_string(), ir);
+        Ok(true)
+    }
+
     fn register_cte(&mut self, name: &str, ir_stmt: &IrStmt) -> String {
         let type_name = cte_stmt_type(ir_stmt);
         self.cte_types.insert(name.to_string(), type_name.clone());
@@ -2169,6 +2192,9 @@ impl<'a> Compiler<'a> {
             // The actual CTE SQL is handled at the top-level compile() boundary.
             Stmt::With(w) => {
                 for alias in &w.aliases {
+                    if self.bind_inline_if_correlated(&alias.name, &alias.expr)? {
+                        continue;
+                    }
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
                     let type_name = self.register_cte(&alias.name, &ir_inner);
                     self.hoisted_ctes.push(IrCteDef {
@@ -3588,12 +3614,7 @@ impl<'a> Compiler<'a> {
                         return true;
                     }
                     // Scalar CTE: type string has no "::" (object types always do).
-                    if self
-                        .cte_types
-                        .get(n.as_str())
-                        .map(|t| !t.contains("::"))
-                        .unwrap_or(false)
-                    {
+                    if self.is_value_binding(n.as_str()) {
                         return true;
                     }
                     // Function parameter — only populated while compiling a
@@ -3625,10 +3646,7 @@ impl<'a> Compiler<'a> {
         let ast::PathStep::Name(n) = &p.steps[0] else {
             return false;
         };
-        self.cte_types
-            .get(n.as_str())
-            .map(|t| !t.contains("::"))
-            .unwrap_or(false)
+        self.is_value_binding(n.as_str())
     }
 
     // ── FREE SELECT ───────────────────────────────────────────────────────────────
@@ -6353,6 +6371,9 @@ impl<'a> Compiler<'a> {
         // statement's own WITH clause and the inner statement takes over.
         if let Stmt::With(w) = stmt {
             for alias in &w.aliases {
+                if self.bind_inline_if_correlated(&alias.name, &alias.expr)? {
+                    continue;
+                }
                 let ir_stmt = compile_cte_binding(self, &alias.expr)?;
                 let type_name = self.register_cte(&alias.name, &ir_stmt);
                 self.hoisted_ctes.push(IrCteDef {
@@ -6451,7 +6472,7 @@ impl<'a> Compiler<'a> {
         // is a value already, not something to traverse from.
         if !path.partial
             && let [ast::PathStep::Name(name)] = path.steps.as_slice()
-            && self.cte_types.get(name).is_some_and(|t| !t.contains("::"))
+            && self.is_value_binding(name)
         {
             let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
             for field in extra_fields {
@@ -7728,6 +7749,9 @@ impl<'a> Compiler<'a> {
                 fields: vec![],
                 is_free_object: true,
             });
+        }
+        if let Some(ir) = self.inline_bindings.get(name) {
+            return Some(ir.clone());
         }
         if let Some(t) = self.cte_types.get(name) {
             // A scalar binding records its pg type here (see `cte_stmt_type`);

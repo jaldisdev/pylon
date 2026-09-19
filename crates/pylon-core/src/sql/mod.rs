@@ -4186,6 +4186,17 @@ mod tests {
     }
 
     #[test]
+    fn test_correlated_with_binding_is_not_hoisted() {
+        let out = compile_and_emit("SELECT Person { n := (WITH own := .name SELECT own) }");
+        assert!(
+            !out.sql.contains("\"own\" AS ("),
+            "the binding is inlined:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("\"name\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_for_over_a_with_binding_iterates_every_row() {
         let out = compile_and_emit(
             "WITH names := (SELECT Person.name) FOR n IN names UNION (SELECT Person FILTER .name = n)",
