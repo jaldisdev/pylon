@@ -26,6 +26,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pylon.exceptions import ClientConnectionClosedError
+
 from pylon.config import DatabaseConfig
 from pylon.exceptions import (
     InterfaceError,
@@ -807,6 +809,46 @@ class TestEnsureConnected:
 
         run(_run())
 
+    def test_a_query_opens_the_pool_when_nothing_connected_first(self):
+        # Gel's client connects on its first query, and a client is reached
+        # from request handlers, workers and CLI commands alike, which share
+        # no startup to connect from.
+        async def _run():
+            from pylon.client import Client
+            from pylon.config import CacheConfig
+
+            cfg = MagicMock()
+            cfg.database = DatabaseConfig(host='h', port=5432, name='db', user='u')
+            cfg.cache = CacheConfig(enabled=False)
+
+            client = Client(cfg)
+            with patch.object(Client, 'ensure_connected', new=AsyncMock()) as connect:
+                with pytest.raises(ClientConnectionClosedError):
+                    await client._connected_pool()
+            connect.assert_awaited_once()
+
+        run(_run())
+
+    def test_a_closed_client_stays_closed(self):
+        async def _run():
+            from pylon.client import Client
+            from pylon.config import CacheConfig
+
+            cfg = MagicMock()
+            cfg.database = DatabaseConfig(host='h', port=5432, name='db', user='u')
+            cfg.cache = CacheConfig(enabled=False)
+
+            client = Client(cfg)
+            client._ref.pool = MagicMock()
+            await client.aclose()
+
+            with patch.object(Client, 'ensure_connected', new=AsyncMock()) as connect:
+                with pytest.raises(ClientConnectionClosedError):
+                    await client._connected_pool()
+            connect.assert_not_awaited()
+
+        run(_run())
+
     def test_second_call_is_noop(self):
         async def _run():
             from pylon.client import Client
@@ -837,6 +879,15 @@ class TestEnsureConnected:
 # ---------------------------------------------------------------------------
 
 
+def client_handing_out(pool):
+    """A stand-in client for `RetryingTransaction`, which takes the client
+    rather than the pool so it can open one on the first awaited attempt."""
+
+    client = MagicMock()
+    client._connected_pool = AsyncMock(return_value=pool)
+    return client
+
+
 class TestRetryingTransaction:
     def test_commits_on_success(self):
         async def _run():
@@ -851,7 +902,7 @@ class TestRetryingTransaction:
             pool.transaction = AsyncMock(return_value=MagicMock())
 
             with patch('pylon.client.AsyncTransaction', return_value=tx_obj):
-                iterator = RetryingTransaction(pool, attempts=3, isolation='serializable')
+                iterator = RetryingTransaction(client_handing_out(pool), attempts=3, isolation='serializable')
                 iterations = 0
                 async for tx in iterator:
                     async with tx:
@@ -890,7 +941,7 @@ class TestRetryingTransaction:
             pool.transaction = AsyncMock(return_value=MagicMock())
 
             with patch('pylon.client.AsyncTransaction', FakeTx):
-                iterator = RetryingTransaction(pool, attempts=2, isolation='serializable')
+                iterator = RetryingTransaction(client_handing_out(pool), attempts=2, isolation='serializable')
                 with pytest.raises(TransactionSerializationError):
                     async for tx in iterator:
                         async with tx:
@@ -935,7 +986,7 @@ class TestRollback:
             pool.transaction = AsyncMock(return_value=pgcon_tx)
 
             bodies = 0
-            async for tx in RetryingTransaction(pool, attempts=3, isolation='serializable'):
+            async for tx in RetryingTransaction(client_handing_out(pool), attempts=3, isolation='serializable'):
                 async with tx:
                     bodies += 1
                     raise Rollback

@@ -199,8 +199,11 @@ class RetryingTransaction:
     Do not construct directly — use ``client.transaction()``.
     """
 
-    def __init__(self, pool: PgconPool, *, attempts: int, isolation: str) -> None:
-        self._pool = pool
+    def __init__(self, client: Client, *, attempts: int, isolation: str) -> None:
+        # The client rather than its pool: `Client.transaction()` is sync, so
+        # a pool that is not open yet can only be opened once the first
+        # attempt is awaited.
+        self._client = client
         self._attempts = attempts
         self._isolation = isolation
         self._attempt = 0
@@ -224,7 +227,8 @@ class RetryingTransaction:
             # Exponential back-off: attempt 1 → 0 ms, 2 → 100 ms, 3 → 200 ms, …
             await asyncio.sleep((self._attempt - 1) * 0.1)
 
-        pgcon_tx = await self._pool.transaction(self._isolation)
+        pool = await self._client._connected_pool()
+        pgcon_tx = await pool.transaction(self._isolation)
         tx = AsyncTransaction(pgcon_tx)
         self._prev_tx = tx
         self._attempt += 1
@@ -246,11 +250,14 @@ _ANALYZE_PREFIX_RE = re.compile(r'(?is)^analyze\b')
 class _PoolRef:
     """Shared mutable pool holder so Client.with_globals() siblings stay in sync."""
 
-    __slots__ = ('lock', 'pool')
+    __slots__ = ('closed', 'lock', 'pool')
 
     def __init__(self) -> None:
         self.pool: PgconPool | None = None
         self.lock = asyncio.Lock()
+        # Tells a client that was closed from one that has never connected:
+        # without it, a query after `aclose()` would quietly open a new pool.
+        self.closed = False
 
 
 class Client:
@@ -284,6 +291,7 @@ class Client:
         async with self._ref.lock:
             if self._ref.pool is not None:
                 return
+            self._ref.closed = False
             dsn = self._config.database.dsn or _build_dsn(self._config.database)
             # Swap the pylon:// scheme for postgresql:// if present.
             dsn = dsn.replace('pylon://', 'postgresql://', 1)
@@ -308,6 +316,7 @@ class Client:
     async def aclose(self) -> None:
         """Close the connection pool and release all resources."""
         async with self._ref.lock:
+            self._ref.closed = True
             if self._ref.pool is not None:
                 self._ref.pool = None
 
@@ -327,6 +336,25 @@ class Client:
         if self._ref.pool is None:
             raise ClientConnectionClosedError('Client is not connected. Call await client.ensure_connected() first.')
         return self._ref.pool
+
+    async def _connected_pool(self) -> PgconPool:
+        """The pool, opening it on first use.
+
+        A client is reached from request handlers, background workers and CLI
+        commands alike, which share no startup between them to connect from,
+        so requiring an explicit `ensure_connected()` means every one of those
+        entry points has to remember — and the ones that forget fail on their
+        first query rather than at startup. `ensure_connected` is idempotent
+        and takes the lock itself, so once connected this costs one check.
+
+        A client that has been closed stays closed; only one that was never
+        connected opens here.
+        """
+        if self._ref.pool is None:
+            if self._ref.closed:
+                raise ClientConnectionClosedError('Client is closed.')
+            await self.ensure_connected()
+        return self._require_pool()
 
     # ------------------------------------------------------------------
     # Query interface
@@ -376,7 +404,7 @@ class Client:
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
         )
@@ -405,7 +433,7 @@ class Client:
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if more
         than one object matches.
         """
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
         )
@@ -444,7 +472,7 @@ class Client:
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
         await pool.execute_compiled(compiled, params)
         from pylon import cache as _cache
@@ -504,7 +532,7 @@ class Client:
 
         Returns ``"[]"`` when the result set is empty.
         """
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
         from pylon import cache as _cache
@@ -525,7 +553,7 @@ class Client:
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if more than one
         object matches.
         """
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
         from pylon import cache as _cache
@@ -571,7 +599,7 @@ class Client:
         Rust-side): ``path``, ``marker_offset``, ``relations``, ``cost``,
         ``children`` (each a ``{"name": ..., "node": {...}}`` entry).
         """
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         normalized = pyql if _ANALYZE_PREFIX_RE.match(pyql.lstrip()) else f'analyze {pyql}'
         compiled, params = await _compile_and_resolve(
             normalized, _merge_args(args, kwargs), self._config, self._globals, self._config_options
@@ -689,7 +717,7 @@ class Client:
         """
         if attempts < 1:
             raise InterfaceError('attempts must be >= 1.')
-        return RetryingTransaction(self._require_pool(), attempts=attempts, isolation=isolation)
+        return RetryingTransaction(self, attempts=attempts, isolation=isolation)
 
     # ------------------------------------------------------------------
     # Raw access (escape hatch)
@@ -706,7 +734,7 @@ class Client:
         ``SELECT count(*) AS n``) works the same as PyQL's own ``result``
         column convention.
         """
-        pool = self._require_pool()
+        pool = await self._connected_pool()
         yield pool
 
     # ------------------------------------------------------------------
