@@ -110,6 +110,9 @@ pub struct DbEnum {
 pub struct DbDomain {
     pub schema: String,
     pub name: String,
+    /// Names of the CHECK constraints the domain carries.
+    #[serde(default)]
+    pub checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +191,11 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         .map(|s| DbDomain {
             schema: s.module.clone(),
             name: s.name.clone(),
+            checks: crate::export::scalar_check_constraints(schema)
+                .into_iter()
+                .filter(|(module, name, _, _)| *module == s.module && *name == s.name)
+                .map(|(_, _, cname, _)| cname)
+                .collect(),
         })
         .collect();
 
@@ -880,6 +888,19 @@ pub struct RequiredInput {
 
 fn verbosename_module(name: &str) -> String {
     format!("module '{name}'")
+}
+
+/// Is this a CHECK constraint Pylon named — `{table}[_{column}]_{hash}_check`?
+/// The 8-hex-digit segment is what distinguishes one from a hand-written
+/// constraint that happens to end in `_check`.
+fn is_generated_check_name(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix("_check") else {
+        return false;
+    };
+    match rest.rsplit_once('_') {
+        Some((prefix, hash)) => !prefix.is_empty() && hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
 }
 
 /// Covers both enums and custom scalar domains — Pylon describes both as
@@ -1866,16 +1887,7 @@ fn diff_inner(
     // ── Phase 3: custom scalar domains ───────────────────────────────────────
     for s in &target.scalars {
         if !cur_domains.contains(&(s.module.as_str(), s.name.as_str())) {
-            let checks: Vec<String> = s
-                .check_constraints
-                .iter()
-                .map(|c| format!("    CHECK ({})", c))
-                .collect();
-            let check_clause = if checks.is_empty() {
-                String::new()
-            } else {
-                format!("\n{}", checks.join("\n"))
-            };
+            let check_clause = crate::export::scalar_check_clauses(target, &s.module, &s.name);
             steps.push(
                 OpKey::Scalar(s.module.clone(), s.name.clone()),
                 Verb::Create,
@@ -1891,6 +1903,59 @@ fn diff_inner(
                     ),
                     non_transactional: false,
                 },
+            );
+        }
+    }
+
+    // ── Phase 3.2: a existing domain's own CHECK constraints ─────────────────
+    // `CREATE DOMAIN` runs once and never again, so without this an edited
+    // `MaxLen`/`Regexp` on a custom scalar reached a fresh database and no
+    // other. Pylon owns the domain outright, so any constraint on it that the
+    // schema no longer names is one of its own leftovers.
+    let expected_domain_checks = crate::export::scalar_check_constraints(target);
+    for cur_domain in &current.domains {
+        if !target
+            .scalars
+            .iter()
+            .any(|s| s.module == cur_domain.schema && s.name == cur_domain.name)
+        {
+            continue; // the domain itself is going, or is not Pylon's
+        }
+        let wanted: Vec<&(String, String, String, String)> = expected_domain_checks
+            .iter()
+            .filter(|(module, name, _, _)| *module == cur_domain.schema && *name == cur_domain.name)
+            .collect();
+        let domain = format!("{}.{}", pg_schema(&cur_domain.schema), qi(&cur_domain.name));
+        let unchanged = wanted.len() == cur_domain.checks.len()
+            && wanted
+                .iter()
+                .all(|(_, _, cname, _)| cur_domain.checks.iter().any(|name| name == cname));
+        if unchanged {
+            continue;
+        }
+        let mut local: Vec<DiffOp> = Vec::new();
+        // Clear the whole set rather than diffing it by name: Postgres names a
+        // domain's inline constraints itself (`EmailAddress_check1`), so a
+        // schema-derived baseline can never say what is actually there. Pylon
+        // owns the domain, so reconciling all of it is safe and reproducible.
+        push_tx(
+            &mut local,
+            format!(
+                "DO $do$ DECLARE existing record; BEGIN                  FOR existing IN SELECT conname FROM pg_constraint                  WHERE contypid = '{domain}'::regtype AND contype = 'c' LOOP                  EXECUTE format('ALTER DOMAIN {domain} DROP CONSTRAINT %I', existing.conname);                  END LOOP; END $do$;"
+            ),
+        );
+        for (_, _, cname, expr) in wanted {
+            push_tx(
+                &mut local,
+                format!("ALTER DOMAIN {} ADD CONSTRAINT {} CHECK ({});", domain, qi(cname), expr),
+            );
+        }
+        if !local.is_empty() {
+            steps.extend(
+                OpKey::Scalar(cur_domain.schema.clone(), cur_domain.name.clone()),
+                Verb::Alter,
+                verbosename_scalar(&cur_domain.schema, &cur_domain.name),
+                local,
             );
         }
     }
@@ -2654,6 +2719,49 @@ fn diff_inner(
                     );
                 }
             }
+        }
+    }
+
+    // ── Phase 11.9: drop CHECK constraints the schema no longer declares ─────
+    // A check's name carries a hash of its own predicate, so editing one adds a
+    // second constraint rather than replacing the first, and both then have to
+    // hold — a column whose check was corrected would reject every value. Only
+    // Pylon's own `…_<hash>_check` names are dropped; a constraint added by
+    // hand is left alone.
+    let expected_checks: HashSet<(String, String, String)> = crate::export::check_constraints(target)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(module, table, name, _)| (module, table, name))
+        .collect();
+    for cur_table in &current.tables {
+        if !target_tables.contains(&(cur_table.schema.clone(), cur_table.name.clone())) {
+            continue; // Phase 12 drops the whole table.
+        }
+        for check in &cur_table.checks {
+            if !is_generated_check_name(&check.constraint_name) {
+                continue;
+            }
+            let key = (
+                cur_table.schema.clone(),
+                cur_table.name.clone(),
+                check.constraint_name.clone(),
+            );
+            if expected_checks.contains(&key) {
+                continue;
+            }
+            steps.extend(
+                OpKey::ForeignKey(cur_table.schema.clone(), format!("{}#checks", cur_table.name)),
+                Verb::Alter,
+                verbosename_type(&cur_table.schema, &cur_table.name),
+                vec![DiffOp {
+                    sql: format!(
+                        "ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};",
+                        qn(&cur_table.schema, &cur_table.name),
+                        qi(&check.constraint_name)
+                    ),
+                    non_transactional: false,
+                }],
+            );
         }
     }
 
@@ -4525,6 +4633,84 @@ mod tests {
     }
 
     #[test]
+    fn test_check_the_schema_no_longer_declares_is_dropped() {
+        // A check's name hashes its predicate, so editing one leaves the old
+        // constraint in place beside the new — and both would have to hold.
+        let mut person = simple_type("default", "Person", "Person");
+        person.properties = vec![prop("id", "uuid", false)];
+        let schema = SchemaDescriptor {
+            types: vec![person],
+            ..SchemaDescriptor::default()
+        };
+        let state = DbState {
+            tables: vec![DbTable {
+                schema: "default".into(),
+                name: "Person".into(),
+                columns: vec![DbColumn {
+                    name: "id".into(),
+                    pg_type: "uuid".into(),
+                    nullable: false,
+                    is_generated: false,
+                    column_default: None,
+                }],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![
+                    DbCheck {
+                        constraint_name: "Person_name_deadbeef_check".into(),
+                    },
+                    DbCheck {
+                        constraint_name: "a_hand_written_check".into(),
+                    },
+                ],
+                triggers: vec![],
+            }],
+            ..DbState::default()
+        };
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("DROP CONSTRAINT IF EXISTS \"Person_name_deadbeef_check\""),
+            "got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("a_hand_written_check"),
+            "a constraint Pylon did not name is left alone:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_changed_scalar_domain_checks_are_reconciled() {
+        use crate::schema::ScalarDescriptor;
+        let schema = SchemaDescriptor {
+            scalars: vec![ScalarDescriptor {
+                name: "EmailStr".into(),
+                module: "default".into(),
+                base: "Str".into(),
+                pg_type: "text".into(),
+                check_constraints: vec!["char_length(VALUE) <= 320".into()],
+                is_sequence: false,
+            }],
+            ..SchemaDescriptor::default()
+        };
+        let state = DbState {
+            domains: vec![DbDomain {
+                schema: "default".into(),
+                name: "EmailStr".into(),
+                checks: vec!["EmailStr_stale000_check".into()],
+            }],
+            ..DbState::default()
+        };
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("DROP CONSTRAINT"), "the old set is cleared:\n{joined}");
+        assert!(
+            joined.contains("ADD CONSTRAINT") && joined.contains("char_length(VALUE) <= 320"),
+            "the new set is added:\n{joined}"
+        );
+    }
+
+    #[test]
     fn test_demoting_an_interface_to_a_mixin_drops_its_view() {
         // A mixin is flattened onto its implementors and has no relation of
         // its own, so the view the interface had must go with it.
@@ -5070,6 +5256,7 @@ mod tests {
             domains: vec![DbDomain {
                 schema: "default".into(),
                 name: "OrderNumber".into(),
+                checks: vec![],
             }],
             sequences: vec![DbSequence {
                 schema: "default".into(),
@@ -5102,6 +5289,7 @@ mod tests {
             domains: vec![DbDomain {
                 schema: "default".into(),
                 name: "OrderNumber".into(),
+                checks: vec![],
             }],
             sequences: vec![DbSequence {
                 schema: "default".into(),
