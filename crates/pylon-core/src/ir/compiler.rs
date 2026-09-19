@@ -2008,9 +2008,62 @@ impl<'a> Compiler<'a> {
                     && !f.args.is_empty()
                     && let Expr::SubQuery(inner_stmt) = &f.args[0]
                 {
-                    let inner = self.compile_subquery_to_array_source(inner_stmt)?;
                     let offset = s.offset.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
                     let limit = s.limit.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
+                    // A set of objects has to come back as rows, not as the
+                    // bare ids the array form carries — so the assert vets the
+                    // ids and the type's own rows are selected by them.
+                    if let Ok(type_name) = self.dml_subject_type(inner_stmt)
+                        && let Ok(td) = self.resolve_type(&type_name)
+                    {
+                        let td_module = td.module.clone();
+                        let td_name = td.name.clone();
+                        let td_table = td.table.clone();
+                        let pk = td
+                            .properties
+                            .iter()
+                            .find(|p| p.is_pk)
+                            .map(|p| (p.name.clone(), p.pg_type.clone()))
+                            .unwrap_or_else(|| ("id".to_string(), "uuid".to_string()));
+                        let inner_ir = self.compile_stmt(inner_stmt)?;
+                        let alias = self.fresh_alias();
+                        let vetted = IrExpr::FunctionCall(IrFunctionCall {
+                            schema: Some("_pylon".to_string()),
+                            name: f.name.clone(),
+                            args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::StmtColumn {
+                                stmt: Box::new(inner_ir),
+                                column: pk.0.clone(),
+                            }))],
+                            sql_template: None,
+                        });
+                        let filter = IrExpr::BinOp(Box::new(IrBinOp {
+                            left: IrExpr::ColumnRef {
+                                alias: alias.clone(),
+                                column: pk.0.clone(),
+                                pg_type: pk.1.clone(),
+                            },
+                            op: ast::BinOpKind::In,
+                            right: vetted,
+                        }));
+                        let shape = vec![IrShapePointer::Scalar(IrScalarPointer {
+                            marker_offset: None,
+                            alias: "id".to_string(),
+                            column: pk.0,
+                            pg_type: pk.1,
+                            tuple_shape: None,
+                        })];
+                        let source = IrSource {
+                            type_name: format!("{td_module}::{td_name}"),
+                            table: td_table,
+                            alias,
+                        };
+                        let mut select = IrSelect::schema_bound(source, shape, Some(filter));
+                        select.offset = offset;
+                        select.limit = limit;
+                        select.distinct = distinct;
+                        return Ok(IrStmt::Select(select));
+                    }
+                    let inner = self.compile_subquery_to_array_source(inner_stmt)?;
                     return Ok(IrStmt::Select(IrSelect {
                         rows: vec![IrRowSource::Free(IrFreeExpr::AssertSet {
                             fn_name: f.name.clone(),

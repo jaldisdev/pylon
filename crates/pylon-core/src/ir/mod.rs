@@ -242,6 +242,9 @@ pub enum IrArraySource {
     Select(IrSelect),
     /// Inner is a path traversal SELECT; scalar result is the array element.
     PathSelect(IrPathSelect),
+    /// One column of whatever rows a statement produces — the only way to
+    /// reach a `for … union`'s set, which has no single source to read from.
+    StmtColumn { stmt: Box<IrStmt>, column: String },
     /// `ARRAY(SELECT expr FROM source)` — cross-scope type-is iteration.
     RawExpr {
         source: IrSource,
