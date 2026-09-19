@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
+from pylon.datatypes import Object
 from pylon.query import _decode, _decode_json_tuple, deserialize, shape_value_tags
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -147,7 +148,9 @@ class TestDecodeObject:
             'pointers': [_scalar('test', 0)],
         }
         value = (1,)
-        assert _decode(value, shape, {}) == {'test': 1}
+        decoded = _decode(value, shape, {})
+        assert isinstance(decoded, Object)
+        assert decoded.test == 1
 
 
 # ── _decode array ─────────────────────────────────────────────────────────────

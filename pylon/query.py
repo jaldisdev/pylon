@@ -228,24 +228,27 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         # objects (type_name is always set for those) carry that
         # discriminator, so only look for it in that case.
         static_type_name = node.get('type_name')
-        if static_type_name:
-            # Use the actual per-row __type__ value (obj_tuple[0]) for class
-            # lookup. For concrete types it equals the static type_name; for
-            # polymorphic (interface) queries it gives the real concrete type.
-            actual_type = obj_tuple[0] if obj_tuple else None
-            type_name = actual_type or static_type_name
-            short = type_name.split('::')[-1]
-            cls = registry.get(short)
-            if cls is not None:
-                obj = object.__new__(cls)
-                obj.__dict__.update(kwargs)
-                obj.__dict__['__pylon_type__'] = type_name
-                # Shadow copy of the hydrated field values — lets
-                # Client.save() diff current vs. persisted state instead of
-                # intercepting every __setattr__ (see pylon.modelquery).
-                obj.__dict__['__pylon_saved__'] = dict(kwargs)
-                _install_link_sets(obj, cls, kwargs)
-                return obj
+        if not static_type_name:
+            from pylon.datatypes import Object
+
+            return Object(**kwargs)
+        # Use the actual per-row __type__ value (obj_tuple[0]) for class
+        # lookup. For concrete types it equals the static type_name; for
+        # polymorphic (interface) queries it gives the real concrete type.
+        actual_type = obj_tuple[0] if obj_tuple else None
+        type_name = actual_type or static_type_name
+        short = type_name.split('::')[-1]
+        cls = registry.get(short)
+        if cls is not None:
+            obj = object.__new__(cls)
+            obj.__dict__.update(kwargs)
+            obj.__dict__['__pylon_type__'] = type_name
+            # Shadow copy of the hydrated field values — lets
+            # Client.save() diff current vs. persisted state instead of
+            # intercepting every __setattr__ (see pylon.modelquery).
+            obj.__dict__['__pylon_saved__'] = dict(kwargs)
+            _install_link_sets(obj, cls, kwargs)
+            return obj
         return kwargs
 
     if kind == 'named_tuple':

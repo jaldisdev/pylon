@@ -117,6 +117,8 @@ pub struct HydrationRegistry {
     /// `__new__` is `object.__new__`, but going through the class would pick
     /// up any override a user's base class introduced.
     object_new: Py<PyAny>,
+    /// `pylon.datatypes.Object`, the dataclass a free object decodes into.
+    free_object: Py<PyAny>,
 }
 
 #[pymethods]
@@ -172,6 +174,7 @@ impl HydrationRegistry {
             pylon_set: datatypes.getattr("PylonSet")?.unbind(),
             named_tuple_value: datatypes.getattr("NamedTupleValue")?.unbind(),
             object_new: py.import("builtins")?.getattr("object")?.getattr("__new__")?.unbind(),
+            free_object: datatypes.getattr("Object")?.unbind(),
         })
     }
 }
@@ -387,9 +390,12 @@ fn decode_object<'py>(
 
     // A free object literal (`select { a := 1 }`) has no schema type, so no
     // injected discriminator either — position 0 there is the first user
-    // field, not a type name. Only schema-backed objects carry one.
+    // field, not a type name. Only schema-backed objects carry one. What
+    // comes back is a `pylon.Object` — a dataclass built from the field
+    // names — so a free object reads through attributes the way a
+    // schema-backed row does.
     let Some(static_type_name) = type_name else {
-        return Ok(kwargs.into_any());
+        return reg.free_object.bind(py).call((), Some(&kwargs));
     };
 
     // The per-row `__type__` is what a polymorphic query needs: for a
