@@ -9040,11 +9040,11 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
     ) -> Result<Option<IrExpr>, PyQLError> {
+        // A bare `.multilink` counts: comparing the link itself to an object
+        // (`filter any(.emails = email)`) is the same set-membership question
+        // as comparing something reached through it, just with no tail.
         fn ml_first_name(steps: &[ast::PathStep]) -> Option<&str> {
-            if steps.len() < 2 {
-                return None;
-            }
-            match &steps[0] {
+            match steps.first()? {
                 ast::PathStep::Name(n) => Some(n.as_str()),
                 _ => None,
             }
@@ -9237,7 +9237,22 @@ impl<'a> Compiler<'a> {
         jt_alias: &str,
         jt_tgt_col: &str,
     ) -> Result<IrExpr, PyQLError> {
-        // steps should have at least 1 element
+        // No tail at all — the multi-link itself is what is being compared,
+        // so the junction row's target id is the whole answer.
+        if steps.is_empty() {
+            let col_ref = IrExpr::ColumnRef {
+                alias: jt_alias.to_string(),
+                column: jt_tgt_col.to_string(),
+                pg_type: "uuid".to_string(),
+            };
+            let (left, right) = if flip {
+                (value_expr, col_ref)
+            } else {
+                (col_ref, value_expr)
+            };
+            return Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op, right })));
+        }
+
         let first_name = match steps.first() {
             Some(ast::PathStep::Name(n)) => n.clone(),
             _ => return Err(self.type_err("expected a property or link name in path")),

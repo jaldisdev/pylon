@@ -4333,6 +4333,38 @@ mod tests {
     }
 
     #[test]
+    fn test_comparing_a_multilink_itself_to_an_object() {
+        // `filter any(.posts = post)` — the multi-link with no tail step. It
+        // used to reach `compile_path`, which only knows properties, links
+        // and computeds, and reported "has no link or property 'posts'".
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Post LIMIT 1) SELECT Person { id } FILTER any(.posts = p)",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("EXISTS((SELECT 1\nFROM \"public\".\"Person.posts\""),
+            "expected a junction EXISTS:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"target\" = (SELECT \"id\" FROM \"p\")"),
+            "expected the junction target compared to the bound object's id:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_comparing_a_multilink_itself_warns_without_any() {
+        let ast = parse::parse("WITH p := (SELECT Post LIMIT 1) SELECT Person { id } FILTER .posts = p").unwrap();
+        let ir = ir::compile(&ast, &make_schema()).unwrap();
+        assert!(
+            ir.warnings.iter().any(|w| w.contains("multi-link '.posts'")),
+            "expected the set-valued FILTER warning, got: {:?}",
+            ir.warnings
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
