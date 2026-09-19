@@ -434,6 +434,7 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
         }
         IrExpr::AggOverQuery { inner, .. } => collect_select(inner, tags),
         IrExpr::ArrayFromSelect(src) => collect_array_source(src, tags),
+        IrExpr::ScalarSubquery(sel) => collect_select(sel, tags),
         IrExpr::NamedTuple { fields, .. } => {
             for (_, e) in fields {
                 collect_expr(e, tags);

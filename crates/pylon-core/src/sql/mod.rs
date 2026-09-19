@@ -3357,6 +3357,12 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("(SELECT {}(*) FROM ({}) _agg)", fn_name, inner_sql)
         }
         IrExpr::ArrayFromSelect(src) => emit_array_source(src),
+        IrExpr::ScalarSubquery(sel) => {
+            format!(
+                "(SELECT \"v\" FROM (\n{}\n) AS \"_scalar_sub\")",
+                emit_select_stmt(sel, &[]).sql
+            )
+        }
 
         IrExpr::CteRef { name, scalar, .. } => {
             // scalar CTEs emit `ROW(expr) AS result, expr AS v`; use `v` for
@@ -4183,6 +4189,17 @@ mod tests {
             "a set-valued filter warns: {:?}",
             ir.warnings
         );
+    }
+
+    #[test]
+    fn test_free_sub_select_with_modifiers_reads_inline() {
+        // The inner statement reads the enclosing row, so it cannot become a
+        // CTE ahead of the FROM clause that defines it.
+        let out = compile_and_emit(
+            "SELECT Person { n := (WITH mine := .name SELECT count(Post) FILTER (Post.title = mine)) }",
+        );
+        assert!(out.sql.contains("_scalar_sub"), "{}", out.sql);
+        assert!(!out.sql.contains("WITH"), "nothing is hoisted:\n{}", out.sql);
     }
 
     #[test]

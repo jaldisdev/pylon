@@ -64,6 +64,7 @@ fn default_blocker(expr: &crate::ir::IrExpr) -> Option<&'static str> {
         | E::PathSubquery(_)
         | E::FnSubquery(_)
         | E::ArrayFromSelect(_)
+        | E::ScalarSubquery(_)
         | E::AggOverQuery { .. }
         | E::AggOverSet { .. }
         | E::CteRef { .. }

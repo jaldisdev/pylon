@@ -6402,10 +6402,29 @@ impl<'a> Compiler<'a> {
                 }
             }
             // `(select <expression>)` with nothing to traverse is just the
-            // expression itself — but only when there are no modifiers to
-            // honour, since there is no row set for them to apply to.
+            // expression itself. With modifiers to honour it is a statement,
+            // not an expression — `(select count(Visit) filter …)` — so it is
+            // hoisted into the enclosing WITH and read back by name.
             if has_modifiers {
-                return Err(self.subquery_expr_err(stmt));
+                let inner = self.compile_stmt(stmt)?;
+                let IrStmt::Select(select) = inner else {
+                    return Err(self.subquery_expr_err(stmt));
+                };
+                if !select
+                    .rows
+                    .iter()
+                    .all(|r| matches!(r, IrRowSource::Free(IrFreeExpr::Scalar(_))))
+                {
+                    return Err(self.subquery_expr_err(stmt));
+                }
+                let mut ir = IrExpr::ScalarSubquery(Box::new(select));
+                for field in extra_fields {
+                    ir = IrExpr::JsonbField {
+                        expr: Box::new(ir),
+                        field: field.clone(),
+                    };
+                }
+                return Ok(ir);
             }
             let mut ir = self.compile_expr_ctx(&sel.result, ctx)?;
             for field in extra_fields {
