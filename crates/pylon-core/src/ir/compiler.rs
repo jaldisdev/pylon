@@ -1140,6 +1140,7 @@ impl<'a> Compiler<'a> {
             return Ok(None);
         };
         let mut steps = type_path.steps.clone();
+        let field_count = fields.len();
         steps.extend(fields.into_iter().map(ast::PathStep::Name));
         let merged_result = Expr::Path(ast::Path { steps, partial: false });
 
@@ -1165,6 +1166,20 @@ impl<'a> Compiler<'a> {
             limit: outer.limit.clone().or(inner_sel.limit.clone()),
             lock: outer.lock.clone().or(inner_sel.lock.clone()),
         };
+
+        // The inner select's own filter and ordering speak about its subject,
+        // not about what the field chain projects off it: `(select Individual
+        // filter .id = $a).credentials.password` filters Individuals, not
+        // Credentials. `tail` is what pins them there. Only safe when the
+        // outer select contributed none of its own — the merge folds both
+        // into one clause, and an outer filter does belong at the end.
+        if outer.filter.is_none() && outer.order_by.is_empty() {
+            let Expr::Path(merged_path) = &merged.result else {
+                unreachable!("built as a path just above")
+            };
+            let ps = self.compile_path_select_with_tail(&merged, merged_path, &[], false, field_count)?;
+            return Ok(Some(IrStmt::PathSelect(ps)));
+        }
 
         let ir = self.compile_stmt(&Stmt::Select(merged))?;
         Ok(Some(ir))
