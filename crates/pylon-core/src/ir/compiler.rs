@@ -10456,9 +10456,10 @@ fn literal_sentinel_to_pg(t: &str) -> &str {
 fn is_array_expr(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::Array(_) | IrExpr::ArrayFromSelect(_) => true,
-        IrExpr::ColumnRef { pg_type, .. } => pg_type.ends_with("[]"),
-        IrExpr::TypeCast(tc) => tc.pg_type.ends_with("[]"),
-        _ => false,
+        // Everything else an array can arrive as — a column, a cast, a
+        // global, a `with` binding, a concatenation of any of those — is
+        // known by the type it carries.
+        other => matches!(infer_ir_type(other), Some(t) if t.ends_with("[]")),
     }
 }
 
@@ -10556,6 +10557,12 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             IrPathResult::Scalar(e, _) => infer_ir_type(e),
             IrPathResult::Object { .. } => None,
         },
+        // `a ++ b` and `distinct a` both yield whatever they were given, so
+        // an array stays recognisable as one through either.
+        IrExpr::BinOp(b) if b.op == crate::parse::ast::BinOpKind::Concat => {
+            infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
+        }
+        IrExpr::UnaryOp(u) if u.op == crate::parse::ast::UnaryOpKind::Distinct => infer_ir_type(&u.operand),
         _ => None,
     }
 }
