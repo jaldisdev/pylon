@@ -1294,6 +1294,12 @@ impl<'a> Compiler<'a> {
 
     // ── Schema lookups ────────────────────────────────────────────────────────────
 
+    /// The object type a WITH binding names, if it binds one — object type
+    /// strings are qualified, free/scalar bindings' are not.
+    fn cte_object_type(&self, name: &str) -> Option<String> {
+        self.cte_types.get(name).filter(|t| t.contains("::")).cloned()
+    }
+
     fn resolve_type(&self, name: &str) -> Result<&'a TypeDescriptor, PyQLError> {
         // Accept both "TypeName" and "module::TypeName"
         self.schema
@@ -2874,7 +2880,7 @@ impl<'a> Compiler<'a> {
         match expr {
             Expr::Path(p) if !p.partial && p.steps.len() > 1 => {
                 if let ast::PathStep::Name(root) = &p.steps[0]
-                    && self.resolve_type(root).is_ok()
+                    && (self.resolve_type(root).is_ok() || self.cte_object_type(root).is_some())
                 {
                     return Some(root.clone());
                 }
@@ -2947,7 +2953,10 @@ impl<'a> Compiler<'a> {
                 _ => return self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct),
             };
             // Compile value side first so we can report its type in errors
-            let root_td = self.resolve_type(root_type_name)?;
+            let root_td = match self.cte_object_type(root_type_name) {
+                Some(t) => self.resolve_type(&t)?,
+                None => self.resolve_type(root_type_name)?,
+            };
             // Build PathSelect for the path (builds root + joins + scalar/object result)
             let ast_path = ast::Path {
                 partial: false,
@@ -2994,11 +3003,18 @@ impl<'a> Compiler<'a> {
         root_type_name: &str,
         distinct: bool,
     ) -> Result<IrPathSelect, PyQLError> {
-        let td = self.resolve_type(root_type_name)?;
+        let cte_object_type = self.cte_object_type(root_type_name);
+        let td = match &cte_object_type {
+            Some(t) => self.resolve_type(t)?,
+            None => self.resolve_type(root_type_name)?,
+        };
         let alias = self.fresh_alias();
         let root = IrSource {
             type_name: format!("{}::{}", td.module, td.name),
-            table: td.table.clone(),
+            table: match &cte_object_type {
+                Some(_) => format!("@cte:{}", root_type_name),
+                None => td.table.clone(),
+            },
             alias: alias.clone(),
         };
         let rewritten = Self::rewrite_abs_to_partial(result.clone(), root_type_name);
