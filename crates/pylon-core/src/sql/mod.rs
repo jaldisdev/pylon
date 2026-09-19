@@ -347,6 +347,18 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
         let mut cte_parts = match dml.as_ref() {
             IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, "_dml"),
             IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, "_dml"),
+            // Nested DML the row's values read from: hoisted ahead of the row
+            // itself, since a data-modifying WITH only works at the top level.
+            IrStmt::Insert(ins) if !ins.nested_ctes.is_empty() => {
+                let mut parts = emit_user_cte_parts(&ins.nested_ctes);
+                parts.push(format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml)));
+                parts
+            }
+            IrStmt::Update(upd) if !upd.nested_ctes.is_empty() => {
+                let mut parts = emit_user_cte_parts(&upd.nested_ctes);
+                parts.push(format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml)));
+                parts
+            }
             IrStmt::Update(upd) if !upd.poly_implementors.is_empty() => emit_poly_update_dml_ctes(upd, "_dml"),
             IrStmt::Delete(del) if !del.poly_implementors.is_empty() => emit_poly_delete_dml_ctes(del, "_dml"),
             _ => vec![format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml))],
@@ -430,12 +442,23 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 .map(|(_, e)| format!("    {}", emit_expr(e)))
                 .chain(ins.rewrites.iter().map(|r| format!("    {}", emit_expr(&r.expr))))
                 .collect();
-            let mut sql = format!(
-                "    INSERT INTO {} (\n{}\n    ) VALUES (\n{}\n    )",
-                source_ref(&ins.target),
-                cols.join(",\n"),
-                vals.join(",\n"),
-            );
+            let mut sql = if !ins.nested_ctes.is_empty() {
+                // The row reads columns out of hoisted nested-DML CTEs, so it
+                // selects from them rather than listing literal values. Those
+                // CTEs are emitted by the caller: Postgres only allows a
+                // data-modifying WITH at the top level, never inside a CTE.
+                format!("    {}", emit_insert_row_sql(ins))
+            } else if cols.is_empty() {
+                // See `emit_insert_row_sql`: a row of nothing but defaults.
+                format!("    INSERT INTO {} DEFAULT VALUES", source_ref(&ins.target))
+            } else {
+                format!(
+                    "    INSERT INTO {} (\n{}\n    ) VALUES (\n{}\n    )",
+                    source_ref(&ins.target),
+                    cols.join(",\n"),
+                    vals.join(",\n"),
+                )
+            };
             if let Some(conflict) = &ins.unless_conflict {
                 emit_conflict(&mut sql, conflict);
             }
@@ -2274,7 +2297,11 @@ fn emit_insert_row_sql(ins: &IrInsert) -> String {
         .map(|(_, e)| emit_expr(e))
         .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
         .collect();
-    if ins.nested_ctes.is_empty() {
+    if cols.is_empty() && ins.nested_ctes.is_empty() {
+        // `insert Preferences {}` — a row made entirely of its own defaults.
+        // An empty column list is not SQL; `DEFAULT VALUES` is how it is said.
+        format!("INSERT INTO {} DEFAULT VALUES", source_ref(&ins.target))
+    } else if ins.nested_ctes.is_empty() {
         format!(
             "INSERT INTO {} ({}) VALUES ({})",
             source_ref(&ins.target),
@@ -4173,6 +4200,29 @@ mod tests {
     fn test_with_binding_in_a_computed_reads_the_enclosing_object() {
         let out = compile_and_emit("SELECT Person { n := (WITH own := .name SELECT own) }");
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_nested_insert_as_a_link_value() {
+        let out = compile_and_emit(
+            "SELECT (INSERT Person { name := 'a', company := (INSERT Company { name := 'c' }) }) { name }",
+        );
+        assert!(out.sql.contains("_nested_dml_0"), "{}", out.sql);
+        assert!(out.sql.contains("INSERT INTO \"public\".\"Company\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_nested_insert_in_a_one_element_set_is_that_insert() {
+        let out = compile_and_emit(
+            "SELECT (INSERT Person { name := 'a', company := { (INSERT Company { name := 'c' }) } }) { name }",
+        );
+        assert!(out.sql.contains("INSERT INTO \"public\".\"Company\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_insert_with_no_assignments_uses_default_values() {
+        let out = compile_and_emit("SELECT (INSERT Person { name := 'a', company := (INSERT Company {}) }) { name }");
+        assert!(out.sql.contains("DEFAULT VALUES"), "{}", out.sql);
     }
 
     #[test]
