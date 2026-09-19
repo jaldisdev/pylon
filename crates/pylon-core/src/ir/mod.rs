@@ -768,6 +768,11 @@ pub enum IrExpr {
     /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
     /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
     ArrayFromSelect(Box<IrArraySource>),
+    /// A free SELECT read for its single value — `(select count(Visit) filter
+    /// …)` in expression position. Inline rather than a CTE because the inner
+    /// statement may read the enclosing row, which nothing ahead of the FROM
+    /// clause can see.
+    ScalarSubquery(Box<IrSelect>),
     /// An enum member access: `default::Gender.Female` → `'Female'::"default"."Gender"`.
     EnumLiteral {
         pg_type: String,
