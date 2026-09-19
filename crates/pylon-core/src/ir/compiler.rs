@@ -247,6 +247,16 @@ fn and_conditions(filter: Option<IrExpr>, extra: Vec<IrExpr>) -> Option<IrExpr> 
 
 const MAX_COMPUTED_SPLICES: usize = 32;
 
+/// `infer_ir_type` as an owned name, plus the array literal it cannot report:
+/// an array's type is built from its elements rather than carried on the node.
+fn ir_value_type_name(expr: &IrExpr) -> String {
+    if let IrExpr::Array(elements) = expr {
+        let element = elements.first().and_then(infer_ir_type).unwrap_or("text");
+        return format!("{}[]", literal_sentinel_to_pg(element));
+    }
+    infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
+}
+
 fn cte_stmt_type(stmt: &IrStmt) -> String {
     match stmt {
         IrStmt::Insert(ins) => ins.target.type_name.clone(),
@@ -257,9 +267,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
             // Infer the scalar pg_type from the first free item so the type
             // is available for UNION mismatch error messages. Returns empty
             // string if unknown.
-            Some(IrRowSource::Free(IrFreeExpr::Scalar(expr))) => {
-                infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
-            }
+            Some(IrRowSource::Free(IrFreeExpr::Scalar(expr))) => ir_value_type_name(expr),
             _ => String::new(),
         },
         // What a path select *yields*, not what it starts from: `with xs :=
@@ -267,7 +275,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
         // difference decides whether a reference to it reads the CTE's
         // `result` column or its `id` (see `resolve_name_ref`).
         IrStmt::PathSelect(ps) => match &ps.result {
-            IrPathResult::Scalar(expr, _) => infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default(),
+            IrPathResult::Scalar(expr, _) => ir_value_type_name(expr),
             IrPathResult::Object { type_name, .. } => type_name.clone(),
         },
         IrStmt::For(f) => cte_stmt_type(&f.body),
