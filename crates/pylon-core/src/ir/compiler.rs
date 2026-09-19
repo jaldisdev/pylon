@@ -9132,6 +9132,13 @@ impl<'a> Compiler<'a> {
         use crate::stdlib::{ImplStrategy, lookup};
 
         let ns = module.unwrap_or("std");
+        // `any`/`all` aggregate a *set* of booleans. Everything that reaches
+        // here is a single value — a multi-link comparison has already become
+        // its own EXISTS — and a single boolean is its own any()/all();
+        // `bool_or` over it would be an aggregate where SQL allows none.
+        if ns == "std" && matches!(name, "any" | "all") && args.len() == 1 && !is_array_expr(&args[0]) {
+            return Ok(args.into_iter().next().expect("checked by the guard"));
+        }
         let overloads = lookup(ns, name);
 
         // Pick the overload whose parameter types best match the argument types.
