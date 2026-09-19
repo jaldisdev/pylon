@@ -3728,6 +3728,38 @@ impl<'a> Compiler<'a> {
                     self.collect_union_items(e, items)?;
                 }
             }
+            // `select { (update A set …), (update B set …) }` — several
+            // mutations in one statement. Postgres cannot run DML in a value
+            // list, so each becomes a data-modifying CTE, which it runs to
+            // completion whether or not the outer query reads it; the item
+            // itself reads back the id, so the set still stands for the rows
+            // the mutations touched.
+            Expr::SubQuery(stmt) if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
+                let (cte_name, type_name) = self.hoist_dml_as_cte(stmt.as_ref())?;
+                // Read back through a subquery rather than naming the CTE's
+                // column directly: a free select has no FROM of its own for the
+                // reference to resolve against.
+                let source = IrSource {
+                    poly: None,
+                    type_name,
+                    table: format!("@cte:{cte_name}"),
+                    alias: self.fresh_alias(),
+                };
+                items.push(IrFreeExpr::Scalar(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                    source,
+                    // The ids the mutation touched: an empty shape would emit
+                    // the `SELECT 1` an EXISTS wants, which says nothing about
+                    // which rows the set stands for.
+                    vec![IrShapePointer::Scalar(IrScalarPointer {
+                        marker_offset: None,
+                        alias: "id".to_string(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                        tuple_shape: None,
+                    })],
+                    None,
+                )))));
+            }
             other => {
                 items.push(IrFreeExpr::Scalar(self.compile_free_expr(other)?));
             }
@@ -4453,8 +4485,8 @@ impl<'a> Compiler<'a> {
     fn dml_subject_type(&self, stmt: &Stmt) -> Result<String, PyQLError> {
         match stmt {
             Stmt::Insert(ins) => Ok(ins.subject.name.clone()),
-            Stmt::Update(upd) => self.expr_as_type_name(&upd.subject),
-            Stmt::Delete(del) => self.expr_as_type_name(&del.subject),
+            Stmt::Update(upd) => self.subject_type_name(&upd.subject),
+            Stmt::Delete(del) => self.subject_type_name(&del.subject),
             Stmt::With(w) => self.dml_subject_type(&w.stmt),
             Stmt::For(f) => self.dml_subject_type(&f.body),
             Stmt::Analyze(inner) => self.dml_subject_type(inner),
@@ -4472,6 +4504,52 @@ impl<'a> Compiler<'a> {
                 Ok(type_name)
             }
         }
+    }
+
+    /// `id in (…)` over the rows a DML subject path traverses to, so a
+    /// mutation written against a traversal touches those rows and no others.
+    fn compile_subject_path_rows(&mut self, subject: &ast::Path) -> Result<IrExpr, PyQLError> {
+        // Traversing to `.id` rather than stopping at the objects: a path that
+        // ends on a link or a type intersection has nothing to project, and the
+        // ids are what the narrowing compares against anyway.
+        let mut steps = subject.steps.clone();
+        steps.push(ast::PathStep::Name("id".to_string()));
+        let ids = ast::Path {
+            steps,
+            partial: false,
+        };
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(ids.clone()),
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            lock: None,
+        };
+        let rows = self.compile_path_select(&synthetic, &ids, &[], false)?;
+        Ok(IrExpr::BinOp(Box::new(IrBinOp {
+            left: IrExpr::ColumnRef {
+                alias: String::new(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+            op: ast::BinOpKind::In,
+            right: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(rows))),
+        })))
+    }
+
+    /// The type a DML subject names, however it is written: a type, a `with`
+    /// binding, or a traversal that ends on one.
+    fn subject_type_name(&self, subject: &Expr) -> Result<String, PyQLError> {
+        if let Expr::Path(p) = subject
+            && p.steps.len() > 1
+            && let Some(ast::PathStep::Name(root)) = p.steps.first()
+            && let Ok(root_td) = self.resolve_path_root(root)
+            && let (_, Some(target)) = self.walk_path_types(root_td, &p.steps[1..], MAX_COMPUTED_SPLICES)
+        {
+            return Ok(format!("{}::{}", target.module, target.name));
+        }
+        self.expr_as_type_name(subject)
     }
 
     fn expr_as_type_name(&self, expr: &Expr) -> Result<String, PyQLError> {
@@ -4765,8 +4843,37 @@ impl<'a> Compiler<'a> {
     fn compile_update(&mut self, upd: &ast::UpdateStmt) -> Result<IrUpdate, PyQLError> {
         // See `compile_insert`'s identical save/restore of `pending_nested_ctes`.
         let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
+        // `update account.preferences[is IndividualPreferences] set …` — the
+        // subject is a traversal rather than a name, so the rows to update are
+        // the ones it lands on: the table is the type the walk ends on, and the
+        // update is narrowed to the ids the traversal yields.
+        if let Expr::Path(subject) = &upd.subject
+            && subject.steps.len() > 1
+            && let Some(ast::PathStep::Name(root)) = subject.steps.first()
+            && let Ok(root_td) = self.resolve_path_root(root)
+            && let (_, Some(target_td)) = self.walk_path_types(root_td, &subject.steps[1..], MAX_COMPUTED_SPLICES)
+        {
+            let rows = self.compile_subject_path_rows(subject)?;
+            let narrowed = ast::UpdateStmt {
+                subject: Expr::Path(ast::Path {
+                    steps: vec![ast::PathStep::Name(format!("{}::{}", target_td.module, target_td.name))],
+                    partial: false,
+                }),
+                filter: upd.filter.clone(),
+                shape: upd.shape.clone(),
+            };
+            self.pending_nested_ctes = outer_pending_nested_ctes;
+            let mut ir = self.compile_update(&narrowed)?;
+            ir.filter = Some(and_conditions(ir.filter.take(), vec![rows]).expect("row set is present"));
+            return Ok(ir);
+        }
         let type_name = self.expr_as_type_name(&upd.subject)?;
-        let td = self.resolve_type(&type_name)?;
+        // `update account set …` where `account` is a `with` binding: the
+        // binding names the rows to update, so it decides the table *and*
+        // narrows the update to its own rows. Without the narrowing this would
+        // resolve to the type and rewrite every row in the table.
+        let bound_rows = self.cte_object_type(&type_name);
+        let td = self.resolve_path_root(&type_name)?;
         let alias = self.fresh_alias();
         let target = IrSource {
             poly: None,
@@ -4775,11 +4882,35 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
         };
 
-        let filter = upd
+        let declared_filter = upd
             .filter
             .as_ref()
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
+        let filter = match bound_rows {
+            Some(_) => {
+                let membership = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::In,
+                    right: IrExpr::ArrayFromSelect(Box::new(IrArraySource::Select(IrSelect::schema_bound(
+                        IrSource {
+                            poly: None,
+                            type_name: format!("{}::{}", td.module, td.name),
+                            table: format!("@cte:{type_name}"),
+                            alias: self.fresh_alias(),
+                        },
+                        vec![],
+                        None,
+                    )))),
+                }));
+                Some(and_conditions(declared_filter, vec![membership]).expect("membership is present"))
+            }
+            None => declared_filter,
+        };
 
         // Classify shape elements by kind.
         let mut multi_link_clears = vec![];
@@ -9364,6 +9495,23 @@ impl<'a> Compiler<'a> {
     /// CTE's name. Postgres cannot run DML inside another statement's value
     /// list, so it is hoisted into the enclosing statement's `WITH` and read
     /// back from there — see `pending_nested_ctes`.
+    /// Compile a DML statement into a CTE of the query's own `WITH`.
+    ///
+    /// Unlike `hoist_nested_dml`, whose CTE belongs to the enclosing
+    /// INSERT/UPDATE it was nested inside, this one has no enclosing statement
+    /// to attach to — the select that names it *is* the top level.
+    fn hoist_dml_as_cte(&mut self, stmt: &Stmt) -> Result<(String, String), PyQLError> {
+        let type_name = self.dml_subject_type(stmt)?;
+        let inner = self.compile_stmt(stmt)?;
+        let cte_name = self.fresh_nested_cte_name();
+        self.hoisted_ctes.push(IrCteDef {
+            name: cte_name.clone(),
+            stmt: inner,
+            type_name: type_name.clone(),
+        });
+        Ok((cte_name, type_name))
+    }
+
     fn hoist_nested_dml(&mut self, stmt: &Stmt) -> Result<String, PyQLError> {
         let type_name = self.dml_subject_type(stmt)?;
         let inner = self.compile_stmt(stmt)?;

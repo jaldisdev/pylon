@@ -6788,6 +6788,80 @@ mod tests {
     }
 
     #[test]
+    fn test_several_mutations_in_a_free_set_each_become_a_cte() {
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "select { (update Person filter .name = 'a' set { age := 1 }), \
+                      (update Company filter .name = 'b' set { name := 'c' }) }",
+            &schema,
+        );
+        assert_eq!(
+            out.sql.matches("UPDATE").count(),
+            2,
+            "both mutations have to run, got:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("WITH"), "each becomes a CTE, got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_updating_a_binding_touches_only_its_own_rows() {
+        // The binding names the rows to update, so resolving it to its type
+        // without narrowing would rewrite every row in the table.
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with mine := (select Person filter .name = 'a') select { (update mine set { age := 1 }) }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("UPDATE") && out.sql.contains("= ANY(ARRAY(SELECT"),
+            "expected the update narrowed to the binding's rows, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_updating_a_traversal_touches_only_the_rows_it_lands_on() {
+        let mut schema = make_schema();
+        // The traversal's target needs an id to narrow against; every real
+        // schema declares one, this one leaves it off Company.
+        let company = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("test schema has a Company type");
+        company.properties.push(crate::schema::PropertyDescriptor {
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: Some("uuidv7()".into()),
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        let out = compile_and_emit_with(
+            "with mine := (select Person filter .name = 'a') select { (update mine.company set { name := 'x' }) }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("= ANY(ARRAY(SELECT"),
+            "expected the update narrowed to the traversal's rows, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"Company\""),
+            "expected the table the traversal ends on, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_aggregate_over_a_multi_valued_path_keeps_the_set_flat() {
         // Regression: `array_agg(a.posts.title)` compiled the path as an
         // expression, where a multi-valued path stands for the array of its
