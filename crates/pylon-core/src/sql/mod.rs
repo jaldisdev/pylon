@@ -537,7 +537,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 return "    SELECT NULL AS \"id\" WHERE FALSE".to_string();
             }
             let (values_from, _) = emit_for_iterator(&f.iterator, &format!("_for_{}", f.var_name));
-            let body = emit_dml_as_cte_source(&f.body).replace('\n', "\n    ");
+            let body = prefix_body_ctes(emit_dml_as_cte_source(&f.body), &f.body_ctes).replace('\n', "\n    ");
             format!(
                 "    SELECT \"_body\".*\n    FROM {}\n    CROSS JOIN LATERAL (\n    {}\n    ) AS \"_body\"",
                 values_from.replace('\n', "\n    "),
@@ -2009,6 +2009,16 @@ fn emit_for_iterator(it: &IrForIterator, iter_alias: &str) -> (String, String) {
     }
 }
 
+/// Put the bindings a `for` body declared in front of the body itself: they may
+/// read the loop variable, so they cannot sit in the enclosing WITH clause.
+fn prefix_body_ctes(sql: String, body_ctes: &[IrCteDef]) -> String {
+    if body_ctes.is_empty() {
+        return sql;
+    }
+    merge_into_existing_with(&sql, &emit_user_cte_parts(body_ctes))
+        .unwrap_or_else(|| format!("{}{}", emit_cte_prefix(body_ctes), sql))
+}
+
 fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
     let iter_alias = format!("_for_{}", f.var_name);
 
@@ -2029,7 +2039,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
     let (values_from, iter_cte) = emit_for_iterator(&f.iterator, &iter_alias);
 
     match f.body.as_ref() {
-        IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &iter_cte, user_ctes),
+        IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &iter_cte, user_ctes, &f.body_ctes),
         body => {
             let body_out = match body {
                 IrStmt::Select(sel) => emit_select_stmt(sel, user_ctes),
@@ -2038,7 +2048,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
                 // body kind with a PyQL error before an `IrFor` is built.
                 other => unreachable!("for-loop body should have been rejected at compile time: {other:?}"),
             };
-            let indent_body = body_out.sql.replace('\n', "\n    ");
+            let indent_body = prefix_body_ctes(body_out.sql, &f.body_ctes).replace('\n', "\n    ");
             let cte_prefix = if !user_ctes.is_empty() {
                 emit_cte_prefix(user_ctes)
             } else {
@@ -2057,7 +2067,13 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
     }
 }
 
-fn emit_for_insert(ins: &IrInsert, iter_alias: &str, iter_cte: &str, user_ctes: &[IrCteDef]) -> SqlOutput {
+fn emit_for_insert(
+    ins: &IrInsert,
+    iter_alias: &str,
+    iter_cte: &str,
+    user_ctes: &[IrCteDef],
+    body_ctes: &[IrCteDef],
+) -> SqlOutput {
     let rewrite_cols: std::collections::HashSet<&str> = ins.rewrites.iter().map(|r| r.column.as_str()).collect();
 
     let cols: Vec<String> = ins
@@ -2076,6 +2092,7 @@ fn emit_for_insert(ins: &IrInsert, iter_alias: &str, iter_cte: &str, user_ctes: 
         .collect();
 
     let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+    cte_parts.extend(emit_user_cte_parts(body_ctes));
     cte_parts.push(iter_cte.to_string());
 
     let mut sql = format!(
@@ -4143,6 +4160,19 @@ mod tests {
         );
         assert!(out.sql.contains("FROM \"names\""), "{}", out.sql);
         assert!(!out.sql.contains("VALUES"), "the whole set is iterated:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_for_body_bindings_stay_inside_the_body() {
+        // `matching` reads the loop variable, so it cannot be hoisted to the
+        // statement's own WITH — nothing there can see `_for_n`.
+        let out = compile_and_emit(
+            "WITH names := (SELECT Person.name) \
+             FOR n IN names UNION (WITH matching := (SELECT Person FILTER .name = n) SELECT matching)",
+        );
+        let lateral = out.sql.find("CROSS JOIN LATERAL").expect("a lateral body");
+        let binding = out.sql.find("\"matching\" AS (").expect("the body's binding");
+        assert!(binding > lateral, "the binding sits inside the body:\n{}", out.sql);
     }
 
     #[test]

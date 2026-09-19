@@ -92,6 +92,10 @@ pub struct IrFor {
     pub var_name: String,
     pub iterator: IrForIterator,
     pub body: Box<IrStmt>,
+    /// WITH bindings the body declared. They are re-evaluated per iteration
+    /// (a binding may read the loop variable), so they belong inside the
+    /// body's own scope rather than the enclosing statement's WITH clause.
+    pub body_ctes: Vec<IrCteDef>,
 }
 
 #[derive(Debug, Clone)]
