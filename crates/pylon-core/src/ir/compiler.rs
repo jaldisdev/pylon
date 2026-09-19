@@ -3099,6 +3099,64 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The pointers a sub-select's shape declares, as the relative paths they
+    /// stand for: `{ handle := [is Handle].handle }` → `handle` → `[is
+    /// Handle].handle`. `None` when any element is something other than a
+    /// named pointer defined by a relative path, which this substitution
+    /// cannot stand in for.
+    fn shape_alias_paths(elements: &[ShapeElement]) -> Option<Vec<(String, ast::Path)>> {
+        let mut defs = Vec::with_capacity(elements.len());
+        for element in elements {
+            let [ast::PathStep::Name(name)] = element.path.steps.as_slice() else {
+                return None;
+            };
+            match &element.compexpr {
+                Some(Expr::Path(p)) if p.partial => defs.push((name.clone(), p.clone())),
+                _ => return None,
+            }
+        }
+        Some(defs)
+    }
+
+    /// Replace each `.alias` a sub-select's shape declares with the path it
+    /// stands for, so the select's own FILTER/ORDER BY read the same thing the
+    /// shape projects.
+    fn substitute_shape_aliases(expr: Expr, defs: &[(String, ast::Path)]) -> Expr {
+        match expr {
+            Expr::Path(ref p) if p.partial => {
+                let Some(ast::PathStep::Name(first)) = p.steps.first() else {
+                    return expr;
+                };
+                let Some((_, definition)) = defs.iter().find(|(name, _)| name == first) else {
+                    return expr;
+                };
+                let mut steps = definition.steps.clone();
+                steps.extend(p.steps[1..].iter().cloned());
+                Expr::Path(ast::Path { steps, partial: true })
+            }
+            Expr::FunctionCall(f) => Expr::FunctionCall(ast::FunctionCall {
+                module: f.module,
+                name: f.name,
+                args: f
+                    .args
+                    .into_iter()
+                    .map(|a| Self::substitute_shape_aliases(a, defs))
+                    .collect(),
+                kwargs: f.kwargs,
+            }),
+            Expr::BinOp(b) => Expr::BinOp(Box::new(ast::BinOp {
+                left: Self::substitute_shape_aliases(b.left, defs),
+                op: b.op,
+                right: Self::substitute_shape_aliases(b.right, defs),
+            })),
+            Expr::UnaryOp(u) => Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: u.op,
+                operand: Self::substitute_shape_aliases(u.operand, defs),
+            })),
+            other => other,
+        }
+    }
+
     /// Compile an expression that contains a type-rooted absolute path as a flat
     /// path select, iterating over the root type and projecting the expression as
     /// a scalar computed pointer.
@@ -6271,6 +6329,46 @@ impl<'a> Compiler<'a> {
             }
             return Ok(ir);
         };
+        // A shape whose pointers are relative paths declares local names for
+        // them, readable by the select's own FILTER/ORDER BY and by whatever
+        // projects off it — `(select .locators { handle := [is Handle].handle,
+        // latest := [is Handle].latest } filter .latest limit 1).handle`. Each
+        // is substituted back into its readers, leaving an ordinary shapeless
+        // sub-select behind.
+        let rewritten_sel;
+        let mut sel = sel;
+        let mut shape_els = shape_els;
+        let mut extra_steps: Vec<ast::PathStep> = extra_fields.iter().map(|f| ast::PathStep::Name(f.clone())).collect();
+        if !shape_els.is_empty()
+            && let Some(defs) = Self::shape_alias_paths(shape_els)
+        {
+            extra_steps = extra_fields
+                .iter()
+                .flat_map(|field| match defs.iter().find(|(name, _)| name == field) {
+                    Some((_, definition)) => definition.steps.clone(),
+                    None => vec![ast::PathStep::Name(field.clone())],
+                })
+                .collect();
+            rewritten_sel = ast::SelectStmt {
+                result: sel.result.clone(),
+                filter: sel.filter.clone().map(|f| Self::substitute_shape_aliases(f, &defs)),
+                order_by: sel
+                    .order_by
+                    .iter()
+                    .map(|o| ast::SortExpr {
+                        expr: Self::substitute_shape_aliases(o.expr.clone(), &defs),
+                        direction: o.direction.clone(),
+                        nones: o.nones.clone(),
+                    })
+                    .collect(),
+                offset: sel.offset.clone(),
+                limit: sel.limit.clone(),
+                lock: sel.lock.clone(),
+            };
+            sel = &rewritten_sel;
+            shape_els = &[];
+        }
+
         // A shape only matters when the sub-select's own value is the
         // result. `(select .emails { address } limit 1).address` projects a
         // column straight back out of it, so the shape says nothing the
@@ -6345,10 +6443,10 @@ impl<'a> Compiler<'a> {
         } else {
             None
         };
-        steps.extend(extra_fields.iter().map(|f| ast::PathStep::Name(f.clone())));
+        steps.extend(extra_steps.iter().cloned());
         let full_path = ast::Path { steps, partial: false };
 
-        let mut ps = self.compile_path_select_with_tail(sel, &full_path, &[], false, extra_fields.len())?;
+        let mut ps = self.compile_path_select_with_tail(sel, &full_path, &[], false, extra_steps.len())?;
         if let Some(outer_alias) = correlate {
             Self::correlate_path_select(&mut ps, &outer_alias);
         }
