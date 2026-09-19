@@ -3359,7 +3359,7 @@ impl<'a> Compiler<'a> {
             IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
                 Ok(IrArraySource::Select(s))
             }
-            IrStmt::PathSelect(ps) => Ok(IrArraySource::PathSelect(ps)),
+            IrStmt::PathSelect(ps) => Ok(IrArraySource::PathSelect(Box::new(ps))),
             _ => Err(self.type_err("assert functions require a schema-bound SELECT as argument")),
         }
     }
@@ -4531,7 +4531,7 @@ impl<'a> Compiler<'a> {
                 pg_type: "uuid".to_string(),
             },
             op: ast::BinOpKind::In,
-            right: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(rows))),
+            right: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(rows)))),
         })))
     }
 
@@ -6165,7 +6165,7 @@ impl<'a> Compiler<'a> {
         Ok(IrShapePointer::Computed(IrComputedPointer {
             marker_offset: None,
             alias: pointer_name.to_string(),
-            expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(path_select))),
+            expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(path_select)))),
         }))
     }
 
@@ -6886,7 +6886,9 @@ impl<'a> Compiler<'a> {
             _ => false,
         };
         if multi && !single && matches!(ps.result, IrPathResult::Scalar(..)) {
-            return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(ps))));
+            return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
+                ps,
+            )))));
         }
         Ok(IrExpr::PathSubquery(Box::new(ps)))
     }
@@ -7163,7 +7165,9 @@ impl<'a> Compiler<'a> {
         let mut ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
         Self::correlate_path_select(&mut ps, alias);
         if multi && matches!(ps.result, IrPathResult::Scalar(..)) {
-            Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(ps))))
+            Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
+                ps,
+            )))))
         } else {
             Ok(IrExpr::PathSubquery(Box::new(ps)))
         }
