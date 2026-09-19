@@ -4403,6 +4403,28 @@ mod tests {
     }
 
     #[test]
+    fn test_a_mutation_as_a_free_object_field() {
+        // Already allowed as an item of a free *set*; a named field of a free
+        // object is the same question and used to answer "an update cannot
+        // stand in for a value".
+        let out = compile_and_emit_with(
+            "SELECT { renamed := (UPDATE Person FILTER .id = $a SET { name := $n }), n := 1 }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("UPDATE \"public\".\"Person\""),
+            "expected the mutation to become a data-modifying CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("(SELECT \"t1\".\"id\"\nFROM \"_nested_dml_0\" AS \"t1\") AS \"_f0\""),
+            "expected the field to carry the rows the mutation touched:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
