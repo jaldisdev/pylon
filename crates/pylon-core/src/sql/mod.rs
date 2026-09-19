@@ -1271,7 +1271,9 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
                 // Arrays and jsonb are returned as plain top-level columns
                 // rather than wrapped, so they keep their own shape node.
                 if is_raw_scalar(expr) {
-                    format!("SELECT {} AS result", emit_expr(expr))
+                    // `v` alongside it for the same reason the wrapped form
+                    // has one: a `with` binding of an array is read by name.
+                    format!("SELECT v AS result, v FROM (SELECT {} AS v) AS _raw", emit_expr(expr))
                 } else {
                     // `result` is a ROW() composite for top-level decoding.
                     // `v` is the unwrapped scalar for use in CteRef expression context.
@@ -4214,6 +4216,17 @@ mod tests {
     }
 
     #[test]
+    fn test_array_literal_binding_is_readable_and_typed() {
+        let out = compile_and_emit("WITH order := ['a', 'b'] SELECT std::find(order, 'b')");
+        assert!(out.sql.contains("array_position"), "its type is known:\n{}", out.sql);
+        assert!(
+            out.sql.contains("AS v"),
+            "the binding exposes a value column:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_for_over_a_with_binding_iterates_every_row() {
         let out = compile_and_emit(
             "WITH names := (SELECT Person.name) FOR n IN names UNION (SELECT Person FILTER .name = n)",
@@ -4716,7 +4729,8 @@ mod tests {
         let ast = parse::parse("SELECT [1, 2, 3]").unwrap();
         let ir = ir::compile(&ast, &schema).unwrap();
         let out = emit(&ir);
-        assert!(out.sql.contains("SELECT ARRAY[1, 2, 3] AS result"));
+        assert!(out.sql.contains("SELECT ARRAY[1, 2, 3] AS v"), "{}", out.sql);
+        assert!(out.sql.contains("SELECT v AS result, v FROM"), "{}", out.sql);
         assert!(matches!(out.shape.root, crate::query::ShapeNode::RawScalar));
     }
 
