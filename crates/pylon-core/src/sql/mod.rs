@@ -4234,6 +4234,13 @@ mod tests {
     }
 
     #[test]
+    fn test_comparing_a_value_to_a_set_is_membership() {
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person FILTER .name = Person.posts.title", &schema);
+        assert!(out.sql.contains("= ANY("), "{}", out.sql);
+    }
+
+    #[test]
     fn test_for_over_a_with_binding_iterates_every_row() {
         let out = compile_and_emit(
             "WITH names := (SELECT Person.name) FOR n IN names UNION (SELECT Person FILTER .name = n)",
