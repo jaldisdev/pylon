@@ -45,7 +45,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pylon.schema as pylon
-from pylon.datatypes import LinkSet, NamedTupleValue, PylonSet
+from pylon.datatypes import LinkSet, NamedTupleValue, Object, PylonSet
 from pylon.query import _decode, hydration_registry
 from pylon.schema import Link, MultiLink
 from pylon.schema._registry import clear as clear_registry
@@ -271,7 +271,9 @@ class TestEnums:
 class TestFreeObjectsAndScalars:
     def test_a_free_object_has_no_discriminator(self):
         compiled = _compile('select { a := 1, b := 2 }')
-        assert_parity([(1, 2)], compiled)
+        native = assert_parity([(1, 2)], compiled)
+        assert isinstance(native[0], Object)
+        assert (native[0].a, native[0].b) == (1, 2)
 
     def test_a_bare_scalar(self):
         # A bare `select <expr>` compiles to a Scalar node at position 0, so
