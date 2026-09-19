@@ -7061,6 +7061,30 @@ impl<'a> Compiler<'a> {
                 }
                 let left = self.compile_expr_ctx(&b.left, ctx)?;
                 let right = self.compile_expr_ctx(&b.right, ctx)?;
+                // Comparing a value against a *set* — a path that crosses a
+                // multi-link or a backlink, which arrives here as an array of
+                // its elements — holds when any element matches, which is what
+                // the equality means in PyQL and what `= ANY` says in SQL.
+                if matches!(b.op, ast::BinOpKind::Eq | ast::BinOpKind::Ne) {
+                    let flipped = matches!(left, IrExpr::ArrayFromSelect(_)) && !is_array_expr(&right);
+                    let straight = matches!(right, IrExpr::ArrayFromSelect(_)) && !is_array_expr(&left);
+                    if flipped || straight {
+                        let (value, set) = if straight { (left, right) } else { (right, left) };
+                        let membership = IrExpr::BinOp(Box::new(IrBinOp {
+                            left: value,
+                            op: ast::BinOpKind::In,
+                            right: set,
+                        }));
+                        return Ok(if matches!(b.op, ast::BinOpKind::Ne) {
+                            IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                                op: ast::UnaryOpKind::Not,
+                                operand: membership,
+                            }))
+                        } else {
+                            membership
+                        });
+                    }
+                }
                 if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right))
                     && !types_compatible(lt, rt)
                     && !datetime_arithmetic_compatible(&b.op, lt, rt)
