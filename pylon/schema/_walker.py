@@ -1080,15 +1080,19 @@ def _build_type_descriptor(
     # An `Expression` written inside `Property[T, ...]`/`Link[T, ...]` is a
     # CHECK on this type's table just like one written in the class body —
     # what it being on the pointer settles is only *which* type owns it.
+    # On a pointer, `__subject__` is that pointer's own value rather than the
+    # row — the one thing promoting it to the type loses, so it is resolved
+    # here while the pointer it came from is still known.
     pointer_expressions = [
-        c for meta in effective.values() for c in getattr(meta, 'constraints', ()) if isinstance(c, Expression)
+        _core.ExpressionConstraint(expr=c.expr.replace('__subject__', f'.{pointer_name}'))
+        for pointer_name, meta in effective.items()
+        for c in getattr(meta, 'constraints', ())
+        if isinstance(c, Expression)
     ]
     exclusive_constraints = [_make_exclusive_constraint(c, _core) for c in all_constraints if isinstance(c, Exclusive)]
     expression_constraints = [
-        _make_expression_constraint(c, _core)
-        for c in all_constraints + pointer_expressions
-        if isinstance(c, Expression)
-    ]
+        _make_expression_constraint(c, _core) for c in all_constraints if isinstance(c, Expression)
+    ] + pointer_expressions
     index_descs = [_make_index_desc(idx, _core) for idx in all_indexes]
     vector_index_descs = [
         _make_vector_index_desc(vi, _core, cfg.name, set(effective.keys())) for vi in cfg.vector_indexes
