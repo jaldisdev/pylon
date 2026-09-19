@@ -2380,11 +2380,14 @@ impl<'a> Compiler<'a> {
                     None => type_ref.name.clone(),
                 };
                 let narrowed = self.resolve_type(&type_name)?;
-                // An interface is a view over the columns its implementors
-                // share, so narrowing to one of them has to move to that
-                // implementor's own table — the view has no column to read.
-                // The row is the same row, so the two are joined on their id.
-                if current_td.abstract_ && current_td.materialized && narrowed.table != current_td.table {
+                // Narrowing to a type with a relation of its own moves to that
+                // relation, joined on the shared id: an interface's view has
+                // none of its implementors' own columns, and two unrelated
+                // types share no ids at all, so the join finds nothing — which
+                // is exactly what an impossible intersection yields. A mixin
+                // has no relation; its columns are already on the current row.
+                let narrowed_has_relation = !narrowed.abstract_ || narrowed.materialized;
+                if narrowed_has_relation && narrowed.table != current_td.table {
                     let target_alias = self.fresh_alias();
                     let target = IrSource {
                         type_name: format!("{}::{}", narrowed.module, narrowed.name),
@@ -4668,8 +4671,15 @@ impl<'a> Compiler<'a> {
                     }
                     // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
                     // Compile as a scalar subquery returning the target pk (the FK uuid).
+                    // A one-element set is that element — `credentials := {
+                    // (insert Credentials { … }) }` says the same thing as
+                    // assigning the insert directly.
                     let fk_col = format!("{}_id", l.name);
-                    if let Expr::SubQuery(inner_stmt) = expr {
+                    let value = match expr {
+                        Expr::Set(elements) if elements.len() == 1 => &elements[0],
+                        other => other,
+                    };
+                    if let Expr::SubQuery(inner_stmt) = value {
                         let ir_expr = self.compile_link_subquery(inner_stmt)?;
                         return Ok((fk_col, ir_expr));
                     }
@@ -5119,6 +5129,36 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        // `{ a, b }` — a set literal of targets, each contributing its own rows.
+        if let Expr::Set(elements) = expr
+            && !elements.is_empty()
+        {
+            let mut combined: Option<IrMultiLinkValues> = None;
+            for element in elements {
+                let one = self.compile_multilink_values(element, td, alias, through_td)?;
+                combined = Some(match combined {
+                    None => one,
+                    Some(previous) => IrMultiLinkValues {
+                        source: IrMultiLinkValueSource::Union(Box::new(previous), Box::new(one)),
+                        link_props: vec![],
+                    },
+                });
+            }
+            return Ok(combined.expect("elements is non-empty"));
+        }
+
+        // `emails := (insert Email { … })` — a nested insert whose rows become
+        // the link's targets, read back from the CTE it is hoisted into.
+        if let Expr::SubQuery(inner) = expr
+            && matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+        {
+            let cte_name = self.hoist_nested_dml(inner)?;
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::CteRef(cte_name),
+                link_props: vec![],
+            });
+        }
+
         // Parenthesised subquery
         if let Expr::SubQuery(inner) = expr {
             return match self.compile_stmt(inner)? {
@@ -5273,7 +5313,8 @@ impl<'a> Compiler<'a> {
                 // target type, one level deep. Recursing with `Deep` here
                 // instead would walk the target's own links too, which for
                 // a two-way or cyclic link graph never terminates.
-                let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, module)?;
+                let target_module = target_td.module.clone();
+                let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, &target_module)?;
                 let subquery = IrSelect::schema_bound(
                     IrSource {
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -5309,7 +5350,8 @@ impl<'a> Compiler<'a> {
                 let target_td = self.resolve_type(&ml.target)?;
                 // See the single-link loop above — same Shallow-not-Deep
                 // reasoning applies to multilink targets.
-                let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, module)?;
+                let target_module = target_td.module.clone();
+                let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, &target_module)?;
 
                 let join = if let Some(through_qname) = &ml.through {
                     let through_td = self.resolve_type(through_qname)?;
@@ -5359,9 +5401,12 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 } else {
+                    // See `junction_info_for`: the junction table is named
+                    // after the owner and lives in the owner's schema, which a
+                    // splat reaching in from another module is not.
                     IrMultiLinkJoin::Standard {
                         junction_table: format!("{}.{}", td.table, ml.name),
-                        module: module.to_string(),
+                        module: td.module.clone(),
                     }
                 };
 
@@ -9108,11 +9153,38 @@ impl<'a> Compiler<'a> {
         self.compile_assignments_for_update(&upd.shape, upd_td, &table)
     }
 
+    /// Compile a nested INSERT/UPDATE/DELETE into its own CTE and return that
+    /// CTE's name. Postgres cannot run DML inside another statement's value
+    /// list, so it is hoisted into the enclosing statement's `WITH` and read
+    /// back from there — see `pending_nested_ctes`.
+    fn hoist_nested_dml(&mut self, stmt: &Stmt) -> Result<String, PyQLError> {
+        let type_name = self.dml_subject_type(stmt)?;
+        let inner = self.compile_stmt(stmt)?;
+        let cte_name = self.fresh_nested_cte_name();
+        self.pending_nested_ctes.push(IrCteDef {
+            name: cte_name.clone(),
+            stmt: inner,
+            type_name,
+        });
+        Ok(cte_name)
+    }
+
     /// Compile `(SELECT TargetType FILTER …)` as a scalar subquery for use in a
     /// link assignment (`company := (SELECT Company FILTER .name = $co)`).
     /// Returns `IrExpr::Subquery` whose shape is the target pk — the SQL emitter
     /// renders this as `(SELECT "alias"."id" FROM … WHERE …)`.
     fn compile_link_subquery(&mut self, stmt: &Stmt) -> Result<IrExpr, PyQLError> {
+        // `preferences := (insert Preferences { … })` — the nested DML used
+        // directly as the value, which is the same hoist the wrapped
+        // `select (insert …) { id }` form below goes through.
+        if matches!(stmt, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) {
+            let cte_name = self.hoist_nested_dml(stmt)?;
+            return Ok(IrExpr::ColumnRef {
+                alias: cte_name,
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            });
+        }
         let Stmt::Select(sel) = stmt else {
             return Err(self.type_err(
                 "only SELECT is valid as a link assignment value; \
@@ -9156,14 +9228,7 @@ impl<'a> Compiler<'a> {
             _ => None,
         };
         if let Some(inner_stmt) = nested_dml {
-            let inner_type_name = self.dml_subject_type(inner_stmt)?;
-            let inner_ir = self.compile_stmt(inner_stmt)?;
-            let cte_name = self.fresh_nested_cte_name();
-            self.pending_nested_ctes.push(IrCteDef {
-                name: cte_name.clone(),
-                stmt: inner_ir,
-                type_name: inner_type_name,
-            });
+            let cte_name = self.hoist_nested_dml(inner_stmt)?;
             return Ok(IrExpr::ColumnRef {
                 alias: cte_name,
                 column: "id".to_string(),
