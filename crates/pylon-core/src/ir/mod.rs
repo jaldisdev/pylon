@@ -180,6 +180,12 @@ pub enum IrPathJoin {
         args: Vec<IrExpr>,
         target: IrSource,
     },
+    /// A computed pointer that carries its own FILTER/ORDER BY/LIMIT as the
+    /// next row source — `.translation.name`, where `translation` is
+    /// `select .translations filter … order by … limit 1`. Those modifiers
+    /// apply per source row, which a plain join cannot express, so the
+    /// computed's own traversal becomes a correlated `JOIN LATERAL`.
+    Lateral { inner: Box<IrPathSelect>, target: IrSource },
     /// Reverse of a multi-link: traverse the junction table in reverse.
     BacklinkMulti {
         source_alias: String,

@@ -943,6 +943,21 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
 /// SQL fragment for a single path join (used in multilink values emission).
 fn emit_path_join_sql(join: &IrPathJoin) -> String {
     match join {
+        IrPathJoin::Lateral { inner, target } => {
+            let projected = match &inner.result {
+                IrPathResult::Object { alias, .. } => alias.clone(),
+                IrPathResult::Scalar(..) => unreachable!("a lateral step is only built for an object-valued computed"),
+            };
+            let mut body = format!(
+                "SELECT {}.* FROM {}",
+                qi(&projected),
+                emit_path_joins(&inner.root, &inner.joins)
+            );
+            append_filter(&mut body, &inner.filter);
+            append_order_by(&mut body, &inner.order_by);
+            append_offset_limit(&mut body, &inner.offset, &inner.limit);
+            format!(" JOIN LATERAL (\n{}\n) AS {} ON TRUE", body, qi(&target.alias))
+        }
         IrPathJoin::Function {
             fn_module,
             fn_name,
@@ -1569,6 +1584,23 @@ fn emit_path_joins(root: &IrSource, joins: &[IrPathJoin]) -> String {
                     args_sql,
                     qi(&target.alias),
                 ));
+            }
+            IrPathJoin::Lateral { inner, target } => {
+                let projected = match &inner.result {
+                    IrPathResult::Object { alias, .. } => alias.clone(),
+                    IrPathResult::Scalar(..) => {
+                        unreachable!("a lateral step is only built for an object-valued computed")
+                    }
+                };
+                let mut body = format!(
+                    "SELECT {}.* FROM {}",
+                    qi(&projected),
+                    emit_path_joins(&inner.root, &inner.joins)
+                );
+                append_filter(&mut body, &inner.filter);
+                append_order_by(&mut body, &inner.order_by);
+                append_offset_limit(&mut body, &inner.offset, &inner.limit);
+                parts.push(format!("JOIN LATERAL (\n{}\n) AS {} ON TRUE", body, qi(&target.alias)));
             }
             IrPathJoin::BacklinkMulti {
                 source_alias,
@@ -4949,14 +4981,15 @@ mod tests {
     }
 
     #[test]
-    fn test_traversing_through_a_limited_computed_points_at_the_workaround() {
+    fn test_traversing_through_a_limited_computed_uses_a_lateral() {
+        // `capped` picks one row per Person, so the traversal correlates
+        // through a LATERAL rather than a plain join — and its `limit 1`
+        // means the result is one title, not an array of them.
         let schema = make_schema_with_computed_links();
-        let ast = parse::parse("SELECT Person { t := .capped.title }").unwrap();
-        let err = match ir::compile(&ast, &schema) {
-            Ok(_) => panic!("expected a compile error"),
-            Err(e) => format!("{e}"),
-        };
-        assert!(err.contains("order/offset/limit of its own"), "{err}");
+        let out = compile_and_emit_with("SELECT Person { t := .capped.title }", &schema);
+        assert!(out.sql.contains("JOIN LATERAL ("), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
+        assert!(!out.sql.contains("ARRAY(SELECT"), "{}", out.sql);
     }
 
     #[test]
