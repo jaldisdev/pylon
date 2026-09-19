@@ -3717,6 +3717,37 @@ impl<'a> Compiler<'a> {
 
     // ── FREE SELECT ───────────────────────────────────────────────────────────────
 
+    /// A mutation standing where a value is expected. Postgres cannot run DML
+    /// in a value list, so it becomes a data-modifying CTE — which it runs to
+    /// completion whether or not the outer query reads it — and what stands
+    /// here reads the ids back, so the value still names the rows the
+    /// mutation touched.
+    fn dml_as_value(&mut self, stmt: &Stmt) -> Result<IrExpr, PyQLError> {
+        let (cte_name, type_name) = self.hoist_dml_as_cte(stmt)?;
+        // Read back through a subquery rather than naming the CTE's column
+        // directly: a free select has no FROM of its own for the reference to
+        // resolve against.
+        let source = IrSource {
+            poly: None,
+            type_name,
+            table: format!("@cte:{cte_name}"),
+            alias: self.fresh_alias(),
+        };
+        Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+            source,
+            // An empty shape would emit the `SELECT 1` an EXISTS wants, which
+            // says nothing about which rows the value stands for.
+            vec![IrShapePointer::Scalar(IrScalarPointer {
+                marker_offset: None,
+                alias: "id".to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+                tuple_shape: None,
+            })],
+            None,
+        ))))
+    }
+
     fn collect_union_items(&mut self, expr: &Expr, items: &mut Vec<IrFreeExpr>) -> Result<(), PyQLError> {
         match expr {
             Expr::Union(a, b) => {
@@ -3735,36 +3766,25 @@ impl<'a> Compiler<'a> {
             // itself reads back the id, so the set still stands for the rows
             // the mutations touched.
             Expr::SubQuery(stmt) if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
-                let (cte_name, type_name) = self.hoist_dml_as_cte(stmt.as_ref())?;
-                // Read back through a subquery rather than naming the CTE's
-                // column directly: a free select has no FROM of its own for the
-                // reference to resolve against.
-                let source = IrSource {
-                    poly: None,
-                    type_name,
-                    table: format!("@cte:{cte_name}"),
-                    alias: self.fresh_alias(),
-                };
-                items.push(IrFreeExpr::Scalar(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
-                    source,
-                    // The ids the mutation touched: an empty shape would emit
-                    // the `SELECT 1` an EXISTS wants, which says nothing about
-                    // which rows the set stands for.
-                    vec![IrShapePointer::Scalar(IrScalarPointer {
-                        marker_offset: None,
-                        alias: "id".to_string(),
-                        column: "id".to_string(),
-                        pg_type: "uuid".to_string(),
-                        tuple_shape: None,
-                    })],
-                    None,
-                )))));
+                items.push(IrFreeExpr::Scalar(self.dml_as_value(stmt.as_ref())?));
             }
             other => {
                 items.push(IrFreeExpr::Scalar(self.compile_free_expr(other)?));
             }
         }
         Ok(())
+    }
+
+    /// One field of a free object written as a whole SELECT's result. A
+    /// mutation is allowed here for the same reason it is allowed as an item
+    /// of a free set — see `dml_as_value`.
+    fn free_object_field(&mut self, expr: &Expr) -> Result<IrExpr, PyQLError> {
+        match expr {
+            Expr::SubQuery(stmt) if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
+                self.dml_as_value(stmt.as_ref())
+            }
+            other => self.compile_free_expr(other),
+        }
     }
 
     fn compile_free_select(
@@ -3827,7 +3847,7 @@ impl<'a> Compiler<'a> {
                         let expr = el.compexpr.as_ref().ok_or_else(|| {
                             self.type_err("free object field must have a value expression (':= expr')")
                         })?;
-                        Ok((name, self.compile_free_expr(expr)?))
+                        Ok((name, self.free_object_field(expr)?))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 vec![IrFreeExpr::FreeObject(fields)]
@@ -7934,7 +7954,15 @@ impl<'a> Compiler<'a> {
                         let expr = el.compexpr.as_ref().ok_or_else(|| {
                             self.type_err("free object field must have a value expression (':= expr')")
                         })?;
-                        Ok((name, self.compile_expr_ctx(expr, ctx)?))
+                        let compiled = match expr {
+                            Expr::SubQuery(stmt)
+                                if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) =>
+                            {
+                                self.dml_as_value(stmt.as_ref())?
+                            }
+                            other => self.compile_expr_ctx(other, ctx)?,
+                        };
+                        Ok((name, compiled))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(IrExpr::NamedTuple {
