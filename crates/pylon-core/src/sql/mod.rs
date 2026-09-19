@@ -4176,6 +4176,15 @@ mod tests {
     }
 
     #[test]
+    fn test_array_valued_binding_picks_the_array_overload() {
+        // The binding carries `text[]`, so the call resolves to the array
+        // overload even though the value itself is no longer an array literal.
+        let out = compile_and_emit("WITH l := <array<std::str>>$0 SELECT std::find(l, 'a')");
+        assert!(out.sql.contains("array_position"), "{}", out.sql);
+        assert!(!out.sql.contains("strpos"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_narrowing_an_interface_joins_the_implementor_table() {
         // `first_name` lives on Individual's own table; the Account view has
         // only the columns every implementor shares.
