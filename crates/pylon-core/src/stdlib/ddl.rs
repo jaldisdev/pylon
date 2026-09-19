@@ -469,10 +469,7 @@ mod tests {
         // once as `INTERNAL_SCHEMA_VERSION` for code to read, once as a
         // literal for the DDL. They must not drift — a database would then
         // record a version no reader recognises.
-        assert_eq!(
-            internal_schema_version_literal!(),
-            INTERNAL_SCHEMA_VERSION.to_string(),
-        );
+        assert_eq!(internal_schema_version_literal!(), INTERNAL_SCHEMA_VERSION.to_string(),);
     }
 
     #[test]

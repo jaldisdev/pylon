@@ -152,7 +152,11 @@ fn hot_path_costs() {
     );
 
     let compiled = query::compile(&pyql, &schema).expect("benchmark query must compile");
-    println!("\n  (SQL: {} bytes, {} params)", compiled.sql.len(), compiled.param_names.len());
+    println!(
+        "\n  (SQL: {} bytes, {} params)",
+        compiled.sql.len(),
+        compiled.param_names.len()
+    );
 
     println!("\nPER-EXECUTION WORK");
     let t_shape_id = time_ns("CompiledQuery::shape_id() — per execution", 20_000, || {
@@ -170,7 +174,13 @@ fn hot_path_costs() {
         std::hint::black_box(compiled.clone());
     });
 
-    println!("\n  Precomputing shape_id saves {:.2} µs per execution.", (t_derive - t_shape_id) / 1000.0);
-    println!("  A cache hit costs {:.2} µs, of which {:.2} µs is the Arc bump.\n",
-             t_cached / 1000.0, t_clone / 1000.0);
+    println!(
+        "\n  Precomputing shape_id saves {:.2} µs per execution.",
+        (t_derive - t_shape_id) / 1000.0
+    );
+    println!(
+        "  A cache hit costs {:.2} µs, of which {:.2} µs is the Arc bump.\n",
+        t_cached / 1000.0,
+        t_clone / 1000.0
+    );
 }

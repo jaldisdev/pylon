@@ -1776,7 +1776,8 @@ fn record_query_compile_result(success: bool) {
 
 #[pyfunction]
 fn export_schema(py: Python<'_>, schema: &SchemaDescriptor) -> PyResult<String> {
-    py.detach(|| core::export::export_schema(&schema.inner)).map_err(|e| pyql_err(e, None))
+    py.detach(|| core::export::export_schema(&schema.inner))
+        .map_err(|e| pyql_err(e, None))
 }
 
 /// Compiles every user function body, computed-pointer expression, and
@@ -1786,21 +1787,22 @@ fn export_schema(py: Python<'_>, schema: &SchemaDescriptor) -> PyResult<String> 
 /// together, joined by newline, as a single `SchemaError`.
 #[pyfunction]
 fn validate_schema_types(py: Python<'_>, schema: &SchemaDescriptor) -> PyResult<()> {
-    py.detach(|| core::validate::validate_schema_types(&schema.inner)).map_err(|errs| {
-        let message = errs
-            .iter()
-            .map(|e| e.class_name_message_position().1.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        pyql_err(
-            core::error::PyQLError::Fragment(core::error::PyQLFragmentError {
-                message,
-                position: core::error::Position { line: 0, col: 0 },
-                context: "schema".to_string(),
-            }),
-            None,
-        )
-    })
+    py.detach(|| core::validate::validate_schema_types(&schema.inner))
+        .map_err(|errs| {
+            let message = errs
+                .iter()
+                .map(|e| e.class_name_message_position().1.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            pyql_err(
+                core::error::PyQLError::Fragment(core::error::PyQLFragmentError {
+                    message,
+                    position: core::error::Position { line: 0, col: 0 },
+                    context: "schema".to_string(),
+                }),
+                None,
+            )
+        })
 }
 
 #[pyfunction]

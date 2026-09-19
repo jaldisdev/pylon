@@ -248,6 +248,31 @@ fn on_delete_schema(module: &str) -> SchemaDescriptor {
                     }],
                 )],
             ),
+            // Both sides declared, the way `account::Individual.sessions` is:
+            // a permissive Target side puts `ON DELETE CASCADE` on the
+            // junction's target FK, which is what made the Source-side
+            // trigger collide with its own statement while it still hung off
+            // the junction table.
+            ty(
+                "ProductAllowAndDeleteTarget",
+                module,
+                vec![id_prop(), text_prop("name")],
+                vec![],
+                vec![ml(
+                    "tags",
+                    &tag_q,
+                    vec![
+                        OnDeletePolicy {
+                            side: DeleteSide::Target,
+                            action: DeleteAction::Allow,
+                        },
+                        OnDeletePolicy {
+                            side: DeleteSide::Source,
+                            action: DeleteAction::DeleteTarget,
+                        },
+                    ],
+                )],
+            ),
         ],
         ..Default::default()
     }
@@ -648,6 +673,75 @@ async fn multilink_source_delete_target_if_orphan_respects_other_references() {
         0,
         "Tag with no remaining references must be deleted when its sole-using Product is deleted"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn multilink_source_delete_target_leaves_the_tag_when_the_link_is_only_cleared() {
+    let (module, schema, pool) = setup().await;
+    exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
+    exec(
+        &pool, &schema,
+        &format!("insert {module}::ProductDeleteTarget {{ name := 'Widget', tags := (select {module}::Tag filter .name = 'red') }}"),
+    ).await;
+
+    exec(
+        &pool,
+        &schema,
+        &format!("update {module}::ProductDeleteTarget filter .name = 'Widget' set {{ tags := {{}} }}"),
+    )
+    .await;
+
+    let tags = rows_of(&pool, &schema, &format!("select {module}::Tag filter .name = 'red'")).await;
+    assert_eq!(
+        tags.len(),
+        1,
+        "DeleteTarget (Source-side) speaks about deleting the Product — unlinking the Tag must not delete it"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn multilink_clearing_a_link_whose_target_side_cascades_does_not_collide_with_itself() {
+    let (module, schema, pool) = setup().await;
+    exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
+    exec(
+        &pool, &schema,
+        &format!("insert {module}::ProductAllowAndDeleteTarget {{ name := 'Widget', tags := (select {module}::Tag filter .name = 'red') }}"),
+    ).await;
+
+    let clear = query::compile(
+        &format!("update {module}::ProductAllowAndDeleteTarget filter .name = 'Widget' set {{ tags := {{}} }}"),
+        &schema,
+    )
+    .unwrap();
+    pool.execute_typed(&clear.sql, &[])
+        .await
+        .expect("clearing the link must not report the junction row as already modified");
+
+    let tags = rows_of(&pool, &schema, &format!("select {module}::Tag filter .name = 'red'")).await;
+    assert_eq!(tags.len(), 1, "unlinking must leave the Tag in place");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn multilink_source_delete_target_still_fires_when_the_target_side_cascades() {
+    let (module, schema, pool) = setup().await;
+    exec(&pool, &schema, &format!("insert {module}::Tag {{ name := 'red' }}")).await;
+    exec(
+        &pool, &schema,
+        &format!("insert {module}::ProductAllowAndDeleteTarget {{ name := 'Widget', tags := (select {module}::Tag filter .name = 'red') }}"),
+    ).await;
+
+    exec(
+        &pool,
+        &schema,
+        &format!("delete {module}::ProductAllowAndDeleteTarget filter .name = 'Widget'"),
+    )
+    .await;
+
+    let tags = rows_of(&pool, &schema, &format!("select {module}::Tag filter .name = 'red'")).await;
+    assert_eq!(tags.len(), 0, "deleting the Product must still take its Tag with it");
 }
 
 // ── Migration (diff) path parity ────────────────────────────────────────────────
