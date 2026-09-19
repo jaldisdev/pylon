@@ -1343,6 +1343,16 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
     } else {
         union_sql
     };
+    // A free SELECT's FILTER has no row of its own to sit beside, so it gates
+    // the result the branches already produced rather than joining their own
+    // WHERE clauses.
+    if let Some(filter) = &sel.filter {
+        sql = format!(
+            "SELECT * FROM (\n{}\n) AS \"_filtered\"\nWHERE {}",
+            sql,
+            emit_expr(filter)
+        );
+    }
     append_order_by(&mut sql, &sel.order_by);
     append_offset_limit(&mut sql, &sel.offset, &sel.limit);
 
@@ -4155,6 +4165,24 @@ mod tests {
     fn test_with_binding_in_a_computed_reads_the_enclosing_object() {
         let out = compile_and_emit("SELECT Person { n := (WITH own := .name SELECT own) }");
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_free_select_filter_gates_the_result_and_warns() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT count(Person) FILTER (Person.age > 18)").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        let out = emit(&ir);
+        assert!(
+            out.sql.contains("EXISTS("),
+            "the condition gates the count:\n{}",
+            out.sql
+        );
+        assert!(
+            ir.warnings.iter().any(|w| w.contains("FILTER clause")),
+            "a set-valued filter warns: {:?}",
+            ir.warnings
+        );
     }
 
     #[test]
