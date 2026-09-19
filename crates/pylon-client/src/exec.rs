@@ -27,9 +27,9 @@ use std::collections::HashMap;
 
 use pylon_core::ir::SessionConfig;
 use pylon_core::query::{CompiledQuery, compile_with_config};
-use std::sync::Arc;
 use pylon_core::schema::SchemaDescriptor;
 use pylon_value::DecodedValue;
+use std::sync::Arc;
 
 use crate::decode::decode;
 use crate::error::{Error, Result};

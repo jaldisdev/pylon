@@ -967,27 +967,30 @@ fn push_junction_deletion_triggers(
         } else {
             "del_target"
         };
-        let deletes = tgt_qnames
+        // On the owner table, not the junction: the policy speaks about the
+        // *source object* being deleted, so merely unlinking (`ml := {}`)
+        // must leave the targets alone. Hanging it off the junction also made
+        // a permissive Target-side FK cascade away the very junction row the
+        // outer statement was deleting -- "tuple to be deleted was already
+        // modified by an operation triggered by the current command".
+        let owner_qname = qn(&t.module, &t.table);
+        let orphan = matches!(src_action, DeleteAction::DeleteTargetIfOrphan);
+        let body = tgt_qnames
             .iter()
-            .map(|tgt_qname| format!("DELETE FROM {tgt_qname} WHERE id = OLD.target;"))
-            .collect::<Vec<_>>();
-
-        let body = if matches!(src_action, DeleteAction::DeleteTargetIfOrphan) {
-            let indented = deletes
-                .iter()
-                .map(|d| format!("        {d}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "    IF NOT EXISTS (\n        SELECT 1 FROM {jt_qname} WHERE target = OLD.target AND source != OLD.source\n    ) THEN\n{indented}\n    END IF;"
-            )
-        } else {
-            deletes
-                .iter()
-                .map(|d| format!("    {d}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+            .map(|tgt_qname| {
+                let mut delete = format!(
+                    "    DELETE FROM {tgt_qname} AS _tgt\n    WHERE _tgt.id IN (SELECT target FROM {jt_qname} WHERE source = OLD.id)"
+                );
+                if orphan {
+                    delete.push_str(&format!(
+                        "\n      AND NOT EXISTS (SELECT 1 FROM {jt_qname} WHERE target = _tgt.id AND source != OLD.id)"
+                    ));
+                }
+                delete.push(';');
+                delete
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Keeps `suffix` in the rendered name (unlike `trigger_names`), since
         // both variants below hang off the same table/pointer pair.
@@ -996,10 +999,10 @@ fn push_junction_deletion_triggers(
         let fn_qname = qn(&t.module, &fname);
 
         let mut ddl = String::new();
-        emit_before_delete_trigger(&fn_qname, &qi(&fname), &jt_qname, &body, &mut ddl);
+        emit_before_delete_trigger(&fn_qname, &qi(&fname), &owner_qname, &body, &mut ddl);
         result.push(DeletionTriggerInfo {
             table_module: t.module.clone(),
-            table_name: jt_name.clone(),
+            table_name: t.table.clone(),
             trigger_name: fname,
             ddl,
         });

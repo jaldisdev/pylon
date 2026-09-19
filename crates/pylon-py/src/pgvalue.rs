@@ -34,8 +34,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::{
-    PyBool, PyBytes, PyDate, PyDateAccess, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
-    PyTimeAccess, PyTuple, PyTzInfo, PyTzInfoAccess, PyType,
+    PyBool, PyBytes, PyDate, PyDateAccess, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString, PyTime, PyTimeAccess,
+    PyTuple, PyType, PyTzInfo, PyTzInfoAccess,
 };
 
 use pylon_value::DecodedValue;
@@ -208,8 +208,7 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
         } else {
             dt
         };
-        let days = days_from_civil(dt.get_year(), dt.get_month().into(), dt.get_day().into())
-            - PG_EPOCH_DAYS_FROM_UNIX;
+        let days = days_from_civil(dt.get_year(), dt.get_month().into(), dt.get_day().into()) - PG_EPOCH_DAYS_FROM_UNIX;
         let total_us = days * US_PER_DAY
             + (i64::from(dt.get_hour()) * 3600 + i64::from(dt.get_minute()) * 60 + i64::from(dt.get_second()))
                 * 1_000_000
@@ -432,7 +431,11 @@ mod calendar_tests {
         // hand-rolled calendar conversion actually breaks.
         for z in days_from_civil(1800, 1, 1)..=days_from_civil(2200, 1, 1) {
             let (y, m, d) = civil_from_days(z);
-            assert_eq!(days_from_civil(y, m.into(), d.into()), z, "round trip failed at day {z}");
+            assert_eq!(
+                days_from_civil(y, m.into(), d.into()),
+                z,
+                "round trip failed at day {z}"
+            );
         }
     }
 

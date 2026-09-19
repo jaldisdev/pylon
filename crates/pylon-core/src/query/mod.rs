@@ -64,7 +64,9 @@ static QUERY_CACHE: OnceLock<Vec<CacheShard>> = OnceLock::new();
 fn query_cache() -> &'static [CacheShard] {
     QUERY_CACHE.get_or_init(|| {
         let per_shard = NonZeroUsize::new(CACHE_CAPACITY / CACHE_SHARDS).unwrap();
-        (0..CACHE_SHARDS).map(|_| RwLock::new(LruCache::new(per_shard))).collect()
+        (0..CACHE_SHARDS)
+            .map(|_| RwLock::new(LruCache::new(per_shard)))
+            .collect()
     })
 }
 

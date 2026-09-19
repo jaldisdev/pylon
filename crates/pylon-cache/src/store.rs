@@ -277,7 +277,11 @@ mod tests {
             let cache = Cache::open(dir.path(), 10).unwrap();
             for i in 0..32 {
                 cache
-                    .put(&format!("key{i}"), vec![DecodedValue::I64(i)], vec!["public.person".into()])
+                    .put(
+                        &format!("key{i}"),
+                        vec![DecodedValue::I64(i)],
+                        vec!["public.person".into()],
+                    )
                     .unwrap();
             }
         }

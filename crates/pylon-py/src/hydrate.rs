@@ -273,9 +273,10 @@ fn decode<'py>(
                 key_obj.set_item(shape_node_name(kn), decode(py, value, kn, reg)?)?;
             }
             let grouping = match item(value, *grouping_position) {
-                Some(DecodedValue::Array(arr)) => {
-                    PyList::new(py, arr.iter().map(|v| cached_to_py(py, v)).collect::<PyResult<Vec<_>>>()?)?
-                }
+                Some(DecodedValue::Array(arr)) => PyList::new(
+                    py,
+                    arr.iter().map(|v| cached_to_py(py, v)).collect::<PyResult<Vec<_>>>()?,
+                )?,
                 _ => PyList::empty(py),
             };
             let elements = match item(value, *elements_position) {
@@ -299,7 +300,10 @@ fn decode<'py>(
             let obj = decode_at_root(py, item(value, *object_position).unwrap_or(&NULL), object_node, reg)?;
             let out = PyDict::new(py);
             out.set_item("object", obj)?;
-            out.set_item("distance", cached_to_py(py, item(value, *distance_position).unwrap_or(&NULL))?)?;
+            out.set_item(
+                "distance",
+                cached_to_py(py, item(value, *distance_position).unwrap_or(&NULL))?,
+            )?;
             Ok(out.into_any())
         }
         ShapeNode::FtsSearch {
@@ -328,9 +332,7 @@ fn decode_at_root<'py>(
         ShapeNode::Object {
             type_name, pointers, ..
         } => decode_object(py, value, 0, type_name.as_deref(), pointers, reg),
-        ShapeNode::NamedTuple {
-            type_name, members, ..
-        } => {
+        ShapeNode::NamedTuple { type_name, members, .. } => {
             let raw = if matches!(value, DecodedValue::Null) || is_json_container(value) {
                 value
             } else {

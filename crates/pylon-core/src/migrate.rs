@@ -785,7 +785,10 @@ mod tests {
     async fn a_freshly_ensured_database_reads_as_current() {
         let pool = test_pool().await;
         ensure_internal_schema(&pool).await.unwrap();
-        assert_eq!(check_internal_schema(&pool).await.unwrap(), InternalSchemaState::Current);
+        assert_eq!(
+            check_internal_schema(&pool).await.unwrap(),
+            InternalSchemaState::Current
+        );
     }
 
     #[tokio::test]
