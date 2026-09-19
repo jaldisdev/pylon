@@ -752,7 +752,7 @@ class TestWalkIntegration:
 
         @pylon.type(module='fx', name='Rate')
         class Rate:
-            currency: Property[str, Expression("__subject__.currency != ''")]
+            currency: Property[str, Expression("__subject__ != ''")]
 
         @pylon.type(module='fx', name='Unrelated')
         class Unrelated:
@@ -761,7 +761,9 @@ class TestWalkIntegration:
         types, enums, scalars = snapshot()
         schema = json.loads(walk(types, enums, scalars, []).to_json())
         by_name = {t['name']: t for t in schema['types']}
-        assert by_name['Rate']['constraints'] == [{'Expression': {'expr': "__subject__.currency != ''"}}]
+        # On a pointer `__subject__` is that pointer's own value, so it resolves
+        # to the pointer while the constraint still knows which one it came from.
+        assert by_name['Rate']['constraints'] == [{'Expression': {'expr': ".currency != ''"}}]
         assert by_name['Unrelated']['constraints'] == []
 
     def test_object_valued_computed_declares_no_scalar_return_type(self):
