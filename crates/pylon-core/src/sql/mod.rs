@@ -4100,6 +4100,35 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_select_modifiers_scope_to_its_own_subject() {
+        // `.title` belongs to Post, the sub-select's subject — not to Person,
+        // where the projection `.author.name` lands.
+        let mut schema = make_schema();
+        let post = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Post")
+            .expect("Post is in the test schema");
+        post.links.push(LinkDescriptor {
+            name: "author".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+            through: None,
+        });
+        let out = compile_and_emit_with(
+            "SELECT Person { a := (SELECT .posts FILTER .title = 'x' LIMIT 1).author.name }",
+            &schema,
+        );
+        assert!(out.sql.contains("'x'"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_free_select_set_literal() {
         let schema = make_schema();
         let ast = parse::parse("SELECT {1, 2, 3}").unwrap();
