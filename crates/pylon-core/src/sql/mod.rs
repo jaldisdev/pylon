@@ -238,9 +238,54 @@ fn module_of(type_name: &str) -> &str {
 fn source_ref(src: &IrSource) -> String {
     // "@cte:name" sentinel: the source is a WITH-clause CTE, not a real table.
     if let Some(cte_name) = src.table.strip_prefix("@cte:") {
-        qi(cte_name)
-    } else {
-        qn(module_of(&src.type_name), &src.table)
+        return qi(cte_name);
+    }
+    // An interface-typed source reads from its implementors, never from the
+    // interface's own view — see `IrSource::poly`.
+    match &src.poly {
+        Some(fanout) => format!("(\n{}\n)", emit_poly_union(&fanout.implementors, &fanout.columns)),
+        None => qn(module_of(&src.type_name), &src.table),
+    }
+}
+
+/// The discriminator for a path select's object result.
+///
+/// The terminal row source is the one the result came from, so that is the one
+/// whose fan-out decides whether the type is read off the row or fixed.
+fn result_type_disc(path: &IrPathSelect, alias: &str, type_name: &str) -> String {
+    match terminal_source(path, alias) {
+        Some(source) => source_type_disc(source),
+        None => type_disc(type_name),
+    }
+}
+
+fn terminal_source<'a>(path: &'a IrPathSelect, alias: &str) -> Option<&'a IrSource> {
+    if path.root.alias == alias {
+        return Some(&path.root);
+    }
+    path.joins
+        .iter()
+        .map(path_join_target)
+        .find(|target| target.alias == alias)
+}
+
+fn path_join_target(join: &IrPathJoin) -> &IrSource {
+    match join {
+        IrPathJoin::Single { target, .. }
+        | IrPathJoin::Multi { target, .. }
+        | IrPathJoin::BacklinkSingle { target, .. }
+        | IrPathJoin::BacklinkMulti { target, .. }
+        | IrPathJoin::Function { target, .. }
+        | IrPathJoin::Lateral { target, .. } => target,
+    }
+}
+
+/// The type discriminator for a row from `src`: the fanned-out column when the
+/// source reads from implementors, else the one type its table holds.
+fn source_type_disc(src: &IrSource) -> String {
+    match &src.poly {
+        Some(_) => format!("{}.\"__type__\"", qi(&src.alias)),
+        None => type_disc(&src.type_name),
     }
 }
 
@@ -1715,7 +1760,19 @@ fn emit_array_source(src: &IrArraySource) -> String {
         IrArraySource::PathSelect(ps) => {
             let scalar = match &ps.result {
                 IrPathResult::Scalar(e, _) => emit_expr(e),
-                IrPathResult::Object { alias, .. } => format!("{}.\"id\"", qi(alias)),
+                // Aggregating objects keeps the whole row, not the id: this is
+                // how a computed pointer that walks through a multi-link comes
+                // back as hydrated rows rather than a list of uuids.
+                IrPathResult::Object {
+                    alias,
+                    type_name,
+                    shape,
+                } => {
+                    let (pointer_exprs, _) = build_shape(shape, alias);
+                    let mut parts = vec![result_type_disc(ps, alias, type_name)];
+                    parts.extend(pointer_exprs);
+                    format!("(\n    {}\n)", parts.join(",\n    "))
+                }
             };
             let from_sql = emit_path_joins(&ps.root, &ps.joins);
             let mut sql = format!(
@@ -1997,7 +2054,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
             shape,
         } => {
             let (pointer_exprs, pointer_nodes) = build_shape(shape, alias);
-            let mut parts = vec![type_disc(type_name)];
+            let mut parts = vec![result_type_disc(sel, alias, type_name)];
             parts.extend(pointer_exprs);
             let expr = format!("(\n    {}\n) AS result", parts.join(",\n    "));
             let shape_root = ShapeNode::Object {
@@ -2970,7 +3027,7 @@ fn emit_single_link(f: &IrSingleLinkPointer, parent_alias: &str, pos: usize) -> 
     let sub_alias = &source.alias;
 
     let (sub_exprs, mut sub_nodes) = build_shape(shape, sub_alias);
-    let mut parts = vec![type_disc(&source.type_name)];
+    let mut parts = vec![source_type_disc(source)];
     parts.extend(sub_exprs);
 
     // Link properties: read from the junction table alias "jt" — only ever
@@ -3071,7 +3128,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
     let sub_alias = &source.alias;
 
     let (sub_exprs, mut sub_nodes) = build_shape(shape, sub_alias);
-    let mut row_parts = vec![type_disc(&source.type_name)];
+    let mut row_parts = vec![source_type_disc(source)];
     row_parts.extend(sub_exprs);
 
     // Link properties: read from the junction table alias "jt".
@@ -8186,6 +8243,155 @@ mod tests {
             ir.warnings.iter().any(|w| w.contains("FILTER clause")),
             "an unwrapped set-valued comparison still warns: {:?}",
             ir.warnings
+        );
+    }
+
+    #[test]
+    fn test_link_to_an_interface_expands_over_its_implementors() {
+        // Regression: an interface's view carries only the interface's own
+        // columns, so reading a link through it tagged every row as the
+        // interface and hydrated `Profile` where the row was an
+        // `IndividualProfile`. The root of a query already expands inline;
+        // a nested link did not.
+        let mut schema = make_interface_schema();
+        let account = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Account")
+            .expect("the interface schema has an Account type");
+        account.materialized = true;
+        // A second implementor, so the fan-out is a real union.
+        let mut organization = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Individual")
+            .expect("the interface schema has an Individual type")
+            .clone();
+        organization.name = "Organization".into();
+        organization.table = "Organization".into();
+        organization.computed.clear();
+        schema.types.push(organization);
+
+        let owner = TypeDescriptor {
+            name: "Note".into(),
+            module: "default".into(),
+            table: "Note".into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: vec![],
+            links: vec![LinkDescriptor {
+                name: "owner".into(),
+                target: "default::Account".into(),
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+                through: None,
+            }],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        };
+        schema.types.push(owner);
+
+        let out = compile_and_emit_with("SELECT Note { owner: { id } }", &schema);
+        assert!(
+            out.sql.contains("UNION ALL"),
+            "the link's target should expand over its implementors, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("'default::Individual'::text AS \"__type__\""),
+            "each branch should carry its own discriminator, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("FROM \"default\".\"Account\" AS"),
+            "the interface's own view should no longer be read directly, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_path_traversal_onto_an_interface_carries_the_concrete_type() {
+        // The hole the chained-pointer fix landed on: a *path join* onto an
+        // interface still read the interface's view, so the rows a traversal
+        // returned were tagged with the interface and hydrated its class. Links
+        // fan out; this is the traversal route they share with computed chains.
+        let mut schema = make_interface_schema();
+        let account = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Account")
+            .expect("the interface schema has an Account type");
+        account.materialized = true;
+        let mut organization = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Individual")
+            .expect("the interface schema has an Individual type")
+            .clone();
+        organization.name = "Organization".into();
+        organization.table = "Organization".into();
+        organization.computed.clear();
+        schema.types.push(organization);
+        schema.types.push(TypeDescriptor {
+            name: "Note".into(),
+            module: "default".into(),
+            table: "Note".into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: vec![],
+            links: vec![LinkDescriptor {
+                name: "owner".into(),
+                target: "default::Account".into(),
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+                through: None,
+            }],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+
+        let out = compile_and_emit_with("SELECT Note.owner { id }", &schema);
+        assert!(
+            out.sql.contains("UNION ALL") && out.sql.contains("'default::Individual'::text AS \"__type__\""),
+            "the traversal's target should fan out over implementors, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("'default::Account'::text,"),
+            "the row's type should be read off the row, not fixed to the interface, got:\n{}",
+            out.sql
         );
     }
 

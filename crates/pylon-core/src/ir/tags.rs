@@ -489,6 +489,7 @@ mod tests {
 
     fn src(type_name: &str, table: &str, alias: &str) -> IrSource {
         IrSource {
+            poly: None,
             type_name: type_name.into(),
             table: table.into(),
             alias: alias.into(),

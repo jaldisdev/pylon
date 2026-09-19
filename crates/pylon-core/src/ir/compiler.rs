@@ -33,7 +33,7 @@ use super::{
     IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup, IrIfElse, IrInsert,
     IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
+    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
     IrSelect, IrSessionGlobalCte, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir,
     IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate, IrVectorSearch, SearchEnqueueInfo, TupleCastShape,
     VectorEnqueueInfo,
@@ -2089,6 +2089,7 @@ impl<'a> Compiler<'a> {
                             tuple_shape: None,
                         })];
                         let source = IrSource {
+                            poly: None,
                             type_name: format!("{td_module}::{td_name}"),
                             table: td_table,
                             alias,
@@ -2168,6 +2169,7 @@ impl<'a> Compiler<'a> {
                         };
                         let ps = IrPathSelect {
                             root: IrSource {
+                                poly: None,
                                 type_name: src_qname,
                                 table: src_table,
                                 alias: src_alias,
@@ -2295,8 +2297,11 @@ impl<'a> Compiler<'a> {
         tail: usize,
     ) -> Result<IrPathSelect, PyQLError> {
         let outer_anchor = self.modifier_anchor.take();
-        let result = self.compile_path_select_inner(sel, path, shape_elements, distinct, tail);
+        let mut result = self.compile_path_select_inner(sel, path, shape_elements, distinct, tail);
         self.modifier_anchor = outer_anchor;
+        if let Ok(path_select) = &mut result {
+            self.resolve_join_fanouts(path_select);
+        }
         result
     }
 
@@ -2327,6 +2332,7 @@ impl<'a> Compiler<'a> {
         };
         let root_alias = self.fresh_alias();
         let root = IrSource {
+            poly: None,
             type_name: format!("{}::{}", root_td.module, root_td.name),
             table: match &cte_object_type {
                 Some(_) => format!("@cte:{}", root_name),
@@ -2395,6 +2401,7 @@ impl<'a> Compiler<'a> {
                 if narrowed_has_relation && narrowed.table != current_td.table {
                     let target_alias = self.fresh_alias();
                     let target = IrSource {
+                        poly: None,
                         type_name: format!("{}::{}", narrowed.module, narrowed.name),
                         table: narrowed.table.clone(),
                         alias: target_alias.clone(),
@@ -2468,6 +2475,7 @@ impl<'a> Compiler<'a> {
 
                 let target_alias = self.fresh_alias();
                 let target = IrSource {
+                    poly: None,
                     type_name: format!("{}::{}", owner_td.module, owner_td.name),
                     table: owner_td.table.clone(),
                     alias: target_alias.clone(),
@@ -2668,6 +2676,7 @@ impl<'a> Compiler<'a> {
                 let target_td = self.resolve_type(&l.target)?;
                 let target_alias = self.fresh_alias();
                 let target = IrSource {
+                    poly: None,
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: target_alias.clone(),
@@ -2727,6 +2736,7 @@ impl<'a> Compiler<'a> {
                 let target_alias = self.fresh_alias();
                 let junction_alias = self.fresh_alias();
                 let target = IrSource {
+                    poly: None,
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: target_alias.clone(),
@@ -2867,6 +2877,7 @@ impl<'a> Compiler<'a> {
                         let target_td = self.resolve_type(&type_name.clone())?;
                         let target_alias = self.fresh_alias();
                         let target = IrSource {
+                            poly: None,
                             type_name: format!("{}::{}", target_td.module, target_td.name),
                             table: target_td.table.clone(),
                             alias: target_alias.clone(),
@@ -2939,6 +2950,7 @@ impl<'a> Compiler<'a> {
                     let target_td = self.resolve_type(&return_type_name)?;
                     let target_alias = self.fresh_alias();
                     let target = IrSource {
+                        poly: None,
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: target_alias.clone(),
@@ -3281,6 +3293,7 @@ impl<'a> Compiler<'a> {
         };
         let alias = self.fresh_alias();
         let root = IrSource {
+            poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table: match &cte_object_type {
                 Some(_) => format!("@cte:{}", root_type_name),
@@ -3460,6 +3473,7 @@ impl<'a> Compiler<'a> {
         }));
         Ok(IrSelect::schema_bound(
             IrSource {
+                poly: None,
                 type_name: format!("{}::__jt__", jt_module),
                 table: jt_table,
                 alias: jt_alias,
@@ -3539,6 +3553,7 @@ impl<'a> Compiler<'a> {
         }));
         let select = IrSelect::schema_bound(
             IrSource {
+                poly: None,
                 type_name: format!("{}::__jt__", jt_module),
                 table: jt_table,
                 alias: jt_alias,
@@ -3809,6 +3824,7 @@ impl<'a> Compiler<'a> {
         let td = self.resolve_type(&root)?;
         let alias = self.fresh_alias();
         let source = IrSource {
+            poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table: td.table.clone(),
             alias: alias.clone(),
@@ -3943,6 +3959,7 @@ impl<'a> Compiler<'a> {
             .into_iter()
             .map(|(type_name, table)| IrRowSource::Bound {
                 source: IrSource {
+                    poly: None,
                     type_name,
                     table,
                     alias: alias.clone(),
@@ -3983,6 +4000,7 @@ impl<'a> Compiler<'a> {
             None => td.table.clone(),
         };
         let source = IrSource {
+            poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table,
             alias: alias.clone(),
@@ -4207,6 +4225,7 @@ impl<'a> Compiler<'a> {
                     "uuid".to_string()
                 };
                 let source = IrSource {
+                    poly: None,
                     type_name: yielded,
                     table: format!("@cte:{name}"),
                     alias: self.fresh_alias(),
@@ -4309,6 +4328,7 @@ impl<'a> Compiler<'a> {
             None => td.table.clone(),
         };
         let source = IrSource {
+            poly: None,
             type_name: fq_type_name.clone(),
             table,
             alias: alias.clone(),
@@ -4462,6 +4482,7 @@ impl<'a> Compiler<'a> {
         }
         let alias = self.fresh_alias();
         let target = IrSource {
+            poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table: td.table.clone(),
             alias: alias.clone(),
@@ -4713,6 +4734,7 @@ impl<'a> Compiler<'a> {
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
         let target = IrSource {
+            poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table: td.table.clone(),
             alias: alias.clone(),
@@ -5218,6 +5240,7 @@ impl<'a> Compiler<'a> {
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
         let target = IrSource {
+            poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table: td.table.clone(),
             alias: alias.clone(),
@@ -5328,6 +5351,7 @@ impl<'a> Compiler<'a> {
                 let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, &target_module)?;
                 let subquery = IrSelect::schema_bound(
                     IrSource {
+                        poly: None,
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: sub_alias.clone(),
@@ -5421,14 +5445,15 @@ impl<'a> Compiler<'a> {
                     }
                 };
 
-                let subquery = IrSelect::schema_bound(
+                let subquery = self.link_target_select(
+                    target_td,
                     IrSource {
+                        poly: None,
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: sub_alias.clone(),
                     },
                     sub_shape,
-                    None,
                 );
 
                 pointers.push(IrShapePointer::MultiLink(IrMultiLinkPointer {
@@ -5512,6 +5537,7 @@ impl<'a> Compiler<'a> {
             }));
             let subquery = IrSelect::schema_bound(
                 IrSource {
+                    poly: None,
                     type_name: concrete_qname.clone(),
                     table: concrete_table.clone(),
                     alias: sub_alias,
@@ -5551,6 +5577,7 @@ impl<'a> Compiler<'a> {
             let inner_ir = self.compile_expr(&expr_ast, concrete_td, &sub_alias)?;
             let subquery = IrSelect::schema_bound(
                 IrSource {
+                    poly: None,
                     type_name: concrete_qname.clone(),
                     table: concrete_table.clone(),
                     alias: sub_alias,
@@ -5608,6 +5635,7 @@ impl<'a> Compiler<'a> {
                 }));
                 let exists_select = IrSelect::schema_bound(
                     IrSource {
+                        poly: None,
                         type_name: format!("{}::__jt__", jt_module),
                         table: jt_table,
                         alias: jt_alias,
@@ -5637,6 +5665,7 @@ impl<'a> Compiler<'a> {
             let sub_shape = Self::pk_returning(target_td);
             let subquery = IrSelect::schema_bound(
                 IrSource {
+                    poly: None,
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: sub_alias,
@@ -5750,6 +5779,7 @@ impl<'a> Compiler<'a> {
 
         Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
             IrSource {
+                poly: None,
                 type_name: concrete_qname,
                 table: concrete_table,
                 alias: sub_alias,
@@ -5887,14 +5917,15 @@ impl<'a> Compiler<'a> {
             };
 
             let sub_shape = self.compile_shape(&regular_els, target_td, &sub_alias, &target_td.module.clone())?;
-            let subquery = IrSelect::schema_bound(
+            let subquery = self.link_target_select(
+                target_td,
                 IrSource {
+                    poly: None,
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: sub_alias,
                 },
                 sub_shape,
-                None,
             );
             let correlation = if l.is_junction_backed() {
                 let join = self.build_multilink_join(td, &l.name, &l.target, &l.through)?;
@@ -6043,10 +6074,10 @@ impl<'a> Compiler<'a> {
         })(self);
         self.link_prop_scope.pop();
         let (filter, order_by, offset, limit) = modifiers?;
-
         let subquery = IrSelect {
             rows: vec![IrRowSource::Bound {
                 source: IrSource {
+                    poly: self.link_target_fanout(target_td),
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: sub_alias.clone(),
@@ -6184,6 +6215,7 @@ impl<'a> Compiler<'a> {
         let subquery = IrSelect {
             rows: vec![IrRowSource::Bound {
                 source: IrSource {
+                    poly: None,
                     type_name: owner_qname,
                     table: owner_td.table.clone(),
                     alias: sub_alias.clone(),
@@ -6579,6 +6611,7 @@ impl<'a> Compiler<'a> {
             let alias = self.fresh_alias();
             let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, root_td, &alias)?;
             let source = IrSource {
+                poly: None,
                 type_name: format!("{}::{}", root_td.module, root_td.name),
                 table: root_td.table.clone(),
                 alias,
@@ -7832,6 +7865,7 @@ impl<'a> Compiler<'a> {
         };
 
         let source = IrSource {
+            poly: None,
             type_name: source_qname,
             table: source_table,
             alias: src_alias,
@@ -8238,6 +8272,7 @@ impl<'a> Compiler<'a> {
                 };
                 return Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                     IrSource {
+                        poly: None,
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: ft_alias.clone(),
@@ -8491,6 +8526,7 @@ impl<'a> Compiler<'a> {
                     op: ast::UnaryOpKind::Exists,
                     operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                         IrSource {
+                            poly: None,
                             type_name: format!("{}::__jt__", jt_module),
                             table: jt_table,
                             alias: jt_alias.clone(),
@@ -8560,6 +8596,7 @@ impl<'a> Compiler<'a> {
                 op: ast::UnaryOpKind::Exists,
                 operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                     IrSource {
+                        poly: None,
                         type_name: format!("{}::__jt__", jt_module),
                         table: jt_table,
                         alias: jt_alias.clone(),
@@ -8621,6 +8658,7 @@ impl<'a> Compiler<'a> {
             op: ast::UnaryOpKind::Exists,
             operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                 IrSource {
+                    poly: None,
                     type_name: target_qname,
                     table: target_table,
                     alias: t_alias,
@@ -8721,6 +8759,7 @@ impl<'a> Compiler<'a> {
                     op: ast::UnaryOpKind::Exists,
                     operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                         IrSource {
+                            poly: None,
                             type_name: link_target_qname,
                             table: link_target_table,
                             alias: l_alias,
@@ -8923,6 +8962,7 @@ impl<'a> Compiler<'a> {
 
         // EXISTS(SELECT 1 FROM junction jt WHERE ...)
         let jt_source = IrSource {
+            poly: None,
             type_name: format!("{}::__jt__", jt_module),
             table: jt_table,
             alias: jt_alias,
@@ -9034,6 +9074,7 @@ impl<'a> Compiler<'a> {
             }));
             let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                 IrSource {
+                    poly: None,
                     type_name: target_type.to_string(),
                     table: target_table,
                     alias: tgt_alias,
@@ -9116,6 +9157,7 @@ impl<'a> Compiler<'a> {
             }));
             let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                 IrSource {
+                    poly: None,
                     type_name: target_type.to_string(),
                     table: target_table,
                     alias: tgt_alias,
@@ -9153,6 +9195,7 @@ impl<'a> Compiler<'a> {
         }));
         let inner = IrExpr::Subquery(Box::new(IrSelect::schema_bound(
             IrSource {
+                poly: None,
                 type_name: target_type.to_string(),
                 table: target_table,
                 alias: tgt_alias,
@@ -9299,6 +9342,7 @@ impl<'a> Compiler<'a> {
 
         Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
             IrSource {
+                poly: None,
                 type_name: format!("{}::{}", td.module, td.name),
                 table: td.table.clone(),
                 alias,
@@ -10049,6 +10093,70 @@ impl<'a> Compiler<'a> {
             .collect()
     }
 
+    /// A nested SELECT over a link's target, expanded inline over the
+    /// interface's implementors when the target is one.
+    ///
+    /// An interface is materialised as a view that carries only the
+    /// interface's own columns -- no discriminator -- so reading a link
+    /// through it tags every row as the interface itself and hydrates the
+    /// interface class rather than the concrete one. Expanding the
+    /// implementors inline is what the root of a query already does, and each
+    /// branch supplies its own `__type__`.
+    fn link_target_select(
+        &self,
+        target_td: &TypeDescriptor,
+        mut source: IrSource,
+        shape: Vec<IrShapePointer>,
+    ) -> IrSelect {
+        source.poly = self.link_target_fanout(target_td);
+        IrSelect::schema_bound(source, shape, None)
+    }
+
+    /// The fan-out a link's target needs, for the builders that assemble their
+    /// own source rather than going through `link_target_select`.
+    fn link_target_fanout(&self, target_td: &TypeDescriptor) -> Option<IrPolyFanout> {
+        self.poly_fanout_for(&format!("{}::{}", target_td.module, target_td.name))
+    }
+
+    /// Give every interface-typed join target its fan-out, so a traversal that
+    /// lands on one reads the implementors and carries the real type rather
+    /// than the interface's view, which has no discriminator to carry.
+    ///
+    /// The root is left alone: a path select fans its own root out through
+    /// `poly_implementors` already, and doing it twice would nest the union.
+    fn resolve_join_fanouts(&self, path_select: &mut IrPathSelect) {
+        for join in &mut path_select.joins {
+            let target = match join {
+                IrPathJoin::Single { target, .. }
+                | IrPathJoin::Multi { target, .. }
+                | IrPathJoin::BacklinkSingle { target, .. }
+                | IrPathJoin::BacklinkMulti { target, .. }
+                | IrPathJoin::Function { target, .. }
+                | IrPathJoin::Lateral { target, .. } => target,
+            };
+            if target.poly.is_none() && !target.table.starts_with("@cte:") {
+                target.poly = self.poly_fanout_for(&target.type_name.clone());
+            }
+        }
+    }
+
+    /// The fan-out a source of `type_name` needs, or `None` when it is not an
+    /// interface and so reads from a table of its own. See `IrSource::poly`.
+    fn poly_fanout_for(&self, type_name: &str) -> Option<IrPolyFanout> {
+        let td = self.schema
+            .types
+            .iter()
+            .find(|t| format!("{}::{}", t.module, t.name) == type_name)?;
+        if !(td.abstract_ && td.materialized) {
+            return None;
+        }
+        let (implementors, columns) = self.collect_poly_info(type_name);
+        Some(IrPolyFanout {
+            implementors,
+            columns,
+        })
+    }
+
     /// Collect poly_implementors and poly_columns for a polymorphic return type.
     fn collect_poly_info(&self, type_name: &str) -> (Vec<IrPolyImplementor>, Vec<String>) {
         let implementors = self.find_poly_implementors(type_name);
@@ -10217,6 +10325,7 @@ impl<'a> Compiler<'a> {
 
         let alias = self.fresh_alias();
         let source = IrSource {
+            poly: None,
             type_name: type_qname.clone(),
             table: td.table.clone(),
             alias: alias.clone(),
@@ -10438,6 +10547,7 @@ impl<'a> Compiler<'a> {
 
         let alias = self.fresh_alias();
         let source = IrSource {
+            poly: None,
             type_name: type_qname.clone(),
             table: td.table.clone(),
             alias: alias.clone(),

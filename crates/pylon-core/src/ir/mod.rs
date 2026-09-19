@@ -372,6 +372,26 @@ pub struct IrSource {
     pub table: String,
     /// Alias used in emitted SQL, e.g. `t0`.
     pub alias: String,
+    /// Set when `type_name` is an interface and the rows have to be read from
+    /// the implementors rather than the interface's own view.
+    ///
+    /// The view carries only the interface's columns and no discriminator, so
+    /// reading through it tags every row as the interface and hydrates the
+    /// interface class instead of the concrete one. The SQL emitters get no
+    /// schema of their own, so whether a source needs fanning out can only be
+    /// decided here, while the IR is built.
+    ///
+    /// `None` everywhere it would be wrong or pointless — a DML target cannot
+    /// be a union, and a concrete type has nothing to fan out to.
+    pub poly: Option<IrPolyFanout>,
+}
+
+/// The implementors an interface-typed source reads from, and the columns each
+/// branch of the union projects.
+#[derive(Debug, Clone)]
+pub struct IrPolyFanout {
+    pub implementors: Vec<IrPolyImplementor>,
+    pub columns: Vec<String>,
 }
 
 /// A set-valued scalar computed pointer from cross-scope `TypeIs`.
