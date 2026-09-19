@@ -769,6 +769,24 @@ class TestEnum:
     def test_is_str_instance(self):
         assert isinstance(Status.Active, str)
 
+    def test_every_rendering_agrees_with_the_value(self):
+        # A `str`-mixin enum inherits `Enum.__str__`, so `str()`, f-strings,
+        # `format()` and `%s` used to render `Status.Active` while `==`,
+        # `json.dumps` and every inherited `str` method rendered `Active`.
+        # `str(status) == 'Active'` was false wherever `status == 'Active'` was
+        # true, which fails quietly rather than loudly.
+        import json
+
+        assert str(Status.Active) == 'Active'
+        assert f'{Status.Active}' == 'Active'
+        assert format(Status.Active) == 'Active'
+        assert '%s' % Status.Active == 'Active'
+        assert json.dumps({'status': Status.Active}) == '{"status": "Active"}'
+        assert '-'.join([Status.Active, 'x']) == 'Active-x'
+
+    def test_repr_still_names_the_member(self):
+        assert repr(Status.Active) == "<Status.Active: 'Active'>"
+
     def test_member_count(self):
         assert len(Status) == 3
 
