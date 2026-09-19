@@ -3657,10 +3657,6 @@ impl<'a> Compiler<'a> {
         result_expr: &Expr,
         distinct: bool,
     ) -> Result<IrSelect, PyQLError> {
-        if sel.filter.is_some() {
-            return Err(self.type_err("FILTER is not supported on free SELECT expressions"));
-        }
-
         let items: Vec<IrFreeExpr> = match result_expr {
             Expr::Union(_, _) | Expr::Set(_) => {
                 let mut union_items = vec![];
@@ -3748,10 +3744,11 @@ impl<'a> Compiler<'a> {
 
         let offset = sel.offset.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
         let limit = sel.limit.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
+        let filter = sel.filter.as_ref().map(|f| self.compile_free_filter(f)).transpose()?;
 
         Ok(IrSelect {
             rows: items.into_iter().map(IrRowSource::Free).collect(),
-            filter: None,
+            filter,
             order_by,
             offset,
             limit,
@@ -3762,6 +3759,35 @@ impl<'a> Compiler<'a> {
             poly_columns: vec![],
             lock: None,
         })
+    }
+
+    /// The FILTER of a free SELECT, which has no row to apply itself to: it
+    /// gates the result the select already produced.
+    ///
+    /// A condition over a type-rooted path is a *set* of booleans, one per row
+    /// of that type, so the result survives when any of them holds — the same
+    /// reading PyQL gives it, and the reason for the warning: a filter is
+    /// meant to be one boolean, and `any()` says so outright.
+    fn compile_free_filter(&mut self, filter: &Expr) -> Result<IrExpr, PyQLError> {
+        let Some(root) = self.find_path_root_in_expr(filter) else {
+            return self.compile_free_expr(filter);
+        };
+        let td = self.resolve_type(&root)?;
+        let alias = self.fresh_alias();
+        let source = IrSource {
+            type_name: format!("{}::{}", td.module, td.name),
+            table: td.table.clone(),
+            alias: alias.clone(),
+        };
+        let condition = self.compile_expr(&Self::rewrite_abs_to_partial(filter.clone(), &root), td, &alias)?;
+        self.warnings.push(format!(
+            "possibly more than one element returned by an expression in a FILTER clause \
+             (every '{root}'); wrap with any() to make intent explicit",
+        ));
+        Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+            op: ast::UnaryOpKind::Exists,
+            operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(source, vec![], Some(condition)))),
+        })))
     }
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
