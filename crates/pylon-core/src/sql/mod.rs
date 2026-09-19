@@ -4227,6 +4227,13 @@ mod tests {
     }
 
     #[test]
+    fn test_any_over_a_single_boolean_is_that_boolean() {
+        let out = compile_and_emit("SELECT Person FILTER std::any(.age > 18)");
+        assert!(!out.sql.contains("bool_or"), "no aggregate in WHERE:\n{}", out.sql);
+        assert!(out.sql.contains("> 18"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_for_over_a_with_binding_iterates_every_row() {
         let out = compile_and_emit(
             "WITH names := (SELECT Person.name) FOR n IN names UNION (SELECT Person FILTER .name = n)",
