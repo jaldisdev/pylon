@@ -4153,6 +4153,13 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_select_shape_declares_names_its_filter_and_projection_read() {
+        let out = compile_and_emit("SELECT Person { n := (SELECT .posts { t := .title } FILTER .t = 'x' LIMIT 1).t }");
+        assert!(out.sql.contains("'x'"), "{}", out.sql);
+        assert!(out.sql.contains("\"title\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_assert_over_an_object_set_returns_rows() {
         let out = compile_and_emit("SELECT std::assert_distinct((SELECT Person))");
         assert!(
