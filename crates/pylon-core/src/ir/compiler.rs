@@ -7089,6 +7089,27 @@ impl<'a> Compiler<'a> {
                 if f.args.len() == 1 {
                     let arg = &f.args[0];
                     if let Some((td, alias)) = ctx {
+                        // `max(items.created_at)` inside a FILTER: the
+                        // aggregate takes the whole set the path names, so it
+                        // belongs inside a subquery over that set — a bare
+                        // `max(...)` here is an aggregate in a WHERE clause,
+                        // which Postgres rejects outright.
+                        if let Expr::Path(p) = arg
+                            && !p.partial
+                            && p.steps.len() > 1
+                            && let Some(root) = self.find_path_root_in_expr(arg)
+                        {
+                            let synthetic = ast::SelectStmt {
+                                result: Expr::FunctionCall(f.clone()),
+                                filter: None,
+                                order_by: vec![],
+                                offset: None,
+                                limit: None,
+                                lock: None,
+                            };
+                            let ps = self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
+                            return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                        }
                         if let Expr::Path(p) = arg
                             && p.partial
                             && p.steps.len() == 1

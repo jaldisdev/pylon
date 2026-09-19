@@ -4185,6 +4185,16 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_over_a_path_in_a_filter_is_a_subquery() {
+        let out = compile_and_emit("SELECT Person FILTER .age = std::max(Person.age)");
+        assert!(
+            out.sql.contains("(SELECT max("),
+            "an aggregate in WHERE needs its own query:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_narrowing_an_interface_joins_the_implementor_table() {
         // `first_name` lives on Individual's own table; the Account view has
         // only the columns every implementor shares.
