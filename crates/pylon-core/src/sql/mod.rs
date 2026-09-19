@@ -8165,6 +8165,133 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_reading_a_link_through_an_interface_target() {
+        // A link whose target is an interface is read by fanning the
+        // implementors out inline. That union used to project only the
+        // interface's *properties*, so a shape that then followed one of the
+        // interface's own links failed with "column t1.company_id does not
+        // exist".
+        fn id_prop() -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: "id".into(),
+                pg_type: "uuid".into(),
+                nullable: false,
+                default_sql: None,
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: true,
+                is_readonly: true,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
+            }
+        }
+        fn text_prop(name: &str) -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: name.into(),
+                pg_type: "text".into(),
+                nullable: false,
+                default_sql: None,
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: false,
+                is_pk: false,
+                is_readonly: false,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
+            }
+        }
+        fn link(name: &str, target: &str) -> LinkDescriptor {
+            LinkDescriptor {
+                name: name.into(),
+                target: target.into(),
+                nullable: true,
+                through: None,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+            }
+        }
+        fn ty(
+            name: &str,
+            abstract_: bool,
+            interfaces: Vec<String>,
+            properties: Vec<PropertyDescriptor>,
+            links: Vec<LinkDescriptor>,
+        ) -> TypeDescriptor {
+            TypeDescriptor {
+                name: name.into(),
+                module: "default".into(),
+                table: name.into(),
+                abstract_,
+                materialized: true,
+                description: None,
+                parents: vec![],
+                interfaces,
+                properties,
+                links,
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                partition: None,
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+                signals: vec![],
+            }
+        }
+        let schema = SchemaDescriptor {
+            types: vec![
+                ty("Company", false, vec![], vec![id_prop(), text_prop("name")], vec![]),
+                ty(
+                    "Account",
+                    true,
+                    vec![],
+                    vec![id_prop(), text_prop("email")],
+                    vec![link("company", "default::Company")],
+                ),
+                ty(
+                    "Individual",
+                    false,
+                    vec!["default::Account".into()],
+                    vec![id_prop(), text_prop("email")],
+                    vec![link("company", "default::Company")],
+                ),
+                ty(
+                    "Token",
+                    false,
+                    vec![],
+                    vec![id_prop(), text_prop("value")],
+                    vec![link("account", "default::Account")],
+                ),
+            ],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        };
+        let out = compile_and_emit_with("SELECT Token { account: { email, company: { name } } }", &schema);
+        assert!(
+            out.sql
+                .contains("\"email\", \"company_id\" FROM \"public\".\"Individual\""),
+            "the fanned-out interface must carry its own link columns:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_computed_pointer_in_shape_emits_expression() {
         let mut schema = make_schema();
         schema.types[0].computed.push(crate::schema::ComputedDescriptor {
