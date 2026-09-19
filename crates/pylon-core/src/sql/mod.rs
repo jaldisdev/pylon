@@ -527,6 +527,18 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 qi(alias),
                 sets.join(",\n"),
             );
+            // The nested CTEs are emitted alongside this body (see
+            // `emit_user_cte_parts`), so the reference to them needs a FROM.
+            if !upd.nested_ctes.is_empty() {
+                sql.push_str(&format!(
+                    "\n    FROM {}",
+                    upd.nested_ctes
+                        .iter()
+                        .map(|c| qi(&c.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             append_filter(&mut sql, &upd.filter);
             sql.push_str("\n    RETURNING *");
             sql
@@ -803,6 +815,18 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
             qi(alias),
             sets.join(", "),
         );
+        // A nested statement's CTE sits beside this one, so reading its id
+        // needs a FROM — the same reason the plain update path has one.
+        if !upd.nested_ctes.is_empty() {
+            upd_sql.push_str(&format!(
+                "\nFROM {}",
+                upd.nested_ctes
+                    .iter()
+                    .map(|c| qi(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\nRETURNING *");
         parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, upd_sql));
@@ -881,6 +905,18 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
 fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
     let mut parts: Vec<String> = vec![];
     for c in ctes {
+        // A hoisted statement may have hoisted one of its own —
+        // `credentials := (insert access::Credentials { … })` inside an update.
+        // Those CTEs are emitted beside it rather than inside its body, which
+        // is where its own SQL expects to read them from.
+        let nested: &[IrCteDef] = match &c.stmt {
+            IrStmt::Insert(ins) => &ins.nested_ctes,
+            IrStmt::Update(upd) => &upd.nested_ctes,
+            _ => &[],
+        };
+        if !nested.is_empty() {
+            parts.extend(emit_user_cte_parts(nested));
+        }
         if let IrStmt::Update(upd) = &c.stmt {
             if update_has_any_multilink(upd) {
                 parts.extend(emit_update_multilink_ctes(upd, &c.name));
@@ -2054,8 +2090,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 // cast to text so the value's shape doesn't depend on a runtime OID.
                 if let IrExpr::ColumnRef { pg_type, .. } = ir_expr {
                     if let Some(qualified) = QualifiedPgType::of(pg_type) {
-                        let expr =
-                            format!("ROW({}{}) AS result", emit_expr(ir_expr), qualified.text_cast());
+                        let expr = format!("ROW({}{}) AS result", emit_expr(ir_expr), qualified.text_cast());
                         let shape = qualified.shape_node(String::new(), 0);
                         (expr, shape)
                     } else {
@@ -4352,6 +4387,52 @@ mod tests {
     fn test_with_binding_in_a_computed_reads_the_enclosing_object() {
         let out = compile_and_emit("SELECT Person { n := (WITH own := .name SELECT own) }");
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_subject_path_update_names_its_own_alias() {
+        let mut schema = make_schema();
+        let company = schema.types.iter_mut().find(|t| t.name == "Company").unwrap();
+        company.properties.insert(
+            0,
+            PropertyDescriptor {
+                name: "id".into(),
+                pg_type: "uuid".into(),
+                nullable: false,
+                default_sql: Some("uuidv7()".into()),
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: true,
+                is_pk: true,
+                is_readonly: true,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
+            },
+        );
+        // The row set narrowing the update compares against *that update's*
+        // alias; a bare `id` would be ambiguous once a nested statement's CTE
+        // joins the FROM.
+        let out = compile_and_emit_with("SELECT (UPDATE Person.company SET { name := 'x' }) { name }", &schema);
+        assert!(out.sql.contains("\"t1\".\"id\" = ANY("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_nested_insert_as_a_link_value_in_an_update() {
+        // The hoisted insert sits beside the update rather than inside it, so
+        // the update needs a FROM to read its id, and its own `id` has to name
+        // the update's alias — a bare one could mean either relation.
+        let out = compile_and_emit(
+            "SELECT (UPDATE Person FILTER .name = 'a' SET { company := (INSERT Company { name := 'c' }) }) { name }",
+        );
+        assert!(out.sql.contains("INSERT INTO \"public\".\"Company\""), "{}", out.sql);
+        assert!(out.sql.contains("_nested_dml_0"), "{}", out.sql);
+        assert!(
+            out.sql.contains("FROM \"_nested_dml_0\""),
+            "the update reads the hoisted CTE:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -8346,10 +8427,7 @@ select owner { posts := (select owner.posts.title) };",
             names.contains(&"age_next"),
             "a computed property belongs in `*`: {names:?}"
         );
-        assert!(
-            !names.contains(&"authors"),
-            "a computed link does not: {names:?}"
-        );
+        assert!(!names.contains(&"authors"), "a computed link does not: {names:?}");
 
         let deep = compile_and_emit_with("SELECT Person { ** }", &schema);
         let crate::query::ShapeNode::Object { pointers, .. } = &deep.shape.root else {
