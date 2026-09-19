@@ -4365,6 +4365,27 @@ mod tests {
     }
 
     #[test]
+    fn test_detached_names_the_type_of_a_nested_select() {
+        // `detached T` as an insert's link value: the prefix used to hide the
+        // type name from the nested select's subject resolution, which then
+        // reported "expected a type name as SELECT subject".
+        let out = compile_and_emit_with(
+            "INSERT Person { name := $n, company := (SELECT detached Company FILTER .name = $c LIMIT 1) }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Person\""),
+            "expected the insert to compile:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("FROM \"public\".\"Company\""),
+            "expected the detached select to read the Company table:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

@@ -4551,6 +4551,9 @@ impl<'a> Compiler<'a> {
 
     fn expr_as_type_name(&self, expr: &Expr) -> Result<String, PyQLError> {
         match expr {
+            // `detached T` names the same type; the prefix only says the set
+            // is not correlated with the enclosing one.
+            Expr::Detached(inner) => self.expr_as_type_name(inner),
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
                     return Ok(n.clone());
