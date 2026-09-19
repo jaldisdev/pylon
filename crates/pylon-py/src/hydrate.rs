@@ -338,6 +338,18 @@ fn decode_at_root<'py>(
             };
             decode_json_tuple(py, raw, type_name.as_deref(), members.as_deref(), reg)
         }
+        // An enum inside an array *is* the label, not a field of a record, so
+        // there is no composite to read a position out of.
+        ShapeNode::Enum { enum_type, .. } if !matches!(value, DecodedValue::Composite(_)) => {
+            if matches!(value, DecodedValue::Null) {
+                return Ok(py.None().into_bound(py));
+            }
+            let raw = cached_to_py(py, value)?;
+            match reg.lookup_enum(enum_type) {
+                Some(cls) => cls.bind(py).call1((raw,)),
+                None => Ok(raw),
+            }
+        }
         _ => decode(py, value, node, reg),
     }
 }
