@@ -4094,6 +4094,12 @@ mod tests {
     }
 
     #[test]
+    fn test_with_binding_in_a_computed_reads_the_enclosing_object() {
+        let out = compile_and_emit("SELECT Person { n := (WITH own := .name SELECT own) }");
+        assert!(out.sql.contains("\"name\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_free_select_set_literal() {
         let schema = make_schema();
         let ast = parse::parse("SELECT {1, 2, 3}").unwrap();

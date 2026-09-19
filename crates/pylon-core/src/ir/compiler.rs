@@ -7586,6 +7586,13 @@ impl<'a> Compiler<'a> {
     /// anything property/link-shaped is a hard error.
     fn compile_free_path(&mut self, p: &ast::Path) -> Result<IrExpr, PyQLError> {
         if p.partial {
+            // A WITH binding inside a computed pointer or a nested SELECT is
+            // compiled without a type in scope, but `.name` there still means
+            // the innermost enclosing set — the one the anchor stack holds.
+            if let Some((qualified, alias)) = self.anchors.last().map(|a| (a.qualified.clone(), a.alias.clone())) {
+                let td = self.resolve_type(&qualified)?;
+                return self.compile_path(p, td, &alias);
+            }
             return Err(self.type_err(
                 "property reference (.name) is not valid in free SELECT; \
                  use a schema-bound SELECT instead",
