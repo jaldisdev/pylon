@@ -4132,6 +4132,22 @@ mod tests {
     }
 
     #[test]
+    fn test_declared_computed_with_binding_reads_its_own_object() {
+        // Validation compiles a declared computed on its own, with no
+        // enclosing SELECT — `.name` in the binding still means this object's.
+        use crate::schema::ComputedDescriptor;
+        let schema = make_schema();
+        let cd = ComputedDescriptor {
+            name: "shouted".into(),
+            expression: "(with own := .name select std::str_upper(own))".into(),
+            return_type: None,
+        };
+        let ir = ir::compile_computed_in_type(&cd, "default::Person", &schema)
+            .expect("a computed may read the object it is declared on");
+        assert!(ir.is_some());
+    }
+
+    #[test]
     fn test_sub_select_modifiers_scope_to_its_own_subject() {
         // `.title` belongs to Post, the sub-select's subject — not to Person,
         // where the projection `.author.name` lands.

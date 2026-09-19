@@ -5947,17 +5947,30 @@ impl<'a> Compiler<'a> {
         nested: &[ShapeElement],
     ) -> Result<IrShapePointer, PyQLError> {
         let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
-        if let Some(ptr) =
-            self.try_compile_pointer_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)?
-        {
-            return Ok(ptr);
-        }
-        let ir = self.compile_expr(&expr_ast, td, alias)?;
-        Ok(IrShapePointer::Computed(IrComputedPointer {
-            marker_offset,
-            alias: cd.name.clone(),
-            expr: ir,
-        }))
+        // The object the pointer is computed on stays in scope for the whole
+        // expression, including any part of it compiled without a type in
+        // hand — a `with` binding's right-hand side, say.
+        self.anchors.push(SelectAnchor {
+            type_name: td.name.clone(),
+            qualified: format!("{}::{}", td.module, td.name),
+            alias: alias.to_string(),
+            detached: false,
+        });
+        let result = (|compiler: &mut Self| -> Result<IrShapePointer, PyQLError> {
+            if let Some(ptr) =
+                compiler.try_compile_pointer_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)?
+            {
+                return Ok(ptr);
+            }
+            let ir = compiler.compile_expr(&expr_ast, td, alias)?;
+            Ok(IrShapePointer::Computed(IrComputedPointer {
+                marker_offset,
+                alias: cd.name.clone(),
+                expr: ir,
+            }))
+        })(self);
+        self.anchors.pop();
+        result
     }
 
     /// Split a sub-select's result into the path it traverses and the nested
