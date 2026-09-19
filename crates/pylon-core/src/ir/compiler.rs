@@ -348,11 +348,18 @@ pub fn compile_fn_body_with(
     use crate::parse::ast::Stmt;
 
     let body = fn_desc.body.trim().to_string();
-    let body = if body.starts_with("select")
-        || body.starts_with("SELECT")
-        || body.starts_with("with")
-        || body.starts_with("WITH")
-    {
+    // A body that is already a statement stands on its own; only a bare
+    // expression needs the `select` that turns it into one. Wrapping a
+    // statement instead would bury it as a sub-select and lose its clauses.
+    let starts_a_stmt = ["select", "with", "for", "group", "insert", "update", "delete"]
+        .iter()
+        .any(|keyword| {
+            body.len() > keyword.len()
+                && body[..keyword.len()].eq_ignore_ascii_case(keyword)
+                && !body.as_bytes()[keyword.len()].is_ascii_alphanumeric()
+                && body.as_bytes()[keyword.len()] != b'_'
+        });
+    let body = if starts_a_stmt {
         body
     } else {
         format!("select {}", body)

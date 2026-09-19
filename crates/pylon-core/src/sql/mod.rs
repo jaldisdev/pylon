@@ -460,7 +460,23 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             append_offset_limit(&mut sql, &sel.offset, &sel.limit);
             sql
         }
-        IrStmt::For(_) | IrStmt::Group(_) | IrStmt::VectorSearch(_) | IrStmt::FtsSearch(_) => {
+        IrStmt::For(f) => {
+            // `for x in S union (...)` as a set source: iterate in the FROM
+            // clause and expose the body's raw columns, the same contract the
+            // other arms honour. An empty literal iterator yields no rows, but
+            // still has to name a column for the outer SELECT to project.
+            if matches!(&f.iterator, IrForIterator::Values { exprs, .. } if exprs.is_empty()) {
+                return "    SELECT NULL AS \"id\" WHERE FALSE".to_string();
+            }
+            let (values_from, _) = emit_for_iterator(&f.iterator, &format!("_for_{}", f.var_name));
+            let body = emit_dml_as_cte_source(&f.body).replace('\n', "\n    ");
+            format!(
+                "    SELECT \"_body\".*\n    FROM {}\n    CROSS JOIN LATERAL (\n    {}\n    ) AS \"_body\"",
+                values_from.replace('\n', "\n    "),
+                body,
+            )
+        }
+        IrStmt::Group(_) | IrStmt::VectorSearch(_) | IrStmt::FtsSearch(_) => {
             unreachable!("cannot appear as a CTE source")
         }
         IrStmt::PathSelect(ps) => {
@@ -3952,6 +3968,27 @@ mod tests {
         let ast = parse::parse(query).expect("parse failed");
         let ir = ir::compile(&ast, schema).expect("IR compile failed");
         emit(&ir)
+    }
+
+    #[test]
+    fn test_for_union_as_a_function_body() {
+        let schema = make_schema();
+        let descriptor = FunctionDescriptor {
+            name: "recent".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Person".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "for n in {1, 2} union (select Person filter .age = n)".into(),
+        };
+        let ir = ir::compile_fn_body(&descriptor, &schema).expect("function body must compile");
+        let body = emit_fn_body(&ir);
+        assert!(body.contains("VALUES"), "{body}");
+        assert!(body.contains("CROSS JOIN LATERAL"), "{body}");
+        assert!(body.contains("\"_body\".*"), "{body}");
     }
 
     #[test]
