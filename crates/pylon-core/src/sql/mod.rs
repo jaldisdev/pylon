@@ -4176,6 +4176,57 @@ mod tests {
     }
 
     #[test]
+    fn test_backlink_narrowed_to_an_interface_its_implementor_declares() {
+        // `notes` is declared on Individual; `[is Account]` is satisfied by an
+        // Individual row, so the backlink resolves through the implementor.
+        use crate::schema::{LinkDescriptor, TypeDescriptor};
+        let mut schema = make_interface_schema();
+        let individual = schema.types.iter().find(|t| t.name == "Individual").unwrap().clone();
+        schema.types.push(TypeDescriptor {
+            name: "Note".into(),
+            module: "default".into(),
+            table: "Note".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            properties: individual.properties[..1].to_vec(),
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+        schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Individual")
+            .unwrap()
+            .links
+            .push(LinkDescriptor {
+                name: "note".into(),
+                target: "default::Note".into(),
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+                through: None,
+            });
+        let out = compile_and_emit_with("SELECT Note FILTER EXISTS .<note[is Account]", &schema);
+        assert!(out.sql.contains("\"Individual\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_subject_reads_the_row_a_constraint_checks() {
         let schema = make_schema();
         let sql = ir::compile_constraint_expr("__subject__.age > 18", "default::Person", &schema)

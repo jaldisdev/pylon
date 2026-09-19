@@ -8244,45 +8244,16 @@ impl<'a> Compiler<'a> {
         // declares the link at this target, so the row qualifies if any one of
         // them points at it.
         let Some(PathStep::TypeIntersection(type_ref)) = steps.get(1) else {
-            let schema = self.schema;
-            let owners: Vec<&'a TypeDescriptor> = schema
-                .types
-                .iter()
-                .filter(|t| !t.abstract_)
-                .filter(|t| {
-                    t.links
-                        .iter()
-                        .any(|l| l.name == backlink_name && self.link_target_reaches(&l.target, current_qname))
-                        || t.multilinks
-                            .iter()
-                            .any(|ml| ml.name == backlink_name && self.link_target_reaches(&ml.target, current_qname))
-                })
-                .collect();
-            if owners.is_empty() {
-                return Err(self.type_err(&format!(
-                    "no type has a link or multi-link '{backlink_name}' pointing to {current_qname}"
-                )));
-            }
-            let mut combined: Option<IrExpr> = None;
-            for owner_td in owners {
-                let one = self.backlink_exists_for_owner(
-                    owner_td,
-                    &backlink_name,
-                    &steps[1..],
-                    comparison.clone(),
-                    current_qname,
-                    alias,
-                )?;
-                combined = Some(match combined {
-                    None => one,
-                    Some(previous) => IrExpr::BinOp(Box::new(IrBinOp {
-                        left: previous,
-                        op: ast::BinOpKind::Or,
-                        right: one,
-                    })),
-                });
-            }
-            return Ok(combined.expect("owners is non-empty"));
+            // Without a type intersection the backlink spans every type that
+            // declares the link at this target.
+            return self.backlink_exists_over_owners(
+                None,
+                &backlink_name,
+                &steps[1..],
+                comparison,
+                current_qname,
+                alias,
+            );
         };
 
         let type_name = match &type_ref.module {
@@ -8290,7 +8261,97 @@ impl<'a> Compiler<'a> {
             None => type_ref.name.clone(),
         };
         let target_td = self.resolve_type(&type_name)?;
-        self.backlink_exists_for_owner(target_td, &backlink_name, &steps[2..], comparison, current_qname, alias)
+        if self.declares_backlink(target_td, &backlink_name, current_qname) {
+            return self.backlink_exists_for_owner(
+                target_td,
+                &backlink_name,
+                &steps[2..],
+                comparison,
+                current_qname,
+                alias,
+            );
+        }
+        // The intersection narrows to an interface or mixin that does not
+        // declare the link itself — its implementors do, and a row of one of
+        // them satisfies `[is ThatType]` all the same. Qualified, because that
+        // is how an implementor names what it implements.
+        let narrow_to = format!("{}::{}", target_td.module, target_td.name);
+        self.backlink_exists_over_owners(
+            Some(&narrow_to),
+            &backlink_name,
+            &steps[2..],
+            comparison,
+            current_qname,
+            alias,
+        )
+    }
+
+    /// Does `td` declare the link a backlink names, pointing at the type the
+    /// traversal is standing on?
+    fn declares_backlink(&self, td: &TypeDescriptor, backlink_name: &str, current_qname: &str) -> bool {
+        td.links
+            .iter()
+            .any(|l| l.name == backlink_name && self.link_target_reaches(&l.target, current_qname))
+            || td
+                .multilinks
+                .iter()
+                .any(|ml| ml.name == backlink_name && self.link_target_reaches(&ml.target, current_qname))
+    }
+
+    /// EXISTS over every type that declares the backlink's link, OR-ed
+    /// together: a row qualifies if any one of them points at it. `narrow_to`
+    /// keeps only the types that satisfy an `[is …]` the path asked for.
+    #[allow(clippy::too_many_arguments)]
+    fn backlink_exists_over_owners(
+        &mut self,
+        narrow_to: Option<&str>,
+        backlink_name: &str,
+        rest: &[ast::PathStep],
+        comparison: Option<(ast::BinOpKind, IrExpr, bool)>,
+        current_qname: &str,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        let schema = self.schema;
+        let owners: Vec<&'a TypeDescriptor> = schema
+            .types
+            .iter()
+            .filter(|t| !t.abstract_)
+            .filter(|t| narrow_to.is_none_or(|q| Self::is_or_implements(t, q)))
+            .filter(|t| self.declares_backlink(t, backlink_name, current_qname))
+            .collect();
+        if owners.is_empty() {
+            return Err(self.type_err(&match narrow_to {
+                Some(q) => format!("type {q} has no link or multi-link '{backlink_name}' pointing to {current_qname}"),
+                None => format!("no type has a link or multi-link '{backlink_name}' pointing to {current_qname}"),
+            }));
+        }
+        let mut combined: Option<IrExpr> = None;
+        for owner_td in owners {
+            let one = self.backlink_exists_for_owner(
+                owner_td,
+                backlink_name,
+                rest,
+                comparison.clone(),
+                current_qname,
+                alias,
+            )?;
+            combined = Some(match combined {
+                None => one,
+                Some(previous) => IrExpr::BinOp(Box::new(IrBinOp {
+                    left: previous,
+                    op: ast::BinOpKind::Or,
+                    right: one,
+                })),
+            });
+        }
+        Ok(combined.expect("owners is non-empty"))
+    }
+
+    /// Is `td` the type `qname` names, or one that implements/extends it?
+    fn is_or_implements(td: &TypeDescriptor, qname: &str) -> bool {
+        format!("{}::{}", td.module, td.name) == qname
+            || td.interfaces.iter().any(|i| i == qname)
+            || td.parents.iter().any(|p| p == qname)
     }
 
     /// One owner type's half of `compile_backlink_as_exists`: EXISTS over the
