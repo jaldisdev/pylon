@@ -655,6 +655,11 @@ struct Compiler<'a> {
     /// Set when `compile_stmt` strips a select-level `detached`, and taken by
     /// the `compile_path_modifiers` that compiles that select's own clauses.
     pending_detached: bool,
+    /// Set while a path continues past a sub-select's own subject, e.g. the
+    /// `.plan.tier` of `(select .licences filter not exists .ended_at limit
+    /// 1).plan.tier`: the subject's landing row is what FILTER/ORDER BY/LIMIT
+    /// scope to, not the type the whole path ends on.
+    modifier_anchor: Option<(String, String)>,
     /// True while compiling a `@pylon.function` body. A session global cannot
     /// be a query parameter there — a `CREATE FUNCTION` body has nothing to
     /// bind one to — so it is read out of the `__pylon_json_globals__`
@@ -768,6 +773,7 @@ impl<'a> Compiler<'a> {
             link_prop_scope: Vec::new(),
             hoisted_ctes: Vec::new(),
             pending_detached: false,
+            modifier_anchor: None,
             in_fn_body: false,
             fns_needing_globals: None,
             used_globals_arg: false,
@@ -2176,6 +2182,35 @@ impl<'a> Compiler<'a> {
         shape_elements: &[ShapeElement],
         distinct: bool,
     ) -> Result<IrPathSelect, PyQLError> {
+        self.compile_path_select_with_tail(sel, path, shape_elements, distinct, 0)
+    }
+
+    /// `compile_path_select` where the last `tail` steps were appended by a
+    /// projection off a sub-select — `(select … limit 1).plan.tier` — so
+    /// `sel`'s own modifiers belong to the step before them, not to the end
+    /// of the path.
+    fn compile_path_select_with_tail(
+        &mut self,
+        sel: &ast::SelectStmt,
+        path: &ast::Path,
+        shape_elements: &[ShapeElement],
+        distinct: bool,
+        tail: usize,
+    ) -> Result<IrPathSelect, PyQLError> {
+        let outer_anchor = self.modifier_anchor.take();
+        let result = self.compile_path_select_inner(sel, path, shape_elements, distinct, tail);
+        self.modifier_anchor = outer_anchor;
+        result
+    }
+
+    fn compile_path_select_inner(
+        &mut self,
+        sel: &ast::SelectStmt,
+        path: &ast::Path,
+        shape_elements: &[ShapeElement],
+        distinct: bool,
+        mut tail: usize,
+    ) -> Result<IrPathSelect, PyQLError> {
         use ast::PathStep;
 
         let root_name = match &path.steps[0] {
@@ -2220,11 +2255,23 @@ impl<'a> Compiler<'a> {
         let mut junction_scope: Option<(String, String)> = None;
         let mut splices = 0usize;
         let mut idx = 0;
+        if tail > 0 && tail >= steps.len() {
+            self.modifier_anchor = Some((
+                format!("{}::{}", current_td.module, current_td.name),
+                current_alias.clone(),
+            ));
+        }
         while idx < steps.len() {
             let owned_step = steps[idx].clone();
             let step = &owned_step;
             let n_steps = steps.len();
             let is_last = |extra: usize| idx + extra == n_steps - 1;
+            if tail > 0 && idx == n_steps - tail {
+                self.modifier_anchor = Some((
+                    format!("{}::{}", current_td.module, current_td.name),
+                    current_alias.clone(),
+                ));
+            }
 
             // A spliced computed's own filter belongs to the step it landed
             // on, which is the one just processed.
@@ -2687,6 +2734,9 @@ impl<'a> Compiler<'a> {
                     }
                     let filter = modifiers.and_then(|m| m.filter.clone());
                     let spliced = p.steps.clone();
+                    if tail > 0 && idx >= steps.len() - tail {
+                        tail += spliced.len() - 1;
+                    }
                     let landing = idx + spliced.len() - 1;
                     steps.splice(idx..idx + 1, spliced);
                     // Every filter already queued for a later step shifts
@@ -2819,7 +2869,15 @@ impl<'a> Compiler<'a> {
         if pushed {
             self.link_prop_scope.push(junction);
         }
-        let result = self.compile_path_modifiers(sel, td, alias);
+        let anchored = self.modifier_anchor.take();
+        let result = match &anchored {
+            Some((qualified, anchor_alias)) => {
+                let anchor_td = self.resolve_type(qualified)?;
+                let anchor_alias = anchor_alias.clone();
+                self.compile_path_modifiers(sel, anchor_td, &anchor_alias)
+            }
+            None => self.compile_path_modifiers(sel, td, alias),
+        };
         if pushed {
             self.link_prop_scope.pop();
         }
@@ -6169,7 +6227,7 @@ impl<'a> Compiler<'a> {
         steps.extend(extra_fields.iter().map(|f| ast::PathStep::Name(f.clone())));
         let full_path = ast::Path { steps, partial: false };
 
-        let mut ps = self.compile_path_select(sel, &full_path, &[], false)?;
+        let mut ps = self.compile_path_select_with_tail(sel, &full_path, &[], false, extra_fields.len())?;
         if let Some(outer_alias) = correlate {
             Self::correlate_path_select(&mut ps, &outer_alias);
         }
