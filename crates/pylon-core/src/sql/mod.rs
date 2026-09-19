@@ -3978,6 +3978,15 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_over_a_with_bound_object_set() {
+        let out = compile_and_emit("WITH people := (SELECT Person) SELECT max(people.age)");
+        assert!(out.sql.contains("\"people\" AS ("));
+        assert!(out.sql.contains("max("));
+        // Reads the binding, not the base table again.
+        assert!(!out.sql.contains("FROM \"default\".\"Person\" AS \"t1\""));
+    }
+
+    #[test]
     fn test_for_union_as_a_function_body() {
         let schema = make_schema();
         let descriptor = FunctionDescriptor {
