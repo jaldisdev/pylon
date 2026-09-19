@@ -2378,6 +2378,49 @@ impl<'a> Compiler<'a> {
                 _ => return Err(self.type_err("only name steps are supported in path traversal")),
             };
 
+            // `__type__` is a virtual scalar property holding the
+            // fully-qualified type name: a real discriminator column on a
+            // polymorphic (interface) source, a constant on a concrete one.
+            if step_name == "__type__" {
+                if !is_last(0) {
+                    return Err(
+                        self.type_err("'__type__' is the type's name, not an object — it cannot be traversed further")
+                    );
+                }
+                let polymorphic = current_td.abstract_ && current_td.materialized;
+                let expr = if polymorphic {
+                    IrExpr::ColumnRef {
+                        alias: current_alias.clone(),
+                        column: "__type__".to_string(),
+                        pg_type: "text".to_string(),
+                    }
+                } else {
+                    IrExpr::Literal(IrLiteral::Str(format!("{}::{}", current_td.module, current_td.name)))
+                };
+                // A CTE-backed root already carries the discriminator column
+                // from the binding's own polymorphic expansion; re-expanding it
+                // here would read the base type again and drop the binding's
+                // filter.
+                let poly_implementors = if polymorphic && joins.is_empty() && !root.table.starts_with("@cte:") {
+                    self.find_poly_implementors(&root.type_name.clone())
+                } else {
+                    vec![]
+                };
+                let (filter, order_by, offset, limit) =
+                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
+                return Ok(IrPathSelect {
+                    root,
+                    joins,
+                    result: IrPathResult::Scalar(expr, None),
+                    filter: and_conditions(filter, extra_conditions),
+                    order_by,
+                    offset,
+                    limit,
+                    distinct,
+                    poly_implementors,
+                });
+            }
+
             // Check scalar property first.
             if let Some(p) = current_td.properties.iter().find(|p| p.name == step_name) {
                 if !is_last(0) {
