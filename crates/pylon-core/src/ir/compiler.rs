@@ -1747,6 +1747,20 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// The type a path's root names — a real type, or the object type a
+    /// `with` binding stands for.
+    ///
+    /// A binding is a row source just like a type name, so anything that
+    /// re-resolves a root after `compile_path_select` has already accepted it
+    /// has to look it up the same way, or a bound alias reads as an unknown
+    /// type.
+    fn resolve_path_root(&self, root_name: &str) -> Result<&'a TypeDescriptor, PyQLError> {
+        match self.cte_types.get(root_name).filter(|t| t.contains("::")).cloned() {
+            Some(bound) => self.resolve_type(&bound),
+            None => self.resolve_type(root_name),
+        }
+    }
+
     fn find_poly_implementors(&self, iface_qname: &str) -> Vec<IrPolyImplementor> {
         self.schema
             .types
@@ -2326,10 +2340,7 @@ impl<'a> Compiler<'a> {
         // mechanism `compile_select`'s bare-CTE-object-select case uses)
         // instead of failing with "unknown type '{root_name}'".
         let cte_object_type = self.cte_types.get(root_name).filter(|t| t.contains("::")).cloned();
-        let root_td = match &cte_object_type {
-            Some(t) => self.resolve_type(t)?,
-            None => self.resolve_type(root_name)?,
-        };
+        let root_td = self.resolve_path_root(root_name)?;
         let root_alias = self.fresh_alias();
         let root = IrSource {
             poly: None,
@@ -6717,7 +6728,7 @@ impl<'a> Compiler<'a> {
         let single = matches!(&sel.limit, Some(Expr::Literal(ast::Literal::Int(1))));
         let multi = match &full_path.steps[0] {
             ast::PathStep::Name(root) => {
-                let root_td = self.resolve_type(root)?;
+                let root_td = self.resolve_path_root(root)?;
                 self.path_crosses_multi(root_td, &full_path.steps[1..])
             }
             _ => false,

@@ -6788,6 +6788,26 @@ mod tests {
     }
 
     #[test]
+    fn test_with_bound_root_read_by_name_inside_a_nested_select() {
+        // Regression: `compile_path_select` resolved a `with`-bound root
+        // correctly, but the multi-valued check straight after it re-resolved
+        // the same root as a plain type, so reading the binding by name from a
+        // nested sub-select failed with "unknown type 'owner'".
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with
+  owner := (select Person limit 1)
+select owner { posts := (select owner.posts.title) };",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("WITH") && out.sql.contains("\"title\""),
+            "expected the nested select to traverse the binding, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_path_traversal_into_with_bound_cte_of_object_type() {
         // Regression: `with user := (select global current_user) select
         // user.name;` failed with "unknown type 'user'" — compile_path_select
