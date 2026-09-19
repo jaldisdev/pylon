@@ -1529,6 +1529,38 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
             members: None,
             is_free_object: *is_free_object,
         },
+        // A path select aggregated into an array keeps its rows' own shape, so
+        // the elements hydrate as objects rather than as opaque scalars.
+        IrExpr::ArrayFromSelect(source) => match source.as_ref() {
+            IrArraySource::PathSelect(ps) => match &ps.result {
+                IrPathResult::Object {
+                    alias,
+                    type_name,
+                    shape,
+                } => {
+                    let (_, pointer_nodes) = build_shape(shape, alias);
+                    ShapeNode::Array {
+                        name: name.to_string(),
+                        position,
+                        element: Box::new(ShapeNode::Object {
+                            name: String::new(),
+                            type_name: Some(type_name.clone()),
+                            position: 0,
+                            cardinality: Cardinality::Many,
+                            pointers: prepend_type(pointer_nodes),
+                        }),
+                    }
+                }
+                IrPathResult::Scalar(..) => ShapeNode::Scalar {
+                    name: name.to_string(),
+                    position,
+                },
+            },
+            _ => ShapeNode::Scalar {
+                name: name.to_string(),
+                position,
+            },
+        },
         e if is_raw_scalar(e) => ShapeNode::RawScalar,
         e => free_field_shape_node(name, position, e),
     }
@@ -8392,6 +8424,67 @@ mod tests {
             !out.sql.contains("'default::Account'::text,"),
             "the row's type should be read off the row, not fixed to the interface, got:\n{}",
             out.sql
+        );
+    }
+
+    #[test]
+    fn test_computed_multilink_chain_comes_back_as_rows() {
+        // Regression: `members := .memberships.member` is a chain, and
+        // try_compile_pointer_expr only recognised a single-step `.multilink`,
+        // so it fell through to expression position and became a scalar
+        // subquery — which Postgres rejects the moment a second row matches.
+        let mut schema = make_schema();
+        schema.types[0].computed.push(crate::schema::ComputedDescriptor {
+            name: "coauthors".into(),
+            expression: ".posts.author".into(),
+            return_type: None,
+        });
+        let post = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Post")
+            .expect("test schema has a Post type");
+        post.links.push(LinkDescriptor {
+            name: "author".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+            through: None,
+        });
+
+        let out = compile_and_emit_with("SELECT Person { coauthors: { name } }", &schema);
+        assert!(
+            out.sql.contains("ARRAY(SELECT"),
+            "the chain should aggregate into an array, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"name\""),
+            "the requested sub-shape should survive, got:\n{}",
+            out.sql
+        );
+
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected Object shape, got {:?}", out.shape.root)
+        };
+        let coauthors = pointers
+            .iter()
+            .find(|node| matches!(node, crate::query::ShapeNode::Array { name, .. } if name == "coauthors"))
+            .unwrap_or_else(|| panic!("expected an Array-shaped pointer, got {pointers:?}"));
+        let crate::query::ShapeNode::Array { element, .. } = coauthors else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                element.as_ref(),
+                crate::query::ShapeNode::Object { type_name: Some(t), .. } if t == "default::Person"
+            ),
+            "the elements should hydrate as objects, got {element:?}",
         );
     }
 

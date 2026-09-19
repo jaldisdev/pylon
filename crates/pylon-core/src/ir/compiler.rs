@@ -5968,6 +5968,44 @@ impl<'a> Compiler<'a> {
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
     }
 
+    /// A computed pointer whose path walks *through* a multi-valued step before
+    /// landing on objects — `members := .memberships.member`.
+    ///
+    /// Rooted at the enclosing type and correlated back to the enclosing row,
+    /// exactly as `compile_partial_path_as_subquery` does for a value, then
+    /// aggregated so the rows survive as rows.
+    fn compile_chained_link_pointer(
+        &mut self,
+        pointer_name: &str,
+        path: &ast::Path,
+        td: &TypeDescriptor,
+        alias: &str,
+        nested: &[ShapeElement],
+        modifiers: Option<&ast::SelectStmt>,
+    ) -> Result<IrShapePointer, PyQLError> {
+        let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+        steps.extend(path.steps.iter().cloned());
+        let full_path = ast::Path {
+            steps,
+            partial: false,
+        };
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(full_path.clone()),
+            filter: modifiers.and_then(|m| m.filter.clone()),
+            order_by: modifiers.map(|m| m.order_by.clone()).unwrap_or_default(),
+            offset: modifiers.and_then(|m| m.offset.clone()),
+            limit: modifiers.and_then(|m| m.limit.clone()),
+            lock: None,
+        };
+        let mut path_select = self.compile_path_select(&synthetic, &full_path, nested, false)?;
+        Self::correlate_path_select(&mut path_select, alias);
+        Ok(IrShapePointer::Computed(IrComputedPointer {
+            marker_offset: None,
+            alias: pointer_name.to_string(),
+            expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(path_select))),
+        }))
+    }
+
     fn compile_multilink_pointer(
         &mut self,
         output_alias: &str,
@@ -6417,6 +6455,23 @@ impl<'a> Compiler<'a> {
                 let nested = nested.to_vec();
                 return self
                     .compile_backlink_pointer(pointer_name, &path, &current_qname, &nested, marker_offset, modifiers)
+                    .map(Some);
+            }
+            // `.memberships.member` — a chain no single-step builder can
+            // express: the junction it would need belongs to no one link but
+            // to the whole walk. Compiled as a path select and aggregated, so
+            // it stays an object pointer instead of collapsing to the bare ids
+            // an expression-position path gives — which, worse, was a scalar
+            // subquery that failed outright the moment a second row matched.
+            steps if matches!(steps.first(), Some(ast::PathStep::Name(_))) => {
+                let (multi, target) = self.walk_path_types(td, steps, MAX_COMPUTED_SPLICES);
+                if !multi || target.is_none() {
+                    return Ok(None);
+                }
+                let path = path.clone();
+                let nested = nested.to_vec();
+                return self
+                    .compile_chained_link_pointer(pointer_name, &path, td, alias, &nested, modifiers)
                     .map(Some);
             }
             _ => return Ok(None),
