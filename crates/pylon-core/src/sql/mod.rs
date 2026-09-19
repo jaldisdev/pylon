@@ -3971,6 +3971,13 @@ mod tests {
     }
 
     #[test]
+    fn test_select_type_name_as_a_path_step() {
+        let out = compile_and_emit("SELECT Person.__type__");
+        assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
+        assert!(out.sql.contains("\"Person\" AS \"t0\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_for_union_as_a_function_body() {
         let schema = make_schema();
         let descriptor = FunctionDescriptor {
