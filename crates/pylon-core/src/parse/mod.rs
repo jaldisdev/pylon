@@ -30,6 +30,12 @@ pub fn parse(input: &str) -> Result<Stmt, PyQLSyntaxError> {
     parser::Parser::new(tokens).parse_stmt()
 }
 
+/// Parse a PyQL script — one or more statements separated by semicolons.
+pub fn parse_script(input: &str) -> Result<Vec<Stmt>, PyQLSyntaxError> {
+    let tokens = lexer::Lexer::new(input).tokenize()?;
+    parser::Parser::new(tokens).parse_script()
+}
+
 /// Parse a single PyQL expression (used for rewrite handlers, computed-field
 /// bodies, and constraint expressions stored as strings in the schema).
 pub fn parse_expr(input: &str) -> Result<Expr, PyQLSyntaxError> {
@@ -580,6 +586,23 @@ mod tests {
     fn test_trailing_garbage_after_a_complete_statement_is_a_clear_error() {
         let err = parse("select 1 select 2").unwrap_err();
         assert_eq!(err.message, "unexpected 'select' after the end of the query");
+    }
+
+    #[test]
+    fn a_script_parses_every_statement() {
+        let statements = parse_script("delete Person; delete Company; select 1;").expect("a script parses");
+        assert_eq!(statements.len(), 3);
+    }
+
+    #[test]
+    fn a_single_statement_is_a_one_element_script() {
+        assert_eq!(parse_script("select 1").expect("parses").len(), 1);
+        assert_eq!(parse_script("select 1;").expect("parses").len(), 1);
+    }
+
+    #[test]
+    fn a_script_still_rejects_trailing_rubbish() {
+        assert!(parse_script("select 1; )").is_err());
     }
 
     #[test]

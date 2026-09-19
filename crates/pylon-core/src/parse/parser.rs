@@ -199,6 +199,24 @@ impl Parser {
 
     // ── Top-level ───────────────────────────────────────────────────────────────
 
+    /// Every statement in the input, for a script written as several
+    /// statements separated by semicolons. A single statement parses to a
+    /// one-element script, so callers need no special case for the common form.
+    pub fn parse_script(&mut self) -> Result<Vec<Stmt>, PyQLSyntaxError> {
+        let mut statements = vec![self.parse_stmt_inner()?];
+        while matches!(self.current(), Token::Semicolon) {
+            self.advance();
+            if self.at_end() {
+                break;
+            }
+            statements.push(self.parse_stmt_inner()?);
+        }
+        if !self.at_end() {
+            return Err(self.err(&format!("unexpected {} after the end of the query", self.current())));
+        }
+        Ok(statements)
+    }
+
     pub fn parse_stmt(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         let stmt = self.parse_stmt_inner()?;
         // Optional trailing semicolon

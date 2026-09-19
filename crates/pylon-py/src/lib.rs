@@ -1746,6 +1746,24 @@ fn compile(
         .map_err(|e| pyql_err(e, Some(query)))
 }
 
+/// Every statement of a script, compiled in the order written — one element
+/// for an ordinary single-statement query.
+#[pyfunction]
+#[pyo3(signature = (query, schema, *, allow_user_specified_id = false))]
+fn compile_script(
+    py: Python<'_>,
+    query: &str,
+    schema: &SchemaDescriptor,
+    allow_user_specified_id: bool,
+) -> PyResult<Vec<CompiledQuery>> {
+    let config = core::ir::SessionConfig {
+        allow_user_specified_id,
+    };
+    py.detach(|| core::query::compile_script(query, &schema.inner, &config))
+        .map(|statements| statements.into_iter().map(|q| CompiledQuery { inner: q }).collect())
+        .map_err(|e| pyql_err(e, Some(query)))
+}
+
 /// Records a compile-stage outcome in `pylon_queries_total{stage="compile"}`
 /// — called from `pylon.client._compile_and_resolve`/`_compile_and_bind`
 /// right after their own `pylon.query.compile()` call, since those (not
@@ -2625,6 +2643,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Functions
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_script, m)?)?;
     m.add_function(wrap_pyfunction!(record_query_compile_result, m)?)?;
     m.add_function(wrap_pyfunction!(export_schema, m)?)?;
     m.add_function(wrap_pyfunction!(validate_schema_types, m)?)?;

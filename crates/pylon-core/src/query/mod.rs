@@ -496,6 +496,26 @@ pub fn compile(query: &str, schema: &SchemaDescriptor) -> Result<Arc<CompiledQue
     compile_with_config(query, schema, &ir::SessionConfig::default())
 }
 
+/// Every statement of a script, compiled in the order written.
+///
+/// A single statement comes back as a one-element list, and takes the cached
+/// path — so this is safe to call for any query, not only ones with semicolons
+/// in them.
+pub fn compile_script(
+    query: &str,
+    schema: &SchemaDescriptor,
+    config: &ir::SessionConfig,
+) -> Result<Vec<Arc<CompiledQuery>>, PyQLError> {
+    let statements = parse::parse_script(query)?;
+    if statements.len() == 1 {
+        return Ok(vec![compile_with_config(query, schema, config)?]);
+    }
+    statements
+        .iter()
+        .map(|ast| compile_ast(ast, schema, config).map(Arc::new))
+        .collect()
+}
+
 /// Like `compile`, but honors a caller-supplied `SessionConfig` for this query.
 ///
 /// Returns an `Arc` — callers share one immutable compilation rather than
@@ -536,8 +556,19 @@ fn compile_uncached(
     config: &ir::SessionConfig,
 ) -> Result<CompiledQuery, PyQLError> {
     let ast = parse::parse(query)?;
+    compile_ast(&ast, schema, config)
+}
+
+/// Compile one already-parsed statement. Shared by the single-statement path
+/// and by `compile_script`, which has several of them and no source text to
+/// hand back to the parser per statement.
+fn compile_ast(
+    ast: &parse::Stmt,
+    schema: &SchemaDescriptor,
+    config: &ir::SessionConfig,
+) -> Result<CompiledQuery, PyQLError> {
     let is_analyze = matches!(ast, parse::Stmt::Analyze(_));
-    let ir_out = ir::compile_with_config(&ast, schema, config)?;
+    let ir_out = ir::compile_with_config(ast, schema, config)?;
     // `analyze`'s own shape-path walk is skipped for every other query — no
     // reason to pay for it when nothing will read `analyze_paths`.
     let analyze_paths = is_analyze.then(|| {
@@ -546,7 +577,7 @@ fn compile_uncached(
         // `root_marker_offset`'s own doc comment) — filled in here from the
         // original AST, still in scope at this point.
         if let Some(root) = paths.iter_mut().find(|p| p.path == "root") {
-            root.marker_offset = analyze::root_marker_offset(&ast);
+            root.marker_offset = analyze::root_marker_offset(ast);
         }
         paths
     });

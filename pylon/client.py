@@ -118,6 +118,12 @@ class AsyncTransaction:
 
         _cache.invalidate_for(compiled)
 
+    async def _run_compiled(self, compiled: CompiledQuery, params: list[Any]) -> list[Any]:
+        """Run an already-compiled statement — what a script's statements are."""
+        rows = await self._tx.query_compiled(compiled, params)
+        self._evict(compiled)
+        return rows
+
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
@@ -402,8 +408,37 @@ class Client:
         c._config_options = {**self._config_options, **options}
         return c
 
+    async def _run_script(self, pyql: str, kwargs: dict[str, Any]) -> list[Any]:
+        """Run a script's statements in order and return the last one's rows.
+
+        Postgres cannot take several statements with parameters in one round
+        trip, so each is sent on its own — inside a transaction, so a script
+        either lands whole or not at all, which is how a reader of the source
+        would expect several statements written together to behave.
+        """
+        from pylon._core import compile_script as _compile_script
+        from pylon.query import _get_schema
+
+        statements = _compile_script(
+            pyql,
+            _get_schema(),
+            allow_user_specified_id=bool(self._config_options.get('allow_user_specified_id', False)),
+        )
+        rows: list[Any] = []
+        last = statements[-1]
+        async for tx in self.transaction():
+            async with tx:
+                for compiled in statements:
+                    if self._warnings:
+                        _emit_warnings(compiled)
+                    rows = await tx._run_compiled(compiled, _bind_params(compiled, kwargs, self._globals))
+        return _hydrate(rows, last)
+
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
+        merged = _merge_args(args, kwargs)
+        if _looks_like_a_script(pyql):
+            return await self._run_script(pyql, merged)
         pool = await self._connected_pool()
         compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
@@ -973,6 +1008,35 @@ def _compile_and_bind(
     except KeyError as exc:
         raise InterfaceError(f'Missing query parameter: {exc}') from exc
     return compiled, params
+
+
+def _bind_params(
+    compiled: CompiledQuery,
+    kwargs: dict[str, Any],
+    globals_: dict[str, Any] | None = None,
+) -> list[Any]:
+    """Positional params for `compiled`, drawn from `kwargs` and `globals_`."""
+    try:
+        params: list[Any] = []
+        for name in compiled.param_names:
+            if name.startswith('__global__'):
+                params.append((globals_ or {}).get(name[len('__global__') :]))
+            else:
+                params.append(kwargs[name])
+    except KeyError as exc:
+        raise InterfaceError(f'Missing query parameter: {exc}') from exc
+    return params
+
+
+def _looks_like_a_script(pyql: str) -> bool:
+    """Whether the source may hold more than one statement.
+
+    Only a hint, to keep the ordinary path off the script route: a semicolon
+    inside a string literal makes this say yes, and compiling the script then
+    reports one statement anyway. A trailing semicolon on a single statement
+    says no.
+    """
+    return ';' in pyql.strip().rstrip(';')
 
 
 def _hydrate(rows: list[Any], compiled: CompiledQuery) -> list[Any]:
