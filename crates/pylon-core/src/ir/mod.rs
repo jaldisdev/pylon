@@ -245,7 +245,7 @@ pub enum IrArraySource {
     /// Inner is a regular schema SELECT; first scalar pointer is the array element.
     Select(IrSelect),
     /// Inner is a path traversal SELECT; scalar result is the array element.
-    PathSelect(IrPathSelect),
+    PathSelect(Box<IrPathSelect>),
     /// One column of whatever rows a statement produces — the only way to
     /// reach a `for … union`'s set, which has no single source to read from.
     StmtColumn { stmt: Box<IrStmt>, column: String },
