@@ -4137,6 +4137,15 @@ mod tests {
     }
 
     #[test]
+    fn test_for_over_a_with_binding_iterates_every_row() {
+        let out = compile_and_emit(
+            "WITH names := (SELECT Person.name) FOR n IN names UNION (SELECT Person FILTER .name = n)",
+        );
+        assert!(out.sql.contains("FROM \"names\""), "{}", out.sql);
+        assert!(!out.sql.contains("VALUES"), "the whole set is iterated:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_narrowing_an_interface_joins_the_implementor_table() {
         // `first_name` lives on Individual's own table; the Account view has
         // only the columns every implementor shares.
