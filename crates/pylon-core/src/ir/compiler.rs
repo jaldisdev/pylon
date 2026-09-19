@@ -33,10 +33,10 @@ use super::{
     IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup, IrIfElse, IrInsert,
     IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
-    IrSelect, IrSessionGlobalCte, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir,
-    IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate, IrVectorSearch, SearchEnqueueInfo, TupleCastShape,
-    VectorEnqueueInfo,
+    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer,
+    IrScalarSetPointer, IrSelect, IrSessionGlobalCte, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer,
+    IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate, IrVectorSearch, SearchEnqueueInfo,
+    TupleCastShape, VectorEnqueueInfo,
 };
 
 // ── Compiled-clause tuples ──────────────────────────────────────────────────────
@@ -4508,16 +4508,13 @@ impl<'a> Compiler<'a> {
 
     /// `id in (…)` over the rows a DML subject path traverses to, so a
     /// mutation written against a traversal touches those rows and no others.
-    fn compile_subject_path_rows(&mut self, subject: &ast::Path) -> Result<IrExpr, PyQLError> {
+    fn compile_subject_path_rows(&mut self, subject: &ast::Path, target_alias: &str) -> Result<IrExpr, PyQLError> {
         // Traversing to `.id` rather than stopping at the objects: a path that
         // ends on a link or a type intersection has nothing to project, and the
         // ids are what the narrowing compares against anyway.
         let mut steps = subject.steps.clone();
         steps.push(ast::PathStep::Name("id".to_string()));
-        let ids = ast::Path {
-            steps,
-            partial: false,
-        };
+        let ids = ast::Path { steps, partial: false };
         let synthetic = ast::SelectStmt {
             result: Expr::Path(ids.clone()),
             filter: None,
@@ -4529,7 +4526,7 @@ impl<'a> Compiler<'a> {
         let rows = self.compile_path_select(&synthetic, &ids, &[], false)?;
         Ok(IrExpr::BinOp(Box::new(IrBinOp {
             left: IrExpr::ColumnRef {
-                alias: String::new(),
+                alias: target_alias.to_string(),
                 column: "id".to_string(),
                 pg_type: "uuid".to_string(),
             },
@@ -4853,7 +4850,6 @@ impl<'a> Compiler<'a> {
             && let Ok(root_td) = self.resolve_path_root(root)
             && let (_, Some(target_td)) = self.walk_path_types(root_td, &subject.steps[1..], MAX_COMPUTED_SPLICES)
         {
-            let rows = self.compile_subject_path_rows(subject)?;
             let narrowed = ast::UpdateStmt {
                 subject: Expr::Path(ast::Path {
                     steps: vec![ast::PathStep::Name(format!("{}::{}", target_td.module, target_td.name))],
@@ -4864,6 +4860,10 @@ impl<'a> Compiler<'a> {
             };
             self.pending_nested_ctes = outer_pending_nested_ctes;
             let mut ir = self.compile_update(&narrowed)?;
+            // Built after the update, so the comparison names that update's own
+            // alias: with a nested statement's CTE in the FROM, a bare `id`
+            // could mean either relation.
+            let rows = self.compile_subject_path_rows(subject, &ir.target.alias)?;
             ir.filter = Some(and_conditions(ir.filter.take(), vec![rows]).expect("row set is present"));
             return Ok(ir);
         }
@@ -6151,10 +6151,7 @@ impl<'a> Compiler<'a> {
     ) -> Result<IrShapePointer, PyQLError> {
         let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
         steps.extend(path.steps.iter().cloned());
-        let full_path = ast::Path {
-            steps,
-            partial: false,
-        };
+        let full_path = ast::Path { steps, partial: false };
         let synthetic = ast::SelectStmt {
             result: Expr::Path(full_path.clone()),
             filter: modifiers.and_then(|m| m.filter.clone()),
@@ -10404,7 +10401,8 @@ impl<'a> Compiler<'a> {
     /// The fan-out a source of `type_name` needs, or `None` when it is not an
     /// interface and so reads from a table of its own. See `IrSource::poly`.
     fn poly_fanout_for(&self, type_name: &str) -> Option<IrPolyFanout> {
-        let td = self.schema
+        let td = self
+            .schema
             .types
             .iter()
             .find(|t| format!("{}::{}", t.module, t.name) == type_name)?;
@@ -10412,10 +10410,7 @@ impl<'a> Compiler<'a> {
             return None;
         }
         let (implementors, columns) = self.collect_poly_info(type_name);
-        Some(IrPolyFanout {
-            implementors,
-            columns,
-        })
+        Some(IrPolyFanout { implementors, columns })
     }
 
     /// Collect poly_implementors and poly_columns for a polymorphic return type.
