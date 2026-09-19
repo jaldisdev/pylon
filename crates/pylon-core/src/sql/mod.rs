@@ -4419,6 +4419,18 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_insert_in_a_mutation_written_as_a_free_set() {
+        let out = compile_and_emit(
+            "SELECT { (UPDATE Person FILTER .name = 'a' SET { company := (INSERT Company { name := 'c' }) }) }",
+        );
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Company\""),
+            "the hoisted insert is defined, not just referenced:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_nested_insert_as_a_link_value_in_an_update() {
         // The hoisted insert sits beside the update rather than inside it, so
         // the update needs a FROM to read its id, and its own `id` has to name
