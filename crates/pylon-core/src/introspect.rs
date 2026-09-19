@@ -128,6 +128,17 @@ const DOMAINS_SQL: &str = r#"
     ORDER BY n.nspname, t.typname
 "#;
 
+const DOMAIN_CHECKS_SQL: &str = r#"
+    SELECT (n.nspname, t.typname, c.conname) AS result
+    FROM pg_constraint c
+    JOIN pg_type t ON t.oid = c.contypid
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE c.contype = 'c'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+    ORDER BY n.nspname, t.typname, c.conname
+"#;
+
 const TABLES_SQL: &str = r#"
     SELECT (n.nspname, c.relname) AS result
     FROM pg_class c
@@ -293,7 +304,23 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
         state.domains.push(DbDomain {
             schema: pg_to_module(&schema),
             name,
+            checks: vec![],
         });
+    }
+
+    // A domain's own CHECK constraints, so that editing one on a custom scalar
+    // reaches an existing database rather than only a freshly created one.
+    for row in query(pool, DOMAIN_CHECKS_SQL, std::slice::from_ref(&object_excludes)).await? {
+        let Some([schema, name, constraint]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(constraint)) = (as_str(schema), as_str(name), as_str(constraint)) else {
+            continue;
+        };
+        let schema = pg_to_module(&schema);
+        if let Some(domain) = state.domains.iter_mut().find(|d| d.schema == schema && d.name == name) {
+            domain.checks.push(constraint);
+        }
     }
 
     // Tables + columns + FKs + indexes

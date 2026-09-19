@@ -234,16 +234,7 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
                 qi(&format!("{}_seq", s.name)),
             ));
         }
-        let checks: Vec<String> = s
-            .check_constraints
-            .iter()
-            .map(|c| format!("    CHECK ({})", c))
-            .collect();
-        let check_clause = if checks.is_empty() {
-            String::new()
-        } else {
-            format!("\n{}", checks.join("\n"))
-        };
+        let check_clause = scalar_check_clauses(schema, &s.module, &s.name);
         out.push_str(&format!(
             "CREATE DOMAIN {}.{} AS {}{};\n",
             pg_schema(&s.module),
@@ -1406,6 +1397,40 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
 /// them from `MaxLen` and friends). A `TypeConstraint::Expression` is user
 /// PyQL and has to be compiled — emitting it verbatim produced SQL containing
 /// `exists (.recipient)`, which no PostgreSQL will accept.
+/// `(module, scalar, constraint name, predicate)` for every CHECK a custom
+/// scalar's domain carries. Named the way a table's checks are — the name
+/// carries a hash of the predicate — so that editing one is visible to the
+/// differ as a new constraint beside a stale one to drop.
+pub fn scalar_check_constraints(schema: &SchemaDescriptor) -> Vec<(String, String, String, String)> {
+    let mut result = Vec::new();
+    for s in &schema.scalars {
+        for expr in &s.check_constraints {
+            let hash = fnv(&[&s.name, expr.as_str()]);
+            result.push((
+                s.module.clone(),
+                s.name.clone(),
+                format!("{}_{}_check", s.name, &hash[..8]),
+                expr.clone(),
+            ));
+        }
+    }
+    result
+}
+
+/// The `CONSTRAINT … CHECK (…)` clauses a `CREATE DOMAIN` for `scalar` needs.
+pub fn scalar_check_clauses(schema: &SchemaDescriptor, module: &str, name: &str) -> String {
+    let clauses: Vec<String> = scalar_check_constraints(schema)
+        .into_iter()
+        .filter(|(m, n, _, _)| m == module && n == name)
+        .map(|(_, _, cname, expr)| format!("    CONSTRAINT {} CHECK ({})", qi(&cname), expr))
+        .collect();
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", clauses.join("\n"))
+    }
+}
+
 pub fn check_constraints(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String, String)>, PyQLError> {
     let mut result = Vec::new();
     for t in &schema.types {
@@ -3441,7 +3466,8 @@ mod tests {
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
-            ddl.contains("CREATE DOMAIN \"public\".\"EmailStr\" AS text\n    CHECK (value ~ '^[^@]+@[^@]+\\.[^@]+$')"),
+            ddl.contains("CREATE DOMAIN \"public\".\"EmailStr\" AS text\n    CONSTRAINT ")
+                && ddl.contains("CHECK (value ~ '^[^@]+@[^@]+\\.[^@]+$')"),
             "got:\n{}",
             ddl
         );
