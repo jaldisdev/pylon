@@ -5301,6 +5301,12 @@ impl<'a> Compiler<'a> {
             .collect();
 
         for cd in &td.computed.clone() {
+            // `*` is properties; links arrive only with `**`. A computed
+            // standing for objects is a link however it is written, so it
+            // waits for the deep form too.
+            if matches!(splat, ast::Splat::Shallow) && self.computed_is_object_valued(cd, td) {
+                continue;
+            }
             pointers.push(self.compile_declared_computed(cd, td, alias, module, None, &[])?);
         }
 
@@ -5472,6 +5478,7 @@ impl<'a> Compiler<'a> {
             .computed
             .iter()
             .filter(|c| !interface_computed.contains(&c.name))
+            .filter(|c| !matches!(splat, ast::Splat::Shallow) || !self.computed_is_object_valued(c, concrete_td))
             .cloned()
             .collect();
 
@@ -6730,6 +6737,32 @@ impl<'a> Compiler<'a> {
             limit,
             distinct: false,
         }))))
+    }
+
+    /// Whether a declared computed pointer stands for *objects* rather than a
+    /// value — `members := .memberships.member`, `primary_email := (select
+    /// .emails filter .primary limit 1)`.
+    ///
+    /// `*` expands to properties and `**` adds links, so a computed belongs to
+    /// whichever side its expression lands on. `ComputedDescriptor` carries no
+    /// flag saying which, so the expression has to be walked.
+    fn computed_is_object_valued(&self, cd: &crate::schema::ComputedDescriptor, td: &TypeDescriptor) -> bool {
+        let Ok(expr) = crate::parse::parse_pointer_expr(&cd.expression) else {
+            return false;
+        };
+        let Some((path, _, _)) = Self::pointer_subject(&expr) else {
+            return false;
+        };
+        if !path.partial {
+            return false;
+        }
+        match path.steps.as_slice() {
+            // A backlink names the objects on the other side of the link.
+            // Traversing past it (`.<author[is Post].title`) is a value again,
+            // which the walk below works out for itself.
+            [ast::PathStep::Backlink(_)] | [ast::PathStep::Backlink(_), ast::PathStep::TypeIntersection(_)] => true,
+            steps => self.walk_path_types(td, steps, MAX_COMPUTED_SPLICES).1.is_some(),
+        }
     }
 
     /// True when traversing `steps` from `td` crosses a multi-valued step —

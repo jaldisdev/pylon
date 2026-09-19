@@ -8107,6 +8107,61 @@ mod tests {
     }
 
     #[test]
+    fn test_shallow_splat_leaves_object_valued_computeds_to_the_deep_form() {
+        // Regression: `*` expanded every computed, link-valued ones included,
+        // which the upstream engine's `*` does not -- it is properties only, `**` adds links.
+        // On jaldis's schema that pulled a computed multi-link
+        // (`members := .memberships.member`) into every splat query.
+        let mut schema = make_schema();
+        schema.types[0].computed.push(crate::schema::ComputedDescriptor {
+            name: "authors".into(),
+            expression: ".posts".into(),
+            return_type: None,
+        });
+        schema.types[0].computed.push(crate::schema::ComputedDescriptor {
+            name: "age_next".into(),
+            expression: ".age + 1".into(),
+            return_type: Some("int8".into()),
+        });
+
+        let shallow = compile_and_emit_with("SELECT Person { * }", &schema);
+        let crate::query::ShapeNode::Object { pointers, .. } = &shallow.shape.root else {
+            panic!("expected Object shape")
+        };
+        let names: Vec<&str> = pointers.iter().map(shape_pointer_name).collect();
+        assert!(
+            names.contains(&"age_next"),
+            "a computed property belongs in `*`: {names:?}"
+        );
+        assert!(
+            !names.contains(&"authors"),
+            "a computed link does not: {names:?}"
+        );
+
+        let deep = compile_and_emit_with("SELECT Person { ** }", &schema);
+        let crate::query::ShapeNode::Object { pointers, .. } = &deep.shape.root else {
+            panic!("expected Object shape")
+        };
+        let names: Vec<&str> = pointers.iter().map(shape_pointer_name).collect();
+        assert!(
+            names.contains(&"authors"),
+            "`**` includes links, computed ones included: {names:?}"
+        );
+    }
+
+    fn shape_pointer_name(node: &crate::query::ShapeNode) -> &str {
+        use crate::query::ShapeNode;
+        match node {
+            ShapeNode::Scalar { name, .. }
+            | ShapeNode::Enum { name, .. }
+            | ShapeNode::NamedTuple { name, .. }
+            | ShapeNode::Object { name, .. }
+            | ShapeNode::Array { name, .. } => name,
+            _ => "",
+        }
+    }
+
+    #[test]
     fn test_multi_sort_with_then_emits_two_order_keys() {
         let out = compile_and_emit("SELECT Person { name } ORDER BY .name THEN .age DESC");
         assert!(out.sql.contains("ORDER BY"), "expected ORDER BY");
