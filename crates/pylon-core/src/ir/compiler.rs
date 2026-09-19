@@ -3237,6 +3237,30 @@ impl<'a> Compiler<'a> {
         root_type_name: &str,
         distinct: bool,
     ) -> Result<IrPathSelect, PyQLError> {
+        // `array_agg(a.sessions.id)` — a single-argument aggregate over a
+        // path. The aggregate applies to the set the path traverses *to*, so
+        // the traversal becomes this select's own row source and the aggregate
+        // wraps the column it lands on. Compiling the path as an expression
+        // instead yields the array it stands for, and aggregating that nests it
+        // one level deep.
+        if let Expr::FunctionCall(f) = result
+            && f.args.len() == 1
+            && let Expr::Path(p) = &f.args[0]
+            && !p.partial
+            && p.steps.len() > 1
+        {
+            let arg_path = ast::Path {
+                partial: false,
+                steps: p.steps.clone(),
+            };
+            let mut ps = self.compile_path_select(sel, &arg_path, &[], distinct)?;
+            if let IrPathResult::Scalar(column, _) = ps.result.clone() {
+                let call = self.resolve_fn_call(f.module.as_deref(), &f.name, vec![column])?;
+                ps.result = IrPathResult::Scalar(call, None);
+                return Ok(ps);
+            }
+        }
+
         // BinOp where one side is the absolute type-rooted path:
         // Build the join chain for the path side, then apply the comparison
         // element-wise so we get one boolean per traversal element (not one EXISTS per root).
@@ -7413,6 +7437,29 @@ impl<'a> Compiler<'a> {
                             }
                         }
                     } else {
+                        // `array_agg(a.sessions.id)` with no type in scope: the
+                        // aggregate takes the whole set the path names, so it
+                        // belongs in a subquery over that traversal. Compiled as
+                        // an expression instead, a multi-valued path stands for
+                        // the array of its elements, and aggregating *that*
+                        // nests it one level deep — the same reason the
+                        // schema-bound branch above routes this way.
+                        if let Expr::Path(p) = arg
+                            && !p.partial
+                            && p.steps.len() > 1
+                            && let Some(root) = self.find_path_root_in_expr(arg)
+                        {
+                            let synthetic = ast::SelectStmt {
+                                result: Expr::FunctionCall(f.clone()),
+                                filter: None,
+                                order_by: vec![],
+                                offset: None,
+                                limit: None,
+                                lock: None,
+                            };
+                            let ps = self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
+                            return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                        }
                         let inner_sel: Option<ast::SelectStmt> = match arg {
                             Expr::Path(p) if !p.partial => {
                                 // Resolve as a schema type if it matches a known type (not enum).

@@ -6788,6 +6788,36 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_over_a_multi_valued_path_keeps_the_set_flat() {
+        // Regression: `array_agg(a.posts.title)` compiled the path as an
+        // expression, where a multi-valued path stands for the array of its
+        // elements — so the aggregate wrapped that array and the result came
+        // back one level deep, `[[t1, t2]]` where Gel gives `[t1, t2]`.
+        let schema = make_schema();
+        let out = compile_and_emit_with(
+            "with a := (select Person limit 1) select { titles := array_agg(a.posts.title) }",
+            &schema,
+        );
+        assert!(
+            !out.sql.contains("array_agg(ARRAY("),
+            "the aggregate must take the set, not the array standing for it, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("array_agg(") && out.sql.contains("\"title\""),
+            "expected the aggregate over the traversal's own column, got:\n{}",
+            out.sql
+        );
+        // The free object keeps its composite emission, so values stay typed
+        // rather than passing through jsonb as strings.
+        assert!(
+            out.sql.contains("ROW(") && !out.sql.contains("jsonb_build_object"),
+            "expected a composite row, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_with_bound_root_read_by_name_inside_a_nested_select() {
         // Regression: `compile_path_select` resolved a `with`-bound root
         // correctly, but the multi-valued check straight after it re-resolved
