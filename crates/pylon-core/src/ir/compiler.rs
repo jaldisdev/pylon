@@ -3537,12 +3537,155 @@ impl<'a> Compiler<'a> {
 
     // ── SELECT ────────────────────────────────────────────────────────────────────
 
+    /// The `(qualified type, source table)` of each branch of an object-set
+    /// union, or `None` if any branch is something other than a direct
+    /// reference to an object set (a WITH binding or a bare type name).
+    fn object_union_branches(&self, expr: &Expr) -> Option<Vec<(String, String)>> {
+        fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match expr {
+                Expr::Union(a, b) => {
+                    flatten(a, out);
+                    flatten(b, out);
+                }
+                other => out.push(other),
+            }
+        }
+        if !matches!(expr, Expr::Union(_, _)) {
+            return None;
+        }
+        let mut operands: Vec<&Expr> = vec![];
+        flatten(expr, &mut operands);
+
+        let mut branches: Vec<(String, String)> = vec![];
+        for operand in operands {
+            let Expr::Path(path) = operand else { return None };
+            if path.partial || path.steps.len() != 1 {
+                return None;
+            }
+            let ast::PathStep::Name(name) = &path.steps[0] else {
+                return None;
+            };
+            match self.cte_object_type(name) {
+                Some(qualified) => branches.push((qualified, format!("@cte:{name}"))),
+                None => match self.resolve_type(name) {
+                    Ok(td) => branches.push((format!("{}::{}", td.module, td.name), td.table.clone())),
+                    Err(_) => return None,
+                },
+            }
+        }
+        Some(branches)
+    }
+
+    /// `select (a union b) { shape }` where every branch is a set of the same
+    /// object type — a WITH binding or a bare type name. Each branch becomes
+    /// its own bound row; the SQL layer unions them in the FROM clause, so the
+    /// shape and modifiers are compiled once, against the shared type.
+    ///
+    /// `Ok(None)` when the result isn't an object union, leaving the ordinary
+    /// single-source path (and its own errors) in charge.
+    fn try_compile_object_union_select(
+        &mut self,
+        sel: &ast::SelectStmt,
+        result_expr: &Expr,
+        distinct: bool,
+    ) -> Result<Option<IrSelect>, PyQLError> {
+        let (union_expr, shape_elements): (&Expr, &[ShapeElement]) = match result_expr {
+            Expr::Union(_, _) => (result_expr, &[]),
+            Expr::Shape(shape) => match &shape.expr {
+                Some(inner @ Expr::Union(_, _)) => (inner, shape.elements.as_slice()),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let Some(branches) = self.object_union_branches(union_expr) else {
+            return Ok(None);
+        };
+
+        let (first_type, _) = &branches[0];
+        if let Some((other, _)) = branches.iter().find(|(t, _)| t != first_type) {
+            return Err(self.type_err(&format!(
+                "operator 'UNION' cannot be applied to operands of type '{first_type}' and '{other}'"
+            )));
+        }
+        if sel.lock.is_some() {
+            return Err(self.type_err(
+                "FOR UPDATE/SHARE cannot be used on a UNION — its rows come from more than one \
+                 source, which a single locking clause can't target",
+            ));
+        }
+        let td = self.resolve_type(first_type)?;
+        let alias = self.fresh_alias();
+
+        self.anchors.push(SelectAnchor {
+            type_name: td.name.clone(),
+            qualified: format!("{}::{}", td.module, td.name),
+            alias: alias.clone(),
+            detached: std::mem::take(&mut self.pending_detached),
+        });
+        let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
+            let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
+            let filter = sel
+                .filter
+                .as_ref()
+                .map(|f| compiler.compile_expr(f, td, &alias))
+                .transpose()?;
+            let order_by = sel
+                .order_by
+                .iter()
+                .map(|o| compiler.compile_sort(o, td, &alias))
+                .collect::<Result<Vec<_>, _>>()?;
+            let offset = sel
+                .offset
+                .as_ref()
+                .map(|e| compiler.compile_expr(e, td, &alias))
+                .transpose()?;
+            let limit = sel
+                .limit
+                .as_ref()
+                .map(|e| compiler.compile_expr(e, td, &alias))
+                .transpose()?;
+            Ok((shape, filter, order_by, offset, limit))
+        })(self);
+        self.anchors.pop();
+        let (shape, filter, order_by, offset, limit) = clauses?;
+
+        let rows = branches
+            .into_iter()
+            .map(|(type_name, table)| IrRowSource::Bound {
+                source: IrSource {
+                    type_name,
+                    table,
+                    alias: alias.clone(),
+                },
+                shape: shape.clone(),
+            })
+            .collect();
+
+        Ok(Some(IrSelect {
+            rows,
+            filter,
+            order_by,
+            offset,
+            limit,
+            distinct,
+            dml_source: None,
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
+            lock: None,
+        }))
+    }
+
     fn compile_select(
         &mut self,
         sel: &ast::SelectStmt,
         result_expr: &Expr,
         distinct: bool,
     ) -> Result<IrSelect, PyQLError> {
+        if let Some(union_select) = self.try_compile_object_union_select(sel, result_expr, distinct)? {
+            return Ok(union_select);
+        }
         let (type_name, shape_elements, inner_stmt, cte_name) = self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
@@ -3959,6 +4102,18 @@ impl<'a> Compiler<'a> {
                     return Ok(n.clone());
                 }
                 Err(self.type_err("expected a type name"))
+            }
+            // `select (a union b)` as a SELECT-over-SELECT subject: every
+            // branch carries the same object type, and that is the subject.
+            Expr::Union(_, _) => {
+                let branches = self
+                    .object_union_branches(expr)
+                    .ok_or_else(|| self.type_err("expected a type name as SELECT subject"))?;
+                let (first, _) = &branches[0];
+                if branches.iter().all(|(t, _)| t == first) {
+                    return Ok(first.clone());
+                }
+                Err(self.type_err("expected a type name as SELECT subject"))
             }
             _ => Err(self.type_err("expected a type name as SELECT subject")),
         }

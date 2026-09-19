@@ -267,7 +267,58 @@ fn emit_poly_union(implementors: &[IrPolyImplementor], columns: &[String]) -> St
 fn emit_select_stmt(sel: &IrSelect, ctes: &[IrCteDef]) -> SqlOutput {
     match sel.rows.as_slice() {
         [IrRowSource::Bound { source, shape }] => emit_bound_select(sel, source, shape),
+        rows if rows.len() > 1 && rows.iter().all(|r| matches!(r, IrRowSource::Bound { .. })) => {
+            emit_bound_union_select(sel, rows)
+        }
         rows => emit_free_rows(sel, rows, ctes),
+    }
+}
+
+/// The branches of `select (a union b)` all carry the same object type, so
+/// they share a column set: union them in the FROM clause and project, filter
+/// and order the combined set once, under the shape's single alias.
+fn bound_union_from_clause(rows: &[IrRowSource]) -> String {
+    rows.iter()
+        .map(|row| match row {
+            IrRowSource::Bound { source, .. } => format!("    SELECT * FROM {}", source_ref(source)),
+            IrRowSource::Free(_) => unreachable!("caller checked every row is bound"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n    UNION ALL\n")
+}
+
+fn emit_bound_union_select(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
+    let IrRowSource::Bound { source, shape } = &rows[0] else {
+        unreachable!("caller checked every row is bound")
+    };
+    let alias = &source.alias;
+    let (pointer_exprs, shape_pointers) = build_shape(shape, alias);
+    let mut parts = vec![type_disc(&source.type_name)];
+    parts.extend(pointer_exprs);
+
+    let mut sql = format!(
+        "SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
+        if sel.distinct { "DISTINCT " } else { "" },
+        parts.join(",\n    "),
+        bound_union_from_clause(rows),
+        qi(alias),
+    );
+    append_filter(&mut sql, &sel.filter);
+    append_order_by(&mut sql, &sel.order_by);
+    append_offset_limit(&mut sql, &sel.offset, &sel.limit);
+
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor {
+            root: ShapeNode::Object {
+                name: String::new(),
+                type_name: Some(source.type_name.clone()),
+                position: 0,
+                cardinality: Cardinality::Many,
+                pointers: prepend_type(shape_pointers),
+            },
+        },
+        inference_plan: None,
     }
 }
 
@@ -436,6 +487,23 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                     "    SELECT {}* FROM {}",
                     if inner.distinct { "DISTINCT " } else { "" },
                     from
+                );
+                append_filter(&mut sql, &inner.filter);
+                append_order_by(&mut sql, &inner.order_by);
+                append_offset_limit(&mut sql, &inner.offset, &inner.limit);
+                sql
+            }
+            // Object union: same FROM-clause union as `emit_bound_union_select`,
+            // but exposing raw columns like every other arm here.
+            rows if rows.len() > 1 && rows.iter().all(|r| matches!(r, IrRowSource::Bound { .. })) => {
+                let IrRowSource::Bound { source, .. } = &rows[0] else {
+                    unreachable!("checked by the guard")
+                };
+                let mut sql = format!(
+                    "    SELECT {}* FROM (\n{}\n    ) AS {}",
+                    if inner.distinct { "DISTINCT " } else { "" },
+                    bound_union_from_clause(rows),
+                    qi(&source.alias),
                 );
                 append_filter(&mut sql, &inner.filter);
                 append_order_by(&mut sql, &inner.order_by);
@@ -3984,6 +4052,24 @@ mod tests {
         assert!(out.sql.contains("max("));
         // Reads the binding, not the base table again.
         assert!(!out.sql.contains("FROM \"default\".\"Person\" AS \"t1\""));
+    }
+
+    #[test]
+    fn test_select_union_of_two_object_bindings() {
+        let out = compile_and_emit("WITH a := (SELECT Person LIMIT 1), b := (SELECT Person) SELECT (a UNION b)");
+        assert!(out.sql.contains("SELECT * FROM \"a\""));
+        assert!(out.sql.contains("UNION ALL"));
+        assert!(out.sql.contains("SELECT * FROM \"b\""));
+    }
+
+    #[test]
+    fn test_select_union_of_different_object_types_is_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("WITH a := (SELECT Person), b := (SELECT Company) SELECT (a UNION b)").unwrap();
+        let Err(err) = ir::compile(&ast, &schema) else {
+            panic!("union of unrelated types must be rejected")
+        };
+        assert!(format!("{err}").contains("UNION"));
     }
 
     #[test]
