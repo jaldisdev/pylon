@@ -4137,6 +4137,22 @@ mod tests {
     }
 
     #[test]
+    fn test_narrowing_an_interface_joins_the_implementor_table() {
+        // `first_name` lives on Individual's own table; the Account view has
+        // only the columns every implementor shares.
+        let mut schema = make_interface_schema();
+        let account = schema.types.iter_mut().find(|t| t.name == "Account").unwrap();
+        account.materialized = true;
+        let out = compile_and_emit_with("SELECT Account[is Individual].first_name", &schema);
+        assert!(
+            out.sql.contains("JOIN \"public\".\"Individual\""),
+            "the implementor's own table is joined:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("\"first_name\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_assert_over_an_object_set_returns_rows() {
         let out = compile_and_emit("SELECT std::assert_distinct((SELECT Person))");
         assert!(
