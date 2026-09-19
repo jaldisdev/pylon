@@ -86,13 +86,23 @@ impl Parser {
     /// return its string form without consuming it. Returns `None` for tokens
     /// that are never valid identifiers (punctuation, literals, EOF).
     fn keyword_as_ident(&self) -> Option<String> {
+        let spelling = self.keyword_ident_spelling()?;
+        // The keyword table can only offer one casing; the source says which
+        // one was actually written.
+        Some(match &self.tokens[self.pos].keyword_text {
+            Some(raw) => raw.to_string(),
+            None => spelling,
+        })
+    }
+
+    fn keyword_ident_spelling(&self) -> Option<String> {
         match self.current() {
             Token::Select => Some("select".into()),
             Token::Insert => Some("insert".into()),
             Token::Update => Some("update".into()),
             Token::Delete => Some("delete".into()),
             Token::Filter => Some("filter".into()),
-            Token::Order => Some("Order".into()),
+            Token::Order => Some("order".into()),
             Token::By => Some("by".into()),
             Token::Asc => Some("asc".into()),
             Token::Desc => Some("desc".into()),

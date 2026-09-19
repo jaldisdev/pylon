@@ -5004,9 +5004,11 @@ mod tests {
     #[test]
     fn test_a_binding_named_after_a_keyword_is_usable() {
         // The lexer is case-insensitive, so `order` arrives as the ORDER
-        // token and read as "expected an expression, found 'order'".
+        // token and read as "expected an expression, found 'order'" — and the
+        // binding keeps the casing it was written with, not the keyword
+        // table's.
         let out = compile_and_emit("WITH order := (select Person.name) SELECT Person { name } FILTER .name = order");
-        assert!(out.sql.contains("(SELECT \"v\" FROM \"Order\")"), "{}", out.sql);
+        assert!(out.sql.contains("(SELECT \"v\" FROM \"order\")"), "{}", out.sql);
     }
 
     #[test]

@@ -216,6 +216,11 @@ pub struct SpannedToken {
     /// conversion needed) — used to place `analyze` markers in the echoed
     /// query text.
     pub byte_offset: usize,
+    /// A keyword token's spelling as written. Keywords are matched
+    /// case-insensitively, so one used as a name (`order`, a link; `Order`, a
+    /// type) would otherwise come back as whatever casing the keyword table
+    /// happens to hold.
+    pub keyword_text: Option<Box<str>>,
 }
 
 pub struct Lexer<'a> {
@@ -249,14 +254,25 @@ impl<'a> Lexer<'a> {
                     token: Token::Eof,
                     pos,
                     byte_offset,
+                    keyword_text: None,
                 });
                 break;
             }
             let tok = self.next_token(pos.clone())?;
+            let word = &self.input[byte_offset..self.pos];
+            let keyword_text = if !matches!(tok, Token::Ident(_))
+                && !word.is_empty()
+                && word.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                std::str::from_utf8(word).ok().map(Box::from)
+            } else {
+                None
+            };
             tokens.push(SpannedToken {
                 token: tok,
                 pos,
                 byte_offset,
+                keyword_text,
             });
         }
         Ok(tokens)
