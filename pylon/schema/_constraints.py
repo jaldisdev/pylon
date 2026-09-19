@@ -250,11 +250,15 @@ class Readonly(_PointerConstraint):
 
 
 class Expression(_PointerConstraint):
-    """Arbitrary PyQL boolean expression declared in the class body.
+    """Arbitrary PyQL boolean expression.
 
-    Uses ``__subject__`` to reference the current object::
+    In a class body, ``__subject__`` is the row being checked::
 
         Expression('__subject__.start_date <= __subject__.end_date')
+
+    Inside ``Property[...]``/``Link[...]`` it is that pointer's own value::
+
+        currency: Property[Currency, Expression('__subject__ != Currency.USD')]
     """
 
     def __init__(self, expr: str) -> None:

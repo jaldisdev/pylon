@@ -4176,6 +4176,14 @@ mod tests {
     }
 
     #[test]
+    fn test_subject_reads_the_row_a_constraint_checks() {
+        let schema = make_schema();
+        let sql = ir::compile_constraint_expr("__subject__.age > 18", "default::Person", &schema)
+            .expect("__subject__ names the row under check");
+        assert!(sql.contains("\"age\""), "{sql}");
+    }
+
+    #[test]
     fn test_free_select_filter_gates_the_result_and_warns() {
         let schema = make_schema();
         let ast = parse::parse("SELECT count(Person) FILTER (Person.age > 18)").unwrap();

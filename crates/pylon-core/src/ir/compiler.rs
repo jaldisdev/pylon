@@ -7944,6 +7944,15 @@ impl<'a> Compiler<'a> {
                     },
                 )));
             }
+            // `__subject__` is the row a constraint is checked against, which
+            // is the same row a relative path reads.
+            if p.steps.len() > 1 && matches!(&p.steps[0], ast::PathStep::Name(root) if root == "__subject__") {
+                let relative = ast::Path {
+                    steps: p.steps[1..].to_vec(),
+                    partial: true,
+                };
+                return self.compile_path(&relative, td, alias);
+            }
             // Absolute path rooted at the current td: `TypeName.prop` inside a schema-bound
             // expression (e.g. the value side of a BinOp in compile_expr_as_path_select).
             // Rewrite to a relative path and compile normally.
