@@ -98,6 +98,45 @@ mod tests {
     }
 
     #[test]
+    fn test_shape_element_bare_select_without_parens() {
+        let stmt = parse("SELECT Person { primary := SELECT .emails FILTER .primary = true LIMIT 1 }").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Shape(shape) = sel.result else {
+            panic!("not a shape")
+        };
+        assert_eq!(shape.elements.len(), 1);
+        let Some(Expr::SubQuery(inner)) = &shape.elements[0].compexpr else {
+            panic!("not a subquery")
+        };
+        let Stmt::Select(inner) = inner.as_ref() else { panic!() };
+        assert!(inner.filter.is_some());
+        assert!(inner.limit.is_some());
+    }
+
+    #[test]
+    fn test_bare_select_stops_at_shape_separator() {
+        let stmt = parse("SELECT Person { a := SELECT .emails LIMIT 1, b := .name }").unwrap();
+        let Stmt::Select(sel) = stmt else { panic!() };
+        let Expr::Shape(shape) = sel.result else {
+            panic!("not a shape")
+        };
+        assert_eq!(shape.elements.len(), 2);
+        assert!(matches!(shape.elements[1].compexpr, Some(Expr::Path(_))));
+    }
+
+    #[test]
+    fn test_bare_with_in_expression_position() {
+        let expr = parse_expr("WITH n := 1 SELECT n").unwrap();
+        assert!(matches!(expr, Expr::SubQuery(_)));
+    }
+
+    #[test]
+    fn test_bare_for_union_in_expression_position() {
+        let expr = parse_expr("FOR x IN {1, 2} UNION (x + 1)").unwrap();
+        assert!(matches!(expr, Expr::SubQuery(_)));
+    }
+
+    #[test]
     fn test_string_literal_preserves_multibyte_utf8() {
         // Regression: the lexer scans raw bytes; a naive `byte as char` cast
         // on non-ASCII bytes previously corrupted multi-byte UTF-8 sequences

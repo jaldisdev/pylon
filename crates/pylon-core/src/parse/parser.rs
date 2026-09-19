@@ -169,6 +169,13 @@ impl Parser {
         )
     }
 
+    fn at_stmt_start(&self) -> bool {
+        matches!(
+            self.current(),
+            Token::With | Token::For | Token::Select | Token::Insert | Token::Update | Token::Delete | Token::Group
+        )
+    }
+
     fn err(&self, msg: &str) -> PyQLSyntaxError {
         PyQLSyntaxError {
             message: msg.to_string(),
@@ -507,15 +514,23 @@ impl Parser {
         if matches!(self.current(), Token::Union) {
             self.advance();
         }
-        let body = if matches!(self.current(), Token::LParen) {
-            // Parenthesised body: `(select ...)`, `(insert ...)`, etc.
-            let expr = self.parse_paren_expr()?;
-            match expr {
-                Expr::SubQuery(stmt) => *stmt,
-                _ => return Err(self.err("for loop body must be a statement")),
-            }
-        } else {
+        // The body is a statement (`union (select ...)`, `union (insert ...)`)
+        // or a plain expression (`union (x + 1)`, `union x.name`); the latter
+        // means the same as selecting it.
+        let body = if self.at_stmt_start() {
             self.parse_inner_stmt()?
+        } else {
+            match self.parse_expr()? {
+                Expr::SubQuery(stmt) => *stmt,
+                expr => Stmt::Select(SelectStmt {
+                    result: expr,
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                }),
+            }
         };
         Ok(Stmt::For(ForStmt {
             var,
@@ -1343,6 +1358,16 @@ impl Parser {
                     steps: vec![PathStep::LinkProp(name)],
                     partial: true,
                 }))
+            }
+
+            // A bare sub-statement in expression position: `x := select .emails
+            // filter .primary limit 1`, `x := with y := ... select ...`. The
+            // parenthesised form is handled in `parse_paren_expr`; EdgeQL accepts
+            // both, and the statement parsers stop on their own at the `,` or `}`
+            // that ends the shape element.
+            _ if self.at_stmt_start() => {
+                let stmt = self.parse_inner_stmt()?;
+                Ok(Expr::SubQuery(Box::new(stmt)))
             }
 
             // A keyword that can't begin an expression is a name here — the
