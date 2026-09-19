@@ -137,6 +137,16 @@ mod tests {
     }
 
     #[test]
+    fn test_keyword_used_as_a_name_keeps_its_written_casing() {
+        let expr = parse_expr(".<order[is OrderAttribute]").unwrap();
+        let Expr::Path(path) = expr else { panic!("not a path") };
+        assert_eq!(path.steps[0], PathStep::Backlink("order".into()));
+        let expr = parse_expr(".<Order[is OrderAttribute]").unwrap();
+        let Expr::Path(path) = expr else { panic!("not a path") };
+        assert_eq!(path.steps[0], PathStep::Backlink("Order".into()));
+    }
+
+    #[test]
     fn test_string_literal_preserves_multibyte_utf8() {
         // Regression: the lexer scans raw bytes; a naive `byte as char` cast
         // on non-ASCII bytes previously corrupted multi-byte UTF-8 sequences
