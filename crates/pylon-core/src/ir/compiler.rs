@@ -5536,7 +5536,7 @@ impl<'a> Compiler<'a> {
     /// Extract the target type name from a DML or inner SELECT statement.
     fn dml_subject_type(&self, stmt: &Stmt) -> Result<String, PyQLError> {
         match stmt {
-            Stmt::Insert(ins) => Ok(ins.subject.name.clone()),
+            Stmt::Insert(ins) => Ok(ins.subject.qualified_name()),
             Stmt::Update(upd) => self.subject_type_name(&upd.subject),
             Stmt::Delete(del) => self.subject_type_name(&del.subject),
             Stmt::With(w) => self.dml_subject_type(&w.stmt),
@@ -5656,7 +5656,7 @@ impl<'a> Compiler<'a> {
         // *outer* insert's link value) had pending, so each level attaches
         // only its own CTEs to its own `IrInsert`.
         let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
-        let type_name = ins.subject.name.to_string();
+        let type_name = ins.subject.qualified_name();
         let td = self.resolve_type(&type_name)?;
         if td.abstract_ && td.materialized {
             return Err(self.type_err(&format!(
