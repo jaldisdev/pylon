@@ -4772,6 +4772,35 @@ mod tests {
     }
 
     #[test]
+    fn test_a_for_loop_variable_over_objects() {
+        // The variable holds the row's key, so a path off it reads that row
+        // back. It used to be treated as a scalar throughout, and any path
+        // rooted at one reported "unknown type".
+        let out = compile_and_emit_with("FOR p IN (SELECT Person) UNION (SELECT p.name)", &make_schema());
+        assert!(
+            out.sql.contains("FROM \"public\".\"Person\"") && out.sql.contains("\"_for_p\".\"v\""),
+            "the body must read the row the variable names:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_shape_on_a_for_loop_variable() {
+        let out = compile_and_emit_with("FOR p IN (SELECT Person) UNION (SELECT p { name })", &make_schema());
+        assert!(
+            out.sql.contains("'default::Person'::text"),
+            "a shape on the variable yields its object:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_for_loop_variable_over_values_is_still_a_scalar() {
+        let out = compile_and_emit_with("FOR n IN {1, 2} UNION (SELECT n)", &make_schema());
+        assert!(out.sql.contains("VALUES"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

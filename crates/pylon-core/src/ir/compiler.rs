@@ -645,6 +645,10 @@ struct Compiler<'a> {
     cte_free_items: HashMap<String, IrFreeExpr>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
+    /// For-loop variables that iterate objects, by qualified type name. The
+    /// variable itself holds the row's key (see `compile_for`), so a path
+    /// rooted at one reads its table back by that key.
+    for_var_types: HashMap<String, String>,
     /// The schema-bound selects currently being compiled, innermost last.
     ///
     /// Only consulted for `detached`: an absolute `TypeName.prop` inside a
@@ -778,6 +782,7 @@ impl<'a> Compiler<'a> {
             cte_types: HashMap::new(),
             cte_free_items: HashMap::new(),
             for_vars: HashMap::new(),
+            for_var_types: HashMap::new(),
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
             global_ctes: vec![],
@@ -1808,6 +1813,9 @@ impl<'a> Compiler<'a> {
     /// has to look it up the same way, or a bound alias reads as an unknown
     /// type.
     fn resolve_path_root(&self, root_name: &str) -> Result<&'a TypeDescriptor, PyQLError> {
+        if let Some(qualified) = self.for_var_types.get(root_name) {
+            return self.resolve_type(qualified);
+        }
         match self.cte_types.get(root_name).filter(|t| t.contains("::")).cloned() {
             Some(bound) => self.resolve_type(&bound),
             None => self.resolve_type(root_name),
@@ -2404,6 +2412,22 @@ impl<'a> Compiler<'a> {
             },
             alias: root_alias.clone(),
         };
+        // `for c in (select Person) union (select c.name)` — the loop variable
+        // holds the row's key, so the walk starts from that row rather than
+        // from the whole table.
+        let for_var_root = self.for_var_types.contains_key(root_name).then(|| {
+            IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: root_alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ForVar {
+                    name: root_name.to_string(),
+                },
+            }))
+        });
 
         let mut joins: Vec<IrPathJoin> = vec![];
         let mut current_td = root_td;
@@ -2416,7 +2440,7 @@ impl<'a> Compiler<'a> {
         // `(step index, filter)` a spliced computed contributed, to compile
         // against the type that step lands on once the loop reaches it.
         let mut pending_filters: Vec<(usize, Expr)> = vec![];
-        let mut extra_conditions: Vec<IrExpr> = vec![];
+        let mut extra_conditions: Vec<IrExpr> = for_var_root.into_iter().collect();
         // The junction the traversal last crossed, for a bare `@prop` in the
         // select's own modifiers.
         let mut junction_scope: Option<(String, String)> = None;
@@ -3728,9 +3752,11 @@ impl<'a> Compiler<'a> {
                 if p.steps.len() == 1
                     && let ast::PathStep::Name(n) = &p.steps[0]
                 {
-                    // For-loop variable is a scalar, not a schema type reference.
+                    // A for-loop variable over values is a scalar; one over
+                    // objects stands for a row, and `select c` is a schema-
+                    // bound select of its type.
                     if self.for_vars.contains_key(n.as_str()) {
-                        return true;
+                        return !self.for_var_types.contains_key(n.as_str());
                     }
                     // Scalar CTE: type string has no "::" (object types always do).
                     if self.is_value_binding(n.as_str()) {
@@ -4285,7 +4311,21 @@ impl<'a> Compiler<'a> {
             Ok((shape, filter, order_by, offset, limit))
         })(self);
         self.anchors.pop();
-        let (shape, filter, order_by, offset, limit) = clauses?;
+        let (shape, mut filter, order_by, offset, limit) = clauses?;
+        // A select whose subject is a for-loop variable reads the one row that
+        // variable holds, not the whole table.
+        if let Some(var) = Self::subject_name(result_expr).filter(|n| self.for_var_types.contains_key(n)) {
+            let narrowed = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ForVar { name: var },
+            }));
+            filter = and_conditions(filter, vec![narrowed]);
+        }
 
         let rows = branches
             .into_iter()
@@ -4313,6 +4353,26 @@ impl<'a> Compiler<'a> {
             poly_columns: vec![],
             lock: None,
         }))
+    }
+
+    /// The bare name a select's result is written as, whether it carries a
+    /// shape or not.
+    fn subject_name(result_expr: &Expr) -> Option<String> {
+        let path = match result_expr {
+            Expr::Path(p) => p,
+            Expr::Shape(sh) => match sh.expr.as_ref()? {
+                Expr::Path(p) => p,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if path.partial {
+            return None;
+        }
+        match path.steps.as_slice() {
+            [ast::PathStep::Name(n)] => Some(n.clone()),
+            _ => None,
+        }
     }
 
     fn compile_select(
@@ -4464,7 +4524,9 @@ impl<'a> Compiler<'a> {
                     Some(Expr::SubQuery(stmt)) => (self.dml_subject_type(stmt)?, None, Some(stmt.as_ref())),
                     Some(Expr::Path(p)) if !p.partial && p.steps.len() == 1 => {
                         if let ast::PathStep::Name(n) = &p.steps[0] {
-                            if let Some(t) = self.cte_types.get(n.as_str()) {
+                            if let Some(t) = self.for_var_types.get(n.as_str()) {
+                                (t.clone(), None, None)
+                            } else if let Some(t) = self.cte_types.get(n.as_str()) {
                                 if t.contains("::") {
                                     (t.clone(), Some(n.clone()), None)
                                 } else {
@@ -4491,11 +4553,15 @@ impl<'a> Compiler<'a> {
             Expr::SubQuery(stmt) => Ok((self.dml_subject_type(stmt)?, &[], Some(stmt.as_ref()), None)),
             // Bare CTE object reference: `select cte_name`
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
-                if let ast::PathStep::Name(n) = &p.steps[0]
-                    && let Some(t) = self.cte_types.get(n.as_str())
-                    && t.contains("::")
-                {
-                    return Ok((t.clone(), &[], None, Some(n.clone())));
+                if let ast::PathStep::Name(n) = &p.steps[0] {
+                    if let Some(t) = self.for_var_types.get(n.as_str()) {
+                        return Ok((t.clone(), &[], None, None));
+                    }
+                    if let Some(t) = self.cte_types.get(n.as_str())
+                        && t.contains("::")
+                    {
+                        return Ok((t.clone(), &[], None, Some(n.clone())));
+                    }
                 }
                 Ok((self.expr_as_type_name(expr)?, &[], None, None))
             }
@@ -4505,7 +4571,7 @@ impl<'a> Compiler<'a> {
 
     fn compile_for(&mut self, f: &ast::ForStmt) -> Result<IrFor, PyQLError> {
         // Compile the iterator to determine what one loop variable binds to.
-        let (iterator, pg_type) = match &f.iterator {
+        let (iterator, pg_type, yielded_object_type) = match &f.iterator {
             Expr::Set(elems) => {
                 let compiled: Result<Vec<_>, _> = elems.iter().map(|e| self.compile_free_expr(e)).collect();
                 let exprs = compiled?;
@@ -4517,6 +4583,7 @@ impl<'a> Compiler<'a> {
                         pg_type: pg_type.clone(),
                     },
                     pg_type,
+                    None,
                 )
             }
             // A derived set — every row of it, not the single value a scalar
@@ -4543,6 +4610,7 @@ impl<'a> Compiler<'a> {
                         scalar,
                     },
                     pg_type,
+                    (!scalar).then_some(yielded),
                 )
             }
             // A WITH binding names a set, so the loop runs once per row of
@@ -4566,7 +4634,7 @@ impl<'a> Compiler<'a> {
                 };
                 let source = IrSource {
                     poly: None,
-                    type_name: yielded,
+                    type_name: yielded.clone(),
                     table: format!("@cte:{name}"),
                     alias: self.fresh_alias(),
                 };
@@ -4576,6 +4644,7 @@ impl<'a> Compiler<'a> {
                         scalar,
                     },
                     pg_type,
+                    (!scalar).then_some(yielded),
                 )
             }
             other => {
@@ -4588,12 +4657,17 @@ impl<'a> Compiler<'a> {
                         pg_type: pg_type.clone(),
                     },
                     pg_type,
+                    None,
                 )
             }
         };
 
         // Register the for variable so the body can reference it.
         let prev = self.for_vars.insert(f.var.clone(), pg_type.clone());
+        let prev_type = match yielded_object_type {
+            Some(qualified) => self.for_var_types.insert(f.var.clone(), qualified),
+            None => self.for_var_types.remove(&f.var),
+        };
         let hoisted_before = self.hoisted_ctes.len();
         let body = self.compile_stmt(&f.body)?;
         let body_ctes: Vec<IrCteDef> = self.hoisted_ctes.split_off(hoisted_before);
@@ -4604,6 +4678,14 @@ impl<'a> Compiler<'a> {
             }
             None => {
                 self.for_vars.remove(&f.var);
+            }
+        }
+        match prev_type {
+            Some(old) => {
+                self.for_var_types.insert(f.var.clone(), old);
+            }
+            None => {
+                self.for_var_types.remove(&f.var);
             }
         }
 
