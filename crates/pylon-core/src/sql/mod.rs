@@ -1611,6 +1611,25 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
 fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match expr {
+        IrExpr::ObjectPathUnion { branches, .. } => {
+            let first = branches.first().expect("a union has at least one branch");
+            let IrPathResult::Object {
+                alias,
+                type_name,
+                shape,
+            } = &first.result
+            else {
+                unreachable!("an object path union's branches always land on objects")
+            };
+            let (_, pointer_nodes) = build_shape(shape, alias);
+            ShapeNode::Object {
+                name: name.to_string(),
+                type_name: Some(type_name.clone()),
+                position,
+                cardinality: Cardinality::Optional,
+                pointers: prepend_type(pointer_nodes),
+            }
+        }
         IrExpr::ObjectPathSubquery(ps) => {
             let IrPathResult::Object {
                 alias,
@@ -3913,6 +3932,38 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             sql
         }
 
+        IrExpr::ObjectPathUnion { branches, limit } => {
+            let arms: Vec<String> = branches
+                .iter()
+                .map(|ps| {
+                    let IrPathResult::Object {
+                        alias,
+                        type_name,
+                        shape,
+                    } = &ps.result
+                    else {
+                        unreachable!("an object path union's branches always land on objects")
+                    };
+                    let (pointer_exprs, _) = build_shape(shape, alias);
+                    let mut parts = vec![result_type_disc(ps, alias, type_name)];
+                    parts.extend(pointer_exprs);
+                    let mut sql = format!(
+                        "SELECT (\n    {}\n) AS \"r\"\nFROM {}",
+                        parts.join(",\n    "),
+                        emit_path_joins(&ps.root, &ps.joins),
+                    );
+                    append_filter(&mut sql, &ps.filter);
+                    sql
+                })
+                .collect();
+            let mut sql = format!("(SELECT \"r\" FROM (\n{}\n) AS \"_u\"", arms.join("\nUNION ALL\n"));
+            if let Some(limit) = limit {
+                sql.push_str(&format!("\nLIMIT {}", emit_expr(limit)));
+            }
+            sql.push(')');
+            sql
+        }
+
         IrExpr::ObjectPathSubquery(ps) => {
             let IrPathResult::Object {
                 alias,
@@ -5153,6 +5204,23 @@ mod tests {
             &make_schema(),
         );
         assert!(out.sql.contains("UNION ALL"), "one branch per side:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_union_of_correlated_walks() {
+        // `(.<a[is T] union .<b[is T]) { id }` — each operand hangs off the
+        // enclosing row, so none can be hoisted into a CTE the way a
+        // standalone union's operands are; they are read as one set instead.
+        let out = compile_and_emit_with(
+            "SELECT Post { owners := (SELECT (.<posts[is Person] UNION .<posts[is Person]) { name } LIMIT 1) }",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("UNION ALL"), "one arm per operand:\n{}", out.sql);
+        assert!(
+            out.sql.contains("AS \"_u\""),
+            "the arms are read as one set:\n{}",
+            out.sql
+        );
     }
 
     #[test]

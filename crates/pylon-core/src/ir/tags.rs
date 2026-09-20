@@ -430,6 +430,11 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
         IrExpr::Subquery(sel) => collect_select(sel, tags),
         IrExpr::ObjectSubquery(sel) => collect_select(sel, tags),
         IrExpr::ObjectPathSubquery(ps) => collect_path_select(ps, tags),
+        IrExpr::ObjectPathUnion { branches, .. } => {
+            for b in branches {
+                collect_path_select(b, tags);
+            }
+        }
         IrExpr::Array(elems) | IrExpr::Tuple(elems) => {
             for e in elems {
                 collect_expr(e, tags);

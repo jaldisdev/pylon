@@ -1139,6 +1139,26 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The operands of a union written entirely of relative paths, which are
+    /// correlated to the enclosing row and so cannot be hoisted.
+    fn union_of_relative_paths(expr: &Expr) -> Option<Vec<ast::Path>> {
+        fn walk(expr: &Expr, out: &mut Vec<ast::Path>) -> bool {
+            match expr {
+                Expr::Union(a, b) => walk(a, out) && walk(b, out),
+                Expr::Path(p) if p.partial => {
+                    out.push(p.clone());
+                    true
+                }
+                _ => false,
+            }
+        }
+        if !matches!(expr, Expr::Union(_, _)) {
+            return None;
+        }
+        let mut out = vec![];
+        walk(expr, &mut out).then_some(out)
+    }
+
     /// `(select Licence filter …) { id }` — a shape written after a
     /// parenthesised sub-select rather than inside it.
     ///
@@ -7621,6 +7641,41 @@ impl<'a> Compiler<'a> {
             return self.compile_subquery_expr(&inner, extra_fields, ctx, outer_shape);
         }
 
+        // `(select (.<a[is T] union .<b[is T]) { id } limit 1)` — the union's
+        // operands are correlated to the enclosing row, so the whole thing is
+        // read as one set rather than hoisted branch by branch.
+        if let Stmt::Select(inner) = stmt
+            && let Expr::Shape(sh) = &inner.result
+            && let Some(subject) = sh.expr.as_ref()
+            && let Some(operands) = Self::union_of_relative_paths(subject)
+            && let Some((td, alias)) = ctx
+        {
+            let elements = sh.elements.clone();
+            let mut branches = Vec::with_capacity(operands.len());
+            for path in operands {
+                let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+                steps.extend(path.steps.iter().cloned());
+                let rooted = ast::Path { steps, partial: false };
+                let synthetic = ast::SelectStmt {
+                    result: Expr::Path(rooted.clone()),
+                    filter: inner.filter.clone(),
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                };
+                let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
+                Self::correlate_path_select(&mut ps, alias);
+                branches.push(ps);
+            }
+            let limit = inner
+                .limit
+                .as_ref()
+                .map(|l| self.compile_free_expr(l))
+                .transpose()?
+                .map(Box::new);
+            return Ok(IrExpr::ObjectPathUnion { branches, limit });
+        }
         let Stmt::Select(sel) = stmt else {
             return Err(self.subquery_expr_err(stmt));
         };
@@ -8967,6 +9022,38 @@ impl<'a> Compiler<'a> {
                     fields,
                     is_free_object: true,
                 })
+            }
+
+            // `(.<prices[is Listing] union .<sale_prices[is Listing]) { id }`
+            // — each operand hangs off the enclosing row, so none can be
+            // hoisted into a CTE the way a standalone union's operands are.
+            Expr::Shape(sh)
+                if ctx.is_some()
+                    && matches!(sh.expr.as_ref(), Some(Expr::Union(_, _)))
+                    && Self::union_of_relative_paths(sh.expr.as_ref().expect("checked")).is_some() =>
+            {
+                let (td, alias) = ctx.expect("checked by the guard");
+                let operands =
+                    Self::union_of_relative_paths(sh.expr.as_ref().expect("checked")).expect("checked by the guard");
+                let elements = sh.elements.clone();
+                let mut branches = Vec::with_capacity(operands.len());
+                for path in operands {
+                    let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+                    steps.extend(path.steps.iter().cloned());
+                    let rooted = ast::Path { steps, partial: false };
+                    let synthetic = ast::SelectStmt {
+                        result: Expr::Path(rooted.clone()),
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        lock: None,
+                    };
+                    let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
+                    Self::correlate_path_select(&mut ps, alias);
+                    branches.push(ps);
+                }
+                Ok(IrExpr::ObjectPathUnion { branches, limit: None })
             }
 
             Expr::Shape(sh) if matches!(sh.expr.as_ref(), Some(Expr::SubQuery(_))) => {
