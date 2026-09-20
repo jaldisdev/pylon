@@ -4366,6 +4366,22 @@ impl<'a> Compiler<'a> {
     /// The `(qualified type, source table)` of each branch of an object-set
     /// union, or `None` if any branch is something other than a direct
     /// reference to an object set (a WITH binding or a bare type name).
+    /// The type a union of object sets carries: the one branch type every
+    /// other branch is or implements. `A union (insert B)` where B implements
+    /// A is an A-set, which is what EdgeQL reads it as; requiring the branches
+    /// to name the same type refuses a get-or-create over an interface.
+    fn common_union_type(&self, branches: &[(String, String)]) -> Option<String> {
+        branches.iter().map(|(t, _)| t.clone()).find(|candidate| {
+            branches.iter().all(|(t, _)| {
+                t == candidate
+                    || self
+                        .resolve_type(t)
+                        .map(|td| Self::is_or_implements(td, candidate))
+                        .unwrap_or(false)
+            })
+        })
+    }
+
     fn object_union_branches(&self, expr: &Expr) -> Option<Vec<(String, String)>> {
         fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
             match expr {
@@ -4713,12 +4729,17 @@ impl<'a> Compiler<'a> {
             return Ok(None);
         };
 
-        let (first_type, _) = &branches[0];
-        if let Some((other, _)) = branches.iter().find(|(t, _)| t != first_type) {
+        let Some(first_type) = self.common_union_type(&branches) else {
+            let (first_type, _) = &branches[0];
+            let (other, _) = branches
+                .iter()
+                .find(|(t, _)| t != first_type)
+                .expect("no common type means at least two differ");
             return Err(self.type_err(&format!(
                 "operator 'UNION' cannot be applied to operands of type '{first_type}' and '{other}'"
             )));
-        }
+        };
+        let first_type = &first_type;
         if sel.lock.is_some() {
             return Err(self.type_err(
                 "FOR UPDATE/SHARE cannot be used on a UNION — its rows come from more than one \
@@ -5495,11 +5516,8 @@ impl<'a> Compiler<'a> {
                 let branches = self
                     .object_union_branches(expr)
                     .ok_or_else(|| self.type_err("expected a type name as SELECT subject"))?;
-                let (first, _) = &branches[0];
-                if branches.iter().all(|(t, _)| t == first) {
-                    return Ok(first.clone());
-                }
-                Err(self.type_err("expected a type name as SELECT subject"))
+                self.common_union_type(&branches)
+                    .ok_or_else(|| self.type_err("expected a type name as SELECT subject"))
             }
             _ => Err(self.type_err("expected a type name as SELECT subject")),
         }
