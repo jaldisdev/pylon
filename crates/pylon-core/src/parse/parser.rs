@@ -545,7 +545,36 @@ impl Parser {
         let shape = self.parse_shape_body()?;
         self.eat(&Token::RBrace)?;
 
-        Ok(Stmt::Update(UpdateStmt { subject, filter, shape }))
+        Ok(Self::returning_subject_shape(
+            subject,
+            |subject| Stmt::Update(UpdateStmt { subject, filter, shape }),
+        ))
+    }
+
+    /// `update T { * } filter … set { … }` — Gel parses a DML subject as a
+    /// whole `Expr` (`UPDATE Expr OptFilterClause SET Shape`), and a shape on
+    /// it is what the statement returns, not part of the subject. That is the
+    /// same thing as a shape written outside the statement, so it is moved
+    /// there and the DML keeps a bare subject.
+    fn returning_subject_shape(subject: Expr, build: impl FnOnce(Expr) -> Stmt) -> Stmt {
+        let Expr::Shape(sh) = subject else {
+            return build(subject);
+        };
+        let Some(inner) = sh.expr.clone() else {
+            return build(Expr::Shape(sh));
+        };
+        Stmt::Select(SelectStmt {
+            result: Expr::Shape(Box::new(ShapeExpr {
+                expr: Some(Expr::SubQuery(Box::new(build(inner)))),
+                elements: sh.elements,
+                marker_offset: sh.marker_offset,
+            })),
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            lock: None,
+        })
     }
 
     // ── DELETE ──────────────────────────────────────────────────────────────────
@@ -561,7 +590,10 @@ impl Parser {
             None
         };
 
-        Ok(Stmt::Delete(DeleteStmt { subject, filter }))
+        Ok(Self::returning_subject_shape(
+            subject,
+            |subject| Stmt::Delete(DeleteStmt { subject, filter }),
+        ))
     }
 
     // ── WITH ────────────────────────────────────────────────────────────────────
