@@ -3765,6 +3765,15 @@ impl<'a> Compiler<'a> {
                 if Self::resolve_multilink(td, pointer_name).is_some() {
                     return self.compile_multilink_exists_check(pointer_name, td, alias);
                 }
+                // `exists .primary_email` — a computed pointer stands for the
+                // path it names, and whether *that* is empty is the question.
+                // Checked last, so a stored pointer of the same name still
+                // wins; without it the suggester could see the name the
+                // resolver had just reported as unknown.
+                if let Some(cd) = self.resolve_computed(td, pointer_name) {
+                    let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+                    return self.compile_exists_ctx(&expr_ast, ctx);
+                }
                 Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
             }
 
