@@ -3162,6 +3162,28 @@ impl<'a> Compiler<'a> {
                             inner: Box::new(inner),
                             target,
                         });
+                        if is_last(0) {
+                            let module = target_td.module.clone();
+                            let shape = self.compile_shape_anchored(shape_elements, target_td, &target_alias, &module)?;
+                            let result = IrPathResult::Object {
+                                alias: target_alias.clone(),
+                                type_name: format!("{}::{}", target_td.module, target_td.name),
+                                shape,
+                            };
+                            let (filter, order_by, offset, limit) =
+                                self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope)?;
+                            return Ok(IrPathSelect {
+                                root,
+                                joins,
+                                result,
+                                filter: and_conditions(filter, extra_conditions),
+                                order_by,
+                                offset,
+                                limit,
+                                distinct,
+                                poly_implementors: vec![],
+                            });
+                        }
                         current_td = target_td;
                         current_alias = target_alias;
                         idx += 1;
