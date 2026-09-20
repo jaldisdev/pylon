@@ -5732,6 +5732,14 @@ mod tests {
     }
 
     #[test]
+    fn test_a_shaped_sub_select_over_a_type_is_an_object() {
+        // Shapeless it stands for the row's key; with a shape it is the object
+        // the shape reads, which used to be refused outright.
+        let out = compile_and_emit("SELECT Person { latest := (SELECT Post { title } LIMIT 1) }");
+        assert!(out.sql.contains("\"title\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_a_walk_inside_a_path_selects_shape_finds_its_row() {
         // The shape is compiled against the type the walk landed on, so a
         // relative path inside it has that row to resolve against.
