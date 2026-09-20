@@ -590,6 +590,11 @@ pub struct SearchEnqueueInfo {
 
 #[derive(Debug, Clone)]
 pub struct IrInsert {
+    /// `(insert …) if cond else {}` — the condition, folded into the insert
+    /// itself. Guarding a reader would not do: the insert is a data-modifying
+    /// CTE, which Postgres runs whether or not anything reads it, so the row
+    /// would be written even when the condition is false.
+    pub guard: Option<IrExpr>,
     pub target: IrSource,
     /// Each element is (column_name, value_expr).
     pub assignments: Vec<(String, IrExpr)>,

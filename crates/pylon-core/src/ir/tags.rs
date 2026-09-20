@@ -671,6 +671,7 @@ mod tests {
     #[test]
     fn insert_tags_target_and_junction_tables() {
         let ins = IrInsert {
+            guard: None,
             target: src("default::Person", "person", "t0"),
             assignments: vec![],
             unless_conflict: None,
