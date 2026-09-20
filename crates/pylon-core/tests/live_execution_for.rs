@@ -293,3 +293,65 @@ async fn for_loop_appends_only_the_row_it_is_iterating() {
         "only the iterated rows are linked, and only onto the updated row"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn nested_for_loops_insert_once_per_pair() {
+    // One iterator CTE per loop, the inner carrying the outer's key. Emitted as
+    // one flat iteration instead, the inner walk loses which outer row it
+    // belongs to and every pair collapses together.
+    let module = unique_module("live_for_nested");
+    let mut person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
+    person.multilinks = vec![multilink("friends", &format!("{module}::Person"))];
+    let post = ty("Post", &module, vec![id_prop(), text_prop("title")]);
+    let sd = SchemaDescriptor {
+        types: vec![person, post],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for name in ["ana", "bo", "cy", "di"] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := 1 }}"),
+        )
+        .await;
+    }
+    // ana befriends bo and cy; di befriends cy alone.
+    for (who, friends) in [("ana", vec!["bo", "cy"]), ("di", vec!["cy"])] {
+        for friend in friends {
+            exec(
+                &pool,
+                &sd,
+                &format!(
+                    "update {module}::Person filter .name = '{who}' set {{ friends += \
+                     (select detached {module}::Person filter .name = '{friend}') }}"
+                ),
+            )
+            .await;
+        }
+    }
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with pairs := (for p in (select {module}::Person) union ( \
+               for f in p.friends union ( \
+                 insert {module}::Post {{ title := p.name ++ '->' ++ f.name }} \
+               ) \
+             )) select pairs"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ title }} order by .title")).await;
+    let titles: Vec<&str> = rows.iter().map(|row| as_str(field(row, 1))).collect();
+    assert_eq!(
+        titles,
+        vec!["ana->bo", "ana->cy", "di->cy"],
+        "one row per (outer, inner) pair, each carrying both loop variables"
+    );
+}

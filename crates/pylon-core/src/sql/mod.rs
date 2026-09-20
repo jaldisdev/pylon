@@ -5797,6 +5797,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_shape_over_a_coalesce_of_walks() {
+        // Each operand is a walk off the enclosing row, and every one after the
+        // first only stands in when the ones before it are empty.
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person { x := (.published ?? .plain) { title } }", &schema);
+        assert!(out.sql.contains("UNION ALL"), "{}", out.sql);
+        assert!(
+            out.sql.contains("NOT EXISTS"),
+            "the later branch only stands in when the first is empty:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
