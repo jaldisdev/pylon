@@ -3507,6 +3507,44 @@ impl<'a> Compiler<'a> {
                 Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
             }
 
+            // `exists ((select .prices filter …))` — a sub-select over a
+            // relative path is relative to the enclosing object, so it needs
+            // the same rooting and correlation `count((select .prices))`
+            // already gets. Compiled without them it resolves in free context
+            // and reports the pointer as unknown.
+            Expr::SubQuery(stmt)
+                if ctx.is_some()
+                    && matches!(
+                        stmt.as_ref(),
+                        Stmt::Select(inner) if matches!(&inner.result, Expr::Path(p) if p.partial)
+                    ) =>
+            {
+                let Stmt::Select(inner) = stmt.as_ref() else {
+                    unreachable!("checked by the guard")
+                };
+                let Expr::Path(path) = &inner.result else {
+                    unreachable!("checked by the guard")
+                };
+                let (td, alias) = ctx.expect("checked by the guard");
+                let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+                steps.extend(path.steps.iter().cloned());
+                let full_path = ast::Path { steps, partial: false };
+                let rooted = ast::SelectStmt {
+                    result: Expr::Path(full_path.clone()),
+                    filter: inner.filter.clone(),
+                    order_by: inner.order_by.clone(),
+                    offset: inner.offset.clone(),
+                    limit: inner.limit.clone(),
+                    lock: None,
+                };
+                let mut ps = self.compile_path_select(&rooted, &full_path, &[], false)?;
+                Self::correlate_path_select(&mut ps, alias);
+                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: IrExpr::PathSubquery(Box::new(ps)),
+                })))
+            }
+
             // exists (select ...) → EXISTS(SELECT 1 FROM ...)
             Expr::SubQuery(stmt) => self.compile_subquery_exists(stmt),
 
