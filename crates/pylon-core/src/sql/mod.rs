@@ -5722,6 +5722,16 @@ mod tests {
     }
 
     #[test]
+    fn test_an_unreserved_keyword_names_a_free_shape_field() {
+        // `last`, `first` and `order` are unreserved in PyQL, so a shape can
+        // carry them. Read as a set literal, the `:=` has nowhere to go.
+        let out = compile_and_emit("SELECT { last := 2, first := 1, order := 3 }");
+        assert!(out.sql.contains("\"last\""), "{}", out.sql);
+        assert!(out.sql.contains("\"first\""), "{}", out.sql);
+        assert!(out.sql.contains("\"order\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
