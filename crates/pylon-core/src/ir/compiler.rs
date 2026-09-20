@@ -4741,6 +4741,22 @@ impl<'a> Compiler<'a> {
             self.set_mutation_guard(&ie.else_expr, negated);
             return Some(ie.else_expr.clone());
         }
+        // `(insert …) if not exists existing else (update existing set …)` —
+        // the upsert idiom. Both branches mutate, so both carry their own
+        // condition; each statement kind has its own pending slot, so two of
+        // different kinds can be guarded at once. Two of the *same* kind would
+        // have one guard overwrite the other, and fall through to the refusal
+        // below rather than compile to a mutation that runs regardless.
+        if let (Some(if_stmt), Some(else_stmt)) = (mutating_stmt(&ie.if_expr), mutating_stmt(&ie.else_expr))
+            && std::mem::discriminant(if_stmt) != std::mem::discriminant(else_stmt)
+        {
+            self.set_mutation_guard(&ie.if_expr, ie.condition.clone());
+            self.set_mutation_guard(&ie.else_expr, negated);
+            return Some(Expr::Union(
+                Box::new(ie.if_expr.clone()),
+                Box::new(ie.else_expr.clone()),
+            ));
+        }
         // `existing if exists existing else (insert …)` — the insert still has
         // to carry the condition itself, but the other branch is a set of its
         // own, so the result is the upstream engine's full rewrite: both branches under
