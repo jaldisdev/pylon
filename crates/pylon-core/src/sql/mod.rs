@@ -5103,6 +5103,31 @@ mod tests {
     }
 
     #[test]
+    fn test_a_pointer_a_binding_declared_in_its_own_shape() {
+        // `p := (select Person { boss := … })` then `p { boss }` — the
+        // pointer is on no type, so reading it back has to find it through
+        // the binding it was written on, and compile it against that row.
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person { co := .company { name } } LIMIT 1) SELECT p { name, co: { name } }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("'default::Company'::text"),
+            "the declared pointer must be inlined:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_binding_declared_pointer_read_from_a_tuple_element() {
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person { co := .company { name } } LIMIT 1) SELECT (p { co: { name } }, 1)",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("'default::Company'::text"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
