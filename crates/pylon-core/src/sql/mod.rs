@@ -1648,6 +1648,23 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
         // A path select aggregated into an array keeps its rows' own shape, so
         // the elements hydrate as objects rather than as opaque scalars.
         IrExpr::ArrayFromSelect(source) => match source.as_ref() {
+            IrArraySource::ObjectSelect(sel) => {
+                let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
+                    unreachable!("IrArraySource::ObjectSelect is always schema-bound")
+                };
+                let (_, nodes) = build_shape(shape, &source.alias);
+                ShapeNode::Array {
+                    name: name.to_string(),
+                    position,
+                    element: Box::new(ShapeNode::Object {
+                        name: String::new(),
+                        type_name: Some(source.type_name.clone()),
+                        position: 0,
+                        cardinality: Cardinality::Many,
+                        pointers: prepend_type(nodes),
+                    }),
+                }
+            }
             IrArraySource::PathSelect(ps) => match &ps.result {
                 IrPathResult::Object {
                     alias,
@@ -1908,6 +1925,24 @@ fn emit_array_source(src: &IrArraySource) -> String {
             };
             let mut sql = format!("SELECT {} FROM {} AS {}", scalar, source_ref(source), qi(&source.alias));
             append_filter(&mut sql, &s.filter);
+            format!("ARRAY({})", sql)
+        }
+        IrArraySource::ObjectSelect(s) => {
+            let [IrRowSource::Bound { source, shape }] = s.rows.as_slice() else {
+                unreachable!("IrArraySource::ObjectSelect is always schema-bound")
+            };
+            let (exprs, _) = build_shape(shape, &source.alias);
+            let mut parts = vec![source_type_disc(source)];
+            parts.extend(exprs);
+            let mut sql = format!(
+                "SELECT (\n    {}\n) FROM {} AS {}",
+                parts.join(",\n    "),
+                source_ref(source),
+                qi(&source.alias)
+            );
+            append_filter(&mut sql, &s.filter);
+            append_order_by(&mut sql, &s.order_by);
+            append_offset_limit(&mut sql, &s.offset, &s.limit);
             format!("ARRAY({})", sql)
         }
         IrArraySource::StmtColumn { stmt, column } => format!(
@@ -4897,6 +4932,31 @@ mod tests {
             "the value must read the row's own posts:\n{}",
             out.sql
         );
+    }
+
+    #[test]
+    fn test_a_shape_written_after_a_sub_select() {
+        // `(select Post filter …) { title }` means the same as putting the
+        // shape inside the parentheses, so the shape is pushed onto the inner
+        // statement's own result rather than refused.
+        let out = compile_and_emit_with(
+            "SELECT Person { ps := (SELECT Post FILTER .title = $t) { title } }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("'default::Post'::text"),
+            "the pointer must carry the object rows:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_shape_after_a_sub_select_with_a_with_block() {
+        let out = compile_and_emit_with(
+            "SELECT Person { ps := (WITH t := $t SELECT Post FILTER .title = t) { title } }",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("'default::Post'::text"), "{}", out.sql);
     }
 
     #[test]
