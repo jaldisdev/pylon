@@ -385,3 +385,95 @@ async fn an_upsert_runs_exactly_one_of_its_two_branches() {
     assert_eq!(rows.len(), 1, "the second run must not insert again, got {rows:?}");
     assert_eq!(as_i64(field(&rows[0], 2)), 31, "the update branch should have run");
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_assert_on_a_pointer_actually_raises() {
+    // `p := assert_exists(.posts { … })` compiles the pointer from the
+    // argument and checks the rows it aggregates. Exercised live twice over:
+    // an assert dropped on the floor still yields a perfectly good query that
+    // simply never raises, and the first attempt at this emitted SQL Postgres
+    // rejected outright ("PL/pgSQL functions cannot accept type record[]").
+    let module = unique_module("live_assert_ptr");
+    let mut sd = schema_with_post(&module);
+    let person = sd.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+    person.multilinks = vec![multilink("posts", &format!("{module}::Post"))];
+    // `posts` is what this test links through, so `Post.author` is beside the
+    // point and only in the way as a required link.
+    let post = sd.types.iter_mut().find(|t| t.name == "Post").expect("Post");
+    post.links[0].nullable = true;
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+
+    let pyql = format!("select {module}::Person {{ name, p := assert_exists(.posts {{ title }}) }}");
+    let compiled = query::compile(&pyql, &sd).unwrap();
+    let error = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .expect_err("assert_exists over an empty pointer must raise")
+        .to_string();
+    assert!(
+        error.contains("assert_exists"),
+        "the raise should come from the assert, got: {error}"
+    );
+
+    exec(
+        &pool,
+        &sd,
+        &format!("update {module}::Person filter .name = 'Alice' set {{ posts := (insert {module}::Post {{ title := 'Hello' }}) }}"),
+    )
+    .await;
+    let rows = rows_of(&pool, &sd, &pyql).await;
+    assert_eq!(rows.len(), 1, "with a post present the assert should pass, got {rows:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn assert_distinct_on_a_pointer_catches_duplicate_rows() {
+    // The check compares the aggregated rows rendered as text, so this proves
+    // the rendering distinguishes rows the way row equality would: two posts
+    // by the same author make `.posts.author` a set with a repeat in it.
+    let module = unique_module("live_assert_distinct");
+    let mut sd = schema_with_post(&module);
+    let person = sd.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+    person.multilinks = vec![multilink("posts", &format!("{module}::Post"))];
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    for title in ["First", "Second"] {
+        exec(
+            &pool,
+            &sd,
+            &format!(
+                "update {module}::Person filter .name = 'Alice' set {{ posts += (insert {module}::Post \
+                 {{ title := '{title}', author := (select detached {module}::Person filter .name = 'Alice' limit 1) }}) }}"
+            ),
+        )
+        .await;
+    }
+
+    let pyql = format!("select {module}::Person {{ name, a := assert_distinct(.posts.author {{ name }}) }}");
+    let compiled = query::compile(&pyql, &sd).unwrap();
+    let error = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .expect_err("two posts by one author make the author set non-distinct")
+        .to_string();
+    assert!(
+        error.contains("assert_distinct"),
+        "the raise should come from the assert, got: {error}"
+    );
+}

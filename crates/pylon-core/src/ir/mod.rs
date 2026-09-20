@@ -427,6 +427,46 @@ pub enum IrShapePointer {
     MultiLink(IrMultiLinkPointer),
     Computed(IrComputedPointer),
     ScalarSet(IrScalarSetPointer),
+    /// `p := assert_exists(.prices { … })` — the pointer the argument compiles
+    /// to, with a cardinality check over the rows it aggregates. A wrapper
+    /// rather than a field on every variant, because any object pointer can
+    /// carry one.
+    Asserted(Box<IrAssertedPointer>),
+}
+
+#[derive(Debug, Clone)]
+pub struct IrAssertedPointer {
+    /// `assert_exists` or `assert_distinct`. Both are `_pylon` functions over
+    /// `anyarray` returning it unchanged; `assert_single` is excluded because
+    /// it returns the element rather than the array, so it has no place in the
+    /// boolean the check is read as.
+    pub fn_name: String,
+    pub inner: IrShapePointer,
+}
+
+impl IrShapePointer {
+    /// True when the pointer stands for a set of objects — the only thing a
+    /// cardinality assert can wrap. A scalar pointer's assert is an ordinary
+    /// function call and belongs on the expression path.
+    pub fn is_object_pointer(&self) -> bool {
+        match self {
+            IrShapePointer::SingleLink(_) | IrShapePointer::MultiLink(_) => true,
+            IrShapePointer::Asserted(a) => a.inner.is_object_pointer(),
+            IrShapePointer::Computed(c) => match &c.expr {
+                IrExpr::ObjectSubquery(_) | IrExpr::ObjectPathSubquery(_) | IrExpr::ObjectPathUnion { .. } => true,
+                // A computed pointer aggregates its objects to an array; only
+                // the sources carrying a shape are objects, the rest reduce to
+                // a single column.
+                IrExpr::ArrayFromSelect(source) => match source.as_ref() {
+                    IrArraySource::ObjectFunction(_) | IrArraySource::ObjectSelect(_) => true,
+                    IrArraySource::PathSelect(ps) => matches!(ps.result, IrPathResult::Object { .. }),
+                    _ => false,
+                },
+                _ => false,
+            },
+            IrShapePointer::Scalar(_) | IrShapePointer::ScalarSet(_) => false,
+        }
+    }
 }
 
 /// A property column included in the output shape.

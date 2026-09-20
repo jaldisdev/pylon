@@ -3473,36 +3473,37 @@ fn build_shape(pointers: &[IrShapePointer], table_alias: &str) -> (Vec<String>, 
     let mut nodes = Vec::new();
 
     for (i, pointer) in pointers.iter().enumerate() {
-        let pos = i + 1;
-        match pointer {
-            IrShapePointer::Scalar(f) => {
-                let (sql, node) = emit_scalar(f, table_alias, pos);
-                exprs.push(sql);
-                nodes.push(node);
-            }
-            IrShapePointer::SingleLink(f) => {
-                let (sql, node) = emit_single_link(f, table_alias, pos);
-                exprs.push(sql);
-                nodes.push(node);
-            }
-            IrShapePointer::MultiLink(f) => {
-                let (sql, node) = emit_multi_link(f, table_alias, pos);
-                exprs.push(sql);
-                nodes.push(node);
-            }
-            IrShapePointer::Computed(f) => {
-                exprs.push(emit_expr(&f.expr));
-                nodes.push(expr_shape_node(&f.alias, pos, &f.expr));
-            }
-            IrShapePointer::ScalarSet(f) => {
-                let (sql, node) = emit_scalar_set(f, pos);
-                exprs.push(sql);
-                nodes.push(node);
-            }
-        }
+        let (sql, node) = emit_shape_pointer(pointer, table_alias, i + 1);
+        exprs.push(sql);
+        nodes.push(node);
     }
 
     (exprs, nodes)
+}
+
+fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -> (String, ShapeNode) {
+    match pointer {
+        IrShapePointer::Scalar(f) => emit_scalar(f, table_alias, pos),
+        IrShapePointer::SingleLink(f) => emit_single_link(f, table_alias, pos),
+        IrShapePointer::MultiLink(f) => emit_multi_link(f, table_alias, pos),
+        IrShapePointer::Computed(f) => (emit_expr(&f.expr), expr_shape_node(&f.alias, pos, &f.expr)),
+        IrShapePointer::ScalarSet(f) => emit_scalar_set(f, pos),
+        IrShapePointer::Asserted(a) => {
+            let (sql, node) = emit_shape_pointer(&a.inner, table_alias, pos);
+            // The inner pointer aggregates rows to `record[]`, which a PL/pgSQL
+            // function cannot take as a parameter at all -- hence the cast to
+            // `text[]`, whose rendering compares element-for-element the same
+            // way. Bound in a sub-select so the pointer's own subquery is
+            // evaluated once rather than in both the check and the result, and
+            // read through `cardinality` because the assert hands back the
+            // array it was given.
+            let checked = format!(
+                "(SELECT \"_a\".\"v\" FROM (SELECT {sql} AS \"v\") AS \"_a\"\n                     WHERE cardinality(\"_pylon\".{}(\"_a\".\"v\"::text[])) >= 0)",
+                qi(&a.fn_name),
+            );
+            (checked, node)
+        }
+    }
 }
 
 /// Convert a PostgreSQL schema-qualified type name (`"module"."TypeName"`) to
@@ -6784,6 +6785,37 @@ mod tests {
         assert!(
             !out.sql.contains("\"t1\".\"name\" = \"t1\".\"name\""),
             "self-comparison means the correlation was lost:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_an_assert_on_a_pointer_checks_its_rows() {
+        // The pointer's own subquery is bound once and read back through the
+        // check, rather than appearing in both — and the cast is what makes
+        // the call legal at all, since PL/pgSQL cannot take a `record[]`.
+        let out = compile_and_emit("SELECT Person { name, p := assert_exists(.posts { title }) }");
+        assert!(
+            out.sql.contains(r#"cardinality("_pylon"."assert_exists"("_a"."v"::text[]))"#),
+            "the assert should read the aggregated rows:\n{}",
+            out.sql
+        );
+        assert_eq!(
+            out.sql.matches("array_agg(ROW(").count(),
+            1,
+            "the pointer's subquery should be evaluated once, not once per use:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_an_assert_on_a_scalar_stays_an_ordinary_call() {
+        // Only an object pointer takes the wrapper; `assert_exists(.name)` is
+        // a value expression and must keep compiling as the function call it is.
+        let out = compile_and_emit("SELECT Person { n := assert_exists(.name) }");
+        assert!(
+            !out.sql.contains(r#""_a"."v""#),
+            "a scalar assert should not be wrapped as a pointer check:\n{}",
             out.sql
         );
     }

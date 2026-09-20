@@ -157,6 +157,9 @@ fn collect_shape(shape: &[IrShapePointer], parent_path: &str, out: &mut Vec<Shap
             // no separate SQL alias to correlate — they're covered by their
             // parent's own row alias.
             IrShapePointer::Scalar(_) | IrShapePointer::Computed(_) | IrShapePointer::ScalarSet(_) => {}
+            // The assert only wraps the inner pointer; the subquery to
+            // correlate is that pointer's own.
+            IrShapePointer::Asserted(a) => collect_shape(std::slice::from_ref(&a.inner), parent_path, out),
         }
     }
 }

@@ -331,6 +331,7 @@ fn collect_shape_pointer(p: &IrShapePointer, tags: &mut Vec<String>) {
             }
             collect_expr(&ss.bool_expr, tags);
         }
+        IrShapePointer::Asserted(a) => collect_shape_pointer(&a.inner, tags),
     }
 }
 
