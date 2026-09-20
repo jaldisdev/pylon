@@ -5104,11 +5104,14 @@ impl<'a> Compiler<'a> {
                 expr: substitute_col_refs(rw.expr, &assignment_map),
             })
             .collect();
-        let unless_conflict = ins
-            .unless_conflict
-            .as_ref()
-            .map(|uc| self.compile_conflict(uc, td))
-            .transpose()?;
+        let unless_conflict = match ins.unless_conflict.as_ref() {
+            Some(uc) => {
+                let (conflict, else_appends) = self.compile_conflict(uc, td)?;
+                multi_link_appends.extend(else_appends);
+                Some(conflict)
+            }
+            None => None,
+        };
         let returning = Self::pk_returning(td);
         let type_name = format!("{}::{}", td.module, td.name);
         let enqueue_vector = td
@@ -10019,12 +10022,20 @@ impl<'a> Compiler<'a> {
     }
 
     /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.
-    fn compile_conflict(&mut self, uc: &ast::UnlessConflict, td: &TypeDescriptor) -> Result<IrConflict, PyQLError> {
+    fn compile_conflict(
+        &mut self,
+        uc: &ast::UnlessConflict,
+        td: &TypeDescriptor,
+    ) -> Result<(IrConflict, Vec<IrMultiLinkMutation>), PyQLError> {
         // ON clause: compile with empty alias → bare column name (`"col"` not `"t0"."col"`)
         // so the emitter produces `ON CONFLICT ("name")` not `ON CONFLICT ("t0"."name")`.
         let on = uc.on.as_ref().map(|e| self.compile_expr(e, td, "")).transpose()?;
-        let do_update = uc.else_.as_ref().map(|e| self.compile_conflict_else(e)).transpose()?;
-        Ok(IrConflict { on, do_update })
+        let mut appends = vec![];
+        let do_update = match uc.else_.as_ref() {
+            Some(e) => Some(self.compile_conflict_else(e, &mut appends)?),
+            None => None,
+        };
+        Ok((IrConflict { on, do_update }, appends))
     }
 
     /// Compile the ELSE clause of UNLESS CONFLICT, which must be `(UPDATE Type SET { … })`.
@@ -10041,7 +10052,11 @@ impl<'a> Compiler<'a> {
     /// own docs describe exactly this qualification: "the existing row
     /// using the table's name (or an alias)," no explicit `AS` needed on
     /// the INSERT target for that self-reference to work.
-    fn compile_conflict_else(&mut self, expr: &Expr) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+    fn compile_conflict_else(
+        &mut self,
+        expr: &Expr,
+        appends: &mut Vec<IrMultiLinkMutation>,
+    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
         let Expr::SubQuery(stmt) = expr else {
             return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)"));
         };
@@ -10053,7 +10068,38 @@ impl<'a> Compiler<'a> {
         // Filter on the ELSE UPDATE is ignored — PostgreSQL infers the conflicting
         // row from the ON CONFLICT target automatically.
         let table = upd_td.table.clone();
-        self.compile_assignments_for_update(&upd.shape, upd_td, &table)
+        // A multi-link cannot be written by `DO UPDATE SET` — junction rows
+        // are separate DML. Appending them to the enclosing insert instead
+        // applies them to whichever row comes back, inserted or conflicting,
+        // and the junction insert is `ON CONFLICT DO NOTHING`, so the
+        // inserted branch (which already wrote the same rows from its own
+        // shape) is unaffected.
+        let mut scalar_shape = vec![];
+        for el in &upd.shape {
+            let pointer_name = path_leaf(&el.path)?;
+            let Some(ml) = Self::resolve_multilink(upd_td, pointer_name) else {
+                scalar_shape.push(el.clone());
+                continue;
+            };
+            if el.op == ShapeOp::Remove {
+                return Err(self.type_err(&format!(
+                    "cannot use `-=` for multi-link '{pointer_name}' inside an UNLESS CONFLICT \
+                     ELSE clause; the rows to remove are not known until the conflict resolves"
+                )));
+            }
+            let Some(value) = &el.compexpr else { continue };
+            let (jt, module, src_col, tgt_col, through_td) = self.multilink_junction_info(upd_td, ml)?;
+            let values = self.compile_multilink_values(value, upd_td, &table, through_td)?;
+            appends.push(IrMultiLinkMutation {
+                junction_table: jt,
+                module,
+                source_col: src_col,
+                target_col: tgt_col,
+                values,
+                single: false,
+            });
+        }
+        self.compile_assignments_for_update(&scalar_shape, upd_td, &table)
     }
 
     /// Compile a nested INSERT/UPDATE/DELETE into its own CTE and return that
