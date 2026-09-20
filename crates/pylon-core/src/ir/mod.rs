@@ -778,6 +778,16 @@ pub enum IrExpr {
         fn_name: String,
         inner: Box<IrSelect>,
     },
+    /// An aggregate applied to a whole `with` binding: `count(memberships)`.
+    /// Emits: `(SELECT fn_name(column) FROM "cte")`, `column` being `*` for an
+    /// object binding and the scalar column for a scalar one. Read through
+    /// `CteRef` instead, a binding holding more than one row aborts the query
+    /// ("more than one row returned by a subquery used as an expression").
+    AggOverCte {
+        fn_name: String,
+        cte: String,
+        column: Option<String>,
+    },
     /// A reference to a named CTE used in expression context.
     /// `scalar = true`  → emits `(SELECT "result" FROM "cte_name")`
     /// `scalar = false` → emits `(SELECT "id"     FROM "cte_name")`

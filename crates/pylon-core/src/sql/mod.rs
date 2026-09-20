@@ -3927,6 +3927,12 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 .join(" UNION ALL ");
             format!("(SELECT {}(v) FROM ({}) AS _set(v))", fn_name, union_all)
         }
+        IrExpr::AggOverCte { fn_name, cte, column } => format!(
+            "(SELECT {}({}) FROM {})",
+            fn_name,
+            column.as_deref().map(qi).unwrap_or_else(|| "*".to_string()),
+            qi(cte),
+        ),
         IrExpr::AggOverQuery { fn_name, inner } => {
             let inner_sql = emit_select_stmt(inner, &[]).sql;
             format!("(SELECT {}(*) FROM ({}) _agg)", fn_name, inner_sql)
@@ -5401,6 +5407,18 @@ mod tests {
             parse::parse("WITH t := (SELECT Post) FOR q IN t UNION (UPDATE Person FILTER .id = $i SET { posts += q })")
                 .unwrap();
         assert!(ir::compile(&ast, &make_schema()).is_err());
+    }
+
+    #[test]
+    fn test_count_of_a_binding_counts_its_rows() {
+        // Read as an ordinary expression a binding becomes a scalar subquery,
+        // which aborts on the second row.
+        let out = compile_and_emit("WITH people := (SELECT Person) SELECT count(people)");
+        assert!(
+            out.sql.contains("(SELECT count(*) FROM \"people\")"),
+            "{}",
+            out.sql
+        );
     }
 
     #[test]
