@@ -95,6 +95,20 @@ impl Parser {
         })
     }
 
+    /// The keywords Gel classifies as *unreserved* — legal wherever an
+    /// identifier is, so a shape can carry a field called `last` or `order`.
+    /// The reserved ones (`select`, `filter`, `limit`, …) are not identifiers
+    /// there, and accepting them would take more than Gel does.
+    fn unreserved_keyword_as_ident(&self) -> Option<String> {
+        let spelling = self.keyword_ident_spelling()?;
+        matches!(
+            spelling.as_str(),
+            "asc" | "conflict" | "desc" | "first" | "last" | "order" | "required" | "then" | "unless" | "using"
+        )
+        .then(|| self.keyword_as_ident())
+        .flatten()
+    }
+
     fn keyword_ident_spelling(&self) -> Option<String> {
         match self.current() {
             Token::Select => Some("select".into()),
@@ -1337,7 +1351,10 @@ impl Parser {
                     Token::Dot => {
                         matches!(self.peek_ahead(1), Token::Ident(_)) && matches!(self.peek_ahead(2), Token::ColonEq)
                     }
-                    _ => false,
+                    // `{ last := … }` — an unreserved keyword names a field as
+                    // well as a bare identifier does. Read as a set literal
+                    // instead, the `:=` has nowhere to go.
+                    _ => self.unreserved_keyword_as_ident().is_some() && matches!(self.peek_ahead(1), Token::ColonEq),
                 };
                 if is_free_object {
                     let elements = self.parse_shape_body()?;

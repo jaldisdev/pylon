@@ -5632,6 +5632,49 @@ mod tests {
         assert!(!out.sql.contains("max(ARRAY("), "{}", out.sql);
     }
 
+    /// `Company.staff` — a computed standing for a narrowed backlink, the
+    /// shape jaldis reaches for wherever one type owns rows of another.
+    fn make_schema_with_a_computed_backlink() -> SchemaDescriptor {
+        use crate::schema::ComputedDescriptor;
+        let mut schema = make_schema();
+        let company = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("Company is in the test schema");
+        company.computed = vec![ComputedDescriptor {
+            name: "staff".into(),
+            expression: ".<company[is default::Person]".into(),
+            return_type: None,
+        }];
+        schema
+    }
+
+    #[test]
+    fn test_a_computed_backlink_reads_the_objects_it_lands_on() {
+        let schema = make_schema_with_a_computed_backlink();
+        let out = compile_and_emit_with("SELECT Company { staff: { name } }", &schema);
+        assert!(
+            out.sql.contains("\"public\".\"Person\""),
+            "the walk reaches Person:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_computed_backlinks_modifiers_belong_to_what_it_lands_on() {
+        // Bound to the declaring type instead, `.name` is a field Company has
+        // not got and the query is rejected outright.
+        let schema = make_schema_with_a_computed_backlink();
+        let out = compile_and_emit_with("SELECT Company.staff { name } FILTER .name = 'ada'", &schema);
+        assert!(out.sql.contains("'ada'"), "{}", out.sql);
+        assert!(
+            out.sql.contains("\"public\".\"Person\""),
+            "filtered on the Person the walk lands on:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
