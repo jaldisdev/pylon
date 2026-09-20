@@ -8684,6 +8684,36 @@ impl<'a> Compiler<'a> {
                             let ps = self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
                             return Ok(IrExpr::PathSubquery(Box::new(ps)));
                         }
+                        // `sum(.applied_promotions.amount)` — the aggregate
+                        // takes the set the walk lands on, so the walk becomes
+                        // the row source of a correlated subquery the aggregate
+                        // sits inside. Compiled as an expression the walk stands
+                        // for the array of its elements, leaving the aggregate
+                        // with an array argument and no overload to match.
+                        if let Expr::Path(p) = arg
+                            && p.partial
+                            && p.steps.len() > 1
+                            && self.path_crosses_multi(td, &p.steps)
+                        {
+                            let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+                            steps.extend(p.steps.iter().cloned());
+                            let rooted = ast::Path { steps, partial: false };
+                            let mut call = f.clone();
+                            call.args[0] = Expr::Path(rooted);
+                            let synthetic = ast::SelectStmt {
+                                result: Expr::FunctionCall(call),
+                                filter: None,
+                                order_by: vec![],
+                                offset: None,
+                                limit: None,
+                                lock: None,
+                            };
+                            let root = format!("{}::{}", td.module, td.name);
+                            let mut ps =
+                                self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
+                            Self::correlate_path_select(&mut ps, alias);
+                            return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                        }
                         if let Expr::Path(p) = arg
                             && p.partial
                             && p.steps.len() == 1
