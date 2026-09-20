@@ -3581,7 +3581,18 @@ impl<'a> Compiler<'a> {
                 steps: p.steps.clone(),
             };
             let mut ps = self.compile_path_select(sel, &arg_path, &[], distinct)?;
-            if let IrPathResult::Scalar(column, _) = ps.result.clone() {
+            // A walk onto objects (`count(.<brand[is Licence])`) is counted by
+            // its rows, which is its key. Falling through instead put the
+            // aggregate back through the expression route that sent it here.
+            let aggregated = match ps.result.clone() {
+                IrPathResult::Scalar(column, _) => Some(column),
+                IrPathResult::Object { alias, .. } => Some(IrExpr::ColumnRef {
+                    alias,
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                }),
+            };
+            if let Some(column) = aggregated {
                 let call = self.resolve_fn_call(f.module.as_deref(), &f.name, vec![column])?;
                 ps.result = IrPathResult::Scalar(call, None);
                 return Ok(ps);
