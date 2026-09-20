@@ -916,7 +916,15 @@ impl Parser {
         let mut left = self.parse_add()?;
         while matches!(self.current(), Token::QQ) {
             self.advance();
-            let right = self.parse_add()?;
+            // `x ?? not exists .y` — `??` binds tighter than `not`, but a
+            // *prefix* operator opening the right operand is unambiguous, and
+            // PyQL takes it. Parsed at the arithmetic level alone, `not` has
+            // nowhere to go.
+            let right = if matches!(self.current(), Token::Not) {
+                self.parse_not()?
+            } else {
+                self.parse_add()?
+            };
             left = Expr::BinOp(Box::new(BinOp {
                 left,
                 op: BinOpKind::Coalesce,
