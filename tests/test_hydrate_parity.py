@@ -275,6 +275,17 @@ class TestFreeObjectsAndScalars:
         assert isinstance(native[0], Object)
         assert (native[0].a, native[0].b) == (1, 2)
 
+    def test_a_tuple_element_holding_an_object(self):
+        """The object branch reads position 0 as "this is the whole row",
+        which is true of the query's root but not of a tuple's first element:
+        the object used to decode against the outer tuple and pick up its
+        neighbours' values."""
+
+        compiled = _compile('with a := (select m::Author limit 1) select (a { name }, 1)')
+        native = assert_parity([(('m::Author', 'Alice'), 1)], compiled)
+        author, number = native[0]
+        assert (author.name, number) == ('Alice', 1)
+
     def test_a_bare_scalar(self):
         # A bare `select <expr>` compiles to a Scalar node at position 0, so
         # the row is still a one-element tuple, not the value itself.

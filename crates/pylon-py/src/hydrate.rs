@@ -259,9 +259,24 @@ fn decode<'py>(
             reg.pylon_set.bind(py).call1((PyList::new(py, items)?,))
         }
         ShapeNode::Tuple { elements, .. } => {
+            // An object element is indexed out first and read as its own
+            // root: `decode_object` takes position 0 to mean "this is the
+            // whole row", true of the query's root but not of a tuple's
+            // first element.
             let items = elements
                 .iter()
-                .map(|e| decode(py, value, e, reg))
+                .map(|e| match e {
+                    ShapeNode::Object {
+                        position,
+                        type_name,
+                        pointers,
+                        ..
+                    } => {
+                        let element = item(value, *position).unwrap_or(&NULL);
+                        decode_object(py, element, 0, type_name.as_deref(), pointers, reg)
+                    }
+                    _ => decode(py, value, e, reg),
+                })
                 .collect::<PyResult<Vec<_>>>()?;
             Ok(PyTuple::new(py, items)?.into_any())
         }

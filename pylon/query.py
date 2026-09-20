@@ -279,7 +279,16 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         return PylonSet(_decode(item, {**element, 'position': 0}, registry) for item in arr)
 
     if kind == 'tuple':
-        return tuple(_decode(value, e, registry) for e in node['elements'])
+        # An object element is indexed out first and read as its own root,
+        # the way `array` does above: the object branch takes position 0 to
+        # mean "this is the whole row", which is true of the query's root
+        # but not of a tuple's first element.
+        return tuple(
+            _decode(value[e['position']], {**e, 'position': 0}, registry)
+            if e['kind'] == 'object'
+            else _decode(value, e, registry)
+            for e in node['elements']
+        )
 
     if kind == 'group':
         key_nodes = node['key_nodes']
