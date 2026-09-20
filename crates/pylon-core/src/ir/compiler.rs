@@ -690,10 +690,6 @@ struct Compiler<'a> {
     /// The condition a `(insert …) if cond else {}` puts on the insert about
     /// to be compiled — see `IrInsert::guard`.
     pending_insert_guard: Option<Expr>,
-    /// The condition a guarded `update` has to carry itself, for the same
-    /// reason an insert does: a data-modifying CTE runs whether or not
-    /// anything reads it, so filtering what is read back changes nothing.
-    pending_update_guard: Option<Expr>,
     /// Pointers a `with` binding declared in its own shape (`offering := (
     /// select Offering { publisher := … })`). They exist nowhere on the type,
     /// so a later `offering { publisher }` has to find them here.
@@ -836,7 +832,6 @@ impl<'a> Compiler<'a> {
             for_var_types: HashMap::new(),
             for_var_ctes: HashMap::new(),
             pending_insert_guard: None,
-            pending_update_guard: None,
             cte_declared_pointers: HashMap::new(),
             active_declared_pointers: vec![],
             fn_params: HashMap::new(),
@@ -1280,13 +1275,6 @@ impl<'a> Compiler<'a> {
             }
             _ => return None,
         };
-        // `(select detached T filter … limit 1).field` — at the top level the
-        // marker says nothing a field access changes, and the path underneath
-        // is the subject to splice the chain onto.
-        let mut sel = sel;
-        if let Expr::Detached(inner) = &sel.result {
-            sel.result = inner.as_ref().clone();
-        }
         match &sel.result {
             Expr::Path(p) if !p.partial => Some(sel),
             _ => None,
@@ -3167,28 +3155,6 @@ impl<'a> Compiler<'a> {
                             inner: Box::new(inner),
                             target,
                         });
-                        if is_last(0) {
-                            let module = target_td.module.clone();
-                            let shape = self.compile_shape_anchored(shape_elements, target_td, &target_alias, &module)?;
-                            let result = IrPathResult::Object {
-                                alias: target_alias.clone(),
-                                type_name: format!("{}::{}", target_td.module, target_td.name),
-                                shape,
-                            };
-                            let (filter, order_by, offset, limit) =
-                                self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope)?;
-                            return Ok(IrPathSelect {
-                                root,
-                                joins,
-                                result,
-                                filter: and_conditions(filter, extra_conditions),
-                                order_by,
-                                offset,
-                                limit,
-                                distinct,
-                                poly_implementors: vec![],
-                            });
-                        }
                         current_td = target_td;
                         current_alias = target_alias;
                         idx += 1;
@@ -4371,22 +4337,6 @@ impl<'a> Compiler<'a> {
     /// The `(qualified type, source table)` of each branch of an object-set
     /// union, or `None` if any branch is something other than a direct
     /// reference to an object set (a WITH binding or a bare type name).
-    /// The type a union of object sets carries: the one branch type every
-    /// other branch is or implements. `A union (insert B)` where B implements
-    /// A is an A-set, which is what PyQL reads it as; requiring the branches
-    /// to name the same type refuses a get-or-create over an interface.
-    fn common_union_type(&self, branches: &[(String, String)]) -> Option<String> {
-        branches.iter().map(|(t, _)| t.clone()).find(|candidate| {
-            branches.iter().all(|(t, _)| {
-                t == candidate
-                    || self
-                        .resolve_type(t)
-                        .map(|td| Self::is_or_implements(td, candidate))
-                        .unwrap_or(false)
-            })
-        })
-    }
-
     fn object_union_branches(&self, expr: &Expr) -> Option<Vec<(String, String)>> {
         fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
             match expr {
@@ -4514,27 +4464,6 @@ impl<'a> Compiler<'a> {
     /// B's when it does not, which is `(A filter cond) union (B filter not
     /// cond)`. Rewritten here rather than given its own IR, so it reaches the
     /// union machinery that already knows how to read one relation per branch.
-    /// Hand a guarded mutation its condition: an insert folds it into its own
-    /// `WHERE`, an update ANDs it onto the rows it narrows to.
-    fn set_mutation_guard(&mut self, branch: &Expr, condition: Expr) {
-        let is_update = matches!(
-            match branch {
-                Expr::SubQuery(stmt) => Some(stmt.as_ref()),
-                Expr::Shape(sh) => match sh.expr.as_ref() {
-                    Some(Expr::SubQuery(stmt)) => Some(stmt.as_ref()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            Some(Stmt::Update(_))
-        );
-        if is_update {
-            self.pending_update_guard = Some(condition);
-        } else {
-            self.pending_insert_guard = Some(condition);
-        }
-    }
-
     fn object_if_else_as_union(&mut self, expr: &Expr) -> Option<Expr> {
         let Expr::IfElse(ie) = expr else {
             return None;
@@ -4611,7 +4540,7 @@ impl<'a> Compiler<'a> {
         // refused rather than compiling to something unconditional.
         for branch in [&ie.if_expr, &ie.else_expr] {
             if let Some(stmt) = mutating_stmt(branch)
-                && !matches!(stmt, Stmt::Insert(_) | Stmt::Update(_))
+                && !matches!(stmt, Stmt::Insert(_))
             {
                 return None;
             }
@@ -4635,15 +4564,14 @@ impl<'a> Compiler<'a> {
             mutating_stmt(branch).is_some() && matches!(other, Expr::Set(items) if items.is_empty())
         };
         if guarded_insert(&ie.if_expr, &ie.else_expr) {
-            self.set_mutation_guard(&ie.if_expr, ie.condition.clone());
+            self.pending_insert_guard = Some(ie.condition.clone());
             return Some(ie.if_expr.clone());
         }
         if guarded_insert(&ie.else_expr, &ie.if_expr) {
-            let negated = Expr::UnaryOp(Box::new(ast::UnaryOp {
+            self.pending_insert_guard = Some(Expr::UnaryOp(Box::new(ast::UnaryOp {
                 op: ast::UnaryOpKind::Not,
                 operand: ie.condition.clone(),
-            }));
-            self.set_mutation_guard(&ie.else_expr, negated);
+            })));
             return Some(ie.else_expr.clone());
         }
         // `existing if exists existing else (insert …)` — the insert still has
@@ -4652,14 +4580,14 @@ impl<'a> Compiler<'a> {
         // opposite guards, unioned.
         let reads_objects = |branch: &Expr, yields: bool| mutating_stmt(branch).is_none() && yields;
         if mutating_stmt(&ie.if_expr).is_some() && reads_objects(&ie.else_expr, else_yields_objects) {
-            self.set_mutation_guard(&ie.if_expr, ie.condition.clone());
+            self.pending_insert_guard = Some(ie.condition.clone());
             return Some(Expr::Union(
                 Box::new(ie.if_expr.clone()),
                 Box::new(guard(&ie.else_expr, negated)),
             ));
         }
         if mutating_stmt(&ie.else_expr).is_some() && reads_objects(&ie.if_expr, if_yields_objects) {
-            self.set_mutation_guard(&ie.else_expr, negated);
+            self.pending_insert_guard = Some(negated);
             return Some(Expr::Union(
                 Box::new(guard(&ie.if_expr, ie.condition.clone())),
                 Box::new(ie.else_expr.clone()),
@@ -4687,51 +4615,12 @@ impl<'a> Compiler<'a> {
         ))
     }
 
-    /// `granted ?? existing` over object sets is the choice `A if exists A
-    /// else B` spells, so it reaches the same union machinery. A scalar
-    /// coalesce rewritten this way is simply not an object union, and the
-    /// caller falls back to compiling what was written.
-    fn object_coalesce_as_if_else(expr: &Expr) -> Option<Expr> {
-        fn as_if_else(b: &ast::BinOp) -> Option<Expr> {
-            (b.op == ast::BinOpKind::Coalesce).then(|| {
-                Expr::IfElse(Box::new(ast::IfElse {
-                    condition: Expr::UnaryOp(Box::new(ast::UnaryOp {
-                        op: ast::UnaryOpKind::Exists,
-                        operand: b.left.clone(),
-                    })),
-                    if_expr: b.left.clone(),
-                    else_expr: b.right.clone(),
-                }))
-            })
-        }
-        match expr {
-            Expr::BinOp(b) => as_if_else(b),
-            Expr::Shape(sh) => match sh.expr.as_ref() {
-                Some(Expr::BinOp(b)) => Some(Expr::Shape(Box::new(ast::ShapeExpr {
-                    expr: Some(as_if_else(b)?),
-                    elements: sh.elements.clone(),
-                    marker_offset: sh.marker_offset,
-                }))),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     fn try_compile_object_union_select(
         &mut self,
         sel: &ast::SelectStmt,
         result_expr: &Expr,
         distinct: bool,
     ) -> Result<Option<IrSelect>, PyQLError> {
-        let coalesced;
-        let result_expr = match Self::object_coalesce_as_if_else(result_expr) {
-            Some(rewritten) => {
-                coalesced = rewritten;
-                &coalesced
-            }
-            None => result_expr,
-        };
         let as_union;
         let (union_expr, shape_elements): (&Expr, &[ShapeElement]) = match result_expr {
             Expr::Union(_, _) => (result_expr, &[]),
@@ -4795,17 +4684,12 @@ impl<'a> Compiler<'a> {
             return Ok(None);
         };
 
-        let Some(first_type) = self.common_union_type(&branches) else {
-            let (first_type, _) = &branches[0];
-            let (other, _) = branches
-                .iter()
-                .find(|(t, _)| t != first_type)
-                .expect("no common type means at least two differ");
+        let (first_type, _) = &branches[0];
+        if let Some((other, _)) = branches.iter().find(|(t, _)| t != first_type) {
             return Err(self.type_err(&format!(
                 "operator 'UNION' cannot be applied to operands of type '{first_type}' and '{other}'"
             )));
-        };
-        let first_type = &first_type;
+        }
         if sel.lock.is_some() {
             return Err(self.type_err(
                 "FOR UPDATE/SHARE cannot be used on a UNION — its rows come from more than one \
@@ -5582,8 +5466,11 @@ impl<'a> Compiler<'a> {
                 let branches = self
                     .object_union_branches(expr)
                     .ok_or_else(|| self.type_err("expected a type name as SELECT subject"))?;
-                self.common_union_type(&branches)
-                    .ok_or_else(|| self.type_err("expected a type name as SELECT subject"))
+                let (first, _) = &branches[0];
+                if branches.iter().all(|(t, _)| t == first) {
+                    return Ok(first.clone());
+                }
+                Err(self.type_err("expected a type name as SELECT subject"))
             }
             _ => Err(self.type_err("expected a type name as SELECT subject")),
         }
@@ -5887,9 +5774,6 @@ impl<'a> Compiler<'a> {
     // ── UPDATE ────────────────────────────────────────────────────────────────────
 
     fn compile_update(&mut self, upd: &ast::UpdateStmt) -> Result<IrUpdate, PyQLError> {
-        // Taken before anything nested is compiled, so a nested statement
-        // cannot pick up a guard meant for this one.
-        let pending_guard = self.pending_update_guard.take();
         // See `compile_insert`'s identical save/restore of `pending_nested_ctes`.
         let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
         // `update account.preferences[is IndividualPreferences] set …` — the
@@ -5911,7 +5795,6 @@ impl<'a> Compiler<'a> {
                 shape: upd.shape.clone(),
             };
             self.pending_nested_ctes = outer_pending_nested_ctes;
-            self.pending_update_guard = pending_guard;
             let mut ir = self.compile_update(&narrowed)?;
             // Built after the update, so the comparison names that update's own
             // alias: with a nested statement's CTE in the FROM, a bare `id`
@@ -5963,16 +5846,6 @@ impl<'a> Compiler<'a> {
                 Some(and_conditions(declared_filter, vec![membership]).expect("membership is present"))
             }
             None => declared_filter,
-        };
-        // `(update cart set { … }) if not exists(existing) else {}` — the
-        // condition narrows the rows this update touches. Left to filter what
-        // is read back instead, the update would still run.
-        let filter = match pending_guard {
-            Some(condition) => {
-                let guard = self.compile_expr(&condition, td, &alias)?;
-                and_conditions(filter, vec![guard])
-            }
-            None => filter,
         };
 
         // Classify shape elements by kind.
@@ -6339,16 +6212,6 @@ impl<'a> Compiler<'a> {
             });
         }
 
-        // `emails := (insert …) if exists($email) else {}` — the same choice
-        // between two sets the select path reads, and the same rewrite: the
-        // insert carries the condition itself, since Postgres runs a
-        // data-modifying CTE whether or not anything reads it.
-        if matches!(expr, Expr::IfElse(_))
-            && let Some(rewritten) = self.object_if_else_as_union(expr)
-        {
-            return self.compile_multilink_values(&rewritten, td, alias, through_td);
-        }
-
         // `expr { @prop := value, ... }` — link-property assignments layered
         // onto an inner target-selecting expression.
         if let Expr::Shape(shape) = expr {
@@ -6411,19 +6274,6 @@ impl<'a> Compiler<'a> {
                 });
             }
             return Ok(combined.expect("elements is non-empty"));
-        }
-
-        // `social_accounts := (for p in … union (insert …))` — the loop's rows
-        // are the link's targets, read back from the CTE it is hoisted into,
-        // the same way a bare nested insert is.
-        if let Expr::SubQuery(inner) = expr
-            && let Stmt::For(_) = inner.as_ref()
-        {
-            let (cte_name, _) = self.hoist_dml_as_cte(inner.as_ref())?;
-            return Ok(IrMultiLinkValues {
-                source: IrMultiLinkValueSource::CteRef(cte_name),
-                link_props: vec![],
-            });
         }
 
         // `emails := (insert Email { … })` — a nested insert whose rows become
@@ -7742,10 +7592,6 @@ impl<'a> Compiler<'a> {
     fn split_path_result(result: &Expr) -> Option<(&ast::Path, &[ShapeElement])> {
         match result {
             Expr::Path(p) => Some((p, &[])),
-            // `(select detached T filter … limit 1).field` — the marker says
-            // the set is not correlated with the enclosing one, which is
-            // already true of a subject named by its own type.
-            Expr::Detached(inner) => Self::split_path_result(inner),
             Expr::Shape(sh) => match &sh.expr {
                 Some(Expr::Path(p)) => Some((p, sh.elements.as_slice())),
                 _ => None,
@@ -8696,28 +8542,6 @@ impl<'a> Compiler<'a> {
                         tuple_shape: None,
                     })));
                 }
-                // `<marketplace::BrandAddon>line.listing.id` — casting a key to
-                // an object type names the row that key identifies, and in
-                // expression position (a link's value, a comparison) the row
-                // *is* its key. There is no scalar pg type to cast to, so
-                // `resolve_cast_pg_type` below reports the object type as
-                // unknown.
-                const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector", "crypto", "postgis"];
-                if let Some((module, name)) = tc.ty.as_named()
-                    && module.map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false)
-                {
-                    let qname = match module {
-                        Some(m) => format!("{m}::{name}"),
-                        None => name.to_string(),
-                    };
-                    if self.resolve_enum(&qname).is_none()
-                        && self.resolve_scalar(&qname).is_none()
-                        && self.resolve_named_tuple(&qname).is_none()
-                        && self.resolve_type(&qname).is_ok()
-                    {
-                        return self.compile_expr_ctx(&tc.expr, ctx);
-                    }
-                }
                 let inner = self.compile_expr_ctx(&tc.expr, ctx)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
 
@@ -9548,12 +9372,6 @@ impl<'a> Compiler<'a> {
                 self.compile_subquery_expr(&stmt, &fields, ctx, &elements)
             }
 
-            // `account := account if cond else {}` — the empty set is a legal
-            // expression in PyQL and means "no value", which is what the
-            // assignment paths already spell `IrExpr::Null`. Only a *non-empty*
-            // set literal has no expression-position meaning.
-            Expr::Set(items) if items.is_empty() => Ok(IrExpr::Null),
-
             // A bare shape or set literal is never valid in expression
             // position, in either context — preserved exactly as the
             // schema-bound side always enforced (the free side's more
@@ -9962,43 +9780,6 @@ impl<'a> Compiler<'a> {
             // a filter, not a traversal: the row is read from the narrowed
             // type's own table by the key the variable holds, so a variable
             // bound to something else yields nothing, as it should.
-            // `line[is BrandOrderLineItem].brand` — the narrowing picks the row
-            // out of the narrowed type's own table, and the walk continues from
-            // there. Without the tail this is the row itself, handled below.
-            if let [ast::PathStep::Name(var), ast::PathStep::TypeIntersection(type_ref), rest @ ..] =
-                p.steps.as_slice()
-                && !rest.is_empty()
-                && self.for_var_types.contains_key(var)
-            {
-                let type_name = match &type_ref.module {
-                    Some(m) => format!("{}::{}", m, type_ref.name),
-                    None => type_ref.name.clone(),
-                };
-                let narrowed = self.resolve_type(&type_name)?;
-                let mut steps = vec![ast::PathStep::Name(format!("{}::{}", narrowed.module, narrowed.name))];
-                steps.extend(rest.iter().cloned());
-                let rooted = ast::Path { steps, partial: false };
-                let synthetic = ast::SelectStmt {
-                    result: Expr::Path(rooted.clone()),
-                    filter: None,
-                    order_by: vec![],
-                    offset: None,
-                    limit: None,
-                    lock: None,
-                };
-                let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
-                let correlation = IrExpr::BinOp(Box::new(IrBinOp {
-                    left: IrExpr::ColumnRef {
-                        alias: ps.root.alias.clone(),
-                        column: "id".to_string(),
-                        pg_type: "uuid".to_string(),
-                    },
-                    op: ast::BinOpKind::Eq,
-                    right: IrExpr::ForVar { name: var.clone() },
-                }));
-                ps.filter = and_conditions(ps.filter, vec![correlation]);
-                return Ok(IrExpr::PathSubquery(Box::new(ps)));
-            }
             if let [ast::PathStep::Name(var), ast::PathStep::TypeIntersection(type_ref)] = p.steps.as_slice()
                 && self.for_var_types.contains_key(var)
             {
@@ -11230,37 +11011,8 @@ impl<'a> Compiler<'a> {
         let Expr::SubQuery(stmt) = expr else {
             return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)"));
         };
-        // `else (select usage::Allowance)` — yield the conflicting row rather
-        // than change it. `DO NOTHING` returns nothing at all, so the row is
-        // read back by assigning its own key to itself, which is what makes
-        // `RETURNING` see it.
-        if let Stmt::Select(sel) = stmt.as_ref()
-            && sel.filter.is_none()
-            && sel.limit.is_none()
-            && sel.offset.is_none()
-            && let Ok(type_name) = self.expr_as_type_name(&sel.result)
-            && let Ok(sel_td) = self.resolve_type(&type_name)
-        {
-            let table = sel_td.table.clone();
-            let pk = sel_td
-                .properties
-                .iter()
-                .find(|p| p.is_pk)
-                .ok_or_else(|| self.type_err(&format!("type '{type_name}' has no primary key to read back")))?;
-            return Ok(vec![(
-                pk.name.clone(),
-                IrExpr::ColumnRef {
-                    alias: table,
-                    column: pk.name.clone(),
-                    pg_type: pk.pg_type.clone(),
-                },
-            )]);
-        }
         let Stmt::Update(upd) = stmt.as_ref() else {
-            return Err(self.type_err(
-                "UNLESS CONFLICT ELSE must be an UPDATE that changes the conflicting row, or a \
-                 SELECT of its type to read it back unchanged",
-            ));
+            return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression"));
         };
         let type_name = self.expr_as_type_name(&upd.subject)?;
         let upd_td = self.resolve_type(&type_name)?;
