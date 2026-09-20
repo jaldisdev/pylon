@@ -5982,6 +5982,16 @@ mod tests {
     }
 
     #[test]
+    fn test_a_select_can_name_its_own_result() {
+        // `SELECT OptionallyAliasedExpr` in EdgeQL: the alias names the result
+        // and the select's own clauses may read it by that name.
+        let out = compile_and_emit("SELECT oldest := max(Person.age)");
+        assert!(out.sql.contains("max("), "{}", out.sql);
+        let filtered = compile_and_emit("SELECT n := Person.age FILTER n > 18");
+        assert!(filtered.sql.contains("18"), "the alias resolves to the result:\n{}", filtered.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

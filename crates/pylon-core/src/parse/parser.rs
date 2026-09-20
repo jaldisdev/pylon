@@ -268,6 +268,19 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         self.eat(&Token::Select)?;
+        // `select max_priority := max(…)` — EdgeQL lets a select name its own
+        // result (`SELECT OptionallyAliasedExpr`), and the select's own
+        // clauses may read it by that name. Substituted back in below, which
+        // is what the name means; Gel keeps it as `result_alias` and scopes it
+        // the same way.
+        let result_alias = if matches!(self.current(), Token::Ident(_)) && matches!(self.peek_ahead(1), Token::ColonEq)
+        {
+            let name = self.eat_ident()?;
+            self.eat(&Token::ColonEq)?;
+            Some(name)
+        } else {
+            None
+        };
         let result = self.parse_expr()?;
 
         let filter = if matches!(self.current(), Token::Filter) {
@@ -301,6 +314,23 @@ impl Parser {
 
         let lock = self.parse_lock_clause()?;
 
+        let (filter, order_by, offset, limit) = match &result_alias {
+            Some(alias) => (
+                filter.map(|e| Self::substitute_alias(e, alias, &result)),
+                order_by
+                    .into_iter()
+                    .map(|s| SortExpr {
+                        expr: Self::substitute_alias(s.expr, alias, &result),
+                        direction: s.direction,
+                        nones: s.nones,
+                    })
+                    .collect(),
+                offset.map(|e| Self::substitute_alias(e, alias, &result)),
+                limit.map(|e| Self::substitute_alias(e, alias, &result)),
+            ),
+            None => (filter, order_by, offset, limit),
+        };
+
         Ok(Stmt::Select(SelectStmt {
             result,
             filter,
@@ -309,6 +339,39 @@ impl Parser {
             limit,
             lock,
         }))
+    }
+
+    /// Put `value` wherever a select's own clauses name its result alias.
+    fn substitute_alias(expr: Expr, alias: &str, value: &Expr) -> Expr {
+        match expr {
+            Expr::Path(ref p)
+                if !p.partial
+                    && p.steps.len() == 1
+                    && matches!(&p.steps[0], PathStep::Name(n) if n == alias) =>
+            {
+                value.clone()
+            }
+            Expr::BinOp(b) => Expr::BinOp(Box::new(BinOp {
+                left: Self::substitute_alias(b.left, alias, value),
+                op: b.op,
+                right: Self::substitute_alias(b.right, alias, value),
+            })),
+            Expr::UnaryOp(u) => Expr::UnaryOp(Box::new(UnaryOp {
+                op: u.op,
+                operand: Self::substitute_alias(u.operand, alias, value),
+            })),
+            Expr::FunctionCall(f) => Expr::FunctionCall(FunctionCall {
+                module: f.module,
+                name: f.name,
+                args: f.args.into_iter().map(|a| Self::substitute_alias(a, alias, value)).collect(),
+                kwargs: f
+                    .kwargs
+                    .into_iter()
+                    .map(|(k, v)| (k, Self::substitute_alias(v, alias, value)))
+                    .collect(),
+            }),
+            other => other,
+        }
     }
 
     /// `FOR UPDATE|SHARE|NO KEY UPDATE|KEY SHARE [NOWAIT|SKIP LOCKED]` —
