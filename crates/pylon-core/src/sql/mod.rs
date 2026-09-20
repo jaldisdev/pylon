@@ -2390,6 +2390,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     match f.body.as_ref() {
         IrStmt::Insert(ins) => emit_for_insert(ins, &iter_alias, &iter_cte, user_ctes, &f.body_ctes),
+        IrStmt::Update(upd) => emit_for_update(upd, &iter_alias, &iter_cte, user_ctes, &f.body_ctes),
         body => {
             let body_out = match body {
                 IrStmt::Select(sel) => emit_select_stmt(sel, user_ctes),
@@ -2414,6 +2415,60 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
                 inference_plan: None,
             }
         }
+    }
+}
+
+/// A `for` whose body updates: driven from the iteration with `UPDATE … FROM`,
+/// since a LATERAL -- what the select-bodied form uses -- cannot hold DML.
+/// Both the SET clause and the filter may read the loop variable, and both are
+/// already compiled against the iteration alias.
+fn emit_for_update(
+    upd: &IrUpdate,
+    iter_alias: &str,
+    iter_cte: &str,
+    user_ctes: &[IrCteDef],
+    body_ctes: &[IrCteDef],
+) -> SqlOutput {
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+    cte_parts.extend(emit_user_cte_parts(body_ctes));
+    cte_parts.push(iter_cte.to_string());
+
+    let alias = &upd.target.alias;
+    let sets: Vec<String> = upd
+        .assignments
+        .iter()
+        .map(|(col, expr)| format!("{} = {}", qi(col), emit_expr(expr)))
+        .chain(
+            upd.rewrites
+                .iter()
+                .map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))),
+        )
+        .collect();
+    let mut sql = format!(
+        "WITH {}\nUPDATE {} AS {}\nSET {}\nFROM {}",
+        cte_parts.join(",\n"),
+        source_ref(&upd.target),
+        qi(alias),
+        sets.join(", "),
+        qi(iter_alias),
+    );
+    append_filter(&mut sql, &upd.filter);
+    let mut parts = vec![type_disc(&upd.target.type_name)];
+    let (pointer_exprs, shape_nodes) = build_shape(&upd.returning, alias);
+    parts.extend(pointer_exprs);
+    sql.push_str(&format!("\nRETURNING (\n    {}\n) AS result", parts.join(",\n    ")));
+    SqlOutput {
+        sql,
+        shape: crate::query::ShapeDescriptor {
+            root: ShapeNode::Object {
+                name: String::new(),
+                type_name: Some(upd.target.type_name.clone()),
+                position: 0,
+                cardinality: Cardinality::Many,
+                pointers: prepend_type(shape_nodes),
+            },
+        },
+        inference_plan: None,
     }
 }
 
@@ -5221,6 +5276,39 @@ mod tests {
             "the arms are read as one set:\n{}",
             out.sql
         );
+    }
+
+    #[test]
+    fn test_a_for_loop_whose_body_updates() {
+        // Driven from the iteration with `UPDATE … FROM`: the select-bodied
+        // form uses a LATERAL, which cannot hold DML. Verified live -- three
+        // rows iterated, three rows updated.
+        let out = compile_and_emit_with(
+            "FOR p IN (SELECT Person) UNION (UPDATE Person FILTER .id = p.id SET { name := $n })",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("UPDATE \"public\".\"Person\""), "{}", out.sql);
+        assert!(
+            out.sql.contains("FROM \"_for_p\""),
+            "driven from the iteration:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("LATERAL"),
+            "DML cannot sit in a LATERAL:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_for_loop_body_mutating_a_multi_link_is_refused() {
+        // Its junction rows would have to be driven from the iteration too,
+        // which they are not yet -- so it stays an error rather than writing
+        // the wrong rows.
+        let ast =
+            parse::parse("WITH t := (SELECT Post) FOR q IN t UNION (UPDATE Person FILTER .id = $i SET { posts += q })")
+                .unwrap();
+        assert!(ir::compile(&ast, &make_schema()).is_err());
     }
 
     #[test]
