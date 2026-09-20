@@ -3947,9 +3947,12 @@ impl<'a> Compiler<'a> {
                 vec![IrFreeExpr::FreeObject(fields)]
             }
             Expr::Tuple(exprs) => {
+                // An element may hold an object with a shape
+                // (`select (offering { id }, revision { id })`), which is the
+                // same question a free object's field asks.
                 let ir = exprs
                     .iter()
-                    .map(|e| self.compile_free_expr(e))
+                    .map(|e| self.free_object_field(e))
                     .collect::<Result<_, _>>()?;
                 vec![IrFreeExpr::Tuple(ir)]
             }
