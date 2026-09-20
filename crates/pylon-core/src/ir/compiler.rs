@@ -107,6 +107,9 @@ pub fn compile_with_config(
 
         let mut cte_defs = vec![];
         for alias in &w.aliases {
+            if let Some(declared) = declared_pointers_of(&alias.expr) {
+                c.cte_declared_pointers.insert(alias.name.clone(), declared);
+            }
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let type_name = c.register_cte(&alias.name, &ir_stmt);
             cte_defs.push(IrCteDef {
@@ -255,6 +258,27 @@ fn ir_value_type_name(expr: &IrExpr) -> String {
         return format!("{}[]", literal_sentinel_to_pg(element));
     }
     infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
+}
+
+/// The computed pointers a `with` binding's own shape declares, if any.
+fn declared_pointers_of(expr: &Expr) -> Option<Vec<ShapeElement>> {
+    let Expr::SubQuery(stmt) = expr else {
+        return None;
+    };
+    let shape = match innermost_select(stmt)? {
+        ast::SelectStmt {
+            result: Expr::Shape(sh),
+            ..
+        } => sh,
+        _ => return None,
+    };
+    let declared: Vec<ShapeElement> = shape
+        .elements
+        .iter()
+        .filter(|el| el.compexpr.is_some())
+        .cloned()
+        .collect();
+    (!declared.is_empty()).then_some(declared)
 }
 
 /// The select a statement ultimately is, past any `with` blocks.
@@ -661,6 +685,12 @@ struct Compiler<'a> {
     /// The condition a `(insert …) if cond else {}` puts on the insert about
     /// to be compiled — see `IrInsert::guard`.
     pending_insert_guard: Option<Expr>,
+    /// Pointers a `with` binding declared in its own shape (`offering := (
+    /// select Offering { publisher := … })`). They exist nowhere on the type,
+    /// so a later `offering { publisher }` has to find them here.
+    cte_declared_pointers: HashMap<String, Vec<ShapeElement>>,
+    /// Those of the binding whose shape is being compiled right now.
+    active_declared_pointers: Vec<ShapeElement>,
     /// The schema-bound selects currently being compiled, innermost last.
     ///
     /// Only consulted for `detached`: an absolute `TypeName.prop` inside a
@@ -796,6 +826,8 @@ impl<'a> Compiler<'a> {
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
             pending_insert_guard: None,
+            cte_declared_pointers: HashMap::new(),
+            active_declared_pointers: vec![],
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
             global_ctes: vec![],
@@ -4019,9 +4051,19 @@ impl<'a> Compiler<'a> {
             },
             alias: alias.clone(),
         };
-        let shape = self.compile_shape(&sh.elements, td, &alias, &td.module)?;
+        // Same as reading the binding by name: its own shape may have
+        // declared pointers that exist on no type.
+        let outer_declared = std::mem::replace(
+            &mut self.active_declared_pointers,
+            cte_name
+                .as_deref()
+                .and_then(|n| self.cte_declared_pointers.get(n).cloned())
+                .unwrap_or_default(),
+        );
+        let shape = self.compile_shape(&sh.elements, td, &alias, &td.module);
+        self.active_declared_pointers = outer_declared;
         Ok(Some(IrExpr::ObjectSubquery(Box::new(IrSelect::schema_bound(
-            source, shape, None,
+            source, shape?, None,
         )))))
     }
 
@@ -4621,6 +4663,16 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
             detached: std::mem::take(&mut self.pending_detached),
         });
+        // A binding read back by name brings whatever its own shape declared
+        // (`offering { publisher }`), which is on no type and has to be found
+        // through the binding it was written on.
+        let outer_declared = std::mem::replace(
+            &mut self.active_declared_pointers,
+            cte_name
+                .as_deref()
+                .and_then(|name| self.cte_declared_pointers.get(name).cloned())
+                .unwrap_or_default(),
+        );
         let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
             let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
             let filter = sel
@@ -4646,6 +4698,7 @@ impl<'a> Compiler<'a> {
             Ok((shape, filter, order_by, offset, limit))
         })(self);
         self.anchors.pop();
+        self.active_declared_pointers = outer_declared;
         let (shape, filter, order_by, offset, limit) = clauses?;
 
         // Compile the inner DML if this is a SELECT-over-DML / SELECT-over-SELECT.
@@ -6805,6 +6858,23 @@ impl<'a> Compiler<'a> {
             );
         }
 
+        // Declared by the binding this shape is read off, rather than by the
+        // type — compiled against the binding's own row, as it was written.
+        if let Some(declared) = self
+            .active_declared_pointers
+            .iter()
+            .find(|d| path_leaf(&d.path).is_ok_and(|n| n == pointer_name))
+            .cloned()
+            && let Some(expr) = declared.compexpr.clone()
+        {
+            let nested = if el.nested.as_deref().unwrap_or(&[]).is_empty() {
+                declared.nested.clone().unwrap_or_default()
+            } else {
+                el.nested.clone().unwrap_or_default()
+            };
+            return self.compile_computed_expr(pointer_name, &expr, td, alias, module, el.marker_offset, &nested);
+        }
+
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
     }
 
@@ -7223,6 +7293,22 @@ impl<'a> Compiler<'a> {
         nested: &[ShapeElement],
     ) -> Result<IrShapePointer, PyQLError> {
         let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+        self.compile_computed_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)
+    }
+
+    /// The body of `compile_declared_computed`, for a pointer whose expression
+    /// is already parsed — a `with` binding's own shape declares one that way.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_computed_expr(
+        &mut self,
+        name: &str,
+        expr_ast: &Expr,
+        td: &TypeDescriptor,
+        alias: &str,
+        module: &str,
+        marker_offset: Option<usize>,
+        nested: &[ShapeElement],
+    ) -> Result<IrShapePointer, PyQLError> {
         // The object the pointer is computed on stays in scope for the whole
         // expression, including any part of it compiled without a type in
         // hand — a `with` binding's right-hand side, say.
@@ -7234,7 +7320,7 @@ impl<'a> Compiler<'a> {
         });
         let result = (|compiler: &mut Self| -> Result<IrShapePointer, PyQLError> {
             if let Some(ptr) =
-                compiler.try_compile_pointer_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)?
+                compiler.try_compile_pointer_expr(name, expr_ast, td, alias, module, marker_offset, nested)?
             {
                 return Ok(ptr);
             }
@@ -7242,19 +7328,19 @@ impl<'a> Compiler<'a> {
             // expression is an object-returning call. The rows it yields are
             // the pointer's objects; read as a plain expression the call is
             // "part of a larger expression", which such a function refuses.
-            if let Expr::FunctionCall(fc) = &expr_ast
+            if let Expr::FunctionCall(fc) = expr_ast
                 && let Some(fs) = compiler.compile_fn_object_source(fc, nested)?
             {
                 return Ok(IrShapePointer::Computed(IrComputedPointer {
                     marker_offset,
-                    alias: cd.name.clone(),
+                    alias: name.to_string(),
                     expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectFunction(Box::new(fs)))),
                 }));
             }
-            let ir = compiler.compile_expr(&expr_ast, td, alias)?;
+            let ir = compiler.compile_expr(expr_ast, td, alias)?;
             Ok(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset,
-                alias: cd.name.clone(),
+                alias: name.to_string(),
                 expr: ir,
             }))
         })(self);
