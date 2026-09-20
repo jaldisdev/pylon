@@ -8572,7 +8572,32 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
-    fn test_reading_a_link_through_an_interface_target() {
+    fn test_a_backlink_narrowed_to_a_supertype() {
+        // `.<company[is Account]` — the intersection narrows what comes back,
+        // while the link itself is declared further down. Pylon looked for it
+        // on the narrowed type alone and reported it had no such link.
+        let mut schema = interface_link_schema();
+        // Leave `company` declared only on the implementor, so the narrowed
+        // type genuinely does not have it.
+        schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Account")
+            .expect("the helper declares Account")
+            .links
+            .clear();
+        let out = compile_and_emit_with("SELECT Company { owners := .<company[is Account] { email } }", &schema);
+        assert!(
+            out.sql.contains("\"public\".\"Individual\""),
+            "the backlink must read the type that declares it:\n{}",
+            out.sql
+        );
+    }
+
+    /// Company, the Account interface, its Individual implementor and a
+    /// Token linking to the interface -- enough to exercise reading and
+    /// backlinking across one.
+    fn interface_link_schema() -> SchemaDescriptor {
         // A link whose target is an interface is read by fanning the
         // implementors out inline. That union used to project only the
         // interface's *properties*, so a shape that then followed one of the
@@ -8656,7 +8681,7 @@ select owner { posts := (select owner.posts.title) };",
                 signals: vec![],
             }
         }
-        let schema = SchemaDescriptor {
+        SchemaDescriptor {
             types: vec![
                 ty("Company", false, vec![], vec![id_prop(), text_prop("name")], vec![]),
                 ty(
@@ -8688,7 +8713,12 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn test_reading_a_link_through_an_interface_target() {
+        let schema = interface_link_schema();
         let out = compile_and_emit_with("SELECT Token { account: { email, company: { name } } }", &schema);
         assert!(
             out.sql

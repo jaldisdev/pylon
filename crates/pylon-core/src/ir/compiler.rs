@@ -6677,6 +6677,42 @@ impl<'a> Compiler<'a> {
             None => type_ref.name.clone(),
         };
         let owner_td = self.resolve_type(&type_name)?;
+        // `.<passkeys[is account::Account]` — the intersection narrows what
+        // comes back, and the link itself may be declared further down: here
+        // `passkeys` is Individual's, and an Individual is an Account. So the
+        // owner is the concrete type that actually declares it, the same way
+        // `backlink_exists_over_owners` resolves one.
+        let owner_td = if self.declares_backlink(owner_td, &backlink_name, current_qname) {
+            owner_td
+        } else {
+            // Qualified, because that is how a type records the interfaces it
+            // implements; the query may well have written the bare name.
+            let narrowed = format!("{}::{}", owner_td.module, owner_td.name);
+            let declaring: Vec<&'a TypeDescriptor> = self
+                .schema
+                .types
+                .iter()
+                .filter(|t| !t.abstract_ && Self::is_or_implements(t, &narrowed))
+                .filter(|t| self.declares_backlink(t, &backlink_name, current_qname))
+                .collect();
+            match declaring.as_slice() {
+                [only] => only,
+                [] => owner_td,
+                several => {
+                    return Err(self.type_err(&format!(
+                        "'{backlink_name}' pointing to {current_qname} is declared by {} types under \
+                         {narrowed} ({}), so a backlink narrowed to it has no single source to read \
+                         — narrow to one of them instead",
+                        several.len(),
+                        several
+                            .iter()
+                            .map(|t| format!("{}::{}", t.module, t.name))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )));
+                }
+            }
+        };
         let owner_qname = format!("{}::{}", owner_td.module, owner_td.name);
 
         let join = if let Some(l) = owner_td
