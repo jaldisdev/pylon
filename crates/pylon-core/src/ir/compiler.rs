@@ -3877,8 +3877,17 @@ impl<'a> Compiler<'a> {
             Expr::Union(a, b) => self.is_free_result(a) && self.is_free_result(b),
             // `A if cond else B` picks between two *sets*; when those are
             // object sets the result is an object set too, not the scalar an
-            // if/else over values gives.
-            Expr::IfElse(ie) => self.is_free_result(&ie.if_expr) || self.is_free_result(&ie.else_expr),
+            // if/else over values gives. An empty branch says nothing about
+            // which it is, so it does not get a vote.
+            Expr::IfElse(ie) => {
+                let empty = |e: &Expr| matches!(e, Expr::Set(items) if items.is_empty());
+                match (empty(&ie.if_expr), empty(&ie.else_expr)) {
+                    (true, true) => true,
+                    (true, false) => self.is_free_result(&ie.else_expr),
+                    (false, true) => self.is_free_result(&ie.if_expr),
+                    (false, false) => self.is_free_result(&ie.if_expr) || self.is_free_result(&ie.else_expr),
+                }
+            }
             _ => true,
         }
     }
@@ -4289,6 +4298,9 @@ impl<'a> Compiler<'a> {
         let Expr::IfElse(ie) = expr else {
             return None;
         };
+        fn is_empty_set(expr: &Expr) -> bool {
+            matches!(expr, Expr::Set(items) if items.is_empty())
+        }
         let yields_objects = |branch: &Expr| match branch {
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => match &p.steps[0] {
                 ast::PathStep::Name(n) => self.cte_object_type(n).is_some() || self.resolve_type(n).is_ok(),
@@ -4298,9 +4310,45 @@ impl<'a> Compiler<'a> {
                 self.dml_subject_type(stmt.as_ref()),
                 Ok(name) if self.resolve_type(&name).is_ok()
             ),
+            // A branch may carry the shape the result is read with.
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::SubQuery(stmt)) => {
+                    matches!(self.dml_subject_type(stmt.as_ref()), Ok(name) if self.resolve_type(&name).is_ok())
+                }
+                Some(Expr::Path(p)) if !p.partial && p.steps.len() == 1 => match &p.steps[0] {
+                    ast::PathStep::Name(n) => self.cte_object_type(n).is_some() || self.resolve_type(n).is_ok(),
+                    _ => false,
+                },
+                _ => false,
+            },
             _ => false,
         };
-        if !yields_objects(&ie.if_expr) || !yields_objects(&ie.else_expr) {
+        // `{}` contributes no rows, so the union degenerates to the other
+        // branch under its own guard -- which is what Gel's own rewrite
+        // (`SELECT A WHERE Cond UNION ALL SELECT B WHERE NOT Cond`) reduces
+        // to when one side is empty.
+        // A mutation under a condition is *not* handled here. Guarding the
+        // branch only filters what is read back: the mutation is its own CTE
+        // and Postgres runs it regardless, so `(insert …) if cond else {}`
+        // would insert even when the condition is false -- silently, which is
+        // far worse than the compile error it replaced. It needs the
+        // condition folded into the mutation itself.
+        let mutates = |branch: &Expr| match branch {
+            Expr::SubQuery(stmt) => matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)),
+            Expr::Shape(sh) => matches!(
+                sh.expr.as_ref(),
+                Some(Expr::SubQuery(stmt)) if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+            ),
+            _ => false,
+        };
+        if mutates(&ie.if_expr) || mutates(&ie.else_expr) {
+            return None;
+        }
+        let (if_empty, else_empty) = (is_empty_set(&ie.if_expr), is_empty_set(&ie.else_expr));
+        if if_empty && else_empty {
+            return None;
+        }
+        if !(if_empty || yields_objects(&ie.if_expr)) || !(else_empty || yields_objects(&ie.else_expr)) {
             return None;
         }
         let guard = |branch: &Expr, condition: Expr| {
@@ -4317,6 +4365,12 @@ impl<'a> Compiler<'a> {
             op: ast::UnaryOpKind::Not,
             operand: ie.condition.clone(),
         }));
+        if else_empty {
+            return Some(guard(&ie.if_expr, ie.condition.clone()));
+        }
+        if if_empty {
+            return Some(guard(&ie.else_expr, negated));
+        }
         Some(Expr::Union(
             Box::new(guard(&ie.if_expr, ie.condition.clone())),
             Box::new(guard(&ie.else_expr, negated)),
@@ -4333,6 +4387,11 @@ impl<'a> Compiler<'a> {
         let (union_expr, shape_elements): (&Expr, &[ShapeElement]) = match result_expr {
             Expr::Union(_, _) => (result_expr, &[]),
             Expr::IfElse(_) => match self.object_if_else_as_union(result_expr) {
+                // One branch empty leaves a single guarded set, not a union;
+                // that is an ordinary select over what the branch names.
+                Some(rewritten @ Expr::SubQuery(_)) => {
+                    return self.compile_select(sel, &rewritten, distinct).map(Some);
+                }
                 Some(rewritten) => {
                     as_union = rewritten;
                     (&as_union, &[] as &[ShapeElement])
@@ -4342,6 +4401,14 @@ impl<'a> Compiler<'a> {
             Expr::Shape(shape) => match &shape.expr {
                 Some(inner @ Expr::Union(_, _)) => (inner, shape.elements.as_slice()),
                 Some(inner @ Expr::IfElse(_)) => match self.object_if_else_as_union(inner) {
+                    Some(Expr::SubQuery(stmt)) => {
+                        let shaped = Expr::Shape(Box::new(ast::ShapeExpr {
+                            expr: Some(Expr::SubQuery(stmt)),
+                            elements: shape.elements.clone(),
+                            marker_offset: None,
+                        }));
+                        return self.compile_select(sel, &shaped, distinct).map(Some);
+                    }
                     Some(rewritten) => {
                         as_union = rewritten;
                         (&as_union, shape.elements.as_slice())
