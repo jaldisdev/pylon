@@ -5128,6 +5128,34 @@ mod tests {
     }
 
     #[test]
+    fn test_a_for_loop_variable_shaped_inside_a_tuple() {
+        // The variable holds one row's key, so the element has to be narrowed
+        // to it. Unfiltered it read the whole table and answered with rows
+        // the loop never named -- wrong, and silently so.
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person LIMIT 1) FOR q IN p.posts UNION (SELECT (a := q { title }, b := 1))",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("\"_for_q\".\"v\""),
+            "the element must be narrowed to the loop's row:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_choosing_between_two_walks() {
+        // `(select p.posts …) if cond else (select p.posts …)` — a walk names
+        // no type of its own, so neither branch could be resolved.
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person LIMIT 1), q := (SELECT p.posts LIMIT 1) IF TRUE ELSE (SELECT p.posts) \
+             SELECT q { title }",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("UNION ALL"), "one branch per side:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
