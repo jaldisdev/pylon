@@ -4857,6 +4857,18 @@ mod tests {
     }
 
     #[test]
+    fn test_a_for_loop_over_a_path() {
+        // `for post in p.posts union (…)` — a walk off a binding names a set
+        // to iterate just as a sub-select does, only written without the
+        // parentheses.
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person LIMIT 1) FOR post IN p.posts UNION (SELECT post.title)",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("CROSS JOIN LATERAL"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
