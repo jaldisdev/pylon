@@ -4062,8 +4062,21 @@ impl<'a> Compiler<'a> {
         );
         let shape = self.compile_shape(&sh.elements, td, &alias, &td.module);
         self.active_declared_pointers = outer_declared;
+        // A for-loop variable holds one row's key, so the select has to be
+        // narrowed to it -- unfiltered it would read the whole table.
+        let filter = self.for_var_types.contains_key(name).then(|| {
+            IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ForVar { name: name.clone() },
+            }))
+        });
         Ok(Some(IrExpr::ObjectSubquery(Box::new(IrSelect::schema_bound(
-            source, shape?, None,
+            source, shape?, filter,
         )))))
     }
 
@@ -4352,10 +4365,29 @@ impl<'a> Compiler<'a> {
                 ast::PathStep::Name(n) => self.cte_object_type(n).is_some() || self.resolve_type(n).is_ok(),
                 _ => false,
             },
-            Expr::SubQuery(stmt) => matches!(
-                self.dml_subject_type(stmt.as_ref()),
-                Ok(name) if self.resolve_type(&name).is_ok()
-            ),
+            Expr::SubQuery(stmt) => {
+                // A select over a walk (`select resource.revisions`) yields
+                // objects too, and names no type for `dml_subject_type` to
+                // report; what it lands on is what the branch carries.
+                if let Some(ast::SelectStmt {
+                    result: Expr::Path(path),
+                    ..
+                }) = innermost_select(stmt.as_ref())
+                    && !path.partial
+                    && path.steps.len() > 1
+                    && let Some(ast::PathStep::Name(root)) = path.steps.first()
+                    && let Ok(root_td) = self.resolve_path_root(root)
+                {
+                    return matches!(
+                        self.walk_path_types(root_td, &path.steps[1..], MAX_COMPUTED_SPLICES),
+                        (_, Some(_))
+                    );
+                }
+                matches!(
+                    self.dml_subject_type(stmt.as_ref()),
+                    Ok(name) if self.resolve_type(&name).is_ok()
+                )
+            }
             // A branch may carry the shape the result is read with.
             Expr::Shape(sh) => match sh.expr.as_ref() {
                 Some(Expr::SubQuery(stmt)) => {
@@ -5150,6 +5182,17 @@ impl<'a> Compiler<'a> {
                     && module.map(|m| m != "std").unwrap_or(false)
                 {
                     return Ok(name.to_string());
+                }
+                // `select resource.revisions` — a walk names no type of its
+                // own; what it lands on is the type the statement yields.
+                if let Expr::Path(path) = &sel.result
+                    && !path.partial
+                    && path.steps.len() > 1
+                    && let Some(ast::PathStep::Name(root)) = path.steps.first()
+                    && let Ok(root_td) = self.resolve_path_root(root)
+                    && let (_, Some(target)) = self.walk_path_types(root_td, &path.steps[1..], MAX_COMPUTED_SPLICES)
+                {
+                    return Ok(format!("{}::{}", target.module, target.name));
                 }
                 // SELECT-over-SELECT: get the type from the inner select's result
                 let (type_name, _, _, _) = self.extract_type_and_shape(&sel.result)?;
