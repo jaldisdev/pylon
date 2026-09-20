@@ -8082,6 +8082,40 @@ impl<'a> Compiler<'a> {
                             let ps = self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
                             return Ok(IrExpr::PathSubquery(Box::new(ps)));
                         }
+                        // `count((delete AuthLink filter .expired))` — the rows
+                        // a mutation touched are countable like any other set.
+                        // The mutation becomes its own data-modifying CTE, which
+                        // Postgres runs regardless, and the aggregate reads it.
+                        if let Expr::SubQuery(stmt) = arg
+                            && matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+                        {
+                            use crate::stdlib::{ImplStrategy, lookup};
+                            let ns = f.module.as_deref().unwrap_or("std");
+                            let overloads = lookup(ns, &f.name);
+                            let best = overloads
+                                .iter()
+                                .find(|d| d.params.len() == 1)
+                                .or_else(|| overloads.first())
+                                .cloned();
+                            if let Some(d) = best
+                                && let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy
+                            {
+                                let fn_name = sql_name.to_string();
+                                let (cte_name, type_name) = self.hoist_dml_as_cte(stmt.as_ref())?;
+                                let td = self.resolve_type(&type_name)?;
+                                let source = IrSource {
+                                    poly: None,
+                                    type_name: format!("{}::{}", td.module, td.name),
+                                    table: format!("@cte:{cte_name}"),
+                                    alias: self.fresh_alias(),
+                                };
+                                let inner = IrSelect::schema_bound(source, Self::pk_returning(td), None);
+                                return Ok(IrExpr::AggOverQuery {
+                                    fn_name,
+                                    inner: Box::new(inner),
+                                });
+                            }
+                        }
                         let inner_sel: Option<ast::SelectStmt> = match arg {
                             Expr::Path(p) if !p.partial => {
                                 // Resolve as a schema type if it matches a known type (not enum).

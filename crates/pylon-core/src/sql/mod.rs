@@ -4824,6 +4824,17 @@ mod tests {
     }
 
     #[test]
+    fn test_counting_the_rows_a_mutation_touched() {
+        // `count((delete X filter …))` — the mutation runs as its own
+        // data-modifying CTE and the aggregate reads it back, rather than
+        // being refused as "a delete cannot stand in for a value".
+        let out = compile_and_emit_with("SELECT count((DELETE Person FILTER .name = $n))", &make_schema());
+        assert!(out.sql.starts_with("WITH"), "{}", out.sql);
+        assert!(out.sql.contains("DELETE FROM \"public\".\"Person\""), "{}", out.sql);
+        assert!(out.sql.contains("count(*)"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
