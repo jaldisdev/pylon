@@ -657,6 +657,7 @@ def _make_default_sql(meta: Any) -> str | None:
     from pylon.modelquery import _Node
 
     from ._constraints import Default, _NowType, _SequenceNextType
+    from ._enums import Enum
 
     for c in meta.constraints:
         if isinstance(c, Default):
@@ -665,6 +666,11 @@ def _make_default_sql(meta: Any) -> str | None:
                 return 'now()'
             if isinstance(s, _SequenceNextType):
                 return None  # handled separately in _make_property_desc
+            # Before the `str` check: a Pylon enum member *is* a `str`, but its
+            # value is a label, not a PyQL expression -- read as one it fails to
+            # parse and the column silently ends up with no default at all.
+            if isinstance(s, Enum):
+                return "'" + s.value.replace("'", "''") + "'"
             if isinstance(s, (str, _Node)):
                 return None  # PyQL expression — handled by _make_default_pyql
             if s is None:
@@ -703,11 +709,14 @@ def _make_default_pyql(meta: Any) -> str | None:
     from pylon.modelquery import _Node, render_default_expr
 
     from ._constraints import Default, _NowType, _SequenceNextType
+    from ._enums import Enum
 
     for c in meta.constraints:
         if not isinstance(c, Default):
             continue
         s = c.sentinel
+        if isinstance(s, Enum):
+            return None  # a SQL literal — see `_make_default_sql`
         if isinstance(s, str):
             return s
         if isinstance(s, _Node):
