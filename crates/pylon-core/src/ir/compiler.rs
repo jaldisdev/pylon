@@ -5358,6 +5358,11 @@ impl<'a> Compiler<'a> {
             }
             IrStmt::Update(_) => Some("update"),
             IrStmt::Delete(_) => Some("delete"),
+            // `for line in … union (for component in … union (insert …))` —
+            // one iterator CTE per loop, joined on the key the inner carries.
+            // Only an insert innermost: anything else would need its own rows
+            // driven from the pair, which they are not.
+            IrStmt::For(inner) if matches!(inner.body.as_ref(), IrStmt::Insert(_)) => None,
             IrStmt::For(_) => Some("nested for"),
             IrStmt::Group(_) => Some("group"),
             _ => Some("this statement"),
