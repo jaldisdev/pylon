@@ -69,6 +69,7 @@ fn default_blocker(expr: &crate::ir::IrExpr) -> Option<&'static str> {
         | E::ArrayFromSelect(_)
         | E::ScalarSubquery(_)
         | E::AggOverQuery { .. }
+        | E::AggOverCte { .. }
         | E::AggOverSet { .. }
         | E::CteRef { .. }
         | E::CteFieldRef { .. }

@@ -8571,6 +8571,32 @@ impl<'a> Compiler<'a> {
                 // resolves the arg as a schema type reference or subquery.
                 if f.args.len() == 1 {
                     let arg = &f.args[0];
+                    // `count(memberships)` — a binding names a set, so the
+                    // aggregate runs over its rows. Compiled as an ordinary
+                    // expression it becomes a scalar subquery over the CTE,
+                    // which any binding of more than one row aborts on.
+                    if let Some(name) = self.resolve_cte_name(arg) {
+                        use crate::stdlib::{ImplStrategy, lookup};
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let overloads = lookup(ns, &f.name);
+                        let best = overloads
+                            .iter()
+                            .find(|d| d.params.len() == 1)
+                            .or_else(|| overloads.first());
+                        if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy)
+                            && best.is_some_and(|d| d.params.first().is_some_and(|p| p.ty.is_set()))
+                        {
+                            let object = self
+                                .cte_types
+                                .get(name)
+                                .is_some_and(|bound| bound.contains("::"));
+                            return Ok(IrExpr::AggOverCte {
+                                fn_name: sql_name.to_string(),
+                                cte: name.to_string(),
+                                column: (!object).then(|| "v".to_string()),
+                            });
+                        }
+                    }
                     if let Some((td, alias)) = ctx {
                         // `max(items.created_at)` inside a FILTER: the
                         // aggregate takes the whole set the path names, so it
