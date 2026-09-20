@@ -5150,6 +5150,52 @@ mod tests {
     }
 
     #[test]
+    fn test_comparing_a_link_with_an_object_returning_function() {
+        // Comparing objects compares identity, so the call stands for the id
+        // of the row it returns. Left whole it is a function call with nowhere
+        // to go but the subject of a select.
+        let mut schema = make_schema();
+        // make_schema's Company carries only a name; identity needs its key.
+        let company = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("make_schema declares Company");
+        company.properties.push(PropertyDescriptor {
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        schema.functions.push(crate::schema::FunctionDescriptor {
+            name: "current_company".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Company".into(),
+            return_is_object: true,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Company limit 1".into(),
+        });
+        let out = compile_and_emit_with("SELECT Person FILTER .company = current_company()", &schema);
+        assert!(
+            out.sql.contains("\"company_id\"") && out.sql.contains("current_company"),
+            "the link's key against the function's row:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_choosing_between_two_object_sets() {
         // `A if cond else B` over objects is not the scalar CASE an if/else
         // over values gives: it stands for A's rows when the condition holds
