@@ -285,6 +285,26 @@ class TestCompiles:
         assert '"token" uuid NOT NULL DEFAULT uuidv7()' in ddl, ddl
         assert '"made" timestamptz NOT NULL DEFAULT clock_timestamp()' in ddl, ddl
 
+    def test_an_enum_default_emits_its_label(self):
+        # A Pylon enum member is a `str`, so it used to take the PyQL path,
+        # where its label parses as a bare identifier and compiles to nothing
+        # -- leaving a NOT NULL column with no default at all.
+        from pylon._core import export_schema
+
+        from pylon.schema import Default, Property
+
+        def declare(pylon, module):
+            @pylon.enum('Guest', 'Member')
+            class MembershipType(pylon.Enum):
+                pass
+
+            @pylon.type(module=module, name='Membership')
+            class Membership:
+                type: Property[MembershipType, Default(MembershipType.Member)]
+
+        ddl = export_schema(self._schema('stdlib_default_enum', declare))
+        assert '"type" ' in ddl and "DEFAULT 'Member'" in ddl, ddl
+
     def test_string_form_emits_the_same_default(self):
         from pylon._core import export_schema
 
