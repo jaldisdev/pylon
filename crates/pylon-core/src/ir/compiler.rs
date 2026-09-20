@@ -5044,6 +5044,19 @@ impl<'a> Compiler<'a> {
         // error the caller could act on.
         let body_kind = match &body {
             IrStmt::Insert(_) | IrStmt::Select(_) | IrStmt::PathSelect(_) => None,
+            // An update is driven from the iteration itself (`UPDATE … FROM
+            // <iterated set>`) rather than from a LATERAL, which cannot hold
+            // DML. A multi-link mutation inside one would need its junction
+            // rows driven from the iteration too, which it is not yet.
+            IrStmt::Update(upd)
+                if upd.multi_link_appends.is_empty()
+                    && upd.multi_link_clears.is_empty()
+                    && upd.multi_link_replaces.is_empty()
+                    && upd.multi_link_removals.is_empty()
+                    && upd.poly_implementors.is_empty() =>
+            {
+                None
+            }
             IrStmt::Update(_) => Some("update"),
             IrStmt::Delete(_) => Some("delete"),
             IrStmt::For(_) => Some("nested for"),
