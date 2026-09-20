@@ -62,6 +62,7 @@ fn default_blocker(expr: &crate::ir::IrExpr) -> Option<&'static str> {
     match expr {
         E::Subquery(_)
         | E::ObjectSubquery(_)
+        | E::ObjectPathSubquery(_)
         | E::PathSubquery(_)
         | E::FnSubquery(_)
         | E::ArrayFromSelect(_)

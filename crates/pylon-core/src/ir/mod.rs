@@ -809,6 +809,11 @@ pub enum IrExpr {
         fields: Vec<(String, IrExpr)>,
         is_free_object: bool,
     },
+    /// The object a single-valued walk lands on, with its shape — the
+    /// path-select twin of `ObjectSubquery`. `PathSubquery` over the same
+    /// walk gives the object's id, which is what a path in plain expression
+    /// position means; this is for a pointer that asked for the object.
+    ObjectPathSubquery(Box<IrPathSelect>),
     /// An object, with its shape, standing as a value — a free object's
     /// object-valued field (`{ device := d { id } }`). Gel models a free shape
     /// as a real object type whose fields are real pointers, so an object
