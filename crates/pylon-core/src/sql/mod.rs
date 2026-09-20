@@ -5399,14 +5399,32 @@ mod tests {
     }
 
     #[test]
-    fn test_a_for_loop_body_mutating_a_multi_link_is_refused() {
-        // Its junction rows would have to be driven from the iteration too,
-        // which they are not yet -- so it stays an error rather than writing
-        // the wrong rows.
-        let ast =
-            parse::parse("WITH t := (SELECT Post) FOR q IN t UNION (UPDATE Person FILTER .id = $i SET { posts += q })")
-                .unwrap();
-        assert!(ir::compile(&ast, &make_schema()).is_err());
+    fn test_a_for_loop_body_appends_the_row_it_is_iterating() {
+        let out = compile_and_emit(
+            "WITH t := (SELECT Post) FOR q IN t UNION (UPDATE Person FILTER .id = $i SET { posts += q })",
+        );
+        // One junction row per iteration, taken from the iteration itself --
+        // not every Post, which an uncorrelated value subquery would append.
+        assert!(
+            out.sql.contains("\"_iter\"") && out.sql.contains("FROM \"_ids\""),
+            "junction rows driven from the iteration:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("LATERAL"),
+            "DML cannot sit in a LATERAL:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_select_on_a_for_loop_variable_reads_only_its_row() {
+        let out = compile_and_emit("FOR p IN (SELECT Person) UNION (SELECT (SELECT p) { name })");
+        assert!(
+            out.sql.contains("= \"_for_p\".\"v\""),
+            "narrowed to the row the variable holds:\n{}",
+            out.sql
+        );
     }
 
     #[test]
