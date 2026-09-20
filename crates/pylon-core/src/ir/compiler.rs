@@ -658,6 +658,9 @@ struct Compiler<'a> {
     /// variable itself holds the row's key (see `compile_for`), so a path
     /// rooted at one reads its table back by that key.
     for_var_types: HashMap<String, String>,
+    /// The condition a `(insert …) if cond else {}` puts on the insert about
+    /// to be compiled — see `IrInsert::guard`.
+    pending_insert_guard: Option<Expr>,
     /// The schema-bound selects currently being compiled, innermost last.
     ///
     /// Only consulted for `detached`: an absolute `TypeName.prop` inside a
@@ -792,6 +795,7 @@ impl<'a> Compiler<'a> {
             cte_free_items: HashMap::new(),
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
+            pending_insert_guard: None,
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
             global_ctes: vec![],
@@ -4333,15 +4337,44 @@ impl<'a> Compiler<'a> {
         // would insert even when the condition is false -- silently, which is
         // far worse than the compile error it replaced. It needs the
         // condition folded into the mutation itself.
-        let mutates = |branch: &Expr| match branch {
-            Expr::SubQuery(stmt) => matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)),
-            Expr::Shape(sh) => matches!(
-                sh.expr.as_ref(),
-                Some(Expr::SubQuery(stmt)) if matches!(stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
-            ),
-            _ => false,
+        fn mutating_stmt(branch: &Expr) -> Option<&Stmt> {
+            match branch {
+                Expr::SubQuery(stmt) => Some(stmt.as_ref()),
+                Expr::Shape(sh) => match sh.expr.as_ref() {
+                    Some(Expr::SubQuery(stmt)) => Some(stmt.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .filter(|stmt| matches!(stmt, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)))
+        }
+        // Guarding a branch only filters what is read back, while the
+        // mutation is its own CTE that Postgres runs regardless -- so the
+        // condition has to go into the mutation itself. An insert can take
+        // one; an update or delete has nowhere to put it yet, so those stay
+        // refused rather than compiling to something unconditional.
+        for branch in [&ie.if_expr, &ie.else_expr] {
+            if let Some(stmt) = mutating_stmt(branch)
+                && !matches!(stmt, Stmt::Insert(_))
+            {
+                return None;
+            }
+        }
+        let guarded_insert = |branch: &Expr, other: &Expr| {
+            mutating_stmt(branch).is_some() && matches!(other, Expr::Set(items) if items.is_empty())
         };
-        if mutates(&ie.if_expr) || mutates(&ie.else_expr) {
+        if guarded_insert(&ie.if_expr, &ie.else_expr) {
+            self.pending_insert_guard = Some(ie.condition.clone());
+            return Some(ie.if_expr.clone());
+        }
+        if guarded_insert(&ie.else_expr, &ie.if_expr) {
+            self.pending_insert_guard = Some(Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: ast::UnaryOpKind::Not,
+                operand: ie.condition.clone(),
+            })));
+            return Some(ie.else_expr.clone());
+        }
+        if mutating_stmt(&ie.if_expr).is_some() || mutating_stmt(&ie.else_expr).is_some() {
             return None;
         }
         let (if_empty, else_empty) = (is_empty_set(&ie.if_expr), is_empty_set(&ie.else_expr));
@@ -4392,6 +4425,9 @@ impl<'a> Compiler<'a> {
                 Some(rewritten @ Expr::SubQuery(_)) => {
                     return self.compile_select(sel, &rewritten, distinct).map(Some);
                 }
+                Some(rewritten) if !matches!(rewritten, Expr::Union(_, _)) => {
+                    return self.compile_select(sel, &rewritten, distinct).map(Some);
+                }
                 Some(rewritten) => {
                     as_union = rewritten;
                     (&as_union, &[] as &[ShapeElement])
@@ -4407,6 +4443,17 @@ impl<'a> Compiler<'a> {
                             elements: shape.elements.clone(),
                             marker_offset: None,
                         }));
+                        return self.compile_select(sel, &shaped, distinct).map(Some);
+                    }
+                    Some(rewritten) if !matches!(rewritten, Expr::Union(_, _)) => {
+                        let shaped = match rewritten {
+                            Expr::Shape(_) => rewritten,
+                            other => Expr::Shape(Box::new(ast::ShapeExpr {
+                                expr: Some(other),
+                                elements: shape.elements.clone(),
+                                marker_offset: None,
+                            })),
+                        };
                         return self.compile_select(sel, &shaped, distinct).map(Some);
                     }
                     Some(rewritten) => {
@@ -5284,7 +5331,12 @@ impl<'a> Compiler<'a> {
         let enqueue_search = collect_search_enqueue(td, &type_name, "index");
         let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
 
+        let guard = match self.pending_insert_guard.take() {
+            Some(condition) => Some(self.compile_expr(&condition, td, &alias)?),
+            None => None,
+        };
         Ok(IrInsert {
+            guard,
             target,
             assignments,
             unless_conflict,

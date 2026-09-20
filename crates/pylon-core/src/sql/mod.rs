@@ -505,11 +505,13 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 .map(|(_, e)| format!("    {}", emit_expr(e)))
                 .chain(ins.rewrites.iter().map(|r| format!("    {}", emit_expr(&r.expr))))
                 .collect();
-            let mut sql = if !ins.nested_ctes.is_empty() {
+            let mut sql = if !ins.nested_ctes.is_empty() || ins.guard.is_some() {
                 // The row reads columns out of hoisted nested-DML CTEs, so it
                 // selects from them rather than listing literal values. Those
                 // CTEs are emitted by the caller: Postgres only allows a
                 // data-modifying WITH at the top level, never inside a CTE.
+                // A guarded insert likewise has to be a `SELECT … WHERE`, so
+                // that it writes nothing when the condition is false.
                 format!("    {}", emit_insert_row_sql(ins))
             } else if cols.is_empty() {
                 // See `emit_insert_row_sql`: a row of nothing but defaults.
@@ -2591,6 +2593,40 @@ fn emit_insert_row_sql(ins: &IrInsert) -> String {
         .map(|(_, e)| emit_expr(e))
         .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
         .collect();
+    // A guarded insert writes nothing when its condition is false, so the row
+    // comes from a `SELECT` that returns none -- `VALUES` always yields one.
+    if let Some(guard) = &ins.guard {
+        let from_ctes = if ins.nested_ctes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " FROM {}",
+                ins.nested_ctes
+                    .iter()
+                    .map(|c| qi(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let projection = if cols.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", vals.join(", "))
+        };
+        let column_list = if cols.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", cols.join(", "))
+        };
+        return format!(
+            "INSERT INTO {}{} SELECT{}{} WHERE {}",
+            source_ref(&ins.target),
+            column_list,
+            projection,
+            from_ctes,
+            emit_expr(guard),
+        );
+    }
     if cols.is_empty() && ins.nested_ctes.is_empty() {
         // `insert Preferences {}` — a row made entirely of its own defaults.
         // An empty column list is not SQL; `DEFAULT VALUES` is how it is said.
@@ -5036,16 +5072,33 @@ mod tests {
     }
 
     #[test]
-    fn test_a_mutation_under_a_condition_is_refused() {
+    fn test_a_conditional_insert_is_guarded_by_its_condition() {
+        // `(insert …) if cond else {}` — guarding a reader would not do: the
+        // insert is a data-modifying CTE that Postgres runs regardless, so
+        // the condition goes into the insert itself and it writes nothing
+        // when false. Verified live: running it twice leaves one row.
+        let out = compile_and_emit_with("SELECT (INSERT Person { name := $n }) IF FALSE ELSE {}", &make_schema());
+        assert!(
+            out.sql.contains("SELECT") && out.sql.contains("WHERE"),
+            "a guarded insert selects its row rather than listing values:\n{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("VALUES"), "VALUES always yields a row:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_conditional_update_is_still_refused() {
         // Guarding the branch only filters what is read back -- the mutation
         // is its own CTE and Postgres runs it regardless. Compiling this
         // would insert even when the condition is false, silently, so it has
         // to stay an error until the condition can be folded into the
         // mutation itself.
-        let ast = parse::parse("SELECT (INSERT Person { name := $n }) IF FALSE ELSE {}").unwrap();
+        // An update has nowhere to put the condition yet, so it must keep
+        // erroring rather than compile to something that runs regardless.
+        let ast = parse::parse("SELECT (UPDATE Person FILTER .name = $n SET { name := $m }) IF FALSE ELSE {}").unwrap();
         assert!(
             ir::compile(&ast, &make_schema()).is_err(),
-            "a conditional mutation must not compile to an unconditional one"
+            "a conditional update must not compile to an unconditional one"
         );
     }
 
