@@ -3060,10 +3060,15 @@ impl<'a> Compiler<'a> {
                 // Chaining computeds this way is routine, so the splice
                 // re-enters the loop and expands again if it lands on
                 // another one.
-                if !is_last(0)
-                    && let Some((p, _, modifiers)) = Self::pointer_subject(&expr_ast)
+                // As the last step too, when what it names lands on an object:
+                // the shape and the select's own modifiers belong to that
+                // object, and reading it as an expression instead binds them to
+                // the type that declares the computed.
+                if let Some((p, _, modifiers)) = Self::pointer_subject(&expr_ast)
                     && p.partial
                     && !p.steps.is_empty()
+                    && (!is_last(0)
+                        || self.walk_path_types(current_td, &p.steps, MAX_COMPUTED_SPLICES).1.is_some())
                 {
                     // Order/offset/limit of its own pick one row *per source
                     // row*, which no plain join expresses — so the computed's
@@ -8117,9 +8122,18 @@ impl<'a> Compiler<'a> {
     ) -> (bool, Option<&'a TypeDescriptor>) {
         let mut current = td;
         let mut multi = false;
-        for step in steps {
+        for (i, step) in steps.iter().enumerate() {
             match step {
-                ast::PathStep::Backlink(_) => return (true, None),
+                // `.<link[is Owner]` names the owner type; a bare `.<link`
+                // spans every type declaring it, so that one lands nowhere in
+                // particular.
+                ast::PathStep::Backlink(_) => {
+                    if matches!(steps.get(i + 1), Some(ast::PathStep::TypeIntersection(_))) {
+                        multi = true;
+                        continue;
+                    }
+                    return (true, None);
+                }
                 ast::PathStep::TypeIntersection(tr) => {
                     let name = match &tr.module {
                         Some(m) => format!("{}::{}", m, tr.name),
@@ -9685,6 +9699,13 @@ impl<'a> Compiler<'a> {
             return self.compile_type_intersection_expr(&p.steps, td, alias);
         }
 
+        // `.<assessment[is brand::AssessmentRespondent]` — a backlink read as a
+        // value, with or without a narrowing. No column holds it, so it is the
+        // traversal as a correlated subquery; the builders below only know
+        // forward links and reject the intersection outright.
+        if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
+            return self.compile_partial_path_as_subquery(p, td, alias);
+        }
         if p.steps.len() == 2 {
             return self.compile_path_2step(p, td, alias);
         }
