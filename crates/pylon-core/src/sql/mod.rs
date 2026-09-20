@@ -5583,6 +5583,46 @@ mod tests {
         );
     }
 
+    /// `@pylon.abstract` — unlike an interface it is materialised as nothing
+    /// at all, so nothing can read a relation under its name. Modelled on
+    /// `Person`, the one test type carrying the `id` every implementor of a
+    /// real abstract has.
+    fn make_schema_with_a_plain_abstract() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        let mut archivable = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Person")
+            .expect("Person is in the test schema")
+            .clone();
+        archivable.name = "Archivable".into();
+        archivable.table = "Archivable".into();
+        archivable.abstract_ = true;
+        archivable.materialized = false;
+        archivable.links = vec![];
+        archivable.multilinks = vec![];
+        schema.types.push(archivable);
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").expect("just found");
+        person.parents.push("default::Archivable".into());
+        schema
+    }
+
+    #[test]
+    fn test_an_intersection_with_a_plain_abstract_fans_out() {
+        let schema = make_schema_with_a_plain_abstract();
+        let out = compile_and_emit_with("SELECT Post { who := [is default::Archivable].name }", &schema);
+        assert!(
+            !out.sql.contains("\"Archivable\""),
+            "a plain abstract backs no relation:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"public\".\"Person\""),
+            "read from the type that carries the column:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");

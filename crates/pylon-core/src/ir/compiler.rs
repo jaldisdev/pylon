@@ -1962,7 +1962,7 @@ impl<'a> Compiler<'a> {
         self.schema
             .types
             .iter()
-            .filter(|t| !t.abstract_ && t.interfaces.iter().any(|i| i == iface_qname))
+            .filter(|t| !t.abstract_ && Self::is_or_implements(t, iface_qname))
             .map(|t| IrPolyImplementor {
                 type_name: format!("{}::{}", t.module, t.name),
                 table: t.table.clone(),
@@ -6828,9 +6828,10 @@ impl<'a> Compiler<'a> {
             },
         }));
 
+        let poly = self.poly_fanout_for(&concrete_qname);
         Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
             IrSource {
-                poly: None,
+                poly,
                 type_name: concrete_qname,
                 table: concrete_table,
                 alias: sub_alias,
@@ -11840,7 +11841,10 @@ impl<'a> Compiler<'a> {
             .types
             .iter()
             .find(|t| format!("{}::{}", t.module, t.name) == type_name)?;
-        if !(td.abstract_ && td.materialized) {
+        // A materialised interface has a view to read; a plain abstract has no
+        // relation at all, so reading its table name finds nothing. Both are
+        // answered by the union of the types that carry the columns.
+        if !td.abstract_ {
             return None;
         }
         let (implementors, columns) = self.collect_poly_info(type_name);
