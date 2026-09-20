@@ -7196,6 +7196,24 @@ impl<'a> Compiler<'a> {
             && el.compexpr.is_none()
             && el.path.steps.len() >= 2
         {
+            // `[is T].configs: { … }` — a shape says the pointer is read as
+            // objects, which the scalar route below cannot give: it resolves
+            // a stored property and nothing else.
+            if let Some(nested) = el.nested.as_deref()
+                && !nested.is_empty()
+                && let Some(ast::PathStep::Name(leaf)) = el.path.steps.last()
+                && let Some(ptr) = self.try_compile_pointer_expr(
+                    &leaf.clone(),
+                    &Expr::Path(el.path.clone()),
+                    td,
+                    alias,
+                    module,
+                    el.marker_offset,
+                    nested,
+                )?
+            {
+                return Ok(ptr);
+            }
             let type_ref = type_ref.clone();
             return self.compile_type_intersection_pointer(&type_ref, &el.path.steps[1..], alias, el.marker_offset);
         }
