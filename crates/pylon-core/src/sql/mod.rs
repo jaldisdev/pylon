@@ -5023,6 +5023,33 @@ mod tests {
     }
 
     #[test]
+    fn test_one_branch_of_an_object_if_else_is_empty() {
+        // `{}` contributes no rows, so the upstream engine's own rewrite (`SELECT A WHERE
+        // Cond UNION ALL SELECT B WHERE NOT Cond`) reduces to the other
+        // branch under its guard.
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person LIMIT 1) SELECT p { name } IF EXISTS p ELSE {}",
+            &make_schema(),
+        );
+        assert!(!out.sql.contains("UNION ALL"), "nothing to union with:\n{}", out.sql);
+        assert!(out.sql.contains("'default::Person'::text"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_mutation_under_a_condition_is_refused() {
+        // Guarding the branch only filters what is read back -- the mutation
+        // is its own CTE and Postgres runs it regardless. Compiling this
+        // would insert even when the condition is false, silently, so it has
+        // to stay an error until the condition can be folded into the
+        // mutation itself.
+        let ast = parse::parse("SELECT (INSERT Person { name := $n }) IF FALSE ELSE {}").unwrap();
+        assert!(
+            ir::compile(&ast, &make_schema()).is_err(),
+            "a conditional mutation must not compile to an unconditional one"
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
