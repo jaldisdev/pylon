@@ -89,5 +89,22 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("math", "var", vec![p("s", set_of(Decimal))], Decimal, B("var_samp")),
         f("math", "var_pop", vec![p("s", set_of(Float64))], Float64, B("var_pop")),
         f("math", "var_pop", vec![p("s", set_of(Decimal))], Decimal, B("var_pop")),
+        // The upstream engine declares these in `math::`, not `std::` — `std::ceil` alone
+        // leaves `math::ceil(…)` reading as a function that does not exist.
+        f("math", "abs", vec![p("x", Int64)], Int64, B("abs")),
+        f("math", "abs", vec![p("x", Float64)], Float64, B("abs")),
+        f("math", "abs", vec![p("x", Decimal)], Decimal, B("abs")),
+        f("math", "ceil", vec![p("x", Int64)], Int64, B("ceil")),
+        f("math", "ceil", vec![p("x", Float64)], Float64, B("ceil")),
+        f("math", "ceil", vec![p("x", Decimal)], Decimal, B("ceil")),
+        f("math", "floor", vec![p("x", Int64)], Int64, B("floor")),
+        f("math", "floor", vec![p("x", Float64)], Float64, B("floor")),
+        f("math", "floor", vec![p("x", Decimal)], Decimal, B("floor")),
+        f("math", "sqrt", vec![p("x", Int64)], Float64, E("sqrt($1::float8)")),
+        f("math", "sqrt", vec![p("x", Float64)], Float64, B("sqrt")),
+        f("math", "sqrt", vec![p("x", Decimal)], Decimal, B("sqrt")),
+        f("math", "mean", vec![p("vals", set_of(Int64))], Float64, E("avg($1)::float8")),
+        f("math", "mean", vec![p("vals", set_of(Float64))], Float64, B("avg")),
+        f("math", "mean", vec![p("vals", set_of(Decimal))], Decimal, B("avg")),
     ]
 }
