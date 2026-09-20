@@ -1593,8 +1593,26 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
 /// it is returned as a bare top-level column, `Enum` when
 /// enum-typed, else a plain `Scalar`.
 fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
-    use crate::query::ShapeNode;
+    use crate::query::{Cardinality, ShapeNode};
     match expr {
+        IrExpr::ObjectPathSubquery(ps) => {
+            let IrPathResult::Object {
+                alias,
+                type_name,
+                shape,
+            } = &ps.result
+            else {
+                unreachable!("an object path subquery always lands on an object")
+            };
+            let (_, pointer_nodes) = build_shape(shape, alias);
+            ShapeNode::Object {
+                name: name.to_string(),
+                type_name: Some(type_name.clone()),
+                position,
+                cardinality: Cardinality::Optional,
+                pointers: prepend_type(pointer_nodes),
+            }
+        }
         IrExpr::TypeCast(c) if c.tuple_shape.is_some() => {
             let shape = c.tuple_shape.as_ref().unwrap();
             ShapeNode::NamedTuple {
@@ -3768,6 +3786,30 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             sql
         }
 
+        IrExpr::ObjectPathSubquery(ps) => {
+            let IrPathResult::Object {
+                alias,
+                type_name,
+                shape,
+            } = &ps.result
+            else {
+                unreachable!("an object path subquery always lands on an object")
+            };
+            let (pointer_exprs, _) = build_shape(shape, alias);
+            let mut parts = vec![result_type_disc(ps, alias, type_name)];
+            parts.extend(pointer_exprs);
+            let mut sql = format!(
+                "(SELECT (\n    {}\n)\nFROM {}",
+                parts.join(",\n    "),
+                emit_path_joins(&ps.root, &ps.joins),
+            );
+            append_filter(&mut sql, &ps.filter);
+            append_order_by(&mut sql, &ps.order_by);
+            append_offset_limit(&mut sql, &ps.offset, &ps.limit);
+            sql.push(')');
+            sql
+        }
+
         IrExpr::ObjectSubquery(sel) => {
             let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
                 unreachable!("an object subquery is always schema-bound")
@@ -4579,6 +4621,37 @@ mod tests {
         assert!(
             out.sql.contains("SELECT v AS result, v FROM"),
             "the object row is already the result row:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_shape_on_a_single_valued_object_path() {
+        // `c := .company { name }` — an object route existed only for walks
+        // that crossed a multi step, so a single-valued one fell through to
+        // expression position and reported "shapes and set literals are not
+        // valid in expression context".
+        let out = compile_and_emit_with("SELECT Person { c := .company { name } }", &make_schema());
+        assert!(
+            out.sql.contains("'default::Company'::text"),
+            "the pointer must carry the object's own row:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("ARRAY(SELECT"),
+            "a single-valued walk is one object, not an array of one:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_shapeless_single_link_still_reads_as_its_value() {
+        // The object route is taken only when a shape says an object was
+        // meant; without one this stays what it always was.
+        let out = compile_and_emit_with("SELECT Person { c := .company }", &make_schema());
+        assert!(
+            !out.sql.contains("'default::Company'::text"),
+            "a bare link reference must not grow an object row:\n{}",
             out.sql
         );
     }

@@ -3827,13 +3827,29 @@ impl<'a> Compiler<'a> {
         if p.partial {
             return Ok(None);
         }
-        let [ast::PathStep::Name(name)] = p.steps.as_slice() else {
+        let rest_steps = p.steps.as_slice();
+        let Some(ast::PathStep::Name(name)) = rest_steps.first() else {
             return Ok(None);
         };
         let cte_name = self.cte_object_type(name).map(|_| name.clone());
         let Ok(td) = self.resolve_path_root(name) else {
             return Ok(None);
         };
+        // `account := resource.account { id }` — the field holds what a walk
+        // off the binding lands on, so it is that walk with the shape on it
+        // rather than a plain read of the binding.
+        if rest_steps.len() > 1 {
+            let synthetic = ast::SelectStmt {
+                result: Expr::Path(p.clone()),
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            };
+            let path_select = self.compile_path_select(&synthetic, p, &sh.elements, false)?;
+            return Ok(Some(IrExpr::ObjectPathSubquery(Box::new(path_select))));
+        }
         let alias = self.fresh_alias();
         let source = IrSource {
             poly: self.poly_fanout_for(&format!("{}::{}", td.module, td.name)),
@@ -6260,6 +6276,7 @@ impl<'a> Compiler<'a> {
     /// Rooted at the enclosing type and correlated back to the enclosing row,
     /// exactly as `compile_partial_path_as_subquery` does for a value, then
     /// aggregated so the rows survive as rows.
+    #[allow(clippy::too_many_arguments)]
     fn compile_chained_link_pointer(
         &mut self,
         pointer_name: &str,
@@ -6268,6 +6285,7 @@ impl<'a> Compiler<'a> {
         alias: &str,
         nested: &[ShapeElement],
         modifiers: Option<&ast::SelectStmt>,
+        multi: bool,
     ) -> Result<IrShapePointer, PyQLError> {
         let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
         steps.extend(path.steps.iter().cloned());
@@ -6282,10 +6300,18 @@ impl<'a> Compiler<'a> {
         };
         let mut path_select = self.compile_path_select(&synthetic, &full_path, nested, false)?;
         Self::correlate_path_select(&mut path_select, alias);
+        // A walk that crosses a multi step stands for a set, so it is
+        // aggregated; one that cannot is a single object and is read as one,
+        // rather than an array of length one.
+        let expr = if multi {
+            IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(path_select))))
+        } else {
+            IrExpr::ObjectPathSubquery(Box::new(path_select))
+        };
         Ok(IrShapePointer::Computed(IrComputedPointer {
             marker_offset: None,
             alias: pointer_name.to_string(),
-            expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(path_select)))),
+            expr,
         }))
     }
 
@@ -6746,15 +6772,28 @@ impl<'a> Compiler<'a> {
             // it stays an object pointer instead of collapsing to the bare ids
             // an expression-position path gives — which, worse, was a scalar
             // subquery that failed outright the moment a second row matched.
-            steps if matches!(steps.first(), Some(ast::PathStep::Name(_))) => {
+            // A leading `[is T]` narrows what the walk starts from
+            // (`brand := [is BrandOrderLineItem].brand { * }`); the walk
+            // itself is the same one a bare name starts.
+            steps
+                if matches!(
+                    steps.first(),
+                    Some(ast::PathStep::Name(_) | ast::PathStep::TypeIntersection(_))
+                ) =>
+            {
                 let (multi, target) = self.walk_path_types(td, steps, MAX_COMPUTED_SPLICES);
-                if !multi || target.is_none() {
+                // A single-valued walk takes this route only when a shape was
+                // written on it (`account := resource.account { id }`), which
+                // is what says an object was meant. Without one, a bare
+                // `x := .link` still stands for the link's value, as it did
+                // before there was an object route at all.
+                if target.is_none() || (!multi && nested.is_empty()) {
                     return Ok(None);
                 }
                 let path = path.clone();
                 let nested = nested.to_vec();
                 return self
-                    .compile_chained_link_pointer(pointer_name, &path, td, alias, &nested, modifiers)
+                    .compile_chained_link_pointer(pointer_name, &path, td, alias, &nested, modifiers, multi)
                     .map(Some);
             }
             _ => return Ok(None),
