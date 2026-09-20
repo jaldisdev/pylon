@@ -6003,6 +6003,23 @@ mod tests {
     }
 
     #[test]
+    fn test_walking_through_a_computed_field_access() {
+        use crate::schema::ComputedDescriptor;
+        // `parent := (select .parents … limit 1).parent` — the modifiers belong
+        // to the step before the field access, not to what it lands on.
+        let mut schema = make_schema_with_computed_links();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+        person.computed.push(ComputedDescriptor {
+            name: "latest_title".into(),
+            expression: "(select .posts order by .title desc limit 1).title".into(),
+            return_type: None,
+        });
+        let out = compile_and_emit_with("SELECT Person { x := .latest_title }", &schema);
+        assert!(out.sql.contains("\"title\""), "{}", out.sql);
+        assert!(out.sql.contains("LIMIT"), "the computed's own limit survives:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

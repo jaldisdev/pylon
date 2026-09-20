@@ -3142,7 +3142,15 @@ impl<'a> Compiler<'a> {
             // A computed pointer declared on the type reached so far (or on
             // an interface it implements).
             if let Some(cd) = self.resolve_computed(current_td, step_name) {
-                let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+                let parsed = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+                // `(select .parents … limit 1).parent` reads as the select over
+                // the walk those two make together.
+                let rewritten = Self::field_access_over_select(&parsed);
+                let expr_ast = match &rewritten {
+                    Some((sel, _)) => Expr::SubQuery(Box::new(Stmt::Select(sel.clone()))),
+                    None => parsed,
+                };
+                let field_steps = rewritten.as_ref().map(|(_, n)| *n).unwrap_or(0);
 
                 // Traversing *through* it: a computed has no stored column
                 // for a join to hang off, but if it just names a link — with
@@ -3183,7 +3191,8 @@ impl<'a> Compiler<'a> {
                             limit: m.limit.clone(),
                             lock: None,
                         };
-                        let mut inner = self.compile_path_select(&inner_sel, &inner_path, &[], false)?;
+                        let mut inner =
+                            self.compile_path_select_with_tail(&inner_sel, &inner_path, &[], false, field_steps)?;
                         Self::correlate_path_select(&mut inner, &current_alias);
                         let IrPathResult::Object { type_name, .. } = &inner.result else {
                             return Err(self.type_err(&format!(
@@ -7903,6 +7912,36 @@ impl<'a> Compiler<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `((select .parents filter … limit 1)).parent` — a computed whose value
+    /// is a field access off its own sub-select. Rewritten as the select over
+    /// the extended path, plus how many steps the field access contributed:
+    /// the modifiers belong to the step *before* them, which is what a walk's
+    /// `tail` pins them to.
+    fn field_access_over_select(expr: &Expr) -> Option<(ast::SelectStmt, usize)> {
+        let (root, fields) = Self::peel_field_access_chain(expr);
+        if fields.is_empty() {
+            return None;
+        }
+        let Expr::SubQuery(stmt) = root else { return None };
+        let Stmt::Select(sel) = stmt.as_ref() else {
+            return None;
+        };
+        let Expr::Path(path) = &sel.result else { return None };
+        if !path.partial {
+            return None;
+        }
+        let mut steps = path.steps.clone();
+        let count = fields.len();
+        steps.extend(fields.into_iter().map(ast::PathStep::Name));
+        Some((
+            ast::SelectStmt {
+                result: Expr::Path(ast::Path { steps, partial: true }),
+                ..sel.clone()
+            },
+            count,
+        ))
     }
 
     /// A computed pointer whose right-hand side names a *link* rather than
