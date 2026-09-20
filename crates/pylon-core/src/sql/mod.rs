@@ -4801,6 +4801,29 @@ mod tests {
     }
 
     #[test]
+    fn test_exists_over_a_sub_select_on_a_relative_path() {
+        // `exists ((select .posts filter …))` — the sub-select is relative to
+        // the enclosing object, so it needs the same rooting and correlation
+        // `count((select .posts))` gets. Compiled without them it resolved in
+        // free context and called the pointer unknown.
+        let out = compile_and_emit_with(
+            "SELECT Person { id } FILTER EXISTS ((SELECT .posts FILTER .title = $t))",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("EXISTS("), "{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person.posts\""),
+            "the junction join must survive into the EXISTS:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"t0\".\"id\""),
+            "and it must correlate to the enclosing row:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
