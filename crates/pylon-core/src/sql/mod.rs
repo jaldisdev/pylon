@@ -1648,6 +1648,20 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
         // A path select aggregated into an array keeps its rows' own shape, so
         // the elements hydrate as objects rather than as opaque scalars.
         IrExpr::ArrayFromSelect(source) => match source.as_ref() {
+            IrArraySource::ObjectFunction(fs) => {
+                let (_, nodes) = build_shape(&fs.shape, &fs.alias);
+                ShapeNode::Array {
+                    name: name.to_string(),
+                    position,
+                    element: Box::new(ShapeNode::Object {
+                        name: String::new(),
+                        type_name: Some(fs.type_name.clone()),
+                        position: 0,
+                        cardinality: Cardinality::Many,
+                        pointers: prepend_type(nodes),
+                    }),
+                }
+            }
             IrArraySource::ObjectSelect(sel) => {
                 let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
                     unreachable!("IrArraySource::ObjectSelect is always schema-bound")
@@ -1925,6 +1939,24 @@ fn emit_array_source(src: &IrArraySource) -> String {
             };
             let mut sql = format!("SELECT {} FROM {} AS {}", scalar, source_ref(source), qi(&source.alias));
             append_filter(&mut sql, &s.filter);
+            format!("ARRAY({})", sql)
+        }
+        IrArraySource::ObjectFunction(fs) => {
+            let (exprs, _) = build_shape(&fs.shape, &fs.alias);
+            let mut parts = vec![sql_str(&fs.type_name) + "::text"];
+            parts.extend(exprs);
+            let args_sql = fs.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+            let mut sql = format!(
+                "SELECT (\n    {}\n) FROM {}.{}({}) AS {}",
+                parts.join(",\n    "),
+                pg_schema(&fs.fn_module),
+                qi(&fs.fn_name),
+                args_sql,
+                qi(&fs.alias),
+            );
+            append_filter(&mut sql, &fs.filter);
+            append_order_by(&mut sql, &fs.order_by);
+            append_offset_limit(&mut sql, &fs.offset, &fs.limit);
             format!("ARRAY({})", sql)
         }
         IrArraySource::ObjectSelect(s) => {
@@ -4957,6 +4989,37 @@ mod tests {
             &make_schema(),
         );
         assert!(out.sql.contains("'default::Post'::text"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_computed_declared_as_an_object_returning_call() {
+        // `recent := recent()` — the rows the function yields are the
+        // pointer's objects. Read as a plain expression the call was "part of
+        // a larger expression", which such a function refuses, so a splat over
+        // a type carrying one could not compile at all.
+        let mut schema = make_schema();
+        schema.functions.push(crate::schema::FunctionDescriptor {
+            name: "recent".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Post".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Post".into(),
+        });
+        schema.types[0].computed.push(crate::schema::ComputedDescriptor {
+            name: "recent".into(),
+            expression: "default::recent()".into(),
+            return_type: None,
+        });
+        let out = compile_and_emit_with("SELECT Person { recent }", &schema);
+        assert!(
+            out.sql.contains("ARRAY(SELECT") && out.sql.contains("'default::Post'::text"),
+            "the pointer must carry the function's rows:\n{}",
+            out.sql
+        );
     }
 
     #[test]

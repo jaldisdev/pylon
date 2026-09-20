@@ -7050,6 +7050,50 @@ impl<'a> Compiler<'a> {
     /// a sub-select over a link — `(select .emails filter .primary limit 1)`
     /// — is an object pointer, exactly as if it had been written inline, so
     /// it takes the same route; everything else is a scalar expression.
+    /// An object-returning function call as a row source, with the shape the
+    /// pointer asked for (its target's own pk when none was written).
+    fn compile_fn_object_source(
+        &mut self,
+        fc: &ast::FunctionCall,
+        nested: &[ShapeElement],
+    ) -> Result<Option<IrFunctionSelect>, PyQLError> {
+        let Some(fd) = self.schema.functions.iter().find(|f| {
+            let module_matches = fc.module.as_deref().map(|m| m == f.module.as_str()).unwrap_or(true);
+            module_matches && f.name == fc.name && f.return_is_object
+        }) else {
+            return Ok(None);
+        };
+        let (fn_module, fn_name, return_type_name) = (fd.module.clone(), fd.name.clone(), fd.return_pg_type.clone());
+        let return_td = self.resolve_type(&return_type_name)?;
+        let alias = self.fresh_alias();
+        let shape = if nested.is_empty() {
+            Self::pk_returning(return_td)
+        } else {
+            self.compile_shape(nested, return_td, &alias, &return_td.module)?
+        };
+        let args = fc
+            .args
+            .iter()
+            .map(|a| self.compile_free_expr(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(IrFunctionSelect {
+            fn_module,
+            fn_name,
+            fn_args: args,
+            alias,
+            type_name: format!("{}::{}", return_td.module, return_td.name),
+            polymorphic: false,
+            poly_implementors: vec![],
+            poly_columns: vec![],
+            shape,
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            distinct: false,
+        }))
+    }
+
     fn compile_declared_computed(
         &mut self,
         cd: &crate::schema::ComputedDescriptor,
@@ -7074,6 +7118,19 @@ impl<'a> Compiler<'a> {
                 compiler.try_compile_pointer_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)?
             {
                 return Ok(ptr);
+            }
+            // `manifest := retrieve_connector_manifest(.id)` — a computed whose
+            // expression is an object-returning call. The rows it yields are
+            // the pointer's objects; read as a plain expression the call is
+            // "part of a larger expression", which such a function refuses.
+            if let Expr::FunctionCall(fc) = &expr_ast
+                && let Some(fs) = compiler.compile_fn_object_source(fc, nested)?
+            {
+                return Ok(IrShapePointer::Computed(IrComputedPointer {
+                    marker_offset,
+                    alias: cd.name.clone(),
+                    expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectFunction(Box::new(fs)))),
+                }));
             }
             let ir = compiler.compile_expr(&expr_ast, td, alias)?;
             Ok(IrShapePointer::Computed(IrComputedPointer {
