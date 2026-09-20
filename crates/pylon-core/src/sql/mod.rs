@@ -5428,6 +5428,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_walk_off_a_for_loop_variable_reads_the_binding() {
+        // The rows a sibling CTE just wrote are not in the base table yet, so
+        // a walk that re-reads the table finds nothing.
+        let out = compile_and_emit(
+            "WITH ps := (SELECT Post) FOR q IN ps UNION (SELECT Person FILTER .name = q.title)",
+        );
+        assert!(
+            out.sql.contains("FROM \"ps\""),
+            "the walk reads the binding:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_count_of_a_binding_counts_its_rows() {
         // Read as an ordinary expression a binding becomes a scalar subquery,
         // which aborts on the second row.
