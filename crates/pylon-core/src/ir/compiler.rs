@@ -11189,8 +11189,37 @@ impl<'a> Compiler<'a> {
         let Expr::SubQuery(stmt) = expr else {
             return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)"));
         };
+        // `else (select usage::Allowance)` — yield the conflicting row rather
+        // than change it. `DO NOTHING` returns nothing at all, so the row is
+        // read back by assigning its own key to itself, which is what makes
+        // `RETURNING` see it.
+        if let Stmt::Select(sel) = stmt.as_ref()
+            && sel.filter.is_none()
+            && sel.limit.is_none()
+            && sel.offset.is_none()
+            && let Ok(type_name) = self.expr_as_type_name(&sel.result)
+            && let Ok(sel_td) = self.resolve_type(&type_name)
+        {
+            let table = sel_td.table.clone();
+            let pk = sel_td
+                .properties
+                .iter()
+                .find(|p| p.is_pk)
+                .ok_or_else(|| self.type_err(&format!("type '{type_name}' has no primary key to read back")))?;
+            return Ok(vec![(
+                pk.name.clone(),
+                IrExpr::ColumnRef {
+                    alias: table,
+                    column: pk.name.clone(),
+                    pg_type: pk.pg_type.clone(),
+                },
+            )]);
+        }
         let Stmt::Update(upd) = stmt.as_ref() else {
-            return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression"));
+            return Err(self.type_err(
+                "UNLESS CONFLICT ELSE must be an UPDATE that changes the conflicting row, or a \
+                 SELECT of its type to read it back unchanged",
+            ));
         };
         let type_name = self.expr_as_type_name(&upd.subject)?;
         let upd_td = self.resolve_type(&type_name)?;
