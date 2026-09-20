@@ -5624,6 +5624,15 @@ mod tests {
     }
 
     #[test]
+    fn test_an_aggregate_over_a_relative_walk_runs_inside_the_subquery() {
+        // Compiled as an expression the walk stands for the array of its
+        // elements, leaving the aggregate with an array argument.
+        let out = compile_and_emit("SELECT Person { latest := max(.posts.title) }");
+        assert!(out.sql.contains("(SELECT max("), "{}", out.sql);
+        assert!(!out.sql.contains("max(ARRAY("), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
