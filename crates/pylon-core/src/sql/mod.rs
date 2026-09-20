@@ -5732,6 +5732,13 @@ mod tests {
     }
 
     #[test]
+    fn test_a_trailing_shape_on_a_field_access_select() {
+        let out = compile_and_emit("SELECT (SELECT Person).company { name }");
+        assert!(out.sql.contains("\"name\""), "{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"Company\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

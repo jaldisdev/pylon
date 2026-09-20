@@ -1295,6 +1295,16 @@ impl<'a> Compiler<'a> {
         outer: &ast::SelectStmt,
         result: &Expr,
     ) -> Result<Option<IrStmt>, PyQLError> {
+        // `(select T).chapter { … }` — the parser folds a trailing shape around
+        // the whole field access, so the chain has to be peeled out of it or
+        // the select reads as one with no type for a subject.
+        let (result, trailing_shape): (&Expr, &[ShapeElement]) = match result {
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(inner @ Expr::FieldAccess { .. }) => (inner, sh.elements.as_slice()),
+                _ => (result, &[]),
+            },
+            other => (other, &[]),
+        };
         let (root, fields) = Self::peel_field_access_chain(result);
         if fields.is_empty() {
             return Ok(None);
@@ -1344,10 +1354,22 @@ impl<'a> Compiler<'a> {
             let Expr::Path(merged_path) = &merged.result else {
                 unreachable!("built as a path just above")
             };
-            let ps = self.compile_path_select_with_tail(&merged, merged_path, &[], false, field_count)?;
+            let ps = self.compile_path_select_with_tail(&merged, merged_path, trailing_shape, false, field_count)?;
             return Ok(Some(IrStmt::PathSelect(ps)));
         }
 
+        let merged = if trailing_shape.is_empty() {
+            merged
+        } else {
+            ast::SelectStmt {
+                result: Expr::Shape(Box::new(ast::ShapeExpr {
+                    expr: Some(merged.result.clone()),
+                    elements: trailing_shape.to_vec(),
+                    marker_offset: None,
+                })),
+                ..merged
+            }
+        };
         let ir = self.compile_stmt(&Stmt::Select(merged))?;
         Ok(Some(ir))
     }
