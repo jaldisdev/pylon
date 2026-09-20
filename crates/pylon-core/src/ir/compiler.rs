@@ -5643,6 +5643,19 @@ impl<'a> Compiler<'a> {
                 self.common_union_type(&branches)
                     .ok_or_else(|| self.type_err("expected a type name as SELECT subject"))
             }
+            // `placed.line_items` — a walk names no type of its own; the type
+            // meant is the one it lands on, which is how `dml_subject_type`
+            // already reads the same path.
+            Expr::Path(p)
+                if !p.partial
+                    && p.steps.len() > 1
+                    && let Some(ast::PathStep::Name(root)) = p.steps.first()
+                    && let Ok(root_td) = self.resolve_path_root(root)
+                    && let (_, Some(target)) =
+                        self.walk_path_types(root_td, &p.steps[1..], MAX_COMPUTED_SPLICES) =>
+            {
+                Ok(format!("{}::{}", target.module, target.name))
+            }
             _ => Err(self.type_err("expected a type name as SELECT subject")),
         }
     }

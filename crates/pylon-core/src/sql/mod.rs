@@ -5923,6 +5923,39 @@ mod tests {
     }
 
     #[test]
+    fn test_a_link_value_can_be_a_walk_off_a_binding() {
+        // `(select placed.line_items limit 1)` — the walk names no type of its
+        // own, so reading one off it used to report the path as no type at all.
+        let mut schema = make_schema();
+        let company = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("make_schema declares Company");
+        company.properties.push(PropertyDescriptor {
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        let out = compile_and_emit_with(
+            "WITH others := (SELECT Person) \
+             SELECT (INSERT Person { name := $n, age := 1, company := (SELECT others.company LIMIT 1) })",
+            &schema,
+        );
+        assert!(out.sql.contains("\"company_id\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_a_shape_over_a_coalesce_of_walks() {
         // Each operand is a walk off the enclosing row, and every one after the
         // first only stands in when the ones before it are empty.
