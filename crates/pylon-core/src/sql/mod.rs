@@ -918,6 +918,99 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
     parts
 }
 
+/// A `for` whose body mutates, bound to a WITH name: the same iteration-driven
+/// shapes `emit_for_insert`/`emit_for_update` build at the top level, but split
+/// into sibling CTE parts. A data-modifying statement can neither sit inside
+/// another CTE's body nor in a LATERAL, so the loop cannot be emitted as the
+/// binding's own subquery the way a select-bodied one is.
+fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
+    let iter_alias = format!("_for_{}", f.var_name);
+    let (_, iter_cte) = emit_for_iterator(&f.iterator, &iter_alias);
+    let mut parts: Vec<String> = emit_user_cte_parts(&f.body_ctes);
+    parts.push(iter_cte);
+    let ids_name = format!("{}__ids", name);
+
+    match f.body.as_ref() {
+        IrStmt::Insert(ins) => {
+            let rewrite_cols: std::collections::HashSet<&str> =
+                ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+            let cols: Vec<String> = ins
+                .assignments
+                .iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(c, _)| qi(c))
+                .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
+                .collect();
+            let values: Vec<String> = ins
+                .assignments
+                .iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(_, e)| emit_expr(e))
+                .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
+                .collect();
+            let mut sql = format!(
+                "INSERT INTO {} ({})\nSELECT {} FROM {}",
+                source_ref(&ins.target),
+                cols.join(", "),
+                values.join(", "),
+                qi(&iter_alias),
+            );
+            if let Some(conflict) = &ins.unless_conflict {
+                emit_conflict(&mut sql, conflict);
+            }
+            sql.push_str("\nRETURNING *");
+            parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
+            for (i, append) in ins.multi_link_appends.iter().enumerate() {
+                parts.push(emit_ml_append_cte(append, &ids_name, &format!("{}__ml_add_{}", name, i)));
+            }
+        }
+        IrStmt::Update(upd) => {
+            let alias = &upd.target.alias;
+            if upd.assignments.is_empty() && upd.rewrites.is_empty() && !upd.multi_link_appends.is_empty() {
+                const ITER_COL: &str = "_iter";
+                let mut ids_sql = format!(
+                    "\"{}\" AS (\nSELECT {}.*, {}.\"v\" AS {} FROM {} AS {}, {}",
+                    ids_name,
+                    qi(alias),
+                    qi(&iter_alias),
+                    qi(ITER_COL),
+                    source_ref(&upd.target),
+                    qi(alias),
+                    qi(&iter_alias),
+                );
+                append_filter(&mut ids_sql, &upd.filter);
+                ids_sql.push_str("\n)");
+                parts.push(ids_sql);
+                for (i, append) in upd.multi_link_appends.iter().enumerate() {
+                    parts.push(emit_for_ml_append_cte(
+                        append,
+                        &ids_name,
+                        &format!("{}__ml_add_{}", name, i),
+                        ITER_COL,
+                    ));
+                }
+            } else {
+                let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
+                let mut sql = format!(
+                    "UPDATE {} AS {}\nSET {}\nFROM {}",
+                    source_ref(&upd.target),
+                    qi(alias),
+                    sets.join(", "),
+                    qi(&iter_alias),
+                );
+                append_filter(&mut sql, &upd.filter);
+                sql.push_str(&format!("\nRETURNING {}.*", qi(alias)));
+                parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
+            }
+        }
+        // Unreachable: only a mutating body is routed here.
+        other => unreachable!("for-loop body is not a mutation: {other:?}"),
+    }
+
+    parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
+    parts
+}
+
 /// Expands a list of user-bound WITH names into their top-level CTE parts —
 /// usually one part per name, except an UPDATE or INSERT with any multi-link
 /// mutation expands into several sibling parts (see
@@ -961,6 +1054,12 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             && !del.poly_implementors.is_empty()
         {
             parts.extend(emit_poly_delete_dml_ctes(del, &c.name));
+            continue;
+        }
+        if let IrStmt::For(f) = &c.stmt
+            && matches!(f.body.as_ref(), IrStmt::Insert(_) | IrStmt::Update(_))
+        {
+            parts.extend(emit_for_dml_ctes(f, &c.name));
             continue;
         }
         parts.push(format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)));
@@ -5437,6 +5536,23 @@ mod tests {
         assert!(
             out.sql.contains("FROM \"ps\""),
             "the walk reads the binding:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_mutating_for_loop_binding_becomes_sibling_ctes() {
+        let out = compile_and_emit(
+            "WITH made := (FOR n IN {'a', 'b'} UNION (INSERT Post { title := n })) SELECT count(made)",
+        );
+        assert!(
+            out.sql.contains("\"made__ids\" AS (\nINSERT INTO"),
+            "the insert is its own top-level CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("LATERAL"),
+            "DML cannot sit in a LATERAL:\n{}",
             out.sql
         );
     }

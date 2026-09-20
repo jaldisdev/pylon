@@ -20,14 +20,11 @@
 //! Live-Postgres tests for `FOR x IN {...} UNION (...)` — bulk insert (the
 //! `emit_for_insert` VALUES-CTE path), a `SELECT` body (the
 //! `CROSS JOIN LATERAL` path), the for-variable composing inside a body
-//! expression (not just a bare assignment), and the empty-iterator no-op
-//! case. Scoped to what Pylon actually supports: the `ForStmt` iterator
-//! takes a scalar `{...}` set literal only (`Compiler::compile_for`'s
-//! `IrForIterator::Values`), not an arbitrary set-returning expression
-//! (e.g. `for x in Person union (...)`), and `emit_for_stmt` implements
-//! only `Insert` and
-//! `Select`/`PathSelect` bodies — an `UPDATE`/`DELETE` for-loop body hits an
-//! unimplemented `panic!`, so this file doesn't exercise those.
+//! expression (not just a bare assignment), the empty-iterator no-op
+//! case, and an `UPDATE` body appending the row it iterates (the
+//! `emit_for_update` path, which drives both the update and its junction
+//! rows from the iteration — a LATERAL cannot hold DML). A `DELETE` body is
+//! still refused, so this file doesn't exercise one.
 //!
 //! No prior live test in this suite ever executed a `FOR` query against
 //! real data, and there were no pure unit tests for `FOR`'s SQL emission at
@@ -235,4 +232,64 @@ async fn for_loop_with_empty_iterator_set_is_a_no_op() {
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person")).await;
     assert_eq!(rows.len(), 0, "an empty iterator set must insert nothing, got {rows:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn for_loop_appends_only_the_row_it_is_iterating() {
+    // The junction rows have to be driven from the iteration. Compiled from
+    // an uncorrelated value subquery instead, `friends += p` reads the whole
+    // table and links every Person to every other one.
+    let module = unique_module("live_for_ml_append");
+    let mut person = ty("Person", &module, vec![id_prop(), text_prop("name"), int_prop("age")]);
+    person.multilinks = vec![multilink("friends", &format!("{module}::Person"))];
+    let sd = SchemaDescriptor {
+        types: vec![person],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for name in ["ana", "bo", "cy"] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := 1 }}"),
+        )
+        .await;
+    }
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with others := (select {module}::Person filter .name != 'ana') \
+             for p in others union (update {module}::Person filter .name = 'ana' set {{ friends += p }})"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name, friends: {{ name }} }} order by .name"),
+    )
+    .await;
+    let friend_counts: Vec<(String, usize)> = rows
+        .iter()
+        .map(|row| {
+            let name = as_str(field(row, 1)).to_string();
+            let friends = match field(row, 2) {
+                DecodedValue::Array(items) => items.len(),
+                DecodedValue::Null => 0,
+                other => panic!("expected an array of friends, got {other:?}"),
+            };
+            (name, friends)
+        })
+        .collect();
+    assert_eq!(
+        friend_counts,
+        vec![("ana".into(), 2), ("bo".into(), 0), ("cy".into(), 0)],
+        "only the iterated rows are linked, and only onto the updated row"
+    );
 }
