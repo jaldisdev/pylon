@@ -5987,6 +5987,18 @@ impl<'a> Compiler<'a> {
                         ),
                         position: Position { line: 0, col: 0 },
                     }));
+                } else if Self::resolve_multilink(td, pointer_name).is_some() {
+                    return Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)));
+                } else if self.resolve_computed(td, pointer_name).is_some() {
+                    // Reported as "no link or property 'x'. Did you mean 'x'?"
+                    // before: the suggester's name list includes computeds,
+                    // the resolution above does not, so it handed back the very
+                    // name it had just refused.
+                    return Err(self.type_err(&format!(
+                        "cannot assign to '{pointer_name}': it is a computed pointer on \
+                         {}::{}, which has no stored column to write",
+                        td.module, td.name
+                    )));
                 } else {
                     return Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)));
                 };
