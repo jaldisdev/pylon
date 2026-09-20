@@ -5817,6 +5817,34 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        // `emails := (select .emails filter .primary)` — a relative path here
+        // is relative to the row being written, so it is rooted at that type
+        // and correlated back to it; compiled bare it has no object to
+        // resolve against and reads as a free select.
+        if let Expr::SubQuery(inner) = expr
+            && let Stmt::Select(sel) = inner.as_ref()
+            && let Expr::Path(path) = &sel.result
+            && path.partial
+        {
+            let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+            steps.extend(path.steps.iter().cloned());
+            let rooted = ast::Path { steps, partial: false };
+            let synthetic = ast::SelectStmt {
+                result: Expr::Path(rooted.clone()),
+                filter: sel.filter.clone(),
+                order_by: sel.order_by.clone(),
+                offset: sel.offset.clone(),
+                limit: sel.limit.clone(),
+                lock: None,
+            };
+            let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
+            Self::correlate_path_select(&mut ps, alias);
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
+                link_props: vec![],
+            });
+        }
+
         // Parenthesised subquery
         if let Expr::SubQuery(inner) = expr {
             return match self.compile_stmt(inner)? {
@@ -7696,6 +7724,46 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// A sub-select written relative to the enclosing object (`(select
+    /// .emails filter .primary)`, with or without a shape), as a path select
+    /// rooted at that object and correlated back to its row.
+    ///
+    /// Several places compile a sub-select with no context and so lose the
+    /// object a relative path hangs off -- it then resolves in free context
+    /// and reports the pointer as unknown. `None` when the statement is not
+    /// of that shape, so the caller can carry on as before.
+    fn relative_subselect(
+        &mut self,
+        stmt: &Stmt,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<IrPathSelect>, PyQLError> {
+        let (Some((td, alias)), Stmt::Select(sel)) = (ctx, stmt) else {
+            return Ok(None);
+        };
+        let (path, shape): (&ast::Path, &[ShapeElement]) = match &sel.result {
+            Expr::Path(p) if p.partial => (p, &[]),
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::Path(p)) if p.partial => (p, sh.elements.as_slice()),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+        steps.extend(path.steps.iter().cloned());
+        let rooted = ast::Path { steps, partial: false };
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(rooted.clone()),
+            filter: sel.filter.clone(),
+            order_by: sel.order_by.clone(),
+            offset: sel.offset.clone(),
+            limit: sel.limit.clone(),
+            lock: None,
+        };
+        let mut ps = self.compile_path_select(&synthetic, &rooted, shape, false)?;
+        Self::correlate_path_select(&mut ps, alias);
+        Ok(Some(ps))
+    }
+
     /// Tie a path select's root row to the enclosing row by primary key —
     /// what makes a relative path's subquery see only the current object's
     /// side of the graph.
@@ -8003,7 +8071,10 @@ impl<'a> Compiler<'a> {
                     && !f.args.is_empty()
                     && let Expr::SubQuery(inner_stmt) = &f.args[0]
                 {
-                    let inner = self.compile_subquery_to_array_source(inner_stmt)?;
+                    let inner = match self.relative_subselect(inner_stmt, ctx)? {
+                        Some(ps) => IrArraySource::PathSelect(Box::new(ps)),
+                        None => self.compile_subquery_to_array_source(inner_stmt)?,
+                    };
                     let fn_pg = match f.name.as_str() {
                         "assert_single" => "assert_single",
                         "assert_exists" => "assert_exists",

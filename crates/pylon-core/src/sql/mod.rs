@@ -4869,6 +4869,37 @@ mod tests {
     }
 
     #[test]
+    fn test_a_relative_sub_select_keeps_its_enclosing_object() {
+        // `assert_exists((select .posts { title }))` and `posts := (select
+        // .posts filter …)` in an update both compiled their sub-select with
+        // no enclosing object, so the relative path resolved in free context
+        // and the pointer came back unknown.
+        let out = compile_and_emit_with(
+            "SELECT Person { ps := assert_exists((SELECT .posts { title })) }",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("assert_exists"), "{}", out.sql);
+        assert!(
+            out.sql.contains("\"Person.posts\""),
+            "the walk must reach the junction:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_relative_sub_select_as_a_multi_link_value() {
+        let out = compile_and_emit_with(
+            "UPDATE Person FILTER .name = $n SET { posts := (SELECT .posts FILTER .title = $t) }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("\"Person.posts\""),
+            "the value must read the row's own posts:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
