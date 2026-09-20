@@ -169,6 +169,7 @@ pub enum Expr {
     /// Binary set difference: `expr except expr` — rows in the left operand
     /// not present in the right, compiled to `EXCEPT`.
     Except(Box<Expr>, Box<Expr>),
+    Intersect(Box<Expr>, Box<Expr>),
     /// A global variable reference: `global name` or `global module::name`.
     Global(String),
     /// Index access: `expr[i]` (0-based).

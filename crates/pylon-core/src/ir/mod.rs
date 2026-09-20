@@ -741,6 +741,31 @@ pub struct IrDelete {
 
 // ── Expressions ─────────────────────────────────────────────────────────────────
 
+/// What the caller wants of a set operation: the set itself, whether it has
+/// anything in it, or an aggregate over its elements. Read as an array either
+/// way, `count()` would count the array as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetOpMode {
+    Array,
+    Exists,
+    Aggregate(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Intersect,
+    Except,
+}
+
+impl SetOpKind {
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Intersect => "INTERSECT",
+            Self::Except => "EXCEPT",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum IrExpr {
     /// A resolved column reference, e.g. `t0.name`.
@@ -787,6 +812,15 @@ pub enum IrExpr {
         fn_name: String,
         cte: String,
         column: Option<String>,
+    },
+    /// `array_unpack(a) intersect array_unpack(b)` — a set operation between
+    /// two set-valued expressions. Emits the array of what it yields, or
+    /// `EXISTS` over it when that is all the caller wanted.
+    SetOp {
+        op: SetOpKind,
+        left: Box<IrExpr>,
+        right: Box<IrExpr>,
+        mode: SetOpMode,
     },
     /// A reference to a named CTE used in expression context.
     /// `scalar = true`  → emits `(SELECT "result" FROM "cte_name")`

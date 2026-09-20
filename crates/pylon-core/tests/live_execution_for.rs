@@ -355,3 +355,32 @@ async fn nested_for_loops_insert_once_per_pair() {
         "one row per (outer, inner) pair, each carrying both loop variables"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn set_operations_run_over_their_elements() {
+    // Read as the array it stands for, `count(a intersect b)` counts the array
+    // — one, whatever the operation yielded.
+    let module = unique_module("live_set_ops");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for (pyql, expected) in [
+        ("select count((array_unpack(['x','y','z']) intersect array_unpack(['y','z','w'])))", 2),
+        ("select count((array_unpack(['x']) intersect array_unpack(['y'])))", 0),
+        ("select count((array_unpack(['x','y','z']) except array_unpack(['y'])))", 2),
+    ] {
+        let rows = rows_of(&pool, &sd, pyql).await;
+        assert_eq!(as_i64(field(&rows[0], 0)), expected, "{pyql}");
+    }
+
+    for (pyql, expected) in [
+        ("select exists(array_unpack(['x','y']) intersect array_unpack(['y']))", true),
+        ("select exists(array_unpack(['x']) intersect array_unpack(['y']))", false),
+    ] {
+        let rows = rows_of(&pool, &sd, pyql).await;
+        let got = matches!(field(&rows[0], 0), DecodedValue::Bool(b) if *b);
+        assert_eq!(got, expected, "{pyql}");
+    }
+}

@@ -3842,6 +3842,16 @@ impl<'a> Compiler<'a> {
             // "not valid in free SELECT" error — same as before the merge.
             other => {
                 let inner = self.compile_expr_ctx(other, ctx)?;
+                // A set operation already knows how to ask whether it yields
+                // anything; going through the array would build it first.
+                if let IrExpr::SetOp { op, left, right, .. } = inner {
+                    return Ok(IrExpr::SetOp {
+                        op,
+                        left,
+                        right,
+                        mode: super::SetOpMode::Exists,
+                    });
+                }
                 Ok(ir_is_not_null(inner))
             }
         }
@@ -9114,6 +9124,26 @@ impl<'a> Compiler<'a> {
                 // resolves the arg as a schema type reference or subquery.
                 if f.args.len() == 1 {
                     let arg = &f.args[0];
+                    // `count(a intersect b)` counts what the operation yields.
+                    // Read as an array it would count the array: always one.
+                    if matches!(arg, Expr::Intersect(_, _) | Expr::Except(_, _)) {
+                        use crate::stdlib::{ImplStrategy, lookup};
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let best = lookup(ns, &f.name)
+                            .iter()
+                            .find(|d| d.params.len() == 1)
+                            .map(|d| d.impl_strategy.clone());
+                        if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best
+                            && let IrExpr::SetOp { op, left, right, .. } = self.compile_expr_ctx(arg, ctx)?
+                        {
+                            return Ok(IrExpr::SetOp {
+                                op,
+                                left,
+                                right,
+                                mode: super::SetOpMode::Aggregate(sql_name.to_string()),
+                            });
+                        }
+                    }
                     // `count(memberships)` — a binding names a set, so the
                     // aggregate runs over its rows. Compiled as an ordinary
                     // expression it becomes a scalar subquery over the CTE,
@@ -9787,10 +9817,24 @@ impl<'a> Compiler<'a> {
                 position: Position { line: 0, col: 0 },
             })),
 
-            Expr::Except(_, _) => Err(PyQLError::Type(PyQLTypeError {
-                message: "except is not valid in expression context".into(),
-                position: Position { line: 0, col: 0 },
-            })),
+            // `array_unpack(a) intersect array_unpack(b)` — a set operation
+            // between two set-valued expressions is itself a set, which in
+            // expression position is the array of what it yields.
+            Expr::Except(left, right) | Expr::Intersect(left, right) => {
+                let op = if matches!(expr, Expr::Intersect(_, _)) {
+                    super::SetOpKind::Intersect
+                } else {
+                    super::SetOpKind::Except
+                };
+                let left = self.compile_expr_ctx(left, ctx)?;
+                let right = self.compile_expr_ctx(right, ctx)?;
+                Ok(IrExpr::SetOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    mode: super::SetOpMode::Array,
+                })
+            }
 
             // TypeIs (`expr is Type`) is schema-exclusive — compile_type_is
             // deeply needs td/alias throughout (interface checks, __type__
