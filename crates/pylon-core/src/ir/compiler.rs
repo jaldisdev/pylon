@@ -4419,6 +4419,33 @@ impl<'a> Compiler<'a> {
                         partial: false,
                     }))
                 }
+                // `a.answers.question union a.current_question` — a walk names
+                // no relation either, so it is hoisted the same way an inline
+                // select is.
+                Expr::Path(path) if !path.partial && path.steps.len() > 1 => {
+                    let synthetic = Stmt::Select(ast::SelectStmt {
+                        result: operand.clone(),
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        lock: None,
+                    });
+                    let Ok((cte_name, type_name)) = compiler.hoist_dml_as_cte(&synthetic) else {
+                        return Ok(operand.clone());
+                    };
+                    let Ok(td) = compiler.resolve_type(&type_name) else {
+                        return Ok(operand.clone());
+                    };
+                    compiler
+                        .cte_types
+                        .insert(cte_name.clone(), format!("{}::{}", td.module, td.name));
+                    rewritten = true;
+                    Ok(Expr::Path(ast::Path {
+                        steps: vec![ast::PathStep::Name(cte_name)],
+                        partial: false,
+                    }))
+                }
                 other => Ok(other.clone()),
             }
         };
