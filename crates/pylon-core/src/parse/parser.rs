@@ -489,6 +489,15 @@ impl Parser {
 
     // ── WITH ────────────────────────────────────────────────────────────────────
 
+    /// True when the next token opens a statement, so a comma just consumed
+    /// ended the list instead of separating it.
+    fn stmt_keyword_ahead(&self) -> bool {
+        matches!(
+            self.current(),
+            Token::With | Token::For | Token::Select | Token::Insert | Token::Update | Token::Delete | Token::Group
+        )
+    }
+
     fn parse_with(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         self.eat(&Token::With)?;
         let mut aliases = vec![];
@@ -502,6 +511,13 @@ impl Parser {
                 break;
             }
             self.advance();
+            // A trailing comma closes the list rather than promising another
+            // binding, the same as every other comma-separated list here and
+            // in EdgeQL (`WithDeclList`, declared with
+            // `allow_trailing_separator=True`).
+            if self.stmt_keyword_ahead() {
+                break;
+            }
         }
         let stmt = self.parse_inner_stmt()?;
         Ok(Stmt::With(WithStmt {

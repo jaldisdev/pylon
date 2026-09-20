@@ -1089,6 +1089,22 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// `(select … limit 1).account { id, name }` — a shape written on what a
+    /// projection off a sub-select lands on. Returns the sub-statement and
+    /// the field chain, so the shape can ride along with the splice instead
+    /// of being rejected as a shape in expression position.
+    fn shape_over_subquery_projection(sh: &ast::ShapeExpr) -> Option<(&Stmt, Vec<String>)> {
+        let inner = sh.expr.as_ref()?;
+        if !matches!(inner, Expr::FieldAccess { .. }) {
+            return None;
+        }
+        let (base, fields) = Self::peel_field_access_chain(inner);
+        match base {
+            Expr::SubQuery(stmt) => Some((stmt.as_ref(), fields)),
+            _ => None,
+        }
+    }
+
     /// Peel nested `Expr::FieldAccess` layers (`X.a.b` parses as
     /// `FieldAccess{FieldAccess{X, "a"}, "b"}`) into the innermost root
     /// expression plus the ordered chain of field names.
@@ -6842,6 +6858,7 @@ impl<'a> Compiler<'a> {
         stmt: &Stmt,
         extra_fields: &[String],
         ctx: Option<(&TypeDescriptor, &str)>,
+        outer_shape: &[ShapeElement],
     ) -> Result<IrExpr, PyQLError> {
         // `(with x := … select …)` — the bindings have nowhere to live in
         // expression position, so they're hoisted to the enclosing
@@ -6860,7 +6877,7 @@ impl<'a> Compiler<'a> {
                 });
             }
             let inner = (*w.stmt).clone();
-            return self.compile_subquery_expr(&inner, extra_fields, ctx);
+            return self.compile_subquery_expr(&inner, extra_fields, ctx, outer_shape);
         }
 
         let Stmt::Select(sel) = stmt else {
@@ -7021,9 +7038,16 @@ impl<'a> Compiler<'a> {
         steps.extend(extra_steps.iter().cloned());
         let full_path = ast::Path { steps, partial: false };
 
-        let mut ps = self.compile_path_select_with_tail(sel, &full_path, &[], false, extra_steps.len())?;
+        let mut ps = self.compile_path_select_with_tail(sel, &full_path, outer_shape, false, extra_steps.len())?;
         if let Some(outer_alias) = correlate {
             Self::correlate_path_select(&mut ps, &outer_alias);
+        }
+        // A shape written after the projection (`(select … limit 1).account
+        // { id, name }`) says the object was wanted, not its id, so the walk
+        // comes back as one rather than being reduced the way a bare path in
+        // expression position is.
+        if !outer_shape.is_empty() && matches!(ps.result, IrPathResult::Object { .. }) {
+            return Ok(IrExpr::ObjectPathSubquery(Box::new(ps)));
         }
         // `limit 1` is what makes a sub-select over a multi-link single-
         // valued — that is the whole point of `(select .emails filter
@@ -7949,7 +7973,7 @@ impl<'a> Compiler<'a> {
                 let (base, fields) = Self::peel_field_access_chain(expr);
                 if let Expr::SubQuery(stmt) = base {
                     let stmt = stmt.as_ref().clone();
-                    return self.compile_subquery_expr(&stmt, &fields, ctx);
+                    return self.compile_subquery_expr(&stmt, &fields, ctx, &[]);
                 }
                 // `account::owner(.id).name` — an object-returning function
                 // projected to one of its columns.
@@ -8127,6 +8151,13 @@ impl<'a> Compiler<'a> {
                 })
             }
 
+            Expr::Shape(sh) if Self::shape_over_subquery_projection(sh).is_some() => {
+                let (stmt, fields) = Self::shape_over_subquery_projection(sh).expect("checked by the guard");
+                let stmt = stmt.clone();
+                let elements = sh.elements.clone();
+                self.compile_subquery_expr(&stmt, &fields, ctx, &elements)
+            }
+
             // A bare shape or set literal is never valid in expression
             // position, in either context — preserved exactly as the
             // schema-bound side always enforced (the free side's more
@@ -8146,7 +8177,7 @@ impl<'a> Compiler<'a> {
             // here rather than ctx-gated.
             Expr::SubQuery(stmt) => {
                 let stmt = stmt.as_ref().clone();
-                self.compile_subquery_expr(&stmt, &[], ctx)
+                self.compile_subquery_expr(&stmt, &[], ctx, &[])
             }
 
             Expr::Union(_, _) => Err(PyQLError::Type(PyQLTypeError {
@@ -9439,9 +9470,15 @@ impl<'a> Compiler<'a> {
                 return Ok(IrExpr::BinOp(Box::new(IrBinOp { left: l, op, right: r })));
             }
             // Check if it's a link (object) rather than a scalar
-            let is_link = target_td.links.iter().any(|l| l.name == first_name)
-                || target_td.multilinks.iter().any(|l| l.name == first_name);
-            if is_link {
+            // A single link is compared by the foreign key it stores, the
+            // same way `.link = obj` is one step higher up
+            // (`any(.access_grants.account = account)`). A multi-link has no
+            // column to compare and would need a junction of its own.
+            let single_link = target_td
+                .links
+                .iter()
+                .find(|l| l.name == first_name && !l.is_junction_backed());
+            if single_link.is_none() && target_td.multilinks.iter().any(|l| l.name == first_name) {
                 let target_display = target_type.replace("::", ".");
                 return Err(PyQLError::Type(PyQLTypeError {
                     message: format!(
@@ -9451,13 +9488,17 @@ impl<'a> Compiler<'a> {
                     position: Position { line: 0, col: 0 },
                 }));
             }
-            let prop = target_td
-                .properties
-                .iter()
-                .find(|p| p.name == first_name)
-                .ok_or_else(|| self.field_err(&first_name, target_type))?;
-            let prop_name = prop.name.clone();
-            let prop_pg = prop.pg_type.clone();
+            let (prop_name, prop_pg) = match single_link {
+                Some(link) => (format!("{}_id", link.name), "uuid".to_string()),
+                None => {
+                    let prop = target_td
+                        .properties
+                        .iter()
+                        .find(|p| p.name == first_name)
+                        .ok_or_else(|| self.field_err(&first_name, target_type))?;
+                    (prop.name.clone(), prop.pg_type.clone())
+                }
+            };
             let tgt_alias = self.fresh_alias();
             // Build EXISTS(SELECT 1 FROM target WHERE target.id = jt.target AND target.prop op value)
             let id_filter = IrExpr::BinOp(Box::new(IrBinOp {
