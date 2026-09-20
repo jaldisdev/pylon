@@ -212,12 +212,18 @@ class TestUnknownNames:
         with pytest.raises(AttributeError, match=r'did you mean std\.ilike'):
             _ = std.iilike
 
-    @pytest.mark.parametrize('name', ['sqrt', 'abs', 'ceil', 'floor', 'round'])
+    @pytest.mark.parametrize('name', ['round'])
     def test_math_functions_that_live_in_std_point_there(self, name):
         # These deliberately live in std, but Python's own math module is
         # where a developer will look first.
         with pytest.raises(AttributeError, match=rf'it lives in std, use std\.{name}'):
             getattr(math, name)
+
+    @pytest.mark.parametrize('name', ['sqrt', 'abs', 'ceil', 'floor'])
+    def test_math_functions_gel_declares_in_math_resolve_there(self, name):
+        # EdgeQL spells these `math::ceil` and so does every ported query;
+        # answering "it lives in std" made a valid query fail to compile.
+        assert getattr(math, name) is not None
 
     def test_std_pi_points_at_math(self):
         with pytest.raises(AttributeError, match=r'it lives in math, use math\.pi'):
