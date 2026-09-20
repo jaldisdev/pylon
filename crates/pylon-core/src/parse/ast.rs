@@ -373,6 +373,10 @@ pub enum BinOpKind {
     In,
     NotIn,
     Coalesce,
+    /// `?=` / `?!=` — equality that treats an absent value as comparable
+    /// rather than unknown, which is `IS [NOT] DISTINCT FROM` in SQL.
+    CoalesceEq,
+    CoalesceNe,
     Concat,
 }
 
@@ -388,6 +392,8 @@ impl std::fmt::Display for BinOpKind {
             Self::Pow => "^",
             Self::Eq => "=",
             Self::Ne => "!=",
+            Self::CoalesceEq => "?=",
+            Self::CoalesceNe => "?!=",
             Self::Lt => "<",
             Self::Le => "<=",
             Self::Gt => ">",

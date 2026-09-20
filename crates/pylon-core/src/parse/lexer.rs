@@ -102,6 +102,8 @@ pub enum Token {
     Percent,    // %
     StarStar,   // **
     QQ,         // ??
+    QEq,        // ?=
+    QNe,        // ?!=
     PlusPlus,   // ++
     PlusEq,     // +=
     MinusEq,    // -=
@@ -197,6 +199,8 @@ impl std::fmt::Display for Token {
             Token::Percent => "'%'",
             Token::StarStar => "'**'",
             Token::QQ => "'??'",
+            Token::QEq => "'?='",
+            Token::QNe => "'?!='",
             Token::PlusPlus => "'++'",
             Token::PlusEq => "'+='",
             Token::MinusEq => "'-='",
@@ -456,10 +460,18 @@ impl<'a> Lexer<'a> {
             b'?' => {
                 if self.pos < self.input.len() && self.current() == b'?' {
                     self.advance();
-                    Ok(Token::QQ)
-                } else {
-                    Err(self.err(pos, "unexpected '?'"))
+                    return Ok(Token::QQ);
                 }
+                if self.pos < self.input.len() && self.current() == b'=' {
+                    self.advance();
+                    return Ok(Token::QEq);
+                }
+                if self.pos + 1 < self.input.len() && self.current() == b'!' && self.input[self.pos + 1] == b'=' {
+                    self.advance();
+                    self.advance();
+                    return Ok(Token::QNe);
+                }
+                Err(self.err(pos, "unexpected '?'"))
             }
             _ => Err(self.err(pos, &format!("unexpected character '{}'", ch as char))),
         }
