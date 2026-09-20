@@ -356,6 +356,11 @@ fn collect_array_source(src: &IrArraySource, tags: &mut Vec<String>) {
     match src {
         IrArraySource::Select(sel) => collect_select(sel, tags),
         IrArraySource::ObjectSelect(sel) => collect_select(sel, tags),
+        IrArraySource::ObjectFunction(fs) => {
+            for a in &fs.fn_args {
+                collect_expr(a, tags);
+            }
+        }
         IrArraySource::StmtColumn { stmt, .. } => collect_stmt(stmt, tags),
         IrArraySource::PathSelect(ps) => collect_path_select(ps, tags),
         IrArraySource::RawExpr {

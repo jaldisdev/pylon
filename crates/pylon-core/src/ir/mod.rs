@@ -250,6 +250,9 @@ pub enum IrArraySource {
     /// Inner is a regular schema SELECT; first scalar pointer is the array element.
     Select(IrSelect),
     /// Inner is a path traversal SELECT; scalar result is the array element.
+    /// An object-returning function's rows, aggregated whole -- a computed
+    /// pointer declared as `fn(.id)` asks for the objects, not one column.
+    ObjectFunction(Box<IrFunctionSelect>),
     /// A bound select whose rows are objects, aggregated whole rather than
     /// reduced to one column the way `Select` is -- `(select Post filter …) {
     /// title }` asked for the objects.
