@@ -829,6 +829,14 @@ pub enum IrExpr {
         fields: Vec<(String, IrExpr)>,
         is_free_object: bool,
     },
+    /// Several correlated walks read as one set -- `(.<prices[is Listing]
+    /// union .<sale_prices[is Listing]) { id }`. Each branch hangs off the
+    /// enclosing row, so none of them can be hoisted into a CTE of its own
+    /// the way a standalone union's operands are.
+    ObjectPathUnion {
+        branches: Vec<IrPathSelect>,
+        limit: Option<Box<IrExpr>>,
+    },
     /// The object a single-valued walk lands on, with its shape — the
     /// path-select twin of `ObjectSubquery`. `PathSubquery` over the same
     /// walk gives the object's id, which is what a path in plain expression
