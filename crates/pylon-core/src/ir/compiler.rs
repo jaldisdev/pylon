@@ -4310,12 +4310,15 @@ impl<'a> Compiler<'a> {
         let Some(root) = self.find_path_root_in_expr(filter) else {
             return self.compile_free_expr(filter);
         };
-        let td = self.resolve_type(&root)?;
+        // A binding roots a path here as readily as a type name does; resolved
+        // as a type it is simply unknown.
+        let td = self.resolve_path_root(&root)?;
+        let table = self.row_source_table(&root, td);
         let alias = self.fresh_alias();
         let source = IrSource {
             poly: None,
             type_name: format!("{}::{}", td.module, td.name),
-            table: td.table.clone(),
+            table,
             alias: alias.clone(),
         };
         let condition = self.compile_expr(&Self::rewrite_abs_to_partial(filter.clone(), &root), td, &alias)?;
@@ -9905,6 +9908,32 @@ impl<'a> Compiler<'a> {
             && let Some(ir) = self.resolve_name_ref(n, true)
         {
             return Ok(ir);
+        }
+        // `assessment.current_question` in a free shape's field or filter — a
+        // walk off an object binding. It is the same traversal a bound select
+        // makes, read back as one subquery; there is no enclosing row to
+        // resolve it against, and nothing else here knows a binding can root a
+        // path.
+        if !p.partial
+            && p.steps.len() > 1
+            && let Some(ast::PathStep::Name(root)) = p.steps.first()
+            && self.cte_object_type(root).is_some()
+        {
+            let synthetic = ast::SelectStmt {
+                result: Expr::Path(p.clone()),
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            };
+            let ps = self.compile_path_select(&synthetic, p, &[], false)?;
+            let multi = matches!(ps.result, IrPathResult::Scalar(..)) && !ps.joins.is_empty();
+            return Ok(if multi {
+                IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps))))
+            } else {
+                IrExpr::PathSubquery(Box::new(ps))
+            });
         }
         Err(self.type_err("expression is not valid in free SELECT context"))
     }

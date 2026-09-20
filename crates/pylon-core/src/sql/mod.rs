@@ -5748,6 +5748,21 @@ mod tests {
     }
 
     #[test]
+    fn test_a_walk_off_a_binding_in_a_free_select() {
+        // A free select has no row of its own, so the walk is read back as one
+        // subquery; resolved as a type name the binding is simply unknown.
+        let out = compile_and_emit("WITH p := (SELECT Person) SELECT { n := p.company.name }");
+        assert!(out.sql.contains("\"p\""), "{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"Company\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_free_selects_filter_can_root_at_a_binding() {
+        let out = compile_and_emit("WITH p := (SELECT Person) SELECT { n := 1 } FILTER p.company.name = 'Acme'");
+        assert!(out.sql.contains("'Acme'"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_a_trailing_shape_on_a_field_access_select() {
         let out = compile_and_emit("SELECT (SELECT Person).company { name }");
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
