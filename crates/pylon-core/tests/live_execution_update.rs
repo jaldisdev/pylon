@@ -356,3 +356,32 @@ async fn update_returns_the_ids_of_the_rows_it_touched() {
         .collect();
     assert_eq!(ages, HashSet::from([31, 40]));
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_upsert_runs_exactly_one_of_its_two_branches() {
+    // `(insert …) if not exists x else (update x set …)` — both branches are
+    // data-modifying CTEs, which Postgres runs whether or not anything reads
+    // them, so each has to carry its own condition. Asserted against the rows:
+    // a branch guarded only on the read side leaves identical-looking SQL.
+    let module = unique_module("live_upsert");
+    let sd = schema_with_post(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    let upsert = format!(
+        "with existing := (select {module}::Person filter .name = 'Alice' limit 1) \
+         select ((insert {module}::Person {{ name := 'Alice', age := 30 }}) \
+         if not exists existing else (update existing set {{ age := 31 }}))"
+    );
+
+    exec(&pool, &sd, &upsert).await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }}")).await;
+    assert_eq!(rows.len(), 1, "the first run should insert exactly one row, got {rows:?}");
+    assert_eq!(as_i64(field(&rows[0], 2)), 30, "the update branch must not have run");
+
+    exec(&pool, &sd, &upsert).await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }}")).await;
+    assert_eq!(rows.len(), 1, "the second run must not insert again, got {rows:?}");
+    assert_eq!(as_i64(field(&rows[0], 2)), 31, "the update branch should have run");
+}
