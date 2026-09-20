@@ -1594,6 +1594,38 @@ impl Parser {
         Ok(first)
     }
 
+    /// A function-call argument, with the `FILTER`/`ORDER BY` EdgeQL lets one
+    /// carry: `count(.<account[is Step] filter .status != Done)`. The clauses
+    /// belong to the set the argument names, so they become a select over it
+    /// — which is what Gel's own grammar builds for this.
+    fn parse_call_arg(&mut self) -> Result<Expr, PyQLSyntaxError> {
+        let expr = self.parse_expr()?;
+        let filter = if matches!(self.current(), Token::Filter) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let order_by = if matches!(self.current(), Token::Order) {
+            self.advance();
+            self.eat(&Token::By)?;
+            self.parse_sort_list()?
+        } else {
+            vec![]
+        };
+        if filter.is_none() && order_by.is_empty() {
+            return Ok(expr);
+        }
+        Ok(Expr::SubQuery(Box::new(Stmt::Select(SelectStmt {
+            result: expr,
+            filter,
+            order_by,
+            offset: None,
+            limit: None,
+            lock: None,
+        }))))
+    }
+
     fn parse_func_call_args(&mut self, module: Option<String>, name: String) -> Result<Expr, PyQLSyntaxError> {
         self.eat(&Token::LParen)?;
         let mut args = vec![];
@@ -1607,7 +1639,7 @@ impl Parser {
                     let val = self.parse_expr()?;
                     kwargs.push((key, val));
                 } else {
-                    args.push(self.parse_expr()?);
+                    args.push(self.parse_call_arg()?);
                 }
                 if !matches!(self.current(), Token::Comma) {
                     break;
