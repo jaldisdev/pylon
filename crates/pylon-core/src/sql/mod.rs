@@ -5570,6 +5570,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_conditional_insert_beside_a_read_branch_unions_both() {
+        let out = compile_and_emit(
+            "WITH existing := (SELECT Person FILTER .name = $n LIMIT 1) \
+             SELECT (existing IF EXISTS existing ELSE (INSERT Person { name := $n })) { name }",
+        );
+        assert!(out.sql.contains("UNION ALL"), "{}", out.sql);
+        assert!(
+            out.sql.contains("INSERT INTO") && out.sql.contains("WHERE (NOT ("),
+            "the insert carries the condition itself:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

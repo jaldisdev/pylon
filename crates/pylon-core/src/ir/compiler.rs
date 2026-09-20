@@ -4466,30 +4466,7 @@ impl<'a> Compiler<'a> {
                 return None;
             }
         }
-        let guarded_insert = |branch: &Expr, other: &Expr| {
-            mutating_stmt(branch).is_some() && matches!(other, Expr::Set(items) if items.is_empty())
-        };
-        if guarded_insert(&ie.if_expr, &ie.else_expr) {
-            self.pending_insert_guard = Some(ie.condition.clone());
-            return Some(ie.if_expr.clone());
-        }
-        if guarded_insert(&ie.else_expr, &ie.if_expr) {
-            self.pending_insert_guard = Some(Expr::UnaryOp(Box::new(ast::UnaryOp {
-                op: ast::UnaryOpKind::Not,
-                operand: ie.condition.clone(),
-            })));
-            return Some(ie.else_expr.clone());
-        }
-        if mutating_stmt(&ie.if_expr).is_some() || mutating_stmt(&ie.else_expr).is_some() {
-            return None;
-        }
-        let (if_empty, else_empty) = (is_empty_set(&ie.if_expr), is_empty_set(&ie.else_expr));
-        if if_empty && else_empty {
-            return None;
-        }
-        if !(if_empty || yields_objects(&ie.if_expr)) || !(else_empty || yields_objects(&ie.else_expr)) {
-            return None;
-        }
+        let (if_yields_objects, else_yields_objects) = (yields_objects(&ie.if_expr), yields_objects(&ie.else_expr));
         let guard = |branch: &Expr, condition: Expr| {
             Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
                 result: branch.clone(),
@@ -4504,6 +4481,49 @@ impl<'a> Compiler<'a> {
             op: ast::UnaryOpKind::Not,
             operand: ie.condition.clone(),
         }));
+        let guarded_insert = |branch: &Expr, other: &Expr| {
+            mutating_stmt(branch).is_some() && matches!(other, Expr::Set(items) if items.is_empty())
+        };
+        if guarded_insert(&ie.if_expr, &ie.else_expr) {
+            self.pending_insert_guard = Some(ie.condition.clone());
+            return Some(ie.if_expr.clone());
+        }
+        if guarded_insert(&ie.else_expr, &ie.if_expr) {
+            self.pending_insert_guard = Some(Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: ast::UnaryOpKind::Not,
+                operand: ie.condition.clone(),
+            })));
+            return Some(ie.else_expr.clone());
+        }
+        // `existing if exists existing else (insert …)` — the insert still has
+        // to carry the condition itself, but the other branch is a set of its
+        // own, so the result is Gel's full rewrite: both branches under
+        // opposite guards, unioned.
+        let reads_objects = |branch: &Expr, yields: bool| mutating_stmt(branch).is_none() && yields;
+        if mutating_stmt(&ie.if_expr).is_some() && reads_objects(&ie.else_expr, else_yields_objects) {
+            self.pending_insert_guard = Some(ie.condition.clone());
+            return Some(Expr::Union(
+                Box::new(ie.if_expr.clone()),
+                Box::new(guard(&ie.else_expr, negated)),
+            ));
+        }
+        if mutating_stmt(&ie.else_expr).is_some() && reads_objects(&ie.if_expr, if_yields_objects) {
+            self.pending_insert_guard = Some(negated);
+            return Some(Expr::Union(
+                Box::new(guard(&ie.if_expr, ie.condition.clone())),
+                Box::new(ie.else_expr.clone()),
+            ));
+        }
+        if mutating_stmt(&ie.if_expr).is_some() || mutating_stmt(&ie.else_expr).is_some() {
+            return None;
+        }
+        let (if_empty, else_empty) = (is_empty_set(&ie.if_expr), is_empty_set(&ie.else_expr));
+        if if_empty && else_empty {
+            return None;
+        }
+        if !(if_empty || if_yields_objects) || !(else_empty || else_yields_objects) {
+            return None;
+        }
         if else_empty {
             return Some(guard(&ie.if_expr, ie.condition.clone()));
         }
