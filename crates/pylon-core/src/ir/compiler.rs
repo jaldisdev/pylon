@@ -687,6 +687,11 @@ struct Compiler<'a> {
     /// yet -- Postgres runs every CTE against the snapshot the statement
     /// started with -- so a walk off the variable has to read the binding.
     for_var_ctes: HashMap<String, String>,
+    /// The name each loop variable's iterator CTE is emitted under. Two
+    /// sibling loops may use the same variable name, and a WITH clause cannot
+    /// hold the same CTE name twice.
+    for_var_slots: HashMap<String, String>,
+    for_slot_counts: HashMap<String, usize>,
     /// The condition a `(insert …) if cond else {}` puts on the insert about
     /// to be compiled — see `IrInsert::guard`.
     pending_insert_guard: Option<Expr>,
@@ -835,6 +840,8 @@ impl<'a> Compiler<'a> {
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
             for_var_ctes: HashMap::new(),
+            for_var_slots: HashMap::new(),
+            for_slot_counts: HashMap::new(),
             pending_insert_guard: None,
             pending_update_guard: None,
             cte_declared_pointers: HashMap::new(),
@@ -975,6 +982,14 @@ impl<'a> Compiler<'a> {
             return Some(n.as_str());
         }
         None
+    }
+
+    /// A reference to the loop variable `name`, under the CTE name its loop
+    /// was emitted with.
+    fn for_var_ref(&self, name: &str) -> IrExpr {
+        IrExpr::ForVar {
+            name: self.for_var_slots.get(name).cloned().unwrap_or_else(|| name.to_string()),
+        }
     }
 
     fn fresh_alias(&mut self) -> String {
@@ -2633,9 +2648,7 @@ impl<'a> Compiler<'a> {
                     pg_type: "uuid".to_string(),
                 },
                 op: ast::BinOpKind::Eq,
-                right: IrExpr::ForVar {
-                    name: root_name.to_string(),
-                },
+                right: self.for_var_ref(root_name),
             }))
         });
 
@@ -4209,7 +4222,7 @@ impl<'a> Compiler<'a> {
                     pg_type: "uuid".to_string(),
                 },
                 op: ast::BinOpKind::Eq,
-                right: IrExpr::ForVar { name: name.clone() },
+                right: self.for_var_ref(name),
             }))
         });
         Ok(Some(IrExpr::ObjectSubquery(Box::new(IrSelect::schema_bound(
@@ -4879,7 +4892,7 @@ impl<'a> Compiler<'a> {
                     pg_type: "uuid".to_string(),
                 },
                 op: ast::BinOpKind::Eq,
-                right: IrExpr::ForVar { name: var },
+                right: self.for_var_ref(&var),
             }));
             filter = and_conditions(filter, vec![narrowed]);
         }
@@ -5014,7 +5027,7 @@ impl<'a> Compiler<'a> {
                     pg_type: "uuid".to_string(),
                 },
                 op: ast::BinOpKind::Eq,
-                right: IrExpr::ForVar { name: var },
+                right: self.for_var_ref(&var),
             }));
             filter = and_conditions(filter, vec![narrowed]);
         }
@@ -5280,6 +5293,16 @@ impl<'a> Compiler<'a> {
             }
         };
 
+        // The CTE name this loop's iterator is emitted under. Two sibling
+        // loops over the same variable name would otherwise both claim
+        // `_for_<name>`, which one WITH clause cannot hold twice.
+        let slot = {
+            let seen = self.for_slot_counts.entry(f.var.clone()).or_insert(0);
+            let n = *seen;
+            *seen += 1;
+            if n == 0 { f.var.clone() } else { format!("{}_{}", f.var, n) }
+        };
+        let prev_slot = self.for_var_slots.insert(f.var.clone(), slot.clone());
         // Register the for variable so the body can reference it.
         let prev = self.for_vars.insert(f.var.clone(), pg_type.clone());
         let prev_cte = match iterated_binding {
@@ -5316,6 +5339,14 @@ impl<'a> Compiler<'a> {
             }
             None => {
                 self.for_var_ctes.remove(&f.var);
+            }
+        }
+        match prev_slot {
+            Some(old) => {
+                self.for_var_slots.insert(f.var.clone(), old);
+            }
+            None => {
+                self.for_var_slots.remove(&f.var);
             }
         }
 
@@ -5374,7 +5405,7 @@ impl<'a> Compiler<'a> {
         }
 
         Ok(IrFor {
-            var_name: f.var.clone(),
+            var_name: slot,
             iterator,
             body: Box::new(body),
             body_ctes,
@@ -9823,7 +9854,7 @@ impl<'a> Compiler<'a> {
     /// there is nothing here for a parameter to shadow.
     fn resolve_name_ref(&self, name: &str, allow_fn_param: bool) -> Option<IrExpr> {
         if self.for_vars.contains_key(name) {
-            return Some(IrExpr::ForVar { name: name.to_string() });
+            return Some(self.for_var_ref(name));
         }
         // A free-object-bound CTE (`with x := { a := 1 } select ... x ...`),
         // referenced bare with no shape to project through, has nothing to
@@ -10071,7 +10102,7 @@ impl<'a> Compiler<'a> {
                         pg_type: "uuid".to_string(),
                     },
                     op: ast::BinOpKind::Eq,
-                    right: IrExpr::ForVar { name: var.clone() },
+                    right: self.for_var_ref(var),
                 }));
                 ps.filter = and_conditions(ps.filter, vec![correlation]);
                 return Ok(IrExpr::PathSubquery(Box::new(ps)));
@@ -10098,7 +10129,7 @@ impl<'a> Compiler<'a> {
                         pg_type: "uuid".to_string(),
                     },
                     op: ast::BinOpKind::Eq,
-                    right: IrExpr::ForVar { name: var.clone() },
+                    right: self.for_var_ref(var),
                 }));
                 return Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
                     source,
