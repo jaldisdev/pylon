@@ -4751,7 +4751,22 @@ impl<'a> Compiler<'a> {
         })(self);
         self.anchors.pop();
         self.active_declared_pointers = outer_declared;
-        let (shape, filter, order_by, offset, limit) = clauses?;
+        let (shape, mut filter, order_by, offset, limit) = clauses?;
+
+        // A select whose subject is a for-loop variable reads the one row that
+        // variable holds; unfiltered it would read the whole table.
+        if let Some(var) = Self::subject_name(result_expr).filter(|n| self.for_var_types.contains_key(n)) {
+            let narrowed = IrExpr::BinOp(Box::new(IrBinOp {
+                left: IrExpr::ColumnRef {
+                    alias: alias.clone(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                },
+                op: ast::BinOpKind::Eq,
+                right: IrExpr::ForVar { name: var },
+            }));
+            filter = and_conditions(filter, vec![narrowed]);
+        }
 
         // Compile the inner DML if this is a SELECT-over-DML / SELECT-over-SELECT.
         let dml_source = inner_stmt.map(|s| self.compile_stmt(s).map(Box::new)).transpose()?;
