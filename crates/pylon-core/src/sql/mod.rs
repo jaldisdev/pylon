@@ -6781,6 +6781,34 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_shape_reads_a_prefix_bound_by_the_outer_select() {
+        // `Person.name` inside the `posts` shape names a type the enclosing
+        // select binds, so EdgeQL reads the outer row — not every Person. The
+        // prefix used to be rejected outright because only the *innermost*
+        // subject was checked.
+        let out = compile_and_emit("SELECT Person { name, posts: { title, who := Person.name } }");
+        assert!(
+            out.sql.contains(r#""t0"."name""#),
+            "the nested computed should read the outer Person alias:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains(r#"FROM "public"."Person" "t2""#),
+            "the prefix should not open a second Person source:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_prefix_naming_a_type_out_of_scope_is_rejected() {
+        // Nothing binds `Company` here, so the prefix stays an absolute path —
+        // Pylon must not silently read the whole table.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person { name, who := Company.name }").unwrap();
+        assert!(ir::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
     fn test_free_select_tuple() {
         let schema = make_schema();
         let ast = parse::parse("SELECT (1, 2)").unwrap();

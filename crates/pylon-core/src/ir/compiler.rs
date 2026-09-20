@@ -10068,6 +10068,15 @@ impl<'a> Compiler<'a> {
             .map(|a| (a.qualified.clone(), a.alias.clone()))
     }
 
+    /// The innermost enclosing select binding `root` as its subject.
+    fn outer_anchor(&self, root: &str) -> Option<(String, String)> {
+        self.anchors
+            .iter()
+            .rev()
+            .find(|a| a.type_name == root || a.qualified == root)
+            .map(|a| (a.qualified.clone(), a.alias.clone()))
+    }
+
     fn compile_path(&mut self, p: &ast::Path, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
         if !p.partial {
             if p.steps.len() == 1
@@ -10198,6 +10207,18 @@ impl<'a> Compiler<'a> {
                         return self.compile_path(&relative, &outer_td, &outer_alias);
                     }
                     return self.compile_path(&relative, td, alias);
+                }
+                // A prefix naming a type an *enclosing* select already binds —
+                // `select Font { styles: { font := Font.id } }`. EdgeQL factors
+                // such a prefix out to the scope that binds it, so it reads that
+                // row rather than every row of the type.
+                if let Some((outer_qualified, outer_alias)) = self.outer_anchor(root) {
+                    let relative = ast::Path {
+                        steps: p.steps[1..].to_vec(),
+                        partial: true,
+                    };
+                    let outer_td = self.resolve_type(&outer_qualified)?.clone();
+                    return self.compile_path(&relative, &outer_td, &outer_alias);
                 }
             }
             // `membership.account.id` — a walk off a for-loop variable in
