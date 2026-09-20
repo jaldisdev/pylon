@@ -5438,18 +5438,31 @@ mod tests {
     }
 
     #[test]
-    fn test_a_conditional_update_is_still_refused() {
+    fn test_a_conditional_update_carries_its_condition() {
         // Guarding the branch only filters what is read back -- the mutation
-        // is its own CTE and Postgres runs it regardless. Compiling this
-        // would insert even when the condition is false, silently, so it has
-        // to stay an error until the condition can be folded into the
-        // mutation itself.
-        // An update has nowhere to put the condition yet, so it must keep
-        // erroring rather than compile to something that runs regardless.
-        let ast = parse::parse("SELECT (UPDATE Person FILTER .name = $n SET { name := $m }) IF FALSE ELSE {}").unwrap();
+        // is its own CTE and Postgres runs it regardless. An update has a
+        // WHERE of its own to fold the condition into, which is what keeps it
+        // from running when the condition is false.
+        let out = compile_and_emit(
+            "SELECT (UPDATE Person FILTER .name = $n SET { name := $m }) IF EXISTS (SELECT Company) ELSE {}",
+        );
+        let update = out.sql.find("UPDATE").expect("an update is emitted");
+        let where_clause = out.sql[update..].find("WHERE").expect("the update is filtered");
+        assert!(
+            out.sql[update + where_clause..].contains("EXISTS"),
+            "the condition narrows the rows the update touches:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_conditional_delete_is_still_refused() {
+        // A delete has nowhere to put the condition, so it must keep erroring
+        // rather than compile to something that runs regardless.
+        let ast = parse::parse("SELECT (DELETE Person FILTER .name = $n) IF FALSE ELSE {}").unwrap();
         assert!(
             ir::compile(&ast, &make_schema()).is_err(),
-            "a conditional update must not compile to an unconditional one"
+            "a conditional delete must not compile to an unconditional one"
         );
     }
 

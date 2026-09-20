@@ -690,6 +690,10 @@ struct Compiler<'a> {
     /// The condition a `(insert …) if cond else {}` puts on the insert about
     /// to be compiled — see `IrInsert::guard`.
     pending_insert_guard: Option<Expr>,
+    /// The condition a guarded `update` has to carry itself, for the same
+    /// reason an insert does: a data-modifying CTE runs whether or not
+    /// anything reads it, so filtering what is read back changes nothing.
+    pending_update_guard: Option<Expr>,
     /// Pointers a `with` binding declared in its own shape (`offering := (
     /// select Offering { publisher := … })`). They exist nowhere on the type,
     /// so a later `offering { publisher }` has to find them here.
@@ -832,6 +836,7 @@ impl<'a> Compiler<'a> {
             for_var_types: HashMap::new(),
             for_var_ctes: HashMap::new(),
             pending_insert_guard: None,
+            pending_update_guard: None,
             cte_declared_pointers: HashMap::new(),
             active_declared_pointers: vec![],
             fn_params: HashMap::new(),
@@ -4509,6 +4514,27 @@ impl<'a> Compiler<'a> {
     /// B's when it does not, which is `(A filter cond) union (B filter not
     /// cond)`. Rewritten here rather than given its own IR, so it reaches the
     /// union machinery that already knows how to read one relation per branch.
+    /// Hand a guarded mutation its condition: an insert folds it into its own
+    /// `WHERE`, an update ANDs it onto the rows it narrows to.
+    fn set_mutation_guard(&mut self, branch: &Expr, condition: Expr) {
+        let is_update = matches!(
+            match branch {
+                Expr::SubQuery(stmt) => Some(stmt.as_ref()),
+                Expr::Shape(sh) => match sh.expr.as_ref() {
+                    Some(Expr::SubQuery(stmt)) => Some(stmt.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Some(Stmt::Update(_))
+        );
+        if is_update {
+            self.pending_update_guard = Some(condition);
+        } else {
+            self.pending_insert_guard = Some(condition);
+        }
+    }
+
     fn object_if_else_as_union(&mut self, expr: &Expr) -> Option<Expr> {
         let Expr::IfElse(ie) = expr else {
             return None;
@@ -4585,7 +4611,7 @@ impl<'a> Compiler<'a> {
         // refused rather than compiling to something unconditional.
         for branch in [&ie.if_expr, &ie.else_expr] {
             if let Some(stmt) = mutating_stmt(branch)
-                && !matches!(stmt, Stmt::Insert(_))
+                && !matches!(stmt, Stmt::Insert(_) | Stmt::Update(_))
             {
                 return None;
             }
@@ -4609,14 +4635,15 @@ impl<'a> Compiler<'a> {
             mutating_stmt(branch).is_some() && matches!(other, Expr::Set(items) if items.is_empty())
         };
         if guarded_insert(&ie.if_expr, &ie.else_expr) {
-            self.pending_insert_guard = Some(ie.condition.clone());
+            self.set_mutation_guard(&ie.if_expr, ie.condition.clone());
             return Some(ie.if_expr.clone());
         }
         if guarded_insert(&ie.else_expr, &ie.if_expr) {
-            self.pending_insert_guard = Some(Expr::UnaryOp(Box::new(ast::UnaryOp {
+            let negated = Expr::UnaryOp(Box::new(ast::UnaryOp {
                 op: ast::UnaryOpKind::Not,
                 operand: ie.condition.clone(),
-            })));
+            }));
+            self.set_mutation_guard(&ie.else_expr, negated);
             return Some(ie.else_expr.clone());
         }
         // `existing if exists existing else (insert …)` — the insert still has
@@ -4625,14 +4652,14 @@ impl<'a> Compiler<'a> {
         // opposite guards, unioned.
         let reads_objects = |branch: &Expr, yields: bool| mutating_stmt(branch).is_none() && yields;
         if mutating_stmt(&ie.if_expr).is_some() && reads_objects(&ie.else_expr, else_yields_objects) {
-            self.pending_insert_guard = Some(ie.condition.clone());
+            self.set_mutation_guard(&ie.if_expr, ie.condition.clone());
             return Some(Expr::Union(
                 Box::new(ie.if_expr.clone()),
                 Box::new(guard(&ie.else_expr, negated)),
             ));
         }
         if mutating_stmt(&ie.else_expr).is_some() && reads_objects(&ie.if_expr, if_yields_objects) {
-            self.pending_insert_guard = Some(negated);
+            self.set_mutation_guard(&ie.else_expr, negated);
             return Some(Expr::Union(
                 Box::new(guard(&ie.if_expr, ie.condition.clone())),
                 Box::new(ie.else_expr.clone()),
@@ -5860,6 +5887,9 @@ impl<'a> Compiler<'a> {
     // ── UPDATE ────────────────────────────────────────────────────────────────────
 
     fn compile_update(&mut self, upd: &ast::UpdateStmt) -> Result<IrUpdate, PyQLError> {
+        // Taken before anything nested is compiled, so a nested statement
+        // cannot pick up a guard meant for this one.
+        let pending_guard = self.pending_update_guard.take();
         // See `compile_insert`'s identical save/restore of `pending_nested_ctes`.
         let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
         // `update account.preferences[is IndividualPreferences] set …` — the
@@ -5881,6 +5911,7 @@ impl<'a> Compiler<'a> {
                 shape: upd.shape.clone(),
             };
             self.pending_nested_ctes = outer_pending_nested_ctes;
+            self.pending_update_guard = pending_guard;
             let mut ir = self.compile_update(&narrowed)?;
             // Built after the update, so the comparison names that update's own
             // alias: with a nested statement's CTE in the FROM, a bare `id`
@@ -5932,6 +5963,16 @@ impl<'a> Compiler<'a> {
                 Some(and_conditions(declared_filter, vec![membership]).expect("membership is present"))
             }
             None => declared_filter,
+        };
+        // `(update cart set { … }) if not exists(existing) else {}` — the
+        // condition narrows the rows this update touches. Left to filter what
+        // is read back instead, the update would still run.
+        let filter = match pending_guard {
+            Some(condition) => {
+                let guard = self.compile_expr(&condition, td, &alias)?;
+                and_conditions(filter, vec![guard])
+            }
+            None => filter,
         };
 
         // Classify shape elements by kind.
