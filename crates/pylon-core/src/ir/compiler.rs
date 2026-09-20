@@ -3749,6 +3749,10 @@ impl<'a> Compiler<'a> {
             Expr::Shape(s) if s.expr.is_some() => false,
             Expr::SubQuery(_) => false,
             Expr::Union(a, b) => self.is_free_result(a) && self.is_free_result(b),
+            // `A if cond else B` picks between two *sets*; when those are
+            // object sets the result is an object set too, not the scalar an
+            // if/else over values gives.
+            Expr::IfElse(ie) => self.is_free_result(&ie.if_expr) || self.is_free_result(&ie.else_expr),
             _ => true,
         }
     }
@@ -4098,21 +4102,139 @@ impl<'a> Compiler<'a> {
     ///
     /// `Ok(None)` when the result isn't an object union, leaving the ordinary
     /// single-source path (and its own errors) in charge.
+    /// Give every operand of an object union a name to be read by.
+    ///
+    /// `object_union_branches` recognises operands that already name a
+    /// relation -- a type, or a `with` binding -- because a union is emitted
+    /// as one relation per branch. An operand written inline (a sub-select, or
+    /// an insert in a get-or-create) names nothing yet, so it is hoisted into
+    /// a CTE of its own and replaced by that name, leaving an ordinary union
+    /// of names behind.
+    fn name_union_operands(&mut self, expr: &Expr) -> Result<Option<Expr>, PyQLError> {
+        let Expr::Union(left, right) = expr else {
+            return Ok(None);
+        };
+        let mut rewritten = false;
+        let mut name_one = |compiler: &mut Self, operand: &Expr| -> Result<Expr, PyQLError> {
+            match operand {
+                Expr::Union(_, _) => match compiler.name_union_operands(operand)? {
+                    Some(inner) => {
+                        rewritten = true;
+                        Ok(inner)
+                    }
+                    None => Ok(operand.clone()),
+                },
+                Expr::SubQuery(stmt) => {
+                    let (cte_name, type_name) = compiler.hoist_dml_as_cte(stmt.as_ref())?;
+                    // An insert names its subject unqualified (`Credentials`),
+                    // a select yields an already-qualified name; a branch that
+                    // resolves to no object type is not one of these at all.
+                    let Ok(td) = compiler.resolve_type(&type_name) else {
+                        return Ok(operand.clone());
+                    };
+                    compiler
+                        .cte_types
+                        .insert(cte_name.clone(), format!("{}::{}", td.module, td.name));
+                    rewritten = true;
+                    Ok(Expr::Path(ast::Path {
+                        steps: vec![ast::PathStep::Name(cte_name)],
+                        partial: false,
+                    }))
+                }
+                other => Ok(other.clone()),
+            }
+        };
+        let left = name_one(self, left)?;
+        let right = name_one(self, right)?;
+        if !rewritten {
+            return Ok(None);
+        }
+        Ok(Some(Expr::Union(Box::new(left), Box::new(right))))
+    }
+
+    /// `A if cond else B` over object sets, as the union it is.
+    ///
+    /// Picking between two *sets* is not the scalar `CASE` an if/else over
+    /// values compiles to: it stands for A's rows when the condition holds and
+    /// B's when it does not, which is `(A filter cond) union (B filter not
+    /// cond)`. Rewritten here rather than given its own IR, so it reaches the
+    /// union machinery that already knows how to read one relation per branch.
+    fn object_if_else_as_union(&mut self, expr: &Expr) -> Option<Expr> {
+        let Expr::IfElse(ie) = expr else {
+            return None;
+        };
+        let yields_objects = |branch: &Expr| match branch {
+            Expr::Path(p) if !p.partial && p.steps.len() == 1 => match &p.steps[0] {
+                ast::PathStep::Name(n) => self.cte_object_type(n).is_some() || self.resolve_type(n).is_ok(),
+                _ => false,
+            },
+            Expr::SubQuery(stmt) => matches!(
+                self.dml_subject_type(stmt.as_ref()),
+                Ok(name) if self.resolve_type(&name).is_ok()
+            ),
+            _ => false,
+        };
+        if !yields_objects(&ie.if_expr) || !yields_objects(&ie.else_expr) {
+            return None;
+        }
+        let guard = |branch: &Expr, condition: Expr| {
+            Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
+                result: branch.clone(),
+                filter: Some(condition),
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            })))
+        };
+        let negated = Expr::UnaryOp(Box::new(ast::UnaryOp {
+            op: ast::UnaryOpKind::Not,
+            operand: ie.condition.clone(),
+        }));
+        Some(Expr::Union(
+            Box::new(guard(&ie.if_expr, ie.condition.clone())),
+            Box::new(guard(&ie.else_expr, negated)),
+        ))
+    }
+
     fn try_compile_object_union_select(
         &mut self,
         sel: &ast::SelectStmt,
         result_expr: &Expr,
         distinct: bool,
     ) -> Result<Option<IrSelect>, PyQLError> {
+        let as_union;
         let (union_expr, shape_elements): (&Expr, &[ShapeElement]) = match result_expr {
             Expr::Union(_, _) => (result_expr, &[]),
+            Expr::IfElse(_) => match self.object_if_else_as_union(result_expr) {
+                Some(rewritten) => {
+                    as_union = rewritten;
+                    (&as_union, &[] as &[ShapeElement])
+                }
+                None => return Ok(None),
+            },
             Expr::Shape(shape) => match &shape.expr {
                 Some(inner @ Expr::Union(_, _)) => (inner, shape.elements.as_slice()),
+                Some(inner @ Expr::IfElse(_)) => match self.object_if_else_as_union(inner) {
+                    Some(rewritten) => {
+                        as_union = rewritten;
+                        (&as_union, shape.elements.as_slice())
+                    }
+                    None => return Ok(None),
+                },
                 _ => return Ok(None),
             },
             _ => return Ok(None),
         };
 
+        let named;
+        let union_expr = match self.name_union_operands(union_expr)? {
+            Some(rewritten) => {
+                named = rewritten;
+                &named
+            }
+            None => union_expr,
+        };
         let Some(branches) = self.object_union_branches(union_expr) else {
             return Ok(None);
         };

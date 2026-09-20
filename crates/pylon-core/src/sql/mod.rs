@@ -4738,6 +4738,40 @@ mod tests {
     }
 
     #[test]
+    fn test_choosing_between_two_object_sets() {
+        // `A if cond else B` over objects is not the scalar CASE an if/else
+        // over values gives: it stands for A's rows when the condition holds
+        // and B's when it does not.
+        let out = compile_and_emit_with(
+            "WITH a := (SELECT Person FILTER .name = $n), b := (SELECT Person) \
+             SELECT (a IF EXISTS a ELSE b) { name }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("UNION ALL"),
+            "expected one branch per side:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_union_operand_written_inline() {
+        // A union reads one relation per branch, so an operand that names no
+        // relation yet -- a sub-select, or an insert in a get-or-create -- is
+        // hoisted into a CTE of its own first.
+        let out = compile_and_emit_with(
+            "SELECT ((SELECT Person FILTER .name = $n) UNION (SELECT Person)) { name }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.starts_with("WITH"),
+            "expected the operands hoisted:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("UNION ALL"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
