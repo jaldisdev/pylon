@@ -8655,6 +8655,28 @@ impl<'a> Compiler<'a> {
                         tuple_shape: None,
                     })));
                 }
+                // `<marketplace::BrandAddon>line.listing.id` — casting a key to
+                // an object type names the row that key identifies, and in
+                // expression position (a link's value, a comparison) the row
+                // *is* its key. There is no scalar pg type to cast to, so
+                // `resolve_cast_pg_type` below reports the object type as
+                // unknown.
+                const STDLIB_MODULES: &[&str] = &["std", "cal", "math", "sys", "pgvector", "crypto", "postgis"];
+                if let Some((module, name)) = tc.ty.as_named()
+                    && module.map(|m| !STDLIB_MODULES.contains(&m)).unwrap_or(false)
+                {
+                    let qname = match module {
+                        Some(m) => format!("{m}::{name}"),
+                        None => name.to_string(),
+                    };
+                    if self.resolve_enum(&qname).is_none()
+                        && self.resolve_scalar(&qname).is_none()
+                        && self.resolve_named_tuple(&qname).is_none()
+                        && self.resolve_type(&qname).is_ok()
+                    {
+                        return self.compile_expr_ctx(&tc.expr, ctx);
+                    }
+                }
                 let inner = self.compile_expr_ctx(&tc.expr, ctx)?;
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
 
