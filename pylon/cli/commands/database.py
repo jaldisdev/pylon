@@ -212,8 +212,12 @@ def wipe(ctx: click.Context, force: bool) -> None:
 
         pool = await pgcon_connect(_pg_dsn(db), 2)
         schemas = await _user_schemas(pool)
-        tracking_rows = await pool.query('SELECT (to_regclass(\'_pylon."Migrations"\')) AS result', [])
-        has_tracking = tracking_rows[0] if tracking_rows else None
+        # `to_regclass` alone comes back as `regclass`, which has no decoder;
+        # the only thing wanted here is whether the table is there.
+        tracking_rows = await pool.query(
+            'SELECT (to_regclass(\'_pylon."Migrations"\') IS NOT NULL) AS result', []
+        )
+        has_tracking = bool(tracking_rows[0]) if tracking_rows else False
 
         # One `batch_execute` call — Postgres's simple query protocol wraps
         # the whole multi-statement blob in an implicit transaction, same
