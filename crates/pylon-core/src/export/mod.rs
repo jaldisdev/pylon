@@ -3421,7 +3421,16 @@ mod tests {
             body: "select Person filter .age > 18".into(),
         };
         let schema = minimal_schema(vec![fd]);
+        // A pointer holding the call's rows is fine — that is a select's
+        // subject by another name, and a declared computed with the same body
+        // already compiled. Only folding the objects into a value expression
+        // is refused.
         let ast = crate::parse::parse("select Person { x := adults() }").unwrap();
+        assert!(
+            crate::ir::compile(&ast, &schema).is_ok(),
+            "an object-returning call should stand as a pointer's own value"
+        );
+        let ast = crate::parse::parse("select Person { x := count(adults()) }").unwrap();
         let err = match crate::ir::compile(&ast, &schema) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected the call to be rejected"),

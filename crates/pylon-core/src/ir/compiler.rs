@@ -30,7 +30,8 @@ use std::collections::HashMap;
 
 use super::{
     IrArraySource, IrBinOp, IrComputedGlobalCte, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup, IrIfElse, IrInsert,
+    IrAssertedPointer, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup,
+    IrIfElse, IrInsert,
     IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
     IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer,
@@ -7301,6 +7302,32 @@ impl<'a> Compiler<'a> {
             }));
         }
 
+        // `p := assert_exists(.prices { … })` — the assert is a check on the
+        // pointer's own set, not part of a value expression, so the pointer is
+        // compiled from the argument and the check reads the rows it
+        // aggregates. Taken as an expression instead, an object-valued
+        // argument is "part of a larger expression", which is exactly what an
+        // object-returning function refuses.
+        if let Some(compexpr) = &el.compexpr
+            && let Some((fn_name, inner, inner_nested)) =
+                Self::asserted_pointer_expr(compexpr, el.nested.as_deref().unwrap_or(&[]))
+        {
+            let inner_el = ShapeElement {
+                compexpr: Some(inner),
+                nested: Some(inner_nested),
+                ..el.clone()
+            };
+            // Compiled speculatively: a scalar argument's assert is an ordinary
+            // function call and belongs on the expression path below, and an
+            // argument that does not compile at all should report its own error
+            // from there rather than this one.
+            if let Ok(ptr) = self.compile_shape_element(&inner_el, td, alias, module)
+                && ptr.is_object_pointer()
+            {
+                return Ok(IrShapePointer::Asserted(Box::new(IrAssertedPointer { fn_name, inner: ptr })));
+            }
+        }
+
         // Computed override: `pointer := expr`
         if let Some(compexpr) = &el.compexpr {
             // A link-valued RHS (`.multilink`, `.<backlink[is T] { … }`,
@@ -7316,6 +7343,19 @@ impl<'a> Compiler<'a> {
                 el.nested.as_deref().unwrap_or(&[]),
             )? {
                 return Ok(ptr);
+            }
+            // `p := marketplace::retrieve_listing_prices(.id) { amount }` — an
+            // object-returning call written inline. A declared computed with
+            // the same body already takes this route; a shape written on it
+            // belongs to the rows it yields.
+            if let Some((fc, call_nested)) = Self::object_call_with_shape(compexpr, el.nested.as_deref())
+                && let Some(fs) = self.compile_fn_object_source(fc, &call_nested)?
+            {
+                return Ok(IrShapePointer::Computed(IrComputedPointer {
+                    marker_offset: el.marker_offset,
+                    alias: pointer_name.to_string(),
+                    expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectFunction(Box::new(fs)))),
+                }));
             }
             let ir = self.compile_expr(compexpr, td, alias)?;
             // Cross-scope TypeIs: promote to set-valued shape pointer.
@@ -7856,6 +7896,54 @@ impl<'a> Compiler<'a> {
             limit: None,
             distinct: false,
         }))
+    }
+
+    /// `assert_exists(x)`, `assert_exists(x { … })`, `assert_distinct(x) { … }`
+    /// — the assert, the set it checks, and the shape to read that set with.
+    ///
+    /// Only the one-argument forms, and not `assert_single`: the message
+    /// overload takes a second argument the wrapper would have to carry, and
+    /// `assert_single` returns the element rather than the array, so it does
+    /// not fit the check `IrShapePointer::Asserted` emits.
+    fn asserted_pointer_expr(expr: &Expr, nested: &[ShapeElement]) -> Option<(String, Expr, Vec<ShapeElement>)> {
+        // A shape written after the call (`assert_distinct(f(.id)) { amount }`)
+        // belongs to the set the assert passes through, so it becomes the
+        // inner pointer's shape.
+        let (call, nested) = match expr {
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::FunctionCall(f)) => (f, sh.elements.clone()),
+                _ => return None,
+            },
+            Expr::FunctionCall(f) => (f, nested.to_vec()),
+            _ => return None,
+        };
+        if call.module.is_some() && call.module.as_deref() != Some("std") {
+            return None;
+        }
+        if !matches!(call.name.as_str(), "assert_exists" | "assert_distinct") {
+            return None;
+        }
+        let [arg] = call.args.as_slice() else {
+            return None;
+        };
+        Some((call.name.clone(), arg.clone(), nested))
+    }
+
+    /// A function call written as a pointer's value, with the shape its rows
+    /// are read through — whether that shape sits after the call
+    /// (`f(.id) { amount }`) or was parsed as the element's nested shape.
+    fn object_call_with_shape<'e>(
+        expr: &'e Expr,
+        nested: Option<&[ShapeElement]>,
+    ) -> Option<(&'e ast::FunctionCall, Vec<ShapeElement>)> {
+        match expr {
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::FunctionCall(f)) => Some((f, sh.elements.clone())),
+                _ => None,
+            },
+            Expr::FunctionCall(f) => Some((f, nested.unwrap_or(&[]).to_vec())),
+            _ => None,
+        }
     }
 
     fn compile_declared_computed(
