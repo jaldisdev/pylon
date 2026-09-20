@@ -106,7 +106,7 @@ fn qn(module: &str, name: &str) -> String {
 
 // ── FNV-1a hash for stable auto-generated constraint/trigger names ─────────────
 
-fn fnv(parts: &[&str]) -> String {
+pub(crate) fn fnv(parts: &[&str]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for p in parts {
         for b in p.bytes() {
@@ -1368,10 +1368,23 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
             } = c
             {
                 let cols: Vec<String> = fields.iter().map(|f| qi(&constraint_column(t, f))).collect();
-                let where_clause = unless
-                    .as_deref()
-                    .map(|u| format!(" WHERE NOT ({})", u))
-                    .unwrap_or_default();
+                // `unless` is PyQL (`.deleted`, `exists(.effective_until)`),
+                // so it has to be compiled the way a CHECK's expression is;
+                // emitted raw it was never valid SQL.
+                let where_clause = match unless.as_deref() {
+                    Some(u) => {
+                        let qualified = format!("{}::{}", t.module, t.name);
+                        match crate::ir::compile_constraint_expr(u, &qualified, schema) {
+                            Ok(compiled) => format!(" WHERE NOT ({compiled})"),
+                            // Validation reports the same expression with a
+                            // far better message than a half-built index
+                            // could; skipping the clause here would silently
+                            // widen the constraint, so skip the index.
+                            Err(_) => continue,
+                        }
+                    }
+                    None => String::new(),
+                };
                 out.push_str(&format!(
                     "CREATE UNIQUE INDEX ON {} ({}){};\n",
                     qname,
@@ -1491,6 +1504,61 @@ fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) -> Result
 
 // ── Phase 9: non-unique indexes ────────────────────────────────────────────────
 
+/// The `(...)` an index is keyed on and its `WHERE`, both as SQL.
+///
+/// A pointer may be a property (its own column), a link (the `{name}_id` the
+/// key is stored in) or a computed, which has no column at all and has to be
+/// inlined as the expression it stands for. `expression` and `unless` are
+/// PyQL for the same reason a CHECK's is, so both are compiled rather than
+/// pasted in — emitted raw they were never valid SQL.
+pub(crate) fn index_body_and_predicate(
+    t: &TypeDescriptor,
+    pointers: &[String],
+    expression: Option<&str>,
+    unless: Option<&str>,
+    schema: &SchemaDescriptor,
+) -> Result<(String, String), PyQLError> {
+    let qualified = format!("{}::{}", t.module, t.name);
+    let body = match expression {
+        Some(expr) => format!("({})", crate::ir::compile_constraint_expr(expr, &qualified, schema)?),
+        None => {
+            let mut cols = Vec::with_capacity(pointers.len());
+            for pointer in pointers {
+                cols.push(index_pointer_sql(t, pointer, &qualified, schema)?);
+            }
+            format!("({})", cols.join(", "))
+        }
+    };
+    let predicate = match unless {
+        Some(u) => format!(
+            " WHERE NOT ({})",
+            crate::ir::compile_constraint_expr(u, &qualified, schema)?
+        ),
+        None => String::new(),
+    };
+    Ok((body, predicate))
+}
+
+/// One pointer's place in an index key.
+pub(crate) fn index_pointer_sql(
+    t: &TypeDescriptor,
+    pointer: &str,
+    qualified: &str,
+    schema: &SchemaDescriptor,
+) -> Result<String, PyQLError> {
+    if t.properties.iter().any(|p| p.name == pointer) {
+        return Ok(qi(pointer));
+    }
+    if t.links.iter().any(|l| l.name == pointer && !l.is_junction_backed()) {
+        return Ok(qi(&format!("{pointer}_id")));
+    }
+    // A computed has no column; index the expression it stands for.
+    Ok(format!(
+        "({})",
+        crate::ir::compile_constraint_expr(&format!(".{pointer}"), qualified, schema)?
+    ))
+}
+
 fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
     for t in &schema.types {
@@ -1501,17 +1569,17 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
 
         for idx in &t.indexes {
             let unique = if idx.unique { "UNIQUE " } else { "" };
-            let body = if let Some(expr) = &idx.expression {
-                format!("({})", expr)
-            } else {
-                let cols: Vec<String> = idx.pointers.iter().map(|f| qi(f)).collect();
-                format!("({})", cols.join(", "))
+            let Ok((body, where_clause)) = index_body_and_predicate(
+                t,
+                &idx.pointers,
+                idx.expression.as_deref(),
+                idx.unless.as_deref(),
+                schema,
+            ) else {
+                // Validation reports the same expression with a far better
+                // message; a half-built index would be worse than none.
+                continue;
             };
-            let where_clause = idx
-                .unless
-                .as_deref()
-                .map(|u| format!(" WHERE NOT ({})", u))
-                .unwrap_or_default();
             out.push_str(&format!(
                 "CREATE {}INDEX ON {} {}{};\n",
                 unique, qname, body, where_clause,

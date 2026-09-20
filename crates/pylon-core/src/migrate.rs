@@ -610,8 +610,14 @@ pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Resu
             }
             tx.commit().await?;
         } else {
-            drop_invalid_concurrent_index(pool, sql).await?;
-            pool.batch_execute(sql).await?;
+            // One statement per round trip: several sent together are one
+            // simple-query batch, which Postgres runs in an implicit
+            // transaction -- the very thing `CREATE INDEX CONCURRENTLY`
+            // refuses to be in.
+            for statement in crate::migration::split_statements(sql) {
+                drop_invalid_concurrent_index(pool, &statement).await?;
+                pool.batch_execute(&statement).await?;
+            }
             if is_last {
                 record_applied(pool, &m.id, &m.onto, &m.filename).await?;
                 if multi_step {

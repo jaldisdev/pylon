@@ -184,7 +184,11 @@ const FKS_SQL: &str = r#"
 "#;
 
 const INDEXES_SQL: &str = r#"
-    SELECT (i.relname, ix.indisunique, am.amname) AS result
+    SELECT (i.relname, ix.indisunique, am.amname, COALESCE((
+        SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+        FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+    ), ''), pg_get_expr(ix.indpred, ix.indrelid)) AS result
     FROM pg_index ix
     JOIN pg_class i ON i.oid = ix.indexrelid
     JOIN pg_am am ON am.oid = i.relam
@@ -393,17 +397,26 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
         )
         .await?
         {
-            let Some([relname, is_unique, amname]) = fields::<3>(idx) else {
+            let Some([relname, is_unique, amname, cols, pred]) = fields::<5>(idx) else {
                 continue;
             };
             let (Some(relname), Some(is_unique), Some(amname)) = (as_str(relname), as_bool(is_unique), as_str(amname))
             else {
                 continue;
             };
+            let columns = as_str(cols)
+                .filter(|c| !c.is_empty())
+                .map(|c| c.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
             indexes.push(DbIndex {
                 name: relname,
                 is_unique,
                 method: amname,
+                columns,
+                predicate: as_opt_str(pred),
+                // Read back from `pg_get_indexdef`'s key only when needed; a
+                // plain column list is compared through `columns`.
+                key: None,
             });
         }
 
