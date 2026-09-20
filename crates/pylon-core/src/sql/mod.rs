@@ -4657,6 +4657,22 @@ mod tests {
     }
 
     #[test]
+    fn test_a_tuple_element_holding_a_shaped_object() {
+        // `select (c { name }, 1)` — an element is the same question a free
+        // object's field asks, and used to report "shapes and set literals
+        // are not valid in expression context".
+        let out = compile_and_emit_with(
+            "WITH c := (SELECT Company LIMIT 1) SELECT (c { name }, 1)",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("'default::Company'::text"),
+            "the element must carry the object's own row:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
