@@ -337,7 +337,7 @@ fn collect_shape_pointer(p: &IrShapePointer, tags: &mut Vec<String>) {
 fn collect_free_expr(item: &IrFreeExpr, tags: &mut Vec<String>) {
     match item {
         IrFreeExpr::Scalar(e) => collect_expr(e, tags),
-        IrFreeExpr::FreeObject(fields) => {
+        IrFreeExpr::FreeObject(fields) | IrFreeExpr::NamedTupleRow(fields) => {
             for (_, e) in fields {
                 collect_expr(e, tags);
             }

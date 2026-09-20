@@ -123,7 +123,16 @@ pub enum ShapeNode {
         element: Box<ShapeNode>,
     },
     /// Anonymous positional tuple decoded to a Python tuple. No type name — no registry lookup.
-    Tuple { position: usize, elements: Vec<ShapeNode> },
+    /// A composite tuple row, read by indexing rather than out of jsonb.
+    /// `names` is set for a named tuple that had to be emitted as a composite
+    /// because an element holds an object -- jsonb has no member kind for one
+    /// (see `JsonMemberKind`) -- and decides whether this hydrates to a plain
+    /// tuple or a `NamedTupleValue`.
+    Tuple {
+        position: usize,
+        elements: Vec<ShapeNode>,
+        names: Option<Vec<String>>,
+    },
     /// Named tuple decoded from jsonb. When `type_name` is Some, hydrated to the registered class.
     /// `members` carries the full per-member decode plan when statically known (a registered
     /// NamedTupleDescriptor's members, a structural `pylon.Tuple[...]` property's tuple_members,

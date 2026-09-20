@@ -286,6 +286,22 @@ class TestFreeObjectsAndScalars:
         author, number = native[0]
         assert (author.name, number) == ('Alice', 1)
 
+    def test_a_named_tuple_element_holding_an_object(self):
+        """jsonb has no member kind for an object, so a named tuple holding
+        one is emitted as a composite -- and must still come back as the value
+        a named tuple gives, not as a plain tuple."""
+
+        compiled = _compile('with a := (select m::Author limit 1) select (who := a { name }, n := 1)')
+        native = assert_parity([(('m::Author', 'Alice'), 1)], compiled)
+        assert isinstance(native[0], NamedTupleValue)
+        assert (native[0].who.name, native[0].n) == ('Alice', 1)
+
+    def test_a_named_tuple_of_scalars_still_travels_as_jsonb(self):
+        """Nothing forced the composite, so the encoding is unchanged."""
+
+        compiled = _compile('select (x := 1, y := 2)')
+        assert compiled.shape['kind'] == 'named_tuple'
+
     def test_a_bare_scalar(self):
         # A bare `select <expr>` compiles to a Scalar node at position 0, so
         # the row is still a one-element tuple, not the value itself.

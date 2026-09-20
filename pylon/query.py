@@ -283,12 +283,20 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         # the way `array` does above: the object branch takes position 0 to
         # mean "this is the whole row", which is true of the query's root
         # but not of a tuple's first element.
-        return tuple(
+        items = [
             _decode(value[e['position']], {**e, 'position': 0}, registry)
             if e['kind'] == 'object'
             else _decode(value, e, registry)
             for e in node['elements']
-        )
+        ]
+        # A named tuple emitted as a composite still hydrates to the value a
+        # named tuple gives, not to a plain tuple.
+        names = node.get('names')
+        if names is None:
+            return tuple(items)
+        from pylon.datatypes import NamedTupleValue
+
+        return NamedTupleValue(**dict(zip(names, items, strict=True)))
 
     if kind == 'group':
         key_nodes = node['key_nodes']

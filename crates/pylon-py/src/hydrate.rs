@@ -258,7 +258,7 @@ fn decode<'py>(
             };
             reg.pylon_set.bind(py).call1((PyList::new(py, items)?,))
         }
-        ShapeNode::Tuple { elements, .. } => {
+        ShapeNode::Tuple { elements, names, .. } => {
             // An object element is indexed out first and read as its own
             // root: `decode_object` takes position 0 to mean "this is the
             // whole row", true of the query's root but not of a tuple's
@@ -278,7 +278,16 @@ fn decode<'py>(
                     _ => decode(py, value, e, reg),
                 })
                 .collect::<PyResult<Vec<_>>>()?;
-            Ok(PyTuple::new(py, items)?.into_any())
+            // A named tuple emitted as a composite still hydrates to the
+            // value a named tuple gives, not to a plain tuple.
+            let Some(names) = names else {
+                return Ok(PyTuple::new(py, items)?.into_any());
+            };
+            let kwargs = PyDict::new(py);
+            for (name, item) in names.iter().zip(items) {
+                kwargs.set_item(name, item)?;
+            }
+            reg.named_tuple_value.bind(py).call((), Some(&kwargs))
         }
         ShapeNode::Group {
             key_nodes,

@@ -230,6 +230,11 @@ pub enum IrFreeExpr {
     Scalar(IrExpr),
     /// A free object: `SELECT { foo := 'bar', n := 42 }`.
     FreeObject(Vec<(String, IrExpr)>),
+    /// A named tuple whose elements had to become a composite row rather than
+    /// jsonb, because one of them holds an object -- jsonb has no member kind
+    /// for an object (see `JsonMemberKind`), so encoding it there would
+    /// flatten it. Still a named tuple to the caller, not a free object.
+    NamedTupleRow(Vec<(String, IrExpr)>),
     /// An anonymous tuple: `SELECT (1, 'x')`.
     Tuple(Vec<IrExpr>),
     /// A set-returning assert: `SELECT ROW(v) FROM unnest(_pylon.fn(ARRAY(inner))) v`.

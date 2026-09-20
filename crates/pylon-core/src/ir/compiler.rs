@@ -3975,12 +3975,22 @@ impl<'a> Compiler<'a> {
             Expr::NamedTuple(fields) => {
                 let ir = fields
                     .iter()
-                    .map(|(name, e)| Ok((name.clone(), self.compile_free_expr(e)?)))
+                    .map(|(name, e)| Ok((name.clone(), self.free_object_field(e)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                vec![IrFreeExpr::Scalar(IrExpr::NamedTuple {
-                    fields: ir,
-                    is_free_object: false,
-                })]
+                // jsonb has no member kind for an object, so a tuple holding
+                // one is emitted as a composite row instead; the rest stay on
+                // the jsonb encoding they have always had.
+                let holds_an_object = ir
+                    .iter()
+                    .any(|(_, e)| matches!(e, IrExpr::ObjectSubquery(_) | IrExpr::ObjectPathSubquery(_)));
+                if holds_an_object {
+                    vec![IrFreeExpr::NamedTupleRow(ir)]
+                } else {
+                    vec![IrFreeExpr::Scalar(IrExpr::NamedTuple {
+                        fields: ir,
+                        is_free_object: false,
+                    })]
+                }
             }
             other => vec![IrFreeExpr::Scalar(self.compile_free_expr(other)?)],
         };
