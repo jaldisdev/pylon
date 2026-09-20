@@ -1275,6 +1275,13 @@ impl<'a> Compiler<'a> {
             }
             _ => return None,
         };
+        // `(select detached T filter … limit 1).field` — at the top level the
+        // marker says nothing a field access changes, and the path underneath
+        // is the subject to splice the chain onto.
+        let mut sel = sel;
+        if let Expr::Detached(inner) = &sel.result {
+            sel.result = inner.as_ref().clone();
+        }
         match &sel.result {
             Expr::Path(p) if !p.partial => Some(sel),
             _ => None,
@@ -7592,6 +7599,10 @@ impl<'a> Compiler<'a> {
     fn split_path_result(result: &Expr) -> Option<(&ast::Path, &[ShapeElement])> {
         match result {
             Expr::Path(p) => Some((p, &[])),
+            // `(select detached T filter … limit 1).field` — the marker says
+            // the set is not correlated with the enclosing one, which is
+            // already true of a subject named by its own type.
+            Expr::Detached(inner) => Self::split_path_result(inner),
             Expr::Shape(sh) => match &sh.expr {
                 Some(Expr::Path(p)) => Some((p, sh.elements.as_slice())),
                 _ => None,
