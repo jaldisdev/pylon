@@ -6298,6 +6298,16 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        // `emails := (insert …) if exists($email) else {}` — the same choice
+        // between two sets the select path reads, and the same rewrite: the
+        // insert carries the condition itself, since Postgres runs a
+        // data-modifying CTE whether or not anything reads it.
+        if matches!(expr, Expr::IfElse(_))
+            && let Some(rewritten) = self.object_if_else_as_union(expr)
+        {
+            return self.compile_multilink_values(&rewritten, td, alias, through_td);
+        }
+
         // `expr { @prop := value, ... }` — link-property assignments layered
         // onto an inner target-selecting expression.
         if let Expr::Shape(shape) = expr {
@@ -6360,6 +6370,19 @@ impl<'a> Compiler<'a> {
                 });
             }
             return Ok(combined.expect("elements is non-empty"));
+        }
+
+        // `social_accounts := (for p in … union (insert …))` — the loop's rows
+        // are the link's targets, read back from the CTE it is hoisted into,
+        // the same way a bare nested insert is.
+        if let Expr::SubQuery(inner) = expr
+            && let Stmt::For(_) = inner.as_ref()
+        {
+            let (cte_name, _) = self.hoist_dml_as_cte(inner.as_ref())?;
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::CteRef(cte_name),
+                link_props: vec![],
+            });
         }
 
         // `emails := (insert Email { … })` — a nested insert whose rows become
