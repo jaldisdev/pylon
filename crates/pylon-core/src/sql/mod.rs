@@ -4691,6 +4691,53 @@ mod tests {
     }
 
     #[test]
+    fn test_an_object_returning_function_as_a_link_value() {
+        // `created_by := account_of_transaction()` — the function names the
+        // row to link to, so its key is what gets stored. The schema itself
+        // writes this as a link default; written out in a query it used to be
+        // refused as "part of a larger expression".
+        let mut schema = make_schema();
+        // make_schema's Company carries only a name; a link's value is its key.
+        let company = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("make_schema declares Company");
+        company.properties.push(PropertyDescriptor {
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        schema.functions.push(crate::schema::FunctionDescriptor {
+            name: "current_company".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Company".into(),
+            return_is_object: true,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Company limit 1".into(),
+        });
+        let out = compile_and_emit_with("INSERT Person { name := $n, company := current_company() }", &schema);
+        assert!(
+            out.sql.contains("FROM \"public\".\"current_company\"()"),
+            "the function must supply the foreign key:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

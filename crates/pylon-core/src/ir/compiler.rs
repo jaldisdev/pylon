@@ -4984,6 +4984,16 @@ impl<'a> Compiler<'a> {
                         let ir_expr = self.compile_link_subquery(inner_stmt)?;
                         return Ok((fk_col, ir_expr));
                     }
+                    // `created_by := account_of_transaction()` — an
+                    // object-returning function names the row to link to, so
+                    // what is stored is its key, the same as for a select.
+                    // The schema itself writes this as a link default.
+                    if let Expr::FunctionCall(fc) = value
+                        && let Some(ir_expr) =
+                            self.try_compile_fn_scalar_subquery(fc, &["id".to_string()], None, None)?
+                    {
+                        return Ok((fk_col, ir_expr));
+                    }
                     fk_col
                 } else {
                     return Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)));
