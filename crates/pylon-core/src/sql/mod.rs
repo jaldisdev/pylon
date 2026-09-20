@@ -5732,6 +5732,14 @@ mod tests {
     }
 
     #[test]
+    fn test_a_walk_inside_a_path_selects_shape_finds_its_row() {
+        // The shape is compiled against the type the walk landed on, so a
+        // relative path inside it has that row to resolve against.
+        let out = compile_and_emit("SELECT Person.posts { mine := (SELECT Post FILTER .title = .title LIMIT 1) }");
+        assert!(out.sql.contains("\"public\".\"Post\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_a_trailing_shape_on_a_field_access_select() {
         let out = compile_and_emit("SELECT (SELECT Person).company { name }");
         assert!(out.sql.contains("\"name\""), "{}", out.sql);

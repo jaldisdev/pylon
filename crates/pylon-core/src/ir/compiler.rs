@@ -2507,6 +2507,28 @@ impl<'a> Compiler<'a> {
 
     /// `select TypeName.link.prop` / `select TypeName.link { shape }`.
     /// Walks the path, building JOIN steps, then projects the final pointer or object.
+    /// `compile_shape` with the type the walk landed on anchored, so a
+    /// relative path written inside the shape — a `with` binding's value, a
+    /// nested sub-select's filter — has an enclosing object to resolve
+    /// against. A plain `select` pushes the same anchor for its own shape.
+    fn compile_shape_anchored(
+        &mut self,
+        elements: &[ShapeElement],
+        td: &'a TypeDescriptor,
+        alias: &str,
+        module: &str,
+    ) -> Result<Vec<IrShapePointer>, PyQLError> {
+        self.anchors.push(SelectAnchor {
+            type_name: td.name.clone(),
+            qualified: format!("{}::{}", td.module, td.name),
+            alias: alias.to_string(),
+            detached: false,
+        });
+        let result = self.compile_shape(elements, td, alias, module);
+        self.anchors.pop();
+        result
+    }
+
     fn compile_path_select(
         &mut self,
         sel: &ast::SelectStmt,
@@ -2769,7 +2791,7 @@ impl<'a> Compiler<'a> {
 
                 if is_last(consumed_extra) {
                     let shape =
-                        self.compile_shape(shape_elements, owner_td, &target_alias, &owner_td.module.clone())?;
+                        self.compile_shape_anchored(shape_elements, owner_td, &target_alias, &owner_td.module.clone())?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", owner_td.module, owner_td.name),
@@ -2946,7 +2968,7 @@ impl<'a> Compiler<'a> {
                 }
                 if is_last(0) {
                     let shape =
-                        self.compile_shape(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                        self.compile_shape_anchored(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -3044,7 +3066,7 @@ impl<'a> Compiler<'a> {
                 });
                 if is_last(0) {
                     let shape =
-                        self.compile_shape(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                        self.compile_shape_anchored(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
@@ -3214,7 +3236,7 @@ impl<'a> Compiler<'a> {
                     }
                     if is_last(0) {
                         let shape =
-                            self.compile_shape(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                            self.compile_shape_anchored(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
                         let result = IrPathResult::Object {
                             alias: target_alias.clone(),
                             type_name: format!("{}::{}", target_td.module, target_td.name),
