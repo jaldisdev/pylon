@@ -4660,12 +4660,51 @@ impl<'a> Compiler<'a> {
         ))
     }
 
+    /// `granted ?? existing` over object sets is the choice `A if exists A
+    /// else B` spells, so it reaches the same union machinery. A scalar
+    /// coalesce rewritten this way is simply not an object union, and the
+    /// caller falls back to compiling what was written.
+    fn object_coalesce_as_if_else(expr: &Expr) -> Option<Expr> {
+        fn as_if_else(b: &ast::BinOp) -> Option<Expr> {
+            (b.op == ast::BinOpKind::Coalesce).then(|| {
+                Expr::IfElse(Box::new(ast::IfElse {
+                    condition: Expr::UnaryOp(Box::new(ast::UnaryOp {
+                        op: ast::UnaryOpKind::Exists,
+                        operand: b.left.clone(),
+                    })),
+                    if_expr: b.left.clone(),
+                    else_expr: b.right.clone(),
+                }))
+            })
+        }
+        match expr {
+            Expr::BinOp(b) => as_if_else(b),
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::BinOp(b)) => Some(Expr::Shape(Box::new(ast::ShapeExpr {
+                    expr: Some(as_if_else(b)?),
+                    elements: sh.elements.clone(),
+                    marker_offset: sh.marker_offset,
+                }))),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn try_compile_object_union_select(
         &mut self,
         sel: &ast::SelectStmt,
         result_expr: &Expr,
         distinct: bool,
     ) -> Result<Option<IrSelect>, PyQLError> {
+        let coalesced;
+        let result_expr = match Self::object_coalesce_as_if_else(result_expr) {
+            Some(rewritten) => {
+                coalesced = rewritten;
+                &coalesced
+            }
+            None => result_expr,
+        };
         let as_union;
         let (union_expr, shape_elements): (&Expr, &[ShapeElement]) = match result_expr {
             Expr::Union(_, _) => (result_expr, &[]),
