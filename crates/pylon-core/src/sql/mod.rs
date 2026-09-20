@@ -1003,6 +1003,48 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                 parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
             }
         }
+        // `for line in … union (for component in … union (insert …))` — one
+        // iterator CTE per loop, the inner carrying the outer's key, and the
+        // insert driven from the two joined on it.
+        IrStmt::For(inner) => {
+            let inner_alias = format!("_for_{}", inner.var_name);
+            parts.push(emit_nested_for_iterator(&inner.iterator, &inner_alias, &iter_alias));
+            parts.extend(emit_user_cte_parts(&inner.body_ctes));
+            let IrStmt::Insert(ins) = inner.body.as_ref() else {
+                unreachable!("a nested for-loop's own body is an insert: {:?}", inner.body)
+            };
+            let rewrite_cols: std::collections::HashSet<&str> =
+                ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+            let cols: Vec<String> = ins
+                .assignments
+                .iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(c, _)| qi(c))
+                .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
+                .collect();
+            let values: Vec<String> = ins
+                .assignments
+                .iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(_, e)| emit_expr(e))
+                .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
+                .collect();
+            let mut sql = format!(
+                "INSERT INTO {} ({})\nSELECT {} FROM {}",
+                source_ref(&ins.target),
+                cols.join(", "),
+                values.join(", "),
+                nested_for_from(&inner_alias, &iter_alias),
+            );
+            if let Some(conflict) = &ins.unless_conflict {
+                emit_conflict(&mut sql, conflict);
+            }
+            sql.push_str("\nRETURNING *");
+            parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
+            for (i, append) in ins.multi_link_appends.iter().enumerate() {
+                parts.push(emit_ml_append_cte(append, &ids_name, &format!("{}__ml_add_{}", name, i)));
+            }
+        }
         // Unreachable: only a mutating body is routed here.
         other => unreachable!("for-loop body is not a mutation: {other:?}"),
     }
@@ -1057,7 +1099,10 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             continue;
         }
         if let IrStmt::For(f) = &c.stmt
-            && matches!(f.body.as_ref(), IrStmt::Insert(_) | IrStmt::Update(_))
+            && matches!(
+                f.body.as_ref(),
+                IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::For(_)
+            )
         {
             parts.extend(emit_for_dml_ctes(f, &c.name));
             continue;
@@ -2498,6 +2543,55 @@ fn emit_for_iterator(it: &IrForIterator, iter_alias: &str) -> (String, String) {
             )
         }
     }
+}
+
+/// The iterator CTE of a `for` nested in another one. The enclosing iterator
+/// goes in its FROM, so the walk it iterates can read the outer loop variable,
+/// and its key rides along as `_outer` for the body to join back on — the bond
+/// the upstream engine's own `merge_iterator` puts between a chain of iterator CTEs.
+fn emit_nested_for_iterator(it: &IrForIterator, iter_alias: &str, outer_alias: &str) -> String {
+    const OUTER: &str = "_outer";
+    match it {
+        IrForIterator::Values { exprs, pg_type } => {
+            let rows: Vec<String> = exprs
+                .iter()
+                .map(|e| format!("({}::{})", emit_expr(e), pg_type))
+                .collect();
+            format!(
+                "{} AS (\nSELECT {}.\"v\" AS {}, \"_vals\".\"v\" AS v\nFROM {}, (VALUES {}) AS \"_vals\"(\"v\")\n)",
+                qi(iter_alias),
+                qi(outer_alias),
+                qi(OUTER),
+                qi(outer_alias),
+                rows.join(", "),
+            )
+        }
+        IrForIterator::Query { stmt, scalar } => {
+            let inner = emit_dml_as_cte_source(stmt);
+            let projected = if *scalar { "\"_src\".\"v\"" } else { "\"_src\".\"id\"" };
+            format!(
+                "{} AS (\nSELECT {}.\"v\" AS {}, {} AS v\nFROM {}\nCROSS JOIN LATERAL (\n{}\n) AS \"_src\"\n)",
+                qi(iter_alias),
+                qi(outer_alias),
+                qi(OUTER),
+                projected,
+                qi(outer_alias),
+                inner,
+            )
+        }
+    }
+}
+
+/// `FROM <inner iterator> JOIN <outer iterator> ON …` — both loop variables in
+/// scope for the body, each still read as `"_for_<name>"."v"`.
+fn nested_for_from(inner_alias: &str, outer_alias: &str) -> String {
+    format!(
+        "{} JOIN {} ON {}.\"v\" = {}.\"_outer\"",
+        qi(inner_alias),
+        qi(outer_alias),
+        qi(outer_alias),
+        qi(inner_alias),
+    )
 }
 
 /// Put the bindings a `for` body declared in front of the body itself: they may
@@ -5794,6 +5888,24 @@ mod tests {
         );
         assert!(out.sql.contains("UNION ALL"), "{}", out.sql);
         assert!(out.sql.contains("\"title\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_nested_for_carries_the_outer_loops_key() {
+        // The inner iterator has the outer one in its FROM, and the insert
+        // joins the two back on the key it carries — the upstream engine's own iterator bond.
+        let out = compile_and_emit(
+            "WITH made := (FOR p IN (SELECT Person) UNION ( \
+               FOR q IN p.posts UNION (INSERT Company { name := q.title }) \
+             )) SELECT count(made)",
+        );
+        assert!(out.sql.contains("\"_outer\""), "the inner iterator carries the bond:\n{}", out.sql);
+        assert!(
+            out.sql.contains("JOIN \"_for_p\" ON"),
+            "the insert reads both loop variables:\n{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("LATERAL (\nINSERT"), "DML cannot sit in a LATERAL:\n{}", out.sql);
     }
 
     #[test]
