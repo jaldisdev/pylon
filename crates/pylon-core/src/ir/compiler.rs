@@ -5048,6 +5048,24 @@ impl<'a> Compiler<'a> {
             // <iterated set>`) rather than from a LATERAL, which cannot hold
             // DML. A multi-link mutation inside one would need its junction
             // rows driven from the iteration too, which it is not yet.
+            // An append whose value is the loop variable itself can be driven
+            // from the iteration (`emit_for_ml_append_cte`); anything more
+            // would need its junction rows correlated in a way they are not.
+            IrStmt::Update(upd)
+                if upd.assignments.is_empty()
+                    && upd.rewrites.is_empty()
+                    && !upd.multi_link_appends.is_empty()
+                    && upd
+                        .multi_link_appends
+                        .iter()
+                        .all(|a| crate::sql::append_value_is_the_loop_variable(&a.values, &f.var))
+                    && upd.multi_link_clears.is_empty()
+                    && upd.multi_link_replaces.is_empty()
+                    && upd.multi_link_removals.is_empty()
+                    && upd.poly_implementors.is_empty() =>
+            {
+                None
+            }
             IrStmt::Update(upd)
                 if upd.multi_link_appends.is_empty()
                     && upd.multi_link_clears.is_empty()

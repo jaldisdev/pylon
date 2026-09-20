@@ -1203,6 +1203,48 @@ fn emit_path_join_sql(join: &IrPathJoin) -> String {
 /// `ids_name` is the row-source CTE to join against (usually "_ids", but
 /// callers hoisting this into a shared top-level WITH block alongside other
 /// user-bound statements pass a name prefixed for collision-safety instead).
+/// The loop variable an append's value stands for, when the value is exactly
+/// that variable (`memberships += membership`).
+///
+/// Such a value is compiled as a select over the target table narrowed to the
+/// key the variable holds. Inside a `for` that key is already carried on the
+/// driving rows, so the junction insert can read it from there instead of
+/// correlating to a CTE it has no range-table entry for.
+pub(crate) fn append_value_is_the_loop_variable(values: &IrMultiLinkValues, var: &str) -> bool {
+    let IrMultiLinkValueSource::Select(sel) = &values.source else {
+        return false;
+    };
+    let Some(IrExpr::BinOp(cmp)) = sel.filter.as_ref() else {
+        return false;
+    };
+    matches!(
+        (&cmp.left, &cmp.op, &cmp.right),
+        (
+            IrExpr::ColumnRef { column, .. },
+            crate::parse::ast::BinOpKind::Eq,
+            IrExpr::ForVar { name },
+        ) if column == "id" && name == var
+    ) && values.link_props.is_empty()
+}
+
+/// `emit_ml_append_cte` for a `for` body: the target comes from the column the
+/// driving rows carry rather than from a correlated subquery.
+fn emit_for_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str, iter_col: &str) -> String {
+    format!(
+        "\"{}\" AS (\nINSERT INTO {} ({}, {})\nSELECT \"{}\".\"id\", \"{}\".{} FROM \"{}\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}\n)",
+        cte_name,
+        qn(&mutation.module, &mutation.junction_table),
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+        ids_name,
+        ids_name,
+        qi(iter_col),
+        ids_name,
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+    )
+}
+
 fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
     let mut prop_names = vec![];
     collect_link_prop_names(&mutation.values, &mut prop_names);
@@ -2434,6 +2476,56 @@ fn emit_for_update(
     cte_parts.push(iter_cte.to_string());
 
     let alias = &upd.target.alias;
+    // With only junction rows to write there is nothing to SET, so the driving
+    // rows are selected rather than updated -- the same shape a multi-link-only
+    // update takes outside a loop.
+    if upd.assignments.is_empty() && upd.rewrites.is_empty() && !upd.multi_link_appends.is_empty() {
+        const ITER_COL: &str = "_iter";
+        let ids_name = "_ids";
+        let mut ids_sql = format!(
+            "\"{}\" AS (\nSELECT {}.*, {}.\"v\" AS {} FROM {} AS {}, {}",
+            ids_name,
+            qi(alias),
+            qi(iter_alias),
+            qi(ITER_COL),
+            source_ref(&upd.target),
+            qi(alias),
+            qi(iter_alias),
+        );
+        append_filter(&mut ids_sql, &upd.filter);
+        ids_sql.push_str("\n)");
+        cte_parts.push(ids_sql);
+        for (i, append) in upd.multi_link_appends.iter().enumerate() {
+            cte_parts.push(emit_for_ml_append_cte(
+                append,
+                ids_name,
+                &format!("_ml_add_{i}"),
+                ITER_COL,
+            ));
+        }
+        let (pointer_exprs, shape_nodes) = build_shape(&upd.returning, ids_name);
+        let mut parts = vec![type_disc(&upd.target.type_name)];
+        parts.extend(pointer_exprs);
+        let sql = format!(
+            "WITH {}\nSELECT (\n    {}\n) AS result\nFROM \"{}\"",
+            cte_parts.join(",\n"),
+            parts.join(",\n    "),
+            ids_name,
+        );
+        return SqlOutput {
+            sql,
+            shape: crate::query::ShapeDescriptor {
+                root: ShapeNode::Object {
+                    name: String::new(),
+                    type_name: Some(upd.target.type_name.clone()),
+                    position: 0,
+                    cardinality: Cardinality::Many,
+                    pointers: prepend_type(shape_nodes),
+                },
+            },
+            inference_plan: None,
+        };
+    }
     let sets: Vec<String> = upd
         .assignments
         .iter()
