@@ -87,11 +87,63 @@ pub struct DbForeignKey {
     pub ref_table: String,
 }
 
+/// Postgres refuses an identifier over 63 bytes, and a composite exclusive on
+/// a long type name easily passes that. Keep the readable head and settle the
+/// tail with a hash, so the name stays stable across runs.
+fn capped_index_name(name: String) -> String {
+    const MAX: usize = 63;
+    if name.len() <= MAX {
+        return name;
+    }
+    let hash = crate::export::fnv(&[&name]);
+    let head: String = name.chars().take(MAX - 9).collect();
+    format!("{head}_{}", &hash[..8])
+}
+
+/// The column a pointer is stored in: a link keeps its key in `{name}_id`,
+/// a property in a column of its own name.
+fn pointer_column(td: &TypeDescriptor, pointer: &str) -> String {
+    if td.links.iter().any(|l| l.name == pointer && !l.is_junction_backed()) {
+        format!("{pointer}_id")
+    } else {
+        pointer.to_string()
+    }
+}
+
+/// Whether a pointer reaches this type from an interface it implements. Such a
+/// pointer is flattened onto every implementor, so uniqueness declared on it
+/// has to hold across all of their tables at once -- not per table.
+fn inherited_from_an_interface(schema: &SchemaDescriptor, td: &TypeDescriptor, pointer: &str) -> bool {
+    td.interfaces.iter().any(|iface| {
+        schema
+            .types
+            .iter()
+            .filter(|t| format!("{}::{}", t.module, t.name) == *iface)
+            .any(|t| t.properties.iter().any(|p| p.name == pointer) || t.links.iter().any(|l| l.name == pointer))
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbIndex {
     pub name: String,
     pub is_unique: bool,
     pub method: String,
+    /// The columns the index is keyed on, in order. Postgres auto-names an
+    /// index created without one, so a name is no basis for deciding whether
+    /// the database already has what the schema asks for -- the columns are.
+    /// Empty for an index over an expression, which is matched by name.
+    #[serde(default)]
+    pub columns: Vec<String>,
+    /// The `WHERE` of a partial index, already compiled to SQL. An exclusive
+    /// declared `unless=` covers only the rows the condition excludes, and an
+    /// index built without it would refuse rows the constraint allows.
+    #[serde(default)]
+    pub predicate: Option<String>,
+    /// The whole `(...)` key as SQL, for an index whose key is not a plain
+    /// column list -- a computed pointer, or an expression index. `columns`
+    /// stays empty then, and this is what decides whether it already exists.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,11 +350,18 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         // Unique indexes from exclusive properties and links (Postgres auto-names them).
         let mut indexes: Vec<DbIndex> = Vec::new();
         for p in &td.properties {
-            if p.is_exclusive && !p.is_pk {
+            // An exclusive inherited from an interface spans every
+            // implementor's table, so a per-table unique index would only
+            // enforce it within one of them; those are carried by the shared
+            // constraint triggers `interface_exclusive_trigger_infos` emits.
+            if p.is_exclusive && !p.is_pk && !inherited_from_an_interface(schema, td, &p.name) {
                 indexes.push(DbIndex {
                     name: format!("{}_{}_key", td.table, p.name),
                     is_unique: true,
                     method: "btree".to_string(),
+                    columns: vec![p.name.clone()],
+                    predicate: None,
+                    key: None,
                 });
             }
         }
@@ -310,23 +369,38 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             // A junction-backed exclusive link's uniqueness is a
             // `UNIQUE (target)` table constraint on its junction table
             // (below), not a separate index on this table.
-            if l.is_exclusive && !l.is_junction_backed() {
+            if l.is_exclusive && !l.is_junction_backed() && !inherited_from_an_interface(schema, td, &l.name) {
                 indexes.push(DbIndex {
                     name: format!("{}_{}_id_key", td.table, l.name),
                     is_unique: true,
                     method: "btree".to_string(),
+                    columns: vec![format!("{}_id", l.name)],
+                    predicate: None,
+                    key: None,
                 });
             }
         }
         for (i, constraint) in td.constraints.iter().enumerate() {
             use crate::schema::TypeConstraint;
-            if let TypeConstraint::Exclusive { pointers: fields, .. } = constraint {
+            if let TypeConstraint::Exclusive {
+                pointers: fields,
+                unless,
+            } = constraint
+            {
                 // Postgres auto-names these; mirror the convention.
                 let idx_name = format!("{}_{}_{}_key", td.table, fields.join("_"), i);
                 indexes.push(DbIndex {
                     name: idx_name,
                     is_unique: true,
                     method: "btree".to_string(),
+                    columns: fields.iter().map(|f| pointer_column(td, f)).collect(),
+                    predicate: unless.as_deref().and_then(|u| {
+                        let qualified = format!("{}::{}", td.module, td.name);
+                        crate::ir::compile_constraint_expr(u, &qualified, schema)
+                            .ok()
+                            .map(|c| format!(" WHERE NOT ({c})"))
+                    }),
+                    key: None,
                 });
             }
         }
@@ -337,10 +411,25 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             } else {
                 format!("{}__{}_idx", td.table, idx.pointers.join("_"))
             };
+            // The key is built by the same helper the export uses, so a
+            // pointer that is a link or a computed lands on the same SQL in
+            // both paths rather than only in one.
+            let Ok((body, predicate)) = crate::export::index_body_and_predicate(
+                td,
+                &idx.pointers,
+                idx.expression.as_deref(),
+                idx.unless.as_deref(),
+                schema,
+            ) else {
+                continue;
+            };
             indexes.push(DbIndex {
                 name,
                 is_unique: idx.unique,
                 method: "btree".to_string(),
+                columns: vec![],
+                key: Some(body),
+                predicate: (!predicate.is_empty()).then_some(predicate),
             });
         }
         // Vector HNSW indexes
@@ -353,6 +442,9 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 name: idx_name,
                 is_unique: false,
                 method: "hnsw".to_string(),
+                columns: vec![],
+                predicate: None,
+                key: None,
             });
         }
         // Search GIN indexes
@@ -368,6 +460,9 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 name: idx_name,
                 is_unique: false,
                 method: "gin".to_string(),
+                columns: vec![],
+                predicate: None,
+                key: None,
             });
         }
 
@@ -2303,6 +2398,74 @@ fn diff_inner(
         }
     }
 
+    // ── Unique and plain indexes ─────────────────────────────────────────────
+    // Only the vector and search passes above used to run here, so every
+    // `Exclusive` and `Index` the schema declared existed on a fresh install
+    // (`export_schema` emits them) and nowhere else: 283 exclusives in the
+    // jaldis schema, none of them enforced in a migrated database.
+    let expected_state = schema_to_db_state(target);
+    let current_indexes: HashMap<(&str, &str), &[DbIndex]> = current
+        .tables
+        .iter()
+        .map(|t| ((t.schema.as_str(), t.name.as_str()), t.indexes.as_slice()))
+        .collect();
+    for table in &expected_state.tables {
+        let existing = current_indexes
+            .get(&(table.schema.as_str(), table.name.as_str()))
+            .copied()
+            .unwrap_or_default();
+        let table_is_new = !current_indexes.contains_key(&(table.schema.as_str(), table.name.as_str()));
+        for idx in &table.indexes {
+            // Vector and search indexes have neither; their own passes above
+            // know the operator class and expression each needs.
+            if idx.columns.is_empty() && idx.key.is_none() {
+                continue;
+            }
+            // Postgres auto-names an index created without a name, so the
+            // database's name is no guide for a plain column list -- what
+            // settles that is the key itself: same columns, same uniqueness,
+            // and partial or not. An index over an expression has no column
+            // list to compare and is matched by the name this generates.
+            let already_there = match &idx.key {
+                Some(_) => existing.iter().any(|b| b.name == idx.name),
+                None => existing.iter().any(|b| {
+                    b.columns == idx.columns
+                        && b.is_unique == idx.is_unique
+                        && b.predicate.is_some() == idx.predicate.is_some()
+                }),
+            };
+            if already_there {
+                continue;
+            }
+            let use_concurrently = for_migration && !table_is_new;
+            let concurrently = if use_concurrently { "CONCURRENTLY " } else { "" };
+            let unique = if idx.is_unique { "UNIQUE " } else { "" };
+            let body = match &idx.key {
+                Some(key) => key.clone(),
+                None => format!("({})", idx.columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ")),
+            };
+            let sql = format!(
+                "CREATE {unique}INDEX {concurrently}IF NOT EXISTS {} ON {} {}{};",
+                qi(&capped_index_name(idx.name.clone())),
+                qn(&table.schema, &table.name),
+                body,
+                idx.predicate.clone().unwrap_or_default(),
+            );
+            let owner_key = OpKey::Table(table.schema.clone(), table.name.clone());
+            let owner_verb = if table_is_new { Verb::Create } else { Verb::Alter };
+            let owner_desc = verbosename_type(&table.schema, &table.name);
+            steps.extend(
+                owner_key,
+                owner_verb,
+                owner_desc,
+                vec![DiffOp {
+                    sql,
+                    non_transactional: use_concurrently,
+                }],
+            );
+        }
+    }
+
     // ── Phase 10: interface views (after all tables exist) ───────────────────
     // In watch mode always re-emit (CREATE OR REPLACE VIEW is idempotent).
     // In migration mode only emit new or changed views.
@@ -3534,22 +3697,40 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
     // New indexes on pre-existing tables (CONCURRENTLY)
     for t in &after.tables {
         let table_is_new = new_tables.contains(&(t.schema.clone(), t.name.clone()));
-        let before_idx_names: HashSet<&str> = before_tables
+        let before_indexes = before_tables
             .get(&(t.schema.as_str(), t.name.as_str()))
-            .map(|bt| bt.indexes.iter().map(|i| i.name.as_str()).collect())
+            .map(|bt| bt.indexes.as_slice())
             .unwrap_or_default();
         for idx in &t.indexes {
-            if before_idx_names.contains(idx.name.as_str()) {
+            // Postgres auto-names an index created without a name, so the
+            // database's name for one never matches the name the schema side
+            // made up. What settles whether it is already there is the key:
+            // same columns, same uniqueness. An expression index has no
+            // column list to compare and falls back to the name.
+            let already_there = if idx.columns.is_empty() {
+                before_indexes.iter().any(|b| b.name == idx.name)
+            } else {
+                before_indexes
+                    .iter()
+                    .any(|b| b.columns == idx.columns && b.is_unique == idx.is_unique)
+            };
+            if already_there {
+                continue;
+            }
+            // Vector and search indexes are created by their own passes, which
+            // know the operator class and expression each needs.
+            if idx.columns.is_empty() {
                 continue;
             }
             let use_concurrently = !table_is_new;
             let concurrently = if use_concurrently { "CONCURRENTLY " } else { "" };
             let unique = if idx.is_unique { "UNIQUE " } else { "" };
             let idx_sql = format!(
-                "CREATE {unique}INDEX {concurrently}IF NOT EXISTS {} ON {}.{};",
+                "CREATE {unique}INDEX {concurrently}IF NOT EXISTS {} ON {}.{} ({});",
                 qi(&idx.name),
                 pg_schema(&t.schema),
-                qi(&t.name)
+                qi(&t.name),
+                idx.columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", "),
             );
             ops.push(DiffOp {
                 sql: idx_sql,

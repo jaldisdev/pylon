@@ -1279,12 +1279,16 @@ def _assemble_migration_body(ops: list[tuple[str, bool]]) -> str:
 
     parts: list[str] = []
     for i, (non_tx, sqls) in enumerate(groups):
-        if i > 0:
-            # Insert the step marker that signals the start of this group.
-            if non_tx:
-                parts.append('-- pylon:step non-transactional')
-            else:
-                parts.append('-- pylon:step')
+        # The first group needs a marker too when it is non-transactional:
+        # without one, a migration that is *entirely* CONCURRENTLY statements
+        # carries no marker at all and apply wraps it in a transaction, which
+        # Postgres refuses ("CREATE INDEX CONCURRENTLY cannot run inside a
+        # transaction block"). A transactional first group is the default and
+        # needs no marker.
+        if non_tx:
+            parts.append('-- pylon:step non-transactional')
+        elif i > 0:
+            parts.append('-- pylon:step')
         parts.append('\n'.join(sqls))
 
     return '\n' + '\n\n'.join(parts) + '\n'
