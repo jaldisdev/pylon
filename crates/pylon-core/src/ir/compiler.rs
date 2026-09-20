@@ -699,6 +699,8 @@ struct Compiler<'a> {
     /// reason an insert does: a data-modifying CTE runs whether or not
     /// anything reads it, so filtering what is read back changes nothing.
     pending_update_guard: Option<Expr>,
+    /// See `pending_update_guard` — the same, for a guarded delete.
+    pending_delete_guard: Option<Expr>,
     /// Pointers a `with` binding declared in its own shape (`offering := (
     /// select Offering { publisher := … })`). They exist nowhere on the type,
     /// so a later `offering { publisher }` has to find them here.
@@ -844,6 +846,7 @@ impl<'a> Compiler<'a> {
             for_slot_counts: HashMap::new(),
             pending_insert_guard: None,
             pending_update_guard: None,
+            pending_delete_guard: None,
             cte_declared_pointers: HashMap::new(),
             active_declared_pointers: vec![],
             fn_params: HashMap::new(),
@@ -4618,23 +4621,20 @@ impl<'a> Compiler<'a> {
     /// cond)`. Rewritten here rather than given its own IR, so it reaches the
     /// union machinery that already knows how to read one relation per branch.
     /// Hand a guarded mutation its condition: an insert folds it into its own
-    /// `WHERE`, an update ANDs it onto the rows it narrows to.
+    /// `WHERE`, an update or a delete ANDs it onto the rows it narrows to.
     fn set_mutation_guard(&mut self, branch: &Expr, condition: Expr) {
-        let is_update = matches!(
-            match branch {
-                Expr::SubQuery(stmt) => Some(stmt.as_ref()),
-                Expr::Shape(sh) => match sh.expr.as_ref() {
-                    Some(Expr::SubQuery(stmt)) => Some(stmt.as_ref()),
-                    _ => None,
-                },
+        let stmt = match branch {
+            Expr::SubQuery(stmt) => Some(stmt.as_ref()),
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::SubQuery(stmt)) => Some(stmt.as_ref()),
                 _ => None,
             },
-            Some(Stmt::Update(_))
-        );
-        if is_update {
-            self.pending_update_guard = Some(condition);
-        } else {
-            self.pending_insert_guard = Some(condition);
+            _ => None,
+        };
+        match stmt {
+            Some(Stmt::Update(_)) => self.pending_update_guard = Some(condition),
+            Some(Stmt::Delete(_)) => self.pending_delete_guard = Some(condition),
+            _ => self.pending_insert_guard = Some(condition),
         }
     }
 
@@ -4709,16 +4709,8 @@ impl<'a> Compiler<'a> {
         }
         // Guarding a branch only filters what is read back, while the
         // mutation is its own CTE that Postgres runs regardless -- so the
-        // condition has to go into the mutation itself. An insert can take
-        // one; an update or delete has nowhere to put it yet, so those stay
-        // refused rather than compiling to something unconditional.
-        for branch in [&ie.if_expr, &ie.else_expr] {
-            if let Some(stmt) = mutating_stmt(branch)
-                && !matches!(stmt, Stmt::Insert(_) | Stmt::Update(_))
-            {
-                return None;
-            }
-        }
+        // condition has to go into the mutation itself, which is what
+        // `set_mutation_guard` arranges for all three.
         let (if_yields_objects, else_yields_objects) = (yields_objects(&ie.if_expr), yields_objects(&ie.else_expr));
         let guard = |branch: &Expr, condition: Expr| {
             Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
@@ -6667,6 +6659,9 @@ impl<'a> Compiler<'a> {
     // ── DELETE ────────────────────────────────────────────────────────────────────
 
     fn compile_delete(&mut self, del: &ast::DeleteStmt) -> Result<IrDelete, PyQLError> {
+        // Taken before anything nested is compiled, so a nested statement
+        // cannot pick up a guard meant for this one.
+        let pending_guard = self.pending_delete_guard.take();
         let type_name = self.expr_as_type_name(&del.subject)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
@@ -6682,6 +6677,13 @@ impl<'a> Compiler<'a> {
             .as_ref()
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
+        let filter = match pending_guard {
+            Some(condition) => {
+                let guard = self.compile_expr(&condition, td, &alias)?;
+                and_conditions(filter, vec![guard])
+            }
+            None => filter,
+        };
 
         let returning = Self::pk_returning(td);
 
