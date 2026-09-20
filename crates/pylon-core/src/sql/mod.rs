@@ -8289,6 +8289,15 @@ mod tests {
     }
 
     #[test]
+    fn test_exists_on_a_link_property() {
+        // `exists @weight` — the junction column the link's own modifiers are
+        // compiled against. `exists` only knew how to take a pointer name.
+        let schema = make_schema_with_through_and_prop();
+        let out = compile_and_emit_with("SELECT Product { tags: { } filter exists @weight }", &schema);
+        assert!(out.sql.contains("\"jt\".\"weight\" IS NOT NULL"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_link_property_in_a_computed_link_filter() {
         let schema = make_schema_with_through_and_prop();
         let out = compile_and_emit_with(

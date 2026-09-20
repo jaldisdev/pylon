@@ -3741,6 +3741,14 @@ impl<'a> Compiler<'a> {
             // exists .multilink → EXISTS(SELECT 1 FROM junction WHERE src = alias.id)
             Expr::Path(p) if ctx.is_some() && p.partial && p.steps.len() == 1 => {
                 let (td, alias) = ctx.unwrap();
+                // `exists @dismissed` — a link property is a column on the
+                // junction row the multi-link's own modifiers are being
+                // compiled against, so whether it is set is an ordinary null
+                // check on it.
+                if let ast::PathStep::LinkProp(prop_name) = &p.steps[0] {
+                    let prop = self.compile_link_prop_ref(prop_name)?;
+                    return Ok(ir_is_not_null(prop));
+                }
                 let pointer_name = match &p.steps[0] {
                     ast::PathStep::Name(n) => n.as_str(),
                     _ => return Err(self.type_err("exists: invalid path step")),
