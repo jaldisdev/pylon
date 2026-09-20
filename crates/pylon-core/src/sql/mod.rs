@@ -5891,6 +5891,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sibling_for_loops_each_get_their_own_iterator() {
+        // One WITH clause cannot hold `_for_p` twice, and two loops written
+        // over the same variable name are ordinary.
+        let out = compile_and_emit(
+            "WITH a := (SELECT Post), b := (SELECT Post), \
+             x := (FOR p IN a UNION (INSERT Person { name := p.title, age := 1 })), \
+             y := (FOR p IN b UNION (INSERT Person { name := p.title, age := 2 })) \
+             SELECT x",
+        );
+        assert!(out.sql.contains("\"_for_p\" AS"), "{}", out.sql);
+        assert!(out.sql.contains("\"_for_p_1\" AS"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_a_nested_for_carries_the_outer_loops_key() {
         // The inner iterator has the outer one in its FROM, and the insert
         // joins the two back on the key it carries — Gel's own iterator bond.
