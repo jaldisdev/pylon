@@ -682,6 +682,11 @@ struct Compiler<'a> {
     /// variable itself holds the row's key (see `compile_for`), so a path
     /// rooted at one reads its table back by that key.
     for_var_types: HashMap<String, String>,
+    /// For a loop over a `with` binding, the binding each variable's rows come
+    /// from. The rows a sibling CTE has just written are not in the base table
+    /// yet -- Postgres runs every CTE against the snapshot the statement
+    /// started with -- so a walk off the variable has to read the binding.
+    for_var_ctes: HashMap<String, String>,
     /// The condition a `(insert …) if cond else {}` puts on the insert about
     /// to be compiled — see `IrInsert::guard`.
     pending_insert_guard: Option<Expr>,
@@ -825,6 +830,7 @@ impl<'a> Compiler<'a> {
             cte_free_items: HashMap::new(),
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
+            for_var_ctes: HashMap::new(),
             pending_insert_guard: None,
             cte_declared_pointers: HashMap::new(),
             active_declared_pointers: vec![],
@@ -1923,6 +1929,18 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// The row source a name reads from: the binding it is bound to, if any,
+    /// else the type's own table.
+    fn row_source_table(&self, name: &str, td: &TypeDescriptor) -> String {
+        if let Some(cte) = self.for_var_ctes.get(name) {
+            return format!("@cte:{cte}");
+        }
+        if self.cte_object_type(name).is_some() {
+            return format!("@cte:{name}");
+        }
+        td.table.clone()
+    }
+
     /// The type a path's root names — a real type, or the object type a
     /// `with` binding stands for.
     ///
@@ -2518,16 +2536,12 @@ impl<'a> Compiler<'a> {
         // type and source from the `@cte:` sentinel table (the same
         // mechanism `compile_select`'s bare-CTE-object-select case uses)
         // instead of failing with "unknown type '{root_name}'".
-        let cte_object_type = self.cte_types.get(root_name).filter(|t| t.contains("::")).cloned();
         let root_td = self.resolve_path_root(root_name)?;
         let root_alias = self.fresh_alias();
         let root = IrSource {
             poly: None,
             type_name: format!("{}::{}", root_td.module, root_td.name),
-            table: match &cte_object_type {
-                Some(_) => format!("@cte:{}", root_name),
-                None => root_td.table.clone(),
-            },
+            table: self.row_source_table(root_name, root_td),
             alias: root_alias.clone(),
         };
         // `for c in (select Person) union (select c.name)` — the loop variable
@@ -4046,6 +4060,7 @@ impl<'a> Compiler<'a> {
         let Ok(td) = self.resolve_path_root(name) else {
             return Ok(None);
         };
+        let table = self.row_source_table(name, td);
         // `account := resource.account { id }` — the field holds what a walk
         // off the binding lands on, so it is that walk with the shape on it
         // rather than a plain read of the binding.
@@ -4065,10 +4080,7 @@ impl<'a> Compiler<'a> {
         let source = IrSource {
             poly: self.poly_fanout_for(&format!("{}::{}", td.module, td.name)),
             type_name: format!("{}::{}", td.module, td.name),
-            table: match &cte_name {
-                Some(cte) => format!("@cte:{cte}"),
-                None => td.table.clone(),
-            },
+            table,
             alias: alias.clone(),
         };
         // Same as reading the binding by name: its own shape may have
@@ -4697,7 +4709,9 @@ impl<'a> Compiler<'a> {
         let alias = self.fresh_alias();
         let table = match cte_name {
             Some(ref cte) => format!("@cte:{}", cte),
-            None => td.table.clone(),
+            None => Self::subject_name(result_expr)
+                .map(|name| self.row_source_table(&name, td))
+                .unwrap_or_else(|| td.table.clone()),
         };
         let source = IrSource {
             poly: None,
@@ -4904,6 +4918,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_for(&mut self, f: &ast::ForStmt) -> Result<IrFor, PyQLError> {
+        // A loop straight over a binding: the rows are that binding's, so a
+        // walk off the variable reads it rather than the type's own table.
+        let iterated_binding = self.resolve_cte_name(&f.iterator).map(str::to_string);
         // Compile the iterator to determine what one loop variable binds to.
         let (iterator, pg_type, yielded_object_type) = match &f.iterator {
             Expr::Set(elems) => {
@@ -5028,6 +5045,10 @@ impl<'a> Compiler<'a> {
 
         // Register the for variable so the body can reference it.
         let prev = self.for_vars.insert(f.var.clone(), pg_type.clone());
+        let prev_cte = match iterated_binding {
+            Some(name) => self.for_var_ctes.insert(f.var.clone(), name),
+            None => self.for_var_ctes.remove(&f.var),
+        };
         let prev_type = match yielded_object_type {
             Some(qualified) => self.for_var_types.insert(f.var.clone(), qualified),
             None => self.for_var_types.remove(&f.var),
@@ -5050,6 +5071,14 @@ impl<'a> Compiler<'a> {
             }
             None => {
                 self.for_var_types.remove(&f.var);
+            }
+        }
+        match prev_cte {
+            Some(old) => {
+                self.for_var_ctes.insert(f.var.clone(), old);
+            }
+            None => {
+                self.for_var_ctes.remove(&f.var);
             }
         }
 
