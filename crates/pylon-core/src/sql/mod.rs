@@ -3942,6 +3942,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                 BinOpKind::In => format!("({} = ANY({}))", l, unwrap_unnest_for_any(&op.right, &r)),
                 BinOpKind::NotIn => format!("({} <> ALL({}))", l, unwrap_unnest_for_any(&op.right, &r)),
                 BinOpKind::Coalesce => format!("COALESCE({}, {})", l, r),
+                BinOpKind::CoalesceEq => format!("({} IS NOT DISTINCT FROM {})", l, r),
+                BinOpKind::CoalesceNe => format!("({} IS DISTINCT FROM {})", l, r),
                 BinOpKind::Concat => format!("({} || {})", l, r),
             }
         }

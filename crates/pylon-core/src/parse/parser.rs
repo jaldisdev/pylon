@@ -852,6 +852,8 @@ impl Parser {
         let op = match self.current() {
             Token::Eq => BinOpKind::Eq,
             Token::Ne => BinOpKind::Ne,
+            Token::QEq => BinOpKind::CoalesceEq,
+            Token::QNe => BinOpKind::CoalesceNe,
             Token::Lt => BinOpKind::Lt,
             Token::Le => BinOpKind::Le,
             Token::Gt => BinOpKind::Gt,
