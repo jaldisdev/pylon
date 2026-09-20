@@ -257,6 +257,15 @@ fn ir_value_type_name(expr: &IrExpr) -> String {
     infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
 }
 
+/// The select a statement ultimately is, past any `with` blocks.
+fn innermost_select(stmt: &Stmt) -> Option<&ast::SelectStmt> {
+    match stmt {
+        Stmt::Select(sel) => Some(sel),
+        Stmt::With(w) => innermost_select(&w.stmt),
+        _ => None,
+    }
+}
+
 fn cte_stmt_type(stmt: &IrStmt) -> String {
     match stmt {
         IrStmt::Insert(ins) => ins.target.type_name.clone(),
@@ -1092,6 +1101,59 @@ impl<'a> Compiler<'a> {
             expr: Box::new(expr),
             field: field.to_string(),
         }
+    }
+
+    /// `(select Licence filter …) { id }` — a shape written after a
+    /// parenthesised sub-select rather than inside it.
+    ///
+    /// The two mean the same thing, so the shape is pushed onto the inner
+    /// statement's own result and the whole thing compiled as the select it
+    /// already was. A `with` block is carried through to its inner statement.
+    fn shape_over_subquery(&mut self, sh: &ast::ShapeExpr) -> Result<Option<IrExpr>, PyQLError> {
+        fn push_shape(stmt: &Stmt, elements: &[ShapeElement]) -> Option<Stmt> {
+            match stmt {
+                Stmt::Select(sel) => {
+                    if matches!(sel.result, Expr::Shape(_)) {
+                        return None;
+                    }
+                    let mut shaped = sel.clone();
+                    shaped.result = Expr::Shape(Box::new(ast::ShapeExpr {
+                        expr: Some(sel.result.clone()),
+                        elements: elements.to_vec(),
+                        marker_offset: None,
+                    }));
+                    Some(Stmt::Select(shaped))
+                }
+                Stmt::With(w) => {
+                    let inner = push_shape(&w.stmt, elements)?;
+                    let mut carried = w.clone();
+                    carried.stmt = Box::new(inner);
+                    Some(Stmt::With(carried))
+                }
+                _ => None,
+            }
+        }
+        let Some(Expr::SubQuery(stmt)) = sh.expr.as_ref() else {
+            return Ok(None);
+        };
+        let Some(shaped) = push_shape(stmt.as_ref(), &sh.elements) else {
+            return Ok(None);
+        };
+        let single = matches!(
+            innermost_select(&shaped).and_then(|s| s.limit.as_ref()),
+            Some(Expr::Literal(ast::Literal::Int(1)))
+        );
+        let IrStmt::Select(select) = self.compile_stmt(&shaped)? else {
+            return Ok(None);
+        };
+        if !matches!(select.rows.as_slice(), [IrRowSource::Bound { .. }]) {
+            return Ok(None);
+        }
+        Ok(Some(if single {
+            IrExpr::ObjectSubquery(Box::new(select))
+        } else {
+            IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectSelect(Box::new(select))))
+        }))
     }
 
     /// `(select … limit 1).account { id, name }` — a shape written on what a
@@ -8600,6 +8662,17 @@ impl<'a> Compiler<'a> {
                     fields,
                     is_free_object: true,
                 })
+            }
+
+            Expr::Shape(sh) if matches!(sh.expr.as_ref(), Some(Expr::SubQuery(_))) => {
+                let sh = sh.clone();
+                match self.shape_over_subquery(&sh)? {
+                    Some(ir) => Ok(ir),
+                    None => Err(PyQLError::Type(PyQLTypeError {
+                        message: "shapes and set literals are not valid in expression context".into(),
+                        position: Position { line: 0, col: 0 },
+                    })),
+                }
             }
 
             Expr::Shape(sh) if Self::shape_over_subquery_projection(sh).is_some() => {
