@@ -5992,6 +5992,17 @@ mod tests {
     }
 
     #[test]
+    fn test_exists_sees_a_computed_pointer() {
+        // The suggester could see the name the resolver had just reported as
+        // unknown — `has no link or property 'published'. Did you mean
+        // 'published'?`
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person FILTER EXISTS .published", &schema);
+        assert!(out.sql.contains("EXISTS"), "{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"Post\""), "the computed's own path:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
