@@ -6020,6 +6020,16 @@ mod tests {
     }
 
     #[test]
+    fn test_a_narrowed_pointer_can_carry_a_shape() {
+        // `[is T].posts: { title }` — the parser stopped at the `:`, and the
+        // route behind it resolved a stored property and nothing else, so a
+        // link reported itself as the name it had just been asked for.
+        let out = compile_and_emit("SELECT Company { x := 1, [is default::Person].posts: { title } }");
+        assert!(out.sql.contains("\"title\""), "{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"Post\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);

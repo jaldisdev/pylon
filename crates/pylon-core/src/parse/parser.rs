@@ -1810,10 +1810,21 @@ impl Parser {
                     limit: None,
                 });
             }
+            // `[is T].configs: { … }` — the narrowed pointer read with a shape
+            // of its own, the same inclusion a plain `configs: { … }` is.
+            let nested = if matches!(self.current(), Token::Colon) {
+                self.advance();
+                self.eat(&Token::LBrace)?;
+                let elements = self.parse_shape_body()?;
+                self.eat(&Token::RBrace)?;
+                Some(elements)
+            } else {
+                None
+            };
             return Ok(ShapeElement {
                 path,
                 splat: None,
-                nested: None,
+                nested,
                 compexpr: None,
                 op: ShapeOp::Assign,
                 filter: None,
