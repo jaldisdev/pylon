@@ -9921,6 +9921,43 @@ impl<'a> Compiler<'a> {
             // a filter, not a traversal: the row is read from the narrowed
             // type's own table by the key the variable holds, so a variable
             // bound to something else yields nothing, as it should.
+            // `line[is BrandOrderLineItem].brand` — the narrowing picks the row
+            // out of the narrowed type's own table, and the walk continues from
+            // there. Without the tail this is the row itself, handled below.
+            if let [ast::PathStep::Name(var), ast::PathStep::TypeIntersection(type_ref), rest @ ..] =
+                p.steps.as_slice()
+                && !rest.is_empty()
+                && self.for_var_types.contains_key(var)
+            {
+                let type_name = match &type_ref.module {
+                    Some(m) => format!("{}::{}", m, type_ref.name),
+                    None => type_ref.name.clone(),
+                };
+                let narrowed = self.resolve_type(&type_name)?;
+                let mut steps = vec![ast::PathStep::Name(format!("{}::{}", narrowed.module, narrowed.name))];
+                steps.extend(rest.iter().cloned());
+                let rooted = ast::Path { steps, partial: false };
+                let synthetic = ast::SelectStmt {
+                    result: Expr::Path(rooted.clone()),
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                };
+                let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
+                let correlation = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: ps.root.alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: IrExpr::ForVar { name: var.clone() },
+                }));
+                ps.filter = and_conditions(ps.filter, vec![correlation]);
+                return Ok(IrExpr::PathSubquery(Box::new(ps)));
+            }
             if let [ast::PathStep::Name(var), ast::PathStep::TypeIntersection(type_ref)] = p.steps.as_slice()
                 && self.for_var_types.contains_key(var)
             {
