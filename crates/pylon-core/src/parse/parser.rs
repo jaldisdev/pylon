@@ -826,6 +826,10 @@ impl Parser {
                 self.advance();
                 let right = self.parse_if_else()?;
                 left = Expr::Except(Box::new(left), Box::new(right));
+            } else if matches!(self.current(), Token::Intersect) {
+                self.advance();
+                let right = self.parse_if_else()?;
+                left = Expr::Intersect(Box::new(left), Box::new(right));
             } else {
                 break;
             }

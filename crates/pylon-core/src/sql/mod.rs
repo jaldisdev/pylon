@@ -4140,6 +4140,17 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             )
         }
 
+        IrExpr::SetOp { op, left, right, mode } => {
+            let set = format!("(SELECT {}) {} (SELECT {})", emit_expr(left), op.sql(), emit_expr(right));
+            match mode {
+                crate::ir::SetOpMode::Exists => format!("EXISTS({set})"),
+                crate::ir::SetOpMode::Array => format!("ARRAY({set})"),
+                crate::ir::SetOpMode::Aggregate(f) => {
+                    format!("(SELECT {f}(\"_s\".\"v\") FROM ({set}) AS \"_s\"(\"v\"))")
+                }
+            }
+        }
+
         IrExpr::CteRef { name, scalar, .. } => {
             // scalar CTEs emit `ROW(expr) AS result, expr AS v`; use `v` for
             // expression context so we get the plain scalar type, not record.

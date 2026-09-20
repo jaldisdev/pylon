@@ -70,6 +70,7 @@ fn default_blocker(expr: &crate::ir::IrExpr) -> Option<&'static str> {
         | E::ScalarSubquery(_)
         | E::AggOverQuery { .. }
         | E::AggOverCte { .. }
+        | E::SetOp { .. }
         | E::AggOverSet { .. }
         | E::CteRef { .. }
         | E::CteFieldRef { .. }
