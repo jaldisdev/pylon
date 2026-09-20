@@ -1471,6 +1471,14 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
                     format!("SELECT ({}) AS result", parts.join(", "))
                 }
             }
+            IrFreeExpr::NamedTupleRow(fields) => {
+                let parts: Vec<String> = fields.iter().map(|(_, e)| emit_free_field_expr(e)).collect();
+                if parts.len() == 1 {
+                    format!("SELECT ROW({}) AS result", parts[0])
+                } else {
+                    format!("SELECT ({}) AS result", parts.join(", "))
+                }
+            }
             IrFreeExpr::AssertSet { .. } => unreachable!("AssertSet is handled by early return above"),
             IrFreeExpr::CtePassthrough(name) => format!("SELECT \"result\" FROM {}", qi(name)),
         })
@@ -1690,6 +1698,16 @@ fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeN
                 .enumerate()
                 .map(|(i, e)| free_field_shape_node("", i, e))
                 .collect(),
+            names: None,
+        },
+        IrFreeExpr::NamedTupleRow(fields) => ShapeNode::Tuple {
+            position: 0,
+            elements: fields
+                .iter()
+                .enumerate()
+                .map(|(i, (name, e))| free_field_shape_node(name, i, e))
+                .collect(),
+            names: Some(fields.iter().map(|(name, _)| name.clone()).collect()),
         },
         IrFreeExpr::AssertSet { .. } => ShapeNode::Scalar {
             name: String::new(),

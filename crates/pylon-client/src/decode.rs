@@ -591,6 +591,7 @@ mod tests {
                     position: 1,
                 },
             ],
+            names: None,
         };
         assert_eq!(
             decode(&shape, &value),
