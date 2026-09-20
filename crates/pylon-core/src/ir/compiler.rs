@@ -9507,6 +9507,12 @@ impl<'a> Compiler<'a> {
                 self.compile_subquery_expr(&stmt, &fields, ctx, &elements)
             }
 
+            // `account := account if cond else {}` — the empty set is a legal
+            // expression in EdgeQL and means "no value", which is what the
+            // assignment paths already spell `IrExpr::Null`. Only a *non-empty*
+            // set literal has no expression-position meaning.
+            Expr::Set(items) if items.is_empty() => Ok(IrExpr::Null),
+
             // A bare shape or set literal is never valid in expression
             // position, in either context — preserved exactly as the
             // schema-bound side always enforced (the free side's more
