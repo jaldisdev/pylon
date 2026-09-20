@@ -1289,7 +1289,13 @@ fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: 
 use crate::ir::IrConflict;
 
 fn emit_conflict(sql: &mut String, conflict: &IrConflict) {
-    let on_sql = conflict.on.as_ref().map(|e| format!("({})", emit_expr(e)));
+    // `unless conflict on (.email, .invitee)` names several columns, not one
+    // composite value: Postgres infers the arbiter index from a column list,
+    // and would look for an expression index on the tuple instead.
+    let on_sql = conflict.on.as_ref().map(|e| match e {
+        IrExpr::Tuple(elements) => format!("({})", elements.iter().map(emit_expr).collect::<Vec<_>>().join(", ")),
+        other => format!("({})", emit_expr(other)),
+    });
     match (&on_sql, &conflict.do_update) {
         (None, None) => sql.push_str(" ON CONFLICT DO NOTHING"),
         (Some(on), None) => sql.push_str(&format!(" ON CONFLICT {} DO NOTHING", on)),
@@ -4832,6 +4838,22 @@ mod tests {
         assert!(out.sql.starts_with("WITH"), "{}", out.sql);
         assert!(out.sql.contains("DELETE FROM \"public\".\"Person\""), "{}", out.sql);
         assert!(out.sql.contains("count(*)"), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_conflict_target_naming_several_columns() {
+        // `unless conflict on (.a, .b)` names columns for Postgres to infer
+        // the arbiter index from; emitted as one composite value it would
+        // look for an expression index on the tuple instead.
+        let out = compile_and_emit_with(
+            "INSERT Person { name := $n } UNLESS CONFLICT ON (.name, .id) ELSE (UPDATE Person SET { name := $n })",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("ON CONFLICT (\"name\", \"id\")"),
+            "expected a column list:\n{}",
+            out.sql
+        );
     }
 
     #[test]
