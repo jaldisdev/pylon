@@ -5970,6 +5970,18 @@ mod tests {
     }
 
     #[test]
+    fn test_an_aggregate_over_a_walk_onto_objects_counts_its_rows() {
+        // Falling through instead put the aggregate back through the very
+        // expression route that sent it here, and the recursion took the
+        // process down with it.
+        let out = compile_and_emit(
+            "WITH c := (SELECT Company) SELECT c { n := count(.<company[is default::Person]) }",
+        );
+        assert!(out.sql.contains("count("), "{}", out.sql);
+        assert!(out.sql.contains("\"public\".\"Person\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
