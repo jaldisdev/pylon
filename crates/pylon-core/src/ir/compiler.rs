@@ -5117,6 +5117,21 @@ impl<'a> Compiler<'a> {
                         return Ok((fk_col, ir_expr));
                     }
                     fk_col
+                } else if Self::resolve_multilink(td, pointer_name).is_some() {
+                    // Same reach as the junction-backed link above: the
+                    // shape-classification loop in `compile_insert` and
+                    // `compile_update` takes multi-links first, so one only
+                    // arrives here from an `UNLESS CONFLICT ... ELSE` clause,
+                    // which has no junction-mutation mechanism to reuse.
+                    // Saying the pointer does not exist sends the reader
+                    // looking for a typo in a name that is plainly right.
+                    return Err(PyQLError::Type(PyQLTypeError {
+                        message: format!(
+                            "'{pointer_name}' is a multi-link and cannot be mutated inside an \
+                             UNLESS CONFLICT ELSE clause"
+                        ),
+                        position: Position { line: 0, col: 0 },
+                    }));
                 } else {
                     return Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)));
                 };
