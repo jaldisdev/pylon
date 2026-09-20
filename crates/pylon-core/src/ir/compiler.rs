@@ -8520,6 +8520,37 @@ impl<'a> Compiler<'a> {
                         right,
                     })));
                 }
+                // `.account = account_of_transaction()` — comparing objects
+                // compares identity, so an object-returning function on either
+                // side stands for the id of the row it returns. Left whole it
+                // is a function call with nowhere to go but the subject of a
+                // select.
+                if matches!(b.op, ast::BinOpKind::Eq | ast::BinOpKind::Ne) {
+                    let id = ["id".to_string()];
+                    let left_id = match &b.left {
+                        Expr::FunctionCall(fc) => self.try_compile_fn_scalar_subquery(fc, &id, None, ctx)?,
+                        _ => None,
+                    };
+                    let right_id = match &b.right {
+                        Expr::FunctionCall(fc) => self.try_compile_fn_scalar_subquery(fc, &id, None, ctx)?,
+                        _ => None,
+                    };
+                    if left_id.is_some() || right_id.is_some() {
+                        let left = match left_id {
+                            Some(e) => e,
+                            None => self.compile_expr_ctx(&b.left, ctx)?,
+                        };
+                        let right = match right_id {
+                            Some(e) => e,
+                            None => self.compile_expr_ctx(&b.right, ctx)?,
+                        };
+                        return Ok(IrExpr::BinOp(Box::new(IrBinOp {
+                            left,
+                            op: b.op.clone(),
+                            right,
+                        })));
+                    }
+                }
                 let left = self.compile_expr_ctx(&b.left, ctx)?;
                 let right = self.compile_expr_ctx(&b.right, ctx)?;
                 // Comparing a value against a *set* — a path that crosses a
