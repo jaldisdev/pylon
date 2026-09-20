@@ -1170,6 +1170,28 @@ impl<'a> Compiler<'a> {
         walk(expr, &mut out).then_some(out)
     }
 
+    /// `([is Conditional].configs ?? [is Loop].configs)` — the operands of a
+    /// coalesce, when every one is a path off the enclosing row. Unlike a
+    /// union each operand but the first only contributes when the ones before
+    /// it are empty, which is what the caller guards them with.
+    fn coalesce_of_relative_paths(expr: &Expr) -> Option<Vec<ast::Path>> {
+        fn walk(expr: &Expr, out: &mut Vec<ast::Path>) -> bool {
+            match expr {
+                Expr::BinOp(b) if b.op == ast::BinOpKind::Coalesce => walk(&b.left, out) && walk(&b.right, out),
+                Expr::Path(p) if p.partial => {
+                    out.push(p.clone());
+                    true
+                }
+                _ => false,
+            }
+        }
+        if !matches!(expr, Expr::BinOp(b) if b.op == ast::BinOpKind::Coalesce) {
+            return None;
+        }
+        let mut out = vec![];
+        walk(expr, &mut out).then_some(out)
+    }
+
     /// `(select Licence filter …) { id }` — a shape written after a
     /// parenthesised sub-select rather than inside it.
     ///
@@ -9525,6 +9547,56 @@ impl<'a> Compiler<'a> {
                     };
                     let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
                     Self::correlate_path_select(&mut ps, alias);
+                    branches.push(ps);
+                }
+                Ok(IrExpr::ObjectPathUnion { branches, limit: None })
+            }
+
+            // `([is Conditional].configs ?? [is Loop].configs) { … }` — the
+            // same correlated walks a union of them gives, except each operand
+            // after the first only stands in when the ones before it are empty.
+            Expr::Shape(sh)
+                if ctx.is_some()
+                    && sh
+                        .expr
+                        .as_ref()
+                        .and_then(Self::coalesce_of_relative_paths)
+                        .is_some() =>
+            {
+                let (td, alias) = ctx.expect("checked by the guard");
+                let operands =
+                    Self::coalesce_of_relative_paths(sh.expr.as_ref().expect("checked")).expect("checked by the guard");
+                let elements = sh.elements.clone();
+                let mut branches: Vec<IrPathSelect> = Vec::with_capacity(operands.len());
+                for path in operands {
+                    let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+                    steps.extend(path.steps.iter().cloned());
+                    let rooted = ast::Path { steps, partial: false };
+                    let synthetic = ast::SelectStmt {
+                        result: Expr::Path(rooted.clone()),
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        lock: None,
+                    };
+                    let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
+                    Self::correlate_path_select(&mut ps, alias);
+                    let guards: Vec<IrExpr> = branches
+                        .iter()
+                        .map(|earlier| {
+                            IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                                op: ast::UnaryOpKind::Not,
+                                operand: IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                                    op: ast::UnaryOpKind::Exists,
+                                    operand: IrExpr::PathSubquery(Box::new(earlier.clone())),
+                                })),
+                            }))
+                        })
+                        .collect();
+                    if !guards.is_empty() {
+                        ps.filter = and_conditions(ps.filter, guards);
+                    }
                     branches.push(ps);
                 }
                 Ok(IrExpr::ObjectPathUnion { branches, limit: None })

@@ -259,6 +259,14 @@ impl ObjectRef {
             name: name.into(),
         }
     }
+    /// `module::Name` when the reference carries a module. Dropping it leaves
+    /// a short name, and two modules may declare the same one.
+    pub fn qualified_name(&self) -> String {
+        match &self.module {
+            Some(module) => format!("{module}::{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 // ── Shape operators ────────────────────────────────────────────────────────────
