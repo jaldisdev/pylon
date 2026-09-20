@@ -252,3 +252,41 @@ async fn delete_with_no_filter_removes_every_row() {
         "an unfiltered delete must remove every row, got {after:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_delete_guarded_by_a_false_condition_removes_nothing() {
+    // `(delete …) if cond else {}` is a data-modifying CTE, which Postgres
+    // runs whether or not anything reads it — so the condition has to narrow
+    // the delete itself. Asserted against the rows, not the SQL: a guard that
+    // only filters what is read back looks identical in the emitted text.
+    let module = unique_module("live_delete_guard");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("select (delete {module}::Person filter .age > 18) if false else {{}}"),
+    )
+    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert_eq!(rows.len(), 1, "a false guard must delete nothing, got {rows:?}");
+
+    exec(
+        &pool,
+        &sd,
+        &format!("select (delete {module}::Person filter .age > 18) if true else {{}}"),
+    )
+    .await;
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert!(rows.is_empty(), "a true guard must still delete, got {rows:?}");
+}

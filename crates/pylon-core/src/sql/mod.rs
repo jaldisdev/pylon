@@ -5561,13 +5561,21 @@ mod tests {
     }
 
     #[test]
-    fn test_a_conditional_delete_is_still_refused() {
-        // A delete has nowhere to put the condition, so it must keep erroring
-        // rather than compile to something that runs regardless.
-        let ast = parse::parse("SELECT (DELETE Person FILTER .name = $n) IF FALSE ELSE {}").unwrap();
+    fn test_a_conditional_delete_carries_its_condition() {
+        // Guarding the branch would only filter what is read back — Postgres
+        // runs a data-modifying CTE regardless — so the condition has to be
+        // ANDed into the DELETE's own WHERE, as it already is for an update.
+        let out = compile_and_emit("SELECT (DELETE Person FILTER .name = $n) IF FALSE ELSE {}");
+        let delete = out
+            .sql
+            .split("DELETE FROM")
+            .nth(1)
+            .expect("the delete should still be emitted");
+        let where_clause = delete.split("WHERE").nth(1).expect("the delete should be filtered");
         assert!(
-            ir::compile(&ast, &make_schema()).is_err(),
-            "a conditional delete must not compile to an unconditional one"
+            where_clause.contains("FALSE") || where_clause.contains("false"),
+            "the condition must narrow the delete itself:\n{}",
+            out.sql
         );
     }
 
