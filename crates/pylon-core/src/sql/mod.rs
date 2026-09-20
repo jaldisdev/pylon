@@ -6781,6 +6781,31 @@ mod tests {
     }
 
     #[test]
+    fn test_shape_over_a_with_binding_reads_the_binding() {
+        // `metadata := metadata { … }` — a binding names a row source, so a
+        // shape on it projects that source. The pointer route only took
+        // relative paths, so this fell through to the expression route and was
+        // rejected as "shapes are not valid in expression context".
+        let out = compile_and_emit(
+            "WITH c := (SELECT Company LIMIT 1) SELECT Person { name, employer := c { name } }",
+        );
+        assert!(
+            out.sql.contains("\"c\""),
+            "the pointer should read the binding's CTE:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_shape_over_a_bare_type_name_is_still_rejected() {
+        // Unlike a binding, a type name in an enclosing scope is a factored
+        // prefix, so a shape on one does not mean "every row of the table".
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person { name, other := Company { name } }").unwrap();
+        assert!(ir::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
     fn test_nested_shape_reads_a_prefix_bound_by_the_outer_select() {
         // `Person.name` inside the `posts` shape names a type the enclosing
         // select binds, so EdgeQL reads the outer row — not every Person. The

@@ -4202,6 +4202,27 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// `metadata := metadata { author }` — a shape over a `with` binding or a
+    /// for-loop variable. Both name a row source, so the shape reads their
+    /// rows; a bare type name is deliberately not accepted here, because in an
+    /// enclosing scope that prefix is factored (see `outer_anchor`) and would
+    /// mean the outer row rather than the whole table.
+    fn shape_over_binding(&mut self, expr: &Expr) -> Result<Option<IrExpr>, PyQLError> {
+        let Expr::Shape(sh) = expr else {
+            return Ok(None);
+        };
+        let Some(Expr::Path(p)) = sh.expr.as_ref() else {
+            return Ok(None);
+        };
+        let Some(ast::PathStep::Name(root)) = p.steps.first() else {
+            return Ok(None);
+        };
+        if p.partial || (self.cte_object_type(root).is_none() && !self.for_var_types.contains_key(root)) {
+            return Ok(None);
+        }
+        self.free_object_link_field(expr)
+    }
+
     /// A free object's field holding an object with a shape (`{ device := d
     /// { id } }`). Gel compiles a free shape into a real object type whose
     /// fields are real pointers, so an object field stays an object; without
@@ -9801,6 +9822,22 @@ impl<'a> Compiler<'a> {
             // assignment paths already spell `IrExpr::Null`. Only a *non-empty*
             // set literal has no expression-position meaning.
             Expr::Set(items) if items.is_empty() => Ok(IrExpr::Null),
+
+            Expr::Shape(sh)
+                if matches!(sh.expr.as_ref(), Some(Expr::Path(p))
+                    if !p.partial
+                        && matches!(p.steps.first(), Some(ast::PathStep::Name(n))
+                            if self.cte_object_type(n).is_some() || self.for_var_types.contains_key(n))) =>
+            {
+                let expr = expr.clone();
+                match self.shape_over_binding(&expr)? {
+                    Some(ir) => Ok(ir),
+                    None => Err(PyQLError::Type(PyQLTypeError {
+                        message: "shapes and set literals are not valid in expression context".into(),
+                        position: Position { line: 0, col: 0 },
+                    })),
+                }
+            }
 
             // A bare shape or set literal is never valid in expression
             // position, in either context — preserved exactly as the
