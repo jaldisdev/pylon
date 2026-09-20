@@ -4685,6 +4685,36 @@ impl<'a> Compiler<'a> {
                     (!scalar).then_some(yielded),
                 )
             }
+            // `for o in invitations.organizations union (…)` — a walk off a
+            // binding names a set to iterate just as a sub-select does; it is
+            // only written without the parentheses.
+            Expr::Path(p) if !p.partial && p.steps.len() > 1 => {
+                let synthetic = ast::SelectStmt {
+                    result: Expr::Path(p.clone()),
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                };
+                let inner = self.compile_stmt(&Stmt::Select(synthetic))?;
+                let yielded = cte_stmt_type(&inner);
+                let scalar = !yielded.contains("::");
+                let pg_type = if scalar {
+                    let raw = if yielded.is_empty() { "text" } else { yielded.as_str() };
+                    literal_sentinel_to_pg(raw).to_string()
+                } else {
+                    "uuid".to_string()
+                };
+                (
+                    IrForIterator::Query {
+                        stmt: Box::new(inner),
+                        scalar,
+                    },
+                    pg_type,
+                    (!scalar).then_some(yielded),
+                )
+            }
             other => {
                 let e = self.compile_free_expr(other)?;
                 let raw = infer_ir_type(&e).unwrap_or("text");
@@ -8891,6 +8921,60 @@ impl<'a> Compiler<'a> {
                     }
                     return self.compile_path(&relative, td, alias);
                 }
+            }
+            // `membership.account.id` — a walk off a for-loop variable in
+            // expression position. `compile_path_select` already knows to
+            // start such a walk from the row the variable holds, so this is
+            // that walk read as one subquery.
+            if let Some(ast::PathStep::Name(var)) = p.steps.first()
+                && p.steps.len() > 1
+                && self.for_var_types.contains_key(var)
+                && !matches!(p.steps[1], ast::PathStep::TypeIntersection(_))
+            {
+                let synthetic = ast::SelectStmt {
+                    result: Expr::Path(p.clone()),
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                };
+                let ps = self.compile_path_select(&synthetic, p, &[], false)?;
+                return Ok(IrExpr::PathSubquery(Box::new(ps)));
+            }
+            // `o[is Organization]` on a for-loop variable — the narrowing is
+            // a filter, not a traversal: the row is read from the narrowed
+            // type's own table by the key the variable holds, so a variable
+            // bound to something else yields nothing, as it should.
+            if let [ast::PathStep::Name(var), ast::PathStep::TypeIntersection(type_ref)] = p.steps.as_slice()
+                && self.for_var_types.contains_key(var)
+            {
+                let type_name = match &type_ref.module {
+                    Some(m) => format!("{}::{}", m, type_ref.name),
+                    None => type_ref.name.clone(),
+                };
+                let narrowed = self.resolve_type(&type_name)?;
+                let narrowed_alias = self.fresh_alias();
+                let source = IrSource {
+                    poly: self.poly_fanout_for(&format!("{}::{}", narrowed.module, narrowed.name)),
+                    type_name: format!("{}::{}", narrowed.module, narrowed.name),
+                    table: narrowed.table.clone(),
+                    alias: narrowed_alias.clone(),
+                };
+                let filter = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: narrowed_alias,
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: IrExpr::ForVar { name: var.clone() },
+                }));
+                return Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+                    source,
+                    Self::pk_returning(narrowed),
+                    Some(filter),
+                ))));
             }
             return Err(PyQLError::Type(PyQLTypeError {
                 message: "absolute paths are not valid in expression context; use .name".into(),
