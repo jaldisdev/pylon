@@ -5770,6 +5770,18 @@ mod tests {
     }
 
     #[test]
+    fn test_a_union_of_walks_names_each_branch() {
+        // A walk names no relation, and a union is emitted one relation per
+        // branch — so each is hoisted into a CTE of its own first.
+        let out = compile_and_emit(
+            "WITH p := (SELECT Person FILTER .name = $a), q := (SELECT Person FILTER .name = $b), \
+             t := (SELECT p.posts UNION q.posts) SELECT t { title }",
+        );
+        assert!(out.sql.contains("UNION ALL"), "{}", out.sql);
+        assert!(out.sql.contains("\"title\""), "{}", out.sql);
+    }
+
+    #[test]
     fn test_select_type_name_as_a_path_step() {
         let out = compile_and_emit("SELECT Person.__type__");
         assert!(out.sql.contains("ROW('default::Person')"), "{}", out.sql);
