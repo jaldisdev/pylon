@@ -486,6 +486,22 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
 
 /// Emit a DML statement for use as a CTE source, using `RETURNING *` to expose
 /// all columns to the outer SELECT.  The DML's own returning shape is ignored.
+/// `FROM` over the nested-DML CTEs `reading` takes a column of, prefixed by
+/// `lead`; empty when it takes none. One read through a scalar subquery
+/// (`(SELECT "id" FROM cte)`) needs no join, and joining it anyway drops every
+/// row the moment that CTE is empty -- which a guarded branch is.
+fn nested_cte_from(ctes: &[IrCteDef], reading: &str, lead: &str) -> String {
+    let joined: Vec<String> = ctes
+        .iter()
+        .map(|c| qi(&c.name))
+        .filter(|name| reading.contains(&format!("{name}.")))
+        .collect();
+    if joined.is_empty() {
+        return String::new();
+    }
+    format!("{lead}FROM {}", joined.join(", "))
+}
+
 fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
     match stmt {
         IrStmt::Insert(ins) => {
@@ -549,16 +565,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             );
             // The nested CTEs are emitted alongside this body (see
             // `emit_user_cte_parts`), so the reference to them needs a FROM.
-            if !upd.nested_ctes.is_empty() {
-                sql.push_str(&format!(
-                    "\n    FROM {}",
-                    upd.nested_ctes
-                        .iter()
-                        .map(|c| qi(&c.name))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
+            sql.push_str(&nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n    "));
             append_filter(&mut sql, &upd.filter);
             // Qualified: past a FROM, a bare `*` carries the joined relation's
             // columns too, and a reader of this CTE then finds two `id`s.
@@ -840,16 +847,7 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         );
         // A nested statement's CTE sits beside this one, so reading its id
         // needs a FROM — the same reason the plain update path has one.
-        if !upd.nested_ctes.is_empty() {
-            upd_sql.push_str(&format!(
-                "\nFROM {}",
-                upd.nested_ctes
-                    .iter()
-                    .map(|c| qi(&c.name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        upd_sql.push_str(&nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n"));
         append_filter(&mut upd_sql, &upd.filter);
         // See `emit_dml_as_cte_source`: past a FROM, a bare `*` would carry the
         // joined relation's columns into this CTE beside the target's.
@@ -3229,18 +3227,7 @@ fn emit_insert_row_sql(ins: &IrInsert) -> String {
     // A guarded insert writes nothing when its condition is false, so the row
     // comes from a `SELECT` that returns none -- `VALUES` always yields one.
     if let Some(guard) = &ins.guard {
-        let from_ctes = if ins.nested_ctes.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " FROM {}",
-                ins.nested_ctes
-                    .iter()
-                    .map(|c| qi(&c.name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+        let from_ctes = nested_cte_from(&ins.nested_ctes, &vals.join(","), " ");
         let projection = if cols.is_empty() {
             String::new()
         } else {
@@ -3272,18 +3259,12 @@ fn emit_insert_row_sql(ins: &IrInsert) -> String {
             vals.join(", ")
         )
     } else {
-        let from_ctes = ins
-            .nested_ctes
-            .iter()
-            .map(|c| qi(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
         format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {}",
+            "INSERT INTO {} ({}) SELECT {}{}",
             source_ref(&ins.target),
             cols.join(", "),
             vals.join(", "),
-            from_ctes,
+            nested_cte_from(&ins.nested_ctes, &vals.join(","), " "),
         )
     }
 }
@@ -3353,21 +3334,10 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     // branch below via its own FROM clause; at most one branch's filter
     // will ever actually match a row, since each row belongs to exactly
     // one concrete implementor table.
-    let mut cte_parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
-    cte_parts.extend(emit_user_cte_parts(user_ctes));
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+    cte_parts.extend(emit_user_cte_parts(&upd.nested_ctes));
     let mut union_parts = vec![];
-    let from_ctes = if upd.nested_ctes.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nFROM {}",
-            upd.nested_ctes
-                .iter()
-                .map(|c| qi(&c.name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
+    let from_ctes = nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n");
 
     for (i, imp) in upd.poly_implementors.iter().enumerate() {
         let cte_name = format!("_u{}", i);
@@ -3428,24 +3398,17 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             qi(alias),
             sets.join(", "),
         );
-        if !upd.nested_ctes.is_empty() {
-            let from_ctes = upd
-                .nested_ctes
-                .iter()
-                .map(|c| qi(&c.name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            sql.push_str(&format!("\nFROM {}", from_ctes));
-        }
+        sql.push_str(&nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n"));
         append_filter(&mut sql, &upd.filter);
         if let Some(r) = returning_sql {
             sql.push_str(&r);
         }
-        let combined_ctes: Vec<IrCteDef> = upd
-            .nested_ctes
+        // The user's bindings first: a nested statement may read them, and a
+        // CTE only sees the ones before it.
+        let combined_ctes: Vec<IrCteDef> = user_ctes
             .iter()
             .cloned()
-            .chain(user_ctes.iter().cloned())
+            .chain(upd.nested_ctes.iter().cloned())
             .collect();
         if !combined_ctes.is_empty() {
             sql = format!("{}{}", emit_cte_prefix(&combined_ctes), sql);
@@ -3466,20 +3429,12 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             qi(alias),
             sets.join(", "),
         );
-        if !upd.nested_ctes.is_empty() {
-            let from_ctes = upd
-                .nested_ctes
-                .iter()
-                .map(|c| qi(&c.name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            upd_sql.push_str(&format!("\n    FROM {}", from_ctes));
-        }
+        upd_sql.push_str(&nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n    "));
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\n    RETURNING \"id\"");
 
-        let mut cte_parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
-        cte_parts.extend(emit_user_cte_parts(user_ctes));
+        let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+        cte_parts.extend(emit_user_cte_parts(&upd.nested_ctes));
         cte_parts.push(format!("\"_w\" AS (\n{}\n)", upd_sql));
         cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, "_w"));
         cte_parts.extend(enqueue_search_ctes(&upd.enqueue_search, "_w", upd.enqueue_vector.len()));
@@ -3512,8 +3467,8 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     // Nested-DML CTEs first (see IrUpdate::nested_ctes) — only relevant when
     // has_scalar_changes, since nested_ctes is only ever populated while
     // compiling scalar assignments, which is exactly the condition below.
-    let mut cte_parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
-    cte_parts.extend(emit_user_cte_parts(user_ctes));
+    let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
+    cte_parts.extend(emit_user_cte_parts(&upd.nested_ctes));
 
     // _ids: the target rows (updated or selected).
     if has_scalar_changes {
@@ -3524,15 +3479,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             qi(alias),
             sets.join(", "),
         );
-        if !upd.nested_ctes.is_empty() {
-            let from_ctes = upd
-                .nested_ctes
-                .iter()
-                .map(|c| qi(&c.name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            upd_sql.push_str(&format!("\nFROM {}", from_ctes));
-        }
+        upd_sql.push_str(&nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n"));
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str("\nRETURNING *");
         cte_parts.push(format!("\"_ids\" AS (\n{}\n)", upd_sql));
