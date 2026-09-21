@@ -6898,6 +6898,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_bare_narrowing_reads_as_a_type_check_and_as_an_object() {
+        // `exists [is Sub]` is whether the row *is* one; `x := [is Sub] { … }`
+        // is that row read as it. Both used to fall off the end of the path
+        // walk ("invalid path step" / "empty path traversal").
+        for query in [
+            "SELECT Person FILTER EXISTS [is Person]",
+            "SELECT Person { p := [is Person] { name } }",
+        ] {
+            let ast = parse::parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(ir::compile(&ast, &make_schema()).is_ok(), "{query} should compile");
+        }
+    }
+
+    #[test]
     fn test_a_multilink_takes_a_set_wrapped_in_a_select() {
         // `translations := (select { a, b })` — a select with no clauses of its
         // own is the expression it wraps. Left wrapped, a free row source (a

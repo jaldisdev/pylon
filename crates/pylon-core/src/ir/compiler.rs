@@ -3378,6 +3378,34 @@ impl<'a> Compiler<'a> {
             return Err(self.field_err(step_name, &format!("{}::{}", current_td.module, current_td.name)));
         }
 
+        // Every step consumed with nothing returned means the path *ended* on a
+        // narrowing (`a.respondents[is GuestRespondent]`, or a bare `[is T]`).
+        // The loop has already joined to the narrowed relation, so what it
+        // landed on is the answer — read with the shape, like any other object
+        // step.
+        if matches!(steps.last(), Some(PathStep::TypeIntersection(_))) {
+            let module = current_td.module.clone();
+            let type_name = format!("{}::{}", current_td.module, current_td.name);
+            let shape = self.compile_shape_anchored(shape_elements, current_td, &current_alias, &module)?;
+            let (filter, order_by, offset, limit) =
+                self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
+            return Ok(IrPathSelect {
+                root,
+                joins,
+                result: IrPathResult::Object {
+                    alias: current_alias,
+                    type_name,
+                    shape,
+                },
+                filter: and_conditions(filter, extra_conditions),
+                order_by,
+                offset,
+                limit,
+                distinct,
+                poly_implementors: vec![],
+            });
+        }
+
         // Should be unreachable: steps is non-empty (we checked len > 1 before dispatch).
         Err(self.type_err("empty path traversal"))
     }
@@ -3797,6 +3825,15 @@ impl<'a> Compiler<'a> {
                 if let ast::PathStep::LinkProp(prop_name) = &p.steps[0] {
                     let prop = self.compile_link_prop_ref(prop_name)?;
                     return Ok(ir_is_not_null(prop));
+                }
+                // `exists [is contact::IndividualContact]` — a bare narrowing
+                // is the current row seen as that type, so whether it exists is
+                // whether the row *is* one.
+                if let ast::PathStep::TypeIntersection(type_ref) = &p.steps[0] {
+                    let narrowed = self.resolve_type(&type_ref.qualified_name())?;
+                    let check = format!("{}::{}", narrowed.module, narrowed.name);
+                    let source = format!("{}::{}", td.module, td.name);
+                    return Ok(self.type_check_bool_expr(&source, &check, td, alias));
                 }
                 let pointer_name = match &p.steps[0] {
                     ast::PathStep::Name(n) => n.as_str(),
