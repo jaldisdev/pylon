@@ -7306,6 +7306,23 @@ impl<'a> Compiler<'a> {
             };
         }
 
+        if let Expr::FunctionCall(fc) = expr {
+            let synthetic = ast::SelectStmt {
+                result: expr.clone(),
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            };
+            if let Some(fs) = self.try_compile_fn_object_select(fc, &[], &synthetic, false)? {
+                return Ok(IrMultiLinkValues {
+                    source: IrMultiLinkValueSource::Function(Box::new(fs)),
+                    link_props: vec![],
+                });
+            }
+        }
+
         // Absolute path expression (type reference or path traversal)
         if let Expr::Path(p) = expr
             && !p.partial
