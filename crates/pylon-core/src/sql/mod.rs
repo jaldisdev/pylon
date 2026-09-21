@@ -6825,6 +6825,21 @@ mod tests {
     }
 
     #[test]
+    fn test_is_not_negates_the_type_check() {
+        // `x IS NOT T` is Gel's own `Expr IS NOT TypeExpr` — the negation of
+        // the check, not a comparison against some type `not T`. Counted
+        // against the migrated data it came out as 3 of 3, matching Gel.
+        let positive = compile_and_emit("SELECT Person FILTER Person IS Person");
+        let negative = compile_and_emit("SELECT Person FILTER Person IS NOT Person");
+        assert!(
+            negative.sql.contains("NOT") && !positive.sql.contains("NOT"),
+            "the negation should reach the SQL:\npositive:\n{}\nnegative:\n{}",
+            positive.sql,
+            negative.sql
+        );
+    }
+
+    #[test]
     fn test_a_cast_takes_a_prefix_operator_as_its_operand() {
         // `<bool>exists x` is valid EdgeQL — Gel's cast takes a whole `Expr` at
         // CAST precedence. Pylon's cast went straight to a postfix expression,
