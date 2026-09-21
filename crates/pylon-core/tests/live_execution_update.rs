@@ -503,3 +503,4 @@ async fn assert_distinct_on_a_pointer_catches_duplicate_rows() {
         "the raise should come from the assert, got: {error}"
     );
 }
+
