@@ -5562,6 +5562,25 @@ impl<'a> Compiler<'a> {
                 None
             }
             IrStmt::Update(_) if std::env::var("PYLON_DBG_FORUPD").is_ok() => None,
+            // `update x set { ml += (insert T { … }) }` — the insert runs once
+            // per iteration, driven from the same rows the update is, and the
+            // junction pairs each with the id that iteration generated. Only
+            // appends: a clear/remove/replace has no such pairing.
+            IrStmt::Update(upd)
+                if upd.assignments.is_empty()
+                    && upd.rewrites.is_empty()
+                    && !upd.multi_link_appends.is_empty()
+                    && upd.multi_link_clears.is_empty()
+                    && upd.multi_link_replaces.is_empty()
+                    && upd.multi_link_removals.is_empty()
+                    && upd.poly_implementors.is_empty()
+                    && upd
+                        .multi_link_appends
+                        .iter()
+                        .all(|a| crate::sql::per_iteration_insert(a, &upd.nested_ctes).is_some()) =>
+            {
+                None
+            }
             IrStmt::Update(_) => Some("update"),
             IrStmt::Delete(_) => Some("delete"),
             // `for line in … union (for component in … union (insert …))` —
@@ -6011,12 +6030,18 @@ impl<'a> Compiler<'a> {
             Some(condition) => Some(self.compile_expr(&condition, td, &alias)?),
             None => None,
         };
+        // Only a `for` body's nested insert needs to name its own id (see
+        // `IrInsert::id_default_sql`); carried here because the schema is in
+        // scope, and ignored everywhere else.
+        let id_default_sql = Self::resolve_property(td, "id")
+            .map(|p| p.default_sql.clone().unwrap_or_else(|| "uuidv7()".to_string()));
         Ok(IrInsert {
             guard,
             target,
             assignments,
             unless_conflict,
             rewrites,
+            id_default_sql,
             returning,
             enqueue_vector,
             enqueue_search,

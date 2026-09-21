@@ -656,6 +656,11 @@ pub struct IrInsert {
     /// there's no clear/remove list: a brand-new row has no prior junction
     /// rows to clear or remove from.
     pub multi_link_appends: Vec<IrMultiLinkMutation>,
+    /// SQL for the target's own `id` default, when the insert has to name the
+    /// id rather than let the column default supply it — a nested insert in a
+    /// `for` body, where the junction row must be paired with the row this
+    /// iteration inserted and `RETURNING` guarantees no order to pair on.
+    pub id_default_sql: Option<String>,
     /// DML (INSERT/UPDATE/DELETE) discovered nested inside a link-assignment
     /// value — `author := (select (insert Person {...}) { id })` — hoisted
     /// into its own `WITH` CTE ahead of this insert, since Postgres has no

@@ -420,3 +420,61 @@ async fn updating_the_loop_variable_touches_only_the_iterated_rows() {
         "only the iterated row should change"
     );
 }
+
+/// A `for` body that updates *and* inserts into a multi-link: the insert runs
+/// once per iteration and the junction has to pair each row with the one that
+/// iteration inserted. Two people with different names make a mis-pairing
+/// visible — swapping them would still produce two rows and two links.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_nested_insert_in_a_for_body_pairs_with_its_own_iteration() {
+    let module = unique_module("live_for_nested");
+    let mut sd = person_schema(&module);
+    let mut note = ty("Note", &module, vec![id_prop(), text_prop("body")]);
+    note.multilinks = vec![];
+    sd.types.push(note);
+    let person = sd.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+    person.multilinks = vec![multilink("notes", &format!("{module}::Note"))];
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for name in ["Ann", "Bo"] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := 30 }}"),
+        )
+        .await;
+    }
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with ps := (select {module}::Person) \
+             for p in ps union (update p set {{ notes += (insert {module}::Note {{ body := p.name }}) }})"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name, n := .notes {{ body }} }} order by .name"),
+    )
+    .await;
+    assert_eq!(rows.len(), 2, "both people should come back, got {rows:?}");
+    for row in &rows {
+        let name = as_str(field(row, 1)).to_string();
+        let notes = match field(row, 2) {
+            pylon_value::DecodedValue::Array(items) => items.clone(),
+            other => panic!("expected an array of notes, got {other:?}"),
+        };
+        assert_eq!(notes.len(), 1, "{name} should have exactly one note, got {notes:?}");
+        assert_eq!(
+            as_str(field(&notes[0], 1)),
+            name,
+            "each note should belong to the person whose name it carries"
+        );
+    }
+}

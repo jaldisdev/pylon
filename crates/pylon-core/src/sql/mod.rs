@@ -968,12 +968,34 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
             let alias = &upd.target.alias;
             if upd.assignments.is_empty() && upd.rewrites.is_empty() && !upd.multi_link_appends.is_empty() {
                 const ITER_COL: &str = "_iter";
+                // A nested insert gets its id generated here rather than by the
+                // column default, so the junction below can name the row this
+                // iteration inserted. `RETURNING` offers no order to pair on.
+                let generated: Vec<Option<&IrInsert>> = upd
+                    .multi_link_appends
+                    .iter()
+                    .map(|a| per_iteration_insert(a, &upd.nested_ctes))
+                    .collect();
+                let new_cols: String = generated
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, ins)| {
+                        ins.map(|ins| {
+                            format!(
+                                ", {} AS {}",
+                                ins.id_default_sql.as_deref().unwrap_or("uuidv7()"),
+                                qi(&format!("_new_{i}"))
+                            )
+                        })
+                    })
+                    .collect();
                 let mut ids_sql = format!(
-                    "\"{}\" AS (\nSELECT {}.*, {}.\"v\" AS {} FROM {} AS {}, {}",
+                    "\"{}\" AS (\nSELECT {}.*, {}.\"v\" AS {}{} FROM {} AS {}, {}",
                     ids_name,
                     qi(alias),
                     qi(&iter_alias),
                     qi(ITER_COL),
+                    new_cols,
                     source_ref(&upd.target),
                     qi(alias),
                     qi(&iter_alias),
@@ -982,12 +1004,29 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                 ids_sql.push_str("\n)");
                 parts.push(ids_sql);
                 for (i, append) in upd.multi_link_appends.iter().enumerate() {
-                    parts.push(emit_for_ml_append_cte(
-                        append,
-                        &ids_name,
-                        &format!("{}__ml_add_{}", name, i),
-                        ITER_COL,
-                    ));
+                    match generated[i] {
+                        Some(ins) => {
+                            parts.push(emit_for_nested_insert_cte(
+                                ins,
+                                &ids_name,
+                                &iter_alias,
+                                &format!("{}__ml_ins_{}", name, i),
+                                &format!("_new_{i}"),
+                            ));
+                            parts.push(emit_for_ml_append_cte(
+                                append,
+                                &ids_name,
+                                &format!("{}__ml_add_{}", name, i),
+                                &format!("_new_{i}"),
+                            ));
+                        }
+                        None => parts.push(emit_for_ml_append_cte(
+                            append,
+                            &ids_name,
+                            &format!("{}__ml_add_{}", name, i),
+                            ITER_COL,
+                        )),
+                    }
                 }
             } else {
                 let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
@@ -1402,6 +1441,57 @@ pub(crate) fn append_value_is_the_loop_variable(values: &IrMultiLinkValues, var:
 
 /// `emit_ml_append_cte` for a `for` body: the target comes from the column the
 /// driving rows carry rather than from a correlated subquery.
+/// The nested insert a multi-link append's value names, when it is one of this
+/// update's own hoisted CTEs. Inside a `for` body such an insert runs once per
+/// iteration, so it cannot stay a standalone CTE.
+pub(crate) fn per_iteration_insert<'c>(
+    mutation: &IrMultiLinkMutation,
+    nested: &'c [IrCteDef],
+) -> Option<&'c IrInsert> {
+    let IrMultiLinkValueSource::CteRef(name) = &mutation.values.source else {
+        return None;
+    };
+    if !mutation.values.link_props.is_empty() {
+        return None;
+    }
+    nested.iter().find(|c| &c.name == name).and_then(|c| match &c.stmt {
+        IrStmt::Insert(ins) if ins.id_default_sql.is_some() && ins.multi_link_appends.is_empty() => Some(ins),
+        _ => None,
+    })
+}
+
+/// A nested insert inside a `for` body: one row per driving row, with its id
+/// taken from the column the driving CTE generated so the junction can pair
+/// with it. The iterator CTE is joined in because the inserted values are
+/// correlated subqueries that read the loop variable.
+fn emit_for_nested_insert_cte(
+    ins: &IrInsert,
+    ids_name: &str,
+    iter_alias: &str,
+    cte_name: &str,
+    id_col: &str,
+) -> String {
+    let mut cols = vec![qi("id")];
+    let mut values = vec![format!("\"{}\".{}", ids_name, qi(id_col))];
+    for (col, expr) in &ins.assignments {
+        cols.push(qi(col));
+        values.push(emit_expr(expr));
+    }
+    format!(
+        "\"{}\" AS (\nINSERT INTO {} ({})\nSELECT {} FROM \"{}\", {}\nWHERE \"{}\".{} = {}.\"v\"\nRETURNING {}\n)",
+        cte_name,
+        source_ref(&ins.target),
+        cols.join(", "),
+        values.join(", "),
+        ids_name,
+        qi(iter_alias),
+        ids_name,
+        qi("_iter"),
+        qi(iter_alias),
+        qi("id"),
+    )
+}
+
 fn emit_for_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str, iter_col: &str) -> String {
     format!(
         "\"{}\" AS (\nINSERT INTO {} ({}, {})\nSELECT \"{}\".\"id\", \"{}\".{} FROM \"{}\"\nON CONFLICT DO NOTHING\nRETURNING {}, {}\n)",
@@ -2704,12 +2794,34 @@ fn emit_for_update(
     if upd.assignments.is_empty() && upd.rewrites.is_empty() && !upd.multi_link_appends.is_empty() {
         const ITER_COL: &str = "_iter";
         let ids_name = "_ids";
+        // A nested insert gets its id generated here rather than by the column
+        // default, so the junction below can name the row *this* iteration
+        // inserted — `RETURNING` offers no order to pair on.
+        let generated: Vec<Option<&IrInsert>> = upd
+            .multi_link_appends
+            .iter()
+            .map(|a| per_iteration_insert(a, &upd.nested_ctes))
+            .collect();
+        let new_cols: String = generated
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ins)| {
+                ins.map(|ins| {
+                    format!(
+                        ", {} AS {}",
+                        ins.id_default_sql.as_deref().unwrap_or("uuidv7()"),
+                        qi(&format!("_new_{i}"))
+                    )
+                })
+            })
+            .collect();
         let mut ids_sql = format!(
-            "\"{}\" AS (\nSELECT {}.*, {}.\"v\" AS {} FROM {} AS {}, {}",
+            "\"{}\" AS (\nSELECT {}.*, {}.\"v\" AS {}{} FROM {} AS {}, {}",
             ids_name,
             qi(alias),
             qi(iter_alias),
             qi(ITER_COL),
+            new_cols,
             source_ref(&upd.target),
             qi(alias),
             qi(iter_alias),
@@ -2718,12 +2830,29 @@ fn emit_for_update(
         ids_sql.push_str("\n)");
         cte_parts.push(ids_sql);
         for (i, append) in upd.multi_link_appends.iter().enumerate() {
-            cte_parts.push(emit_for_ml_append_cte(
-                append,
-                ids_name,
-                &format!("_ml_add_{i}"),
-                ITER_COL,
-            ));
+            match generated[i] {
+                Some(ins) => {
+                    cte_parts.push(emit_for_nested_insert_cte(
+                        ins,
+                        ids_name,
+                        iter_alias,
+                        &format!("_ml_ins_{i}"),
+                        &format!("_new_{i}"),
+                    ));
+                    cte_parts.push(emit_for_ml_append_cte(
+                        append,
+                        ids_name,
+                        &format!("_ml_add_{i}"),
+                        &format!("_new_{i}"),
+                    ));
+                }
+                None => cte_parts.push(emit_for_ml_append_cte(
+                    append,
+                    ids_name,
+                    &format!("_ml_add_{i}"),
+                    ITER_COL,
+                )),
+            }
         }
         let (pointer_exprs, shape_nodes) = build_shape(&upd.returning, ids_name);
         let mut parts = vec![type_disc(&upd.target.type_name)];

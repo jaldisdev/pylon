@@ -692,6 +692,7 @@ mod tests {
             returning: vec![],
             enqueue_vector: vec![],
             enqueue_search: vec![],
+            id_default_sql: None,
             multi_link_appends: vec![IrMultiLinkMutation {
                 junction_table: "person.posts".into(),
                 module: "default".into(),
