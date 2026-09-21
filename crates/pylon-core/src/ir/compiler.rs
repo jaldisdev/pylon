@@ -2378,6 +2378,7 @@ impl<'a> Compiler<'a> {
                 {
                     let offset = s.offset.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
                     let limit = s.limit.as_ref().map(|e| self.compile_free_expr(e)).transpose()?;
+                    let message = self.assert_message(f, None)?;
                     // A set of objects has to come back as rows, not as the
                     // bare ids the array form carries — so the assert vets the
                     // ids and the type's own rows are selected by them.
@@ -2398,10 +2399,12 @@ impl<'a> Compiler<'a> {
                         let vetted = IrExpr::FunctionCall(IrFunctionCall {
                             schema: Some("_pylon".to_string()),
                             name: f.name.clone(),
-                            args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::StmtColumn {
+                            args: std::iter::once(IrExpr::ArrayFromSelect(Box::new(IrArraySource::StmtColumn {
                                 stmt: Box::new(inner_ir),
                                 column: pk.0.clone(),
-                            }))],
+                            })))
+                            .chain(message)
+                            .collect(),
                             sql_template: None,
                         });
                         let filter = IrExpr::BinOp(Box::new(IrBinOp {
@@ -2437,6 +2440,7 @@ impl<'a> Compiler<'a> {
                         rows: vec![IrRowSource::Free(IrFreeExpr::AssertSet {
                             fn_name: f.name.clone(),
                             inner: Box::new(inner),
+                            message,
                         })],
                         filter: None,
                         order_by: vec![],
@@ -3714,7 +3718,17 @@ impl<'a> Compiler<'a> {
                 }),
             };
             if let Some(column) = aggregated {
-                let mut call = self.resolve_fn_call(f.module.as_deref(), &f.name, vec![column])?;
+                let mut args = vec![column];
+                if !f.kwargs.is_empty() {
+                    if !matches!(f.name.as_str(), "assert_single" | "assert_exists" | "assert_distinct") {
+                        return Err(self.type_err(&format!(
+                            "function '{}' does not take named arguments, got '{}'",
+                            f.name, f.kwargs[0].0
+                        )));
+                    }
+                    args.extend(self.assert_message(f, None)?);
+                }
+                let mut call = self.resolve_fn_call(f.module.as_deref(), &f.name, args)?;
                 if agg_distinct {
                     let IrExpr::FunctionCall(fc) = &mut call else {
                         return Err(self.type_err(&format!(
@@ -7098,10 +7112,12 @@ impl<'a> Compiler<'a> {
                     props.join(", "),
                 )));
             }
+            let message = self.assert_message(f, Some((td, alias)))?;
             return Ok(IrMultiLinkValues {
                 source: IrMultiLinkValueSource::Asserted {
                     fn_name: f.name.clone(),
                     inner: Box::new(inner),
+                    message,
                 },
                 link_props: vec![],
             });
@@ -7915,7 +7931,7 @@ impl<'a> Compiler<'a> {
         // argument is "part of a larger expression", which is exactly what an
         // object-returning function refuses.
         if let Some(compexpr) = &el.compexpr
-            && let Some((fn_name, value_expr, check_expr)) =
+            && let Some((call, value_expr, check_expr)) =
                 Self::asserted_pointer_expr(compexpr, el.nested.as_deref().unwrap_or(&[]))
         {
             let element_for = |expr: Expr| ShapeElement {
@@ -7934,10 +7950,12 @@ impl<'a> Compiler<'a> {
                     Some(expr) => Some(self.compile_shape_element(&element_for(expr), td, alias, module)?),
                     None => None,
                 };
+                let message = self.assert_message(&call, Some((td, alias)))?;
                 return Ok(IrShapePointer::Asserted(Box::new(IrAssertedPointer {
-                    fn_name,
+                    fn_name: call.name,
                     inner: ptr,
                     check,
+                    message,
                 })));
             }
         }
@@ -8537,7 +8555,7 @@ impl<'a> Compiler<'a> {
     /// overload takes a second argument the wrapper would have to carry, and
     /// `assert_single` returns the element rather than the array, so it does
     /// not fit the check `IrShapePointer::Asserted` emits.
-    fn asserted_pointer_expr(expr: &Expr, nested: &[ShapeElement]) -> Option<(String, Expr, Option<Expr>)> {
+    fn asserted_pointer_expr(expr: &Expr, nested: &[ShapeElement]) -> Option<(ast::FunctionCall, Expr, Option<Expr>)> {
         // `(select assert_distinct(X) { … } limit 1)` — the assert is the
         // select's subject, so it sees the whole set, while the modifiers
         // narrow only what is read back. The two coincide unless a limit or
@@ -8553,7 +8571,7 @@ impl<'a> Compiler<'a> {
         if let Expr::SubQuery(stmt) = expr
             && let Stmt::Select(sel) = stmt.as_ref()
         {
-            let (fn_name, inner, _) = Self::asserted_pointer_expr(&sel.result, nested)?;
+            let (call, inner, _) = Self::asserted_pointer_expr(&sel.result, nested)?;
             let rebuild = |offset: Option<Expr>, limit: Option<Expr>| {
                 Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
                     result: inner.clone(),
@@ -8566,7 +8584,7 @@ impl<'a> Compiler<'a> {
             };
             let value = rebuild(sel.offset.clone(), sel.limit.clone());
             let check = (sel.offset.is_some() || sel.limit.is_some()).then(|| rebuild(None, None));
-            return Some((fn_name, value, check));
+            return Some((call, value, check));
         }
         // A shape written after the call (`assert_distinct(f(.id)) { amount }`)
         // belongs to the set the assert passes through, so it becomes the
@@ -8600,7 +8618,7 @@ impl<'a> Compiler<'a> {
                 marker_offset: None,
             })),
         };
-        Some((call.name.clone(), inner, None))
+        Some((call.clone(), inner, None))
     }
 
     /// A function call written as a pointer's value, with the shape its rows
@@ -9953,10 +9971,12 @@ impl<'a> Compiler<'a> {
                         "assert_exists" => "assert_exists",
                         _ => "assert_distinct",
                     };
+                    let mut args = vec![IrExpr::ArrayFromSelect(Box::new(inner))];
+                    args.extend(self.assert_message(f, ctx)?);
                     return Ok(IrExpr::FunctionCall(IrFunctionCall {
                         schema: Some("_pylon".to_string()),
                         name: fn_pg.to_string(),
-                        args: vec![IrExpr::ArrayFromSelect(Box::new(inner))],
+                        args,
                         sql_template: None,
                     }));
                 }
@@ -10313,6 +10333,9 @@ impl<'a> Compiler<'a> {
                 // set, so the comparison inside must not also be warned about.
                 // The argument is compiled before `resolve_fn_call` ever sees
                 // which function this is, which is why the guard goes here.
+                if let Some(args) = self.compile_named_call_args(f, ctx)? {
+                    return self.resolve_fn_call(f.module.as_deref(), &f.name, args);
+                }
                 let is_explicit_set = f.module.as_deref().unwrap_or("std") == "std"
                     && matches!(f.name.as_str(), "any" | "all")
                     && f.args.len() == 1;
@@ -12769,6 +12792,89 @@ impl<'a> Compiler<'a> {
     /// Look up `name` in the stdlib (namespace = `module` or `"std"`) and produce
     /// the correct `IrExpr::FunctionCall` based on the matching `ImplStrategy`.
     /// Falls through to a plain call if no overload is found (unknown / PG built-in).
+    /// `message := …` of an assert handled outside the generic call route,
+    /// which would otherwise drop it and raise the assert's own text.
+    fn assert_message(
+        &mut self,
+        f: &ast::FunctionCall,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let mut message = None;
+        for (name, value) in &f.kwargs {
+            if name != "message" {
+                return Err(self.type_err(&format!("function 'std::{}' has no parameter '{name}'", f.name)));
+            }
+            message = Some(self.compile_expr_ctx(value, ctx)?);
+        }
+        Ok(message)
+    }
+
+    /// A stdlib call against its named-only parameters — `message :=` of the
+    /// asserts, every parameter of `cal::to_relative_duration`. The arguments
+    /// come back in parameter order, each named-only one left out standing
+    /// at its default. `None` for a call that names nothing and needs no
+    /// default, which the positional route handles as it always has.
+    fn compile_named_call_args(
+        &mut self,
+        f: &ast::FunctionCall,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<Vec<IrExpr>>, PyQLError> {
+        use crate::stdlib::NamedDefault;
+
+        let ns = f.module.as_deref().unwrap_or("std");
+        let overloads = crate::stdlib::lookup(ns, &f.name);
+        let positional = |d: &crate::stdlib::FnDescriptor| d.params.iter().filter(|p| p.named_only.is_none()).count();
+        let named = |d: &crate::stdlib::FnDescriptor| d.params.iter().filter(|p| p.named_only.is_some()).count();
+        if f.kwargs.is_empty() {
+            if overloads.iter().any(|d| positional(d) == f.args.len() && named(d) == 0) {
+                return Ok(None);
+            }
+            if !overloads.iter().any(|d| positional(d) == f.args.len()) && overloads.iter().any(|d| named(d) > 0) {
+                let param = overloads
+                    .iter()
+                    .flat_map(|d| d.params.iter())
+                    .find(|p| p.named_only.is_some())
+                    .map_or("", |p| p.keyword());
+                return Err(self.type_err(&format!(
+                    "function '{ns}::{}' takes '{param}' as a named argument only — e.g. '{param} := …'",
+                    f.name
+                )));
+            }
+        }
+        let fits = |d: &&&crate::stdlib::FnDescriptor| {
+            positional(d) == f.args.len()
+                && named(d) > 0
+                && f.kwargs
+                    .iter()
+                    .all(|(name, _)| d.params.iter().any(|p| p.keyword() == name && p.named_only.is_some()))
+        };
+        let Some(desc) = overloads.iter().find(fits) else {
+            if let Some((name, _)) = f.kwargs.first() {
+                let message = if overloads.iter().all(|d| named(d) == 0) {
+                    format!("function '{ns}::{}' does not take named arguments, got '{name}'", f.name)
+                } else {
+                    format!("function '{ns}::{}' has no parameter '{name}'", f.name)
+                };
+                return Err(self.type_err(&message));
+            }
+            return Ok(None);
+        };
+        let mut args = f
+            .args
+            .iter()
+            .map(|a| self.compile_expr_ctx(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        for param in desc.params.iter().filter(|p| p.named_only.is_some()) {
+            let arg = match (f.kwargs.iter().find(|(name, _)| name == param.keyword()), param.named_only) {
+                (Some((_, value)), _) => self.compile_expr_ctx(value, ctx)?,
+                (None, Some(NamedDefault::Int(n))) => IrExpr::Literal(IrLiteral::Int(n)),
+                (None, _) => IrExpr::Null,
+            };
+            args.push(arg);
+        }
+        Ok(Some(args))
+    }
+
     fn resolve_fn_call(&mut self, module: Option<&str>, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
         use crate::stdlib::{ImplStrategy, lookup};
 

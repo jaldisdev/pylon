@@ -18,7 +18,7 @@
 //
 
 use super::{Datetime, Float64, FnDescriptor, Int64, LocalDate, LocalDatetime, LocalTime, RelativeDuration, Str};
-use super::{E, f, p, plpgsql, sql};
+use super::{E, NamedDefault, f, p, plpgsql, pn, sql};
 
 pub(super) fn build() -> Vec<FnDescriptor> {
     vec![
@@ -203,6 +203,22 @@ END"#,
                  hours => $4::int, mins => $5::int, secs => $6) \
                  + ($7::text || ' microseconds')::interval",
             ),
+        ),
+        f(
+            "cal",
+            "to_relative_duration",
+            vec![
+                pn("years", Int64, NamedDefault::Int(0)),
+                pn("months", Int64, NamedDefault::Int(0)),
+                pn("days", Int64, NamedDefault::Int(0)),
+                pn("hours", Int64, NamedDefault::Int(0)),
+                pn("minutes", Int64, NamedDefault::Int(0)),
+                pn("seconds", Float64, NamedDefault::Int(0)),
+                pn("microseconds", Int64, NamedDefault::Int(0)),
+            ],
+            RelativeDuration,
+            E("(make_interval(years => $1::int, months => $2::int, days => $3::int, hours => $4::int, \
+               mins => $5::int, secs => $6) + make_interval(secs => $7 / 1000000.0))"),
         ),
         f(
             "cal",
