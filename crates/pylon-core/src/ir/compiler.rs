@@ -13002,10 +13002,24 @@ impl<'a> Compiler<'a> {
 
         // Pick the overload whose parameter types best match the argument types.
         // Fall back to the first registered overload when no type info is available.
-        let best = overloads
-            .iter()
-            .find(|d| {
-                d.params.len() == args.len() && d.params.iter().zip(&args).all(|(p, a)| pylon_type_matches(a, &p.ty))
+        // An overload whose declared types are exactly what is known of the
+        // arguments beats one that merely accepts them: `to_str(<bytes>)`
+        // is the bytes overload, not the first one whose parameter type no
+        // check rejects.
+        let exact = overloads.iter().find(|d| {
+            d.params.len() == args.len()
+                && d.params.iter().zip(&args).any(|(p, a)| p.ty.scalar_pg_type().is_some() && infer_ir_type(a).is_some())
+                && d.params.iter().zip(&args).all(|(p, a)| match (p.ty.scalar_pg_type(), infer_ir_type(a)) {
+                    (Some(declared), Some(known)) => declared == known,
+                    _ => pylon_type_matches(a, &p.ty),
+                })
+        });
+        let best = exact
+            .or_else(|| {
+                overloads.iter().find(|d| {
+                    d.params.len() == args.len()
+                        && d.params.iter().zip(&args).all(|(p, a)| pylon_type_matches(a, &p.ty))
+                })
             })
             .or_else(|| overloads.first());
 
@@ -14708,6 +14722,16 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
         }
         IrExpr::UnaryOp(u) if u.op == crate::parse::ast::UnaryOpKind::Distinct => infer_ir_type(&u.operand),
+        // `enc::base64_decode(…)` — a stdlib call is typed by what it
+        // returns, when every overload of that name agrees.
+        IrExpr::FunctionCall(f) if f.schema.is_none() => {
+            let mut returns = crate::stdlib::registry()
+                .iter()
+                .filter(|d| d.name == f.name)
+                .map(|d| d.return_type.scalar_pg_type());
+            let first = returns.next()??;
+            returns.all(|t| t == Some(first)).then_some(first)
+        }
         _ => None,
     }
 }
