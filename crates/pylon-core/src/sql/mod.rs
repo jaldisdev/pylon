@@ -6854,6 +6854,22 @@ mod tests {
     }
 
     #[test]
+    fn test_a_declared_pointer_can_be_walked_through() {
+        // `p { boss := … }` read back as `.boss.name` — the walk builder
+        // resolved a *schema* computed as a step but not one a shape in scope
+        // declared, so anything past the first step reported it as unknown.
+        let out = compile_and_emit_with(
+            "WITH p := (SELECT Person { boss := .company } LIMIT 1) SELECT p { name, boss_name := .boss.name }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains(r#""public"."Company""#),
+            "the walk should reach the declared pointer's own target table:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_a_sibling_shape_pointer_is_not_in_scope() {
         // The upstream engine rejects one shape pointer reading another; matching that is what
         // keeps four graph queries reported as the application bugs they are.
