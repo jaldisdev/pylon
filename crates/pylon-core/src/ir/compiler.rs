@@ -6656,6 +6656,30 @@ impl<'a> Compiler<'a> {
             return self.compile_multilink_values(&rewritten, td, alias, through_td);
         }
 
+        // `notifications += (select .notifications { @read_at := … } filter …)`
+        // — the link properties sit *inside* the select. Lifted out, the shape
+        // branch below assigns them and the bare select goes down the
+        // relative-path branch, which is what each already knows how to do.
+        if let Expr::SubQuery(inner) = expr
+            && let Stmt::Select(sel) = inner.as_ref()
+            && let Expr::Shape(sh) = &sel.result
+            && !sh.elements.is_empty()
+            && sh.elements.iter().all(|el| {
+                matches!(el.path.steps.as_slice(), [ast::PathStep::LinkProp(_)])
+            })
+            && let Some(base) = sh.expr.clone()
+        {
+            let lifted = Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: Some(Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
+                    result: base,
+                    ..sel.clone()
+                })))),
+                elements: sh.elements.clone(),
+                marker_offset: sh.marker_offset,
+            }));
+            return self.compile_multilink_values(&lifted, td, alias, through_td);
+        }
+
         // `expr { @prop := value, ... }` — link-property assignments layered
         // onto an inner target-selecting expression.
         if let Expr::Shape(shape) = expr {
