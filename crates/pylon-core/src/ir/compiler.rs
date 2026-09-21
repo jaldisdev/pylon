@@ -344,6 +344,7 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
             IrPathResult::Object { type_name, .. } => type_name.clone(),
         },
         IrStmt::For(f) => cte_stmt_type(&f.body),
+        IrStmt::ScalarUnion(branches) => branches.first().map(cte_stmt_type).unwrap_or_default(),
         IrStmt::Group(g) => g.source.type_name.clone(),
         IrStmt::FunctionSelect(fs) => fs.type_name.clone(),
         IrStmt::VectorSearch(vs) => format!("__vs__{}", vs.source.type_name),
@@ -2528,6 +2529,16 @@ impl<'a> Compiler<'a> {
                         };
                         return Ok(IrStmt::PathSelect(ps));
                     }
+                }
+                if let Expr::Union(a, b) = result
+                    && !distinct
+                    && s.filter.is_none()
+                    && s.order_by.is_empty()
+                    && s.offset.is_none()
+                    && s.limit.is_none()
+                    && (self.is_scalar_walk(a) || self.is_scalar_walk(b))
+                {
+                    return self.compile_scalar_union(result);
                 }
                 // Catch mixed object/scalar UNION before dispatching further.
                 self.check_union_type_compat(result)?;
@@ -6181,6 +6192,69 @@ impl<'a> Compiler<'a> {
             Some(key) => Ok(key),
             None => self.compile_expr(branch, td, alias),
         }
+    }
+
+    /// `l.addon.id` — an absolute walk that lands on a property, so it yields
+    /// values rather than objects.
+    fn is_scalar_walk(&self, expr: &Expr) -> bool {
+        let Expr::Path(p) = expr else { return false };
+        let (Some(ast::PathStep::Name(root)), false) = (p.steps.first(), p.partial) else {
+            return false;
+        };
+        let (Some(ast::PathStep::Name(leaf)), [_, middle @ .., _]) = (p.steps.last(), p.steps.as_slice()) else {
+            return false;
+        };
+        let Ok(root_td) = self.resolve_path_root(root) else {
+            return false;
+        };
+        let owner = if middle.is_empty() {
+            Some(root_td)
+        } else {
+            self.walk_path_types(root_td, middle, MAX_COMPUTED_SPLICES).1
+        };
+        owner.is_some_and(|td| Self::resolve_property(td, leaf).is_some())
+    }
+
+    /// `a.id union b.id` — each operand compiled as the select it stands
+    /// for, the rows of all of them concatenated.
+    fn compile_scalar_union(&mut self, expr: &Expr) -> Result<IrStmt, PyQLError> {
+        fn operands<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match expr {
+                Expr::Union(a, b) => {
+                    operands(a, out);
+                    operands(b, out);
+                }
+                other => out.push(other),
+            }
+        }
+        let mut exprs = vec![];
+        operands(expr, &mut exprs);
+        let mut branches = Vec::with_capacity(exprs.len());
+        for operand in exprs {
+            let stmt = match operand {
+                Expr::SubQuery(stmt) => stmt.as_ref().clone(),
+                other => Stmt::Select(ast::SelectStmt {
+                    result: other.clone(),
+                    filter: None,
+                    order_by: vec![],
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                }),
+            };
+            branches.push(self.compile_stmt(&stmt)?);
+        }
+        let types: Vec<String> = branches.iter().map(cte_stmt_type).collect();
+        let first = types.iter().find(|t| !t.is_empty()).cloned().unwrap_or_default();
+        if let Some(other) = types.iter().find(|t| t.contains("::") || (!t.is_empty() && **t != first)) {
+            let display = |t: &str| if t.contains("::") { t.to_string() } else { pg_type_to_pyql(t).to_string() };
+            return Err(self.type_err(&format!(
+                "operator 'UNION' cannot be applied to operands of type '{}' and '{}'",
+                display(&first),
+                display(other)
+            )));
+        }
+        Ok(IrStmt::ScalarUnion(branches))
     }
 
     /// Extract the target type name from a DML or inner SELECT statement.

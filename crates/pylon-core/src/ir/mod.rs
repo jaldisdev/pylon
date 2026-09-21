@@ -83,6 +83,9 @@ pub enum IrStmt {
     VectorSearch(IrVectorSearch),
     /// `select fts::search(Type, $query) { object { … }, score }` — full-text search.
     FtsSearch(IrFtsSearch),
+    /// `a.id union b.id` — scalar sets concatenated, each operand a statement
+    /// yielding one value per row.
+    ScalarUnion(Vec<IrStmt>),
 }
 
 // ── FOR LOOP ─────────────────────────────────────────────────────────────────────
