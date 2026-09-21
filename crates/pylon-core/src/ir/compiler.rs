@@ -1090,11 +1090,19 @@ impl<'a> Compiler<'a> {
     /// Bind `name` to the value of a relative path off the enclosing object —
     /// `with handle_id := .id`. Returns false when the binding is anything
     /// else, which the caller hoists into a CTE as usual.
-    fn bind_inline_if_correlated(&mut self, name: &str, expr: &Expr) -> Result<bool, PyQLError> {
-        if self.anchors.is_empty() || !matches!(expr, Expr::Path(p) if p.partial) {
+    /// `ctx` is the row the enclosing sub-select is correlated to, when it
+    /// has one: a relative path in its bindings reads that row, not whichever
+    /// select happens to enclose it.
+    fn bind_inline_if_correlated(
+        &mut self,
+        name: &str,
+        expr: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<bool, PyQLError> {
+        if (self.anchors.is_empty() && ctx.is_none()) || !matches!(expr, Expr::Path(p) if p.partial) {
             return Ok(false);
         }
-        let ir = self.compile_free_expr(expr)?;
+        let ir = self.compile_expr_ctx(expr, ctx)?;
         self.inline_bindings.insert(name.to_string(), ir);
         Ok(true)
     }
@@ -2778,7 +2786,7 @@ impl<'a> Compiler<'a> {
             // The actual CTE SQL is handled at the top-level compile() boundary.
             Stmt::With(w) => {
                 for alias in &w.aliases {
-                    if self.bind_inline_if_correlated(&alias.name, &alias.expr)? || self.bind_group(&alias.name, &alias.expr)? {
+                    if self.bind_inline_if_correlated(&alias.name, &alias.expr, None)? || self.bind_group(&alias.name, &alias.expr)? {
                         continue;
                     }
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
@@ -9446,7 +9454,7 @@ impl<'a> Compiler<'a> {
         // statement's own WITH clause and the inner statement takes over.
         if let Stmt::With(w) = stmt {
             for alias in &w.aliases {
-                if self.bind_inline_if_correlated(&alias.name, &alias.expr)? || self.bind_group(&alias.name, &alias.expr)? {
+                if self.bind_inline_if_correlated(&alias.name, &alias.expr, ctx)? || self.bind_group(&alias.name, &alias.expr)? {
                     continue;
                 }
                 let ir_stmt = compile_cte_binding(self, &alias.expr)?;
