@@ -3367,18 +3367,49 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
     let mut union_parts = vec![];
     let from_ctes = nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n");
 
+    let has_any_multilink = !upd.multi_link_clears.is_empty()
+        || !upd.multi_link_replaces.is_empty()
+        || !upd.multi_link_appends.is_empty()
+        || !upd.multi_link_removals.is_empty();
     for (i, imp) in upd.poly_implementors.iter().enumerate() {
         let cte_name = format!("_u{}", i);
-        let mut upd_sql = format!(
+        // Junction rows live in each implementor's own junction table, so
+        // with any to write each implementor is updated as the concrete type
+        // it is.
+        if has_any_multilink {
+            let interface_prefix = format!("{}.", upd.target.table);
+            let own_prefix = format!("{}.", imp.table);
+            let own_junction = |table: &mut String| {
+                if let Some(link) = table.strip_prefix(&interface_prefix) {
+                    *table = format!("{own_prefix}{link}");
+                }
+            };
+            let mut concrete = upd.clone();
+            concrete.poly_implementors = vec![];
+            concrete.nested_ctes = vec![];
+            concrete.target.table = imp.table.clone();
+            concrete.target.type_name = imp.type_name.clone();
+            concrete.target.poly = None;
+            concrete.multi_link_clears.iter_mut().for_each(|c| own_junction(&mut c.junction_table));
+            concrete
+                .multi_link_replaces
+                .iter_mut()
+                .chain(concrete.multi_link_appends.iter_mut())
+                .chain(concrete.multi_link_removals.iter_mut())
+                .for_each(|m| own_junction(&mut m.junction_table));
+            cte_parts.extend(emit_update_multilink_ctes(&concrete, &cte_name));
+        } else {
+            let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}{}",
             qn(&imp.module, &imp.table),
             qi(alias),
             sets.join(", "),
             from_ctes,
         );
-        append_filter(&mut upd_sql, &upd.filter);
-        upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
-        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+            append_filter(&mut upd_sql, &upd.filter);
+            upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
+            cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+        }
 
         let r_alias = format!("_r{}", i);
         union_parts.push(format!(

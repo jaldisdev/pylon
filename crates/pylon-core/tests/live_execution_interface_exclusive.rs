@@ -757,3 +757,47 @@ async fn junction_backed_read_through_the_interface_view_resolves_the_link() {
     };
     assert_eq!(employer_fields[1], DecodedValue::Str("Acme".into()));
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_multilink_append_through_the_interface_reaches_each_implementors_rows() {
+    // Each implementor keeps its own junction table, so an update written
+    // against the interface has to write the one belonging to each row.
+    let module = unique_module("live_iface_ml_append");
+    let mut schema = account_schema(&module);
+    let tag_q = format!("{module}::Tag");
+    for td in schema.types.iter_mut() {
+        td.multilinks = vec![multilink("tags", &tag_q)];
+    }
+    schema.types.push(TypeDescriptor {
+        multilinks: vec![],
+        ..implementor_ty("Tag", &module, "", vec![id_prop(), text_prop("name")], vec![])
+    });
+    if let Some(tag) = schema.types.last_mut() {
+        tag.interfaces = vec![];
+    }
+    let pool = setup(&schema).await;
+
+    for stmt in [
+        format!("insert {module}::Individual {{ email := 'a@x', first_name := 'A' }}"),
+        format!("insert {module}::Organization {{ email := 'b@x', legal_name := 'B' }}"),
+        format!("insert {module}::Tag {{ name := 'vip' }}"),
+    ] {
+        exec(&pool, &schema, &stmt).await.unwrap();
+    }
+    exec(
+        &pool,
+        &schema,
+        &format!("update {module}::Account filter .email = 'b@x' set {{ tags += (select {module}::Tag) }}"),
+    )
+    .await
+    .unwrap();
+
+    let tag_counts = |type_name: &str| format!("select {module}::{type_name} {{ n := count(.tags) }}");
+    let count_of = |rows: Vec<DecodedValue>| match rows.as_slice() {
+        [DecodedValue::Composite(fields)] => fields.get(1).cloned(),
+        other => panic!("expected one row, got {other:?}"),
+    };
+    assert_eq!(count_of(rows_of(&pool, &schema, &tag_counts("Individual")).await), Some(DecodedValue::I64(0)));
+    assert_eq!(count_of(rows_of(&pool, &schema, &tag_counts("Organization")).await), Some(DecodedValue::I64(1)));
+}
