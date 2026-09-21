@@ -3242,7 +3242,22 @@ fn emit_column_diff(
         for (m, n, _) in &affected_views {
             push_tx(ops, format!("DROP VIEW IF EXISTS {};", qn(m, n)));
         }
-        for (col, target_type, _has_default) in &type_changes {
+        for (col, target_type, has_default) in &type_changes {
+            // Postgres checks the *existing* DEFAULT against the new type
+            // before any `SET DEFAULT` further down can replace it, and
+            // refuses ("default for column ... cannot be cast automatically").
+            // Dropping it first leaves the column bare for exactly as long as
+            // the type change takes; the new default is set below.
+            if *has_default {
+                push_tx(
+                    ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                        qn(&td.module, &td.table),
+                        qi(col)
+                    ),
+                );
+            }
             // The conversion expression is a placeholder, not a blind cast —
             // an interactive caller offers `default_expr` (identical to what
             // this used to emit unconditionally) and lets the user override
@@ -4753,6 +4768,59 @@ mod tests {
             joined.contains(r#"USING "verb"::text::"public"."HttpMethod";"#),
             "the conversion should go through text:\n{joined}"
         );
+    }
+
+    #[test]
+    fn test_a_column_default_is_dropped_before_its_type_changes() {
+        // Postgres checks the existing DEFAULT against the new type before any
+        // later `SET DEFAULT` can replace it: "default for column ... cannot
+        // be cast automatically". The drop has to come first.
+        let mut td = simple_type("default", "Person", "Person");
+        let mut rating = prop("rating", "int8", true);
+        rating.default_sql = Some("'1'".into());
+        td.properties.push(rating);
+        let schema = SchemaDescriptor {
+            types: vec![td],
+            ..Default::default()
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(),
+                name: "Person".into(),
+                columns: vec![
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "rating".into(),
+                        pg_type: "text".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: Some("'x'::text".into()),
+                    },
+                ],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
+            }],
+            enums: vec![],
+            domains: vec![],
+            ..DbState::default()
+        };
+        let joined = diff_schema(&schema, &state).unwrap().join("\n");
+        let Some(drop) = joined.find(r#"ALTER COLUMN "rating" DROP DEFAULT;"#) else {
+            panic!("the default should be dropped:\n{joined}");
+        };
+        let Some(retype) = joined.find(r#"ALTER COLUMN "rating" TYPE int8"#) else {
+            panic!("the type should change:\n{joined}");
+        };
+        assert!(drop < retype, "the drop must come first:\n{joined}");
     }
 
 
