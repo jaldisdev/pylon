@@ -264,7 +264,12 @@ pub enum IrFreeExpr {
     Tuple(Vec<IrExpr>),
     /// A set-returning assert: `SELECT ROW(v) FROM unnest(_pylon.fn(ARRAY(inner))) v`.
     /// Used for `assert_exists` and `assert_distinct` which pass through the set.
-    AssertSet { fn_name: String, inner: Box<IrArraySource> },
+    AssertSet {
+        fn_name: String,
+        inner: Box<IrArraySource>,
+        /// `message := …` — raised in place of the assert's own text.
+        message: Option<IrExpr>,
+    },
     /// Pass all rows from a scalar CTE through: `SELECT "result" FROM "cte_name"`.
     CtePassthrough(String),
 }
@@ -473,6 +478,8 @@ pub struct IrAssertedPointer {
     /// `(select assert_distinct(X) … limit 1)` asserts over all of X while
     /// returning one row of it. `None` when the two coincide.
     pub check: Option<IrShapePointer>,
+    /// `message := …` — raised in place of the assert's own text.
+    pub message: Option<IrExpr>,
 }
 
 impl IrShapePointer {
@@ -805,6 +812,8 @@ pub enum IrMultiLinkValueSource {
     Asserted {
         fn_name: String,
         inner: Box<IrMultiLinkValues>,
+        /// `message := …` — raised in place of the assert's own text.
+        message: Option<IrExpr>,
     },
 }
 

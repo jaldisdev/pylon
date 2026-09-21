@@ -559,3 +559,24 @@ async fn an_asserted_multilink_value_checks_its_targets() {
     .await;
     assert_eq!(rows.len(), 1, "the update should have landed, got {rows:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_assert_raises_the_message_it_was_given() {
+    let module = unique_module("live_assert_message");
+    let sd = schema_with_post(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    let pyql = format!(
+        "with p := assert_exists((select {module}::Person filter .name = 'Nobody' limit 1), message := 'no such person') \
+         select p {{ name }}"
+    );
+    let compiled = query::compile(&pyql, &sd).unwrap();
+    let error = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .expect_err("asserting a missing person must raise")
+        .to_string();
+    assert!(error.contains("no such person"), "got: {error}");
+}

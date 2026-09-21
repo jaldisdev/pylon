@@ -17,7 +17,7 @@
 // limitations under the License.
 //
 
-use super::{FnDescriptor, FnVolatility, ImplStrategy, Param, PylonFnDef, PylonType, SqlLanguage};
+use super::{FnDescriptor, FnVolatility, ImplStrategy, NamedDefault, Param, PylonFnDef, PylonType, SqlLanguage};
 
 use ImplStrategy::{SqlBuiltin as B, SqlExpression as E, SqlOperator as O, TranspilerIntrinsic as I};
 use PylonType::{
@@ -62,6 +62,8 @@ fn p(name: &'static str, ty: PylonType) -> Param {
         name,
         ty,
         variadic: false,
+        named_only: None,
+        keyword: None,
     }
 }
 fn pv(name: &'static str, ty: PylonType) -> Param {
@@ -69,6 +71,24 @@ fn pv(name: &'static str, ty: PylonType) -> Param {
         name,
         ty,
         variadic: true,
+        named_only: None,
+        keyword: None,
+    }
+}
+/// `pn` whose SQL parameter keeps an older name than the one calls use.
+fn pn_as(name: &'static str, keyword: &'static str, ty: PylonType, default: NamedDefault) -> Param {
+    Param {
+        keyword: Some(keyword),
+        ..pn(name, ty, default)
+    }
+}
+fn pn(name: &'static str, ty: PylonType, default: NamedDefault) -> Param {
+    Param {
+        name,
+        ty,
+        variadic: false,
+        named_only: Some(default),
+        keyword: None,
     }
 }
 

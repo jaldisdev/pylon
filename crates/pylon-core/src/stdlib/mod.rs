@@ -193,6 +193,28 @@ pub struct Param {
     pub ty: PylonType,
     /// True for `name: type...` variadic parameters.
     pub variadic: bool,
+    /// `named only name: type = default` — passed only as `name := value`,
+    /// and this value when left out.
+    pub named_only: Option<NamedDefault>,
+    /// The name a call passes it by when that is not `name` -- which is also
+    /// the SQL function's parameter name, and so cannot change once
+    /// installed (`CREATE OR REPLACE` refuses a renamed parameter).
+    pub keyword: Option<&'static str>,
+}
+
+impl Param {
+    /// The name a call passes this parameter by.
+    pub fn keyword(&self) -> &'static str {
+        self.keyword.unwrap_or(self.name)
+    }
+}
+
+/// What a named-only parameter stands at when a call leaves it out.
+#[derive(Debug, Clone, Copy)]
+pub enum NamedDefault {
+    Int(i64),
+    /// `<str>{}` — no value.
+    Empty,
 }
 
 // ── Function descriptor ──────────────────────────────────────────────────────

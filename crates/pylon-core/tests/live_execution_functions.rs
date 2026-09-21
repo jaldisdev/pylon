@@ -420,3 +420,27 @@ async fn function_call_composed_as_an_argument_to_another_function_call() {
     };
     assert_eq!(shape[0], DecodedValue::I64(12));
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn named_only_arguments_default_what_they_leave_out() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    let same = eval_scalar(
+        &pool,
+        "cal::to_relative_duration(days := 1, hours := 2) = cal::to_relative_duration(hours := 26)",
+    )
+    .await;
+    assert_eq!(same, DecodedValue::Bool(true));
+    let empty = SchemaDescriptor::default();
+    assert!(
+        query::compile("select cal::to_relative_duration(30)", &empty).is_err(),
+        "a named-only parameter cannot be passed by position"
+    );
+    assert!(
+        query::compile("select cal::to_relative_duration(weeks := 1)", &empty).is_err(),
+        "an argument the function does not declare is refused"
+    );
+}
+

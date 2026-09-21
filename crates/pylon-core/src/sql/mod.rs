@@ -1217,13 +1217,14 @@ fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], 
     // through the check, and unnested back into rows. Reading the inner value
     // twice — once for the check, once for the rows — would run any `insert`
     // inside it twice.
-    if let IrMultiLinkValueSource::Asserted { fn_name, inner } = &vals.source {
+    if let IrMultiLinkValueSource::Asserted { fn_name, inner, message } = &vals.source {
         let inner_sql = emit_multilink_values_inner(inner, &[], false);
         let prop_cols = emit_link_prop_cols(vals, prop_names);
         return format!(
-            "(SELECT unnest(\"_pylon\".{}(ARRAY(SELECT \"_v\".\"id\" FROM {} AS \"_v\"))) AS \"id\"{})",
+            "(SELECT unnest(\"_pylon\".{}(ARRAY(SELECT \"_v\".\"id\" FROM {} AS \"_v\"){})) AS \"id\"{})",
             qi(fn_name),
             inner_sql,
+            assert_message_arg(message),
             prop_cols,
         );
     }
@@ -1684,9 +1685,9 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
 
     // assert_exists / assert_distinct: set-returning — emit as unnest, not UNION ALL
     if items.len() == 1
-        && let IrFreeExpr::AssertSet { fn_name, inner } = items[0]
+        && let IrFreeExpr::AssertSet { fn_name, inner, message } = items[0]
     {
-        let array_sql = emit_array_source(inner);
+        let array_sql = emit_array_source(inner) + &assert_message_arg(message);
         let mut sql = format!(
             "SELECT ROW(v) AS result FROM unnest(\"_pylon\".{}({})) AS _assert(v)",
             fn_name, array_sql,
@@ -3754,6 +3755,14 @@ fn build_shape(pointers: &[IrShapePointer], table_alias: &str) -> (Vec<String>, 
     (exprs, nodes)
 }
 
+/// `, message` for an assert given `message := …`, else nothing.
+fn assert_message_arg(message: &Option<IrExpr>) -> String {
+    message
+        .as_ref()
+        .map(|m| format!(", ({})::text", emit_expr(m)))
+        .unwrap_or_default()
+}
+
 fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -> (String, ShapeNode) {
     match pointer {
         IrShapePointer::Scalar(f) => emit_scalar(f, table_alias, pos),
@@ -3775,8 +3784,9 @@ fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -
                 None => "\"_a\".\"v\"".to_string(),
             };
             let checked = format!(
-                "(SELECT \"_a\".\"v\" FROM (SELECT {sql} AS \"v\") AS \"_a\"\n                     WHERE cardinality(\"_pylon\".{}({checked_set}::text[])) >= 0)",
+                "(SELECT \"_a\".\"v\" FROM (SELECT {sql} AS \"v\") AS \"_a\"\n                     WHERE cardinality(\"_pylon\".{}({checked_set}::text[]{})) >= 0)",
                 qi(&a.fn_name),
+                assert_message_arg(&a.message),
             );
             (checked, node)
         }

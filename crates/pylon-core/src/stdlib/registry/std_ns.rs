@@ -22,8 +22,8 @@ use super::{
     Int16, Int32, Int64, Json, LocalDate, Str, Uuid,
 };
 use super::{
-    B, E, I, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_stable_nullable, plpgsql_stable_nullable_bool,
-    plpgsql_stable_nullable_elem, plpgsql_stable_returns, pv, ro, set_of, sql, sql_returns, tup,
+    B, E, I, NamedDefault, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_stable_nullable, plpgsql_stable_nullable_bool,
+    plpgsql_stable_nullable_elem, plpgsql_stable_returns, pn_as, pv, ro, set_of, sql, sql_returns, tup,
 };
 use crate::stdlib::FnVolatility::{Modifying, Stable, Volatile};
 
@@ -98,7 +98,7 @@ END"#,
         f(
             "std",
             "assert_single",
-            vec![p("s", set_of(Any)), p("msg", Str)],
+            vec![p("s", set_of(Any)), pn_as("msg", "message", Str, NamedDefault::Empty)],
             opt(Any),
             plpgsql_stable_nullable_elem(
                 "assert_single",
@@ -133,7 +133,7 @@ END"#,
         f(
             "std",
             "assert_exists",
-            vec![p("s", set_of(Any)), p("msg", Str)],
+            vec![p("s", set_of(Any)), pn_as("msg", "message", Str, NamedDefault::Empty)],
             set_of(Any),
             plpgsql_stable_nullable(
                 "assert_exists",
@@ -171,7 +171,7 @@ END"#,
         f(
             "std",
             "assert_distinct",
-            vec![p("s", set_of(Any)), p("msg", Str)],
+            vec![p("s", set_of(Any)), pn_as("msg", "message", Str, NamedDefault::Empty)],
             set_of(Any),
             plpgsql_stable_nullable(
                 "assert_distinct",
@@ -209,7 +209,7 @@ END"#,
         f(
             "std",
             "assert",
-            vec![p("condition", Bool), p("msg", Str)],
+            vec![p("condition", Bool), pn_as("msg", "message", Str, NamedDefault::Empty)],
             Bool,
             plpgsql_stable_nullable_bool(
                 "assert",
