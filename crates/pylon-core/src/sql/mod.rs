@@ -1792,7 +1792,11 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
                     } else {
                         "v"
                     };
-                    format!("SELECT ROW({row_value}) AS result, v FROM (SELECT {e} AS v) AS _scalar")
+                    // In a set of several, an element that is empty is not
+                    // in the set at all (`{a.id, b.id}` with no `a` is just
+                    // `b.id`) — where SQL would carry it as a NULL row.
+                    let present = if items.len() > 1 { " WHERE v IS NOT NULL" } else { "" };
+                    format!("SELECT ROW({row_value}) AS result, v FROM (SELECT {e} AS v) AS _scalar{present}")
                 }
             }
             IrFreeExpr::FreeObject(fields) => {
