@@ -6852,6 +6852,41 @@ mod tests {
     }
 
     #[test]
+    fn test_an_aggregate_over_a_subselected_path() {
+        // `array_agg((select Person.name))` — the sub-select walks to a scalar,
+        // which has no type name to be a schema select's subject. It means the
+        // same as `array_agg(Person.name)` with the select's own modifiers on
+        // the walk, which the path-select builder already handles. Checked
+        // against Gel's own answer, element for element.
+        let out = compile_and_emit("SELECT array_agg((SELECT Person.name))");
+        assert!(
+            out.sql.contains("array_agg") && out.sql.contains(r#""public"."Person""#),
+            "the aggregate should wrap the walk's column:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_distinct_aggregate_argument_reaches_the_aggregate() {
+        // `array_agg(distinct x)` used to emit `array_agg(x)`: the unary
+        // `distinct` emits its operand unchanged, because it is normally
+        // applied where the set is built — which an aggregate argument is not.
+        // Both spellings mean the same thing and both were checked against
+        // Gel, which returns one element where the old output returned two.
+        for query in [
+            "SELECT array_agg(DISTINCT Person.name)",
+            "SELECT array_agg((SELECT DISTINCT Person.name))",
+        ] {
+            let out = compile_and_emit(query);
+            assert!(
+                out.sql.contains("array_agg(DISTINCT "),
+                "{query} should deduplicate inside the aggregate:\n{}",
+                out.sql
+            );
+        }
+    }
+
+    #[test]
     fn test_is_not_negates_the_type_check() {
         // `x IS NOT T` is Gel's own `Expr IS NOT TypeExpr` — the negation of
         // the check, not a comparison against some type `not T`. Counted
