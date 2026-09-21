@@ -444,3 +444,19 @@ async fn named_only_arguments_default_what_they_leave_out() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn base64_round_trips_without_line_breaks() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    let decoded = eval_scalar(&pool, "to_str(enc::base64_decode('YXxi'))").await;
+    assert_eq!(decoded, DecodedValue::Str("a|b".to_string()));
+    // Postgres wraps every 76 characters; 60 bytes encode to 80.
+    let encoded = eval_scalar(&pool, "enc::base64_encode(to_bytes(str_repeat('x', 60), 'UTF8'))").await;
+    let DecodedValue::Str(text) = encoded else {
+        panic!("expected Str, got {encoded:?}")
+    };
+    assert_eq!(text.len(), 80);
+    assert!(!text.contains('\n'), "got {text:?}");
+}

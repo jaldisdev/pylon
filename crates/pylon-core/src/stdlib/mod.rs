@@ -69,6 +69,31 @@ pub enum PylonType {
 }
 
 impl PylonType {
+    /// The PostgreSQL type a plain scalar travels as, as the compiler's type
+    /// inference spells it; `None` for anything polymorphic or composite.
+    pub fn scalar_pg_type(&self) -> Option<&'static str> {
+        use PylonType::*;
+        Some(match self {
+            Str => "text",
+            Bool => "boolean",
+            Int16 => "int2",
+            Int32 => "int4",
+            Int64 => "int8",
+            Float32 => "float4",
+            Float64 => "float8",
+            Decimal | BigInt => "numeric",
+            Uuid => "uuid",
+            Json => "jsonb",
+            Bytes => "bytea",
+            Datetime => "timestamptz",
+            Duration | RelativeDuration => "interval",
+            LocalDatetime => "timestamp",
+            LocalDate => "date",
+            LocalTime => "time",
+            _ => return None,
+        })
+    }
+
     /// PyQL-facing spelling of the type, as a user would write it in a query
     /// (`str`, `array<int64>`, `range<datetime>`). Distinct from
     /// `ddl::pg_type`, which renders the PostgreSQL side.
