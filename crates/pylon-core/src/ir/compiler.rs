@@ -10586,6 +10586,15 @@ impl<'a> Compiler<'a> {
             return self.compile_expr(&expr_ast, td, alias);
         }
 
+        // `o in .organizations` — a multi-link read as a value is the set of
+        // rows on the other side, which no column holds; the same traversal a
+        // longer walk already becomes. Only property, link and computed were
+        // resolved here, so a bare multi-link reported itself as unknown —
+        // while the suggester, which does know them, offered the name back.
+        if Self::resolve_multilink(td, pointer_name).is_some() {
+            return self.compile_partial_path_as_subquery(p, td, alias);
+        }
+
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
     }
 
@@ -13269,6 +13278,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn field_err(&self, field: &str, type_name: &str) -> PyQLError {
+        if std::env::var("PYLON_DBG_FIELD_ERR").is_ok() {
+            eprintln!("DBG field_err {field} on {type_name}
+{}", std::backtrace::Backtrace::force_capture());
+        }
         let suggestion = self
             .schema
             .types

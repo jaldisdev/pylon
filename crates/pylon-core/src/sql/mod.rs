@@ -6825,6 +6825,22 @@ mod tests {
     }
 
     #[test]
+    fn test_a_bare_multilink_reads_as_a_set() {
+        // `p in .posts` — a multi-link read as a value, not traversed through.
+        // The single-step resolver knew properties, links and computeds but
+        // never multi-links, so the pointer reported itself as unknown while
+        // the suggester, which does know them, offered the name straight back.
+        let out = compile_and_emit(
+            "WITH p := (SELECT DETACHED Post LIMIT 1) SELECT Person { name } FILTER p IN .posts",
+        );
+        assert!(
+            out.sql.contains(r#""public"."Person.posts""#),
+            "the membership test should read the link's junction:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_shape_over_a_with_binding_reads_the_binding() {
         // `metadata := metadata { … }` — a binding names a row source, so a
         // shape on it projects that source. The pointer route only took
