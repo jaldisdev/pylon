@@ -324,3 +324,37 @@ async fn an_outer_filter_reads_a_pointer_the_inner_select_declared() {
         rows.len()
     );
 }
+
+/// `select <path> { n := .link.name } order by .n` — a path select's own shape
+/// computeds are in scope for the clauses beside it, exactly as a schema
+/// select's are. Ordering by one has to actually sort: a dropped ORDER BY
+/// would still return every row.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_path_select_orders_by_a_pointer_its_own_shape_declared() {
+    let module = unique_module("live_path_order");
+    let sd = schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    seed(&pool, &sd, &module).await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ label := .name }} order by .label desc"),
+    )
+    .await;
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| match field(r, 1) {
+            DecodedValue::Str(s) => s.clone(),
+            other => panic!("expected a text label, got {other:?}"),
+        })
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.reverse();
+    assert_eq!(names, sorted, "the order by should have sorted descending");
+    assert!(names.len() > 1, "need more than one row to tell, got {names:?}");
+}

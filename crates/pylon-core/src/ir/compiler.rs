@@ -2849,7 +2849,7 @@ impl<'a> Compiler<'a> {
                         shape,
                     };
                     let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers_scoped(sel, owner_td, &target_alias, junction_scope.clone())?;
+                        self.compile_path_modifiers_scoped(sel, owner_td, &target_alias, junction_scope.clone(), shape_elements)?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -2902,7 +2902,7 @@ impl<'a> Compiler<'a> {
                     vec![]
                 };
                 let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
+                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -2945,6 +2945,7 @@ impl<'a> Compiler<'a> {
                             current_td,
                             &current_alias,
                             junction_scope.clone(),
+                            shape_elements,
                         )?;
                         return Ok(IrPathSelect {
                             root,
@@ -2972,7 +2973,7 @@ impl<'a> Compiler<'a> {
                     tuple_shape,
                 );
                 let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
+                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -3026,7 +3027,7 @@ impl<'a> Compiler<'a> {
                         shape,
                     };
                     let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone())?;
+                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone(), shape_elements)?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -3124,7 +3125,7 @@ impl<'a> Compiler<'a> {
                         shape,
                     };
                     let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone())?;
+                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone(), shape_elements)?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -3234,7 +3235,7 @@ impl<'a> Compiler<'a> {
                                 shape,
                             };
                             let (filter, order_by, offset, limit) =
-                                self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope)?;
+                                self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope, shape_elements)?;
                             return Ok(IrPathSelect {
                                 root,
                                 joins,
@@ -3335,7 +3336,7 @@ impl<'a> Compiler<'a> {
                             shape,
                         };
                         let (filter, order_by, offset, limit) =
-                            self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone())?;
+                            self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone(), shape_elements)?;
                         return Ok(IrPathSelect {
                             root,
                             joins,
@@ -3361,7 +3362,7 @@ impl<'a> Compiler<'a> {
                 }
                 let expr = self.compile_expr(&expr_ast, current_td, &current_alias)?;
                 let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
+                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -3388,7 +3389,7 @@ impl<'a> Compiler<'a> {
             let type_name = format!("{}::{}", current_td.module, current_td.name);
             let shape = self.compile_shape_anchored(shape_elements, current_td, &current_alias, &module)?;
             let (filter, order_by, offset, limit) =
-                self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone())?;
+                self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
             return Ok(IrPathSelect {
                 root,
                 joins,
@@ -3420,11 +3421,19 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
         junction: Option<(String, String)>,
+        shape: &[ShapeElement],
     ) -> Result<SelectModifiers, PyQLError> {
         let pushed = junction.is_some();
         if pushed {
             self.link_prop_scope.push(junction);
         }
+        // `select .applied_promotions { name := .promotion.name } order by .name`
+        // — the shape's own computeds are in scope for the clauses beside it,
+        // the same as for a schema select. Added only now, after the shape has
+        // been compiled, so one shape pointer still cannot read another.
+        let outer_declared = self.active_declared_pointers.clone();
+        self.active_declared_pointers
+            .extend(shape.iter().filter(|el| el.compexpr.is_some()).cloned());
         let anchored = self.modifier_anchor.take();
         let result = match &anchored {
             Some((qualified, anchor_alias)) => {
@@ -3437,6 +3446,7 @@ impl<'a> Compiler<'a> {
         if pushed {
             self.link_prop_scope.pop();
         }
+        self.active_declared_pointers = outer_declared;
         result
     }
 
