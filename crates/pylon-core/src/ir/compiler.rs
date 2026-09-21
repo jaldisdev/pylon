@@ -263,6 +263,66 @@ fn selects_at_most_one(sel: &ast::SelectStmt, td: &TypeDescriptor) -> bool {
         || sel.filter.as_ref().is_some_and(|f| pins_exclusive(f, td))
 }
 
+/// A shape's subject written in a longer form than it needs, rewritten to the
+/// form the select routes already take; `None` when there is nothing to
+/// rewrite.
+///
+/// - `(select E) { … }` with no clauses of its own is `E { … }`, for the
+///   subjects only a select over them spells: an if/else, a union, a shape.
+/// - `X { a := … } { a: { … } }` is one shape. The outer one says what comes
+///   back; a name it lists that the inner one computed keeps that computation
+///   and takes the outer one's nested shape and modifiers.
+fn flatten_shape_subject(expr: &Expr) -> Option<Expr> {
+    let Expr::Shape(outer) = expr else { return None };
+    match outer.expr.as_ref()? {
+        Expr::SubQuery(stmt) => {
+            let Stmt::Select(sel) = stmt.as_ref() else { return None };
+            let bare = sel.filter.is_none()
+                && sel.order_by.is_empty()
+                && sel.offset.is_none()
+                && sel.limit.is_none()
+                && sel.lock.is_none();
+            if !bare || !matches!(sel.result, Expr::IfElse(_) | Expr::Union(_, _) | Expr::Shape(_)) {
+                return None;
+            }
+            let mut flat = outer.as_ref().clone();
+            flat.expr = Some(sel.result.clone());
+            Some(Expr::Shape(Box::new(flat)))
+        }
+        Expr::Shape(inner) => {
+            let elements = outer
+                .elements
+                .iter()
+                .map(|el| {
+                    let declared = match (&el.compexpr, el.path.steps.as_slice()) {
+                        (None, [ast::PathStep::Name(name)]) => inner.elements.iter().find(|d| {
+                            d.compexpr.is_some() && matches!(d.path.steps.as_slice(), [ast::PathStep::Name(n)] if n == name)
+                        }),
+                        _ => None,
+                    };
+                    match declared {
+                        Some(d) => ShapeElement {
+                            nested: el.nested.clone().or_else(|| d.nested.clone()),
+                            filter: el.filter.clone().or_else(|| d.filter.clone()),
+                            order_by: if el.order_by.is_empty() { d.order_by.clone() } else { el.order_by.clone() },
+                            offset: el.offset.clone().or_else(|| d.offset.clone()),
+                            limit: el.limit.clone().or_else(|| d.limit.clone()),
+                            ..d.clone()
+                        },
+                        None => el.clone(),
+                    }
+                })
+                .collect();
+            Some(Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: inner.expr.clone(),
+                elements,
+                marker_offset: inner.marker_offset,
+            })))
+        }
+        _ => None,
+    }
+}
+
 /// The name `.key.<name>` of a group is read through while its shape
 /// compiles — not one a query can spell, so it shadows nothing.
 fn group_key_binding(name: &str) -> String {
@@ -2198,6 +2258,17 @@ impl<'a> Compiler<'a> {
                     other => (false, other),
                 };
 
+                if let Some(flattened) = flatten_shape_subject(result) {
+                    let mut flat = s.clone();
+                    flat.result = match distinct {
+                        true => Expr::UnaryOp(Box::new(ast::UnaryOp {
+                            op: ast::UnaryOpKind::Distinct,
+                            operand: flattened,
+                        })),
+                        false => flattened,
+                    };
+                    return self.compile_stmt(&Stmt::Select(flat));
+                }
                 if let Expr::Shape(sh) = result
                     && let Some(Expr::SubQuery(inner)) = &sh.expr
                     && let Stmt::Group(g) = inner.as_ref()
