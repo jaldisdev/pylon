@@ -447,3 +447,123 @@ async fn group_over_a_walk_covers_only_the_rows_the_walk_reaches() {
         "only the walked team's members should be grouped — 'ops' and 'legal' belong to no group here, got {rows:?}"
     );
 }
+
+/// `department` optional, so a row can fall into the empty-key group.
+fn optional_department(mut sd: SchemaDescriptor) -> SchemaDescriptor {
+    for prop in sd.types.iter_mut().flat_map(|t| t.properties.iter_mut()) {
+        if prop.name == "department" {
+            prop.nullable = true;
+        }
+    }
+    sd
+}
+
+async fn seed_departments(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) {
+    for (name, dept, age) in [("Alice", "eng", 30), ("Bob", "eng", 32), ("Carol", "sales", 28), ("Dave", "sales", 40)] {
+        exec(
+            pool,
+            sd,
+            &format!("insert {module}::Employee {{ name := '{name}', department := '{dept}', age := {age}, active := true }}"),
+        )
+        .await;
+    }
+    // No department: the upstream engine groups the rows whose key is empty together too.
+    exec(
+        pool,
+        sd,
+        &format!("insert {module}::Employee {{ name := 'Eve', age := 50, active := true }}"),
+    )
+    .await;
+}
+
+fn as_i64(v: &DecodedValue) -> i64 {
+    match v {
+        DecodedValue::I64(n) => *n,
+        other => panic!("expected I64, got {other:?}"),
+    }
+}
+
+/// Each row's `name`, read from an element row `[type-tag, name]`.
+fn element_names(rows: &[DecodedValue]) -> HashSet<String> {
+    rows.iter().map(|row| as_str(&fields(row)[1]).to_string()).collect()
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn shape_over_a_group_reads_its_key_and_aggregates_its_elements() {
+    let module = unique_module("live_group_projection");
+    let sd = optional_department(employee_schema(&module));
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+    seed_departments(&pool, &sd, &module).await;
+
+    let rows = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "select (group {module}::Employee using d := .department by d) {{ \
+               d := .key.d, n := count(.elements), oldest := max(.elements.age) \
+             }} order by max(.elements.age) desc limit 2"
+        ),
+    )
+    .await;
+    // [type slot, d, n, oldest]; the empty-key group sorts first on age 50.
+    let got: Vec<(Option<String>, i64, i64)> = rows
+        .iter()
+        .map(|row| {
+            let f = fields(row);
+            let key = match &f[1] {
+                DecodedValue::Null => None,
+                other => Some(as_str(other).to_string()),
+            };
+            (key, as_i64(&f[2]), as_i64(&f[3]))
+        })
+        .collect();
+    assert_eq!(got, vec![(None, 1, 50), (Some("sales".to_string()), 2, 40)]);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn for_over_a_group_takes_the_first_elements_of_each_key() {
+    let module = unique_module("live_group_for");
+    let sd = optional_department(employee_schema(&module));
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+    seed_departments(&pool, &sd, &module).await;
+
+    let oldest = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "with g := (group {module}::Employee by .department) \
+             for x in g union (select x.elements order by .age desc limit 1) {{ name }}"
+        ),
+    )
+    .await;
+    assert_eq!(element_names(&oldest), HashSet::from(["Bob", "Dave", "Eve"].map(String::from)));
+
+    let youngest = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "for x in (group {module}::Employee by .department) \
+             union (select x.elements order by .age limit 1) {{ name }}"
+        ),
+    )
+    .await;
+    assert_eq!(element_names(&youngest), HashSet::from(["Alice", "Carol", "Eve"].map(String::from)));
+
+    // Bound in a `with` itself, the loop is read back like any object binding.
+    let bound = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "with youngest := (for x in (group {module}::Employee by .department) \
+               union (select x.elements order by .age limit 1)) \
+             select youngest {{ name }} filter .age < 50"
+        ),
+    )
+    .await;
+    assert_eq!(element_names(&bound), HashSet::from(["Alice", "Carol"].map(String::from)));
+}
+
