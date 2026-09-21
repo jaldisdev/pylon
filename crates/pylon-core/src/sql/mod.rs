@@ -6841,6 +6841,28 @@ mod tests {
     }
 
     #[test]
+    fn test_a_select_reads_its_own_shape_computed_in_its_clauses() {
+        // `select T { x := … } order by .x` — Gel puts a shape's computeds in
+        // scope for the select's own clauses (but not for a sibling pointer,
+        // which it rejects, so the scope stops at the clauses).
+        let out = compile_and_emit("SELECT Person { n := .name } ORDER BY .n ASC");
+        assert!(
+            out.sql.contains("ORDER BY"),
+            "the order by should compile against the declared pointer:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_sibling_shape_pointer_is_not_in_scope() {
+        // Gel rejects one shape pointer reading another; matching that is what
+        // keeps four graph queries reported as the application bugs they are.
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person { n := .name, copy := .n }").unwrap();
+        assert!(ir::compile(&ast, &schema).is_err());
+    }
+
+    #[test]
     fn test_shape_over_a_with_binding_reads_the_binding() {
         // `metadata := metadata { … }` — a binding names a row source, so a
         // shape on it projects that source. The pointer route only took

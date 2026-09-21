@@ -5068,6 +5068,15 @@ impl<'a> Compiler<'a> {
         );
         let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
             let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
+            // This select's own shape declares pointers the same way, and its
+            // clauses read them the same way: `select T { x := … } order by .x`
+            // is valid EdgeQL, while one shape pointer reading another is not —
+            // verified against Gel, which accepts the first and rejects the
+            // second. Added only now, after the shape is compiled, so the scope
+            // stops where Gel's does.
+            compiler
+                .active_declared_pointers
+                .extend(shape_elements.iter().filter(|el| el.compexpr.is_some()).cloned());
             let filter = sel
                 .filter
                 .as_ref()
@@ -10593,6 +10602,19 @@ impl<'a> Compiler<'a> {
         // while the suggester, which does know them, offered the name back.
         if Self::resolve_multilink(td, pointer_name).is_some() {
             return self.compile_partial_path_as_subquery(p, td, alias);
+        }
+
+        // `select (select T { a := … }) filter .a = …` — a pointer the shape
+        // in scope declared is on no type, so it is read as the expression it
+        // was written as. The shape route already resolves these; a filter or
+        // order-by naming one arrives here instead.
+        if let Some(expr) = self
+            .active_declared_pointers
+            .iter()
+            .find(|d| path_leaf(&d.path).is_ok_and(|n| n == pointer_name))
+            .and_then(|d| d.compexpr.clone())
+        {
+            return self.compile_expr(&expr, td, alias);
         }
 
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
