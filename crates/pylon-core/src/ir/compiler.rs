@@ -6353,6 +6353,19 @@ impl<'a> Compiler<'a> {
             other => other,
         };
         match value {
+            // `link := (select { <T>a.id, <T>b.id } limit 1)` — a set literal
+            // of keys, read for the one value its clauses leave.
+            Expr::SubQuery(inner_stmt)
+                if matches!(inner_stmt.as_ref(), Stmt::Select(sel) if matches!(sel.result, Expr::Set(_))) =>
+            {
+                let IrStmt::Select(select) = self.compile_stmt(inner_stmt)? else {
+                    return Ok(None);
+                };
+                if !select.rows.iter().all(|r| matches!(r, IrRowSource::Free(IrFreeExpr::Scalar(_)))) {
+                    return Ok(None);
+                }
+                Ok(Some(IrExpr::ScalarSubquery(Box::new(select))))
+            }
             // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
             // Compile as a scalar subquery returning the target pk (the FK uuid).
             Expr::SubQuery(inner_stmt) => self.compile_link_subquery(inner_stmt).map(Some),

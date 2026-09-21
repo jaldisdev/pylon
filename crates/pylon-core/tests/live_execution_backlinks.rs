@@ -641,6 +641,40 @@ async fn an_object_computed_guarded_by_a_condition_keeps_its_shape() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_empty_element_is_not_in_a_set_literal() {
+    // `{a.id, b.id}` with no `a` is just `b.id` — so the first key picked out
+    // of it is b's, not the NULL a row would carry in SQL.
+    let (module, schema, pool) = setup().await;
+    seed_teams(&pool, &schema, &module).await;
+
+    let found = rows(&pool, &schema, "select {<str>{}, 'b', <str>{}}").await;
+    assert_eq!(text_fields(&found, 0), vec![Some("b".to_string())]);
+
+    let insert = query::compile(
+        &format!(
+            "with missing := (select {module}::Org filter .name = 'Nobody' limit 1), \
+               present := (select {module}::Org filter .name = 'HasTeam' limit 1) \
+             insert {module}::Team {{ name := 'Gamma', \
+               org := (select {{ <{module}::Org>missing.id, <{module}::Org>present.id }} limit 1) }}"
+        ),
+        &schema,
+    )
+    .unwrap();
+    pool.execute_typed(&insert.sql, &[]).await.unwrap();
+    let gamma = rows(
+        &pool,
+        &schema,
+        &format!("select {module}::Team {{ org: {{ name }} }} filter .name = 'Gamma'"),
+    )
+    .await;
+    let [pylon_value::DecodedValue::Composite(team)] = gamma.as_slice() else {
+        panic!("expected Gamma, got {gamma:?}")
+    };
+    assert_eq!(text_fields(std::slice::from_ref(&team[1]), 1), vec![Some("HasTeam".to_string())]);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn a_computed_read_off_a_binding_keeps_its_own_bindings_on_that_row() {
     // `t.label` inside a shape over Org: the computed's own `with` reads the
     // Team `t` names, not the Org the shape is written on.
