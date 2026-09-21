@@ -6825,6 +6825,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_cast_takes_a_prefix_operator_as_its_operand() {
+        // `<bool>exists x` is valid EdgeQL — Gel's cast takes a whole `Expr` at
+        // CAST precedence. Pylon's cast went straight to a postfix expression,
+        // so any prefix operator after one failed to parse.
+        for query in [
+            "SELECT <bool>EXISTS (SELECT Person LIMIT 1)",
+            "SELECT <int64>-1",
+        ] {
+            let ast = parse::parse(query).unwrap_or_else(|e| panic!("{query} should parse: {e}"));
+            assert!(ir::compile(&ast, &make_schema()).is_ok(), "{query} should compile");
+        }
+    }
+
+    #[test]
     fn test_a_bare_multilink_reads_as_a_set() {
         // `p in .posts` — a multi-link read as a value, not traversed through.
         // The single-step resolver knew properties, links and computeds but

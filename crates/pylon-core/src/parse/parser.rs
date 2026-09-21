@@ -1127,7 +1127,11 @@ impl Parser {
                 }
                 let ty = self.parse_type_expr()?;
                 self.eat(&Token::Gt)?;
-                let expr = self.parse_type_cast()?;
+                // `<bool>exists x` — Gel's cast takes a whole `Expr` at CAST
+                // precedence, so a prefix operator is a legal operand. Going
+                // back through `parse_unary` (rather than straight to the next
+                // cast) is what lets `exists`/`distinct`/unary minus follow one.
+                let expr = self.parse_unary()?;
                 return Ok(Expr::TypeCast(Box::new(TypeCast { expr, ty })));
             }
         }
