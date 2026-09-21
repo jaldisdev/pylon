@@ -1132,6 +1132,7 @@ pub(crate) fn collect_link_prop_names(vals: &IrMultiLinkValues, names: &mut Vec<
             collect_link_prop_names(a, names);
             collect_link_prop_names(b, names);
         }
+        IrMultiLinkValueSource::Asserted { inner, .. } => collect_link_prop_names(inner, names),
         _ => {}
     }
 }
@@ -1169,6 +1170,21 @@ fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], 
             "({}\nUNION ALL\n{})",
             emit_multilink_values_inner(a, prop_names, false),
             emit_multilink_values_inner(b, prop_names, false),
+        );
+    }
+
+    // The assert wraps the whole value, so the ids are collected once, passed
+    // through the check, and unnested back into rows. Reading the inner value
+    // twice — once for the check, once for the rows — would run any `insert`
+    // inside it twice.
+    if let IrMultiLinkValueSource::Asserted { fn_name, inner } = &vals.source {
+        let inner_sql = emit_multilink_values_inner(inner, &[], false);
+        let prop_cols = emit_link_prop_cols(vals, prop_names);
+        return format!(
+            "(SELECT unnest(\"_pylon\".{}(ARRAY(SELECT \"_v\".\"id\" FROM {} AS \"_v\"))) AS \"id\"{})",
+            qi(fn_name),
+            inner_sql,
+            prop_cols,
         );
     }
 
@@ -1219,7 +1235,9 @@ fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], 
             sql.push(')');
             sql
         }
-        IrMultiLinkValueSource::Union(..) => unreachable!("handled above"),
+        IrMultiLinkValueSource::Union(..) | IrMultiLinkValueSource::Asserted { .. } => {
+            unreachable!("handled above")
+        }
     }
 }
 

@@ -6619,6 +6619,36 @@ impl<'a> Compiler<'a> {
             return Ok(inner);
         }
 
+        // `prices := assert_distinct(<union>)` — the assert checks the targets
+        // before they become junction rows, and passes them through otherwise.
+        if let Expr::FunctionCall(f) = expr
+            && (f.module.is_none() || f.module.as_deref() == Some("std"))
+            && matches!(f.name.as_str(), "assert_exists" | "assert_distinct")
+            && let [arg] = f.args.as_slice()
+        {
+            let arg = arg.clone();
+            let inner = self.compile_multilink_values(&arg, td, alias, through_td)?;
+            // The ids travel through the check as a plain array and come back
+            // unnested, which leaves no row for a per-target link property to
+            // ride along on.
+            let mut props = vec![];
+            crate::sql::collect_link_prop_names(&inner, &mut props);
+            if !props.is_empty() {
+                return Err(self.type_err(&format!(
+                    "'{}' cannot be applied to a link that carries link properties ({}) —                      the check reads the targets alone",
+                    f.name,
+                    props.join(", "),
+                )));
+            }
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::Asserted {
+                    fn_name: f.name.clone(),
+                    inner: Box::new(inner),
+                },
+                link_props: vec![],
+            });
+        }
+
         // `translations := (select { teaser, title })` — a select with no
         // clauses of its own is the expression it wraps, and the forms below
         // already know what to do with that. Left wrapped, a free row source
