@@ -3497,8 +3497,12 @@ fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -
             // evaluated once rather than in both the check and the result, and
             // read through `cardinality` because the assert hands back the
             // array it was given.
+            let checked_set = match &a.check {
+                Some(check) => emit_shape_pointer(check, table_alias, pos).0,
+                None => "\"_a\".\"v\"".to_string(),
+            };
             let checked = format!(
-                "(SELECT \"_a\".\"v\" FROM (SELECT {sql} AS \"v\") AS \"_a\"\n                     WHERE cardinality(\"_pylon\".{}(\"_a\".\"v\"::text[])) >= 0)",
+                "(SELECT \"_a\".\"v\" FROM (SELECT {sql} AS \"v\") AS \"_a\"\n                     WHERE cardinality(\"_pylon\".{}({checked_set}::text[])) >= 0)",
                 qi(&a.fn_name),
             );
             (checked, node)
