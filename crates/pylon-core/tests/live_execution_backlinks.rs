@@ -613,3 +613,28 @@ async fn a_second_shape_shapes_what_the_first_one_declared() {
     assert_eq!(text_fields(first, 1), vec![Some("Alpha".to_string())]);
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_object_computed_guarded_by_a_condition_keeps_its_shape() {
+    let (module, schema, pool) = setup().await;
+    seed_teams(&pool, &schema, &module).await;
+
+    for (condition, expected) in [("true", vec![Some("Alpha".to_string())]), ("false", vec![])] {
+        let found = rows(
+            &pool,
+            &schema,
+            &format!(
+                "select {module}::Org {{ first := (select .<org[is {module}::Team] order by .name limit 1) {{ name }} \
+                   if {condition} else {{}} }} filter .name = 'HasTeam'"
+            ),
+        )
+        .await;
+        let [pylon_value::DecodedValue::Composite(org)] = found.as_slice() else {
+            panic!("expected one org, got {found:?}")
+        };
+        let pylon_value::DecodedValue::Array(first) = &org[1] else {
+            panic!("expected the pointer's rows as objects, got {:?}", org[1])
+        };
+        assert_eq!(text_fields(first, 1), expected, "under `if {condition}`");
+    }
+}
