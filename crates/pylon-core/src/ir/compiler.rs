@@ -263,6 +263,91 @@ fn selects_at_most_one(sel: &ast::SelectStmt, td: &TypeDescriptor) -> bool {
         || sel.filter.as_ref().is_some_and(|f| pins_exclusive(f, td))
 }
 
+/// `(select .teams … limit 1) if cond else {}` as `(select .teams filter cond …
+/// limit 1)`, carrying along a shape written on the branch or on the whole
+/// if/else. `None` unless exactly one branch is empty and the other is a
+/// relative walk or a select over one, and `cond` reads no relative path --
+/// moved into the branch's filter, one would read the branch's rows instead.
+fn guarded_object_branch(expr: &Expr) -> Option<Expr> {
+    fn reads_relative(expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(p) => p.partial,
+            Expr::Literal(_) | Expr::Parameter(_) | Expr::Global(_) => false,
+            Expr::BinOp(b) => reads_relative(&b.left) || reads_relative(&b.right),
+            Expr::UnaryOp(u) => reads_relative(&u.operand),
+            Expr::TypeCast(c) => reads_relative(&c.expr),
+            Expr::FunctionCall(f) => f.args.iter().chain(f.kwargs.iter().map(|(_, v)| v)).any(reads_relative),
+            Expr::IfElse(ie) => reads_relative(&ie.if_expr) || reads_relative(&ie.condition) || reads_relative(&ie.else_expr),
+            _ => true,
+        }
+    }
+    fn empty(expr: &Expr) -> bool {
+        match expr {
+            Expr::Set(items) => items.is_empty(),
+            Expr::TypeCast(c) => matches!(&c.expr, Expr::Set(items) if items.is_empty()),
+            _ => false,
+        }
+    }
+    let (ie, outer_shape) = match expr {
+        Expr::IfElse(ie) => (ie.as_ref(), None),
+        Expr::Shape(sh) => match sh.expr.as_ref()? {
+            Expr::IfElse(ie) => (ie.as_ref(), Some(sh.elements.clone())),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if reads_relative(&ie.condition) {
+        return None;
+    }
+    let (branch, condition) = match (empty(&ie.if_expr), empty(&ie.else_expr)) {
+        (false, true) => (&ie.if_expr, ie.condition.clone()),
+        (true, false) => (
+            &ie.else_expr,
+            Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: ast::UnaryOpKind::Not,
+                operand: ie.condition.clone(),
+            })),
+        ),
+        _ => return None,
+    };
+    let (branch, branch_shape) = match branch {
+        Expr::Shape(sh) => (sh.expr.as_ref()?, Some(sh.elements.clone())),
+        other => (other, None),
+    };
+    let mut select = match branch {
+        Expr::Path(p) if p.partial => ast::SelectStmt {
+            result: branch.clone(),
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            lock: None,
+        },
+        Expr::SubQuery(stmt) => match stmt.as_ref() {
+            Stmt::Select(sel) if matches!(&sel.result, Expr::Path(p) if p.partial) => sel.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    select.filter = Some(match select.filter.take() {
+        Some(filter) => Expr::BinOp(Box::new(ast::BinOp {
+            left: filter,
+            op: ast::BinOpKind::And,
+            right: condition,
+        })),
+        None => condition,
+    });
+    let guarded = Expr::SubQuery(Box::new(Stmt::Select(select)));
+    Some(match outer_shape.or(branch_shape) {
+        Some(elements) => Expr::Shape(Box::new(ast::ShapeExpr {
+            expr: Some(guarded),
+            elements,
+            marker_offset: None,
+        })),
+        None => guarded,
+    })
+}
+
 /// A shape's subject written in a longer form than it needs, rewritten to the
 /// form the select routes already take; `None` when there is nothing to
 /// rewrite.
@@ -8339,6 +8424,19 @@ impl<'a> Compiler<'a> {
                     message,
                 })));
             }
+        }
+
+        // `t := (select .teams limit 1) if cond else {}` — one branch names
+        // objects and the other nothing, so the pointer is that branch with
+        // the condition folded into its own filter.
+        if let Some(compexpr) = &el.compexpr
+            && let Some(guarded) = guarded_object_branch(compexpr)
+        {
+            let element = ShapeElement {
+                compexpr: Some(guarded),
+                ..el.clone()
+            };
+            return self.compile_shape_element(&element, td, alias, module);
         }
 
         // Computed override: `pointer := expr`
