@@ -396,6 +396,7 @@ fn collect_multi_link_value_source(src: &IrMultiLinkValueSource, tags: &mut Vec<
     match src {
         IrMultiLinkValueSource::CteRef(_) => {}
         IrMultiLinkValueSource::Select(sel) => collect_select(sel, tags),
+        IrMultiLinkValueSource::Function(fs) => collect_function_select(fs, tags),
         IrMultiLinkValueSource::PathSelect(ps) => collect_path_select(ps, tags),
         IrMultiLinkValueSource::Union(a, b) => {
             collect_multi_link_values(a, tags);

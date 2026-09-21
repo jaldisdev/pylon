@@ -1274,6 +1274,21 @@ fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], 
             sql.push(')');
             sql
         }
+        IrMultiLinkValueSource::Function(fs) => {
+            let args = fs.fn_args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+            let mut sql = format!(
+                "(SELECT {}.\"id\"{} FROM {}.{}({}) AS {}",
+                qi(&fs.alias),
+                prop_cols,
+                pg_schema(&fs.fn_module),
+                qi(&fs.fn_name),
+                args,
+                qi(&fs.alias),
+            );
+            append_filter(&mut sql, &fs.filter);
+            sql.push(')');
+            sql
+        }
         IrMultiLinkValueSource::Union(..) | IrMultiLinkValueSource::Asserted { .. } => {
             unreachable!("handled above")
         }

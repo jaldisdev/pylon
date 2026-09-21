@@ -802,6 +802,9 @@ pub enum IrMultiLinkValueSource {
     Select(Box<IrSelect>),
     /// A path-traversal SELECT (root + joins, final result is the id).
     PathSelect(Box<IrPathSelect>),
+    /// `members := account_of_transaction()` — the rows an object-returning
+    /// function yields.
+    Function(Box<IrFunctionSelect>),
     /// `a union b` — combine two target sets (e.g. distinct-typed adds, or an
     /// existing-select add alongside a same-batch forward-referenced insert).
     Union(Box<IrMultiLinkValues>, Box<IrMultiLinkValues>),
