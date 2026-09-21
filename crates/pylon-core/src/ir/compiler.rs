@@ -3826,6 +3826,23 @@ impl<'a> Compiler<'a> {
                     let prop = self.compile_link_prop_ref(prop_name)?;
                     return Ok(ir_is_not_null(prop));
                 }
+                // `filter exists .n` where the shape in scope declared `n` —
+                // the pointer is on no type, so it is read as the expression it
+                // was written as.
+                if let ast::PathStep::Name(n) = &p.steps[0]
+                    && Self::resolve_property(td, n).is_none()
+                    && Self::resolve_link(td, n).is_none()
+                    && Self::resolve_multilink(td, n).is_none()
+                    && self.resolve_computed(td, n).is_none()
+                    && let Some(expr) = self
+                        .active_declared_pointers
+                        .iter()
+                        .find(|d| path_leaf(&d.path).is_ok_and(|name| name == n))
+                        .and_then(|d| d.compexpr.clone())
+                {
+                    let inner = self.compile_expr(&expr, td, alias)?;
+                    return Ok(ir_is_not_null(inner));
+                }
                 // `exists [is contact::IndividualContact]` — a bare narrowing
                 // is the current row seen as that type, so whether it exists is
                 // whether the row *is* one.
@@ -5147,13 +5164,20 @@ impl<'a> Compiler<'a> {
         // A binding read back by name brings whatever its own shape declared
         // (`offering { publisher }`), which is on no type and has to be found
         // through the binding it was written on.
-        let outer_declared = std::mem::replace(
-            &mut self.active_declared_pointers,
-            cte_name
-                .as_deref()
-                .and_then(|name| self.cte_declared_pointers.get(name).cloned())
+        let declared = match cte_name.as_deref() {
+            Some(name) => self.cte_declared_pointers.get(name).cloned().unwrap_or_default(),
+            // `select (select T { x := … }) filter .x…` — a nested select's
+            // shape declares pointers on no type, just as a binding's does, and
+            // the outer select's clauses read them the same way.
+            None => inner_stmt
+                .and_then(innermost_select)
+                .and_then(|inner| match &inner.result {
+                    Expr::Shape(sh) => Some(sh.elements.clone()),
+                    _ => None,
+                })
                 .unwrap_or_default(),
-        );
+        };
+        let outer_declared = std::mem::replace(&mut self.active_declared_pointers, declared);
         let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
             let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
             // This select's own shape declares pointers the same way, and its
@@ -10873,6 +10897,40 @@ impl<'a> Compiler<'a> {
         if p.partial && matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))) {
             return self.compile_partial_path_as_subquery(p, td, alias);
         }
+        // `.ca.name` where `ca := a if cond else b` — the condition does not
+        // depend on which branch is taken, so the field access distributes
+        // over both and the walk happens inside each. Left whole, the walk
+        // builder has no column to traverse through.
+        if p.partial
+            && p.steps.len() > 1
+            && let Some(ast::PathStep::Name(first)) = p.steps.first()
+            && let Some(Expr::IfElse(ie)) = self
+                .active_declared_pointers
+                .iter()
+                .find(|d| path_leaf(&d.path).is_ok_and(|name| name == first))
+                .and_then(|d| d.compexpr.clone())
+        {
+            let extend = |branch: &Expr| match branch {
+                Expr::Path(bp) => {
+                    let mut steps = bp.steps.clone();
+                    steps.extend(p.steps[1..].iter().cloned());
+                    Some(Expr::Path(ast::Path {
+                        steps,
+                        partial: bp.partial,
+                    }))
+                }
+                _ => None,
+            };
+            if let (Some(if_expr), Some(else_expr)) = (extend(&ie.if_expr), extend(&ie.else_expr)) {
+                let distributed = Expr::IfElse(Box::new(ast::IfElse {
+                    condition: ie.condition.clone(),
+                    if_expr,
+                    else_expr,
+                }));
+                return self.compile_expr(&distributed, td, alias);
+            }
+        }
+
         if p.steps.len() == 2 {
             return self.compile_path_2step(p, td, alias);
         }

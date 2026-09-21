@@ -289,3 +289,38 @@ async fn outer_shape_replaces_the_aliases_own_shape() {
     assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Bob".to_string()));
     assert_eq!(field(&rows[0], 2), &DecodedValue::I64(25));
 }
+
+/// A pointer the query itself declares, read back by the *outer* select's
+/// filter — including one whose value is an if/else, which the field access
+/// has to distribute over. Gel accepts both; Pylon used to report the pointer
+/// as unknown, or as "a computed pointer with no stored column to traverse".
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_outer_filter_reads_a_pointer_the_inner_select_declared() {
+    let module = unique_module("live_declared_filter");
+    let sd = schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+    seed(&pool, &sd, &module).await;
+
+    // `label` is the name of whoever is inactive, else a fixed marker. Filtering
+    // on it has to pick exactly the inactive people — a distribution that
+    // dropped the condition would return everyone, and one that dropped a
+    // branch would return none.
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!(
+            "select (select {module}::Person {{ label := .name if .active = false else 'skip' }}) filter .label != 'skip' order by .label"
+        ),
+    )
+    .await;
+    let all = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert!(
+        !rows.is_empty() && rows.len() < all.len(),
+        "the filter should pick some but not all of {} people, got {}",
+        all.len(),
+        rows.len()
+    );
+}
