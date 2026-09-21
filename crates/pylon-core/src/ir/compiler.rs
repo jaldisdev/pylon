@@ -3593,9 +3593,20 @@ impl<'a> Compiler<'a> {
         // wraps the column it lands on. Compiling the path as an expression
         // instead yields the array it stands for, and aggregating that nests it
         // one level deep.
+        // `array_agg(distinct X.p)` — the DISTINCT belongs *inside* the
+        // aggregate. The unary `distinct` emits its operand unchanged (it is
+        // normally applied where the set is built, which an aggregate argument
+        // is not), so left here it silently keeps the duplicates the upstream engine drops.
+        let (agg_arg, agg_distinct) = match result {
+            Expr::FunctionCall(f) if f.args.len() == 1 => match &f.args[0] {
+                Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOpKind::Distinct) => (Some(&u.operand), true),
+                other => (Some(other), false),
+            },
+            _ => (None, false),
+        };
         if let Expr::FunctionCall(f) = result
             && f.args.len() == 1
-            && let Expr::Path(p) = &f.args[0]
+            && let Some(Expr::Path(p)) = agg_arg
             && !p.partial
             && p.steps.len() > 1
         {
@@ -3616,7 +3627,22 @@ impl<'a> Compiler<'a> {
                 }),
             };
             if let Some(column) = aggregated {
-                let call = self.resolve_fn_call(f.module.as_deref(), &f.name, vec![column])?;
+                let mut call = self.resolve_fn_call(f.module.as_deref(), &f.name, vec![column])?;
+                if agg_distinct {
+                    let IrExpr::FunctionCall(fc) = &mut call else {
+                        return Err(self.type_err(&format!(
+                            "'{}' does not take a distinct argument — it does not resolve to an aggregate",
+                            f.name
+                        )));
+                    };
+                    if fc.schema.is_some() || fc.sql_template.is_some() {
+                        return Err(self.type_err(&format!(
+                            "'distinct' inside '{}' is not supported — only a plain SQL aggregate can take it",
+                            f.name
+                        )));
+                    }
+                    fc.sql_template = Some(format!("{}(DISTINCT $1)", fc.name));
+                }
                 ps.result = IrPathResult::Scalar(call, None);
                 return Ok(ps);
             }
@@ -5720,6 +5746,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn expr_as_type_name(&self, expr: &Expr) -> Result<String, PyQLError> {
+        if std::env::var("PYLON_DBG_SUBJ").is_ok() {
+            eprintln!("DBG subj {:.90?}
+{}", expr, std::backtrace::Backtrace::force_capture());
+        }
         match expr {
             // `detached T` names the same type; the prefix only says the set
             // is not correlated with the enclosing one.
@@ -9615,6 +9645,48 @@ impl<'a> Compiler<'a> {
                                 .iter()
                                 .find(|d| d.params.len() == 1)
                                 .or_else(|| overloads.first());
+                            // `array_agg((select Type.prop))` — the sub-select
+                            // walks to a scalar, which has no type name to be a
+                            // schema select's subject. It is the same thing as
+                            // `array_agg(Type.prop)` with the select's own
+                            // modifiers on the walk, which is what
+                            // `compile_expr_as_path_select` already builds.
+                            // A `distinct` inside the sub-select means the
+                            // same as one on the argument, and that is where the
+                            // aggregate can act on it.
+                            let (inner_result, inner_distinct) = match &sel.result {
+                                Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOpKind::Distinct) => {
+                                    (&u.operand, true)
+                                }
+                                other => (other, false),
+                            };
+                            if let Expr::Path(inner_path) = inner_result
+                                && !inner_path.partial
+                                && inner_path.steps.len() > 1
+                                && let Some(ast::PathStep::Name(root)) = inner_path.steps.first()
+                                && let Ok(root_td) = self.resolve_path_root(root)
+                                && self
+                                    .walk_path_types(root_td, &inner_path.steps[1..], MAX_COMPUTED_SPLICES)
+                                    .1
+                                    .is_none()
+                            {
+                                let root = root.clone();
+                                let mut inner_call = f.clone();
+                                inner_call.args = vec![if inner_distinct {
+                                    Expr::UnaryOp(Box::new(ast::UnaryOp {
+                                        op: ast::UnaryOpKind::Distinct,
+                                        operand: inner_result.clone(),
+                                    }))
+                                } else {
+                                    inner_result.clone()
+                                }];
+                                let call = ast::SelectStmt {
+                                    result: Expr::FunctionCall(inner_call),
+                                    ..sel.clone()
+                                };
+                                let ps = self.compile_expr_as_path_select(&call, &call.result, &root, false)?;
+                                return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                            }
                             if let Some(d) = best
                                 && let ImplStrategy::SqlBuiltin(sql_name) = &d.impl_strategy
                             {
