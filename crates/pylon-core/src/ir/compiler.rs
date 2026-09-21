@@ -6619,6 +6619,23 @@ impl<'a> Compiler<'a> {
             return Ok(inner);
         }
 
+        // `translations := (select { teaser, title })` — a select with no
+        // clauses of its own is the expression it wraps, and the forms below
+        // already know what to do with that. Left wrapped, a free row source
+        // (a set literal, a union) reaches the generic subquery arm and is
+        // refused, while the identical unwrapped `{ teaser, title }` compiles.
+        if let Expr::SubQuery(inner) = expr
+            && let Stmt::Select(sel) = inner.as_ref()
+            && sel.filter.is_none()
+            && sel.order_by.is_empty()
+            && sel.offset.is_none()
+            && sel.limit.is_none()
+            && matches!(sel.result, Expr::Set(_) | Expr::Union(_, _))
+        {
+            let result = sel.result.clone();
+            return self.compile_multilink_values(&result, td, alias, through_td);
+        }
+
         // CTE reference: bare name matching a registered CTE
         if let Some(name) = self.resolve_cte_name(expr) {
             return Ok(IrMultiLinkValues {
