@@ -466,3 +466,51 @@ async fn triple_nested_single_link_backlink_shape_returns_the_correct_chain() {
     titles.sort();
     assert_eq!(titles, vec!["Review PR".to_string(), "Ship it".to_string()]);
 }
+
+/// A multi-link read as a bare value, not traversed through:
+/// `filter <binding> in .friends`. The single-step resolver in
+/// `compile_path` knew properties, links and computeds but never
+/// multi-links, so this reported the pointer as unknown — while the
+/// suggester, which does know them, offered the same name straight back.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_bare_multilink_reads_as_the_set_of_rows_on_its_far_side() {
+    let (module, schema, pool) = setup().await;
+
+    for name in ["Alice", "Bob", "Carol"] {
+        let compiled = query::compile(&format!("insert {module}::Person {{ name := '{name}' }}"), &schema).unwrap();
+        pool.execute_typed(&compiled.sql, &[]).await.unwrap();
+    }
+    let update = query::compile(
+        &format!(
+            "update {module}::Person filter .name = 'Alice' \
+             set {{ friends += (select {module}::Person filter .name = 'Bob') }}"
+        ),
+        &schema,
+    )
+    .unwrap();
+    pool.execute_typed(&update.sql, &[]).await.unwrap();
+
+    let select = query::compile(
+        &format!(
+            "with bob := (select detached {module}::Person filter .name = 'Bob' limit 1) \
+             select {module}::Person {{ name }} filter bob in .friends order by .name"
+        ),
+        &schema,
+    )
+    .unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only Alice lists Bob as a friend — a membership test that matched everyone \
+         or no one would still have compiled, got {rows:?}"
+    );
+    let pylon_value::DecodedValue::Composite(fields) = &rows[0] else {
+        panic!("expected a Composite-shaped Person row, got {:?}", rows[0]);
+    };
+    assert_eq!(fields.get(1), Some(&pylon_value::DecodedValue::Str("Alice".to_string())));
+}
