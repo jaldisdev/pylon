@@ -562,6 +562,49 @@ async fn an_asserted_multilink_value_checks_its_targets() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_single_link_upsert_writes_exactly_one_branch() {
+    // `author := (update p set { … }) if exists(p) else (insert Person { … })`
+    // where `p` is a binding the nested statements read: the binding has to
+    // come before them, and the branch that writes nothing must not stop the
+    // update from happening.
+    let module = unique_module("live_update_link_upsert");
+    let sd = schema_with_post(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"),
+    )
+    .await;
+
+    let upsert = |name: &str| {
+        format!(
+            "with p := (select {module}::Person filter .name = '{name}' limit 1) \
+             update {module}::Post filter .title = 'Hello' set {{ \
+               author := (update p set {{ age := p.age + 1 }}) if exists(p) \
+                 else (insert {module}::Person {{ name := '{name}', age := 1 }}) \
+             }}"
+        )
+    };
+    exec(&pool, &sd, &upsert("Bob")).await;
+    exec(&pool, &sd, &upsert("Alice")).await;
+
+    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }} order by .name")).await;
+    let got: Vec<(String, i64)> = people
+        .iter()
+        .map(|r| (as_str(field(r, 1)).to_string(), as_i64(field(r, 2))))
+        .collect();
+    assert_eq!(got, vec![("Alice".to_string(), 31), ("Bob".to_string(), 1)]);
+
+    let posts = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
+    assert_eq!(as_str(field(field(&posts[0], 1), 1)), "Alice");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn an_assert_raises_the_message_it_was_given() {
     let module = unique_module("live_assert_message");
     let sd = schema_with_post(&module);

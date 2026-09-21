@@ -6101,6 +6101,88 @@ impl<'a> Compiler<'a> {
         Ok(Some(grp))
     }
 
+    /// The key a single-link assignment stores, for the values that name a
+    /// row rather than compute one. `None` for anything the generic
+    /// expression route already handles.
+    fn compile_link_key(&mut self, expr: &Expr, td: &TypeDescriptor, alias: &str) -> Result<Option<IrExpr>, PyQLError> {
+        // A one-element set is that element — `credentials := {
+        // (insert Credentials { … }) }` says the same thing as assigning the
+        // insert directly.
+        let value = match expr {
+            Expr::Set(elements) if elements.len() == 1 => &elements[0],
+            other => other,
+        };
+        match value {
+            // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
+            // Compile as a scalar subquery returning the target pk (the FK uuid).
+            Expr::SubQuery(inner_stmt) => self.compile_link_subquery(inner_stmt).map(Some),
+            // `created_by := account_of_transaction()` — an object-returning
+            // function names the row to link to, so what is stored is its key,
+            // the same as for a select. The schema itself writes this as a
+            // link default.
+            Expr::FunctionCall(fc) => self.try_compile_fn_scalar_subquery(fc, &["id".to_string()], None, None),
+            // `credentials := (update c set { … }) if exists(c) else (insert
+            // Credentials { … })` — each mutation carries its own condition,
+            // so exactly one branch yields the row to link.
+            Expr::IfElse(ie)
+                if [&ie.if_expr, &ie.else_expr].iter().any(|b| {
+                    matches!(b, Expr::SubQuery(s) if matches!(s.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)))
+                }) =>
+            {
+                let Some(rewritten) = self.object_if_else_as_union(value) else {
+                    return Ok(None);
+                };
+                self.compile_link_key(&rewritten, td, alias)
+            }
+            Expr::Union(a, b) => {
+                let (Some(left), Some(right)) = (self.compile_link_key(a, td, alias)?, self.compile_link_key(b, td, alias)?)
+                else {
+                    return Ok(None);
+                };
+                // A hoisted mutation's key is read by subquery: joined into
+                // the statement instead, the branch that wrote nothing would
+                // leave no row to update.
+                let hoisted = |key: IrExpr| match key {
+                    IrExpr::ColumnRef { alias, column, .. } if column == "id" => IrExpr::CteRef {
+                        name: alias,
+                        scalar: false,
+                        pg_type: None,
+                    },
+                    other => other,
+                };
+                Ok(Some(IrExpr::FunctionCall(IrFunctionCall {
+                    schema: None,
+                    name: "coalesce".to_string(),
+                    args: vec![hoisted(left), hoisted(right)],
+                    sql_template: None,
+                })))
+            }
+            // `by := account_of_transaction() if cond else {}` — each branch
+            // names a row (or none) the same way.
+            Expr::IfElse(ie) => {
+                if ![&ie.if_expr, &ie.else_expr].iter().any(|b| matches!(b, Expr::FunctionCall(_))) {
+                    return Ok(None);
+                }
+                Ok(Some(IrExpr::IfElse(Box::new(IrIfElse {
+                    condition: self.compile_expr(&ie.condition, td, alias)?,
+                    if_: self.compile_link_branch(&ie.if_expr, td, alias)?,
+                    else_: self.compile_link_branch(&ie.else_expr, td, alias)?,
+                }))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn compile_link_branch(&mut self, branch: &Expr, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
+        if matches!(branch, Expr::Set(elements) if elements.is_empty()) {
+            return Ok(IrExpr::Null);
+        }
+        match self.compile_link_key(branch, td, alias)? {
+            Some(key) => Ok(key),
+            None => self.compile_expr(branch, td, alias),
+        }
+    }
+
     /// Extract the target type name from a DML or inner SELECT statement.
     fn dml_subject_type(&self, stmt: &Stmt) -> Result<String, PyQLError> {
         match stmt {
@@ -6484,22 +6566,7 @@ impl<'a> Compiler<'a> {
                     // (insert Credentials { … }) }` says the same thing as
                     // assigning the insert directly.
                     let fk_col = format!("{}_id", l.name);
-                    let value = match expr {
-                        Expr::Set(elements) if elements.len() == 1 => &elements[0],
-                        other => other,
-                    };
-                    if let Expr::SubQuery(inner_stmt) = value {
-                        let ir_expr = self.compile_link_subquery(inner_stmt)?;
-                        return Ok((fk_col, ir_expr));
-                    }
-                    // `created_by := account_of_transaction()` — an
-                    // object-returning function names the row to link to, so
-                    // what is stored is its key, the same as for a select.
-                    // The schema itself writes this as a link default.
-                    if let Expr::FunctionCall(fc) = value
-                        && let Some(ir_expr) =
-                            self.try_compile_fn_scalar_subquery(fc, &["id".to_string()], None, None)?
-                    {
+                    if let Some(ir_expr) = self.compile_link_key(expr, td, alias)? {
                         return Ok((fk_col, ir_expr));
                     }
                     fk_col
