@@ -5535,7 +5535,13 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_group(&mut self, g: &ast::GroupStmt) -> Result<IrGroup, PyQLError> {
-        // Resolve the subject type — may be a schema type or a CTE alias.
+        // Resolve the subject type — may be a schema type, a CTE alias, or a
+        // walk. A walk (`group a.names by …`) names rows rather than a type:
+        // the group runs over what it lands on, narrowed below to the rows it
+        // yields, the same way `update a.preferences` narrows its own target.
+        // The steps used to be joined with `::` and looked up as a type name,
+        // which reported `a.names` as an unknown type `a::names`.
+        let mut walked: Option<&ast::Path> = None;
         let (type_name, cte_name) = match &g.subject {
             Expr::Path(p) if !p.partial => match p.steps.as_slice() {
                 [ast::PathStep::Name(n)] => {
@@ -5545,7 +5551,14 @@ impl<'a> Compiler<'a> {
                         (n.clone(), None)
                     }
                 }
-                [ast::PathStep::Name(m), ast::PathStep::Name(n)] => (format!("{}::{}", m, n), None),
+                [ast::PathStep::Name(root), rest @ ..]
+                    if !rest.is_empty()
+                        && let Ok(root_td) = self.resolve_path_root(root)
+                        && let (_, Some(target)) = self.walk_path_types(root_td, rest, MAX_COMPUTED_SPLICES) =>
+                {
+                    walked = Some(p);
+                    (format!("{}::{}", target.module, target.name), None)
+                }
                 _ => {
                     return Err(PyQLError::Type(PyQLTypeError {
                         message: format!("unsupported group subject: {:?}", g.subject),
@@ -5643,6 +5656,16 @@ impl<'a> Compiler<'a> {
             lock: None,
         };
         let (filter, order_by, offset, limit) = self.compile_path_modifiers(&synthetic, td, &alias)?;
+        // A walked subject groups only the rows the walk reaches, not every
+        // row of the type it happens to land on.
+        let filter = match walked {
+            Some(subject) => {
+                let subject = subject.clone();
+                let rows = self.compile_subject_path_rows(&subject, &alias)?;
+                and_conditions(filter, vec![rows])
+            }
+            None => filter,
+        };
 
         Ok(IrGroup {
             source,
