@@ -11726,6 +11726,20 @@ impl<'a> Compiler<'a> {
                         partial: bp.partial,
                     }))
                 }
+                // `(select .<brand[is T] … limit 1).priority` — the walk's
+                // remaining steps projected off the sub-select.
+                Expr::SubQuery(_) => p.steps[1..].iter().try_fold(branch.clone(), |expr, step| match step {
+                    ast::PathStep::Name(field) => Some(Expr::FieldAccess {
+                        expr: Box::new(expr),
+                        field: field.clone(),
+                    }),
+                    _ => None,
+                }),
+                // Nothing to walk from, so nothing is reached.
+                Expr::Set(items) if items.is_empty() => Some(Expr::Set(vec![])),
+                Expr::TypeCast(cast) if matches!(&cast.expr, Expr::Set(items) if items.is_empty()) => {
+                    Some(Expr::Set(vec![]))
+                }
                 _ => None,
             };
             if let (Some(if_expr), Some(else_expr)) = (extend(&ie.if_expr), extend(&ie.else_expr)) {
