@@ -567,3 +567,35 @@ async fn for_over_a_group_takes_the_first_elements_of_each_key() {
     assert_eq!(element_names(&bound), HashSet::from(["Alice", "Carol"].map(String::from)));
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn free_object_field_holds_every_row_its_select_yields() {
+    let module = unique_module("live_group_free_field");
+    let sd = optional_department(employee_schema(&module));
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+    seed_departments(&pool, &sd, &module).await;
+
+    let rows = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "select {{ \
+               everyone := (select {module}::Employee {{ name }}), \
+               first := (select {module}::Employee {{ name }} order by .age limit 1), \
+               per_department := (select (group {module}::Employee by .department) {{ \
+                 n := count(.elements) \
+               }}) \
+             }}"
+        ),
+    )
+    .await;
+    let [row] = rows.as_slice() else { panic!("expected one free object, got {rows:?}") };
+    let f = fields(row);
+    assert_eq!(element_names(as_array(&f[0])).len(), 5);
+    assert_eq!(as_str(&fields(&f[1])[1]), "Carol");
+    let mut counts: Vec<i64> = as_array(&f[2]).iter().map(|g| as_i64(&fields(g)[1])).collect();
+    counts.sort();
+    assert_eq!(counts, vec![1, 2, 2]);
+}
+

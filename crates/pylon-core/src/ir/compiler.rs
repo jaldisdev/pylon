@@ -241,6 +241,25 @@ fn try_compile_fts_with_pattern(c: &mut Compiler<'_>, w: &ast::WithStmt) -> Resu
 /// computed pointers spliced into it contributed. Every join in a path
 /// select is inner, so a spliced computed's filter means the same thing as a
 /// WHERE condition on the whole traversal.
+/// True when a select can yield at most one row: `limit 1`, or a filter that
+/// pins an exclusive property (`.id = …`) in one of its `and`-ed conditions.
+fn selects_at_most_one(sel: &ast::SelectStmt, td: &TypeDescriptor) -> bool {
+    fn pins_exclusive(expr: &Expr, td: &TypeDescriptor) -> bool {
+        let Expr::BinOp(b) = expr else { return false };
+        match b.op {
+            ast::BinOpKind::And => pins_exclusive(&b.left, td) || pins_exclusive(&b.right, td),
+            ast::BinOpKind::Eq => [&b.left, &b.right].into_iter().any(|side| {
+                matches!(side, Expr::Path(p) if p.partial
+                    && matches!(p.steps.as_slice(), [ast::PathStep::Name(name)]
+                        if td.properties.iter().any(|d| &d.name == name && (d.is_exclusive || d.is_pk))))
+            }),
+            _ => false,
+        }
+    }
+    matches!(sel.limit, Some(Expr::Literal(ast::Literal::Int(1))))
+        || sel.filter.as_ref().is_some_and(|f| pins_exclusive(f, td))
+}
+
 /// The name `.key.<name>` of a group is read through while its shape
 /// compiles — not one a query can spell, so it shadows nothing.
 fn group_key_binding(name: &str) -> String {
@@ -9090,11 +9109,18 @@ impl<'a> Compiler<'a> {
                 table: root_td.table.clone(),
                 alias,
             };
+            let single = selects_at_most_one(sel, root_td);
             let mut select = IrSelect::schema_bound(source, shape, filter);
             select.order_by = order_by;
             select.offset = offset;
             select.limit = limit;
-            return Ok(IrExpr::ObjectSubquery(Box::new(select)));
+            // Read as one object, a select yielding several rows aborts the
+            // query ("more than one row returned by a subquery").
+            return Ok(if single {
+                IrExpr::ObjectSubquery(Box::new(select))
+            } else {
+                IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectSelect(Box::new(select))))
+            });
         }
 
         if !shape_els.is_empty() && extra_fields.is_empty() {
