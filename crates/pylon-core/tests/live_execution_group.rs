@@ -599,3 +599,29 @@ async fn free_object_field_holds_every_row_its_select_yields() {
     assert_eq!(counts, vec![1, 2, 2]);
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn asserted_select_over_a_binding_keeps_the_shape_written_after_it() {
+    let module = unique_module("live_group_assert_binding");
+    let sd = optional_department(team_schema(&module));
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+    seed_departments(&pool, &sd, &module).await;
+    exec(&pool, &sd, &format!("insert {module}::Team {{ name := 'core' }}")).await;
+
+    let rows = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "with engineers := (select {module}::Employee filter .department = 'eng') \
+             select {module}::Team {{ members := (select assert_exists(engineers)) {{ name }} }} \
+             filter .name = 'core'"
+        ),
+    )
+    .await;
+    let [team] = rows.as_slice() else { panic!("expected one team, got {rows:?}") };
+    assert_eq!(
+        element_names(as_array(&fields(team)[1])),
+        HashSet::from(["Alice", "Bob"].map(String::from))
+    );
+}

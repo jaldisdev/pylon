@@ -8543,10 +8543,17 @@ impl<'a> Compiler<'a> {
         // narrow only what is read back. The two coincide unless a limit or
         // offset is written, and then the check needs its own copy without
         // them, or it would be asserting over the one row that survives.
+        // `(select assert_exists(X)) { … }` — the shape after the select is
+        // the one its subject passes through.
+        if let Expr::Shape(sh) = expr
+            && let Some(subquery @ Expr::SubQuery(_)) = sh.expr.as_ref()
+        {
+            return Self::asserted_pointer_expr(subquery, &sh.elements);
+        }
         if let Expr::SubQuery(stmt) = expr
             && let Stmt::Select(sel) = stmt.as_ref()
         {
-            let (fn_name, inner, _) = Self::asserted_pointer_expr(&sel.result, &[])?;
+            let (fn_name, inner, _) = Self::asserted_pointer_expr(&sel.result, nested)?;
             let rebuild = |offset: Option<Expr>, limit: Option<Expr>| {
                 Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
                     result: inner.clone(),
@@ -9093,20 +9100,42 @@ impl<'a> Compiler<'a> {
         // — a select over a named type, carrying the shape its rows are read
         // with. That is an object, not the bare key the branch below gives a
         // shapeless one, so the shape has somewhere to go after all.
+        // `(select names { * })` over an object `with` binding reads the
+        // binding's rows the same way.
         if !shape_els.is_empty()
             && extra_fields.is_empty()
             && !path.partial
             && let [ast::PathStep::Name(type_name)] = path.steps.as_slice()
-            && let Ok(root_td) = self.resolve_type(type_name)
+            && let Some(root_td) = match self.cte_object_type(type_name) {
+                Some(_) => self.resolve_path_root(type_name).ok(),
+                None => self.resolve_type(type_name).ok(),
+            }
         {
             let alias = self.fresh_alias();
-            let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, root_td, &alias)?;
+            let binding = self.cte_object_type(type_name).map(|_| type_name.clone());
+            let table = match &binding {
+                Some(name) => self.row_source_table(name, root_td),
+                None => root_td.table.clone(),
+            };
+            let outer_declared = binding.as_ref().map(|name| {
+                let declared = self.cte_declared_pointers.get(name).cloned().unwrap_or_default();
+                std::mem::replace(&mut self.active_declared_pointers, declared)
+            });
+            let modifiers = self.compile_path_modifiers(sel, root_td, &alias);
             let module = root_td.module.clone();
-            let shape = self.compile_shape(shape_els, root_td, &alias, &module)?;
+            let shape = self.compile_shape(shape_els, root_td, &alias, &module);
+            if let Some(outer) = outer_declared {
+                self.active_declared_pointers = outer;
+            }
+            let (filter, order_by, offset, limit) = modifiers?;
+            let shape = shape?;
             let source = IrSource {
-                poly: self.poly_fanout_for(&format!("{}::{}", root_td.module, root_td.name)),
+                poly: match binding {
+                    Some(_) => None,
+                    None => self.poly_fanout_for(&format!("{}::{}", root_td.module, root_td.name)),
+                },
                 type_name: format!("{}::{}", root_td.module, root_td.name),
-                table: root_td.table.clone(),
+                table,
                 alias,
             };
             let single = selects_at_most_one(sel, root_td);
