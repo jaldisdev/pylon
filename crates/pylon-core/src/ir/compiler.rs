@@ -5509,6 +5509,7 @@ impl<'a> Compiler<'a> {
             {
                 None
             }
+            IrStmt::Update(_) if std::env::var("PYLON_DBG_FORUPD").is_ok() => None,
             IrStmt::Update(_) => Some("update"),
             IrStmt::Delete(_) => Some("delete"),
             // `for line in … union (for component in … union (insert …))` —
@@ -6158,6 +6159,13 @@ impl<'a> Compiler<'a> {
         // narrows the update to its own rows. Without the narrowing this would
         // resolve to the type and rewrite every row in the table.
         let bound_rows = self.cte_object_type(&type_name);
+        // `for p in … union (update p set …)` — the same for a loop variable,
+        // which names the one row this iteration holds. Without it the UPDATE
+        // went out with no WHERE at all and rewrote every row of the table.
+        let iterated = self
+            .for_var_types
+            .contains_key(&type_name)
+            .then(|| self.for_var_ref(&type_name));
         let td = self.resolve_path_root(&type_name)?;
         let alias = self.fresh_alias();
         let target = IrSource {
@@ -6195,6 +6203,21 @@ impl<'a> Compiler<'a> {
                 Some(and_conditions(declared_filter, vec![membership]).expect("membership is present"))
             }
             None => declared_filter,
+        };
+        let filter = match iterated {
+            Some(value) => {
+                let this_row = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::Eq,
+                    right: value,
+                }));
+                Some(and_conditions(filter, vec![this_row]).expect("the row condition is present"))
+            }
+            None => filter,
         };
         // `(update cart set { … }) if not exists(existing) else {}` — the
         // condition narrows the rows this update touches. Left to filter what
