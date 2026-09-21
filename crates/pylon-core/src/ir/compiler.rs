@@ -11376,17 +11376,33 @@ impl<'a> Compiler<'a> {
         // Warn: multi-link traversal in a comparison returns a set, not a single boolean.
         // The query works (compiled as EXISTS), but `any()` makes the intent explicit.
         if self.explicit_set_depth == 0 {
-            let pointer_path: Vec<_> = path_steps
-                .iter()
-                .map(|s| match s {
-                    ast::PathStep::Name(n) => n.as_str(),
-                    _ => "?",
-                })
-                .collect();
+            // Rendered back the way it was written — a path the reader cannot
+            // find in their own query is worse than no path at all.
+            let mut pointer_path = String::new();
+            for step in path_steps {
+                match step {
+                    ast::PathStep::Name(n) => {
+                        pointer_path.push('.');
+                        pointer_path.push_str(n);
+                    }
+                    ast::PathStep::Backlink(n) => {
+                        pointer_path.push_str(".<");
+                        pointer_path.push_str(n);
+                    }
+                    ast::PathStep::LinkProp(n) => {
+                        pointer_path.push('@');
+                        pointer_path.push_str(n);
+                    }
+                    ast::PathStep::TypeIntersection(t) => {
+                        pointer_path.push_str("[is ");
+                        pointer_path.push_str(&t.qualified_name());
+                        pointer_path.push(']');
+                    }
+                }
+            }
             self.warnings.push(format!(
                 "possibly more than one element returned by an expression in a FILTER clause \
-                 (multi-link '.{}'); wrap with any() to make intent explicit",
-                pointer_path.join("."),
+                 (multi-link '{pointer_path}'); wrap with any() to make intent explicit",
             ));
         }
 
