@@ -3144,9 +3144,19 @@ impl<'a> Compiler<'a> {
             }
 
             // A computed pointer declared on the type reached so far (or on
-            // an interface it implements).
-            if let Some(cd) = self.resolve_computed(current_td, step_name) {
-                let parsed = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
+            // an interface it implements) — or, at the root only, one the
+            // shape in scope declared, which is on no type at all:
+            // `r { revision := … }` read back as `.revision.created_at`.
+            let declared = match self.resolve_computed(current_td, step_name) {
+                Some(cd) => Some(crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?),
+                None if idx == 0 => self
+                    .active_declared_pointers
+                    .iter()
+                    .find(|d| path_leaf(&d.path).is_ok_and(|n| n == step_name))
+                    .and_then(|d| d.compexpr.clone()),
+                None => None,
+            };
+            if let Some(parsed) = declared {
                 // `(select .parents … limit 1).parent` reads as the select over
                 // the walk those two make together.
                 let rewritten = Self::field_access_over_select(&parsed);
