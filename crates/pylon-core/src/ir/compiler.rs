@@ -13989,7 +13989,15 @@ impl<'a> Compiler<'a> {
         let td_module = td.module.clone();
         // Build shape against the return type (treat alias as the source alias).
         let shape = self.compile_shape(elements, &td, &alias, &td_module)?;
-        let (filter, order_by, offset, limit) = self.compile_path_modifiers(s, &td, &alias)?;
+        // The shape's own computeds are in scope for the select's clauses,
+        // the same as over a type -- added only now, so one pointer still
+        // cannot read another.
+        let outer_declared = self.active_declared_pointers.clone();
+        self.active_declared_pointers
+            .extend(elements.iter().filter(|el| el.compexpr.is_some()).cloned());
+        let modifiers = self.compile_path_modifiers(s, &td, &alias);
+        self.active_declared_pointers = outer_declared;
+        let (filter, order_by, offset, limit) = modifiers?;
 
         Ok(Some(IrFunctionSelect {
             fn_module,
