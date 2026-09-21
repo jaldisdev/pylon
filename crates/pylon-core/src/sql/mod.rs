@@ -6852,6 +6852,24 @@ mod tests {
     }
 
     #[test]
+    fn test_a_multilink_takes_a_set_wrapped_in_a_select() {
+        // `translations := (select { a, b })` — a select with no clauses of its
+        // own is the expression it wraps. Left wrapped, a free row source (a
+        // set literal, a union) reached the generic subquery arm and was
+        // refused, while the identical unwrapped `{ a, b }` compiled.
+        let out = compile_and_emit_with(
+            "WITH a := (INSERT Post { title := $t1 }), b := (INSERT Post { title := $t2 }) \
+             SELECT (INSERT Person { name := $n, posts := (SELECT { a, b }) })",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains(r#""public"."Person.posts""#),
+            "both targets should reach the junction:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_an_aggregate_over_a_subselected_path() {
         // `array_agg((select Person.name))` — the sub-select walks to a scalar,
         // which has no type name to be a schema select's subject. It means the
