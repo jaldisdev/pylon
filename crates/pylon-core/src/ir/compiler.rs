@@ -4556,7 +4556,7 @@ impl<'a> Compiler<'a> {
     /// A is an A-set, which is what EdgeQL reads it as; requiring the branches
     /// to name the same type refuses a get-or-create over an interface.
     fn common_union_type(&self, branches: &[(String, String)]) -> Option<String> {
-        branches.iter().map(|(t, _)| t.clone()).find(|candidate| {
+        let covers_all = |candidate: &String| {
             branches.iter().all(|(t, _)| {
                 t == candidate
                     || self
@@ -4564,8 +4564,23 @@ impl<'a> Compiler<'a> {
                         .map(|td| Self::is_or_implements(td, candidate))
                         .unwrap_or(false)
             })
-        })
+        };
+        if let Some(branch) = branches.iter().map(|(t, _)| t.clone()).find(&covers_all) {
+            return Some(branch);
+        }
+        // None of the branches is the others' supertype, but they may still
+        // share one — `IncomingTransformer union OutgoingTransformer` are both
+        // `Transformer`. The first branch's ancestors are the only candidates,
+        // since a common type has to be among them.
+        let first = self.resolve_type(&branches.first()?.0).ok()?;
+        first
+            .interfaces
+            .iter()
+            .chain(first.parents.iter())
+            .find(|ancestor| covers_all(ancestor))
+            .cloned()
     }
+
 
     fn object_union_branches(&self, expr: &Expr) -> Option<Vec<(String, String)>> {
         fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
