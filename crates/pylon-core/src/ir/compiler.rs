@@ -7131,6 +7131,24 @@ impl<'a> Compiler<'a> {
                 .as_ref()
                 .ok_or_else(|| self.type_err("multilink value shape must have a base expression"))?;
             let mut inner = self.compile_multilink_values(inner_expr, td, alias, through_td)?;
+            // `(select .notifications { @read_at := … @read_at })` — over a
+            // walk of a link with properties, `@prop` reads the row's current
+            // value off the junction that walk crosses.
+            let walked_junction = match (&inner.source, inner_expr) {
+                (IrMultiLinkValueSource::PathSelect(ps), Expr::SubQuery(stmt)) => match (stmt.as_ref(), ps.joins.last()) {
+                    (Stmt::Select(sel), Some(IrPathJoin::Multi { junction_alias, .. })) => match &sel.result {
+                        Expr::Path(p) if p.partial => match p.steps.as_slice() {
+                            [ast::PathStep::Name(link)] => Self::resolve_multilink(td, link)
+                                .and_then(|m| m.through.clone())
+                                .map(|through| (through, junction_alias.clone())),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
 
             let Some(through) = through_td else {
                 return Err(self.type_err(
@@ -7155,8 +7173,15 @@ impl<'a> Compiler<'a> {
                     .compexpr
                     .as_ref()
                     .ok_or_else(|| self.type_err(&format!("link property '{prop_name}' must be assigned a value")))?;
-                let ir_expr = self.compile_expr(value_expr, td, alias)?;
-                inner.link_props.push((prop.name.clone(), ir_expr));
+                let scoped = walked_junction.is_some();
+                if scoped {
+                    self.link_prop_scope.push(walked_junction.clone());
+                }
+                let ir_expr = self.compile_expr(value_expr, td, alias);
+                if scoped {
+                    self.link_prop_scope.pop();
+                }
+                inner.link_props.push((prop.name.clone(), ir_expr?));
             }
             return Ok(inner);
         }
