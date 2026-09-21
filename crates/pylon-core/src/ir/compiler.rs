@@ -6194,6 +6194,65 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// `.teams { owning := … }.owning` — a walk, and a pointer its shape
+    /// declares read back off each row it lands on. `None` for anything
+    /// else, including a field the shape does not compute.
+    fn compile_shape_field_select(
+        &mut self,
+        expr: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<IrPathSelect>, PyQLError> {
+        let Expr::FieldAccess { expr: inner, field } = expr else {
+            return Ok(None);
+        };
+        let Expr::Shape(sh) = inner.as_ref() else {
+            return Ok(None);
+        };
+        let Some(Expr::Path(base)) = sh.expr.as_ref() else {
+            return Ok(None);
+        };
+        let Some(value) = sh
+            .elements
+            .iter()
+            .find(|el| matches!(el.path.steps.as_slice(), [ast::PathStep::Name(n)] if n == field))
+            .and_then(|el| el.compexpr.clone())
+        else {
+            return Ok(None);
+        };
+        let (rooted, correlate) = if base.partial {
+            let Some((td, alias)) = ctx else {
+                return Ok(None);
+            };
+            let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+            steps.extend(base.steps.iter().cloned());
+            (ast::Path { steps, partial: false }, Some(alias.to_string()))
+        } else if base.steps.len() > 1 {
+            (base.clone(), None)
+        } else {
+            return Ok(None);
+        };
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(rooted.clone()),
+            filter: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+            lock: None,
+        };
+        let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
+        if let Some(alias) = correlate {
+            Self::correlate_path_select(&mut ps, &alias);
+        }
+        let IrPathResult::Object { alias, type_name, .. } = &ps.result else {
+            return Err(self.type_err(&format!("'{field}' is read off a walk that lands on a value, which has no shape")));
+        };
+        let (alias, type_name) = (alias.clone(), type_name.clone());
+        let td = self.resolve_type(&type_name)?;
+        let value = self.compile_expr(&value, td, &alias)?;
+        ps.result = IrPathResult::Scalar(value, None);
+        Ok(Some(ps))
+    }
+
     /// `l.addon.id` — an absolute walk that lands on a property, so it yields
     /// values rather than objects.
     fn is_scalar_walk(&self, expr: &Expr) -> bool {
@@ -10195,6 +10254,50 @@ impl<'a> Compiler<'a> {
                 // the junction/FK table (`.multilink` isn't an ordinary scalar
                 // path). Free: count(TypeName) / count((select TypeName ...))
                 // resolves the arg as a schema type reference or subquery.
+                if f.args.len() == 1
+                    && f.kwargs.is_empty()
+                    && let Some(mut ps) = self.compile_shape_field_select(&f.args[0], ctx)?
+                {
+                    let IrPathResult::Scalar(column, _) = ps.result else {
+                        return Err(self.type_err("a shape's pointer read off a walk is a value"));
+                    };
+                    let ns = f.module.as_deref().unwrap_or("std");
+                    let aggregate = crate::stdlib::lookup(ns, &f.name).into_iter().find_map(|d| match &d.impl_strategy {
+                        crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
+                        _ => None,
+                    });
+                    let Some(sql_name) = aggregate else {
+                        return Err(self.type_err(&format!(
+                            "'{}' over a shape's pointer read off a walk needs an aggregate",
+                            f.name
+                        )));
+                    };
+                    // Over no rows SQL's aggregates give NULL where the upstream engine's give
+                    // the empty set's own value.
+                    let over_nothing = match f.name.as_str() {
+                        "any" => Some(IrLiteral::Bool(false)),
+                        "all" => Some(IrLiteral::Bool(true)),
+                        "sum" => Some(IrLiteral::Int(0)),
+                        _ => None,
+                    };
+                    let aggregate = IrExpr::FunctionCall(IrFunctionCall {
+                        schema: None,
+                        name: sql_name,
+                        args: vec![column],
+                        sql_template: None,
+                    });
+                    ps.result = IrPathResult::Scalar(aggregate, None);
+                    let subquery = IrExpr::PathSubquery(Box::new(ps));
+                    return Ok(match over_nothing {
+                        Some(value) => IrExpr::FunctionCall(IrFunctionCall {
+                            schema: None,
+                            name: "coalesce".to_string(),
+                            args: vec![subquery, IrExpr::Literal(value)],
+                            sql_template: None,
+                        }),
+                        None => subquery,
+                    });
+                }
                 if f.args.len() == 1 {
                     let arg = &f.args[0];
                     // `count(a intersect b)` counts what the operation yields.
@@ -10616,6 +10719,9 @@ impl<'a> Compiler<'a> {
                         self.type_err(&format!("{field} is not a member of {}", named_tuple_type_str(fields)))
                     })?;
                     return self.compile_expr_ctx(val, ctx);
+                }
+                if let Some(ps) = self.compile_shape_field_select(expr, ctx)? {
+                    return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps)))));
                 }
                 // `(select .emails filter .primary limit 1).address` — the
                 // field chain is spliced onto the sub-select's own path so
