@@ -1899,6 +1899,19 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
             pointers: prepend_type(nodes),
         };
     }
+    // A set of objects keeps its rows' own shape, as it does on a schema
+    // shape; described as a scalar, each row hydrates as a bare tuple.
+    if let IrExpr::ArrayFromSelect(source) = expr
+        && matches!(
+            source.as_ref(),
+            IrArraySource::ObjectSelect(_)
+                | IrArraySource::ObjectFunction(_)
+                | IrArraySource::PathSelect(_)
+                | IrArraySource::Group(_)
+        )
+    {
+        return expr_shape_node(name, position, expr);
+    }
     match enum_type_of_shape_expr(expr) {
         Some(qualified) => qualified.shape_node(name.to_string(), position),
         None => ShapeNode::Scalar {
