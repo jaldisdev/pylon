@@ -638,3 +638,32 @@ async fn an_object_computed_guarded_by_a_condition_keeps_its_shape() {
         assert_eq!(text_fields(first, 1), expected, "under `if {condition}`");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_computed_read_off_a_binding_keeps_its_own_bindings_on_that_row() {
+    // `t.label` inside a shape over Org: the computed's own `with` reads the
+    // Team `t` names, not the Org the shape is written on.
+    let module = unique_module("live_backlinks_binding_computed");
+    let mut schema = backlinks_schema(&module);
+    let team = schema.types.iter_mut().find(|t| t.name == "Team").expect("Team");
+    team.computed = vec![pylon_core::schema::ComputedDescriptor {
+        name: "label".into(),
+        expression: "(with org_name := .org.name select org_name ++ '!')".into(),
+        return_type: Some("text".into()),
+    }];
+    let pool = test_pool().await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    seed_teams(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "with t := (select {module}::Team filter .name = 'Alpha' limit 1) \
+             select {module}::Org {{ r := t.label }} filter .name = 'NoTeam'"
+        ),
+    )
+    .await;
+    assert_eq!(text_fields(&found, 1), vec![Some("HasTeam!".to_string())]);
+}
