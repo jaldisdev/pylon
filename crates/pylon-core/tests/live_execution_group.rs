@@ -85,6 +85,17 @@ fn bool_prop(name: &str) -> PropertyDescriptor {
     p
 }
 
+/// `Employee` plus a `Team` whose `members` multi-link reaches it, so a group
+/// can be written over a *walk* (`group t.members by .department`) rather than
+/// over the type itself.
+fn team_schema(module: &str) -> SchemaDescriptor {
+    let mut sd = employee_schema(module);
+    let mut team = ty("Team", module, vec![id_prop(), text_prop("name")]);
+    team.multilinks = vec![multilink("members", &format!("{module}::Employee"))];
+    sd.types.push(team);
+    sd
+}
+
 fn employee_schema(module: &str) -> SchemaDescriptor {
     let employee = ty(
         "Employee",
@@ -378,5 +389,61 @@ async fn group_with_no_explicit_shape_defaults_to_id_only() {
         matches!(&el_fields[1], DecodedValue::Uuid(_)),
         "expected id to be a Uuid, got {:?}",
         el_fields[1]
+    );
+}
+
+/// A group whose subject is a walk rather than a type name. The steps used to
+/// be joined with `::` and looked up as a type, so `group t.members by …`
+/// reported an unknown type `t::members`. Grouping the landing type without
+/// narrowing to the walked rows would be the other way to get this wrong —
+/// hence two teams, and an assertion that only one team's members are counted.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn group_over_a_walk_covers_only_the_rows_the_walk_reaches() {
+    let module = unique_module("live_group_walk");
+    let sd = team_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for (name, dept) in [("Ann", "eng"), ("Bo", "eng"), ("Cy", "ops"), ("Di", "legal")] {
+        exec(
+            &pool,
+            &sd,
+            &format!(
+                "insert {module}::Employee {{ name := '{name}', department := '{dept}', age := 30, active := true }}"
+            ),
+        )
+        .await;
+    }
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Team {{ name := 'core', members := (select {module}::Employee filter .department = 'eng') }}"
+        ),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Team {{ name := 'other', members := (select {module}::Employee filter .department = 'legal') }}"
+        ),
+    )
+    .await;
+
+    let rows = group_rows(
+        &pool,
+        &sd,
+        &format!(
+            "with t := (select {module}::Team filter .name = 'core' limit 1) \
+             group t.members by .department"
+        ),
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the walked team's members should be grouped — 'ops' and 'legal' belong to no group here, got {rows:?}"
     );
 }
