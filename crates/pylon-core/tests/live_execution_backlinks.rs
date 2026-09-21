@@ -588,3 +588,28 @@ async fn a_pointer_read_off_a_walks_shape_is_evaluated_per_row() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_second_shape_shapes_what_the_first_one_declared() {
+    let (module, schema, pool) = setup().await;
+    seed_teams(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "select (select {module}::Org filter .name = 'HasTeam') \
+               {{ first := (select .<org[is {module}::Team] order by .name limit 1) }} \
+               {{ first: {{ name }} }}"
+        ),
+    )
+    .await;
+    let [pylon_value::DecodedValue::Composite(org)] = found.as_slice() else {
+        panic!("expected one org, got {found:?}")
+    };
+    let pylon_value::DecodedValue::Array(first) = &org[1] else {
+        panic!("expected the declared pointer's rows, got {:?}", org[1])
+    };
+    assert_eq!(text_fields(first, 1), vec![Some("Alpha".to_string())]);
+}
+
