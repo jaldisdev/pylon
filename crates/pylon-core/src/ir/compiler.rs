@@ -11537,6 +11537,25 @@ impl<'a> Compiler<'a> {
             return Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op, right })));
         }
 
+        // `.emails[is account::Email].email` — an intersection narrows what the
+        // walk continues from. The remaining steps read against the narrowed
+        // type, and because its own table is what they join to, a row of any
+        // other type drops out on its own: the narrowing needs no separate
+        // check.
+        if let Some(ast::PathStep::TypeIntersection(type_ref)) = steps.first() {
+            let narrowed = self.resolve_type(&type_ref.qualified_name())?;
+            let narrowed_qname = format!("{}::{}", narrowed.module, narrowed.name);
+            return self.compile_path_tail_filter(
+                &steps[1..],
+                op,
+                value_expr,
+                flip,
+                &narrowed_qname,
+                jt_alias,
+                jt_tgt_col,
+            );
+        }
+
         let first_name = match steps.first() {
             Some(ast::PathStep::Name(n)) => n.clone(),
             _ => return Err(self.type_err("expected a property or link name in path")),

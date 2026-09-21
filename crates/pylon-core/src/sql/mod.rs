@@ -6839,6 +6839,19 @@ mod tests {
     }
 
     #[test]
+    fn test_an_intersection_narrows_the_rest_of_a_multilink_walk() {
+        // `.posts[is Post].title` — the narrowed type's own table is what the
+        // remaining steps join to, so a row of any other type drops out
+        // without a separate check. Agreed with the upstream engine on real data (1 and 1).
+        let out = compile_and_emit("SELECT Person FILTER any(.posts[is Post].title = $t)");
+        assert!(
+            out.sql.contains(r#""public"."Post""#),
+            "the walk should continue from the narrowed type:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_is_not_negates_the_type_check() {
         // `x IS NOT T` is the upstream engine's own `Expr IS NOT TypeExpr` — the negation of
         // the check, not a comparison against some type `not T`. Counted
