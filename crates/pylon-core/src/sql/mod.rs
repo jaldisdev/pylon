@@ -1121,15 +1121,18 @@ fn emit_cte_prefix(ctes: &[IrCteDef]) -> String {
 /// tree (both sides of any nested `union`), in first-seen order — the SQL
 /// layer needs one consistent column list across every unioned branch, even
 /// when different targets set different (or no) properties.
-fn collect_link_prop_names(vals: &IrMultiLinkValues, names: &mut Vec<String>) {
+pub(crate) fn collect_link_prop_names(vals: &IrMultiLinkValues, names: &mut Vec<String>) {
     for (name, _) in &vals.link_props {
         if !names.contains(name) {
             names.push(name.clone());
         }
     }
-    if let IrMultiLinkValueSource::Union(a, b) = &vals.source {
-        collect_link_prop_names(a, names);
-        collect_link_prop_names(b, names);
+    match &vals.source {
+        IrMultiLinkValueSource::Union(a, b) => {
+            collect_link_prop_names(a, names);
+            collect_link_prop_names(b, names);
+        }
+        _ => {}
     }
 }
 
@@ -1153,11 +1156,19 @@ fn emit_link_prop_cols(vals: &IrMultiLinkValues, prop_names: &[String]) -> Strin
 /// leaf projects all of them so a `union` of heterogeneous branches has a
 /// consistent column list.
 fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String]) -> String {
+    emit_multilink_values_inner(vals, prop_names, true)
+}
+
+/// `bare_cte_ok` is false wherever the result has to be a SELECT in its own
+/// right — a `UNION ALL` operand, or the body of an assert. A CTE reference
+/// otherwise emits just its quoted name, which only works where the caller
+/// aliases it into a FROM.
+fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], bare_cte_ok: bool) -> String {
     if let IrMultiLinkValueSource::Union(a, b) = &vals.source {
         return format!(
             "({}\nUNION ALL\n{})",
-            emit_multilink_values_subquery(a, prop_names),
-            emit_multilink_values_subquery(b, prop_names),
+            emit_multilink_values_inner(a, prop_names, false),
+            emit_multilink_values_inner(b, prop_names, false),
         );
     }
 
@@ -1165,7 +1176,7 @@ fn emit_multilink_values_subquery(vals: &IrMultiLinkValues, prop_names: &[String
 
     match &vals.source {
         IrMultiLinkValueSource::CteRef(name) => {
-            if prop_cols.is_empty() {
+            if prop_cols.is_empty() && bare_cte_ok {
                 // Just the CTE name; will be aliased at the call site.
                 format!("\"{}\"", name)
             } else {
@@ -6847,6 +6858,23 @@ mod tests {
         assert!(
             out.sql.contains(r#""public"."Post""#),
             "the walk should continue from the narrowed type:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_union_of_bindings_emits_selects_not_bare_names() {
+        // A CTE reference normally emits just its quoted name, which works
+        // where the caller aliases it into a FROM. As a `UNION ALL` operand it
+        // has to be a SELECT of its own — `("a" UNION ALL "b")` is not SQL.
+        let out = compile_and_emit_with(
+            "WITH a := (INSERT Post { title := $t1 }), b := (INSERT Post { title := $t2 }) \
+             SELECT (INSERT Person { name := $n, posts := (a UNION b) })",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains(r#"(SELECT "_s"."id" FROM "a" AS "_s")"#),
+            "each union operand should be a select:\n{}",
             out.sql
         );
     }
