@@ -6699,7 +6699,12 @@ impl<'a> Compiler<'a> {
         // cannot pick up a guard meant for this one.
         let pending_guard = self.pending_delete_guard.take();
         let type_name = self.expr_as_type_name(&del.subject)?;
-        let td = self.resolve_type(&type_name)?;
+        // `delete previous` where `previous` is a `with` binding: the binding
+        // names the rows to delete, so it decides the table *and* narrows the
+        // delete to its own rows — exactly as `compile_update` does. Without
+        // the narrowing this would resolve to the type and empty the table.
+        let bound_rows = self.cte_object_type(&type_name);
+        let td = self.resolve_path_root(&type_name)?;
         let alias = self.fresh_alias();
         let target = IrSource {
             poly: None,
@@ -6708,11 +6713,35 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
         };
 
-        let filter = del
+        let declared_filter = del
             .filter
             .as_ref()
             .map(|f| self.compile_expr(f, td, &alias))
             .transpose()?;
+        let filter = match bound_rows {
+            Some(_) => {
+                let membership = IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: alias.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    op: ast::BinOpKind::In,
+                    right: IrExpr::ArrayFromSelect(Box::new(IrArraySource::Select(IrSelect::schema_bound(
+                        IrSource {
+                            poly: None,
+                            type_name: format!("{}::{}", td.module, td.name),
+                            table: format!("@cte:{type_name}"),
+                            alias: self.fresh_alias(),
+                        },
+                        vec![],
+                        None,
+                    )))),
+                }));
+                Some(and_conditions(declared_filter, vec![membership]).expect("membership is present"))
+            }
+            None => declared_filter,
+        };
         let filter = match pending_guard {
             Some(condition) => {
                 let guard = self.compile_expr(&condition, td, &alias)?;

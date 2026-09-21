@@ -290,3 +290,39 @@ async fn a_delete_guarded_by_a_false_condition_removes_nothing() {
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
     assert!(rows.is_empty(), "a true guard must still delete, got {rows:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn deleting_a_binding_removes_only_the_rows_it_names() {
+    // `delete previous` where `previous` is a `with` binding. The binding
+    // decides the table, so resolving it to its type and stopping there would
+    // empty the table instead — which is why this is asserted against the
+    // surviving rows rather than the emitted SQL.
+    let module = unique_module("live_delete_binding");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for (name, age) in [("Alice", 30), ("Bob", 40), ("Kid", 10)] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := {age} }}"),
+        )
+        .await;
+    }
+
+    exec(
+        &pool,
+        &sd,
+        &format!("with doomed := (select {module}::Person filter .age < 18) delete doomed"),
+    )
+    .await;
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "only the rows the binding names should go, got {rows:?}"
+    );
+}
