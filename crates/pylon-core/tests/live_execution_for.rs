@@ -384,3 +384,39 @@ async fn set_operations_run_over_their_elements() {
         assert_eq!(got, expected, "{pyql}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn updating_the_loop_variable_touches_only_the_iterated_rows() {
+    let module = unique_module("live_for_upd");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for (name, age) in [("Ann", 10), ("Bo", 20), ("Cy", 30)] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := {age} }}"),
+        )
+        .await;
+    }
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with young := (select {module}::Person filter .age < 15) \
+             for p in young union (update p set {{ name := 'TOUCHED' }})"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }} order by .name")).await;
+    let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 1)).to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["Bo".to_string(), "Cy".to_string(), "TOUCHED".to_string()],
+        "only the iterated row should change"
+    );
+}
