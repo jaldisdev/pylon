@@ -559,3 +559,32 @@ async fn a_union_of_walks_yields_the_values_of_both() {
     assert_eq!(names, vec!["Alpha", "Beta", "Mo"]);
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_pointer_read_off_a_walks_shape_is_evaluated_per_row() {
+    let (module, schema, pool) = setup().await;
+    seed_teams(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "select {module}::Org {{ name, has_alpha := any(.<org[is {module}::Team] {{ alpha := .name = 'Alpha' }}.alpha) }} \
+             order by .name"
+        ),
+    )
+    .await;
+    let flags: Vec<_> = found
+        .iter()
+        .map(|row| match row {
+            pylon_value::DecodedValue::Composite(fields) => fields.get(2).cloned(),
+            other => panic!("expected a Composite row, got {other:?}"),
+        })
+        .collect();
+    // An org with no teams has nothing to be true of: `any` of nothing is false.
+    assert_eq!(
+        flags,
+        vec![Some(pylon_value::DecodedValue::Bool(true)), Some(pylon_value::DecodedValue::Bool(false))]
+    );
+}
+
