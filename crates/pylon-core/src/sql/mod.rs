@@ -876,13 +876,13 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         parts.push(format!("\"{}__clr_{}\" AS (\n{}\n)", name, i, del));
     }
     for (i, app) in upd.multi_link_appends.iter().enumerate() {
-        parts.push(emit_ml_append_cte(app, &ids_name, &format!("{}__ml_add_{}", name, i)));
+        parts.push(emit_ml_append_cte(app, &ids_name, &upd.target.alias, &format!("{}__ml_add_{}", name, i)));
     }
     for (i, rem) in upd.multi_link_removals.iter().enumerate() {
         parts.push(emit_ml_remove_cte(rem, &ids_name, &format!("{}__ml_rm_{}", name, i)));
     }
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
-        parts.push(emit_ml_append_cte(rep, &ids_name, &format!("{}__ml_rep_{}", name, i)));
+        parts.push(emit_ml_append_cte(rep, &ids_name, &upd.target.alias, &format!("{}__ml_rep_{}", name, i)));
     }
 
     parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
@@ -910,7 +910,7 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
     parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, insert_sql));
 
     for (i, app) in ins.multi_link_appends.iter().enumerate() {
-        parts.push(emit_ml_append_cte(app, &ids_name, &format!("{}__ml_add_{}", name, i)));
+        parts.push(emit_ml_append_cte(app, &ids_name, &ins.target.alias, &format!("{}__ml_add_{}", name, i)));
     }
 
     parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
@@ -960,7 +960,7 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
             sql.push_str("\nRETURNING *");
             parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
             for (i, append) in ins.multi_link_appends.iter().enumerate() {
-                parts.push(emit_ml_append_cte(append, &ids_name, &format!("{}__ml_add_{}", name, i)));
+                parts.push(emit_ml_append_cte(append, &ids_name, &ins.target.alias, &format!("{}__ml_add_{}", name, i)));
             }
         }
         IrStmt::Update(upd) => {
@@ -1080,7 +1080,7 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
             sql.push_str("\nRETURNING *");
             parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
             for (i, append) in ins.multi_link_appends.iter().enumerate() {
-                parts.push(emit_ml_append_cte(append, &ids_name, &format!("{}__ml_add_{}", name, i)));
+                parts.push(emit_ml_append_cte(append, &ids_name, &ins.target.alias, &format!("{}__ml_add_{}", name, i)));
             }
         }
         // Unreachable: only a mutating body is routed here.
@@ -1529,7 +1529,9 @@ fn emit_for_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_na
     )
 }
 
-fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
+/// `ids_alias` is the name the rows being written go by inside the value:
+/// a walk off the row (`+= (select .notifications …)`) is correlated to it.
+fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, ids_alias: &str, cte_name: &str) -> String {
     let mut prop_names = vec![];
     collect_link_prop_names(&mutation.values, &mut prop_names);
     let vals_ref = emit_multilink_values_subquery(&mutation.values, &prop_names);
@@ -1576,15 +1578,20 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: 
         )
     };
 
+    // A subquery value may read the row it is written for, so it joins
+    // laterally; a bare CTE name cannot take LATERAL.
+    let lateral = if vals_ref.starts_with('(') { "LATERAL " } else { "" };
     let ins = format!(
-        "INSERT INTO {} ({}, {}{})\nSELECT \"{}\".\"id\", \"_v\".\"id\"{} FROM \"{}\" CROSS JOIN {} AS \"_v\"\n{}\nRETURNING {}, {}",
+        "INSERT INTO {} ({}, {}{})\nSELECT {}.\"id\", \"_v\".\"id\"{} FROM \"{}\" AS {} CROSS JOIN {}{} AS \"_v\"\n{}\nRETURNING {}, {}",
         qn(&mutation.module, &mutation.junction_table),
         qi(&mutation.source_col),
         qi(&mutation.target_col),
         extra_cols,
-        ids_name,
+        qi(ids_alias),
         extra_select,
         ids_name,
+        qi(ids_alias),
+        lateral,
         vals_ref,
         conflict_clause,
         qi(&mutation.source_col),
@@ -3529,7 +3536,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Junction appends (`+=`).
     for (i, app) in upd.multi_link_appends.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(app, "_ids", &format!("_ml_add_{}", i)));
+        cte_parts.push(emit_ml_append_cte(app, "_ids", &upd.target.alias, &format!("_ml_add_{}", i)));
     }
 
     // Junction removals (`-=`).
@@ -3539,7 +3546,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Junction inserts for replace (`:= expr` — insert after the clear).
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(rep, "_ids", &format!("_ml_rep_{}", i)));
+        cte_parts.push(emit_ml_append_cte(rep, "_ids", &upd.target.alias, &format!("_ml_rep_{}", i)));
     }
 
     // Enqueue CTEs (source is _ids which has all columns including id).
