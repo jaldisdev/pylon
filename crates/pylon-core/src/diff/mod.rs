@@ -1684,6 +1684,17 @@ fn pg_schema(module: &str) -> String {
     }
 }
 
+/// Whether `pg_type` names one of the schema's own enums (or an array of one).
+/// PostgreSQL will not cast between two enum types directly, so such a column
+/// has to be converted through `text`.
+fn enum_target(schema: &SchemaDescriptor, pg_type: &str) -> bool {
+    let bare = pg_type.strip_suffix("[]").unwrap_or(pg_type);
+    schema
+        .enums
+        .iter()
+        .any(|e| bare == qn(&e.module, &e.name) || bare == qi(&e.name))
+}
+
 fn qn(schema: &str, name: &str) -> String {
     format!("{}.{}", pg_schema(schema), qi(name))
 }
@@ -3203,7 +3214,7 @@ fn emit_column_diff(
     // ── Type changes on existing columns ──────────────────────────────────────
     // e.g. a property gaining a registered custom scalar's own DOMAIN (see
     // PropertyDescriptor.column_type), or any other base-type change.
-    let type_changes: Vec<(&str, &str)> = td
+    let type_changes: Vec<(&str, &str, bool)> = td
         .properties
         .iter()
         .filter_map(|p| {
@@ -3212,7 +3223,11 @@ fn emit_column_diff(
                 return None;
             }
             let target_type = col_type_str(p);
-            pg_type_changed(target_type, &cur.pg_type).then_some((p.name.as_str(), target_type))
+            pg_type_changed(target_type, &cur.pg_type).then_some((
+                p.name.as_str(),
+                target_type,
+                cur.column_default.is_some(),
+            ))
         })
         .collect();
     if !type_changes.is_empty() {
@@ -3227,7 +3242,7 @@ fn emit_column_diff(
         for (m, n, _) in &affected_views {
             push_tx(ops, format!("DROP VIEW IF EXISTS {};", qn(m, n)));
         }
-        for (col, target_type) in &type_changes {
+        for (col, target_type, _has_default) in &type_changes {
             // The conversion expression is a placeholder, not a blind cast —
             // an interactive caller offers `default_expr` (identical to what
             // this used to emit unconditionally) and lets the user override
@@ -3236,7 +3251,16 @@ fn emit_column_diff(
             // `required_input` still get the exact same default behavior via
             // `RequiredInput::default_expr`-as-fallback at the CLI layer.
             let placeholder = format!("cast_expr__{col}");
-            let default_expr = format!("{}::{target_type}", qi(col));
+            // PostgreSQL has no enum-to-enum cast, so a column moving between
+            // two enums (a renamed one, most often) has to go through `text`.
+            // Only for an enum target: a numeric conversion routed through
+            // text would change what it accepts.
+            let default_expr = if enum_target(schema, target_type) {
+                let text_type = if target_type.ends_with("[]") { "text[]" } else { "text" };
+                format!("{}::{text_type}::{target_type}", qi(col))
+            } else {
+                format!("{}::{target_type}", qi(col))
+            };
             required_input.push(RequiredInput {
                 placeholder: placeholder.clone(),
                 prompt: format!(
@@ -4676,6 +4700,61 @@ mod tests {
             "got:\n{joined}"
         );
     }
+
+    #[test]
+    fn test_a_column_moving_between_enums_converts_through_text() {
+        // PostgreSQL has no enum-to-enum cast, so the direct one the diff used
+        // to emit aborted the migration outright: `cannot cast type "Method"[]
+        // to "HttpMethod"[]`. Renaming an enum is the ordinary way to reach
+        // this.
+        let mut td = simple_type("default", "Person", "Person");
+        td.properties.push(prop("verb", "\"public\".\"HttpMethod\"", true));
+        let schema = SchemaDescriptor {
+            types: vec![td],
+            enums: vec![crate::schema::EnumDescriptor {
+                name: "HttpMethod".into(),
+                module: "default".into(),
+                members: vec!["GET".into(), "POST".into()],
+            }],
+            ..Default::default()
+        };
+        let state = DbState {
+            schemas: vec!["default".into()],
+            tables: vec![DbTable {
+                schema: "default".into(),
+                name: "Person".into(),
+                columns: vec![
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: Some("uuidv7()".into()),
+                    },
+                    DbColumn {
+                        name: "verb".into(),
+                        pg_type: "\"public\".\"Method\"".into(),
+                        nullable: true,
+                        is_generated: false,
+                        column_default: None,
+                    },
+                ],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![],
+                triggers: vec![],
+            }],
+            enums: vec![],
+            domains: vec![],
+            ..DbState::default()
+        };
+        let joined = diff_schema(&schema, &state).unwrap().join("\n");
+        assert!(
+            joined.contains(r#"USING "verb"::text::"public"."HttpMethod";"#),
+            "the conversion should go through text:\n{joined}"
+        );
+    }
+
 
     #[test]
     fn test_property_type_change_surfaces_a_required_cast_expression_step() {
