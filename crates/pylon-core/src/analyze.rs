@@ -98,7 +98,8 @@ pub fn collect_shape_path_aliases(stmt: &IrStmt) -> Vec<ShapePathAlias> {
         | IrStmt::For(_)
         | IrStmt::FunctionSelect(_)
         | IrStmt::VectorSearch(_)
-        | IrStmt::FtsSearch(_) => {}
+        | IrStmt::FtsSearch(_)
+        | IrStmt::ScalarUnion(_) => {}
     }
     out
 }

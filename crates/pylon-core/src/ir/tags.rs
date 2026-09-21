@@ -74,6 +74,11 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
     match stmt {
         IrStmt::Select(sel) => collect_select(sel, tags),
         IrStmt::PathSelect(ps) => collect_path_select(ps, tags),
+        IrStmt::ScalarUnion(branches) => {
+            for branch in branches {
+                collect_stmt(branch, tags);
+            }
+        }
         IrStmt::Insert(ins) => {
             tags.push(tag_for(&ins.target));
             for (_, e) in &ins.assignments {

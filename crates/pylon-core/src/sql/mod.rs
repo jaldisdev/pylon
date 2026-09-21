@@ -126,6 +126,16 @@ pub fn emit(ir: &IrOutput) -> SqlOutput {
                 IrStmt::FunctionSelect(sel) => emit_function_select(sel),
                 IrStmt::VectorSearch(vs) => emit_vector_search(vs),
                 IrStmt::FtsSearch(fs) => emit_fts_search(fs),
+                IrStmt::ScalarUnion(branches) => SqlOutput {
+                    sql: emit_scalar_union(branches),
+                    shape: ShapeDescriptor {
+                        root: ShapeNode::Scalar {
+                            name: String::new(),
+                            position: 0,
+                        },
+                    },
+                    inference_plan: None,
+                },
                 IrStmt::Update(_) | IrStmt::For(_) => unreachable!(),
             };
             if !ir.ctes.is_empty() {
@@ -502,8 +512,23 @@ fn nested_cte_from(ctes: &[IrCteDef], reading: &str, lead: &str) -> String {
     format!("{lead}FROM {}", joined.join(", "))
 }
 
+/// Each operand's rows read through the bare `v` every scalar statement
+/// exposes as a CTE source, so operands of different kinds line up.
+fn emit_scalar_union(branches: &[IrStmt]) -> String {
+    let operands: Vec<String> = branches
+        .iter()
+        .enumerate()
+        .map(|(i, branch)| format!("SELECT \"v\" FROM (\n{}\n) AS \"_u{i}\"", emit_dml_as_cte_source(branch)))
+        .collect();
+    format!(
+        "SELECT ROW(v) AS result, v FROM (\n{}\n) AS _scalar",
+        operands.join("\nUNION ALL\n")
+    )
+}
+
 fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
     match stmt {
+        IrStmt::ScalarUnion(branches) => format!("    {}", emit_scalar_union(branches)),
         IrStmt::Insert(ins) => {
             let rewrite_cols: std::collections::HashSet<&str> =
                 ins.rewrites.iter().map(|r| r.column.as_str()).collect();

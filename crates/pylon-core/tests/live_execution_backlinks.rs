@@ -514,3 +514,48 @@ async fn a_bare_multilink_reads_as_the_set_of_rows_on_its_far_side() {
     };
     assert_eq!(fields.get(1), Some(&pylon_value::DecodedValue::Str("Alice".to_string())));
 }
+
+async fn rows(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<pylon_value::DecodedValue> {
+    let compiled = query::compile(pyql, schema).unwrap();
+    pool.query_typed(&compiled.sql, &[], &pylon_pgcon::ExtensionOids::default())
+        .await
+        .unwrap()
+}
+
+async fn seed_teams(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, module: &str) {
+    for stmt in [
+        format!("insert {module}::Org {{ name := 'HasTeam' }}"),
+        format!("insert {module}::Org {{ name := 'NoTeam' }}"),
+        format!("insert {module}::Team {{ name := 'Beta', org := (select {module}::Org filter .name = 'HasTeam') }}"),
+        format!("insert {module}::Team {{ name := 'Alpha', org := (select {module}::Org filter .name = 'HasTeam') }}"),
+        format!("insert {module}::Member {{ name := 'Mo', team := (select {module}::Team filter .name = 'Alpha') }}"),
+    ] {
+        let compiled = query::compile(&stmt, schema).unwrap();
+        pool.execute_typed(&compiled.sql, &[]).await.unwrap();
+    }
+}
+
+fn text_fields(rows: &[pylon_value::DecodedValue], position: usize) -> Vec<Option<String>> {
+    rows.iter()
+        .map(|row| match row {
+            pylon_value::DecodedValue::Composite(fields) => match fields.get(position) {
+                Some(pylon_value::DecodedValue::Str(s)) => Some(s.clone()),
+                _ => None,
+            },
+            other => panic!("expected a Composite row, got {other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_union_of_walks_yields_the_values_of_both() {
+    let (module, schema, pool) = setup().await;
+    seed_teams(&pool, &schema, &module).await;
+
+    let found = rows(&pool, &schema, &format!("select {module}::Team.name union {module}::Member.name")).await;
+    let mut names: Vec<_> = text_fields(&found, 0).into_iter().flatten().collect();
+    names.sort();
+    assert_eq!(names, vec!["Alpha", "Beta", "Mo"]);
+}
+
