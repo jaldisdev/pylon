@@ -2258,6 +2258,52 @@ impl<'a> Compiler<'a> {
                     other => (false, other),
                 };
 
+                // `select assert_distinct(f(…)) { … }` — the function's rows,
+                // with the assert run once over all of them: the select's own
+                // filter narrows what comes back, not what is checked.
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::FunctionCall(assert)) = &sh.expr
+                    && assert.module.as_deref().is_none_or(|m| m == "std")
+                    && matches!(assert.name.as_str(), "assert_exists" | "assert_distinct")
+                    && let [Expr::FunctionCall(inner)] = assert.args.as_slice()
+                    && let Some(mut fs) = self.try_compile_fn_object_select(inner, &sh.elements, s, distinct)?
+                {
+                    let message = self.assert_message(assert, None)?;
+                    let unchecked = ast::SelectStmt {
+                        result: Expr::FunctionCall(inner.clone()),
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        lock: None,
+                    };
+                    let every_row = self
+                        .try_compile_fn_object_select(inner, &[], &unchecked, false)?
+                        .ok_or_else(|| self.type_err("assert subject is not an object-returning function"))?;
+                    let checked = IrExpr::FunctionCall(IrFunctionCall {
+                        schema: Some("_pylon".to_string()),
+                        name: assert.name.clone(),
+                        args: std::iter::once(IrExpr::ArrayFromSelect(Box::new(IrArraySource::StmtColumn {
+                            stmt: Box::new(IrStmt::FunctionSelect(every_row)),
+                            column: "id".to_string(),
+                        })))
+                        .chain(message)
+                        .collect(),
+                        sql_template: None,
+                    });
+                    let check = IrExpr::BinOp(Box::new(IrBinOp {
+                        left: IrExpr::FunctionCall(IrFunctionCall {
+                            schema: None,
+                            name: "cardinality".to_string(),
+                            args: vec![checked],
+                            sql_template: None,
+                        }),
+                        op: ast::BinOpKind::Ge,
+                        right: IrExpr::Literal(IrLiteral::Int(0)),
+                    }));
+                    fs.filter = and_conditions(fs.filter, vec![check]);
+                    return Ok(IrStmt::FunctionSelect(fs));
+                }
                 if let Some(flattened) = flatten_shape_subject(result) {
                     let mut flat = s.clone();
                     flat.result = match distinct {
