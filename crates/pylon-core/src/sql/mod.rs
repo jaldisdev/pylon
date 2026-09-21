@@ -6825,6 +6825,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_backlink_tail_walks_past_the_first_step() {
+        // `.<link[is T].multilink.prop` — the tail after a backlink was read
+        // one arity at a time (property, or link-then-property), so anything
+        // crossing a multi-link had no single column to read and was refused.
+        // Counted against the migrated data it agreed with the upstream engine: 4 and 4.
+        let out = compile_and_emit("SELECT Post FILTER any(.<posts[is Person].posts.title = $t)");
+        assert!(
+            out.sql.contains(r#""public"."Person.posts""#),
+            "the tail should walk the multi-link's junction:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_is_not_negates_the_type_check() {
         // `x IS NOT T` is the upstream engine's own `Expr IS NOT TypeExpr` — the negation of
         // the check, not a comparison against some type `not T`. Counted

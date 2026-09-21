@@ -11213,7 +11213,9 @@ impl<'a> Compiler<'a> {
                 };
                 return Ok(Some(Self::apply_comparison(col, comparison)));
             }
-            return Err(self.field_err(pointer_name, target_qname));
+            // Not a property or a link: a multi-link has no single column to
+            // read, so it falls through to the general tail walk below, which
+            // reports the same error for a name that is none of the three.
         }
 
         // Two forward steps: link then property (single FK join)
@@ -11271,10 +11273,16 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        Err(PyQLError::Type(PyQLTypeError {
-            message: "backlink path tail is unsupported (expected a property name)".to_string(),
-            position: Position { line: 0, col: 0 },
-        }))
+        // Anything else is an ordinary path from the backlink's target type, so
+        // it is compiled as one rather than enumerated arity by arity. The two
+        // cases above stay because each reads a single column; a step that
+        // crosses a multi-link has none to read.
+        let tail = ast::Path {
+            steps: steps.to_vec(),
+            partial: true,
+        };
+        let walked = self.compile_path(&tail, target_td, t_alias)?;
+        Ok(Some(Self::apply_comparison(walked, comparison)))
     }
 
     /// Apply an optional comparison to a column ref, defaulting to IS NOT NULL.
@@ -11282,6 +11290,27 @@ impl<'a> Compiler<'a> {
         match comparison {
             Some((op, val, flip)) => {
                 let (l, r) = if flip { (val, col) } else { (col, val) };
+                // A walk that crosses a multi-link stands for a *set*, which
+                // an equality holds against when any element matches — the
+                // same reading `compile_expr_ctx` gives one anywhere else.
+                if matches!(op, ast::BinOpKind::Eq | ast::BinOpKind::Ne)
+                    && matches!(l, IrExpr::ArrayFromSelect(_)) != matches!(r, IrExpr::ArrayFromSelect(_))
+                {
+                    let (value, set) = if matches!(r, IrExpr::ArrayFromSelect(_)) { (l, r) } else { (r, l) };
+                    let membership = IrExpr::BinOp(Box::new(IrBinOp {
+                        left: value,
+                        op: ast::BinOpKind::In,
+                        right: set,
+                    }));
+                    return if matches!(op, ast::BinOpKind::Ne) {
+                        IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                            op: ast::UnaryOpKind::Not,
+                            operand: membership,
+                        }))
+                    } else {
+                        membership
+                    };
+                }
                 IrExpr::BinOp(Box::new(IrBinOp { left: l, op, right: r }))
             }
             None => ir_is_not_null(col),
