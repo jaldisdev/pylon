@@ -143,15 +143,62 @@ class TestCompileAndBind:
 
         assert params == [30, 'Alice']
 
-    def test_missing_param_raises_interface_error(self):
+    def test_missing_param_names_what_was_expected_and_what_was_missed(self):
         from pylon.client import _compile_and_bind
+        from pylon.exceptions import MissingParameterError
 
         compiled = self._make_compiled('SELECT $1', param_names=['name'])
         with (
             patch('pylon.query.compile', return_value=compiled),
-            pytest.raises(InterfaceError, match='Missing query parameter'),
+            pytest.raises(MissingParameterError, match=r"expected \{'name'\} arguments, got nothing, missed \{'name'\}"),
         ):
             _compile_and_bind('select $name', {})
+
+    def test_an_argument_the_query_does_not_declare_is_refused(self):
+        # The upstream engine raises rather than ignoring it, and a dropped argument hides the
+        # bug it usually is — a condition edited out, or a renamed parameter.
+        from pylon.client import _compile_and_bind
+        from pylon.exceptions import UnknownParameterError
+
+        compiled = self._make_compiled('SELECT $1', param_names=['name'])
+        with (
+            patch('pylon.query.compile', return_value=compiled),
+            pytest.raises(UnknownParameterError, match=r"extra \{'other'\}"),
+        ):
+            _compile_and_bind('select $name', {'name': 'Alice', 'other': 1})
+
+    def test_a_query_with_no_parameters_takes_no_arguments(self):
+        from pylon.client import _compile_and_bind
+        from pylon.exceptions import UnknownParameterError
+
+        compiled = self._make_compiled('SELECT 1', param_names=[])
+        with (
+            patch('pylon.query.compile', return_value=compiled),
+            pytest.raises(UnknownParameterError, match='expected no named arguments'),
+        ):
+            _compile_and_bind('select 1', {'other': 1})
+
+    def test_a_scripts_arguments_belong_to_the_whole_script(self):
+        # Each statement is sent on its own, so a statement must not report a
+        # sibling statement's parameter as an extra argument.
+        from pylon.client import _bind_positional, _declared_params
+
+        first = self._make_compiled('DELETE ...', param_names=['credentials'])
+        second = self._make_compiled('DELETE ...', param_names=['devices'])
+        script = _declared_params(first) | _declared_params(second)
+        kwargs = {'credentials': [1], 'devices': [2]}
+
+        assert _bind_positional(first, kwargs, declared=script) == [[1]]
+        assert _bind_positional(second, kwargs, declared=script) == [[2]]
+
+    def test_a_session_global_is_not_an_argument_the_caller_owes(self):
+        from pylon.client import _compile_and_bind
+
+        compiled = self._make_compiled('SELECT $1, $2', param_names=['name', '__global__actor'])
+        with patch('pylon.query.compile', return_value=compiled):
+            _, params = _compile_and_bind('q', {'name': 'Alice'}, {'actor': 'a'})
+
+        assert params == ['Alice', 'a']
 
     def test_config_options_thread_allow_user_specified_id(self):
         from pylon.client import _compile_and_bind

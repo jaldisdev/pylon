@@ -31,12 +31,14 @@ from pylon.exceptions import (
     ClientConnectionClosedError,
     InterfaceError,
     InternalServerError,
+    MissingParameterError,
     NoDataError,
     PylonError,
     ResultCardinalityError,
     Rollback,
     TransactionDeadlockError,
     TransactionSerializationError,
+    UnknownParameterError,
 )
 
 if TYPE_CHECKING:
@@ -426,12 +428,21 @@ class Client:
         )
         rows: list[Any] = []
         last = statements[-1]
+        # The arguments are the script's, not any one statement's — checked
+        # once against every parameter it declares, so a statement does not
+        # report its neighbour's parameter as an extra argument.
+        script_params: set[str] = set()
+        for compiled in statements:
+            script_params |= _declared_params(compiled)
+        _check_arguments(script_params, kwargs)
         async for tx in self.transaction():
             async with tx:
                 for compiled in statements:
                     if self._warnings:
                         _emit_warnings(compiled)
-                    rows = await tx._run_compiled(compiled, _bind_params(compiled, kwargs, self._globals))
+                    rows = await tx._run_compiled(
+                        compiled, _bind_positional(compiled, kwargs, self._globals, declared=script_params)
+                    )
         return _hydrate(rows, last)
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
@@ -862,17 +873,7 @@ async def _compile_and_resolve(
     plan = compiled.inference_plan
     if plan is None:
         # Normal path — bind params from kwargs/globals the standard way.
-        try:
-            params: list[Any] = []
-            for name in compiled.param_names:
-                if name.startswith('__global__'):
-                    qname = name[len('__global__') :]
-                    params.append((globals_ or {}).get(qname))
-                else:
-                    params.append(kwargs[name])
-        except KeyError as exc:
-            raise InterfaceError(f'Missing query parameter: {exc}') from exc
-        return compiled, params
+        return compiled, _bind_positional(compiled, kwargs, globals_)
 
     query_text = _resolve_query_text(plan, kwargs)
 
@@ -966,6 +967,55 @@ def _normalize_pyql_source(pyql: Any, kwargs: dict[str, Any]) -> tuple[str, dict
     return text, {**kwargs, **extra_params}
 
 
+def _check_arguments(expected: set[str], kwargs: dict[str, Any]) -> None:
+    """Refuse arguments the query does not declare, and vice versa.
+
+    the upstream engine rejects a stray argument rather than ignoring it, and a silently
+    dropped one hides what it usually is: a condition that was edited out, or
+    a name that no longer matches. The wording is the upstream engine's own, from
+    `_make_missing_args_error_message` in its `object.pyx` codec, so a message
+    carried over from an older log or test still reads the same.
+    """
+    passed = set(kwargs)
+    if not expected:
+        if passed:
+            raise UnknownParameterError('expected no named arguments')
+    elif expected != passed:
+        missed = expected - passed
+        extra = passed - expected
+        message = f'expected {expected} arguments, got {passed if passed else "nothing"}'
+        if missed:
+            message += f', missed {missed}'
+        if extra:
+            message += f', extra {extra}'
+        raise MissingParameterError(message) if missed else UnknownParameterError(message)
+
+
+def _declared_params(compiled: CompiledQuery) -> set[str]:
+    """The names `compiled` expects from the caller — globals come from the
+    session, so they are not the caller's to supply."""
+    return {name for name in compiled.param_names if not name.startswith('__global__')}
+
+
+def _bind_positional(
+    compiled: CompiledQuery,
+    kwargs: dict[str, Any],
+    globals_: dict[str, Any] | None = None,
+    declared: set[str] | None = None,
+) -> list[Any]:
+    """Positional params for `compiled`, drawn from `kwargs` and `globals_`.
+
+    `declared` overrides what the arguments are checked against, for a script:
+    its arguments belong to the script as a whole, so a statement must not
+    call another statement's parameter an extra one.
+    """
+    _check_arguments(_declared_params(compiled) if declared is None else declared, kwargs)
+    return [
+        (globals_ or {}).get(name[len('__global__') :]) if name.startswith('__global__') else kwargs[name]
+        for name in compiled.param_names
+    ]
+
+
 def _compile_and_bind(
     pyql: str,
     kwargs: dict[str, Any],
@@ -997,35 +1047,7 @@ def _compile_and_bind(
         _record_compile(False)
         raise InternalServerError(str(exc)) from exc
     _record_compile(True)
-    try:
-        params: list[Any] = []
-        for name in compiled.param_names:
-            if name.startswith('__global__'):
-                qname = name[len('__global__') :]
-                params.append((globals_ or {}).get(qname))
-            else:
-                params.append(kwargs[name])
-    except KeyError as exc:
-        raise InterfaceError(f'Missing query parameter: {exc}') from exc
-    return compiled, params
-
-
-def _bind_params(
-    compiled: CompiledQuery,
-    kwargs: dict[str, Any],
-    globals_: dict[str, Any] | None = None,
-) -> list[Any]:
-    """Positional params for `compiled`, drawn from `kwargs` and `globals_`."""
-    try:
-        params: list[Any] = []
-        for name in compiled.param_names:
-            if name.startswith('__global__'):
-                params.append((globals_ or {}).get(name[len('__global__') :]))
-            else:
-                params.append(kwargs[name])
-    except KeyError as exc:
-        raise InterfaceError(f'Missing query parameter: {exc}') from exc
-    return params
+    return compiled, _bind_positional(compiled, kwargs, globals_)
 
 
 def _looks_like_a_script(pyql: str) -> bool:
