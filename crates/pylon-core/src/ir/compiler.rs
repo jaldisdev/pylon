@@ -116,6 +116,9 @@ pub fn compile_with_config(
             }
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let type_name = c.register_cte(&alias.name, &ir_stmt);
+            // What the binding hoisted (`p := existing ?? (insert …)`) goes
+            // right before it: a CTE only sees the ones ahead of it.
+            cte_defs.append(&mut c.hoisted_ctes);
             cte_defs.push(IrCteDef {
                 name: alias.name.clone(),
                 stmt: ir_stmt,
