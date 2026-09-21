@@ -6870,6 +6870,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_replaced_subject_shape_stays_in_scope() {
+        // `(select .company { n := .name }) { n }` — a shape at the point of
+        // use replaces the subject's own, so what that one declared has to
+        // stay readable or the replacement cannot see it. Before, this was an
+        // outright compile error.
+        let out = compile_and_emit("SELECT Person { c := (SELECT .company { n := .name }) { n } }");
+        assert!(
+            out.sql.contains(r#"'default::Company'::text"#) && out.sql.contains(r#""t2"."name""#),
+            "`n` should resolve to the company's own column:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_a_sibling_shape_pointer_is_not_in_scope() {
         // Gel rejects one shape pointer reading another; matching that is what
         // keeps four graph queries reported as the application bugs they are.
