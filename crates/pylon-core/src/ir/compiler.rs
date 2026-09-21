@@ -364,6 +364,25 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
         }
         return Ok(stmt);
     }
+    // `existing ?? (insert Tag { … })` — on sets `A ?? B` is `A if exists A
+    // else B`, the upsert idiom the if/else route already guards the
+    // mutation for.
+    let expr = match expr {
+        Expr::BinOp(b)
+            if b.op == ast::BinOpKind::Coalesce
+                && matches!(&b.right, Expr::SubQuery(s) if matches!(s.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))) =>
+        {
+            &Expr::IfElse(Box::new(ast::IfElse {
+                if_expr: b.left.clone(),
+                condition: Expr::UnaryOp(Box::new(ast::UnaryOp {
+                    op: ast::UnaryOpKind::Exists,
+                    operand: b.left.clone(),
+                })),
+                else_expr: b.right.clone(),
+            }))
+        }
+        other => other,
+    };
     // Non-statement expression (e.g. `<default::Company><uuid>'...'`):
     // treat as `select expr`.
     let fake_sel = ast::SelectStmt {

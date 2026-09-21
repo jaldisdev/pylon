@@ -605,6 +605,27 @@ async fn a_single_link_upsert_writes_exactly_one_branch() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_coalesced_insert_runs_only_when_nothing_exists() {
+    let module = unique_module("live_update_coalesce_insert");
+    let sd = schema_with_post(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    let get_or_create = format!(
+        "with existing := (select {module}::Person filter .name = 'Carol' limit 1), \
+           p := (existing ?? (insert {module}::Person {{ name := 'Carol', age := 7 }})) \
+         select p {{ name }}"
+    );
+    for _ in 0..2 {
+        let found = rows_of(&pool, &sd, &get_or_create).await;
+        assert_eq!(found.len(), 1, "both runs return the one Carol, got {found:?}");
+    }
+    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert_eq!(people.len(), 1, "the second run must not insert again, got {people:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn an_assert_raises_the_message_it_was_given() {
     let module = unique_module("live_assert_message");
     let sd = schema_with_post(&module);
