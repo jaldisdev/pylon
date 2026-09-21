@@ -962,10 +962,24 @@ impl Parser {
             Token::In => BinOpKind::In,
             Token::Is => {
                 self.advance();
+                // `x IS NOT T` — the upstream engine's own `Expr IS NOT TypeExpr`, the negation
+                // of the type check rather than a comparison against `not T`.
+                let negated = matches!(self.current(), Token::Not);
+                if negated {
+                    self.advance();
+                }
                 let ty = self.parse_type_expr()?;
-                return Ok(Expr::TypeIs {
+                let check = Expr::TypeIs {
                     expr: Box::new(left),
                     ty,
+                };
+                return Ok(if negated {
+                    Expr::UnaryOp(Box::new(UnaryOp {
+                        op: UnaryOpKind::Not,
+                        operand: check,
+                    }))
+                } else {
+                    check
                 });
             }
             Token::Not => {
