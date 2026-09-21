@@ -132,6 +132,31 @@ pub struct IrGroup {
     /// plain `LIMIT` would cut whole groups instead.
     pub offset: Option<IrExpr>,
     pub limit: Option<IrExpr>,
+    pub output: IrGroupOutput,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrGroupProjection {
+    pub pointers: Vec<IrShapePointer>,
+    /// Orders and caps the groups themselves, not their elements.
+    pub order_by: Vec<IrSort>,
+    pub offset: Option<IrExpr>,
+    pub limit: Option<IrExpr>,
+}
+
+/// What a group yields: the `{ key, grouping, elements }` rows themselves,
+/// a shape read off each of them, or the elements a `for` over the groups
+/// picks out of each one.
+#[derive(Debug, Clone)]
+pub enum IrGroupOutput {
+    Groups,
+    /// `select (group … by k) { n := count(.elements) }` — one row per key,
+    /// each pointer compiled over the group's rows so an aggregate reads the
+    /// whole group.
+    Projection(Box<IrGroupProjection>),
+    /// `for g in (group …) union (select g.elements … limit 1)` — the
+    /// elements themselves, `offset`/`limit` taken per key.
+    Elements,
 }
 
 // ── PATH SELECT (type-rooted path traversal) ────────────────────────────────────
@@ -258,6 +283,8 @@ pub enum IrArraySource {
     /// title }` asked for the objects.
     ObjectSelect(Box<IrSelect>),
     PathSelect(Box<IrPathSelect>),
+    /// `(select (group …) { … })` — one free object per group.
+    Group(Box<IrGroup>),
     /// One column of whatever rows a statement produces — the only way to
     /// reach a `for … union`'s set, which has no single source to read from.
     StmtColumn {

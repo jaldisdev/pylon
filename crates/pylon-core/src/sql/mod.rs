@@ -19,7 +19,7 @@
 
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionSelect,
-    IrGlobalCte, IrGroup, IrInsert, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkJoin,
+    IrGlobalCte, IrGroup, IrGroupOutput, IrInsert, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
     IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
     IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
@@ -646,6 +646,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 body,
             )
         }
+        IrStmt::Group(grp) if matches!(grp.output, IrGroupOutput::Elements) => emit_group_elements_source(grp),
         IrStmt::Group(_) | IrStmt::VectorSearch(_) | IrStmt::FtsSearch(_) => {
             unreachable!("cannot appear as a CTE source")
         }
@@ -1988,6 +1989,11 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                     }),
                 }
             }
+            IrArraySource::Group(grp) => ShapeNode::Array {
+                name: name.to_string(),
+                position,
+                element: Box::new(emit_group(grp).shape.root),
+            },
             IrArraySource::ObjectSelect(sel) => {
                 let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
                     unreachable!("IrArraySource::ObjectSelect is always schema-bound")
@@ -2303,6 +2309,7 @@ fn emit_array_source(src: &IrArraySource) -> String {
             append_offset_limit(&mut sql, &s.offset, &s.limit);
             format!("ARRAY({})", sql)
         }
+        IrArraySource::Group(grp) => format!("ARRAY({})", emit_group(grp).sql),
         IrArraySource::StmtColumn { stmt, column } => format!(
             "ARRAY(SELECT {} FROM (\n{}\n) AS \"_rows\")",
             qi(column),
@@ -2373,7 +2380,148 @@ fn emit_key_expr(expr: &IrExpr) -> String {
     emit_expr(expr)
 }
 
+/// The rows a group reads, as `(FROM, WHERE)`. A per-group OFFSET/LIMIT
+/// can't be a plain LIMIT — that would cut whole groups — so the rows are
+/// ranked within each key first and only the wanted slice kept.
+fn group_rows(grp: &IrGroup) -> (String, Option<String>) {
+    let alias = &grp.source.alias;
+    if grp.limit.is_none() && grp.offset.is_none() {
+        return (
+            format!("{} AS {}", source_ref(&grp.source), qi(alias)),
+            grp.filter.as_ref().map(emit_expr),
+        );
+    }
+    let ranked = format!(
+        "(SELECT {}.*, row_number() OVER (PARTITION BY {}{}) AS \"__rk\"\n    FROM {} AS {}{}) AS {}",
+        qi(alias),
+        group_by_sql(grp),
+        group_element_order(grp),
+        source_ref(&grp.source),
+        qi(alias),
+        grp.filter
+            .as_ref()
+            .map(|f| format!("\n    WHERE {}", emit_expr(f)))
+            .unwrap_or_default(),
+        qi(alias),
+    );
+    let lower = grp.offset.as_ref().map(emit_expr).unwrap_or_else(|| "0".to_string());
+    let mut conds = vec![format!("\"__rk\" > {}", lower)];
+    if let Some(l) = &grp.limit {
+        conds.push(format!("\"__rk\" <= {} + {}", lower, emit_expr(l)));
+    }
+    (ranked, Some(conds.join(" AND ")))
+}
+
+fn group_by_sql(grp: &IrGroup) -> String {
+    grp.keys
+        .iter()
+        .map(|(_, key_expr)| emit_expr(key_expr))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn group_element_order(grp: &IrGroup) -> String {
+    if grp.order_by.is_empty() {
+        return String::new();
+    }
+    let s: Vec<_> = grp.order_by.iter().map(emit_sort_clause).collect();
+    format!(" ORDER BY {}", s.join(", "))
+}
+
+/// A `for` over a group's elements used as a CTE body: the rows themselves,
+/// so the outer query can traverse them like any object binding.
+fn emit_group_elements_source(grp: &IrGroup) -> String {
+    let (from_sql, cond) = group_rows(grp);
+    let mut sql = format!("SELECT {}.*\n    FROM {}", qi(&grp.source.alias), from_sql);
+    if let Some(cond) = cond {
+        sql.push_str(&format!("\n    WHERE {}", cond));
+    }
+    sql
+}
+
 fn emit_group(grp: &IrGroup) -> SqlOutput {
+    match &grp.output {
+        IrGroupOutput::Groups => emit_group_rows(grp),
+        IrGroupOutput::Projection(projection) => emit_group_projection(
+            grp,
+            &projection.pointers,
+            &projection.order_by,
+            &projection.offset,
+            &projection.limit,
+        ),
+        IrGroupOutput::Elements => emit_group_elements(grp),
+    }
+}
+
+fn emit_group_projection(
+    grp: &IrGroup,
+    pointers: &[IrShapePointer],
+    order_by: &[IrSort],
+    offset: &Option<IrExpr>,
+    limit: &Option<IrExpr>,
+) -> SqlOutput {
+    let (exprs, nodes) = build_shape(pointers, &grp.source.alias);
+    let mut parts = vec!["NULL::text".to_string()];
+    parts.extend(exprs);
+    let (from_sql, cond) = group_rows(grp);
+    let mut sql = format!(
+        "SELECT (\n    {}\n) AS \"result\"\nFROM {}",
+        parts.join(",\n    "),
+        from_sql
+    );
+    if let Some(cond) = cond {
+        sql.push_str(&format!("\nWHERE {}", cond));
+    }
+    sql.push_str(&format!("\nGROUP BY {}", group_by_sql(grp)));
+    if !order_by.is_empty() {
+        let sorts: Vec<_> = order_by.iter().map(emit_sort_clause).collect();
+        sql.push_str(&format!("\nORDER BY {}", sorts.join(", ")));
+    }
+    append_offset_limit(&mut sql, offset, limit);
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor {
+            root: ShapeNode::Object {
+                name: String::new(),
+                type_name: None,
+                position: 0,
+                cardinality: Cardinality::Many,
+                pointers: nodes,
+            },
+        },
+        inference_plan: None,
+    }
+}
+
+fn emit_group_elements(grp: &IrGroup) -> SqlOutput {
+    let (exprs, nodes) = build_shape(&grp.shape, &grp.source.alias);
+    let mut parts = vec![type_disc(&grp.source.type_name)];
+    parts.extend(exprs);
+    let (from_sql, cond) = group_rows(grp);
+    let mut sql = format!(
+        "SELECT (\n    {}\n) AS \"result\"\nFROM {}",
+        parts.join(",\n    "),
+        from_sql
+    );
+    if let Some(cond) = cond {
+        sql.push_str(&format!("\nWHERE {}", cond));
+    }
+    SqlOutput {
+        sql,
+        shape: ShapeDescriptor {
+            root: ShapeNode::Object {
+                name: String::new(),
+                type_name: Some(grp.source.type_name.clone()),
+                position: 0,
+                cardinality: Cardinality::Many,
+                pointers: prepend_type(nodes),
+            },
+        },
+        inference_plan: None,
+    }
+}
+
+fn emit_group_rows(grp: &IrGroup) -> SqlOutput {
     let alias = &grp.source.alias;
     let (shape_exprs, shape_nodes) = build_shape(&grp.shape, alias);
 
@@ -2416,65 +2564,19 @@ fn emit_group(grp: &IrGroup) -> SqlOutput {
         .collect::<Vec<_>>()
         .join(", ");
     outer_parts.push(format!("ARRAY[{}]::text[]", key_names_sql));
-    let elem_order = if grp.order_by.is_empty() {
-        String::new()
-    } else {
-        let s: Vec<_> = grp.order_by.iter().map(emit_sort_clause).collect();
-        format!(" ORDER BY {}", s.join(", "))
-    };
     outer_parts.push(format!(
         "array_agg(ROW(\n            {}\n        )::record{})",
-        elem_row, elem_order
+        elem_row,
+        group_element_order(grp)
     ));
 
     let outer_tuple = outer_parts.join(",\n    ");
-
-    let group_by_sql = grp
-        .keys
-        .iter()
-        .map(|(_, key_expr)| emit_expr(key_expr))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // A per-group OFFSET/LIMIT can't be a plain LIMIT — that would cut whole
-    // groups. Rank the rows within each key first and keep the wanted slice.
-    let (from_sql, rank_filter) = if grp.limit.is_some() || grp.offset.is_some() {
-        let order = if elem_order.is_empty() {
-            String::new()
-        } else {
-            elem_order.clone()
-        };
-        let ranked = format!(
-            "(SELECT {}.*, row_number() OVER (PARTITION BY {}{}) AS \"__rk\"\n    FROM {} AS {}{}) AS {}",
-            qi(alias),
-            group_by_sql,
-            order,
-            source_ref(&grp.source),
-            qi(alias),
-            grp.filter
-                .as_ref()
-                .map(|f| format!("\n    WHERE {}", emit_expr(f)))
-                .unwrap_or_default(),
-            qi(alias),
-        );
-        let lower = grp.offset.as_ref().map(emit_expr).unwrap_or_else(|| "0".to_string());
-        let mut conds = vec![format!("\"__rk\" > {}", lower)];
-        if let Some(l) = &grp.limit {
-            conds.push(format!("\"__rk\" <= {} + {}", lower, emit_expr(l)));
-        }
-        (ranked, Some(conds.join(" AND ")))
-    } else {
-        (
-            format!("{} AS {}", source_ref(&grp.source), qi(alias)),
-            grp.filter.as_ref().map(emit_expr),
-        )
-    };
-
+    let (from_sql, cond) = group_rows(grp);
     let mut sql = format!("SELECT (\n    {}\n) AS \"result\"\nFROM {}", outer_tuple, from_sql,);
-    if let Some(cond) = rank_filter {
+    if let Some(cond) = cond {
         sql.push_str(&format!("\nWHERE {}", cond));
     }
-    sql.push_str(&format!("\nGROUP BY {}", group_by_sql));
+    sql.push_str(&format!("\nGROUP BY {}", group_by_sql(grp)));
 
     // ShapeNode for each element (Object with the selected pointers).
     let element_node = ShapeNode::Object {

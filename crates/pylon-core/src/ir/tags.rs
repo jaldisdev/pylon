@@ -161,6 +161,11 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             for (_, e) in &g.keys {
                 collect_expr(e, tags);
             }
+            if let IrGroupOutput::Projection(projection) = &g.output {
+                for p in &projection.pointers {
+                    collect_shape_pointer(p, tags);
+                }
+            }
         }
         IrStmt::FunctionSelect(fs) => collect_function_select(fs, tags),
         IrStmt::VectorSearch(vs) => {
@@ -363,6 +368,7 @@ fn collect_array_source(src: &IrArraySource, tags: &mut Vec<String>) {
             }
         }
         IrArraySource::StmtColumn { stmt, .. } => collect_stmt(stmt, tags),
+        IrArraySource::Group(grp) => collect_stmt(&IrStmt::Group(grp.as_ref().clone()), tags),
         IrArraySource::PathSelect(ps) => collect_path_select(ps, tags),
         IrArraySource::RawExpr {
             source,

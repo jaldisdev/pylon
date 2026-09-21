@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use super::{
     IrArraySource, IrBinOp, IrComputedGlobalCte, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrAssertedPointer, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup,
+    IrAssertedPointer, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup, IrGroupOutput, IrGroupProjection,
     IrIfElse, IrInsert,
     IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
@@ -110,6 +110,9 @@ pub fn compile_with_config(
         for alias in &w.aliases {
             if let Some(declared) = declared_pointers_of(&alias.expr) {
                 c.cte_declared_pointers.insert(alias.name.clone(), declared);
+            }
+            if c.bind_group(&alias.name, &alias.expr)? {
+                continue;
             }
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let type_name = c.register_cte(&alias.name, &ir_stmt);
@@ -238,6 +241,12 @@ fn try_compile_fts_with_pattern(c: &mut Compiler<'_>, w: &ast::WithStmt) -> Resu
 /// computed pointers spliced into it contributed. Every join in a path
 /// select is inner, so a spliced computed's filter means the same thing as a
 /// WHERE condition on the whole traversal.
+/// The name `.key.<name>` of a group is read through while its shape
+/// compiles — not one a query can spell, so it shadows nothing.
+fn group_key_binding(name: &str) -> String {
+    format!("<group key {name}>")
+}
+
 fn and_conditions(filter: Option<IrExpr>, extra: Vec<IrExpr>) -> Option<IrExpr> {
     extra.into_iter().fold(filter, |acc, cond| match acc {
         Some(existing) => Some(IrExpr::BinOp(Box::new(IrBinOp {
@@ -324,7 +333,13 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
 /// expression is wrapped in a synthetic `select expr` so it can be used as a CTE.
 fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQLError> {
     if let Expr::SubQuery(s) = expr {
-        return c.compile_stmt(s);
+        let stmt = c.compile_stmt(s)?;
+        if let IrStmt::Group(grp) = &stmt
+            && !matches!(grp.output, IrGroupOutput::Elements)
+        {
+            return Err(c.type_err("a `group` cannot be bound in a `with` except to iterate it with `for`"));
+        }
+        return Ok(stmt);
     }
     // Non-statement expression (e.g. `<default::Company><uuid>'...'`):
     // treat as `select expr`.
@@ -672,6 +687,10 @@ struct Compiler<'a> {
     alias_counter: usize,
     /// CTE names registered in the enclosing WITH block → qualified type name.
     cte_types: HashMap<String, String>,
+    /// `with g := (group …)` bindings. A group's rows are no schema object, so
+    /// nothing can read them as a CTE; a `for` over one compiles the group
+    /// again in its own terms instead.
+    group_bindings: HashMap<String, IrGroup>,
     /// CTE names bound to a single free row (free object/scalar/tuple, not
     /// a schema object) → that row's `IrFreeExpr` — lets `root.field`
     /// resolve to `IrExpr::CteFieldRef` when `root` is such a binding,
@@ -839,6 +858,7 @@ impl<'a> Compiler<'a> {
             params: vec![],
             alias_counter: 0,
             cte_types: HashMap::new(),
+            group_bindings: HashMap::new(),
             cte_free_items: HashMap::new(),
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
@@ -2136,6 +2156,13 @@ impl<'a> Compiler<'a> {
                     other => (false, other),
                 };
 
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::SubQuery(inner)) = &sh.expr
+                    && let Stmt::Group(g) = inner.as_ref()
+                {
+                    return self.compile_group_projection(s, g, &sh.elements).map(IrStmt::Group);
+                }
+
                 // `select alias_name [{ shape }]` — inline the alias expression.
                 if let Some(ir) = self.try_compile_alias_select(s, result, distinct)? {
                     return Ok(ir);
@@ -2493,7 +2520,7 @@ impl<'a> Compiler<'a> {
             // The actual CTE SQL is handled at the top-level compile() boundary.
             Stmt::With(w) => {
                 for alias in &w.aliases {
-                    if self.bind_inline_if_correlated(&alias.name, &alias.expr)? {
+                    if self.bind_inline_if_correlated(&alias.name, &alias.expr)? || self.bind_group(&alias.name, &alias.expr)? {
                         continue;
                     }
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
@@ -2506,7 +2533,10 @@ impl<'a> Compiler<'a> {
                 }
                 self.compile_stmt(&w.stmt)
             }
-            Stmt::For(f) => self.compile_for(f).map(IrStmt::For),
+            Stmt::For(f) => match self.compile_group_elements(f)? {
+                Some(grp) => Ok(IrStmt::Group(grp)),
+                None => self.compile_for(f).map(IrStmt::For),
+            },
             // `analyze` only changes how the query is *executed* (see
             // `analyze.rs`) — the inner statement's IR is identical either
             // way, so this layer just unwraps and compiles it normally.
@@ -5781,7 +5811,258 @@ impl<'a> Compiler<'a> {
             order_by,
             offset,
             limit,
+            output: IrGroupOutput::Groups,
         })
+    }
+
+    fn bind_group(&mut self, name: &str, expr: &Expr) -> Result<bool, PyQLError> {
+        let Expr::SubQuery(stmt) = expr else {
+            return Ok(false);
+        };
+        let Stmt::Group(g) = stmt.as_ref() else {
+            return Ok(false);
+        };
+        let grp = self.compile_group(g)?;
+        self.group_bindings.insert(name.to_string(), grp);
+        Ok(true)
+    }
+
+    /// `select (group S using k := E by k) { n := count(.elements) }`. Each
+    /// pointer is compiled over the grouped rows of `S`: `.key.k` stands for
+    /// `E` itself, which is constant within a group, and an aggregate over
+    /// `.elements.p` for the same aggregate over `.p`, which the `GROUP BY`
+    /// then takes per group.
+    fn compile_group_projection(
+        &mut self,
+        sel: &ast::SelectStmt,
+        g: &ast::GroupStmt,
+        elements: &[ShapeElement],
+    ) -> Result<IrGroup, PyQLError> {
+        if sel.filter.is_some() {
+            return Err(self.type_err("a shape over a `group` does not support filter"));
+        }
+        if !g.order_by.is_empty() || g.offset.is_some() || g.limit.is_some() {
+            return Err(self.type_err(
+                "a `group` read through a shape does not support order by, offset or limit on its elements",
+            ));
+        }
+        let mut grp = self.compile_group(g)?;
+        // `.key.k` reads the key as the `GROUP BY` already compiled it:
+        // compiling it a second time would give a walk fresh aliases, and
+        // Postgres only accepts a grouped expression it can match verbatim.
+        let keys: Vec<String> = grp.keys.iter().map(|(name, _)| name.clone()).collect();
+        for (name, key) in &grp.keys {
+            self.inline_bindings.insert(group_key_binding(name), key.clone());
+        }
+        let compiled = self.compile_group_projection_parts(sel, &grp, &keys, elements);
+        for name in &keys {
+            self.inline_bindings.remove(&group_key_binding(name));
+        }
+        let (pointers, order_by, offset, limit) = compiled?;
+        grp.output = IrGroupOutput::Projection(Box::new(IrGroupProjection {
+            pointers,
+            order_by,
+            offset,
+            limit,
+        }));
+        Ok(grp)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn compile_group_projection_parts(
+        &mut self,
+        sel: &ast::SelectStmt,
+        grp: &IrGroup,
+        keys: &[String],
+        elements: &[ShapeElement],
+    ) -> Result<(Vec<IrShapePointer>, Vec<IrSort>, Option<IrExpr>, Option<IrExpr>), PyQLError> {
+        let td = self.resolve_type(&grp.source.type_name)?;
+        let mut rewritten = Vec::with_capacity(elements.len());
+        for element in elements {
+            let (Some(compexpr), [ast::PathStep::Name(_)]) = (&element.compexpr, element.path.steps.as_slice()) else {
+                return Err(self.type_err(
+                    "only computed pointers (`name := …`) can be read off a `group` — e.g. `k := .key.name`",
+                ));
+            };
+            let mut element = element.clone();
+            element.compexpr = Some(self.rewrite_group_refs(compexpr, keys, td)?);
+            rewritten.push(element);
+        }
+        let alias = grp.source.alias.clone();
+        let module = td.module.clone();
+        let pointers = self.compile_shape(&rewritten, td, &alias, &module)?;
+        let order_by = sel
+            .order_by
+            .iter()
+            .map(|sort| {
+                Ok(ast::SortExpr {
+                    expr: self.rewrite_group_refs(&sort.expr, keys, td)?,
+                    direction: sort.direction.clone(),
+                    nones: sort.nones.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, PyQLError>>()?;
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(ast::Path::absolute(grp.source.type_name.clone())),
+            filter: None,
+            order_by,
+            offset: sel.offset.clone(),
+            limit: sel.limit.clone(),
+            lock: None,
+        };
+        let (_, order_by, offset, limit) = self.compile_path_modifiers(&synthetic, td, &alias)?;
+        Ok((pointers, order_by, offset, limit))
+    }
+
+    fn rewrite_group_refs(&self, expr: &Expr, keys: &[String], td: &TypeDescriptor) -> Result<Expr, PyQLError> {
+        const AGGREGATES: &[&str] = &["count", "sum", "min", "max", "avg", "array_agg", "all", "any"];
+        let rewrite = |e: &Expr| self.rewrite_group_refs(e, keys, td);
+        Ok(match expr {
+            Expr::Path(p) if p.partial => {
+                let name = match p.steps.first() {
+                    Some(ast::PathStep::Name(name)) => name.as_str(),
+                    _ => "",
+                };
+                match (name, p.steps.get(1..).unwrap_or_default()) {
+                    ("key", [ast::PathStep::Name(key)]) if keys.contains(key) => {
+                        Expr::Path(ast::Path::absolute(group_key_binding(key)))
+                    }
+                    ("key", [ast::PathStep::Name(key)]) => {
+                        return Err(self.type_err(&format!("'{key}' is not a key of this group")));
+                    }
+                    ("elements", _) => {
+                        return Err(self.type_err(
+                            "`.elements` of a group can only be read through an aggregate over one \
+                             of their properties — e.g. `count(.elements)`, `sum(.elements.amount)`",
+                        ));
+                    }
+                    _ => {
+                        return Err(self.type_err(&format!(
+                            "a group has no pointer '{name}' — read `.key.<name>` or aggregate over `.elements`"
+                        )));
+                    }
+                }
+            }
+            Expr::FunctionCall(f)
+                if f.args.len() == 1
+                    && f.kwargs.is_empty()
+                    && f.module.as_deref().is_none_or(|m| m == "std")
+                    && AGGREGATES.contains(&f.name.as_str())
+                    && let Expr::Path(p) = &f.args[0]
+                    && p.partial
+                    && matches!(p.steps.first(), Some(ast::PathStep::Name(n)) if n == "elements") =>
+            {
+                let property = match p.steps.get(1..).unwrap_or_default() {
+                    [] => "id",
+                    [ast::PathStep::Name(prop)] if td.properties.iter().any(|d| &d.name == prop) => prop.as_str(),
+                    _ => {
+                        return Err(self.type_err(&format!(
+                            "'{}' over a group's elements only reads one of their own properties",
+                            f.name
+                        )));
+                    }
+                };
+                Expr::FunctionCall(ast::FunctionCall {
+                    module: f.module.clone(),
+                    name: f.name.clone(),
+                    args: vec![Expr::Path(ast::Path::relative(property))],
+                    kwargs: vec![],
+                })
+            }
+            Expr::FunctionCall(f) => Expr::FunctionCall(ast::FunctionCall {
+                module: f.module.clone(),
+                name: f.name.clone(),
+                args: f.args.iter().map(rewrite).collect::<Result<_, _>>()?,
+                kwargs: f
+                    .kwargs
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), rewrite(v)?)))
+                    .collect::<Result<_, PyQLError>>()?,
+            }),
+            Expr::BinOp(b) => Expr::BinOp(Box::new(ast::BinOp {
+                left: rewrite(&b.left)?,
+                op: b.op.clone(),
+                right: rewrite(&b.right)?,
+            })),
+            Expr::UnaryOp(u) => Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: u.op.clone(),
+                operand: rewrite(&u.operand)?,
+            })),
+            Expr::TypeCast(c) => Expr::TypeCast(Box::new(ast::TypeCast {
+                expr: rewrite(&c.expr)?,
+                ty: c.ty.clone(),
+            })),
+            Expr::IfElse(ie) => Expr::IfElse(Box::new(ast::IfElse {
+                if_expr: rewrite(&ie.if_expr)?,
+                condition: rewrite(&ie.condition)?,
+                else_expr: rewrite(&ie.else_expr)?,
+            })),
+            other => other.clone(),
+        })
+    }
+
+    /// `for g in (group S by k) union (select g.elements order by … limit n)`
+    /// — the first `n` rows of `S` per key. `None` for any other `for`.
+    fn compile_group_elements(&mut self, f: &ast::ForStmt) -> Result<Option<IrGroup>, PyQLError> {
+        let Stmt::Select(body) = f.body.as_ref() else {
+            return Ok(None);
+        };
+        let unmodified = body.filter.is_none() && body.order_by.is_empty() && body.offset.is_none() && body.limit.is_none();
+        let (inner, shape) = match &body.result {
+            Expr::Shape(sh) if unmodified => match &sh.expr {
+                Some(Expr::SubQuery(stmt)) => match stmt.as_ref() {
+                    Stmt::Select(inner) => (inner, Some(sh.elements.as_slice())),
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+            _ => (body, None),
+        };
+        let reads_elements = matches!(&inner.result, Expr::Path(p) if !p.partial
+            && matches!(p.steps.as_slice(), [ast::PathStep::Name(var), ast::PathStep::Name(elements)]
+                if var == &f.var && elements == "elements"));
+        if !reads_elements {
+            return Ok(None);
+        }
+        let mut grp = match &f.iterator {
+            Expr::SubQuery(stmt) => match stmt.as_ref() {
+                Stmt::Group(g) => self.compile_group(g)?,
+                _ => return Ok(None),
+            },
+            Expr::Path(p) if !p.partial => match p.steps.as_slice() {
+                [ast::PathStep::Name(name)] => match self.group_bindings.get(name) {
+                    Some(grp) => grp.clone(),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let ordered = !inner.order_by.is_empty() || inner.offset.is_some() || inner.limit.is_some();
+        if ordered && (!grp.order_by.is_empty() || grp.offset.is_some() || grp.limit.is_some()) {
+            return Err(self.type_err(
+                "a group that already orders or limits its elements cannot be ordered or limited again by a `for` over it",
+            ));
+        }
+        let td = self.resolve_type(&grp.source.type_name)?;
+        let alias = grp.source.alias.clone();
+        let synthetic = ast::SelectStmt {
+            result: Expr::Path(ast::Path::absolute(grp.source.type_name.clone())),
+            ..inner.clone()
+        };
+        let (filter, order_by, offset, limit) = self.compile_path_modifiers(&synthetic, td, &alias)?;
+        grp.filter = and_conditions(grp.filter, filter.into_iter().collect());
+        if ordered {
+            grp.order_by = order_by;
+            grp.offset = offset;
+            grp.limit = limit;
+        }
+        if let Some(shape) = shape {
+            let module = td.module.clone();
+            grp.shape = self.compile_shape(shape, td, &alias, &module)?;
+        }
+        grp.output = IrGroupOutput::Elements;
+        Ok(Some(grp))
     }
 
     /// Extract the target type name from a DML or inner SELECT statement.
@@ -8642,7 +8923,7 @@ impl<'a> Compiler<'a> {
         // statement's own WITH clause and the inner statement takes over.
         if let Stmt::With(w) = stmt {
             for alias in &w.aliases {
-                if self.bind_inline_if_correlated(&alias.name, &alias.expr)? {
+                if self.bind_inline_if_correlated(&alias.name, &alias.expr)? || self.bind_group(&alias.name, &alias.expr)? {
                     continue;
                 }
                 let ir_stmt = compile_cte_binding(self, &alias.expr)?;
@@ -8655,6 +8936,16 @@ impl<'a> Compiler<'a> {
             }
             let inner = (*w.stmt).clone();
             return self.compile_subquery_expr(&inner, extra_fields, ctx, outer_shape);
+        }
+
+        if extra_fields.is_empty()
+            && let Stmt::Select(sel) = stmt
+            && let Expr::Shape(sh) = &sel.result
+            && let Some(Expr::SubQuery(subject)) = &sh.expr
+            && matches!(subject.as_ref(), Stmt::Group(_))
+            && let IrStmt::Group(grp) = self.compile_stmt(stmt)?
+        {
+            return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::Group(Box::new(grp)))));
         }
 
         // `(select (.<a[is T] union .<b[is T]) { id } limit 1)` — the union's
