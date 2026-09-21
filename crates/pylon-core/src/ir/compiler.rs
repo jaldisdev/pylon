@@ -1244,23 +1244,24 @@ impl<'a> Compiler<'a> {
     /// a bare Python class name. Mirrors every shape `_pyql_type_name` can
     /// produce for a `Global[T]` annotation.
     fn resolve_global_pg_type(&self, scalar_type: &str) -> String {
-        let builtin = match scalar_type {
-            "std::str" => Some("text"),
-            "std::int16" => Some("int2"),
-            "std::int32" => Some("int4"),
-            "std::int64" => Some("int8"),
-            "std::float32" => Some("float4"),
-            "std::float64" => Some("float8"),
-            "std::decimal" => Some("numeric"),
-            "std::bool" => Some("boolean"),
-            "std::datetime" => Some("timestamptz"),
+        // `datetime` and `std::datetime` name the same type.
+        let builtin = match scalar_type.strip_prefix("std::").unwrap_or(scalar_type) {
+            "str" => Some("text"),
+            "int16" => Some("int2"),
+            "int32" => Some("int4"),
+            "int64" => Some("int8"),
+            "float32" => Some("float4"),
+            "float64" => Some("float8"),
+            "decimal" => Some("numeric"),
+            "bool" => Some("boolean"),
+            "datetime" => Some("timestamptz"),
             "cal::local_datetime" => Some("timestamp"),
             "cal::local_date" => Some("date"),
             "cal::local_time" => Some("time"),
-            "std::uuid" => Some("uuid"),
-            "std::bytes" => Some("bytea"),
-            "std::json" => Some("jsonb"),
-            "std::duration" => Some("interval"),
+            "uuid" => Some("uuid"),
+            "bytes" => Some("bytea"),
+            "json" => Some("jsonb"),
+            "duration" => Some("interval"),
             _ => None,
         };
         if let Some(t) = builtin {
