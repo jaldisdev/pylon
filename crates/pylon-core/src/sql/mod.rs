@@ -1260,9 +1260,15 @@ fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], 
         }
         IrMultiLinkValueSource::PathSelect(ps) => {
             let root_alias = &ps.root.alias;
+            // The targets are the rows the walk lands on, not the one it
+            // starts from.
+            let target_alias = match &ps.result {
+                IrPathResult::Object { alias, .. } => alias,
+                IrPathResult::Scalar(..) => root_alias,
+            };
             let mut sql = format!(
                 "(SELECT {}.\"id\"{} FROM {} AS {}",
-                qi(root_alias),
+                qi(target_alias),
                 prop_cols,
                 source_ref(&ps.root),
                 qi(root_alias)
