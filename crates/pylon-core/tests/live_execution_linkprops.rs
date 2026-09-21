@@ -342,3 +342,52 @@ async fn remove_link_clears_the_junction_row() {
         "removing the link must not delete the target Tag row itself"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_link_property_value_reads_the_walked_links_current_value() {
+    // `tags += (select .tags { @weight := @weight + 1.0 } filter …)` — the
+    // `@weight` on the right is the junction row the walk crosses.
+    let module = unique_module("live_lp_read_current");
+    let sd = schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'sale' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'new' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Product {{ name := 'Widget' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "update {module}::Product set {{ \
+             tags += (select {module}::Tag) {{ @weight := 1.0 }} }}"
+        ),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "update {module}::Product set {{ \
+             tags += (select .tags {{ @weight := @weight + 1.5 }} filter .name = 'sale') }}"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ tags: {{ name, @weight }} order by .name }}"),
+    )
+    .await;
+    let DecodedValue::Composite(shape) = &rows[0] else {
+        panic!("expected Composite")
+    };
+    let DecodedValue::Array(tags) = &shape[1] else {
+        panic!("expected an Array for tags")
+    };
+    let weights: Vec<f64> = tags.iter().map(|t| as_f64(field(t, 2))).collect();
+    assert_eq!(weights, vec![1.0, 2.5], "only the walked-and-filtered link moves, got {tags:?}");
+}
