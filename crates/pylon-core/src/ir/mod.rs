@@ -442,6 +442,10 @@ pub struct IrAssertedPointer {
     /// boolean the check is read as.
     pub fn_name: String,
     pub inner: IrShapePointer,
+    /// The set the check reads, when it is not the one the pointer returns —
+    /// `(select assert_distinct(X) … limit 1)` asserts over all of X while
+    /// returning one row of it. `None` when the two coincide.
+    pub check: Option<IrShapePointer>,
 }
 
 impl IrShapePointer {

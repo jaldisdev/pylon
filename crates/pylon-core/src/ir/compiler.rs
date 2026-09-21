@@ -7309,22 +7309,30 @@ impl<'a> Compiler<'a> {
         // argument is "part of a larger expression", which is exactly what an
         // object-returning function refuses.
         if let Some(compexpr) = &el.compexpr
-            && let Some((fn_name, inner, inner_nested)) =
+            && let Some((fn_name, value_expr, check_expr)) =
                 Self::asserted_pointer_expr(compexpr, el.nested.as_deref().unwrap_or(&[]))
         {
-            let inner_el = ShapeElement {
-                compexpr: Some(inner),
-                nested: Some(inner_nested),
+            let element_for = |expr: Expr| ShapeElement {
+                compexpr: Some(expr),
+                nested: None,
                 ..el.clone()
             };
             // Compiled speculatively: a scalar argument's assert is an ordinary
             // function call and belongs on the expression path below, and an
             // argument that does not compile at all should report its own error
             // from there rather than this one.
-            if let Ok(ptr) = self.compile_shape_element(&inner_el, td, alias, module)
+            if let Ok(ptr) = self.compile_shape_element(&element_for(value_expr), td, alias, module)
                 && ptr.is_object_pointer()
             {
-                return Ok(IrShapePointer::Asserted(Box::new(IrAssertedPointer { fn_name, inner: ptr })));
+                let check = match check_expr {
+                    Some(expr) => Some(self.compile_shape_element(&element_for(expr), td, alias, module)?),
+                    None => None,
+                };
+                return Ok(IrShapePointer::Asserted(Box::new(IrAssertedPointer {
+                    fn_name,
+                    inner: ptr,
+                    check,
+                })));
             }
         }
 
@@ -7905,7 +7913,30 @@ impl<'a> Compiler<'a> {
     /// overload takes a second argument the wrapper would have to carry, and
     /// `assert_single` returns the element rather than the array, so it does
     /// not fit the check `IrShapePointer::Asserted` emits.
-    fn asserted_pointer_expr(expr: &Expr, nested: &[ShapeElement]) -> Option<(String, Expr, Vec<ShapeElement>)> {
+    fn asserted_pointer_expr(expr: &Expr, nested: &[ShapeElement]) -> Option<(String, Expr, Option<Expr>)> {
+        // `(select assert_distinct(X) { … } limit 1)` — the assert is the
+        // select's subject, so it sees the whole set, while the modifiers
+        // narrow only what is read back. The two coincide unless a limit or
+        // offset is written, and then the check needs its own copy without
+        // them, or it would be asserting over the one row that survives.
+        if let Expr::SubQuery(stmt) = expr
+            && let Stmt::Select(sel) = stmt.as_ref()
+        {
+            let (fn_name, inner, _) = Self::asserted_pointer_expr(&sel.result, &[])?;
+            let rebuild = |offset: Option<Expr>, limit: Option<Expr>| {
+                Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
+                    result: inner.clone(),
+                    filter: sel.filter.clone(),
+                    order_by: sel.order_by.clone(),
+                    offset,
+                    limit,
+                    lock: sel.lock.clone(),
+                })))
+            };
+            let value = rebuild(sel.offset.clone(), sel.limit.clone());
+            let check = (sel.offset.is_some() || sel.limit.is_some()).then(|| rebuild(None, None));
+            return Some((fn_name, value, check));
+        }
         // A shape written after the call (`assert_distinct(f(.id)) { amount }`)
         // belongs to the set the assert passes through, so it becomes the
         // inner pointer's shape.
@@ -7926,7 +7957,19 @@ impl<'a> Compiler<'a> {
         let [arg] = call.args.as_slice() else {
             return None;
         };
-        Some((call.name.clone(), arg.clone(), nested))
+        // A shape written after the call belongs to the set the assert passes
+        // through, so it is folded onto the argument rather than left as the
+        // element's nested shape: a union only reads as objects when the shape
+        // sits directly on it.
+        let inner = match (&arg, nested.is_empty()) {
+            (Expr::Shape(_), _) | (_, true) => arg.clone(),
+            _ => Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: Some(arg.clone()),
+                elements: nested.clone(),
+                marker_offset: None,
+            })),
+        };
+        Some((call.name.clone(), inner, None))
     }
 
     /// A function call written as a pointer's value, with the shape its rows

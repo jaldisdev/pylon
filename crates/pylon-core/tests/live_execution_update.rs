@@ -432,6 +432,15 @@ async fn an_assert_on_a_pointer_actually_raises() {
     .await;
     let rows = rows_of(&pool, &sd, &pyql).await;
     assert_eq!(rows.len(), 1, "with a post present the assert should pass, got {rows:?}");
+
+    // The limited form's other direction: a set that does satisfy the assert
+    // must still come back, rather than the wider check tripping on rows the
+    // limit was there to drop.
+    let limited = format!(
+        "select {module}::Person {{ name, p := (select assert_distinct(.posts {{ title }}) limit 1) }}"
+    );
+    let rows = rows_of(&pool, &sd, &limited).await;
+    assert_eq!(rows.len(), 1, "a distinct set should pass under a limit, got {rows:?}");
 }
 
 #[tokio::test]
@@ -471,6 +480,23 @@ async fn assert_distinct_on_a_pointer_catches_duplicate_rows() {
         .query_typed(&compiled.sql, &[], &ExtensionOids::default())
         .await
         .expect_err("two posts by one author make the author set non-distinct")
+        .to_string();
+    assert!(
+        error.contains("assert_distinct"),
+        "the raise should come from the assert, got: {error}"
+    );
+
+    // The assert is the inner select's *subject*, so it sees the whole set
+    // while `limit 1` narrows only what comes back. Checking the limited set
+    // instead would find one row, be trivially distinct, and never raise —
+    // which is what makes this the load-bearing case, not a variation.
+    let limited =
+        format!("select {module}::Person {{ name, a := (select assert_distinct(.posts.author {{ name }}) limit 1) }}");
+    let compiled = query::compile(&limited, &sd).unwrap();
+    let error = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .expect_err("the limit must not narrow what the assert checks")
         .to_string();
     assert!(
         error.contains("assert_distinct"),
