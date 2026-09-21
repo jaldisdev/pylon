@@ -395,6 +395,7 @@ fn collect_multi_link_value_source(src: &IrMultiLinkValueSource, tags: &mut Vec<
             collect_multi_link_values(a, tags);
             collect_multi_link_values(b, tags);
         }
+        IrMultiLinkValueSource::Asserted { inner, .. } => collect_multi_link_values(inner, tags),
     }
 }
 

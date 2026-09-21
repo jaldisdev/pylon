@@ -504,3 +504,58 @@ async fn assert_distinct_on_a_pointer_catches_duplicate_rows() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_asserted_multilink_value_checks_its_targets() {
+    // `posts := assert_distinct(a union b)` — the check runs over the targets
+    // before they become junction rows. Unwrapping the assert would compile
+    // just as well and never raise, which is what this rules out; the inner
+    // value is also evaluated once, so an `insert` inside it cannot run twice.
+    let module = unique_module("live_ml_assert");
+    let mut sd = schema_with_post(&module);
+    let person = sd.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+    person.multilinks = vec![multilink("posts", &format!("{module}::Post"))];
+    let post = sd.types.iter_mut().find(|t| t.name == "Post").expect("Post");
+    post.links[0].nullable = true;
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(&pool, &sd, &format!("insert {module}::Post {{ title := 'One' }}")).await;
+
+    // The same post on both sides of the union: distinct must refuse it.
+    let dupe = format!(
+        "with p := (select {module}::Post limit 1) \
+         update {module}::Person filter .name = 'Alice' \
+         set {{ posts := assert_distinct(p union p) }}"
+    );
+    let compiled = query::compile(&dupe, &sd).unwrap();
+    let error = pool
+        .execute_typed(&compiled.sql, &[])
+        .await
+        .expect_err("a repeated target must be refused")
+        .to_string();
+    assert!(
+        error.contains("assert_distinct"),
+        "the raise should come from the assert, got: {error}"
+    );
+
+    // And a genuinely distinct set still lands.
+    let ok = format!(
+        "with p := (select {module}::Post limit 1) \
+         update {module}::Person filter .name = 'Alice' set {{ posts := assert_distinct(p) }}"
+    );
+    exec(&pool, &sd, &ok).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name, p := .posts {{ title }} }}"),
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the update should have landed, got {rows:?}");
+}

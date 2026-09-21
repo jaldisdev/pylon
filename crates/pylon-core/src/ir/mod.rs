@@ -766,6 +766,14 @@ pub enum IrMultiLinkValueSource {
     /// `a union b` — combine two target sets (e.g. distinct-typed adds, or an
     /// existing-select add alongside a same-batch forward-referenced insert).
     Union(Box<IrMultiLinkValues>, Box<IrMultiLinkValues>),
+    /// `prices := assert_distinct(…)` — the targets the inner value names,
+    /// checked before they become junction rows. `fn_name` is a `_pylon`
+    /// assert over `anyarray`; the ids go through it as a `uuid[]`, so the
+    /// inner value is evaluated once even when it contains an `insert`.
+    Asserted {
+        fn_name: String,
+        inner: Box<IrMultiLinkValues>,
+    },
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────────
