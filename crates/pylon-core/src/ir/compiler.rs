@@ -7360,7 +7360,21 @@ impl<'a> Compiler<'a> {
             // A link-valued RHS (`.multilink`, `.<backlink[is T] { … }`,
             // `(select .link filter … limit 1)`) is a pointer in its own
             // right, not an expression — see `try_compile_pointer_expr`.
-            if let Some(ptr) = self.try_compile_pointer_expr(
+            // `(select .resource { rev := … }) { changed_at := .rev.created_at }`
+            // — a shape written at the point of use replaces the one the
+            // subject carries, so whatever that one declared has to stay in
+            // scope or the replacement cannot read it.
+            let inner_declared: Vec<ShapeElement> = Self::replaced_subject_shape(compexpr)
+                .iter()
+                .filter(|e| e.compexpr.is_some())
+                .cloned()
+                .collect();
+            let restore = (!inner_declared.is_empty()).then(|| {
+                let mut scope = self.active_declared_pointers.clone();
+                scope.extend(inner_declared);
+                std::mem::replace(&mut self.active_declared_pointers, scope)
+            });
+            let pointer = self.try_compile_pointer_expr(
                 pointer_name,
                 compexpr,
                 td,
@@ -7368,7 +7382,11 @@ impl<'a> Compiler<'a> {
                 module,
                 el.marker_offset,
                 el.nested.as_deref().unwrap_or(&[]),
-            )? {
+            );
+            if let Some(previous) = restore {
+                self.active_declared_pointers = previous;
+            }
+            if let Some(ptr) = pointer? {
                 return Ok(ptr);
             }
             // `p := marketplace::retrieve_listing_prices(.id) { amount }` — an
@@ -8114,6 +8132,21 @@ impl<'a> Compiler<'a> {
             let module_matches = fc.module.as_deref().map(|m| m == f.module.as_str()).unwrap_or(true);
             module_matches && f.name == fc.name && f.return_is_object
         })
+    }
+
+    /// The shape a pointer's subject carried, when a shape written at the
+    /// point of use replaced it: `(select .resource { rev := … }) { … }`.
+    /// `pointer_subject` drops it, but its declarations are what the
+    /// replacement reads `.rev` from.
+    fn replaced_subject_shape(e: &Expr) -> &[ShapeElement] {
+        let Expr::Shape(sh) = e else { return &[] };
+        if sh.elements.is_empty() {
+            return &[];
+        }
+        match sh.expr.as_ref() {
+            Some(inner) => Self::pointer_subject(inner).map(|(_, nested, _)| nested).unwrap_or(&[]),
+            None => &[],
+        }
     }
 
     /// Peel a computed pointer's right-hand side down to the path it names,
