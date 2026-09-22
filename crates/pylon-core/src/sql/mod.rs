@@ -8262,6 +8262,21 @@ mod tests {
     }
 
     #[test]
+    fn test_a_cycle_of_computed_pointers_read_as_a_value_is_reported_not_hung_on() {
+        // Read as the last step, the computed was compiled as an expression,
+        // which walked the same path again with no count of how often.
+        let schema = make_schema_with_computed_links();
+        for query in ["SELECT Person { looper }", "SELECT Person { * }"] {
+            let ast = parse::parse(query).unwrap();
+            let err = match ir::compile(&ast, &schema) {
+                Ok(_) => panic!("expected a compile error for {query}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(err.contains("expands into itself"), "{query}: {err}");
+        }
+    }
+
+    #[test]
     fn test_traversing_through_a_limited_computed_uses_a_lateral() {
         // `capped` picks one row per Person, so the traversal correlates
         // through a LATERAL rather than a plain join — and its `limit 1`
