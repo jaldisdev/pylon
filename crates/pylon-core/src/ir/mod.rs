@@ -1550,6 +1550,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 

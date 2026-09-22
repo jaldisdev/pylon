@@ -586,6 +586,34 @@ pub struct SchemaDescriptor {
     pub functions: Vec<FunctionDescriptor>,
     pub aliases: Vec<AliasDescriptor>,
     pub channels: Vec<ChannelDescriptor>,
+    /// `ir::functions_needing_globals`, which compiles every function body
+    /// and is asked for by every compile that calls one. Filled on first use,
+    /// so a schema must not change once it has been compiled against.
+    #[serde(skip)]
+    pub functions_needing_globals: Derived<std::collections::HashSet<String>>,
+}
+
+/// A value computed from the schema on first use. A clone starts out empty,
+/// so a copy that is then changed never reads the original's value.
+#[derive(Debug)]
+pub struct Derived<T>(std::sync::OnceLock<T>);
+
+impl<T> Derived<T> {
+    pub fn get_or_init(&self, init: impl FnOnce() -> T) -> &T {
+        self.0.get_or_init(init)
+    }
+}
+
+impl<T> Default for Derived<T> {
+    fn default() -> Self {
+        Derived(std::sync::OnceLock::new())
+    }
+}
+
+impl<T> Clone for Derived<T> {
+    fn clone(&self) -> Self {
+        Derived::default()
+    }
 }
 
 impl SchemaDescriptor {

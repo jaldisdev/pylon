@@ -286,6 +286,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let step = type_step(schema.types[0].clone(), Verb::Create);
         let snippet = python_snippet_for_step(&step, &schema).unwrap();
@@ -311,6 +312,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let step = MigrationStep {
             prompt: String::new(),
@@ -339,6 +341,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let step = MigrationStep {
             prompt: String::new(),
@@ -379,6 +382,7 @@ mod tests {
                 volatility: "immutable".into(),
                 body: "select 1".into(),
             }],
+            ..Default::default()
         };
         let step = MigrationStep {
             prompt: String::new(),
@@ -410,6 +414,7 @@ mod tests {
                 volatility: "immutable".into(),
                 body: "with\n  h := str_replace(<str>uuid_val, '-', ''),\n  ct_bytes := std::from_hex(h[20:24])\nselect ct_bytes".into(),
             }],
+            ..Default::default()
         };
         let step = MigrationStep {
             prompt: String::new(),
@@ -456,6 +461,7 @@ mod tests {
                 volatility: "immutable".into(),
                 body: "select 1".into(),
             }],
+            ..Default::default()
         };
         let steps = crate::diff::diff_schema_steps_with_renames_and_fills(
             &schema,
@@ -488,6 +494,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let step = MigrationStep {
             prompt: String::new(),

@@ -695,7 +695,13 @@ fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQL
 /// first pass finds the direct readers, later passes find their callers. A body
 /// that fails to compile is skipped; that failure is reported by validation,
 /// and guessing at its globals here would only produce a second, worse error.
-pub fn functions_needing_globals(schema: &SchemaDescriptor) -> std::collections::HashSet<String> {
+pub fn functions_needing_globals(schema: &SchemaDescriptor) -> &std::collections::HashSet<String> {
+    schema
+        .functions_needing_globals
+        .get_or_init(|| find_functions_needing_globals(schema))
+}
+
+fn find_functions_needing_globals(schema: &SchemaDescriptor) -> std::collections::HashSet<String> {
     let mut needs: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let mut changed = false;
@@ -725,7 +731,7 @@ pub fn compile_fn_body(
     fn_desc: &crate::schema::FunctionDescriptor,
     schema: &SchemaDescriptor,
 ) -> Result<super::IrOutput, crate::error::PyQLError> {
-    compile_fn_body_with(fn_desc, schema, &functions_needing_globals(schema))
+    compile_fn_body_with(fn_desc, schema, functions_needing_globals(schema))
 }
 
 /// `compile_fn_body` with the globals-argument set supplied, so the fixpoint in
@@ -14940,7 +14946,7 @@ impl<'a> Compiler<'a> {
     /// the callee's body.
     fn globals_arg_for_call(&mut self, qualified: &str) -> Result<Option<IrExpr>, PyQLError> {
         if self.fns_needing_globals.is_none() {
-            self.fns_needing_globals = Some(functions_needing_globals(self.schema));
+            self.fns_needing_globals = Some(functions_needing_globals(self.schema).clone());
         }
         if !self.fns_needing_globals.as_ref().is_some_and(|s| s.contains(qualified)) {
             return Ok(None);

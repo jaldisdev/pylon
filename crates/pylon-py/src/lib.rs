@@ -1502,6 +1502,7 @@ impl SchemaDescriptor {
                 functions: functions.unwrap_or_default().iter().map(|f| f.inner.clone()).collect(),
                 aliases: aliases.unwrap_or_default().iter().map(|a| a.inner.clone()).collect(),
                 channels: channels.unwrap_or_default().iter().map(|c| c.inner.clone()).collect(),
+                ..Default::default()
             },
             tag_to_type: std::sync::OnceLock::new(),
         }

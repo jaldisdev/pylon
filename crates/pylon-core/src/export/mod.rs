@@ -2868,6 +2868,7 @@ mod tests {
             functions: fns,
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -2916,6 +2917,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -3320,6 +3322,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -3461,6 +3464,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         let fn_count = ddl.matches("CREATE OR REPLACE FUNCTION \"public\".\"Person_").count();
@@ -3763,6 +3767,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -3841,6 +3846,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -3915,6 +3921,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -4146,6 +4153,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -4236,6 +4244,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
 
         let ddl = export_schema(&schema).unwrap();
@@ -4289,6 +4298,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -4350,6 +4360,7 @@ mod tests {
                 functions: vec![],
                 aliases: vec![],
                 channels: vec![],
+                ..Default::default()
             };
             signal_trigger_infos(&schema)
                 .into_iter()
@@ -4389,6 +4400,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
 
@@ -4427,6 +4439,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -4473,6 +4486,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(
@@ -4500,6 +4514,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(!ddl.contains("IF TG_OP = 'UPDATE'"), "got:\n{ddl}");

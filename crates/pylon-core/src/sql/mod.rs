@@ -5508,6 +5508,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -7484,6 +7485,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ast = parse::parse("SELECT Account FOR UPDATE").expect("parse failed");
         let err = ir::compile(&ast, &schema).err().expect("expected a compile error");
@@ -8912,6 +8914,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -9116,6 +9119,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -9411,6 +9415,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -10864,6 +10869,7 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let out = compile_and_emit_with(
             "UPDATE Account FILTER .email = $email \
@@ -11043,6 +11049,7 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -11188,6 +11195,7 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -13048,6 +13056,7 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let out = compile_and_emit_with("SELECT Person { address }", &schema);
         assert!(out.sql.contains("::jsonb"), "got:\n{}", out.sql);
@@ -13138,6 +13147,7 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let out = compile_and_emit_with("SELECT Person.address", &schema);
         match &out.shape.root {
@@ -13209,6 +13219,7 @@ select owner { posts := (select owner.posts.title) };",
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         // Regression: a structural (unnamed) tuple property previously failed
         // path traversal with "'address' is a scalar property, not a link —
