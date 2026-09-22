@@ -542,22 +542,20 @@ def _reload_schema(config):
 
     _clear_registry()
 
-    # Ensure schema_dir is on sys.path
-    if schema_dir_str not in sys.path:
-        sys.path.insert(0, schema_dir_str)
+    from pylon._finalize import RESERVED_MODULE_NAMES, schema_import_names, schema_import_root
 
-    from pylon._finalize import RESERVED_MODULE_NAMES
+    import_root = str(schema_import_root(schema_dir))
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
 
-    for py_file in sorted(schema_dir.glob('*.py')):
-        stem = py_file.stem
-        if stem.startswith('_'):
-            continue
+    for name in schema_import_names(schema_dir):
+        stem = name.rpartition('.')[-1]
         if stem in RESERVED_MODULE_NAMES:
             raise click.ClickException(
                 f"'{stem}.py' is not a valid module name: '{stem}' is a reserved "
                 f'PostgreSQL schema name. Use a different name.'
             )
-        importlib.import_module(stem)
+        importlib.import_module(name)
 
     from pylon.schema._aliases import collect_module_aliases
     from pylon.schema._channels import collect_module_channels
@@ -572,12 +570,11 @@ def _reload_schema(config):
     # ever applied, even though `pylon.finalize()` itself saw it fine.
     aliases_: list = []
     channels_: list = []
-    for py_file in sorted(schema_dir.glob('*.py')):
-        stem = py_file.stem
-        if not stem.startswith('_') and stem in sys.modules:
-            globals_.extend(collect_module_globals(sys.modules[stem]))
-            aliases_.extend(collect_module_aliases(sys.modules[stem]))
-            channels_.extend(collect_module_channels(sys.modules[stem]))
+    for name in schema_import_names(schema_dir):
+        if name in sys.modules:
+            globals_.extend(collect_module_globals(sys.modules[name]))
+            aliases_.extend(collect_module_aliases(sys.modules[name]))
+            channels_.extend(collect_module_channels(sys.modules[name]))
 
     schema = walk(
         types,

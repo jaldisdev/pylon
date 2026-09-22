@@ -51,30 +51,49 @@ RESERVED_MODULE_NAMES: frozenset[str] = frozenset(
 )
 
 
-def _import_schema_dir(schema_dir: Path) -> None:
-    """Import every .py file in schema_dir as a top-level module.
+def schema_import_names(schema_dir: Path) -> list[str]:
+    """The import name of every schema module in schema_dir.
 
-    schema_dir is added to the front of sys.path so that cross-module imports
-    inside the schema directory work without any package prefix. Each file stem
-    becomes the Python module name and therefore the Pylon module name (unless
-    overridden by __pylon_module__ in the file or module= on a decorator).
+    A schema_dir holding an ``__init__.py`` is a package, so its modules are
+    imported under the package name (``dbschema.account``) and an application
+    importing them the same way gets the very classes Pylon registered.
+    Otherwise each file stem is a top-level module (``account``). Either way
+    the stem stays the Pylon module name.
     """
-    schema_dir_str = str(schema_dir)
-    if schema_dir_str not in sys.path:
-        sys.path.insert(0, schema_dir_str)
-
-    # Sort so __init__.py (if present) loads before sibling files.
+    package = schema_dir.name if (schema_dir / '__init__.py').exists() else None
+    names = []
     for py_file in sorted(schema_dir.glob('*.py')):
         stem = py_file.stem
         if stem.startswith('_'):
             continue
+        names.append(f'{package}.{stem}' if package else stem)
+    return names
+
+
+def schema_import_root(schema_dir: Path) -> Path:
+    """The directory that has to be on sys.path for schema_import_names to import."""
+    return schema_dir.parent if (schema_dir / '__init__.py').exists() else schema_dir
+
+
+def _import_schema_dir(schema_dir: Path) -> None:
+    """Import every schema module in schema_dir under its schema_import_names name.
+
+    The import root is added to the front of sys.path so that cross-module
+    imports inside the schema directory resolve.
+    """
+    root = str(schema_import_root(schema_dir))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    for name in schema_import_names(schema_dir):
+        stem = name.rpartition('.')[-1]
         if stem in RESERVED_MODULE_NAMES:
             raise ValueError(
                 f"'{stem}.py' is not a valid module name: '{stem}' is a reserved "
                 f'PostgreSQL schema name. Use a different name.'
             )
-        if stem not in sys.modules:
-            importlib.import_module(stem)
+        if name not in sys.modules:
+            importlib.import_module(name)
 
 
 def finalize(
@@ -146,11 +165,10 @@ def finalize(
     # Collect aliases and channels from every non-private schema file that was imported.
     aliases_: list[Any] = []
     channels_: list[Any] = []
-    for py_file in sorted(schema_dir.glob('*.py')):
-        stem = py_file.stem
-        if not stem.startswith('_') and stem in sys.modules:
-            aliases_.extend(collect_module_aliases(sys.modules[stem]))
-            channels_.extend(collect_module_channels(sys.modules[stem]))
+    for name in schema_import_names(schema_dir):
+        if name in sys.modules:
+            aliases_.extend(collect_module_aliases(sys.modules[name]))
+            channels_.extend(collect_module_channels(sys.modules[name]))
     if modules:
         for mod in modules:
             aliases_.extend(collect_module_aliases(mod))
