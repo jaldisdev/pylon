@@ -247,7 +247,11 @@ fn decode<'py>(
             }
         }
         ShapeNode::Array { position, element, .. } => {
+            // A set of objects is never NULL; an unset array-typed property is.
             let items = match item(value, *position) {
+                Some(DecodedValue::Null) if !matches!(element.as_ref(), ShapeNode::Object { .. }) => {
+                    return Ok(py.None().into_bound(py));
+                }
                 Some(DecodedValue::Array(arr)) => arr
                     .iter()
                     // Array elements are anonymous records: each decodes as a
