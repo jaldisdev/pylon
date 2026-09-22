@@ -1841,6 +1841,10 @@ fn stdlib_registry<'py>(
                         pd.set_item("name", p.name)?;
                         pd.set_item("type", p.ty.pyql_name())?;
                         pd.set_item("variadic", p.variadic)?;
+                        // Named only, and so never counted as a positional
+                        // argument; always defaulted when left out.
+                        pd.set_item("named_only", p.named_only.is_some())?;
+                        pd.set_item("keyword", p.keyword())?;
                         Ok(pd)
                     })
                     .collect::<PyResult<Vec<_>>>()?,

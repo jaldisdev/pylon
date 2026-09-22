@@ -98,9 +98,11 @@ def _signature(entry: dict, method_name: str) -> str:
 
     Every parameter is positional-only (`/`): PyQL calls are positional, and
     it frees the stub from having to promise that registry parameter names
-    are stable keyword names.
+    are stable keyword names. The exception is a named-only parameter, which
+    is keyword-only and defaulted, exactly as PyQL takes it.
     """
-    params = entry['params']
+    params = stdlib.positional_params(entry)
+    named = stdlib.named_params(entry)
     variadic_at = next((i for i, p in enumerate(params) if p['variadic']), None)
 
     # A variadic that isn't last (`std::json_set(j, path..., val)`) has no
@@ -120,6 +122,10 @@ def _signature(entry: dict, method_name: str) -> str:
     # one such parameter precedes it, and never after `*args`.
     if params and variadic_at is None:
         parts.append('/')
+    if named:
+        if variadic_at is None:
+            parts.append('*')
+        parts.extend(f'{p["keyword"]}: _Arg = ...' for p in named)
     return f'    def {method_name}({", ".join(parts)}) -> _Node: ...'
 
 
@@ -130,7 +136,11 @@ def _distinct_signatures(entries: list[dict]) -> list[dict]:
     seen: set[tuple] = set()
     out: list[dict] = []
     for e in entries:
-        shape = (len(e['params']), tuple(p['variadic'] for p in e['params']))
+        shape = (
+            len(stdlib.positional_params(e)),
+            tuple(p['variadic'] for p in e['params']),
+            tuple(p['keyword'] for p in stdlib.named_params(e)),
+        )
         if shape in seen:
             continue
         seen.add(shape)
@@ -158,7 +168,7 @@ def _class_for(namespace: str) -> str:
         if len(shapes) == 1:
             body.append(_signature(shapes[0], attr))
         else:
-            for e in sorted(shapes, key=lambda e: len(e['params'])):
+            for e in sorted(shapes, key=lambda e: (len(stdlib.positional_params(e)), len(stdlib.named_params(e)))):
                 body.append('    @overload')
                 body.append(_signature(e, attr))
 
