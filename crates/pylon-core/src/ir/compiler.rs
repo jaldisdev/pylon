@@ -1141,6 +1141,10 @@ struct Compiler<'a> {
     cte_declared_pointers: HashMap<String, Vec<ShapeElement>>,
     /// Those of the binding whose shape is being compiled right now.
     active_declared_pointers: Vec<ShapeElement>,
+    /// Computed pointers a path is reading as a value right now, as
+    /// `module::Type.name` — one that names itself would otherwise recurse
+    /// without end.
+    expanding_computeds: Vec<String>,
     /// The schema-bound selects currently being compiled, innermost last.
     ///
     /// Only consulted for `detached`: an absolute `TypeName.prop` inside a
@@ -1284,6 +1288,7 @@ impl<'a> Compiler<'a> {
             pending_delete_guard: None,
             cte_declared_pointers: HashMap::new(),
             active_declared_pointers: vec![],
+            expanding_computeds: vec![],
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
             global_ctes: vec![],
@@ -3901,7 +3906,17 @@ impl<'a> Compiler<'a> {
                         "'{step_name}' is a computed pointer — it has no stored column to traverse further through"
                     )));
                 }
-                let expr = self.compile_expr(&expr_ast, current_td, &current_alias)?;
+                let expanding = format!("{}::{}.{step_name}", current_td.module, current_td.name);
+                if self.expanding_computeds.contains(&expanding) {
+                    return Err(self.type_err(&format!(
+                        "computed pointer '{step_name}' expands into itself — \
+                         a path cannot be resolved through a cycle of computed pointers"
+                    )));
+                }
+                self.expanding_computeds.push(expanding);
+                let expr = self.compile_expr(&expr_ast, current_td, &current_alias);
+                self.expanding_computeds.pop();
+                let expr = expr?;
                 let (filter, order_by, offset, limit) =
                     self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
                 return Ok(IrPathSelect {
