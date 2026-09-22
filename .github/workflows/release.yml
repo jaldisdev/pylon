@@ -62,17 +62,14 @@ jobs:
             --release --locked --out dist
             ${{ runner.os == 'Linux' && format('--interpreter {0}', matrix.python-version) || '' }}
           # manylinux containers are what make a Linux wheel installable
-          # somewhere other than the runner that built it.
-          manylinux: auto
-          # aws-lc-sys again: its build drives cmake, which that container
-          # does not ship.
-          before-script-linux: |
-            if command -v yum >/dev/null; then
-              yum install -y cmake3 perl
-              ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
-            elif command -v apt-get >/dev/null; then
-              apt-get update && apt-get install -y cmake perl
-            fi
+          # somewhere other than the runner that built it. 2_28 rather than
+          # the default: its CentOS 7 base has no `cmake` package on aarch64,
+          # only on x86_64. The glibc floor this sets, 2.28, is older than any
+          # distro that can run the Python this package requires.
+          manylinux: "2_28"
+          # aws-lc-sys, which reqwest's rustls pulls in, drives cmake, and no
+          # manylinux image ships one.
+          before-script-linux: yum install -y cmake perl
 
       - name: Check the wheel is installable and carries its licence
         shell: bash
