@@ -11040,6 +11040,40 @@ impl<'a> Compiler<'a> {
                         }
                     }
                     if let Some((td, alias)) = ctx {
+                        // `count((select .<promotion filter …))` — compiled as an
+                        // expression the sub-select is a scalar subquery, and a
+                        // bare aggregate around it aggregates the enclosing select.
+                        if let Expr::SubQuery(stmt) = arg
+                            && f.name != "array_agg"
+                            && let Some(sql_name) = crate::stdlib::lookup(f.module.as_deref().unwrap_or("std"), &f.name)
+                                .into_iter()
+                                .find_map(|d| match &d.impl_strategy {
+                                    crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => {
+                                        Some(sql_name.to_string())
+                                    }
+                                    _ => None,
+                                })
+                            && let Some(mut ps) = self.relative_subselect(stmt, ctx)?
+                        {
+                            // An object row is an anonymous record, which `unnest` cannot expand.
+                            if let IrPathResult::Object { alias, .. } = &ps.result {
+                                let id = IrExpr::ColumnRef {
+                                    alias: alias.clone(),
+                                    column: "id".to_string(),
+                                    pg_type: "uuid".to_string(),
+                                };
+                                ps.result = IrPathResult::Scalar(id, None);
+                            }
+                            let aggregate = IrExpr::FunctionCall(IrFunctionCall {
+                                schema: None,
+                                name: sql_name.clone(),
+                                args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps))))],
+                                sql_template: Some(format!(
+                                    "(SELECT {sql_name}(\"_s\".\"v\") FROM unnest($1) AS \"_s\"(\"v\"))"
+                                )),
+                            });
+                            return Ok(aggregate_over_nothing(&f.name, aggregate));
+                        }
                         // `max(items.created_at)` inside a FILTER: the
                         // aggregate takes the whole set the path names, so it
                         // belongs inside a subquery over that set — a bare

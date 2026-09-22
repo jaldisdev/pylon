@@ -5517,6 +5517,16 @@ mod tests {
     }
 
     #[test]
+    fn an_aggregate_over_a_relative_subselect_counts_inside_a_subquery() {
+        let out = compile_and_emit_with(
+            "SELECT Post { n := count((SELECT .<posts FILTER .age > 1)) }",
+            &make_schema(),
+        );
+        assert!(!out.sql.contains("count((SELECT"), "an aggregate over a scalar subquery:\n{}", out.sql);
+        assert!(out.sql.contains(r#"(SELECT count("_s"."v") FROM unnest(ARRAY("#), "{}", out.sql);
+    }
+
+    #[test]
     fn any_over_a_link_type_check_tests_each_element() {
         let out = compile_and_emit_with(
             "SELECT Company { name } FILTER any(.<company.posts IS Post)",
