@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.14.1,<2.0"]
+requires = ["maturin>=1.15.0,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -13,14 +13,14 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
-    "click>=8.4.2",
+    "click>=8.5.0",
     "prompt_toolkit>=3.0.53",
     "httpx>=0.28.1",
     "watchfiles>=1.2"
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.1.1", "ruff>=0.16"]
+dev = ["pytest>=9.1.1", "ruff>=0.16.5"]
 
 [project.scripts]
 pylon = 'pylon.cli:main'
