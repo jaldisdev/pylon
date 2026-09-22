@@ -120,3 +120,62 @@ async fn insert_and_select_round_trip_a_real_value() {
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_abstract_type_reads_the_rows_of_the_types_inheriting_it() {
+    // An abstract type has no table, so selecting it has to read the tables of
+    // the concrete types naming it as a parent.
+    let module = unique_module("live_abstract");
+    let named_q = format!("{module}::Named");
+    let widget = smoke_schema(&module).types.remove(0);
+    let named = TypeDescriptor {
+        name: "Named".into(),
+        table: "Named".into(),
+        abstract_: true,
+        materialized: false,
+        ..widget.clone()
+    };
+    let concrete = |name: &str| TypeDescriptor {
+        name: name.into(),
+        table: name.into(),
+        parents: vec![named_q.clone()],
+        ..widget.clone()
+    };
+    let schema = SchemaDescriptor {
+        types: vec![named, concrete("Widget"), concrete("Gadget")],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+    for (type_name, name) in [("Widget", "a"), ("Gadget", "b")] {
+        let insert = query::compile(&format!("insert {module}::{type_name} {{ name := '{name}' }}"), &schema).unwrap();
+        pool.execute_typed(&insert.sql, &[]).await.unwrap();
+    }
+
+    for pyql in [
+        format!("select {named_q} {{ name }} order by .name"),
+        format!("with named := (select {named_q} filter .name != '') select named {{ name }} order by .name"),
+    ] {
+        let select = query::compile(&pyql, &schema).unwrap();
+        let rows = pool
+            .query_typed(&select.sql, &[], &ExtensionOids::default())
+            .await
+            .unwrap();
+        let read: Vec<(DecodedValue, DecodedValue)> = rows
+            .iter()
+            .map(|row| match row {
+                DecodedValue::Composite(fields) => (fields[0].clone(), fields[1].clone()),
+                other => panic!("expected a Composite-shaped row, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (DecodedValue::Str(format!("{module}::Widget")), DecodedValue::Str("a".to_string())),
+                (DecodedValue::Str(format!("{module}::Gadget")), DecodedValue::Str("b".to_string())),
+            ],
+            "{pyql}"
+        );
+    }
+}
