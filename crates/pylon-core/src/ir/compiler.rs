@@ -9238,44 +9238,7 @@ impl<'a> Compiler<'a> {
             Some(m) => format!("{}::{}", m, type_ref.name),
             None => type_ref.name.clone(),
         };
-        let owner_td = self.resolve_type(&type_name)?;
-        // `.<passkeys[is account::Account]` — the intersection narrows what
-        // comes back, and the link itself may be declared further down: here
-        // `passkeys` is Individual's, and an Individual is an Account. So the
-        // owner is the concrete type that actually declares it, the same way
-        // `backlink_exists_over_owners` resolves one.
-        let owner_td = if self.declares_backlink(owner_td, &backlink_name, current_qname) {
-            owner_td
-        } else {
-            // Qualified, because that is how a type records the interfaces it
-            // implements; the query may well have written the bare name.
-            let narrowed = format!("{}::{}", owner_td.module, owner_td.name);
-            let declaring: Vec<&'a TypeDescriptor> = self
-                .schema
-                .types
-                .iter()
-                .filter(|t| !t.abstract_ && Self::is_or_implements(t, &narrowed))
-                .filter(|t| self.declares_backlink(t, &backlink_name, current_qname))
-                .collect();
-            let declaring = Self::without_inherited_owners(declaring);
-            match declaring.as_slice() {
-                [only] => only,
-                [] => owner_td,
-                several => {
-                    return Err(self.type_err(&format!(
-                        "'{backlink_name}' pointing to {current_qname} is declared by {} types under \
-                         {narrowed} ({}), so a backlink narrowed to it has no single source to read \
-                         — narrow to one of them instead",
-                        several.len(),
-                        several
-                            .iter()
-                            .map(|t| format!("{}::{}", t.module, t.name))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    )));
-                }
-            }
-        };
+        let owner_td = self.backlink_owner(self.resolve_type(&type_name)?, &backlink_name, current_qname)?;
         let owner_qname = format!("{}::{}", owner_td.module, owner_td.name);
 
         let join = if let Some(l) = owner_td
@@ -9362,7 +9325,7 @@ impl<'a> Compiler<'a> {
             subquery,
             link_properties: vec![],
             marker_offset,
-            single: limits_to_one(modifiers),
+            single: self.backlink_is_single(owner_td, &backlink_name, current_qname) || limits_to_one(modifiers),
         }))
     }
 
@@ -10314,12 +10277,20 @@ impl<'a> Compiler<'a> {
                 // `.<link[is Owner]` names the owner type; a bare `.<link`
                 // spans every type declaring it, so that one lands nowhere in
                 // particular.
-                ast::PathStep::Backlink(_) => {
-                    if matches!(steps.get(i + 1), Some(ast::PathStep::TypeIntersection(_))) {
-                        multi = true;
-                        continue;
-                    }
-                    return (true, None);
+                ast::PathStep::Backlink(backlink_name) => {
+                    let Some(ast::PathStep::TypeIntersection(tr)) = steps.get(i + 1) else {
+                        return (true, None);
+                    };
+                    let owner_name = match &tr.module {
+                        Some(m) => format!("{}::{}", m, tr.name),
+                        None => tr.name.clone(),
+                    };
+                    let current_qname = format!("{}::{}", current.module, current.name);
+                    let single = self
+                        .resolve_type(&owner_name)
+                        .is_ok_and(|owner| self.backlink_is_single(owner, backlink_name, &current_qname));
+                    multi |= !single;
+                    continue;
                 }
                 ast::PathStep::TypeIntersection(tr) => {
                     let name = match &tr.module {
@@ -12811,6 +12782,69 @@ impl<'a> Compiler<'a> {
             current_qname,
             alias,
         )
+    }
+
+    /// The type that declares the link a backlink narrowed to `owner_td`
+    /// reads through.
+    fn backlink_owner(
+        &self,
+        owner_td: &'a TypeDescriptor,
+        backlink_name: &str,
+        current_qname: &str,
+    ) -> Result<&'a TypeDescriptor, PyQLError> {
+        // `.<passkeys[is account::Account]` — the intersection narrows what
+        // comes back, and the link itself may be declared further down: here
+        // `passkeys` is Individual's, and an Individual is an Account. So the
+        // owner is the concrete type that actually declares it, the same way
+        // `backlink_exists_over_owners` resolves one.
+        Ok(if self.declares_backlink(owner_td, backlink_name, current_qname) {
+            owner_td
+        } else {
+            // Qualified, because that is how a type records the interfaces it
+            // implements; the query may well have written the bare name.
+            let narrowed = format!("{}::{}", owner_td.module, owner_td.name);
+            let declaring: Vec<&'a TypeDescriptor> = self
+                .schema
+                .types
+                .iter()
+                .filter(|t| !t.abstract_ && Self::is_or_implements(t, &narrowed))
+                .filter(|t| self.declares_backlink(t, backlink_name, current_qname))
+                .collect();
+            let declaring = Self::without_inherited_owners(declaring);
+            match declaring.as_slice() {
+                [only] => only,
+                [] => owner_td,
+                several => {
+                    return Err(self.type_err(&format!(
+                        "'{backlink_name}' pointing to {current_qname} is declared by {} types under \
+                         {narrowed} ({}), so a backlink narrowed to it has no single source to read \
+                         — narrow to one of them instead",
+                        several.len(),
+                        several
+                            .iter()
+                            .map(|t| format!("{}::{}", t.module, t.name))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )));
+                }
+            }
+        })
+    }
+
+    /// Whether a backlink narrowed to `owner_td` reaches at most one object,
+    /// which it does through an exclusive link.
+    fn backlink_is_single(&self, owner_td: &'a TypeDescriptor, backlink_name: &str, current_qname: &str) -> bool {
+        let Ok(owner) = self.backlink_owner(owner_td, backlink_name, current_qname) else {
+            return false;
+        };
+        owner
+            .links
+            .iter()
+            .any(|l| l.name == backlink_name && l.is_exclusive && self.link_target_reaches(&l.target, current_qname))
+            || owner
+                .multilinks
+                .iter()
+                .any(|ml| ml.name == backlink_name && ml.is_exclusive && self.link_target_reaches(&ml.target, current_qname))
     }
 
     /// Does `td` declare the link a backlink names, pointing at the type the

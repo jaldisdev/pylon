@@ -106,6 +106,7 @@ fn ml(name: &str, target_qname: &str, on_delete: Vec<OnDeletePolicy>) -> MultiLi
         description: None,
         default_pyql: None,
         on_delete,
+        is_exclusive: false,
     }
 }
 

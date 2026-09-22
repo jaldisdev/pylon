@@ -126,6 +126,7 @@ fn main() {
                     description: None,
                     default_pyql: None,
                     on_delete: vec![],
+                    is_exclusive: false,
                 }],
                 computed: vec![],
                 constraints: vec![],

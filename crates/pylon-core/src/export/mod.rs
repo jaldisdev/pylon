@@ -2952,6 +2952,7 @@ mod tests {
                     description: None,
                     default_pyql: None,
                     on_delete: vec![],
+                    is_exclusive: false,
                 });
             }
         }
@@ -3066,6 +3067,7 @@ mod tests {
                     description: None,
                     default_pyql: None,
                     on_delete: allow,
+                    is_exclusive: false,
                 }],
             ),
         ]);
@@ -3095,6 +3097,7 @@ mod tests {
                 description: None,
                 default_pyql: None,
                 on_delete: vec![],
+                is_exclusive: false,
             }],
         )]);
         let ddl = export_schema(&schema).unwrap();
@@ -4066,6 +4069,7 @@ mod tests {
                 side: DeleteSide::Target,
                 action: DeleteAction::DeleteSource,
             }],
+            is_exclusive: false,
         }];
         let schema = SchemaDescriptor {
             types: vec![org_type(module), owner],
@@ -4208,6 +4212,7 @@ mod tests {
                 side: DeleteSide::Target,
                 action: DeleteAction::DeleteSource,
             }],
+            is_exclusive: false,
         }];
         SchemaDescriptor {
             types: vec![org_type(module), owner],

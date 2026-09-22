@@ -455,7 +455,8 @@ impl MultiLinkDescriptor {
         nullable = false,
         default_pyql = None,
         description = None,
-        on_delete = None
+        on_delete = None,
+        is_exclusive = false
     ))]
     fn new(
         name: String,
@@ -465,6 +466,7 @@ impl MultiLinkDescriptor {
         default_pyql: Option<String>,
         description: Option<String>,
         on_delete: Option<Vec<PyRef<OnDeletePolicy>>>,
+        is_exclusive: bool,
     ) -> Self {
         Self {
             inner: core::schema::MultiLinkDescriptor {
@@ -475,6 +477,7 @@ impl MultiLinkDescriptor {
                 default_pyql,
                 description,
                 on_delete: on_delete.unwrap_or_default().iter().map(|p| p.inner.clone()).collect(),
+                is_exclusive,
             },
         }
     }
@@ -502,6 +505,11 @@ impl MultiLinkDescriptor {
     #[getter]
     fn description(&self) -> Option<&str> {
         self.inner.description.as_deref()
+    }
+
+    #[getter]
+    fn is_exclusive(&self) -> bool {
+        self.inner.is_exclusive
     }
 }
 

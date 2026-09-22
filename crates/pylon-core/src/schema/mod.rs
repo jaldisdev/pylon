@@ -149,6 +149,10 @@ pub struct MultiLinkDescriptor {
     pub description: Option<String>,
     pub default_pyql: Option<String>,
     pub on_delete: Vec<OnDeletePolicy>,
+    /// True when a target may be linked from at most one source, which makes
+    /// the backlink single.
+    #[serde(default)]
+    pub is_exclusive: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
