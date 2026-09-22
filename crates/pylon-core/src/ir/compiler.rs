@@ -10883,6 +10883,42 @@ impl<'a> Compiler<'a> {
                 // set, so the comparison inside must not also be warned about.
                 // The argument is compiled before `resolve_fn_call` ever sees
                 // which function this is, which is why the guard goes here.
+                // `all(array_unpack($tags) in .tags.label)` — the comparison is
+                // made once per element, then aggregated. Inlined as `unnest()`
+                // the array is a set-returning call, which Postgres refuses in a
+                // WHERE; over no elements `all` is true and `any` false.
+                if f.module.as_deref().unwrap_or("std") == "std"
+                    && matches!(f.name.as_str(), "any" | "all")
+                    && f.kwargs.is_empty()
+                    && let [Expr::BinOp(comparison)] = f.args.as_slice()
+                    && let Expr::FunctionCall(unpack) = &comparison.left
+                    && unpack.module.as_deref().unwrap_or("std") == "std"
+                    && unpack.name == "array_unpack"
+                    && let [array] = unpack.args.as_slice()
+                {
+                    let array = self.compile_expr_ctx(array, ctx)?;
+                    let element = "<unnested element>".to_string();
+                    self.inline_bindings
+                        .insert(element.clone(), IrExpr::RawSql("\"_unnested\".\"v\"".to_string()));
+                    let per_element = self.compile_expr_ctx(
+                        &Expr::BinOp(Box::new(ast::BinOp {
+                            left: Expr::Path(ast::Path::absolute(element.clone())),
+                            op: comparison.op.clone(),
+                            right: comparison.right.clone(),
+                        })),
+                        ctx,
+                    );
+                    self.inline_bindings.remove(&element);
+                    let (aggregate, over_nothing) = if f.name == "all" { ("bool_and", "true") } else { ("bool_or", "false") };
+                    return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        schema: None,
+                        name: aggregate.to_string(),
+                        args: vec![per_element?, array],
+                        sql_template: Some(format!(
+                            "(SELECT coalesce({aggregate}($1), {over_nothing}) FROM unnest($2) AS \"_unnested\"(\"v\"))"
+                        )),
+                    }));
+                }
                 if let Some(args) = self.compile_named_call_args(f, ctx)? {
                     return self.resolve_fn_call(f.module.as_deref(), &f.name, args);
                 }
