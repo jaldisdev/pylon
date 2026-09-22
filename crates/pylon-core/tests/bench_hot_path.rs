@@ -102,6 +102,7 @@ fn empty_type() -> TypeDescriptor {
         description: None,
         parents: vec![],
         interfaces: vec![],
+        bases: vec![],
         properties: vec![],
         links: vec![],
         multilinks: vec![],

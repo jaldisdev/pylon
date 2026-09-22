@@ -66,6 +66,7 @@ fn ty(
         description: None,
         parents: vec![],
         interfaces: vec![],
+        bases: vec![],
         properties,
         links,
         multilinks,

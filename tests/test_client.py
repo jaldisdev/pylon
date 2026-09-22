@@ -783,6 +783,34 @@ class TestWithGlobals:
         client._ref.pool = pool
         assert view._require_pool() is pool
 
+    def test_an_unqualified_name_is_a_default_global(self):
+        # As in the upstream engine: `with_globals({'current_account_id': …})` sets `default::current_account_id`.
+        client = _client_with_pool(_make_pool())
+        view = client.with_globals({'current_account_id': 1, 'account::region': 'eu'})
+        assert view._globals == {'default::current_account_id': 1, 'account::region': 'eu'}
+
+    def test_a_transaction_carries_the_clients_globals(self):
+        from pylon.client import AsyncTransaction
+
+        tx = AsyncTransaction(MagicMock(), {'default::a': 1}, {'opt': True})
+        assert tx._globals == {'default::a': 1}
+        assert tx._config_options == {'opt': True}
+
+    def test_a_write_hands_its_triggers_the_globals(self):
+        import json
+        import uuid
+
+        from pylon.client import _trigger_globals
+
+        write, read = MagicMock(mutates=True), MagicMock(mutates=False)
+        account = uuid.UUID('0199a16e-2c71-8325-8246-0004ea37a31c')
+        globals_ = {'default::current_account_id': account, 'default::languages': ['en']}
+        assert _trigger_globals(read, globals_) is None
+        assert json.loads(_trigger_globals(write, globals_)) == {
+            'default::current_account_id': str(account),
+            'default::languages': ['en'],
+        }
+
 
 class TestWithConfig:
     def test_returns_client_instance(self):
@@ -971,7 +999,7 @@ class TestRetryingTransaction:
             call_count = 0
 
             class FakeTx:
-                def __init__(self, pgcon_tx):
+                def __init__(self, pgcon_tx, globals_=None, config_options=None):
                     self._tx = pgcon_tx
 
                 async def __aenter__(self):

@@ -444,6 +444,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![MultiLinkDescriptor {
@@ -474,6 +475,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![LinkDescriptor {
                         name: "nemesis".into(),

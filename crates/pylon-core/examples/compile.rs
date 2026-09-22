@@ -34,6 +34,7 @@ fn main() {
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![
                     PropertyDescriptor {
                         name: "id".into(),
@@ -145,6 +146,7 @@ fn main() {
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![PropertyDescriptor {
                     name: "name".into(),
                     pg_type: "text".into(),
@@ -181,6 +183,7 @@ fn main() {
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![
                     PropertyDescriptor {
                         name: "title".into(),

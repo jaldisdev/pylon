@@ -21,12 +21,13 @@ use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionSelect,
     IrGlobalCte, IrGroup, IrGroupOutput, IrInsert, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
+    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
     IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
     IrUpdate, IrVectorSearch, SearchEnqueueInfo, VectorEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, InferencePlan, ShapeDescriptor, ShapeNode};
+use std::collections::HashMap;
 
 pub struct SqlOutput {
     pub sql: String,
@@ -113,6 +114,10 @@ fn emit_global_cte_parts(global_ctes: &[IrGlobalCte]) -> Vec<String> {
 }
 
 pub fn emit(ir: &IrOutput) -> SqlOutput {
+    with_subtype_fanouts(&ir.subtype_fanouts, || emit_output(ir))
+}
+
+fn emit_output(ir: &IrOutput) -> SqlOutput {
     let mut out = match &ir.stmt {
         IrStmt::Update(upd) => emit_update_stmt(upd, &ir.ctes),
         IrStmt::For(f) => emit_for_stmt(f, &ir.ctes),
@@ -250,12 +255,53 @@ fn source_ref(src: &IrSource) -> String {
     if let Some(cte_name) = src.table.strip_prefix("@cte:") {
         return qi(cte_name);
     }
+    // "@row:NEW" sentinel: a trigger's own row.
+    if let Some(row) = src.table.strip_prefix("@row:") {
+        return format!("(SELECT ({row}).*)");
+    }
     // An interface-typed source reads from its implementors, never from the
     // interface's own view — see `IrSource::poly`.
-    match &src.poly {
+    match source_fanout(src) {
         Some(fanout) => format!("(\n{}\n)", emit_poly_union(&fanout.implementors, &fanout.columns)),
+        None => junction_ref(module_of(&src.type_name), &src.table),
+    }
+}
+
+/// The table a statement writes to: only ever the one named, never the
+/// subtypes a read of it would take in.
+fn target_ref(src: &IrSource) -> String {
+    match src.table.strip_prefix("@cte:") {
+        Some(cte_name) => qi(cte_name),
         None => qn(module_of(&src.type_name), &src.table),
     }
+}
+
+thread_local! {
+    /// The statement being emitted's `IrOutput::subtype_fanouts`.
+    static SUBTYPE_FANOUTS: std::cell::RefCell<HashMap<(String, String), IrPolyFanout>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Installs `fanouts` for the emission running inside `emit`, restoring the
+/// previous set after, so a nested emission of another output cannot leak.
+fn with_subtype_fanouts<T>(fanouts: &HashMap<(String, String), IrPolyFanout>, emit: impl FnOnce() -> T) -> T {
+    let previous = SUBTYPE_FANOUTS.with(|cell| cell.replace(fanouts.clone()));
+    let result = emit();
+    SUBTYPE_FANOUTS.with(|cell| cell.replace(previous));
+    result
+}
+
+/// The fan-out a read of `src` goes through: its own, or the one a concrete
+/// type with subtypes needs.
+fn source_fanout(src: &IrSource) -> Option<IrPolyFanout> {
+    if let Some(fanout) = &src.poly {
+        return Some(fanout.clone());
+    }
+    if src.table.starts_with('@') {
+        return None;
+    }
+    let key = (module_of(&src.type_name).to_string(), src.table.clone());
+    SUBTYPE_FANOUTS.with(|cell| cell.borrow().get(&key).cloned())
 }
 
 /// A junction table, or the CTE standing in for one. Same `@cte:` sentinel
@@ -270,10 +316,19 @@ fn source_ref(src: &IrSource) -> String {
 pub const DML_CTE: &str = "_dml";
 
 fn junction_ref(module: &str, junction_table: &str) -> String {
-    match junction_table.strip_prefix("@cte:") {
-        Some(cte_name) => qi(cte_name),
-        None => qn(module, junction_table),
+    if let Some(cte_name) = junction_table.strip_prefix("@cte:") {
+        return qi(cte_name);
     }
+    let Some((tables, columns)) = crate::ir::parse_inherited_junction(junction_table) else {
+        return qn(module, junction_table);
+    };
+    let columns = columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+    let branches = tables
+        .iter()
+        .map(|(module, table)| format!("SELECT {columns} FROM {}", qn(module, table)))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    format!("({branches})")
 }
 
 /// The discriminator for a path select's object result.
@@ -311,7 +366,7 @@ fn path_join_target(join: &IrPathJoin) -> &IrSource {
 /// The type discriminator for a row from `src`: the fanned-out column when the
 /// source reads from implementors, else the one type its table holds.
 fn source_type_disc(src: &IrSource) -> String {
-    match &src.poly {
+    match source_fanout(src) {
         Some(_) => format!("{}.\"__type__\"", qi(&src.alias)),
         None => type_disc(&src.type_name),
     }
@@ -350,9 +405,20 @@ fn emit_select_stmt(sel: &IrSelect, ctes: &[IrCteDef]) -> SqlOutput {
 /// The branches of `select (a union b)` all carry the same object type, so
 /// they share a column set: union them in the FROM clause and project, filter
 /// and order the combined set once, under the shape's single alias.
-fn bound_union_from_clause(rows: &[IrRowSource]) -> String {
+/// `common_columns`, when set, are the columns of the ancestor branches of
+/// different types share: each branch projects those and its rows' concrete
+/// type, rather than columns the others do not have.
+fn bound_union_from_clause(rows: &[IrRowSource], common_columns: &[String]) -> String {
+    let columns = common_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
     rows.iter()
         .map(|row| match row {
+            IrRowSource::Bound { source, .. } if !common_columns.is_empty() => {
+                let own_type = match source_fanout(source) {
+                    Some(_) => "\"__type__\"".to_string(),
+                    None => format!("{} AS \"__type__\"", type_disc(&source.type_name)),
+                };
+                format!("    SELECT {own_type}, {columns} FROM {}", source_ref(source))
+            }
             IrRowSource::Bound { source, .. } => format!("    SELECT * FROM {}", source_ref(source)),
             IrRowSource::Free(_) => unreachable!("caller checked every row is bound"),
         })
@@ -366,14 +432,19 @@ fn emit_bound_union_select(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
     };
     let alias = &source.alias;
     let (pointer_exprs, shape_pointers) = build_shape(shape, alias);
-    let mut parts = vec![type_disc(&source.type_name)];
+    let row_type = if sel.poly_columns.is_empty() {
+        type_disc(&source.type_name)
+    } else {
+        format!("{}.\"__type__\"", qi(alias))
+    };
+    let mut parts = vec![row_type];
     parts.extend(pointer_exprs);
 
     let mut sql = format!(
         "SELECT {}(\n    {}\n) AS result\nFROM (\n{}\n) AS {}",
         if sel.distinct { "DISTINCT " } else { "" },
         parts.join(",\n    "),
-        bound_union_from_clause(rows),
+        bound_union_from_clause(rows, &sel.poly_columns),
         qi(alias),
     );
     append_filter(&mut sql, &sel.filter);
@@ -556,11 +627,11 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 format!("    {}", emit_insert_row_sql(ins))
             } else if cols.is_empty() {
                 // See `emit_insert_row_sql`: a row of nothing but defaults.
-                format!("    INSERT INTO {} DEFAULT VALUES", source_ref(&ins.target))
+                format!("    INSERT INTO {} DEFAULT VALUES", target_ref(&ins.target))
             } else {
                 format!(
                     "    INSERT INTO {} (\n{}\n    ) VALUES (\n{}\n    )",
-                    source_ref(&ins.target),
+                    target_ref(&ins.target),
                     cols.join(",\n"),
                     vals.join(",\n"),
                 )
@@ -584,7 +655,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
             let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "    ");
             let mut sql = format!(
                 "    UPDATE {} AS {}\n    SET\n{}",
-                source_ref(&upd.target),
+                target_ref(&upd.target),
                 qi(alias),
                 sets.join(",\n"),
             );
@@ -599,12 +670,32 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
         }
         IrStmt::Delete(del) => {
             let alias = &del.target.alias;
-            let mut sql = format!("    DELETE FROM {} AS {}", source_ref(&del.target), qi(alias),);
+            let mut sql = format!("    DELETE FROM {} AS {}", target_ref(&del.target), qi(alias),);
             append_filter(&mut sql, &del.filter);
             sql.push_str("\n    RETURNING *");
             sql
         }
         IrStmt::Select(inner) => match inner.rows.as_slice() {
+            // `x := (select (select T filter …) filter …)` — the inner select is
+            // what this one reads, the same `_dml` the top-level emitter reads
+            // it from. Read from the table instead, it returned every row of
+            // the type, with neither filter applied.
+            [IrRowSource::Bound { source, .. }]
+                if let Some(read) = inner.dml_source.as_deref()
+                    && !matches!(read, IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::Delete(_)) =>
+            {
+                // A subquery, not a `WITH`: this may already sit inside one.
+                let mut sql = format!(
+                    "    SELECT {}* FROM (\n{}\n    ) AS {}",
+                    if inner.distinct { "DISTINCT " } else { "" },
+                    emit_dml_as_cte_source(read),
+                    qi(&source.alias),
+                );
+                append_filter(&mut sql, &inner.filter);
+                append_order_by(&mut sql, &inner.order_by);
+                append_offset_limit(&mut sql, &inner.offset, &inner.limit);
+                sql
+            }
             [IrRowSource::Bound { source, .. }] => {
                 // SELECT-over-SELECT: expose raw columns so the outer SELECT can
                 // project its own shape from them, mirroring DML's RETURNING *.
@@ -636,7 +727,7 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 let mut sql = format!(
                     "    SELECT {}* FROM (\n{}\n    ) AS {}",
                     if inner.distinct { "DISTINCT " } else { "" },
-                    bound_union_from_clause(rows),
+                    bound_union_from_clause(rows, &inner.poly_columns),
                     qi(&source.alias),
                 );
                 append_filter(&mut sql, &inner.filter);
@@ -860,13 +951,14 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     let alias = &upd.target.alias;
     let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
     let ids_name = format!("{}__ids", name);
-    let mut parts: Vec<String> = vec![];
+    // The nested statements its values read from, ahead of it.
+    let mut parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
 
     if has_scalar_changes {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
             sets.join(", "),
         );
@@ -882,7 +974,7 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         let mut sel = format!(
             "SELECT {}.* FROM {} AS {}",
             qi(alias),
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
         );
         append_filter(&mut sel, &upd.filter);
@@ -974,7 +1066,7 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                 .collect();
             let mut sql = format!(
                 "INSERT INTO {} ({})\nSELECT {} FROM {}",
-                source_ref(&ins.target),
+                target_ref(&ins.target),
                 cols.join(", "),
                 values.join(", "),
                 qi(&iter_alias),
@@ -1020,7 +1112,7 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                     qi(&iter_alias),
                     qi(ITER_COL),
                     new_cols,
-                    source_ref(&upd.target),
+                    target_ref(&upd.target),
                     qi(alias),
                     qi(&iter_alias),
                 );
@@ -1056,7 +1148,7 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                 let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
                 let mut sql = format!(
                     "UPDATE {} AS {}\nSET {}\nFROM {}",
-                    source_ref(&upd.target),
+                    target_ref(&upd.target),
                     qi(alias),
                     sets.join(", "),
                     qi(&iter_alias),
@@ -1094,7 +1186,7 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                 .collect();
             let mut sql = format!(
                 "INSERT INTO {} ({})\nSELECT {} FROM {}",
-                source_ref(&ins.target),
+                target_ref(&ins.target),
                 cols.join(", "),
                 values.join(", "),
                 nested_for_from(&inner_alias, &iter_alias),
@@ -1131,7 +1223,10 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
         // `credentials := (insert access::Credentials { … })` inside an update.
         // Those CTEs are emitted beside it rather than inside its body, which
         // is where its own SQL expects to read them from.
+        // The multi-link builders emit a statement's own, ahead of it.
         let nested: &[IrCteDef] = match &c.stmt {
+            IrStmt::Insert(ins) if insert_has_any_multilink(ins) => &[],
+            IrStmt::Update(upd) if update_has_any_multilink(upd) => &[],
             IrStmt::Insert(ins) => &ins.nested_ctes,
             IrStmt::Update(upd) => &upd.nested_ctes,
             _ => &[],
@@ -1526,7 +1621,7 @@ fn emit_for_nested_insert_cte(
     format!(
         "\"{}\" AS (\nINSERT INTO {} ({})\nSELECT {} FROM \"{}\", {}\nWHERE \"{}\".{} = {}.\"v\"\nRETURNING {}\n)",
         cte_name,
-        source_ref(&ins.target),
+        target_ref(&ins.target),
         cols.join(", "),
         values.join(", "),
         ids_name,
@@ -1954,6 +2049,10 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
             cardinality: Cardinality::Optional,
             pointers: prepend_type(nodes),
         };
+    }
+    // A walk landing on one object: `(select … limit 1).latest_data { … }`.
+    if matches!(expr, IrExpr::ObjectPathSubquery(_) | IrExpr::ObjectPathUnion { .. }) {
+        return expr_shape_node(name, position, expr);
     }
     // A set of objects keeps its rows' own shape, as it does on a schema
     // shape; described as a scalar, each row hydrates as a bare tuple.
@@ -2993,7 +3092,7 @@ fn emit_for_update(
             qi(iter_alias),
             qi(ITER_COL),
             new_cols,
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
             qi(iter_alias),
         );
@@ -3061,7 +3160,7 @@ fn emit_for_update(
     let mut sql = format!(
         "WITH {}\nUPDATE {} AS {}\nSET {}\nFROM {}",
         cte_parts.join(",\n"),
-        source_ref(&upd.target),
+        target_ref(&upd.target),
         qi(alias),
         sets.join(", "),
         qi(iter_alias),
@@ -3117,7 +3216,7 @@ fn emit_for_insert(
     let mut sql = format!(
         "WITH {}\nINSERT INTO {} ({})\nSELECT {} FROM {}",
         cte_parts.join(",\n"),
-        source_ref(&ins.target),
+        target_ref(&ins.target),
         cols.join(", "),
         sel_exprs.join(", "),
         qi(iter_alias),
@@ -3297,7 +3396,7 @@ fn emit_insert_row_sql(ins: &IrInsert) -> String {
         };
         return format!(
             "INSERT INTO {}{} SELECT{}{} WHERE {}",
-            source_ref(&ins.target),
+            target_ref(&ins.target),
             column_list,
             projection,
             from_ctes,
@@ -3307,18 +3406,18 @@ fn emit_insert_row_sql(ins: &IrInsert) -> String {
     if cols.is_empty() && ins.nested_ctes.is_empty() {
         // `insert Preferences {}` — a row made entirely of its own defaults.
         // An empty column list is not SQL; `DEFAULT VALUES` is how it is said.
-        format!("INSERT INTO {} DEFAULT VALUES", source_ref(&ins.target))
+        format!("INSERT INTO {} DEFAULT VALUES", target_ref(&ins.target))
     } else if ins.nested_ctes.is_empty() {
         format!(
             "INSERT INTO {} ({}) VALUES ({})",
-            source_ref(&ins.target),
+            target_ref(&ins.target),
             cols.join(", "),
             vals.join(", ")
         )
     } else {
         format!(
             "INSERT INTO {} ({}) SELECT {}{}",
-            source_ref(&ins.target),
+            target_ref(&ins.target),
             cols.join(", "),
             vals.join(", "),
             nested_cte_from(&ins.nested_ctes, &vals.join(","), " "),
@@ -3482,7 +3581,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
             sets.join(", "),
         );
@@ -3513,7 +3612,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "    UPDATE {} AS {}\n    SET {}",
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
             sets.join(", "),
         );
@@ -3563,7 +3662,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
         let mut upd_sql = format!(
             "UPDATE {} AS {}\nSET {}",
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
             sets.join(", "),
         );
@@ -3575,7 +3674,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         let mut sel = format!(
             "SELECT {}.* FROM {} AS {}",
             qi(alias),
-            source_ref(&upd.target),
+            target_ref(&upd.target),
             qi(alias),
         );
         append_filter(&mut sel, &upd.filter);
@@ -3639,7 +3738,7 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
     let alias = &del.target.alias;
 
     if del.enqueue_search.is_empty() {
-        let mut sql = format!("DELETE FROM {} AS {}", source_ref(&del.target), qi(alias),);
+        let mut sql = format!("DELETE FROM {} AS {}", target_ref(&del.target), qi(alias),);
         append_filter(&mut sql, &del.filter);
         let (shape, returning_sql) = emit_returning_shape(&del.target, &del.returning, true);
         if let Some(r) = returning_sql {
@@ -3653,7 +3752,7 @@ fn emit_delete_stmt(del: &IrDelete) -> SqlOutput {
     }
 
     // Wrap DELETE in a CTE to enqueue OpenSearch delete jobs.
-    let mut del_sql = format!("    DELETE FROM {} AS {}", source_ref(&del.target), qi(alias),);
+    let mut del_sql = format!("    DELETE FROM {} AS {}", target_ref(&del.target), qi(alias),);
     append_filter(&mut del_sql, &del.filter);
     del_sql.push_str("\n    RETURNING \"id\"");
 
@@ -4189,6 +4288,46 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
         where_parts.push(emit_expr(filter));
     }
 
+    if f.single {
+        let mut sql = format!(
+            "(SELECT (\n            {}\n        )\n    {}\n    WHERE {}",
+            row,
+            from_sql,
+            where_parts.join(" AND "),
+        );
+        append_order_by(&mut sql, &sub.order_by);
+        append_offset_limit(&mut sql, &sub.offset, &sub.limit);
+        sql.push(')');
+        let node = ShapeNode::Object {
+            name: f.alias.clone(),
+            type_name: Some(source.type_name.clone()),
+            position: pos,
+            cardinality: Cardinality::Optional,
+            pointers: prepend_type(sub_nodes),
+        };
+        return (sql, node);
+    }
+
+    if f.single {
+        let mut sql = format!(
+            "(SELECT (\n            {}\n        )\n    {}\n    WHERE {}",
+            row,
+            from_sql,
+            where_parts.join(" AND "),
+        );
+        append_order_by(&mut sql, &sub.order_by);
+        append_offset_limit(&mut sql, &sub.offset, &sub.limit);
+        sql.push(')');
+        let node = ShapeNode::Object {
+            name: f.alias.clone(),
+            type_name: Some(source.type_name.clone()),
+            position: pos,
+            cardinality: Cardinality::Optional,
+            pointers: prepend_type(sub_nodes),
+        };
+        return (sql, node);
+    }
+
     let sql = if sub.limit.is_some() || sub.offset.is_some() {
         // OFFSET/LIMIT cut the *rows* that go into the array, so they can't
         // sit next to the aggregate — the aggregate collapses them to one
@@ -4326,6 +4465,24 @@ fn emit_sort_clause(s: &IrSort) -> String {
 }
 
 // ── Expression emission ─────────────────────────────────────────────────────
+
+/// One side of `a intersect b` as the rows of the set it stands for: an
+/// array's elements, a binding's rows, else the single value.
+fn set_operand(expr: &IrExpr) -> String {
+    match expr {
+        IrExpr::ArrayFromSelect(_) => format!("SELECT unnest({})", emit_expr(expr)),
+        IrExpr::CteRef { name, scalar, .. } => {
+            format!("SELECT {} FROM {}", if *scalar { "\"v\"" } else { "\"id\"" }, qi(name))
+        }
+        _ => format!("SELECT {}", emit_expr(expr)),
+    }
+}
+
+/// `emit_expr`, reading the types with subtypes through `fanouts` the way
+/// `emit` does — see `IrOutput::subtype_fanouts`.
+pub fn emit_expr_with_fanouts(expr: &IrExpr, fanouts: &HashMap<(String, String), IrPolyFanout>) -> String {
+    with_subtype_fanouts(fanouts, || emit_expr(expr))
+}
 
 pub fn emit_expr(expr: &IrExpr) -> String {
     match expr {
@@ -4487,7 +4644,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         }
 
         IrExpr::SetOp { op, left, right, mode } => {
-            let set = format!("(SELECT {}) {} (SELECT {})", emit_expr(left), op.sql(), emit_expr(right));
+            let set = format!("({}) {} ({})", set_operand(left), op.sql(), set_operand(right));
             match mode {
                 crate::ir::SetOpMode::Exists => format!("EXISTS({set})"),
                 crate::ir::SetOpMode::Array => format!("ARRAY({set})"),
@@ -5078,6 +5235,10 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
 /// For everything else (object functions, non-scalar free selects) emits a
 /// full `SELECT … FROM …` via `emit_dml_as_cte_source`.
 pub fn emit_fn_body(ir: &crate::ir::IrOutput) -> String {
+    with_subtype_fanouts(&ir.subtype_fanouts, || emit_output_fn_body(ir))
+}
+
+fn emit_output_fn_body(ir: &crate::ir::IrOutput) -> String {
     let body = match &ir.stmt {
         IrStmt::Select(sel) if matches!(sel.rows.as_slice(), [IrRowSource::Free(IrFreeExpr::Scalar(_))]) => {
             let IrRowSource::Free(IrFreeExpr::Scalar(e)) = &sel.rows[0] else {
@@ -5158,6 +5319,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![
                         PropertyDescriptor {
                             name: "id".into(),
@@ -5245,6 +5407,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![PropertyDescriptor {
                         name: "name".into(),
                         pg_type: "text".into(),
@@ -5281,6 +5444,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![PropertyDescriptor {
                         name: "title".into(),
                         pg_type: "text".into(),
@@ -5328,6 +5492,99 @@ mod tests {
         let ast = parse::parse(query).expect("parse failed");
         let ir = ir::compile(&ast, schema).expect("IR compile failed");
         emit(&ir)
+    }
+
+    #[test]
+    fn a_nested_read_inside_a_with_opens_no_second_with() {
+        let out = compile_and_emit_with(
+            "WITH a := (SELECT Person FILTER .age > 1), b := (SELECT Person LIMIT 1) SELECT (SELECT (a UNION b))",
+            &make_schema(),
+        );
+        assert_eq!(out.sql.matches("WITH").count(), 1, "{}", out.sql);
+    }
+
+    #[test]
+    fn an_aggregate_over_a_backlink_counts_inside_a_subquery() {
+        let out = compile_and_emit_with("SELECT Post { n := count(.<posts) }", &make_schema());
+        assert!(!out.sql.contains("count((SELECT"), "an aggregate over a scalar subquery:\n{}", out.sql);
+        assert!(out.sql.contains("count("), "{}", out.sql);
+    }
+
+    #[test]
+    fn any_over_a_link_type_check_tests_each_element() {
+        let out = compile_and_emit_with(
+            "SELECT Company { name } FILTER any(.<company.posts IS Post)",
+            &make_schema(),
+        );
+        assert!(!out.sql.contains("bool_or(ARRAY"), "an aggregate over outer rows:\n{}", out.sql);
+        assert!(out.sql.contains("FROM unnest(ARRAY(SELECT ('default::Post' = 'default::Post')"), "{}", out.sql);
+    }
+
+    #[test]
+    fn a_link_type_check_reads_the_linked_object() {
+        let out = compile_and_emit_with("SELECT Person { name } FILTER .company IS Company", &make_schema());
+        assert!(!out.sql.contains("WHERE FALSE"), "{}", out.sql);
+        assert!(out.sql.contains("'default::Company'"), "{}", out.sql);
+    }
+
+    /// `make_schema` with an `Admin` extending `Person`, in a table of its own.
+    fn schema_with_a_subtype() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        let mut admin = schema.types[0].clone();
+        admin.name = "Admin".into();
+        admin.table = "Admin".into();
+        admin.bases = vec!["default::Person".into()];
+        schema.types.push(admin);
+        schema
+    }
+
+    #[test]
+    fn a_type_with_subtypes_reads_their_rows_too() {
+        let out = compile_and_emit_with("SELECT Person { name }", &schema_with_a_subtype());
+        assert!(
+            out.sql.contains("'default::Admin'::text AS \"__type__\"") && out.sql.contains("FROM \"public\".\"Admin\""),
+            "expected the subtype's table in the read:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_path_from_a_type_with_subtypes_reads_their_rows_too() {
+        let out = compile_and_emit_with("SELECT Person.name", &schema_with_a_subtype());
+        assert!(out.sql.contains("FROM \"public\".\"Admin\""), "{}", out.sql);
+    }
+
+    #[test]
+    fn a_multilink_of_a_type_with_subtypes_reads_their_junctions_too() {
+        let out = compile_and_emit_with("SELECT Person { posts: { title } }", &schema_with_a_subtype());
+        assert!(
+            out.sql.contains(
+                "(SELECT \"source\", \"target\" FROM \"public\".\"Person.posts\" UNION ALL \
+                 SELECT \"source\", \"target\" FROM \"public\".\"Admin.posts\")"
+            ),
+            "expected the junctions unioned:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn is_a_supertype_matches_its_subtypes() {
+        let out = compile_and_emit_with(
+            "SELECT Person { name } FILTER Person IS Admin",
+            &schema_with_a_subtype(),
+        );
+        assert!(out.sql.contains("\"__type__\" = 'default::Admin'"), "{}", out.sql);
+    }
+
+    #[test]
+    fn a_write_to_a_type_with_subtypes_reaches_their_tables() {
+        let out = compile_and_emit_with("UPDATE Person SET { age := 1 }", &schema_with_a_subtype());
+        assert!(
+            out.sql.contains("UPDATE \"public\".\"Person\"") && out.sql.contains("UPDATE \"public\".\"Admin\""),
+            "expected both tables updated:\n{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("UPDATE (\n"), "a write never targets the union:\n{}", out.sql);
     }
 
     #[test]
@@ -6576,6 +6833,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: individual.properties[..1].to_vec(),
             links: vec![],
             multilinks: vec![],
@@ -7046,6 +7304,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop()],
                     links: vec![],
                     multilinks: vec![],
@@ -7068,6 +7327,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec!["default::Account".into()],
+                    bases: vec![],
                     properties: vec![id_prop()],
                     links: vec![],
                     multilinks: vec![],
@@ -7655,18 +7915,17 @@ mod tests {
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!()
         };
-        // Named after the pointer, not after the link it selects from.
-        let ShapeNode::Array { name, element, .. } = &pointers[1] else {
+        // Named after the pointer, not after the link it selects from, and
+        // one object: `limit 1` makes the sub-select at most one row.
+        let ShapeNode::Object {
+            name,
+            pointers: elem_pointers,
+            ..
+        } = &pointers[1]
+        else {
             panic!("{:?}", pointers[1])
         };
         assert_eq!(name, "recent");
-        let ShapeNode::Object {
-            pointers: elem_pointers,
-            ..
-        } = element.as_ref()
-        else {
-            panic!()
-        };
         assert!(matches!(&elem_pointers[1], ShapeNode::Scalar { name, .. } if name == "title"));
         assert!(out.sql.contains("\"jt\".source = \"t0\".id"), "{}", out.sql);
         assert!(out.sql.contains("LIMIT 1"), "{}", out.sql);
@@ -7960,6 +8219,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: individual.properties[..1].to_vec(),
             // Targets the *interface*, which `Individual` implements.
             links: vec![LinkDescriptor {
@@ -8335,7 +8595,7 @@ mod tests {
         };
         // A declared computed gets the same treatment as one written inline:
         // object-valued when it selects a link, scalar when it projects one.
-        assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "recent"));
+        assert!(matches!(&pointers[1], ShapeNode::Object { name, .. } if name == "recent"));
         assert!(matches!(&pointers[2], ShapeNode::Scalar { name, .. } if name == "recent_title"));
         assert!(out.sql.contains("\"jt\".source = \"t0\".id"), "{}", out.sql);
         assert_eq!(out.sql.matches("LIMIT 1").count(), 2, "{}", out.sql);
@@ -8399,6 +8659,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![MultiLinkDescriptor {
@@ -8429,6 +8690,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop()],
                     links: vec![
                         LinkDescriptor {
@@ -8558,6 +8820,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![LinkDescriptor {
                         name: "spouse".into(),
@@ -8591,6 +8854,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![],
@@ -8613,6 +8877,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![
                         id_prop(),
                         PropertyDescriptor {
@@ -8874,6 +9139,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![MultiLinkDescriptor {
@@ -8904,6 +9170,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), name_prop()],
                     links: vec![],
                     multilinks: vec![],
@@ -8926,6 +9193,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![
                         id_prop(),
                         PropertyDescriptor {
@@ -10031,126 +10299,59 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
-    fn test_insert_rewrite_injected() {
-        let schema = make_schema_with_rewrite();
-        let out = compile_and_emit_with("INSERT Person { name := $name, age := 30 }", &schema);
-        // slug should appear in the INSERT column list via the rewrite
-        assert!(out.sql.contains("\"slug\""));
-        // The rewrite expression str_lower($1) should appear in VALUES
-        assert!(out.sql.contains("lower("));
-        // $1 (name param) should be the arg
-        assert!(out.sql.contains("$1"));
+    fn a_link_assigned_from_a_select_keeps_its_clauses() {
+        let out = compile_and_emit("INSERT Person { name := 'a', age := 1, company := (SELECT Company ORDER BY .name LIMIT 1) }");
+        assert!(out.sql.contains("ORDER BY") && out.sql.contains("LIMIT 1"), "{}", out.sql);
     }
 
     #[test]
-    fn test_insert_rewrite_overrides_explicit_assignment() {
+    fn a_rewrite_leaves_the_statement_alone() {
+        // It runs in the table's own `BEFORE` trigger, on the row as written.
         let schema = make_schema_with_rewrite();
-        // User explicitly assigns slug — rewrite should win (user assignment dropped)
-        let out = compile_and_emit_with("INSERT Person { name := $name, age := 30, slug := 'manual' }", &schema);
-        // The literal 'manual' must NOT appear — rewrite wins
-        assert!(
-            !out.sql.contains("'manual'"),
-            "rewrite must override explicit slug assignment"
-        );
-        // The rewrite expression must appear
-        assert!(out.sql.contains("lower("), "rewrite expression must be present");
+        for query in [
+            "INSERT Person { name := $name, age := 30 }",
+            "UPDATE Person FILTER .id = $id SET { name := $name }",
+        ] {
+            let out = compile_and_emit_with(query, &schema);
+            assert!(!out.sql.contains("\"slug\""), "{}", out.sql);
+        }
     }
 
     #[test]
-    fn test_update_rewrite_in_set_clause() {
+    fn a_rewrite_reads_the_row_being_written() {
         let schema = make_schema_with_rewrite();
-        let out = compile_and_emit_with("UPDATE Person FILTER .id = $id SET { name := $name }", &schema);
-        assert!(out.sql.contains("SET"));
-        assert!(out.sql.contains("\"slug\""));
-        // Rewrite references .name which is also being SET to $name ($2).
-        // After substitute_col_refs, the rewrite should use $2, not the pre-update column.
-        // $1 = id (filter), $2 = name (assignment)
-        assert!(
-            out.sql.contains("lower($2)"),
-            "rewrite must use new name value ($2), got:\n{}",
-            out.sql
-        );
-        assert!(
-            !out.sql.contains("lower(\"t0\".\"name\")"),
-            "rewrite must not use pre-update column ref"
-        );
+        let assignments = crate::ir::compile_rewrite_assignments("default::Person", 1, &schema).unwrap();
+        let [assignment] = assignments.as_slice() else {
+            panic!("one rewrite on insert")
+        };
+        assert_eq!(assignment.column, "slug");
+        assert!(assignment.sql.contains("NEW.\"name\""), "{}", assignment.sql);
     }
 
     #[test]
-    fn test_update_rewrite_unrelated_property_uses_row_value() {
-        // If the rewrite references a property NOT being SET, it should read
-        // the current row value (ColumnRef), not a parameter.
-        let schema = make_schema_with_rewrite();
-        // SET age only — slug rewrite references .name which is NOT being SET.
-        let out = compile_and_emit_with("UPDATE Person FILTER .id = $id SET { age := $age }", &schema);
-        assert!(out.sql.contains("\"slug\""));
-        // .name is not being SET, so rewrite sees the current row value.
-        assert!(
-            out.sql.contains("lower(\"t0\".\"name\")"),
-            "rewrite must use current row value when name is not being SET, got:\n{}",
-            out.sql
-        );
+    fn rewrites_become_before_triggers() {
+        let ddl = crate::export::export_schema(&make_schema_with_rewrite()).unwrap();
+        for event in ["BEFORE INSERT", "BEFORE UPDATE"] {
+            assert!(ddl.contains(&format!("{event} ON \"public\".\"Person\"")), "{event}:\n{ddl}");
+        }
+        assert!(ddl.contains("NEW.\"slug\" := _pylon_rewrites.\"v0\";"), "{ddl}");
     }
 
     #[test]
-    fn test_update_rewrite_overrides_explicit_assignment_to_same_column() {
-        // Regression: every UPDATE emission site independently lacked the
-        // INSERT-side dedup (`rewrite_cols` filtering `ins.assignments`) —
-        // an UPDATE explicitly assigning a column that also has its own
-        // rewrite produced two `SET "col" = ...` entries for the same
-        // column, which Postgres rejects with "multiple assignments to
-        // same column" (confirmed live against a real database).
-        let schema = make_schema_with_rewrite();
-        let out = compile_and_emit_with(
-            "UPDATE Person FILTER .id = $id SET { name := $name, slug := 'manual' }",
-            &schema,
-        );
-        let set_count = out.sql.matches("\"slug\" =").count();
-        assert_eq!(set_count, 1, "slug must appear exactly once in SET, got:\n{}", out.sql);
-        assert!(
-            !out.sql.contains("'manual'"),
-            "rewrite must override explicit slug assignment, got:\n{}",
-            out.sql
-        );
-        assert!(
-            out.sql.contains("lower("),
-            "rewrite expression must be present, got:\n{}",
-            out.sql
-        );
-    }
-
-    #[test]
-    fn test_insert_rewrite_self_reference_falls_back_to_default_sql() {
-        // Regression: a property with both a Default(...) and an INSERT
-        // rewrite that reads its own value (`.name`) — when the property
-        // isn't explicitly assigned, its self-reference used to compile to
-        // a bare `"t0"."name"` ColumnRef, which has no FROM-clause to
-        // resolve against inside a plain `INSERT ... VALUES (...)`
-        // (confirmed live: "missing FROM-clause entry for table t0").
-        // `.name` must fall back to the property's own `default_sql`
-        // instead — the same value Postgres's column DEFAULT would have
-        // produced.
+    fn a_rewrite_walking_a_link_starts_from_the_new_row() {
+        // The row is not in its table yet when a `BEFORE INSERT` trigger runs.
         use crate::schema::RewriteEntry;
-        let mut schema = make_schema();
+        let mut schema = make_schema_with_rewrite();
         let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
-        let name_prop = person.properties.iter_mut().find(|p| p.name == "name").unwrap();
-        name_prop.default_sql = Some("'untitled'".into());
-        name_prop.rewrites = vec![RewriteEntry {
+        let slug = person.properties.iter_mut().find(|p| p.name == "slug").unwrap();
+        slug.rewrites = vec![RewriteEntry {
             on: 1,
-            handler: ".name ++ ' (new)'".into(),
+            handler: "<str>(.company is Company) ++ .company.name".into(),
         }];
-
-        let out = compile_and_emit_with("INSERT Person { age := 30 }", &schema);
-        assert!(
-            !out.sql.contains("\"t0\""),
-            "must not reference a nonexistent table alias, got:\n{}",
-            out.sql
-        );
-        assert!(
-            out.sql.contains("'untitled'"),
-            "must fall back to the property's own default_sql, got:\n{}",
-            out.sql
-        );
+        let assignments = crate::ir::compile_rewrite_assignments("default::Person", 1, &schema).unwrap();
+        let sql = &assignments[0].sql;
+        assert!(!sql.contains("\"public\".\"Person\""), "{sql}");
+        assert!(sql.contains("(SELECT (NEW).*)") && sql.contains("NEW.\"company_id\""), "{sql}");
     }
 
     #[test]
@@ -10419,6 +10620,7 @@ select owner { posts := (select owner.posts.title) };",
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), text_prop("name")],
                     links: vec![],
                     multilinks: vec![],
@@ -10441,6 +10643,7 @@ select owner { posts := (select owner.posts.title) };",
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![id_prop(), text_prop("email")],
                     links: vec![company_link()],
                     multilinks: vec![],
@@ -10463,6 +10666,7 @@ select owner { posts := (select owner.posts.title) };",
                     description: None,
                     parents: vec![],
                     interfaces: vec!["default::Account".into()],
+                    bases: vec![],
                     properties: vec![id_prop(), text_prop("email"), text_prop("first_name")],
                     links: vec![company_link()],
                     multilinks: vec![],
@@ -10524,6 +10728,23 @@ select owner { posts := (select owner.posts.title) };",
             "the backlink must read the type that declares it:\n{}",
             out.sql
         );
+    }
+
+    #[test]
+    fn a_path_through_a_backlink_narrowed_to_a_supertype() {
+        let mut schema = interface_link_schema();
+        schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Account")
+            .expect("the helper declares Account")
+            .links
+            .clear();
+        let out = compile_and_emit_with(
+            "SELECT Company { name } FILTER EXISTS (SELECT .<company[is Account])",
+            &schema,
+        );
+        assert!(out.sql.contains("\"public\".\"Individual\""), "{}", out.sql);
     }
 
     /// Company, the Account interface, its Individual implementor and a
@@ -10599,6 +10820,7 @@ select owner { posts := (select owner.posts.title) };",
                 description: None,
                 parents: vec![],
                 interfaces,
+                bases: vec![],
                 properties,
                 links,
                 multilinks: vec![],
@@ -10707,6 +10929,7 @@ select owner { posts := (select owner.posts.title) };",
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![
                         id_prop(),
                         PropertyDescriptor {
@@ -10746,6 +10969,7 @@ select owner { posts := (select owner.posts.title) };",
                     description: None,
                     parents: vec![],
                     interfaces: vec!["default::Account".into()],
+                    bases: vec![],
                     properties: vec![
                         id_prop(),
                         PropertyDescriptor {
@@ -11075,6 +11299,7 @@ select owner { posts := (select owner.posts.title) };",
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![],
             links: vec![LinkDescriptor {
                 name: "owner".into(),
@@ -11151,6 +11376,7 @@ select owner { posts := (select owner.posts.title) };",
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![],
             links: vec![LinkDescriptor {
                 name: "owner".into(),
@@ -12425,6 +12651,7 @@ select owner { posts := (select owner.posts.title) };",
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![PropertyDescriptor {
                     name: "address".into(),
                     pg_type: "jsonb".into(),
@@ -12514,6 +12741,7 @@ select owner { posts := (select owner.posts.title) };",
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![PropertyDescriptor {
                     name: "address".into(),
                     pg_type: "jsonb".into(),
@@ -12584,6 +12812,7 @@ select owner { posts := (select owner.posts.title) };",
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![PropertyDescriptor {
                     name: "address".into(),
                     pg_type: "jsonb".into(),

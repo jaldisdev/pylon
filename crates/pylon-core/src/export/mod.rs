@@ -410,11 +410,14 @@ fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
 /// at all; their deletion policy is enforced by the per-implementor triggers
 /// `interface_link_trigger_infos` builds instead.
 pub(crate) fn polymorphic_types(schema: &SchemaDescriptor) -> HashSet<String> {
+    let extended: HashSet<&str> = schema.types.iter().flat_map(|t| t.bases.iter().map(String::as_str)).collect();
     schema
         .types
         .iter()
-        .filter(|t| t.abstract_ && t.materialized)
         .map(|t| format!("{}::{}", t.module, t.name))
+        .zip(&schema.types)
+        .filter(|(qname, t)| (t.abstract_ && t.materialized) || extended.contains(qname.as_str()))
+        .map(|(qname, _)| qname)
         .collect()
 }
 
@@ -427,6 +430,18 @@ pub(crate) fn interface_implementors(schema: &SchemaDescriptor) -> HashMap<Strin
         if !t.abstract_ {
             for iface in &t.interfaces {
                 implementors.entry(iface.clone()).or_default().push(t);
+            }
+        }
+    }
+    // A concrete type with subtypes spans its own table and theirs.
+    for t in &schema.types {
+        for base in &t.bases {
+            if let Some(base_td) = schema.types.iter().find(|b| format!("{}::{}", b.module, b.name) == *base) {
+                let entry = implementors.entry(base.clone()).or_default();
+                if entry.is_empty() {
+                    entry.push(base_td);
+                }
+                entry.push(t);
             }
         }
     }
@@ -1627,9 +1642,18 @@ fn trigger_return_statement(timing: &str, on: u8) -> &'static str {
 /// its owning table and its own content — shared by `user_trigger_infos`
 /// (which needs it to build DDL) and `user_trigger_names` (which needs
 /// only the name, not the DDL, and stays infallible because of it).
-fn trigger_ddl_name(table: &str, trig: &crate::schema::TriggerDescriptor) -> String {
-    let hash = fnv(&[table, &trig.on.to_string(), trig.timing.as_str(), trig.handler.as_str()]);
+fn trigger_ddl_name(table: &str, trig: &crate::schema::TriggerDescriptor, body_sql: &str) -> String {
+    // The compiled body is part of the name, so a handler Pylon now compiles
+    // differently replaces the trigger rather than keeping the old one.
+    let hash = fnv(&[table, &trig.on.to_string(), trig.timing.as_str(), trig.handler.as_str(), body_sql]);
     format!("{table}_{}", &hash[..12])
+}
+
+/// The body a trigger's name is derived from. A handler that does not
+/// compile falls back to its own text here; `user_trigger_infos` reports the
+/// error when it builds the DDL.
+fn trigger_name_body(trig: &crate::schema::TriggerDescriptor, type_name: &str, schema: &SchemaDescriptor) -> String {
+    crate::query::compile_trigger_handler(&trig.handler, type_name, trig.on, schema).unwrap_or_else(|_| trig.handler.clone())
 }
 
 /// Just the `(module, table, trigger_name)` every user-declared `Trigger`
@@ -1643,11 +1667,115 @@ pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, Str
         if t.abstract_ || t.junction {
             continue;
         }
+        let type_name = format!("{}::{}", t.module, t.name);
         for trig in &t.triggers {
-            result.push((t.module.clone(), t.table.clone(), trigger_ddl_name(&t.table, trig)));
+            let body = trigger_name_body(trig, &type_name, schema);
+            result.push((t.module.clone(), t.table.clone(), trigger_ddl_name(&t.table, trig, &body)));
+        }
+        for (on, _) in REWRITE_EVENTS {
+            if let Some(name) = rewrite_trigger_name(t, on, schema) {
+                result.push((t.module.clone(), t.table.clone(), name));
+            }
         }
     }
     result
+}
+
+/// The events a rewrite applies on, and the trigger event it becomes.
+const REWRITE_EVENTS: [(u8, &str); 2] = [(1, "INSERT"), (2, "UPDATE")];
+
+/// The name of the `BEFORE` trigger applying `t`'s rewrites on `on`, or
+/// `None` when it has none — derived from the rewrites themselves, so
+/// editing one replaces the trigger.
+fn rewrite_trigger_name(t: &TypeDescriptor, on: u8, schema: &SchemaDescriptor) -> Option<String> {
+    let handlers: Vec<String> = t
+        .properties
+        .iter()
+        .map(|p| (&p.name, &p.rewrites))
+        .chain(t.links.iter().map(|l| (&l.name, &l.rewrites)))
+        .flat_map(|(name, rewrites)| {
+            rewrites
+                .iter()
+                .filter(move |rw| rw.on & on != 0)
+                .map(move |rw| format!("{name}:{}", rw.handler))
+        })
+        .collect();
+    if handlers.is_empty() {
+        return None;
+    }
+    let event = if on == 1 { "ins" } else { "upd" };
+    // As for `trigger_ddl_name`: the compiled SQL too, when it compiles.
+    let compiled = crate::ir::compile_rewrite_assignments(&format!("{}::{}", t.module, t.name), on, schema)
+        .map(|assignments| assignments.into_iter().map(|a| a.sql).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default();
+    let hash = fnv(&[&t.table, event, &handlers.join("\n"), &compiled]);
+    Some(format!("{}_rw_{event}_{}", t.table, &hash[..12]))
+}
+
+/// The `BEFORE INSERT`/`BEFORE UPDATE` triggers applying each type's
+/// rewrites to the row being written — the row with every value the
+/// statement gave it, which a rewrite compiled into the statement itself
+/// cannot see (an insert has no row yet to walk a link from).
+fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTriggerInfo>, PyQLError> {
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if t.abstract_ || t.junction {
+            continue;
+        }
+        let type_name = format!("{}::{}", t.module, t.name);
+        for (on, event) in REWRITE_EVENTS {
+            let Some(fname) = rewrite_trigger_name(t, on, schema) else { continue };
+            let assignments = crate::ir::compile_rewrite_assignments(&type_name, on, schema).map_err(|e| {
+                PyQLError::Fragment(PyQLFragmentError {
+                    message: format!("error in a rewrite of '{type_name}': {e}"),
+                    context: type_name.clone(),
+                    position: crate::error::Position { line: 0, col: 0 },
+                })
+            })?;
+            if assignments.is_empty() {
+                continue;
+            }
+            let values = assignments
+                .iter()
+                .enumerate()
+                .map(|(i, assignment)| format!("{} AS \"v{i}\"", assignment.sql))
+                .collect::<Vec<_>>()
+                .join(",\n\t\t");
+            let sets = assignments
+                .iter()
+                .enumerate()
+                .map(|(i, assignment)| format!("\tNEW.{} := _pylon_rewrites.\"v{i}\";", qi(&assignment.column)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let fn_qname = qn(&t.module, &fname);
+            let table_qname = qn(&t.module, &t.table);
+            let globals_arg = qi(crate::ir::GLOBALS_ARG);
+            let ddl = format!(
+                "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+                 RETURNS trigger LANGUAGE plpgsql AS $$\n\
+                 DECLARE\n\
+                 \t_pylon_rewrites record;\n\
+                 \t{globals_arg} jsonb := nullif(current_setting('pylon.globals', true), '')::jsonb;\n\
+                 BEGIN\n\
+                 \tSELECT {values} INTO _pylon_rewrites;\n\
+                 {sets}\n\
+                 \tRETURN NEW;\n\
+                 END;\n\
+                 $$;\n\n\
+                 CREATE OR REPLACE TRIGGER {}\n\
+                 BEFORE {event} ON {table_qname}\n\
+                 FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n",
+                qi(&fname),
+            );
+            result.push(DeletionTriggerInfo {
+                table_module: t.module.clone(),
+                table_name: t.table.clone(),
+                trigger_name: fname,
+                ddl,
+            });
+        }
+    }
+    Ok(result)
 }
 
 /// One `CREATE FUNCTION` + `CREATE TRIGGER` pair per user-declared schema
@@ -1665,7 +1793,7 @@ pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, Str
 /// _pylon_trigger_result` to swallow it — a non-`STRICT` `INTO` is fine
 /// with any row count (0, 1, or many), matching "fire and forget" exactly.
 pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTriggerInfo>, PyQLError> {
-    let mut result = Vec::new();
+    let mut result = rewrite_trigger_infos(schema)?;
     for t in &schema.types {
         if t.abstract_ || t.junction {
             continue;
@@ -1674,7 +1802,7 @@ pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigg
         let type_name = format!("{}::{}", t.module, t.name);
 
         for trig in &t.triggers {
-            let fname = trigger_ddl_name(&t.table, trig);
+            let fname = trigger_ddl_name(&t.table, trig, &trigger_name_body(trig, &type_name, schema));
             let fn_qname = qn(&t.module, &fname);
             let events = trigger_events(trig.on);
             let timing = trigger_timing(&trig.timing);
@@ -1690,12 +1818,14 @@ pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigg
                     })
                 })?;
             let body_sql = body_sql.trim_end_matches(';');
+            let globals_arg = qi(crate::ir::GLOBALS_ARG);
 
             let ddl = format!(
                 "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
                  RETURNS trigger LANGUAGE plpgsql AS $$\n\
                  DECLARE\n\
                  \t_pylon_trigger_result record;\n\
+                 \t{globals_arg} jsonb := nullif(current_setting('pylon.globals', true), '')::jsonb;\n\
                  BEGIN\n\
                  {body_sql} INTO _pylon_trigger_result;\n\
                  {return_stmt}\n\
@@ -1952,10 +2082,26 @@ fn make_excl_info(
     fields: &[String],
     columns: &[String],
     impl_t: &TypeDescriptor,
+    impls: &[&TypeDescriptor],
 ) -> ExclTriggerInfo {
     let fn_name = excl_fn_name(&iface.table, fields);
     let fn_qname = format!("{}.{}", pg_schema(&iface.module), qi(&fn_name));
-    let view_qname = qn(&iface.module, &iface.table);
+    // A concrete type with subtypes has no view spanning them to check against.
+    let view_qname = if iface.abstract_ {
+        qn(&iface.module, &iface.table)
+    } else {
+        let spanned_columns = std::iter::once("id".to_string())
+            .chain(columns.iter().cloned())
+            .map(|c| qi(&c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let branches = impls
+            .iter()
+            .map(|t| format!("SELECT {spanned_columns} FROM {}", qn(&t.module, &t.table)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        format!("({branches}) AS \"_spanned\"")
+    };
     let tbl_qname = qn(&impl_t.module, &impl_t.table);
 
     let field_conds: Vec<String> = columns.iter().map(|c| format!("{} = NEW.{}", qi(c), qi(c))).collect();
@@ -2106,37 +2252,48 @@ fn make_excl_junction_info(iface: &TypeDescriptor, link_name: &str, impl_t: &Typ
 /// The same `fn_name` may appear multiple times (once per implementor); callers should
 /// deduplicate when emitting `CREATE OR REPLACE FUNCTION`.
 pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclTriggerInfo> {
-    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
-    for t in &schema.types {
-        if !t.abstract_ {
-            for iface in &t.interfaces {
-                implementors.entry(iface.clone()).or_default().push(t);
-            }
-        }
-    }
+    let implementors = interface_implementors(schema);
 
     let mut result = Vec::new();
     for t in &schema.types {
-        if !(t.abstract_ && t.materialized) {
+        let key = format!("{}::{}", t.module, t.name);
+        let spans_subtypes = !t.abstract_ && schema.types.iter().any(|sub| sub.bases.contains(&key));
+        if !(spans_subtypes || t.abstract_ && t.materialized) {
             continue;
         }
-        let key = format!("{}::{}", t.module, t.name);
         let Some(impls) = implementors.get(&key) else { continue };
         if impls.is_empty() {
             continue;
         }
+        // A concrete base's interfaces already span its subtypes for the
+        // pointers they declare.
+        let interfaces: Vec<&TypeDescriptor> = if t.abstract_ {
+            vec![]
+        } else {
+            schema
+                .types
+                .iter()
+                .filter(|i| i.abstract_ && i.materialized && t.interfaces.contains(&format!("{}::{}", i.module, i.name)))
+                .collect()
+        };
+        let declared_by_interface = |name: &str| {
+            interfaces.iter().any(|i| {
+                i.properties.iter().any(|p| p.name == name && p.is_exclusive)
+                    || i.links.iter().any(|l| l.name == name && l.is_exclusive)
+            })
+        };
 
         for p in &t.properties {
-            if !p.is_exclusive || p.is_pk {
+            if !p.is_exclusive || p.is_pk || declared_by_interface(&p.name) {
                 continue;
             }
             let fields = vec![p.name.clone()];
             for impl_t in impls {
-                result.push(make_excl_info(t, &fields, &fields, impl_t));
+                result.push(make_excl_info(t, &fields, &fields, impl_t, impls));
             }
         }
         for l in &t.links {
-            if !l.is_exclusive {
+            if !l.is_exclusive || declared_by_interface(&l.name) {
                 continue;
             }
             // A junction-backed exclusive link has no `{name}_id` column
@@ -2155,14 +2312,22 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             }
             let fields = vec![format!("{}_id", l.name)];
             for impl_t in impls {
-                result.push(make_excl_info(t, &fields, &fields, impl_t));
+                result.push(make_excl_info(t, &fields, &fields, impl_t, impls));
             }
         }
         for c in &t.constraints {
             if let TypeConstraint::Exclusive { pointers: fields, .. } = c {
+                let from_interface = interfaces.iter().any(|i| {
+                    i.constraints
+                        .iter()
+                        .any(|ic| matches!(ic, TypeConstraint::Exclusive { pointers, .. } if pointers == fields))
+                });
+                if from_interface {
+                    continue;
+                }
                 let columns: Vec<String> = fields.iter().map(|f| constraint_column(t, f)).collect();
                 for impl_t in impls {
-                    result.push(make_excl_info(t, fields, &columns, impl_t));
+                    result.push(make_excl_info(t, fields, &columns, impl_t, impls));
                 }
             }
         }
@@ -2220,7 +2385,21 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
     })?;
 
     // Emit the raw SQL body.
-    let body_sql = emit_fn_body(&ir_output);
+    let mut body_sql = emit_fn_body(&ir_output);
+    // A table can carry columns its type does not declare — a search
+    // index's generated `__search__`, a vector index's embedding — which a
+    // body ending in `SELECT *` hands back too, and Postgres then rejects as
+    // not the declared row. Projecting the declared columns by name keeps the
+    // two in step. A mutation cannot sit in a subquery, so it is left alone.
+    if fd.return_is_object
+        && !matches!(
+            ir_output.stmt,
+            crate::ir::IrStmt::Insert(_) | crate::ir::IrStmt::Update(_) | crate::ir::IrStmt::Delete(_)
+        )
+        && let Some(columns) = fn_return_column_names(fd, schema)
+    {
+        body_sql = format!("SELECT {} FROM (\n    {}\n    ) AS \"_returned\"", columns.join(", "), body_sql);
+    }
 
     // Parameter list: "name" pg_type, ...
     //
@@ -2268,6 +2447,26 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
         vol = volatility_kw,
         body = body_sql,
     ))
+}
+
+/// The quoted column names `emit_fn_return_table` declares, in its order.
+fn fn_return_column_names(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Option<Vec<String>> {
+    let td = schema
+        .types
+        .iter()
+        .find(|t| format!("{}::{}", t.module, t.name) == fd.return_pg_type)?;
+    let mut names: Vec<String> = Vec::new();
+    if fd.return_is_polymorphic {
+        names.push(qi("__type__"));
+    }
+    names.extend(td.properties.iter().map(|p| qi(&p.name)));
+    names.extend(
+        td.links
+            .iter()
+            .filter(|l| !l.is_junction_backed())
+            .map(|l| qi(&format!("{}_id", l.name))),
+    );
+    Some(names)
 }
 
 fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> String {
@@ -2582,6 +2781,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![
                 PropertyDescriptor {
                     name: "id".into(),
@@ -2656,6 +2856,7 @@ mod tests {
                 description: None,
                 parents: vec![],
                 interfaces,
+                bases: vec![],
                 properties: vec![],
                 links: vec![],
                 multilinks: vec![],
@@ -2717,6 +2918,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![],
             links,
             multilinks,
@@ -2765,6 +2967,32 @@ mod tests {
                 "union view misses {}, got:\n{}",
                 implementor,
                 ddl
+            );
+        }
+    }
+
+    /// `interface_schema` with a `Staff` extending `Individual`, and a
+    /// `Session` linking to `Individual`.
+    fn schema_with_a_link_to_a_type_with_subtypes() -> SchemaDescriptor {
+        let mut link = link_to_account("holder", vec![], None);
+        link.target = "default::Individual".into();
+        let mut schema = interface_schema(vec![referencing_type("Session", vec![link], vec![])]);
+        let mut staff = schema.types[1].clone();
+        staff.name = "Staff".into();
+        staff.table = "Staff".into();
+        staff.bases = vec!["default::Individual".into()];
+        schema.types.push(staff);
+        schema
+    }
+
+    #[test]
+    fn a_link_to_a_type_with_subtypes_emits_no_foreign_key() {
+        let ddl = export_schema(&schema_with_a_link_to_a_type_with_subtypes()).unwrap();
+        assert!(!ddl.contains("Session_holder_fkey"), "got:\n{}", ddl);
+        for table in ["Individual", "Staff"] {
+            assert!(
+                ddl.contains(&format!("BEFORE DELETE ON \"public\".\"{table}\"")),
+                "missing enforcement trigger on {table}, got:\n{ddl}"
             );
         }
     }
@@ -3502,6 +3730,7 @@ mod tests {
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![PropertyDescriptor {
                     name: "email".into(),
                     pg_type: "text".into(),
@@ -3570,6 +3799,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![PropertyDescriptor {
                 name: "email".into(),
                 pg_type: "text".into(),
@@ -3780,6 +4010,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![PropertyDescriptor {
                 name: "id".into(),
                 pg_type: "uuid".into(),
@@ -4237,6 +4468,7 @@ mod partition_tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![prop("id", "uuid", true), prop("occurred_at", "timestamptz", false)],
             links: vec![],
             multilinks: vec![],

@@ -61,6 +61,7 @@ fn smoke_schema(module: &str) -> SchemaDescriptor {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![id_prop(), text_prop("name")],
             links: vec![],
             multilinks: vec![],

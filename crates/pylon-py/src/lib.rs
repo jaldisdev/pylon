@@ -869,6 +869,7 @@ impl TypeDescriptor {
         description = None,
         parents = None,
         interfaces = None,
+        bases = None,
         exclusive_constraints = None,
         expression_constraints = None,
         indexes = None,
@@ -892,6 +893,7 @@ impl TypeDescriptor {
         description: Option<String>,
         parents: Option<Vec<String>>,
         interfaces: Option<Vec<String>>,
+        bases: Option<Vec<String>>,
         exclusive_constraints: Option<Vec<PyRef<ExclusiveConstraint>>>,
         expression_constraints: Option<Vec<PyRef<ExpressionConstraint>>>,
         indexes: Option<Vec<PyRef<IndexDescriptor>>>,
@@ -920,6 +922,7 @@ impl TypeDescriptor {
                 description,
                 parents: parents.unwrap_or_default(),
                 interfaces: interfaces.unwrap_or_default(),
+                bases: bases.unwrap_or_default(),
                 properties: properties.iter().map(|p| p.inner.clone()).collect(),
                 links: links.iter().map(|l| l.inner.clone()).collect(),
                 multilinks: multilinks.iter().map(|m| m.inner.clone()).collect(),
@@ -981,6 +984,11 @@ impl TypeDescriptor {
     #[getter]
     fn parents(&self) -> Vec<String> {
         self.inner.parents.clone()
+    }
+
+    #[getter]
+    fn bases(&self) -> Vec<String> {
+        self.inner.bases.clone()
     }
 
     #[getter]

@@ -366,10 +366,13 @@ def _effective_pointers(cls: type) -> dict[str, Any]:
 def _find_pylon_parents(
     cls: type,
     class_to_qname: dict[int, str],
-) -> tuple[list[str], list[str]]:
-    """Return (abstract_parents, interfaces) from the MRO of cls."""
+) -> tuple[list[str], list[str], list[str]]:
+    """Return (abstract_parents, interfaces, concrete bases) from the MRO of
+    cls — the bases nearest first, each a type with a table of its own that
+    this one extends."""
     parents: list[str] = []
     interfaces: list[str] = []
+    bases: list[str] = []
     for base in cls.__mro__[1:]:
         if not _is_pylon_type(base):
             continue
@@ -381,14 +384,17 @@ def _find_pylon_parents(
             interfaces.append(class_to_qname[cls_id])
         elif bcfg.abstract and not bcfg.materialized:
             parents.append(class_to_qname[cls_id])
-    return parents, interfaces
+        elif not bcfg.junction:
+            bases.append(class_to_qname[cls_id])
+    return parents, interfaces, bases
 
 
 def _collect_inherited_cit(cls: type) -> tuple[list[Any], list[Any], list[Any]]:
-    """Collect constraints, indexes, triggers from abstract non-materialized parents.
+    """Collect constraints and indexes from abstract non-materialized parents,
+    and triggers from every parent.
 
-    These have no table of their own, so their DDL-level metadata must propagate
-    to the concrete subtype.
+    The former have no table of their own, so their DDL-level metadata must
+    propagate to the concrete subtype.
     """
     constraints: list[Any] = []
     indexes: list[Any] = []
@@ -400,7 +406,9 @@ def _collect_inherited_cit(cls: type) -> tuple[list[Any], list[Any], list[Any]]:
         if bcfg.abstract and not bcfg.materialized:
             constraints.extend(bcfg.constraints)
             indexes.extend(bcfg.indexes)
-            triggers.extend(bcfg.triggers)
+        # A trigger fires for the rows of every type below the one declaring
+        # it, and each of those has a table of its own to fire it on.
+        triggers.extend(bcfg.triggers)
     return constraints, indexes, triggers
 
 
@@ -1063,7 +1071,7 @@ def _build_type_descriptor(
 
     cfg = cls.__pylon_config__
     effective = _effective_pointers(cls)
-    parents, interfaces = _find_pylon_parents(cls, class_to_qname)
+    parents, interfaces, bases = _find_pylon_parents(cls, class_to_qname)
 
     properties: list[Any] = []
     links: list[Any] = []
@@ -1139,6 +1147,7 @@ def _build_type_descriptor(
         description=cfg.description,
         parents=parents,
         interfaces=interfaces,
+        bases=bases,
         exclusive_constraints=exclusive_constraints,
         expression_constraints=expression_constraints,
         indexes=index_descs,

@@ -34,7 +34,7 @@ use super::{
     IrIfElse, IrInsert,
     IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
     IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer,
+    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRowSource, IrScalarPointer,
     IrScalarSetPointer, IrSelect, IrSessionGlobalCte, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer,
     IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate, IrVectorSearch, SearchEnqueueInfo,
     TupleCastShape, VectorEnqueueInfo,
@@ -86,6 +86,7 @@ pub fn compile_with_config(
         // Merge into a single IrVectorSearch rather than going through the CTE machinery.
         if let Some(ir) = try_compile_vs_with_pattern(&mut c, w)? {
             return Ok(IrOutput {
+                subtype_fanouts: c.subtype_fanouts(),
                 stmt: ir,
                 params: c.params,
                 ctes: vec![],
@@ -97,6 +98,7 @@ pub fn compile_with_config(
         // Special case: `with search := fts::search(…); select search { … } …`
         if let Some(ir) = try_compile_fts_with_pattern(&mut c, w)? {
             return Ok(IrOutput {
+                subtype_fanouts: c.subtype_fanouts(),
                 stmt: ir,
                 params: c.params,
                 ctes: vec![],
@@ -134,6 +136,7 @@ pub fn compile_with_config(
     let mut ctes = ctes;
     ctes.extend(std::mem::take(&mut c.hoisted_ctes));
     Ok(IrOutput {
+        subtype_fanouts: c.subtype_fanouts(),
         stmt: ir,
         params: c.params,
         ctes,
@@ -244,6 +247,34 @@ fn try_compile_fts_with_pattern(c: &mut Compiler<'_>, w: &ast::WithStmt) -> Resu
 /// computed pointers spliced into it contributed. Every join in a path
 /// select is inner, so a spliced computed's filter means the same thing as a
 /// WHERE condition on the whole traversal.
+/// `__subject__.p ?? (insert T { … })` — a rewrite that fills `p` with a new
+/// object when the statement gives it none. The insert has no place in an
+/// expression, so on insert it becomes `p := (insert …)` instead; `None`
+/// for any other rewrite.
+fn subject_default_insert(handler: &str, pointer: &str) -> Option<Expr> {
+    fn holds_insert(expr: &Expr) -> bool {
+        match expr {
+            Expr::SubQuery(stmt) => match stmt.as_ref() {
+                Stmt::Insert(_) => true,
+                Stmt::Select(sel) => holds_insert(&sel.result),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    let Ok(Expr::BinOp(b)) = crate::parse::parse_pointer_expr(handler) else {
+        return None;
+    };
+    let reads_itself = matches!(&b.left, Expr::Path(p) if matches!(p.steps.as_slice(),
+        [ast::PathStep::Name(subject), ast::PathStep::Name(name)] if subject == "__subject__" && name == pointer));
+    (matches!(b.op, ast::BinOpKind::Coalesce) && reads_itself && holds_insert(&b.right)).then_some(b.right)
+}
+
+/// A sub-select's own `limit 1`: what makes it one object rather than a set.
+fn limits_to_one(sel: Option<&ast::SelectStmt>) -> bool {
+    sel.is_some_and(|sel| matches!(sel.limit, Some(Expr::Literal(ast::Literal::Int(1)))))
+}
+
 /// True when a select can yield at most one row: `limit 1`, or a filter that
 /// pins an exclusive property (`.id = …`) in one of its `and`-ed conditions.
 fn selects_at_most_one(sel: &ast::SelectStmt, td: &TypeDescriptor) -> bool {
@@ -348,6 +379,79 @@ fn guarded_object_branch(expr: &Expr) -> Option<Expr> {
     })
 }
 
+/// `.grants.account = a and not .grants.deleted` as the multi-link `grants`
+/// and the condition on one of its elements (`.account = a and not
+/// .deleted`, a bare `.grants` becoming the element's `.id`). `None` unless
+/// every relative path in the condition walks that same multi-link — one
+/// reading the outer row would rebind to the element inside the sub-select —
+/// and the condition holds no sub-statement.
+fn per_element_of_one_multilink(condition: &Expr, td: &TypeDescriptor) -> Option<(Vec<ast::PathStep>, Expr)> {
+    // The steps that reach the elements: a link name, or a backlink with the
+    // type intersection that narrows it (`.<brand[is Assignment]`).
+    fn prefix_len(steps: &[ast::PathStep]) -> Option<usize> {
+        match steps {
+            [ast::PathStep::Name(_), ..] => Some(1),
+            [ast::PathStep::Backlink(_), ast::PathStep::TypeIntersection(_), ..] => Some(2),
+            _ => None,
+        }
+    }
+    fn rewrite(expr: &Expr, link: &mut Option<Vec<ast::PathStep>>) -> Option<Expr> {
+        Some(match expr {
+            Expr::Path(p) if p.partial => {
+                let split = prefix_len(&p.steps)?;
+                let prefix = p.steps[..split].to_vec();
+                if *link.get_or_insert_with(|| prefix.clone()) != prefix {
+                    return None;
+                }
+                // The link itself (`.posts = p`) already compares per element.
+                let rest = p.steps[split..].to_vec();
+                if rest.is_empty() {
+                    return None;
+                }
+                Expr::Path(ast::Path { steps: rest, partial: true })
+            }
+            Expr::Path(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Global(_) => expr.clone(),
+            Expr::BinOp(b) => Expr::BinOp(Box::new(ast::BinOp {
+                left: rewrite(&b.left, link)?,
+                op: b.op.clone(),
+                right: rewrite(&b.right, link)?,
+            })),
+            Expr::UnaryOp(u) => Expr::UnaryOp(Box::new(ast::UnaryOp {
+                op: u.op.clone(),
+                operand: rewrite(&u.operand, link)?,
+            })),
+            Expr::TypeCast(c) => Expr::TypeCast(Box::new(ast::TypeCast {
+                expr: rewrite(&c.expr, link)?,
+                ty: c.ty.clone(),
+            })),
+            Expr::TypeIs { expr, ty } => Expr::TypeIs {
+                expr: Box::new(rewrite(expr, link)?),
+                ty: ty.clone(),
+            },
+            Expr::FunctionCall(f) => Expr::FunctionCall(ast::FunctionCall {
+                module: f.module.clone(),
+                name: f.name.clone(),
+                args: f.args.iter().map(|a| rewrite(a, link)).collect::<Option<_>>()?,
+                kwargs: f
+                    .kwargs
+                    .iter()
+                    .map(|(k, v)| Some((k.clone(), rewrite(v, link)?)))
+                    .collect::<Option<_>>()?,
+            }),
+            _ => return None,
+        })
+    }
+    let mut link = None;
+    let element_condition = rewrite(condition, &mut link)?;
+    let link = link?;
+    let many = match link.first()? {
+        ast::PathStep::Name(name) => td.multilinks.iter().any(|m| &m.name == name),
+        ast::PathStep::Backlink(_) => true,
+        _ => false,
+    };
+    many.then_some((link, element_condition))
+}
+
 /// A shape's subject written in a longer form than it needs, rewritten to the
 /// form the select routes already take; `None` when there is nothing to
 /// rewrite.
@@ -429,9 +533,48 @@ const MAX_COMPUTED_SPLICES: usize = 32;
 
 /// `infer_ir_type` as an owned name, plus the array literal it cannot report:
 /// an array's type is built from its elements rather than carried on the node.
+/// `sum`, `any` and `all` over no rows: SQL gives NULL, the upstream engine the empty set's
+/// own value.
+fn aggregate_over_nothing(name: &str, aggregate: IrExpr) -> IrExpr {
+    let value = match name {
+        "sum" => IrLiteral::Int(0),
+        "any" => IrLiteral::Bool(false),
+        "all" => IrLiteral::Bool(true),
+        _ => return aggregate,
+    };
+    IrExpr::FunctionCall(IrFunctionCall {
+        schema: None,
+        name: "coalesce".to_string(),
+        args: vec![aggregate, IrExpr::Literal(value)],
+        sql_template: None,
+    })
+}
+
+/// An expression whose value is a whole set, gathered as an array.
+fn yields_array(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::ArrayFromSelect(_) => true,
+        IrExpr::IfElse(ie) => {
+            (yields_array(&ie.if_) || matches!(ie.if_, IrExpr::Null))
+                && (yields_array(&ie.else_) || matches!(ie.else_, IrExpr::Null))
+                && !(matches!(ie.if_, IrExpr::Null) && matches!(ie.else_, IrExpr::Null))
+        }
+        _ => false,
+    }
+}
+
 fn ir_value_type_name(expr: &IrExpr) -> String {
     if let IrExpr::Array(elements) = expr {
         let element = elements.first().and_then(infer_ir_type).unwrap_or("text");
+        return format!("{}[]", literal_sentinel_to_pg(element));
+    }
+    // `ids := array_agg(r.id)` binds an array of what it aggregates, which
+    // is what lets `contains(ids, .id)` pick the array overload over `str`'s.
+    if let IrExpr::FunctionCall(f) = expr
+        && f.schema.is_none()
+        && f.name == "array_agg"
+        && let Some(element) = f.args.first().and_then(infer_ir_type)
+    {
         return format!("{}[]", literal_sentinel_to_pg(element));
     }
     infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
@@ -439,6 +582,10 @@ fn ir_value_type_name(expr: &IrExpr) -> String {
 
 /// The computed pointers a `with` binding's own shape declares, if any.
 fn declared_pointers_of(expr: &Expr) -> Option<Vec<ShapeElement>> {
+    // `(select T { x := … }) if cond else {}` declares what its select does.
+    if let Expr::IfElse(ie) = expr {
+        return declared_pointers_of(&ie.if_expr).or_else(|| declared_pointers_of(&ie.else_expr));
+    }
     let Expr::SubQuery(stmt) = expr else {
         return None;
     };
@@ -638,6 +785,7 @@ pub fn compile_fn_body_with(
     let mut ctes = ctes;
     ctes.extend(std::mem::take(&mut c.hoisted_ctes));
     Ok(super::IrOutput {
+        subtype_fanouts: c.subtype_fanouts(),
         stmt: ir,
         params: c.params,
         ctes,
@@ -660,6 +808,72 @@ pub fn compile_fn_body_with(
 /// mask combining Insert and Delete (with no Update) legally binds
 /// neither. Referencing an anchor that isn't bound is a compile error, not
 /// a runtime NULL.
+/// One compiled rewrite: the column it writes and the value it writes there.
+pub struct RewriteAssignment {
+    pub pointer: String,
+    pub column: String,
+    pub ir: IrExpr,
+    pub sql: String,
+}
+
+/// A type's rewrites for one event (`on_mask`: 1 = insert, 2 = update), each
+/// compiled against the row being written (`NEW`) as `(column, SQL)`, for
+/// the `BEFORE` trigger that applies them. Evaluated on the row as the
+/// statement left it, every rewrite sees the others' inputs, not their
+/// results — as the upstream engine evaluates them.
+pub fn compile_rewrite_assignments(
+    type_name: &str,
+    on_mask: u8,
+    schema: &SchemaDescriptor,
+) -> Result<Vec<RewriteAssignment>, crate::error::PyQLError> {
+    let mut c = Compiler::new(schema);
+    c.in_fn_body = true;
+    let owner_td = c.resolve_type(type_name)?;
+    c.special_anchors
+        .insert("__new__".to_string(), (owner_td, "NEW".to_string()));
+    if on_mask & 1 == 0 {
+        c.special_anchors
+            .insert("__old__".to_string(), (owner_td, "OLD".to_string()));
+    }
+    let pointers = owner_td
+        .properties
+        .iter()
+        .map(|p| (p.name.clone(), p.name.clone(), &p.rewrites))
+        .chain(
+            owner_td
+                .links
+                .iter()
+                .filter(|l| !l.is_junction_backed())
+                .map(|l| (l.name.clone(), format!("{}_id", l.name), &l.rewrites)),
+        );
+    let fanouts = c.subtype_fanouts();
+    let mut out = Vec::new();
+    for (name, column, rewrites) in pointers {
+        for rw in rewrites.iter().filter(|rw| rw.on & on_mask != 0) {
+            // Carried out by `compile_insert` as an assignment.
+            if on_mask == 1 && subject_default_insert(&rw.handler, &name).is_some() {
+                continue;
+            }
+            let expr = crate::parse::parse_pointer_expr(&rw.handler)?;
+            let ir = c.compile_expr(&expr, owner_td, "NEW")?;
+            if !c.params.is_empty() || !c.hoisted_ctes.is_empty() {
+                return Err(PyQLError::Type(PyQLTypeError {
+                    message: format!("the rewrite of '{type_name}.{name}' has nowhere to bind a parameter or a binding"),
+                    position: Position { line: 0, col: 0 },
+                }));
+            }
+            let sql = crate::sql::emit_expr_with_fanouts(&ir, &fanouts);
+            out.push(RewriteAssignment {
+                pointer: name.clone(),
+                column: column.clone(),
+                ir,
+                sql,
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub fn compile_trigger_handler(
     handler: &str,
     type_name: &str,
@@ -671,6 +885,9 @@ pub fn compile_trigger_handler(
 
     let ast = parse::parse(handler.trim())?;
     let mut c = Compiler::new(schema);
+    // A trigger has no parameters to bind a session global to; it reads them
+    // from `GLOBALS_ARG`, which its function declares from `pylon.globals`.
+    c.in_fn_body = true;
     // The trigger's own type — `__new__`/`__old__` always resolve against
     // this, regardless of what type happens to be the ambient `td` where
     // the anchor is textually used (e.g. inside `insert Note { note :=
@@ -688,6 +905,15 @@ pub fn compile_trigger_handler(
     let (ctes, ir) = if let Stmt::With(w) = &ast {
         let mut cte_defs = vec![];
         for alias in &w.aliases {
+            // `resolved := (__new__.status = …)` — a value read off the row
+            // the trigger fired for, which a CTE has no way to see; it
+            // stands in for its value wherever the name is used.
+            if !matches!(alias.expr, ast::Expr::SubQuery(_)) {
+                let anchor = if on_mask & 4 == 0 { "NEW" } else { "OLD" };
+                let value = c.compile_expr(&alias.expr, owner_td, anchor)?;
+                c.inline_bindings.insert(alias.name.clone(), value);
+                continue;
+            }
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let cte_type_name = cte_stmt_type(&ir_stmt);
             c.cte_types.insert(alias.name.clone(), cte_type_name.clone());
@@ -722,6 +948,7 @@ pub fn compile_trigger_handler(
     let mut ctes = ctes;
     ctes.extend(std::mem::take(&mut c.hoisted_ctes));
     Ok(super::IrOutput {
+        subtype_fanouts: c.subtype_fanouts(),
         stmt: ir,
         params: c.params,
         ctes,
@@ -2700,6 +2927,7 @@ impl<'a> Compiler<'a> {
                     && !p.partial
                     && p.steps.len() == 1
                     && let ast::PathStep::Name(src_name) = &p.steps[0]
+                    && self.resolve_name_ref(src_name, true).is_none()
                 {
                     let src_td = self.resolve_type(src_name)?;
                     {
@@ -2712,31 +2940,14 @@ impl<'a> Compiler<'a> {
                         self.resolve_type(&check_name)?;
                         let check_qname = check_name;
                         let src_table = src_td.table.clone();
-                        let src_abstract = src_td.abstract_;
-                        let src_materialized = src_td.materialized;
-                        let src_interfaces = src_td.interfaces.clone();
                         let src_alias = self.fresh_alias();
-                        let poly_implementors = if src_abstract && src_materialized {
+                        let src_td = self.resolve_type(&src_qname)?;
+                        let poly_implementors = if self.is_polymorphic(src_td) {
                             self.find_poly_implementors(&src_qname)
                         } else {
                             vec![]
                         };
-                        let bool_expr = if check_qname == src_qname || src_interfaces.iter().any(|i| i == &check_qname)
-                        {
-                            IrExpr::Literal(IrLiteral::Bool(true))
-                        } else if src_abstract && src_materialized {
-                            IrExpr::BinOp(Box::new(IrBinOp {
-                                left: IrExpr::ColumnRef {
-                                    alias: src_alias.clone(),
-                                    column: "__type__".into(),
-                                    pg_type: "text".into(),
-                                },
-                                op: crate::parse::ast::BinOpKind::Eq,
-                                right: IrExpr::Literal(IrLiteral::Str(check_qname)),
-                            }))
-                        } else {
-                            IrExpr::Literal(IrLiteral::Bool(false))
-                        };
+                        let bool_expr = self.type_check_bool_expr(&src_qname, &check_qname, src_td, &src_alias);
                         let ps = IrPathSelect {
                             root: IrSource {
                                 poly: None,
@@ -2769,6 +2980,16 @@ impl<'a> Compiler<'a> {
                     && (self.is_scalar_walk(a) || self.is_scalar_walk(b))
                 {
                     return self.compile_scalar_union(result);
+                }
+                // `select (l.addon { c := … }).c` — the values, one row each.
+                if !distinct
+                    && s.filter.is_none()
+                    && s.order_by.is_empty()
+                    && s.offset.is_none()
+                    && s.limit.is_none()
+                    && let Some(ps) = self.compile_shape_field_select(result, None)?
+                {
+                    return Ok(IrStmt::PathSelect(ps));
                 }
                 // Catch mixed object/scalar UNION before dispatching further.
                 self.check_union_type_compat(result)?;
@@ -3056,19 +3277,42 @@ impl<'a> Compiler<'a> {
                             || td.multilinks.iter().any(|ml| {
                                 ml.name == *link_name && self.link_target_reaches(&ml.target, &current_qname)
                             });
-                    if !link_targets_current {
-                        return Err(self.type_err(&format!(
-                            "link '{}::{}' does not target '{}'; backlink is not valid here",
-                            type_name, link_name, current_qname,
-                        )));
+                    if link_targets_current {
+                        td
+                    } else {
+                        // `.<memberships[is account::Account]` — declared further
+                        // down, by the one type under the narrowing that has it.
+                        let narrowed = format!("{}::{}", td.module, td.name);
+                        let declaring: Vec<&'a TypeDescriptor> = self
+                            .schema
+                            .types
+                            .iter()
+                            .filter(|t| !t.abstract_ && Self::is_or_implements(t, &narrowed))
+                            .filter(|t| self.declares_backlink(t, link_name, &current_qname))
+                            .collect();
+                        match Self::without_inherited_owners(declaring).as_slice() {
+                            [only] => only,
+                            _ => {
+                                return Err(self.type_err(&format!(
+                                    "link '{}::{}' does not target '{}'; backlink is not valid here",
+                                    type_name, link_name, current_qname,
+                                )));
+                            }
+                        }
                     }
-                    td
                 } else {
                     // No hint — search for any type whose link/multilink targets current_td.
                     let current_qname = format!("{}::{}", current_td.module, current_td.name);
                     self.schema
                         .types
                         .iter()
+                        // The base, not a subtype inheriting the link from it.
+                        .filter(|t| t.bases.is_empty() || !t.bases.iter().any(|base| {
+                            self.resolve_type(base).is_ok_and(|b| {
+                                b.links.iter().any(|l| l.name == *link_name)
+                                    || b.multilinks.iter().any(|ml| ml.name == *link_name)
+                            })
+                        }))
                         .find(|t| {
                             t.links
                                 .iter()
@@ -3179,7 +3423,7 @@ impl<'a> Compiler<'a> {
                         self.type_err("'__type__' is the type's name, not an object — it cannot be traversed further")
                     );
                 }
-                let polymorphic = current_td.abstract_ && current_td.materialized;
+                let polymorphic = self.is_polymorphic(current_td);
                 let expr = if polymorphic {
                     IrExpr::ColumnRef {
                         alias: current_alias.clone(),
@@ -3360,7 +3604,7 @@ impl<'a> Compiler<'a> {
                         // See `junction_info_for`'s doc comment: owner-derived,
                         // never `through_td.table` itself.
                         IrMultiLinkJoin::Standard {
-                            junction_table: format!("{}.{}", current_td.table, ml.name),
+                            junction_table: self.owner_junction(current_td, &ml.name, Some(through_td)),
                             module: current_td.module.clone(),
                         }
                     } else {
@@ -3402,7 +3646,7 @@ impl<'a> Compiler<'a> {
                     }
                 } else {
                     IrMultiLinkJoin::Standard {
-                        junction_table: format!("{}.{}", current_td.table, ml.name),
+                        junction_table: self.owner_junction(current_td, &ml.name, None),
                         module: current_td.module.clone(),
                     }
                 };
@@ -4807,9 +5051,17 @@ impl<'a> Compiler<'a> {
                 // jsonb has no member kind for an object, so a tuple holding
                 // one is emitted as a composite row instead; the rest stay on
                 // the jsonb encoding they have always had.
-                let holds_an_object = ir
-                    .iter()
-                    .any(|(_, e)| matches!(e, IrExpr::ObjectSubquery(_) | IrExpr::ObjectPathSubquery(_)));
+                // An array of objects (`brands := array_agg((select b { * }))`)
+                // flattens in jsonb the same way.
+                let holds_an_object = ir.iter().any(|(_, e)| match e {
+                    IrExpr::ObjectSubquery(_) | IrExpr::ObjectPathSubquery(_) => true,
+                    IrExpr::ArrayFromSelect(source) => match source.as_ref() {
+                        IrArraySource::ObjectSelect(_) | IrArraySource::ObjectFunction(_) | IrArraySource::Group(_) => true,
+                        IrArraySource::PathSelect(ps) => matches!(ps.result, IrPathResult::Object { .. }),
+                        _ => false,
+                    },
+                    _ => false,
+                });
                 if holds_an_object {
                     vec![IrFreeExpr::NamedTupleRow(ir)]
                 } else {
@@ -5396,11 +5648,21 @@ impl<'a> Compiler<'a> {
             filter = and_conditions(filter, vec![narrowed]);
         }
 
+        // `brands union offerings` — types that only share an ancestor carry
+        // different columns, so each branch is read as that ancestor: its
+        // columns, and the concrete type each row has. An abstract branch's
+        // rows already say which type they are.
+        let heterogeneous = branches.iter().any(|(t, _)| t != first_type);
+        let common_columns = if heterogeneous {
+            self.collect_poly_info(first_type).1
+        } else {
+            vec![]
+        };
         let rows = branches
             .into_iter()
             .map(|(type_name, table)| IrRowSource::Bound {
                 source: IrSource {
-                    poly: None,
+                    poly: if heterogeneous { self.poly_fanout_for(&type_name) } else { None },
                     type_name,
                     table,
                     alias: alias.clone(),
@@ -5419,7 +5681,7 @@ impl<'a> Compiler<'a> {
             dml_source: None,
             polymorphic: false,
             poly_implementors: vec![],
-            poly_columns: vec![],
+            poly_columns: common_columns,
             lock: None,
         }))
     }
@@ -5494,6 +5756,41 @@ impl<'a> Compiler<'a> {
                 })
                 .unwrap_or_default(),
         };
+        // `*` on a binding takes in what the binding's shape computed, too.
+        let splat_over_declared: Vec<ShapeElement>;
+        let shape_elements = if shape_elements
+            .iter()
+            .any(|el| el.splat.is_some() && !matches!(el.path.steps.first(), Some(ast::PathStep::TypeIntersection(_))))
+        {
+            let named = |name: &str| {
+                shape_elements
+                    .iter()
+                    .any(|el| el.splat.is_none() && path_leaf(&el.path).is_ok_and(|n| n == name))
+            };
+            let extra: Vec<ShapeElement> = declared
+                .iter()
+                .filter(|d| d.compexpr.is_some())
+                .filter_map(|d| {
+                    let name = path_leaf(&d.path).ok()?;
+                    (!named(name)).then(|| ShapeElement {
+                        path: ast::Path::relative(name),
+                        splat: None,
+                        nested: None,
+                        compexpr: None,
+                        op: ast::ShapeOp::Assign,
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        marker_offset: None,
+                    })
+                })
+                .collect();
+            splat_over_declared = shape_elements.iter().cloned().chain(extra).collect();
+            &splat_over_declared[..]
+        } else {
+            shape_elements
+        };
         let outer_declared = std::mem::replace(&mut self.active_declared_pointers, declared);
         let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
             let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
@@ -5558,7 +5855,7 @@ impl<'a> Compiler<'a> {
             Self::read_nested_links_from_their_ctes(dml, Some(dml_cte), &mut shape);
         }
 
-        let polymorphic = td.abstract_ && td.materialized;
+        let polymorphic = self.is_polymorphic(td);
         let (poly_implementors, poly_columns) = if polymorphic {
             let iface_qname = format!("{}::{}", td.module, td.name);
             (self.find_poly_implementors(&iface_qname), Self::poly_dml_columns(td))
@@ -6471,6 +6768,15 @@ impl<'a> Compiler<'a> {
             (ast::Path { steps, partial: false }, Some(alias.to_string()))
         } else if base.steps.len() > 1 {
             (base.clone(), None)
+        } else if let [ast::PathStep::Name(root)] = base.steps.as_slice()
+            && let Ok(root_td) = self.resolve_path_root(root)
+        {
+            // A walk needs a step: `T[is T]` lands on the same objects.
+            let narrowing = ast::PathStep::TypeIntersection(ast::ObjectRef {
+                module: Some(root_td.module.clone()),
+                name: root_td.name.clone(),
+            });
+            (ast::Path { steps: vec![base.steps[0].clone(), narrowing], partial: false }, None)
         } else {
             return Ok(None);
         };
@@ -6492,6 +6798,18 @@ impl<'a> Compiler<'a> {
         let (alias, type_name) = (alias.clone(), type_name.clone());
         let td = self.resolve_type(&type_name)?;
         let value = self.compile_expr(&value, td, &alias)?;
+        // A computed standing for a set is an array per row; the field reads
+        // its elements, so the rows of all of them make up one set.
+        let value = if yields_array(&value) {
+            IrExpr::FunctionCall(IrFunctionCall {
+                schema: None,
+                name: "unnest".to_string(),
+                args: vec![value],
+                sql_template: None,
+            })
+        } else {
+            value
+        };
         ps.result = IrPathResult::Scalar(value, None);
         Ok(Some(ps))
     }
@@ -6718,9 +7036,31 @@ impl<'a> Compiler<'a> {
         // Multi-link shape elements (`tags := ...` / `tags += ...`) populate
         // the junction table once the row exists; everything else goes
         // through the normal scalar/link assignment path.
+        let mut shape = ins.shape.clone();
+        for link in &td.links {
+            let unset = !shape.iter().any(|el| path_leaf(&el.path).is_ok_and(|n| n == link.name));
+            for rw in link.rewrites.iter().filter(|rw| rw.on & 1 != 0) {
+                if let Some(value) = subject_default_insert(&rw.handler, &link.name)
+                    && unset
+                {
+                    shape.push(ShapeElement {
+                        path: ast::Path::relative(&link.name),
+                        splat: None,
+                        nested: None,
+                        compexpr: Some(value),
+                        op: ShapeOp::Assign,
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        marker_offset: None,
+                    });
+                }
+            }
+        }
         let mut multi_link_appends = vec![];
         let mut scalar_elements: Vec<ShapeElement> = vec![];
-        for el in &ins.shape {
+        for el in &shape {
             let pointer_name = match path_leaf(&el.path) {
                 Ok(n) => n,
                 Err(_) => {
@@ -6738,7 +7078,7 @@ impl<'a> Compiler<'a> {
                     }
                     ShapeOp::Assign | ShapeOp::Append => {
                         if let Some(expr) = &el.compexpr {
-                            let (jt, module, src_col, tgt_col, through_td) = self.multilink_junction_info(td, ml)?;
+                            let (jt, module, src_col, tgt_col, through_td) = self.own_multilink_junction_info(td, ml)?;
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
                                 junction_table: jt,
@@ -6767,7 +7107,7 @@ impl<'a> Compiler<'a> {
                     // omitting the pointer entirely: nothing to append, no
                     // junction row created yet.
                     if !is_empty_set_expr(expr) {
-                        let (jt, module, src_col, tgt_col, through_td) = self.link_junction_info(td, l)?;
+                        let (jt, module, src_col, tgt_col, through_td) = self.own_link_junction_info(td, l)?;
                         let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                         multi_link_appends.push(IrMultiLinkMutation {
                             junction_table: jt,
@@ -6785,35 +7125,9 @@ impl<'a> Compiler<'a> {
         }
 
         let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
-        // Compile INSERT rewrites; substitute column refs so they are valid in
-        // VALUES — a plain `INSERT ... VALUES (...)` has no FROM-clause for a
-        // real ColumnRef (`"t0"."name"`) to resolve against (confirmed live:
-        // "missing FROM-clause entry for table t0"), unlike UPDATE's SET
-        // clause, which can validly reference the table's own alias. For a
-        // property with no explicit assignment here, fall back to its own
-        // `default_sql` (the same value Postgres's column DEFAULT would
-        // produce) rather than leaving its self-reference unsubstituted — a
-        // `default_pyql` default isn't covered by this fallback (it would
-        // need a full recursive compile at this point, not just a raw-SQL
-        // substitution), so a rewrite self-referencing a `default_pyql`
-        // property with no explicit assignment still hits the same error.
-        let mut assignment_map: HashMap<String, IrExpr> =
-            assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
-        for prop in &td.properties {
-            if !assignment_map.contains_key(&prop.name)
-                && let Some(default_sql) = &prop.default_sql
-            {
-                assignment_map.insert(prop.name.clone(), IrExpr::RawSql(default_sql.clone()));
-            }
-        }
-        let rewrites = self
-            .compile_rewrites(td, &alias, 1)?
-            .into_iter()
-            .map(|rw| IrRewrite {
-                column: rw.column,
-                expr: substitute_col_refs(rw.expr, &assignment_map),
-            })
-            .collect();
+        // Rewrites apply in the table's own `BEFORE` trigger — see
+        // `export::rewrite_trigger_infos`.
+        let rewrites = vec![];
         let unless_conflict = match ins.unless_conflict.as_ref() {
             Some(uc) => {
                 let (conflict, else_appends) = self.compile_conflict(uc, td)?;
@@ -7118,7 +7432,7 @@ impl<'a> Compiler<'a> {
             };
 
             if let Some(ml) = Self::resolve_multilink(td, pointer_name) {
-                let (jt, module, src_col, tgt_col, through_td) = self.multilink_junction_info(td, ml)?;
+                let (jt, module, src_col, tgt_col, through_td) = self.own_multilink_junction_info(td, ml)?;
 
                 match el.op {
                     ShapeOp::Assign => {
@@ -7194,7 +7508,7 @@ impl<'a> Compiler<'a> {
                         "'{pointer_name}' is a single link; only `:=` is supported, not `+=`/`-=`"
                     )));
                 }
-                let (jt, module, src_col, tgt_col, through_td) = self.link_junction_info(td, l)?;
+                let (jt, module, src_col, tgt_col, through_td) = self.own_link_junction_info(td, l)?;
                 let is_empty = el.compexpr.as_ref().map(is_empty_set_expr).unwrap_or(false);
                 if is_empty {
                     // := {} — clear the junction row
@@ -7225,18 +7539,11 @@ impl<'a> Compiler<'a> {
         }
 
         let assignments = self.compile_assignments_for_update(&scalar_elements, td, &alias)?;
-        let assignment_map: HashMap<String, IrExpr> = assignments.iter().map(|(c, e)| (c.clone(), e.clone())).collect();
-        let rewrites = self
-            .compile_rewrites(td, &alias, 2)?
-            .into_iter()
-            .map(|rw| IrRewrite {
-                column: rw.column,
-                expr: substitute_col_refs(rw.expr, &assignment_map),
-            })
-            .collect();
+        // See the insert's own: rewrites apply in the table's `BEFORE` trigger.
+        let rewrites = vec![];
         let returning = Self::pk_returning(td);
 
-        let (poly_implementors, poly_columns) = if td.abstract_ && td.materialized {
+        let (poly_implementors, poly_columns) = if self.is_polymorphic(td) {
             (
                 self.find_poly_implementors(&format!("{}::{}", td.module, td.name)),
                 Self::poly_dml_columns(td),
@@ -7292,6 +7599,45 @@ impl<'a> Compiler<'a> {
     /// a Standard (implicit) junction table, which has no user-declared
     /// properties at all.
     fn junction_info_for(
+        &mut self,
+        td: &TypeDescriptor,
+        name: &str,
+        target: &str,
+        through: &Option<String>,
+    ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
+        let (junction_table, module, source_col, target_col, through_td) =
+            self.own_junction_info_for(td, name, target, through)?;
+        let owner_derived = through_td.is_none_or(|through_td| through_td.junction);
+        let junction_table = if owner_derived {
+            self.owner_junction(td, name, through_td)
+        } else {
+            junction_table
+        };
+        Ok((junction_table, module, source_col, target_col, through_td))
+    }
+
+    /// The junction a read of `td`'s multi-link `name` goes through: its own
+    /// table, or, when `td` has subtypes, the union of theirs beside it.
+    fn owner_junction(&self, td: &TypeDescriptor, name: &str, through_td: Option<&TypeDescriptor>) -> String {
+        let own = format!("{}.{}", td.table, name);
+        if !self.has_subtypes(td) {
+            return own;
+        }
+        let tables = self
+            .find_poly_implementors(&format!("{}::{}", td.module, td.name))
+            .into_iter()
+            .map(|implementor| (implementor.module, format!("{}.{}", implementor.table, name)))
+            .collect::<Vec<_>>();
+        let mut columns = vec!["source".to_string(), "target".to_string()];
+        if let Some(through_td) = through_td {
+            columns.extend(Self::poly_dml_columns(through_td).into_iter().filter(|c| c != "id"));
+        }
+        super::inherited_junction(&tables, &columns)
+    }
+
+    /// `junction_info_for` naming the owner's own junction table, which is
+    /// the one a write to that owner's rows goes to.
+    fn own_junction_info_for(
         &mut self,
         td: &TypeDescriptor,
         name: &str,
@@ -7366,6 +7712,22 @@ impl<'a> Compiler<'a> {
         self.junction_info_for(td, &ml.name, &ml.target, &ml.through)
     }
 
+    fn own_multilink_junction_info(
+        &mut self,
+        td: &TypeDescriptor,
+        ml: &MultiLinkDescriptor,
+    ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
+        self.own_junction_info_for(td, &ml.name, &ml.target, &ml.through)
+    }
+
+    fn own_link_junction_info(
+        &mut self,
+        td: &TypeDescriptor,
+        l: &LinkDescriptor,
+    ) -> Result<(String, String, String, String, Option<&'a TypeDescriptor>), PyQLError> {
+        self.own_junction_info_for(td, &l.name, &l.target, &l.through)
+    }
+
     /// Same as `multilink_junction_info`, for a junction-backed single link.
     fn link_junction_info(
         &mut self,
@@ -7394,7 +7756,7 @@ impl<'a> Compiler<'a> {
                 // (one per concrete implementor), never `through_td.table`
                 // itself.
                 Ok(IrMultiLinkJoin::Standard {
-                    junction_table: format!("{}.{}", td.table, name),
+                    junction_table: self.owner_junction(td, name, Some(through_td)),
                     module: td.module.clone(),
                 })
             } else {
@@ -7433,7 +7795,7 @@ impl<'a> Compiler<'a> {
             }
         } else {
             Ok(IrMultiLinkJoin::Standard {
-                junction_table: format!("{}.{}", td.table, name),
+                junction_table: self.owner_junction(td, name, None),
                 module: td.module.clone(),
             })
         }
@@ -7814,7 +8176,7 @@ impl<'a> Compiler<'a> {
 
         let returning = Self::pk_returning(td);
 
-        let (poly_implementors, poly_columns) = if td.abstract_ && td.materialized {
+        let (poly_implementors, poly_columns) = if self.is_polymorphic(td) {
             (
                 self.find_poly_implementors(&format!("{}::{}", td.module, td.name)),
                 Self::poly_dml_columns(td),
@@ -7953,7 +8315,7 @@ impl<'a> Compiler<'a> {
                     if through_td.junction {
                         // See `junction_info_for`'s doc comment: owner-derived.
                         IrMultiLinkJoin::Standard {
-                            junction_table: format!("{}.{}", td.table, ml.name),
+                            junction_table: self.owner_junction(td, &ml.name, Some(through_td)),
                             module: td.module.clone(),
                         }
                     } else {
@@ -8000,7 +8362,7 @@ impl<'a> Compiler<'a> {
                     // after the owner and lives in the owner's schema, which a
                     // splat reaching in from another module is not.
                     IrMultiLinkJoin::Standard {
-                        junction_table: format!("{}.{}", td.table, ml.name),
+                        junction_table: self.owner_junction(td, &ml.name, None),
                         module: td.module.clone(),
                     }
                 };
@@ -8022,6 +8384,7 @@ impl<'a> Compiler<'a> {
                     join,
                     subquery,
                     link_properties: vec![],
+                    single: false,
                 }));
             }
         }
@@ -8396,7 +8759,7 @@ impl<'a> Compiler<'a> {
         // It's always injected at position 0 for internal use; explicit inclusion adds
         // it as a regular computed pointer at a later position so Python can read it.
         if pointer_name == "__type__" && el.compexpr.is_none() {
-            let expr = if td.abstract_ && td.materialized {
+            let expr = if self.is_polymorphic(td) {
                 IrExpr::ColumnRef {
                     alias: alias.to_string(),
                     column: "__type__".to_string(),
@@ -8677,7 +9040,7 @@ impl<'a> Compiler<'a> {
         // A walk that crosses a multi step stands for a set, so it is
         // aggregated; one that cannot is a single object and is read as one,
         // rather than an array of length one.
-        let expr = if multi {
+        let expr = if multi && !limits_to_one(modifiers) {
             IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(path_select))))
         } else {
             IrExpr::ObjectPathSubquery(Box::new(path_select))
@@ -8725,7 +9088,7 @@ impl<'a> Compiler<'a> {
                 // `target`. See `junction_info_for`'s doc comment: the
                 // physical table is owner-derived, never `through_td.table`.
                 IrMultiLinkJoin::Standard {
-                    junction_table: format!("{}.{}", td.table, ml_name),
+                    junction_table: self.owner_junction(td, ml_name, Some(through_td)),
                     module: td.module.clone(),
                 }
             } else {
@@ -8764,7 +9127,7 @@ impl<'a> Compiler<'a> {
             }
         } else {
             IrMultiLinkJoin::Standard {
-                junction_table: format!("{}.{}", td.table, ml_name),
+                junction_table: self.owner_junction(td, ml_name, None),
                 module: module.to_string(),
             }
         };
@@ -8823,6 +9186,7 @@ impl<'a> Compiler<'a> {
             join,
             subquery,
             link_properties,
+            single: false,
         }))
     }
 
@@ -8893,6 +9257,7 @@ impl<'a> Compiler<'a> {
                 .filter(|t| !t.abstract_ && Self::is_or_implements(t, &narrowed))
                 .filter(|t| self.declares_backlink(t, &backlink_name, current_qname))
                 .collect();
+            let declaring = Self::without_inherited_owners(declaring);
             match declaring.as_slice() {
                 [only] => only,
                 [] => owner_td,
@@ -8997,6 +9362,7 @@ impl<'a> Compiler<'a> {
             subquery,
             link_properties: vec![],
             marker_offset,
+            single: limits_to_one(modifiers),
         }))
     }
 
@@ -9438,8 +9804,11 @@ impl<'a> Compiler<'a> {
             limit: modifiers.and_then(|s| s.limit.clone()),
             marker_offset,
         };
-        self.compile_multilink_pointer(pointer_name, &ml_name, td, alias, module, &synthetic)
-            .map(Some)
+        let mut pointer = self.compile_multilink_pointer(pointer_name, &ml_name, td, alias, module, &synthetic)?;
+        if let IrShapePointer::MultiLink(link) = &mut pointer {
+            link.single = limits_to_one(modifiers);
+        }
+        Ok(Some(pointer))
     }
 
     /// A sub-statement used as an expression: `(select .emails filter
@@ -9767,7 +10136,13 @@ impl<'a> Compiler<'a> {
         let multi = match &full_path.steps[0] {
             ast::PathStep::Name(root) => {
                 let root_td = self.resolve_path_root(root)?;
-                self.path_crosses_multi(root_td, &full_path.steps[1..])
+                // `(select T filter …).field` reads every `T` the filter
+                // keeps, unless it pins an exclusive pointer.
+                let every_row_of_a_type = !path.partial
+                    && self.cte_object_type(root).is_none()
+                    && self.resolve_type(root).is_ok()
+                    && !selects_at_most_one(sel, root_td);
+                every_row_of_a_type || self.path_crosses_multi(root_td, &full_path.steps[1..])
             }
             _ => false,
         };
@@ -10112,6 +10487,12 @@ impl<'a> Compiler<'a> {
     /// what makes a relative path's subquery see only the current object's
     /// side of the graph.
     fn correlate_path_select(ps: &mut IrPathSelect, outer_alias: &str) {
+        // A trigger's own row may not be in its table yet (`BEFORE INSERT`):
+        // the walk starts from the row itself.
+        if outer_alias == "NEW" || outer_alias == "OLD" {
+            ps.root.table = format!("@row:{outer_alias}");
+            ps.root.poly = None;
+        }
         let correlation = IrExpr::BinOp(Box::new(IrBinOp {
             left: IrExpr::ColumnRef {
                 alias: ps.root.alias.clone(),
@@ -10541,14 +10922,28 @@ impl<'a> Compiler<'a> {
                         "sum" => Some(IrLiteral::Int(0)),
                         _ => None,
                     };
-                    let aggregate = IrExpr::FunctionCall(IrFunctionCall {
-                        schema: None,
-                        name: sql_name,
-                        args: vec![column],
-                        sql_template: None,
-                    });
-                    ps.result = IrPathResult::Scalar(aggregate, None);
-                    let subquery = IrExpr::PathSubquery(Box::new(ps));
+                    // An unnested set cannot sit inside the aggregate call;
+                    // the walk's rows are aggregated from outside instead.
+                    let subquery = if matches!(&column, IrExpr::FunctionCall(f) if f.name == "unnest" && f.sql_template.is_none()) {
+                        ps.result = IrPathResult::Scalar(column, None);
+                        IrExpr::FunctionCall(IrFunctionCall {
+                            schema: None,
+                            name: sql_name.clone(),
+                            args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps))))],
+                            sql_template: Some(format!(
+                                "(SELECT {sql_name}(\"_s\".\"v\") FROM unnest($1) AS \"_s\"(\"v\"))"
+                            )),
+                        })
+                    } else {
+                        let aggregate = IrExpr::FunctionCall(IrFunctionCall {
+                            schema: None,
+                            name: sql_name,
+                            args: vec![column],
+                            sql_template: None,
+                        });
+                        ps.result = IrPathResult::Scalar(aggregate, None);
+                        IrExpr::PathSubquery(Box::new(ps))
+                    };
                     return Ok(match over_nothing {
                         Some(value) => IrExpr::FunctionCall(IrFunctionCall {
                             schema: None,
@@ -10579,6 +10974,43 @@ impl<'a> Compiler<'a> {
                                 right,
                                 mode: super::SetOpMode::Aggregate(sql_name.to_string()),
                             });
+                        }
+                    }
+                    // `sum((select T filter …).amount)` — the sub-select's
+                    // values arrive gathered as an array; the aggregate
+                    // takes its elements.
+                    if matches!(arg, Expr::FieldAccess { .. })
+                        && matches!(Self::peel_field_access_chain(arg).0, Expr::SubQuery(_))
+                    {
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let aggregate = crate::stdlib::lookup(ns, &f.name).into_iter().find_map(|d| match &d.impl_strategy {
+                            crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
+                            _ => None,
+                        });
+                        if let Some(sql_name) = aggregate {
+                            let values = self.compile_expr_ctx(arg, ctx)?;
+                            if matches!(values, IrExpr::ArrayFromSelect(_)) {
+                                let over_nothing = match f.name.as_str() {
+                                    "any" => "false",
+                                    "all" => "true",
+                                    "sum" => "0",
+                                    _ => "NULL",
+                                };
+                                return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                    schema: None,
+                                    name: sql_name.clone(),
+                                    args: vec![values],
+                                    sql_template: Some(format!(
+                                        "(SELECT coalesce({sql_name}(\"_s\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_s\"(\"v\"))"
+                                    )),
+                                }));
+                            }
+                            return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                schema: None,
+                                name: sql_name,
+                                args: vec![values],
+                                sql_template: None,
+                            }));
                         }
                     }
                     // `count(memberships)` — a binding names a set, so the
@@ -10627,7 +11059,7 @@ impl<'a> Compiler<'a> {
                                 lock: None,
                             };
                             let ps = self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
-                            return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                            return Ok(aggregate_over_nothing(&f.name, IrExpr::PathSubquery(Box::new(ps))));
                         }
                         // `sum(.applied_promotions.amount)` — the aggregate
                         // takes the set the walk lands on, so the walk becomes
@@ -10635,10 +11067,11 @@ impl<'a> Compiler<'a> {
                         // sits inside. Compiled as an expression the walk stands
                         // for the array of its elements, leaving the aggregate
                         // with an array argument and no overload to match.
+                        // A backlink is as many-valued: `count(.<revisions)`.
                         if let Expr::Path(p) = arg
                             && p.partial
-                            && p.steps.len() > 1
-                            && self.path_crosses_multi(td, &p.steps)
+                            && (p.steps.len() > 1 && self.path_crosses_multi(td, &p.steps)
+                                || matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))))
                         {
                             let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
                             steps.extend(p.steps.iter().cloned());
@@ -10657,7 +11090,7 @@ impl<'a> Compiler<'a> {
                             let mut ps =
                                 self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
                             Self::correlate_path_select(&mut ps, alias);
-                            return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                            return Ok(aggregate_over_nothing(&f.name, IrExpr::PathSubquery(Box::new(ps))));
                         }
                         if let Expr::Path(p) = arg
                             && p.partial
@@ -10703,7 +11136,7 @@ impl<'a> Compiler<'a> {
                                 lock: None,
                             };
                             let ps = self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
-                            return Ok(IrExpr::PathSubquery(Box::new(ps)));
+                            return Ok(aggregate_over_nothing(&f.name, IrExpr::PathSubquery(Box::new(ps))));
                         }
                         // `count((delete AuthLink filter .expired))` — the rows
                         // a mutation touched are countable like any other set.
@@ -10836,6 +11269,17 @@ impl<'a> Compiler<'a> {
                             {
                                 let fn_name = sql_name.to_string();
                                 let inner_ir = self.compile_select(&sel, &sel.result, false)?;
+                                // `array_agg((select brands { * } filter …))` —
+                                // an array of the objects, rows and shape
+                                // whole; `array_agg(*)` is not an aggregate
+                                // Postgres has.
+                                if fn_name == "array_agg"
+                                    && matches!(inner_ir.rows.as_slice(), [IrRowSource::Bound { .. }])
+                                {
+                                    return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectSelect(
+                                        Box::new(inner_ir),
+                                    ))));
+                                }
                                 return Ok(IrExpr::AggOverQuery {
                                     fn_name,
                                     inner: Box::new(inner_ir),
@@ -10883,6 +11327,65 @@ impl<'a> Compiler<'a> {
                 // set, so the comparison inside must not also be warned about.
                 // The argument is compiled before `resolve_fn_call` ever sees
                 // which function this is, which is why the guard goes here.
+                // `any(.grants.account = a and not .grants.deleted)` — every
+                // `.grants` in it is the same grant, so the condition holds
+                // per grant; compiled term by term, each walked the link on
+                // its own.
+                if let Some((td, _)) = ctx
+                    && f.module.as_deref().unwrap_or("std") == "std"
+                    && matches!(f.name.as_str(), "any" | "all")
+                    && f.kwargs.is_empty()
+                    && let [condition] = f.args.as_slice()
+                    && let Some(per_element) = per_element_of_one_multilink(condition, td)
+                {
+                    let (link, element_condition) = per_element;
+                    let condition = if f.name == "all" {
+                        Expr::UnaryOp(Box::new(ast::UnaryOp {
+                            op: ast::UnaryOpKind::Not,
+                            operand: element_condition,
+                        }))
+                    } else {
+                        element_condition
+                    };
+                    let exists = Expr::UnaryOp(Box::new(ast::UnaryOp {
+                        op: ast::UnaryOpKind::Exists,
+                        operand: Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
+                            result: Expr::Path(ast::Path { steps: link, partial: true }),
+                            filter: Some(condition),
+                            order_by: vec![],
+                            offset: None,
+                            limit: None,
+                            lock: None,
+                        }))),
+                    }));
+                    let exists = if f.name == "all" {
+                        Expr::UnaryOp(Box::new(ast::UnaryOp {
+                            op: ast::UnaryOpKind::Not,
+                            operand: exists,
+                        }))
+                    } else {
+                        exists
+                    };
+                    return self.compile_expr_ctx(&exists, ctx);
+                }
+                // `any(.<company.posts is Post)` — one answer per object the
+                // path reaches, gathered as an array, so aggregate its elements.
+                if f.module.as_deref().unwrap_or("std") == "std"
+                    && matches!(f.name.as_str(), "any" | "all")
+                    && f.kwargs.is_empty()
+                    && let [arg @ Expr::TypeIs { .. }] = f.args.as_slice()
+                    && let answers @ IrExpr::ArrayFromSelect(_) = self.compile_expr_ctx(arg, ctx)?
+                {
+                    let (aggregate, over_nothing) = if f.name == "all" { ("bool_and", "true") } else { ("bool_or", "false") };
+                    return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        schema: None,
+                        name: aggregate.to_string(),
+                        args: vec![answers],
+                        sql_template: Some(format!(
+                            "(SELECT coalesce({aggregate}(\"_unnested\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_unnested\"(\"v\"))"
+                        )),
+                    }));
+                }
                 // `all(array_unpack($tags) in .tags.label)` — the comparison is
                 // made once per element, then aggregated. Inlined as `unnest()`
                 // the array is a set-returning call, which Postgres refuses in a
@@ -11380,7 +11883,10 @@ impl<'a> Compiler<'a> {
             // is a new, clearer explicit error for that case.
             Expr::TypeIs { expr, ty } => match ctx {
                 Some((td, alias)) => self.compile_type_is(expr, ty, td, alias),
-                None => Err(self.type_err("'is' type check is not valid in free SELECT context")),
+                None => match expr.as_ref() {
+                    Expr::Path(p) => self.compile_path_type_is(p, ty, None),
+                    _ => Err(self.type_err("'is' type check is not valid in free SELECT context")),
+                },
             },
         }
     }
@@ -11393,6 +11899,67 @@ impl<'a> Compiler<'a> {
         self.compile_expr_ctx(expr, None)
     }
 
+    /// `path is T`: whether the objects `path` reaches are of `T` or one of
+    /// its subtypes, read off their own `__type__`.
+    fn compile_path_type_is(
+        &mut self,
+        path: &ast::Path,
+        ty: &ast::TypeExpr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<IrExpr, PyQLError> {
+        let (ty_module, ty_name) = ty
+            .as_named()
+            .ok_or_else(|| self.type_err("cannot use IS with a tuple or array type"))?;
+        let check_qname = match (ty_module, ctx) {
+            (Some(module), _) => format!("{module}::{ty_name}"),
+            (None, Some((td, _))) => format!("{}::{}", td.module, ty_name),
+            (None, None) => ty_name.to_string(),
+        };
+        let check_td = self.resolve_type(&check_qname)?;
+        let check_qname = format!("{}::{}", check_td.module, check_td.name);
+        let mut type_path = path.clone();
+        type_path.steps.push(ast::PathStep::Name("__type__".to_string()));
+        let own_type = self.compile_expr_ctx(&Expr::Path(type_path), ctx)?;
+        let implementors: Vec<String> = self
+            .find_poly_implementors(&check_qname)
+            .into_iter()
+            .map(|implementor| implementor.type_name)
+            .collect();
+        let is_one_of = |own_type: IrExpr| {
+            implementors
+                .iter()
+                .map(|implementor| {
+                    IrExpr::BinOp(Box::new(IrBinOp {
+                        left: own_type.clone(),
+                        op: ast::BinOpKind::Eq,
+                        right: IrExpr::Literal(IrLiteral::Str(implementor.clone())),
+                    }))
+                })
+                .reduce(|left, right| {
+                    IrExpr::BinOp(Box::new(IrBinOp {
+                        left,
+                        op: ast::BinOpKind::Or,
+                        right,
+                    }))
+                })
+                .unwrap_or(IrExpr::Literal(IrLiteral::Bool(false)))
+        };
+        // A path that reaches many objects yields one answer per object.
+        Ok(match own_type {
+            IrExpr::ArrayFromSelect(source) => match *source {
+                IrArraySource::PathSelect(mut path_select) => {
+                    let IrPathResult::Scalar(element, cast) = path_select.result else {
+                        return Err(self.type_err("'__type__' is read as a value"));
+                    };
+                    path_select.result = IrPathResult::Scalar(is_one_of(element), cast);
+                    IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(path_select)))
+                }
+                other => is_one_of(IrExpr::ArrayFromSelect(Box::new(other))),
+            },
+            single => is_one_of(single),
+        })
+    }
+
     fn compile_type_is(
         &mut self,
         expr: &Expr,
@@ -11401,6 +11968,23 @@ impl<'a> Compiler<'a> {
         alias: &str,
     ) -> Result<IrExpr, PyQLError> {
         let self_qname = format!("{}::{}", td.module, td.name);
+
+        // `.listing is T`, `x is T`: the objects the path reaches are tested,
+        // not the current row — through their own `__type__`.
+        let reaches_other_objects = match expr {
+            Expr::Path(p) if p.partial || p.steps.len() > 1 => {
+                !matches!(p.steps.last(), Some(ast::PathStep::Name(n)) if n == "__type__")
+            }
+            Expr::Path(p) => matches!(
+                p.steps.as_slice(),
+                [ast::PathStep::Name(n)] if n != &td.name && n != &self_qname && self.resolve_type(n).is_err()
+                    && self.resolve_name_ref(n, true).is_some()
+            ),
+            _ => false,
+        };
+        if reaches_other_objects && let Expr::Path(p) = expr {
+            return self.compile_path_type_is(p, ty, Some((td, alias)));
+        }
 
         // Determine whether `expr` refers to the current scope or a different type.
         // A 1-step absolute path matching the current td → same scope.
@@ -11437,52 +12021,15 @@ impl<'a> Compiler<'a> {
 
         // Cross-scope: ARRAY(SELECT bool_expr FROM source_table).
         // Collect everything needed before calling fresh_alias (which needs &mut self).
-        let (source_table, source_abstract, source_materialized, poly_implementors, poly_columns) = {
-            let src_td = self.resolve_type(&source_qname)?;
-            let table = src_td.table.clone();
-            let abstract_ = src_td.abstract_;
-            let materialized = src_td.materialized;
-            let imps = if abstract_ && materialized {
-                self.find_poly_implementors(&source_qname)
-            } else {
-                vec![]
-            };
-            let cols = if abstract_ && materialized {
-                src_td
-                    .properties
-                    .iter()
-                    .map(|p| p.name.clone())
-                    .chain(
-                        src_td
-                            .links
-                            .iter()
-                            .filter(|l| !l.is_junction_backed())
-                            .map(|l| format!("{}_id", l.name)),
-                    )
-                    .collect::<Vec<_>>()
-            } else {
-                vec![]
-            };
-            (table, abstract_, materialized, imps, cols)
-        };
-
         let src_alias = self.fresh_alias();
-
-        let bool_expr = if check_qname == source_qname {
-            IrExpr::Literal(IrLiteral::Bool(true))
-        } else if source_abstract && source_materialized {
-            IrExpr::BinOp(Box::new(IrBinOp {
-                left: IrExpr::ColumnRef {
-                    alias: src_alias.clone(),
-                    column: "__type__".into(),
-                    pg_type: "text".into(),
-                },
-                op: crate::parse::ast::BinOpKind::Eq,
-                right: IrExpr::Literal(IrLiteral::Str(check_qname)),
-            }))
+        let src_td = self.resolve_type(&source_qname)?;
+        let source_table = src_td.table.clone();
+        let (poly_implementors, poly_columns) = if self.is_polymorphic(src_td) {
+            (self.find_poly_implementors(&source_qname), Self::poly_dml_columns(src_td))
         } else {
-            IrExpr::Literal(IrLiteral::Bool(false))
+            (vec![], vec![])
         };
+        let bool_expr = self.type_check_bool_expr(&source_qname, &check_qname, src_td, &src_alias);
 
         let source = IrSource {
             poly: None,
@@ -11501,21 +12048,35 @@ impl<'a> Compiler<'a> {
 
     /// Build the boolean `IrExpr` for `source_qname is check_qname` in the current row's scope.
     fn type_check_bool_expr(&self, source_qname: &str, check_qname: &str, td: &TypeDescriptor, alias: &str) -> IrExpr {
-        if check_qname == source_qname || td.interfaces.iter().any(|i| i == check_qname) {
-            IrExpr::Literal(IrLiteral::Bool(true))
-        } else if td.abstract_ && td.materialized {
-            IrExpr::BinOp(Box::new(IrBinOp {
-                left: IrExpr::ColumnRef {
-                    alias: alias.to_string(),
-                    column: "__type__".into(),
-                    pg_type: "text".into(),
-                },
-                op: crate::parse::ast::BinOpKind::Eq,
-                right: IrExpr::Literal(IrLiteral::Str(check_qname.to_string())),
-            }))
-        } else {
-            IrExpr::Literal(IrLiteral::Bool(false))
+        if check_qname == source_qname || Self::is_or_implements(td, check_qname) {
+            return IrExpr::Literal(IrLiteral::Bool(true));
         }
+        if !self.is_polymorphic(td) {
+            return IrExpr::Literal(IrLiteral::Bool(false));
+        }
+        // A row is of the checked type when its own type is that type or one
+        // of its subtypes.
+        self.find_poly_implementors(check_qname)
+            .into_iter()
+            .map(|implementor| {
+                IrExpr::BinOp(Box::new(IrBinOp {
+                    left: IrExpr::ColumnRef {
+                        alias: alias.to_string(),
+                        column: "__type__".into(),
+                        pg_type: "text".into(),
+                    },
+                    op: crate::parse::ast::BinOpKind::Eq,
+                    right: IrExpr::Literal(IrLiteral::Str(implementor.type_name)),
+                }))
+            })
+            .reduce(|left, right| {
+                IrExpr::BinOp(Box::new(IrBinOp {
+                    left,
+                    op: crate::parse::ast::BinOpKind::Or,
+                    right,
+                }))
+            })
+            .unwrap_or(IrExpr::Literal(IrLiteral::Bool(false)))
     }
 
     /// Shared lookup for a bare 1-step name: for-loop variable, CTE binding,
@@ -11612,7 +12173,7 @@ impl<'a> Compiler<'a> {
                 }
                 // __type__ without a leading dot still means the current object's type.
                 if n == "__type__" {
-                    return Ok(if td.abstract_ && td.materialized {
+                    return Ok(if self.is_polymorphic(td) {
                         IrExpr::ColumnRef {
                             alias: alias.to_string(),
                             column: "__type__".to_string(),
@@ -11936,7 +12497,7 @@ impl<'a> Compiler<'a> {
         // __type__ as an expression: for polymorphic (interface) types, read from the
         // inline union column; for concrete types, emit the static qualified name.
         if pointer_name == "__type__" {
-            return Ok(if td.abstract_ && td.materialized {
+            return Ok(if self.is_polymorphic(td) {
                 IrExpr::ColumnRef {
                     alias: alias.to_string(),
                     column: "__type__".to_string(),
@@ -12268,6 +12829,16 @@ impl<'a> Compiler<'a> {
     /// together: a row qualifies if any one of them points at it. `narrow_to`
     /// keeps only the types that satisfy an `[is …]` the path asked for.
     #[allow(clippy::too_many_arguments)]
+    /// Drops the owners that only inherit the link from another owner in the
+    /// list: reading the base already reads its subtypes' rows.
+    fn without_inherited_owners(owners: Vec<&'a TypeDescriptor>) -> Vec<&'a TypeDescriptor> {
+        let qnames: Vec<String> = owners.iter().map(|t| format!("{}::{}", t.module, t.name)).collect();
+        owners
+            .into_iter()
+            .filter(|t| !t.bases.iter().any(|base| qnames.contains(base)))
+            .collect()
+    }
+
     fn backlink_exists_over_owners(
         &mut self,
         narrow_to: Option<&str>,
@@ -12285,6 +12856,7 @@ impl<'a> Compiler<'a> {
             .filter(|t| narrow_to.is_none_or(|q| Self::is_or_implements(t, q)))
             .filter(|t| self.declares_backlink(t, backlink_name, current_qname))
             .collect();
+        let owners = Self::without_inherited_owners(owners);
         if owners.is_empty() {
             return Err(self.type_err(&match narrow_to {
                 Some(q) => format!("type {q} has no link or multi-link '{backlink_name}' pointing to {current_qname}"),
@@ -12318,6 +12890,35 @@ impl<'a> Compiler<'a> {
         format!("{}::{}", td.module, td.name) == qname
             || td.interfaces.iter().any(|i| i == qname)
             || td.parents.iter().any(|p| p == qname)
+            || td.bases.iter().any(|b| b == qname)
+    }
+
+    /// A concrete type another concrete type extends (`BrandAddon`, which
+    /// `BrandAddonBundle` extends). Its own table holds only its own rows, so
+    /// reading the type means reading the subtypes' tables beside it.
+    fn has_subtypes(&self, td: &TypeDescriptor) -> bool {
+        let qname = format!("{}::{}", td.module, td.name);
+        !td.abstract_ && self.schema.types.iter().any(|t| t.bases.contains(&qname))
+    }
+
+    /// See `IrOutput::subtype_fanouts`.
+    fn subtype_fanouts(&self) -> HashMap<(String, String), IrPolyFanout> {
+        self.schema
+            .types
+            .iter()
+            .filter(|t| self.has_subtypes(t))
+            .filter_map(|t| {
+                let fanout = self.poly_fanout_for(&format!("{}::{}", t.module, t.name))?;
+                Some(((t.module.clone(), t.table.clone()), fanout))
+            })
+            .collect()
+    }
+
+    /// Whether the type's rows come from more than one table — an interface,
+    /// or a concrete type with subtypes — and so are read through the union
+    /// that carries each row's own `__type__`.
+    fn is_polymorphic(&self, td: &TypeDescriptor) -> bool {
+        (td.abstract_ && td.materialized) || self.has_subtypes(td)
     }
 
     /// One owner type's half of `compile_backlink_as_exists`: EXISTS over the
@@ -12514,8 +13115,20 @@ impl<'a> Compiler<'a> {
     ) -> Result<Option<IrExpr>, PyQLError> {
         use ast::PathStep;
 
+        // `.<contacts[is Account] = account` — nothing after the backlink, so
+        // the objects it reaches are what is compared, by identity. Returning
+        // nothing here dropped the comparison, leaving "any account links to
+        // this row" in its place.
         if steps.is_empty() {
-            return Ok(None);
+            return Ok(comparison.map(|(op, value, flip)| {
+                let key = IrExpr::ColumnRef {
+                    alias: t_alias.to_string(),
+                    column: "id".to_string(),
+                    pg_type: "uuid".to_string(),
+                };
+                let (left, right) = if flip { (value, key) } else { (key, value) };
+                IrExpr::BinOp(Box::new(IrBinOp { left, op, right }))
+            }));
         }
 
         // Chained backlink: recurse (current_qname is now target_qname of the outer backlink)
@@ -13229,7 +13842,7 @@ impl<'a> Compiler<'a> {
                 )));
             }
             let Some(value) = &el.compexpr else { continue };
-            let (jt, module, src_col, tgt_col, through_td) = self.multilink_junction_info(upd_td, ml)?;
+            let (jt, module, src_col, tgt_col, through_td) = self.own_multilink_junction_info(upd_td, ml)?;
             let values = self.compile_multilink_values(value, upd_td, &table, through_td)?;
             appends.push(IrMultiLinkMutation {
                 junction_table: jt,
@@ -13347,13 +13960,10 @@ impl<'a> Compiler<'a> {
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
 
-        let filter = sel
-            .filter
-            .as_ref()
-            .map(|f| self.compile_expr(f, td, &alias))
-            .transpose()?;
-
-        Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
+        // `(select T filter … order by … limit 1)` — every clause decides
+        // which row is linked, not just the filter.
+        let (filter, order_by, offset, limit) = self.compile_path_modifiers(sel, td, &alias)?;
+        let mut select = IrSelect::schema_bound(
             IrSource {
                 poly: None,
                 type_name: format!("{}::{}", td.module, td.name),
@@ -13362,7 +13972,11 @@ impl<'a> Compiler<'a> {
             },
             Self::pk_returning(td),
             filter,
-        ))))
+        );
+        select.order_by = order_by;
+        select.offset = offset;
+        select.limit = limit;
+        Ok(IrExpr::Subquery(Box::new(select)))
     }
 
     /// Shared `IrSort` builder for both schema-bound (`compile_sort`) and
@@ -14348,7 +14962,7 @@ impl<'a> Compiler<'a> {
         // A materialised interface has a view to read; a plain abstract has no
         // relation at all, so reading its table name finds nothing. Both are
         // answered by the union of the types that carry the columns.
-        if !td.abstract_ {
+        if !td.abstract_ && !self.has_subtypes(td) {
             return None;
         }
         let (implementors, columns) = self.collect_poly_info(type_name);
@@ -14911,28 +15525,6 @@ impl<'a> Compiler<'a> {
             .collect()
     }
 
-    // ── Mutation rewrite compilation ─────────────────────────────────────────────
-
-    /// Compile all active rewrites on `td`'s properties for the given event mask
-    /// (1 = INSERT, 2 = UPDATE). Uses `self` so the alias counter and param list
-    /// are shared with the surrounding statement.
-    fn compile_rewrites(&mut self, td: &TypeDescriptor, alias: &str, on_mask: u8) -> Result<Vec<IrRewrite>, PyQLError> {
-        let mut out = Vec::new();
-        for prop in &td.properties {
-            for rw in &prop.rewrites {
-                if rw.on & on_mask == 0 {
-                    continue;
-                }
-                let expr_ast = crate::parse::parse_expr(&rw.handler).map_err(PyQLError::Syntax)?;
-                let ir_expr = self.compile_expr(&expr_ast, td, alias)?;
-                out.push(IrRewrite {
-                    column: prop.name.clone(),
-                    expr: ir_expr,
-                });
-            }
-        }
-        Ok(out)
-    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -15384,56 +15976,3 @@ pub fn pg_type_to_pyql(pg: &str) -> &str {
     }
 }
 
-/// Walk an `IrExpr` tree and replace every `ColumnRef` whose column name appears
-/// in `bindings` with the bound expression.
-///
-/// Used for INSERT rewrites: the handler `lower(.name)` compiles to
-/// `FunctionCall(lower, [ColumnRef("name")])`. If `name := $1` in the INSERT,
-/// substituting produces `FunctionCall(lower, [Param(0)])`, which is valid in a
-/// VALUES clause.
-pub(super) fn substitute_col_refs(expr: IrExpr, bindings: &HashMap<String, IrExpr>) -> IrExpr {
-    match expr {
-        IrExpr::ColumnRef { ref column, .. } => {
-            if let Some(replacement) = bindings.get(column) {
-                replacement.clone()
-            } else {
-                expr
-            }
-        }
-        IrExpr::BinOp(op) => IrExpr::BinOp(Box::new(IrBinOp {
-            left: substitute_col_refs(op.left, bindings),
-            op: op.op,
-            right: substitute_col_refs(op.right, bindings),
-        })),
-        IrExpr::UnaryOp(op) => IrExpr::UnaryOp(Box::new(IrUnaryOp {
-            op: op.op,
-            operand: substitute_col_refs(op.operand, bindings),
-        })),
-        IrExpr::FunctionCall(f) => IrExpr::FunctionCall(IrFunctionCall {
-            schema: f.schema,
-            name: f.name,
-            args: f.args.into_iter().map(|a| substitute_col_refs(a, bindings)).collect(),
-            sql_template: f.sql_template,
-        }),
-        IrExpr::TypeCast(c) => IrExpr::TypeCast(Box::new(IrTypeCast {
-            expr: substitute_col_refs(c.expr, bindings),
-            pg_type: c.pg_type,
-            tuple_shape: None,
-        })),
-        IrExpr::IfElse(ie) => IrExpr::IfElse(Box::new(IrIfElse {
-            condition: substitute_col_refs(ie.condition, bindings),
-            if_: substitute_col_refs(ie.if_, bindings),
-            else_: substitute_col_refs(ie.else_, bindings),
-        })),
-        IrExpr::Array(elems) => IrExpr::Array(elems.into_iter().map(|e| substitute_col_refs(e, bindings)).collect()),
-        IrExpr::NamedTuple { fields, is_free_object } => IrExpr::NamedTuple {
-            fields: fields
-                .into_iter()
-                .map(|(k, v)| (k, substitute_col_refs(v, bindings)))
-                .collect(),
-            is_free_object,
-        },
-        // Literals, Params, Subqueries — no column refs to substitute
-        other => other,
-    }
-}

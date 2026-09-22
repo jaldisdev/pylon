@@ -48,6 +48,12 @@ pub fn collect_tags(output: &IrOutput) -> Vec<String> {
             collect_stmt(&c.stmt, &mut tags);
         }
     }
+    // A read of a type with subtypes reads their tables too.
+    for ((module, table), fanout) in &output.subtype_fanouts {
+        if tags.contains(&qualify(module, table)) {
+            tags.extend(fanout.implementors.iter().map(tag_for_implementor));
+        }
+    }
     tags.sort();
     tags.dedup();
     tags
@@ -61,9 +67,16 @@ fn qualify(module: &str, table: &str) -> String {
     format!("{}.{}", pg_schema(module), table)
 }
 
-fn tag_for(source: &IrSource) -> String {
+fn push_source_tags(source: &IrSource, tags: &mut Vec<String>) {
     let module = source.type_name.split("::").next().unwrap_or("");
-    qualify(module, &source.table)
+    push_table_tags(module, &source.table, tags);
+}
+
+fn push_table_tags(module: &str, table: &str, tags: &mut Vec<String>) {
+    match super::parse_inherited_junction(table) {
+        Some((tables, _)) => tags.extend(tables.iter().map(|(module, table)| qualify(module, table))),
+        None => tags.push(qualify(module, table)),
+    }
 }
 
 fn tag_for_implementor(imp: &IrPolyImplementor) -> String {
@@ -80,7 +93,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             }
         }
         IrStmt::Insert(ins) => {
-            tags.push(tag_for(&ins.target));
+            push_source_tags(&ins.target, tags);
             for (_, e) in &ins.assignments {
                 collect_expr(e, tags);
             }
@@ -106,7 +119,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             }
         }
         IrStmt::Update(upd) => {
-            tags.push(tag_for(&upd.target));
+            push_source_tags(&upd.target, tags);
             for imp in &upd.poly_implementors {
                 tags.push(tag_for_implementor(imp));
             }
@@ -136,7 +149,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             }
         }
         IrStmt::Delete(del) => {
-            tags.push(tag_for(&del.target));
+            push_source_tags(&del.target, tags);
             for imp in &del.poly_implementors {
                 tags.push(tag_for_implementor(imp));
             }
@@ -159,7 +172,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             collect_stmt(&f.body, tags);
         }
         IrStmt::Group(g) => {
-            tags.push(tag_for(&g.source));
+            push_source_tags(&g.source, tags);
             for p in &g.shape {
                 collect_shape_pointer(p, tags);
             }
@@ -174,7 +187,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
         }
         IrStmt::FunctionSelect(fs) => collect_function_select(fs, tags),
         IrStmt::VectorSearch(vs) => {
-            tags.push(tag_for(&vs.source));
+            push_source_tags(&vs.source, tags);
             collect_expr(&vs.query_expr, tags);
             for p in &vs.object_shape {
                 collect_shape_pointer(p, tags);
@@ -190,7 +203,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
             }
         }
         IrStmt::FtsSearch(fs) => {
-            tags.push(tag_for(&fs.source));
+            push_source_tags(&fs.source, tags);
             collect_expr(&fs.query_expr, tags);
             for p in &fs.object_shape {
                 collect_shape_pointer(p, tags);
@@ -212,7 +225,7 @@ fn collect_select(sel: &IrSelect, tags: &mut Vec<String>) {
     for row in &sel.rows {
         match row {
             IrRowSource::Bound { source, shape } => {
-                tags.push(tag_for(source));
+                push_source_tags(source, tags);
                 for p in shape {
                     collect_shape_pointer(p, tags);
                 }
@@ -241,19 +254,19 @@ fn collect_select(sel: &IrSelect, tags: &mut Vec<String>) {
 }
 
 fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
-    tags.push(tag_for(&ps.root));
+    push_source_tags(&ps.root, tags);
     for imp in &ps.poly_implementors {
         tags.push(tag_for_implementor(imp));
     }
     for j in &ps.joins {
         match j {
-            IrPathJoin::Single { target, .. } | IrPathJoin::BacklinkSingle { target, .. } => tags.push(tag_for(target)),
+            IrPathJoin::Single { target, .. } | IrPathJoin::BacklinkSingle { target, .. } => push_source_tags(target, tags),
             // A junction is involved — a write to it (e.g. re-linking a
             // junction-backed single link, or appending/removing a
             // multi-link target) must also invalidate this query's cache
             // entry, not just a write to the target's own table.
             IrPathJoin::Multi { join, target, .. } => {
-                tags.push(tag_for(target));
+                push_source_tags(target, tags);
                 tag_junction(join, tags);
             }
             IrPathJoin::BacklinkMulti {
@@ -262,15 +275,15 @@ fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
                 target,
                 ..
             } => {
-                tags.push(tag_for(target));
+                push_source_tags(target, tags);
                 tags.push(qualify(module, junction_table));
             }
             IrPathJoin::Lateral { inner, target } => {
-                tags.push(tag_for(target));
+                push_source_tags(target, tags);
                 collect_path_select(inner, tags);
             }
             IrPathJoin::Function { args, target, .. } => {
-                tags.push(tag_for(target));
+                push_source_tags(target, tags);
                 for a in args {
                     collect_expr(a, tags);
                 }
@@ -312,7 +325,7 @@ fn tag_junction(join: &IrMultiLinkJoin, tags: &mut Vec<String>) {
         | IrMultiLinkJoin::BacklinkJunction {
             junction_table, module, ..
         } => {
-            tags.push(qualify(module, junction_table));
+            push_table_tags(module, junction_table, tags);
         }
         // No junction table involved — the owner table's own tag comes from
         // the caller's own `collect_select`/`tag_for` instead.
@@ -335,7 +348,7 @@ fn collect_shape_pointer(p: &IrShapePointer, tags: &mut Vec<String>) {
         }
         IrShapePointer::Computed(c) => collect_expr(&c.expr, tags),
         IrShapePointer::ScalarSet(ss) => {
-            tags.push(tag_for(&ss.source));
+            push_source_tags(&ss.source, tags);
             for imp in &ss.poly_implementors {
                 tags.push(tag_for_implementor(imp));
             }
@@ -381,7 +394,7 @@ fn collect_array_source(src: &IrArraySource, tags: &mut Vec<String>) {
             expr,
             ..
         } => {
-            tags.push(tag_for(source));
+            push_source_tags(source, tags);
             for imp in poly_implementors {
                 tags.push(tag_for_implementor(imp));
             }
@@ -537,6 +550,7 @@ mod tests {
             global_ctes: vec![],
             warnings: vec![],
             uses_globals_arg: false,
+            subtype_fanouts: Default::default(),
         }
     }
 
@@ -664,6 +678,7 @@ mod tests {
             },
             subquery: inner,
             link_properties: vec![],
+            single: false,
         });
         let sel = IrSelect::schema_bound(src("default::Person", "person", "t0"), vec![ml], None);
         let out = output(IrStmt::Select(sel));

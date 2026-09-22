@@ -270,9 +270,10 @@ class TestFindPylonParents:
             name: str
 
         _, cid = _build_type_index([AbstractP, ConcreteC])
-        parents, interfaces = _find_pylon_parents(ConcreteC, cid)
+        parents, interfaces, bases = _find_pylon_parents(ConcreteC, cid)
         assert 't::AbstractP' in parents
         assert interfaces == []
+        assert bases == []
 
     def test_interface_detected(self):
         @pylon.interface(module='t', name='IFace')
@@ -284,9 +285,25 @@ class TestFindPylonParents:
             name: str
 
         _, cid = _build_type_index([IFace, ConcreteI])
-        parents, interfaces = _find_pylon_parents(ConcreteI, cid)
+        parents, interfaces, bases = _find_pylon_parents(ConcreteI, cid)
         assert parents == []
         assert 't::IFace' in interfaces
+        assert bases == []
+
+    def test_concrete_base_detected(self):
+        @pylon.type(module='t', name='Addon')
+        class Addon:
+            name: str
+
+        @pylon.type(module='t', name='Bundle')
+        class Bundle(Addon):
+            size: pylon.Int64
+
+        _, cid = _build_type_index([Addon, Bundle])
+        parents, interfaces, bases = _find_pylon_parents(Bundle, cid)
+        assert bases == ['t::Addon']
+        assert parents == []
+        assert interfaces == []
 
 
 # ---------------------------------------------------------------------------

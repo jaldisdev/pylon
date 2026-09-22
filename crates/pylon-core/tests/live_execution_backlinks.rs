@@ -75,6 +75,7 @@ fn ty(
         description: None,
         parents: vec![],
         interfaces: vec![],
+        bases: vec![],
         properties,
         links,
         multilinks,
@@ -607,10 +608,11 @@ async fn a_second_shape_shapes_what_the_first_one_declared() {
     let [pylon_value::DecodedValue::Composite(org)] = found.as_slice() else {
         panic!("expected one org, got {found:?}")
     };
-    let pylon_value::DecodedValue::Array(first) = &org[1] else {
-        panic!("expected the declared pointer's rows, got {:?}", org[1])
+    // `limit 1`: one object, as the upstream engine gives it.
+    let pylon_value::DecodedValue::Composite(first) = &org[1] else {
+        panic!("expected the declared pointer's object, got {:?}", org[1])
     };
-    assert_eq!(text_fields(first, 1), vec![Some("Alpha".to_string())]);
+    assert_eq!(first.get(1), Some(&pylon_value::DecodedValue::Str("Alpha".to_string())));
 }
 
 #[tokio::test]
@@ -619,7 +621,7 @@ async fn an_object_computed_guarded_by_a_condition_keeps_its_shape() {
     let (module, schema, pool) = setup().await;
     seed_teams(&pool, &schema, &module).await;
 
-    for (condition, expected) in [("true", vec![Some("Alpha".to_string())]), ("false", vec![])] {
+    for (condition, expected) in [("true", Some("Alpha")), ("false", None)] {
         let found = rows(
             &pool,
             &schema,
@@ -632,10 +634,16 @@ async fn an_object_computed_guarded_by_a_condition_keeps_its_shape() {
         let [pylon_value::DecodedValue::Composite(org)] = found.as_slice() else {
             panic!("expected one org, got {found:?}")
         };
-        let pylon_value::DecodedValue::Array(first) = &org[1] else {
-            panic!("expected the pointer's rows as objects, got {:?}", org[1])
+        // `limit 1`: one object or none, as the upstream engine gives it.
+        let name = match &org[1] {
+            pylon_value::DecodedValue::Composite(first) => match first.get(1) {
+                Some(pylon_value::DecodedValue::Str(name)) => Some(name.as_str()),
+                other => panic!("expected the object's name, got {other:?}"),
+            },
+            pylon_value::DecodedValue::Null => None,
+            other => panic!("expected the pointer's object, got {other:?}"),
         };
-        assert_eq!(text_fields(first, 1), expected, "under `if {condition}`");
+        assert_eq!(name, expected, "under `if {condition}`");
     }
 }
 

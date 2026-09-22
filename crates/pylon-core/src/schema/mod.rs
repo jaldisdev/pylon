@@ -384,6 +384,11 @@ pub struct TypeDescriptor {
     pub parents: Vec<String>,
     /// Qualified names of interface parents.
     pub interfaces: Vec<String>,
+    /// Qualified names of the concrete types this one extends, nearest first
+    /// (`BrandAddonBundle` extends `BrandAddon`). Each has a table of its own,
+    /// and reading one of them reads this type's rows too.
+    #[serde(default)]
+    pub bases: Vec<String>,
     /// Flattened properties (includes inherited from abstract parents).
     pub properties: Vec<PropertyDescriptor>,
     /// Flattened links.

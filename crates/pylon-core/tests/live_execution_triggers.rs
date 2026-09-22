@@ -51,6 +51,7 @@ fn ty(name: &str, module: &str, properties: Vec<pylon_core::schema::PropertyDesc
         description: None,
         parents: vec![],
         interfaces: vec![],
+        bases: vec![],
         properties,
         links: vec![],
         multilinks: vec![],
