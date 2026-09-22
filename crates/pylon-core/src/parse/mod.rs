@@ -64,6 +64,19 @@ mod tests {
     use ast::*;
 
     #[test]
+    fn a_module_under_std_takes_its_full_spelling() {
+        let expr = parse_expr("<std::cal::relative_duration>'30 days'").unwrap();
+        let Expr::TypeCast(cast) = expr else { panic!("{expr:?}") };
+        assert_eq!(cast.ty.as_named(), Some((Some("cal"), "relative_duration")));
+    }
+
+    #[test]
+    fn an_insert_needs_no_shape() {
+        let Stmt::Insert(ins) = parse("insert Person").unwrap() else { panic!() };
+        assert!(ins.shape.is_empty());
+    }
+
+    #[test]
     fn test_select_bare_type() {
         let stmt = parse("SELECT Person").unwrap();
         assert!(matches!(
