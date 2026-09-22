@@ -147,12 +147,15 @@ class _Not(_Node):
 
 
 class _FuncCall(_Node):
-    __slots__ = ('args', 'module', 'name')
+    __slots__ = ('args', 'kwargs', 'module', 'name')
 
-    def __init__(self, module: str | None, name: str, args: list[_Node]) -> None:
+    def __init__(self, module: str | None, name: str, args: list[_Node], kwargs: dict[str, _Node] | None = None) -> None:
         self.module = module
         self.name = name
         self.args = args
+        # Named-only arguments, rendered `name := value` — `message` on the
+        # asserts, every parameter of `cal.to_relative_duration`.
+        self.kwargs = kwargs or {}
 
 
 class _ConstantCall(_FuncCall):
@@ -309,10 +312,11 @@ class _FuncNamespace:
         if stdlib.is_constant(self._module, name):
             return _ConstantCall(self._module, name, [])
 
-        def _call(*args: Any) -> _Node:
+        def _call(*args: Any, **kwargs: Any) -> _Node:
             nodes = [_as_node(a) for a in args]
-            stdlib.check_call(self._module, name, len(nodes))
-            return _FuncCall(self._module, name, nodes)
+            named = {key: _as_node(value) for key, value in kwargs.items()}
+            stdlib.check_call(self._module, name, len(nodes), tuple(named))
+            return _FuncCall(self._module, name, nodes, named)
 
         return _call
 
@@ -465,8 +469,10 @@ def _render(node: _Node, ctx: _RenderCtx) -> str:
             # Deferred to render time on purpose: the same `std.*` object is
             # admissible in one context and not the other, and it doesn't know
             # which it's in until something renders it.
-            stdlib.check_context(node.module, node.name, len(node.args), ctx.context)
-        args_text = ', '.join(_render(a, ctx) for a in node.args)
+            stdlib.check_context(node.module, node.name, len(node.args), ctx.context, tuple(node.kwargs))
+        args_text = ', '.join(
+            [_render(a, ctx) for a in node.args] + [f'{key} := {_render(value, ctx)}' for key, value in node.kwargs.items()]
+        )
         prefix = f'{node.module}::' if node.module else ''
         return f'{prefix}{node.name}({args_text})'
     if isinstance(node, _SubQuery):
@@ -505,7 +511,7 @@ def _collect_subqueries(node: Any, found: list[Any], seen: set[int]) -> None:
     elif isinstance(node, _Not):
         _collect_subqueries(node.operand, found, seen)
     elif isinstance(node, _FuncCall):
-        for arg in node.args:
+        for arg in [*node.args, *node.kwargs.values()]:
             _collect_subqueries(arg, found, seen)
 
 

@@ -157,16 +157,29 @@ def unknown_function_message(namespace: str, name: str, extra: frozenset[str] = 
     return f'unknown function {namespace}.{name}(){_suggest(namespace, name, extra)}'
 
 
-def _arity_matches(entry: dict[str, Any], argc: int) -> bool:
+def positional_params(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """The parameters a call passes by position — all but the named-only ones."""
+    return [p for p in entry['params'] if not p.get('named_only')]
+
+
+def named_params(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """`message := …` on the asserts, every parameter of `cal::to_relative_duration`."""
+    return [p for p in entry['params'] if p.get('named_only')]
+
+
+def _arity_matches(entry: dict[str, Any], argc: int, keywords: tuple[str, ...] = ()) -> bool:
+    if not set(keywords) <= {p['keyword'] for p in named_params(entry)}:
+        return False
+    positional = positional_params(entry)
     if entry['variadic']:
         # The trailing variadic parameter absorbs zero or more arguments, so
         # everything from "all the fixed params" upward is legal.
-        return argc >= len(entry['params']) - 1
-    return argc == len(entry['params'])
+        return argc >= len(positional) - 1
+    return argc == len(positional)
 
 
 def _arity_error(namespace: str, name: str, entries: list[dict[str, Any]], argc: int) -> str:
-    arities = sorted({len(e['params']) for e in entries})
+    arities = sorted({len(positional_params(e)) for e in entries})
     if any(e['variadic'] for e in entries):
         expected = f'at least {min(arities) - 1}'
     elif len(arities) == 1:
@@ -176,7 +189,7 @@ def _arity_error(namespace: str, name: str, entries: list[dict[str, Any]], argc:
     return f'{namespace}.{name}() takes {expected} argument(s), got {argc}'
 
 
-def check_call(namespace: str, name: str, argc: int) -> None:
+def check_call(namespace: str, name: str, argc: int, keywords: tuple[str, ...] = ()) -> None:
     """Validate that `namespace.name(...)` names a real overload with a legal
     argument count. Context-independent, so it can run the moment the call is
     written — a `std.*` node doesn't yet know whether it will end up in a
@@ -185,11 +198,18 @@ def check_call(namespace: str, name: str, argc: int) -> None:
     if not entries:
         raise InterfaceError(unknown_function_message(namespace, name))
 
-    if not any(_arity_matches(e, argc) for e in entries):
+    accepted = {p['keyword'] for e in entries for p in named_params(e)}
+    unknown = [k for k in keywords if k not in accepted]
+    if unknown:
+        if not accepted:
+            raise InterfaceError(f'{namespace}.{name}() does not take named arguments, got {unknown[0]!r}')
+        raise InterfaceError(f'{namespace}.{name}() has no parameter {unknown[0]!r}')
+
+    if not any(_arity_matches(e, argc, keywords) for e in entries):
         raise InterfaceError(_arity_error(namespace, name, entries, argc))
 
 
-def check_context(namespace: str, name: str, argc: int, context: str) -> None:
+def check_context(namespace: str, name: str, argc: int, context: str, keywords: tuple[str, ...] = ()) -> None:
     """Validate that a known-good call is admissible where it's being used.
 
     Runs at render time rather than call time, because the same `std.*`
@@ -197,7 +217,7 @@ def check_context(namespace: str, name: str, argc: int, context: str) -> None:
     against the overloads the caller actually selected by arity, so a name
     with mixed overloads isn't rejected on the strength of one it didn't use.
     """
-    matching = [e for e in overloads(namespace, name) if _arity_matches(e, argc)]
+    matching = [e for e in overloads(namespace, name) if _arity_matches(e, argc, keywords)]
     if not matching:
         return  # check_call already reported this
 

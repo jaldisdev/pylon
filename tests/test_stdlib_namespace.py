@@ -136,6 +136,17 @@ class TestNamespaceCalls:
         assert text == 'std::str_pad_start(.name, $__mq_p0, $__mq_p1)'
         assert params == {'__mq_p0': 10, '__mq_p1': '0'}
 
+    def test_named_only_arguments_render_by_name(self):
+        text, params = render_expr(std.assert_exists(_path('name'), message='missing'))
+        assert text == 'std::assert_exists(.name, message := $__mq_p0)'
+        assert params == {'__mq_p0': 'missing'}
+
+    def test_a_named_only_parameter_is_not_passed_by_position(self):
+        with pytest.raises(InterfaceError):
+            std.assert_exists(_path('name'), 'missing')
+        with pytest.raises(InterfaceError, match='does not take named arguments'):
+            std.str_lower(_path('name'), locale='de')
+
     def test_infix_alias_renders_as_an_operator(self):
         text, params = render_expr(std.ilike(_path('name'), '%bob%'))
         assert text == '.name ilike $__mq_p0'
