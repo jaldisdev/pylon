@@ -105,7 +105,9 @@ def finalize(
 
     Reads ``pylon.toml`` (walking up from the current directory unless *config*
     is given), imports every ``.py`` file from ``[project] schema-dir``, then
-    validates and assembles the full schema.
+    validates and assembles the full schema. The types of its expressions are
+    not checked here; ``pylon migration create``/``apply``/``watch`` check them
+    before anything reaches the database.
 
     Parameters
     ----------
@@ -187,6 +189,11 @@ def finalize(
         named_tuples=named_tuples,
         signals=signals,
         channels=channels_,
+        # Compiling every expression in the schema to check its type is what
+        # makes startup slow, and a connected client compiles against the
+        # migrated schema instead — which the migration commands checked
+        # before writing it.
+        validate_types=False,
     )
     _set_schema(schema)
     _set_signal_index(build_signal_index(signals))
