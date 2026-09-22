@@ -507,6 +507,44 @@ async fn assert_distinct_on_a_pointer_catches_duplicate_rows() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_assert_on_a_single_object_pointer_checks_its_row() {
+    // A single link, or a union of them, is emitted as one record rather than
+    // an array; casting that record straight to `text[]` is what Postgres
+    // rejected ("cannot cast type record to text[]").
+    let module = unique_module("live_assert_single");
+    let sd = schema_with_post(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Post {{ title := 'Hello', author := (insert {module}::Person {{ name := 'Alice', age := 30 }}) }}"
+        ),
+    )
+    .await;
+
+    let single = format!("select {module}::Post {{ title, a := assert_distinct(.author {{ name }}) }}");
+    let rows = rows_of(&pool, &sd, &single).await;
+    assert_eq!(rows.len(), 1, "a single author is distinct, got {rows:?}");
+
+    let repeated_union =
+        format!("select {module}::Post {{ title, a := (select assert_distinct(.author union .author) {{ name }} limit 1) }}");
+    let compiled = query::compile(&repeated_union, &sd).unwrap();
+    let error = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .expect_err("the same author twice is not distinct")
+        .to_string();
+    assert!(
+        error.contains("assert_distinct"),
+        "the raise should come from the assert, got: {error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn an_asserted_multilink_value_checks_its_targets() {
     // `posts := assert_distinct(a union b)` — the check runs over the targets
     // before they become junction rows. Unwrapping the assert would compile
