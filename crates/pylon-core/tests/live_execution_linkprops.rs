@@ -346,6 +346,89 @@ async fn remove_link_clears_the_junction_row() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn remove_link_reads_the_walked_links_of_each_row() {
+    // `tags -= (select .tags filter …)` — the walk on the right is correlated
+    // to the row being updated, both for a plain update and one bound in a
+    // `with`, whose junction DELETE sits in a CTE apart from the row's own.
+    let module = unique_module("live_lp_remove_walk");
+    let sd = schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'sale' }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'new' }}")).await;
+    for product in ["Gadget", "Widget", "Doohickey"] {
+        exec(
+            &pool,
+            &sd,
+            &format!(
+                "insert {module}::Product {{ name := '{product}', \
+                 tags := (select {module}::Tag) {{ @weight := 1.0 }} }}"
+            ),
+        )
+        .await;
+    }
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "update {module}::Product filter .name = 'Widget' set {{ \
+             tags -= (select .tags filter .name = 'sale') }}"
+        ),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with product := (select {module}::Product filter .name = 'Doohickey'), \
+             unassignment := (update product set {{ tags -= (select .tags filter .name = 'new') }}) \
+             select unassignment"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Product {{ name, tags: {{ name }} order by .name }} order by .name"),
+    )
+    .await;
+    let tag_names: Vec<(String, Vec<String>)> = rows
+        .iter()
+        .map(|row| {
+            let DecodedValue::Composite(shape) = row else {
+                panic!("expected Composite")
+            };
+            let DecodedValue::Str(name) = &shape[1] else {
+                panic!("expected a Str for name")
+            };
+            let DecodedValue::Array(tags) = &shape[2] else {
+                panic!("expected an Array for tags")
+            };
+            let names = tags
+                .iter()
+                .map(|tag| match field(tag, 1) {
+                    DecodedValue::Str(tag_name) => tag_name.clone(),
+                    other => panic!("expected a Str for the tag name, got {other:?}"),
+                })
+                .collect();
+            (name.clone(), names)
+        })
+        .collect();
+    assert_eq!(
+        tag_names,
+        vec![
+            ("Doohickey".to_string(), vec!["sale".to_string()]),
+            ("Gadget".to_string(), vec!["new".to_string(), "sale".to_string()]),
+            ("Widget".to_string(), vec!["new".to_string()]),
+        ],
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn a_link_property_value_reads_the_walked_links_current_value() {
     // `tags += (select .tags { @weight := @weight + 1.0 } filter …)` — the
     // `@weight` on the right is the junction row the walk crosses.
