@@ -535,6 +535,34 @@ class TestLinkField:
         assert _make_product().alt_category is None
 
 
+class TestLinkPropertyAccess:
+    """Errors mirror a the upstream engine object's, so ported `obj['@prop']` reads behave alike."""
+
+    def _linked_product(self) -> Product:
+        product = _make_product()
+        vars(product)['@weight'] = 1.5
+        return product
+
+    def test_reads_a_fetched_link_property(self):
+        assert self._linked_product()['@weight'] == 1.5
+
+    def test_missing_link_property(self):
+        with pytest.raises(KeyError, match="link property '@missing' does not exist"):
+            self._linked_product()['@missing']
+
+    def test_property_needs_dot_notation(self):
+        with pytest.raises(TypeError, match="property 'name' should be accessed via dot notation"):
+            self._linked_product()['name']
+
+    def test_link_needs_dot_notation(self):
+        with pytest.raises(TypeError, match="link 'category' should be accessed via dot notation"):
+            self._linked_product()['category']
+
+    def test_name_without_prefix(self):
+        with pytest.raises(TypeError, match="link property 'weight' should be accessed with '@' prefix"):
+            self._linked_product()['weight']
+
+
 # ---------------------------------------------------------------------------
 # MultiLink fields
 # ---------------------------------------------------------------------------

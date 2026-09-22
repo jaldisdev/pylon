@@ -286,6 +286,28 @@ def _inject_repr(cls: type) -> None:
     cls.__repr__ = __repr__  # type: ignore[method-assign]
 
 
+def _inject_link_property_access(cls: type) -> None:
+    """Read a fetched link property as ``obj['@name']``, with the upstream engine's errors."""
+
+    def __getitem__(self, name: Any) -> Any:
+        if isinstance(name, str) and name.startswith('@'):
+            try:
+                return vars(self)[name]
+            except KeyError:
+                raise KeyError(f'link property {name!r} does not exist') from None
+        fetched = vars(self).get(name, MISSING) if isinstance(name, str) and not name.startswith('__') else MISSING
+        from pylon.datatypes import LinkSet
+
+        if fetched is not MISSING and not (isinstance(fetched, LinkSet) and not fetched.is_hydrated):
+            cfg = getattr(type(self), '__pylon_config__', None)
+            meta = cfg.pointers.get(name) if cfg else None
+            kind = 'link' if meta is not None and meta.kind in ('link', 'multilink') else 'property'
+            raise TypeError(f'{kind} {name!r} should be accessed via dot notation')
+        raise TypeError(f"link property {name!r} should be accessed with '@' prefix")
+
+    cls.__getitem__ = __getitem__  # type: ignore[attr-defined]
+
+
 def _inject_query_methods(cls: type, *, abstract: bool, junction: bool) -> None:
     """Attach `.filter()` for model-based querying (`client.query(Model)` /
     `Model.filter(...)`, see `pylon.modelquery`) — only for regular,
@@ -571,6 +593,7 @@ def _build_type(
     _prepare_dataclass(cls, pointer_metas)
     dataclasses.dataclass(cls, kw_only=True)
     _inject_repr(cls)
+    _inject_link_property_access(cls)
     _inject_query_methods(cls, abstract=abstract, junction=junction)
 
     resolved_module = module or _infer_module(cls)
