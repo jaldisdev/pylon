@@ -76,6 +76,7 @@ class Author:
 class Post:
     title: str
     shade: Colour
+    palette: pylon.Array[Colour] | None
     author: Link[Author] | None
     tags: MultiLink[Tag]
 
@@ -266,6 +267,16 @@ class TestEnums:
     def test_a_null_enum(self):
         compiled = _compile('select m::Post { shade }')
         assert_parity([('m::Post', None)], compiled)
+
+    def test_an_enum_array_property(self):
+        compiled = _compile('select m::Post { palette }')
+        native = assert_parity([('m::Post', ['RED', 'BLUE'])], compiled)
+        assert list(native[0].palette) == [Colour.RED, Colour.BLUE]
+
+    def test_an_unset_enum_array_property(self):
+        compiled = _compile('select m::Post { palette }')
+        native = assert_parity([('m::Post', None)], compiled)
+        assert native[0].palette is None
 
 
 class TestFreeObjectsAndScalars:

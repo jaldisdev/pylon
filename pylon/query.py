@@ -260,7 +260,9 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         return _decode_json_tuple(raw, node, registry)
 
     if kind == 'enum':
-        raw = value[node['position']]
+        # An enum inside an array arrives as the label itself rather than as a
+        # field of a record.
+        raw = value[node['position']] if isinstance(value, tuple) else value
         if raw is None:
             return None
         enum_type = node['enum_type']
@@ -273,8 +275,13 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
     if kind == 'array':
         from pylon.datatypes import PylonSet
 
-        arr = value[node['position']] or []
+        arr = value[node['position']]
         element = node['element']
+        # A set of objects is never None; an unset array-typed property is.
+        if arr is None:
+            if element['kind'] != 'object':
+                return None
+            arr = []
         # Array elements are anonymous records; decode each one as a root object.
         return PylonSet(_decode(item, {**element, 'position': 0}, registry) for item in arr)
 

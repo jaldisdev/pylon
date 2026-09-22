@@ -186,6 +186,16 @@ class TestDecodeArray:
         outer = ('default::Person', 'Alice', None)
         assert _decode(outer, shape, {}) == []
 
+    def test_unset_array_property_decodes_to_none(self):
+        shape = {
+            'kind': 'array',
+            'name': 'nicknames',
+            'position': 1,
+            'element': {'kind': 'scalar', 'name': '', 'position': 0},
+        }
+        outer = ('default::Person', None)
+        assert _decode(outer, shape, {}) is None
+
 
 # ── _decode named_tuple / _decode_json_tuple ───────────────────────────────────
 

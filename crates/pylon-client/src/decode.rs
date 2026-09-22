@@ -199,8 +199,10 @@ fn is_nothing(value: &Value) -> bool {
 }
 
 fn decode_array(value: &DecodedValue, position: usize, element: &ShapeNode) -> Value {
+    // A set of objects is never NULL; an unset array-typed property is.
     let items = match composite_at(value, position) {
         DecodedValue::Array(items) => items,
+        DecodedValue::Null if !matches!(element, ShapeNode::Object { .. }) => return Value::Null,
         _ => vec![],
     };
     Value::Array(items.iter().map(|item| decode_inner(element, item, Some(0))).collect())
@@ -616,6 +618,21 @@ mod tests {
             panic!("expected Object element")
         };
         assert_eq!(tag.get("name"), Some(&Value::Str("rust".into())));
+    }
+
+    #[test]
+    fn an_unset_array_property_decodes_to_null() {
+        let value = comp(vec![DecodedValue::Str("default::Person".into()), DecodedValue::Null]);
+        let shape = ShapeNode::Array {
+            name: "roles".into(),
+            position: 1,
+            element: Box::new(ShapeNode::Enum {
+                name: String::new(),
+                position: 0,
+                enum_type: "default::Role".into(),
+            }),
+        };
+        assert_eq!(decode(&shape, &value), Value::Null);
     }
 
     #[test]
