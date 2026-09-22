@@ -5740,7 +5740,7 @@ impl<'a> Compiler<'a> {
                 .unwrap_or_else(|| td.table.clone()),
         };
         let source = IrSource {
-            poly: None,
+            poly: self.poly_fanout_for(&format!("{}::{}", td.module, td.name)),
             type_name: format!("{}::{}", td.module, td.name),
             table,
             alias: alias.clone(),
@@ -6307,7 +6307,7 @@ impl<'a> Compiler<'a> {
             None => td.table.clone(),
         };
         let source = IrSource {
-            poly: None,
+            poly: self.poly_fanout_for(&fq_type_name),
             type_name: fq_type_name.clone(),
             table,
             alias: alias.clone(),
@@ -8288,7 +8288,7 @@ impl<'a> Compiler<'a> {
                 let sub_shape = self.compile_splat(&ast::Splat::Shallow, target_td, &sub_alias, &target_module)?;
                 let subquery = IrSelect::schema_bound(
                     IrSource {
-                        poly: None,
+                        poly: self.link_target_fanout(target_td),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         table: target_td.table.clone(),
                         alias: sub_alias.clone(),
@@ -8622,7 +8622,7 @@ impl<'a> Compiler<'a> {
             let sub_shape = Self::pk_returning(target_td);
             let subquery = IrSelect::schema_bound(
                 IrSource {
-                    poly: None,
+                    poly: self.link_target_fanout(target_td),
                     type_name: format!("{}::{}", target_td.module, target_td.name),
                     table: target_td.table.clone(),
                     alias: sub_alias,
@@ -9345,7 +9345,7 @@ impl<'a> Compiler<'a> {
         let subquery = IrSelect {
             rows: vec![IrRowSource::Bound {
                 source: IrSource {
-                    poly: None,
+                    poly: self.poly_fanout_for(&owner_qname),
                     type_name: owner_qname,
                     table: owner_td.table.clone(),
                     alias: sub_alias.clone(),
@@ -10055,10 +10055,7 @@ impl<'a> Compiler<'a> {
             let (filter, order_by, offset, limit) = modifiers?;
             let shape = shape?;
             let source = IrSource {
-                poly: match binding {
-                    Some(_) => None,
-                    None => self.poly_fanout_for(&format!("{}::{}", root_td.module, root_td.name)),
-                },
+                poly: self.poly_fanout_for(&format!("{}::{}", root_td.module, root_td.name)),
                 type_name: format!("{}::{}", root_td.module, root_td.name),
                 table,
                 alias,

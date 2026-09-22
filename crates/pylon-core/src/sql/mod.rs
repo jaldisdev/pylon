@@ -2668,7 +2668,7 @@ fn emit_group_projection(
 
 fn emit_group_elements(grp: &IrGroup) -> SqlOutput {
     let (exprs, nodes) = build_shape(&grp.shape, &grp.source.alias);
-    let mut parts = vec![type_disc(&grp.source.type_name)];
+    let mut parts = vec![source_type_disc(&grp.source)];
     parts.extend(exprs);
     let (from_sql, cond) = group_rows(grp);
     let mut sql = format!(
@@ -2699,7 +2699,7 @@ fn emit_group_rows(grp: &IrGroup) -> SqlOutput {
     let (shape_exprs, shape_nodes) = build_shape(&grp.shape, alias);
 
     // Build the elements ROW: type discriminator at pos 0, then shape pointers.
-    let mut elem_row_parts = vec![type_disc(&grp.source.type_name)];
+    let mut elem_row_parts = vec![source_type_disc(&grp.source)];
     elem_row_parts.extend(shape_exprs);
     let elem_row = elem_row_parts.join(",\n            ");
 
@@ -11449,6 +11449,132 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             !out.sql.contains("FROM \"default\".\"Account\" AS"),
             "the interface's own view should no longer be read directly, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// `make_interface_schema` with a second implementor of `Account`, so a
+    /// read of it is a real union of two concrete types.
+    fn make_two_implementor_schema() -> SchemaDescriptor {
+        let mut schema = make_interface_schema();
+        let mut organization = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Individual")
+            .expect("the interface schema has an Individual type")
+            .clone();
+        organization.name = "Organization".into();
+        organization.table = "Organization".into();
+        organization.computed.clear();
+        schema.types.push(organization);
+        schema
+    }
+
+    /// Every row read of an interface names its own concrete type, so none may
+    /// be labelled with the interface's.
+    fn assert_rows_carry_their_concrete_type(query: &str) {
+        let out = compile_and_emit_with(query, &make_two_implementor_schema());
+        assert!(
+            !out.sql.contains("'default::Account'::text"),
+            "rows are labelled with the interface instead of their own type:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("'default::Individual'::text AS \"__type__\""),
+            "the rows should come from the implementors, each tagging its own:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn an_aggregated_select_of_an_interface_carries_the_concrete_type() {
+        assert_rows_carry_their_concrete_type("SELECT (xs := array_agg((SELECT Account { id })))");
+    }
+
+    #[test]
+    fn an_aggregated_binding_of_an_interface_carries_the_concrete_type() {
+        assert_rows_carry_their_concrete_type(
+            "WITH a := (SELECT Account) SELECT (xs := array_agg((SELECT a { id })))",
+        );
+    }
+
+    #[test]
+    fn a_single_object_read_off_a_binding_carries_the_concrete_type() {
+        assert_rows_carry_their_concrete_type("WITH a := (SELECT Account) SELECT (x := (SELECT a { id } LIMIT 1))");
+    }
+
+    #[test]
+    fn grouped_elements_of_an_interface_carry_the_concrete_type() {
+        assert_rows_carry_their_concrete_type("group Account { id } by .email");
+    }
+
+    /// `make_two_implementor_schema` with a `Note` that links to an `Account`,
+    /// and an `Account` that links back to a `Note`.
+    fn make_note_schema() -> SchemaDescriptor {
+        fn link_to(name: &str, target: &str) -> LinkDescriptor {
+            LinkDescriptor {
+                name: name.into(),
+                target: target.into(),
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                is_exclusive: false,
+                is_readonly: false,
+                rewrites: vec![],
+                on_delete: vec![],
+                through: None,
+            }
+        }
+        let mut schema = make_two_implementor_schema();
+        for account in schema
+            .types
+            .iter_mut()
+            .filter(|t| ["Account", "Individual", "Organization"].contains(&t.name.as_str()))
+        {
+            account.links.push(link_to("pinned", "default::Note"));
+        }
+        schema.types.push(TypeDescriptor {
+            name: "Note".into(),
+            module: "default".into(),
+            table: "Note".into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![],
+            links: vec![link_to("owner", "default::Account")],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+        schema
+    }
+
+    #[test]
+    fn a_backlink_to_an_interface_carries_the_concrete_type() {
+        let out = compile_and_emit_with("SELECT Note { pinners := .<pinned[is Account] { id } }", &make_note_schema());
+        assert!(
+            !out.sql.contains("'default::Account'::text"),
+            "the backlink's rows are labelled with the interface instead of their own type:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_link_reached_through_a_deep_splat_carries_the_concrete_type() {
+        let out = compile_and_emit_with("SELECT Note { ** }", &make_note_schema());
+        assert!(
+            !out.sql.contains("'default::Account'::text"),
+            "the splatted link's rows are labelled with the interface instead of their own type:\n{}",
             out.sql
         );
     }
