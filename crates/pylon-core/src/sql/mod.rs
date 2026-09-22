@@ -6393,6 +6393,39 @@ mod tests {
     }
 
     #[test]
+    fn test_dividing_integers_yields_a_float() {
+        for (query, expected) in [
+            ("SELECT 100 / 133", "((100)::float8 / 133)"),
+            ("SELECT Person { a := .age / 2 }", "::float8 / 2)"),
+            ("SELECT Person.age / 2", "::float8 / 2)"),
+            (
+                "WITH total := max({133}), current := 38 - 1 SELECT 100 / total * current",
+                "(((100)::float8 / (SELECT \"v\" FROM \"total\")) * (SELECT \"v\" FROM \"current\"))",
+            ),
+            (
+                "WITH p := (SELECT Person LIMIT 1), index := p.age - 1, total := max(Person.age) SELECT 100 / total * index",
+                "((100)::float8 / (SELECT \"v\" FROM \"total\"))",
+            ),
+        ] {
+            let out = compile_and_emit(query);
+            assert!(out.sql.contains(expected), "{query}:\n{}", out.sql);
+        }
+    }
+
+    #[test]
+    fn test_dividing_anything_but_two_integers_is_left_to_postgres() {
+        for query in [
+            "SELECT 100 // 133",
+            "SELECT 100 / 1.5",
+            "SELECT <decimal>100 / <decimal>3",
+            "SELECT 100 / <decimal>3",
+        ] {
+            let out = compile_and_emit(query);
+            assert!(!out.sql.contains("::float8 /"), "{query}:\n{}", out.sql);
+        }
+    }
+
+    #[test]
     fn test_a_free_object_under_a_condition_stays_an_object() {
         for query in [
             "SELECT { a := 1 } IF true ELSE {}",
