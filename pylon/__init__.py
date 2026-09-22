@@ -93,6 +93,7 @@ from .schema import (
     Readonly,
     Regexp,
     Restrict,
+    Rewrite,
     Scalar,
     SearchBackend,
     SearchIndex,
@@ -118,6 +119,8 @@ from .schema import (
     named_tuple,
     scalar,
     type,  # shadows builtins.type intentionally
+    Timing,
+    Trigger,
 )
 from .schema import (
     function_decorator as function,
@@ -198,6 +201,9 @@ __all__ = [
     'PylonConfig',
     'PylonError',
     'Readonly',
+    'Rewrite',
+    'Timing',
+    'Trigger',
     'Regexp',
     'Restrict',
     'Rollback',
