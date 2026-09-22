@@ -3946,8 +3946,15 @@ fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -
             // evaluated once rather than in both the check and the result, and
             // read through `cardinality` because the assert hands back the
             // array it was given.
+            // A pointer landing on one object reads as a lone record, not an
+            // array, so its set is re-read through `ARRAY(…)`; the unlimited
+            // check form would otherwise fail on more than one row.
             let checked_set = match &a.check {
+                Some(check) if emits_one_object(check) => {
+                    format!("ARRAY{}", emit_shape_pointer(check, table_alias, pos).0)
+                }
                 Some(check) => emit_shape_pointer(check, table_alias, pos).0,
+                None if emits_one_object(&a.inner) => format!("ARRAY{sql}"),
                 None => "\"_a\".\"v\"".to_string(),
             };
             let checked = format!(
@@ -3957,6 +3964,17 @@ fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -
             );
             (checked, node)
         }
+    }
+}
+
+/// True when the pointer is emitted as a single `(SELECT …)` record rather
+/// than an aggregated array of them.
+fn emits_one_object(pointer: &IrShapePointer) -> bool {
+    match pointer {
+        IrShapePointer::SingleLink(_) => true,
+        IrShapePointer::Computed(c) => matches!(c.expr, IrExpr::ObjectPathSubquery(_) | IrExpr::ObjectPathUnion { .. }),
+        IrShapePointer::Asserted(a) => emits_one_object(&a.inner),
+        _ => false,
     }
 }
 
