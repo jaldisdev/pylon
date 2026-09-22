@@ -9042,6 +9042,7 @@ impl<'a> Compiler<'a> {
         nested: &[ShapeElement],
         modifiers: Option<&ast::SelectStmt>,
         multi: bool,
+        tail: usize,
     ) -> Result<IrShapePointer, PyQLError> {
         let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
         steps.extend(path.steps.iter().cloned());
@@ -9054,12 +9055,12 @@ impl<'a> Compiler<'a> {
             limit: modifiers.and_then(|m| m.limit.clone()),
             lock: None,
         };
-        let mut path_select = self.compile_path_select(&synthetic, &full_path, nested, false)?;
+        let mut path_select = self.compile_path_select_with_tail(&synthetic, &full_path, nested, false, tail)?;
         Self::correlate_path_select(&mut path_select, alias);
         // A walk that crosses a multi step stands for a set, so it is
         // aggregated; one that cannot is a single object and is read as one,
         // rather than an array of length one.
-        let expr = if multi && !limits_to_one(modifiers) {
+        let expr = if multi {
             IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(path_select))))
         } else {
             IrExpr::ObjectPathSubquery(Box::new(path_select))
@@ -9719,6 +9720,30 @@ impl<'a> Compiler<'a> {
         // `Expr::Shape` wrapping whatever precedes it, never into
         // `el.nested` (that field is only populated by the separate no-`:=`
         // "bare inclusion with nested shape" parse path).
+        // `((select .history order by … limit 1)).release` — the field access
+        // continues the walk, and the modifiers stay on the step they were
+        // written on.
+        if let Some((sel, tail)) = Self::field_access_over_select(compexpr)
+            && let Expr::Path(path) = &sel.result
+        {
+            let (head_steps, tail_steps) = path.steps.split_at(path.steps.len() - tail);
+            let (head_multi, head_target) = self.walk_path_types(td, head_steps, MAX_COMPUTED_SPLICES);
+            let Some(head_target) = head_target else {
+                return Ok(None);
+            };
+            let (tail_multi, target) = self.walk_path_types(head_target, tail_steps, MAX_COMPUTED_SPLICES);
+            if target.is_none() {
+                return Ok(None);
+            }
+            let multi = tail_multi || (head_multi && !limits_to_one(Some(&sel)));
+            if !multi && nested_override.is_empty() {
+                return Ok(None);
+            }
+            let path = path.clone();
+            return self
+                .compile_chained_link_pointer(pointer_name, &path, td, alias, nested_override, Some(&sel), multi, tail)
+                .map(Some);
+        }
         let Some((path, declared_nested, modifiers)) = Self::pointer_subject(compexpr) else {
             return Ok(None);
         };
@@ -9778,7 +9803,7 @@ impl<'a> Compiler<'a> {
                 let path = path.clone();
                 let nested = nested.to_vec();
                 return self
-                    .compile_chained_link_pointer(pointer_name, &path, td, alias, &nested, modifiers, multi)
+                    .compile_chained_link_pointer(pointer_name, &path, td, alias, &nested, modifiers, multi && !limits_to_one(modifiers), 0)
                     .map(Some);
             }
             _ => return Ok(None),
@@ -10260,6 +10285,10 @@ impl<'a> Compiler<'a> {
     fn computed_is_object_valued(&self, cd: &crate::schema::ComputedDescriptor, td: &TypeDescriptor) -> bool {
         let Ok(expr) = crate::parse::parse_pointer_expr(&cd.expression) else {
             return false;
+        };
+        let expr = match Self::field_access_over_select(&expr) {
+            Some((sel, _)) => Expr::SubQuery(Box::new(Stmt::Select(sel))),
+            None => expr,
         };
         let Some((path, _, _)) = Self::pointer_subject(&expr) else {
             return false;
