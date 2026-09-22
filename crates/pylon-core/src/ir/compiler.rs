@@ -10115,6 +10115,7 @@ impl<'a> Compiler<'a> {
             && let Some((td, alias)) = ctx
         {
             let elements = sh.elements.clone();
+            let operands_reach_many = self.relative_paths_reach_many(td, &operands);
             let mut branches = Vec::with_capacity(operands.len());
             for path in operands {
                 let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
@@ -10138,7 +10139,9 @@ impl<'a> Compiler<'a> {
                 .map(|l| self.compile_free_expr(l))
                 .transpose()?
                 .map(Box::new);
-            return Ok(IrExpr::ObjectPathUnion { branches, limit });
+            let multi = !matches!(limit.as_deref(), Some(IrExpr::Literal(IrLiteral::Int(1))))
+                && operands_reach_many;
+            return Ok(IrExpr::ObjectPathUnion { branches, limit, multi });
         }
         let Stmt::Select(sel) = stmt else {
             return Err(self.subquery_expr_err(stmt));
@@ -10530,6 +10533,98 @@ impl<'a> Compiler<'a> {
     /// second row showed up).
     fn path_crosses_multi(&self, td: &TypeDescriptor, steps: &[ast::PathStep]) -> bool {
         self.walk_path_types(td, steps, MAX_COMPUTED_SPLICES).0
+    }
+
+    /// One correlated walk per operand of a coalesce of relative paths, each
+    /// one filtered to the rows where every operand before it came up empty —
+    /// which is what makes the arms, read together, mean what `??` means.
+    fn coalesce_path_branches(
+        &mut self,
+        td: &TypeDescriptor,
+        alias: &str,
+        operands: &[ast::Path],
+        elements: &[ast::ShapeElement],
+    ) -> Result<Vec<IrPathSelect>, PyQLError> {
+        let mut branches: Vec<IrPathSelect> = Vec::with_capacity(operands.len());
+        for path in operands {
+            let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+            steps.extend(path.steps.iter().cloned());
+            let rooted = ast::Path { steps, partial: false };
+            let synthetic = ast::SelectStmt {
+                result: Expr::Path(rooted.clone()),
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            };
+            let mut ps = self.compile_path_select(&synthetic, &rooted, elements, false)?;
+            Self::correlate_path_select(&mut ps, alias);
+            let guards: Vec<IrExpr> = branches
+                .iter()
+                .map(|earlier| {
+                    IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                        op: ast::UnaryOpKind::Not,
+                        operand: IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                            op: ast::UnaryOpKind::Exists,
+                            operand: IrExpr::PathSubquery(Box::new(earlier.clone())),
+                        })),
+                    }))
+                })
+                .collect();
+            if !guards.is_empty() {
+                ps.filter = and_conditions(ps.filter, guards);
+            }
+            branches.push(ps);
+        }
+        Ok(branches)
+    }
+
+    /// Whether a relative path lands on objects rather than on values — its
+    /// last named step is a link, a multi-link or a backlink. A coalesce over
+    /// values is a choice between two sets of scalars, which the ordinary
+    /// binary-operator path already reads as one.
+    fn path_lands_on_objects(&self, td: &TypeDescriptor, path: &ast::Path) -> bool {
+        let Some(last) = path
+            .steps
+            .iter()
+            .rposition(|step| matches!(step, ast::PathStep::Name(_) | ast::PathStep::Backlink(_)))
+        else {
+            return false;
+        };
+        match &path.steps[last] {
+            ast::PathStep::Backlink(_) => true,
+            ast::PathStep::Name(name) => self
+                .walk_path_types(td, &path.steps[..last], MAX_COMPUTED_SPLICES)
+                .1
+                .is_some_and(|owner| {
+                    Self::resolve_multilink(owner, name).is_some() || Self::resolve_link(owner, name).is_some()
+                }),
+            _ => false,
+        }
+    }
+
+    /// Whether the operands of a union or coalesce of relative paths reach
+    /// more than one object between them. A leading type intersection roots
+    /// the walk at the intersected type, as `compile_partial_path_as_subquery`
+    /// does, so `[is Loop].condition_configs` is read off `Loop`.
+    fn relative_paths_reach_many(&self, td: &TypeDescriptor, operands: &[ast::Path]) -> bool {
+        operands.iter().any(|path| {
+            let (root_td, rest) = match path.steps.first() {
+                Some(ast::PathStep::TypeIntersection(tr)) => {
+                    let name = match &tr.module {
+                        Some(module) => format!("{}::{}", module, tr.name),
+                        None => tr.name.clone(),
+                    };
+                    match self.resolve_type(&name) {
+                        Ok(resolved) => (resolved, &path.steps[1..]),
+                        Err(_) => return true,
+                    }
+                }
+                _ => (td, &path.steps[..]),
+            };
+            self.path_crosses_multi(root_td, rest)
+        })
     }
 
     /// Walk `steps` from `td` without compiling anything, reporting whether
@@ -10947,6 +11042,29 @@ impl<'a> Compiler<'a> {
                     pg_type,
                     tuple_shape,
                 })))
+            }
+
+            // The same coalesce with no shape after it — `(… ?? …)` standing
+            // for the ids of the set it reaches. SQL's own COALESCE, which an
+            // ordinary binary operator compiles to, takes one value per side,
+            // so a walk reaching many rows has to be read as a set instead.
+            Expr::BinOp(b)
+                if b.op == ast::BinOpKind::Coalesce
+                    && ctx.is_some()
+                    && Self::coalesce_of_relative_paths(expr).is_some_and(|operands| {
+                        let td = ctx.expect("checked").0;
+                        self.relative_paths_reach_many(td, &operands)
+                            && operands.iter().all(|path| self.path_lands_on_objects(td, path))
+                    }) =>
+            {
+                let (td, alias) = ctx.expect("checked by the guard");
+                let operands = Self::coalesce_of_relative_paths(expr).expect("checked by the guard");
+                let branches = self.coalesce_path_branches(td, alias, &operands, &[])?;
+                Ok(IrExpr::ObjectPathUnion {
+                    branches,
+                    limit: None,
+                    multi: true,
+                })
             }
 
             Expr::BinOp(b) => {
@@ -12113,6 +12231,7 @@ impl<'a> Compiler<'a> {
                 let operands =
                     Self::union_of_relative_paths(sh.expr.as_ref().expect("checked")).expect("checked by the guard");
                 let elements = sh.elements.clone();
+                let multi = self.relative_paths_reach_many(td, &operands);
                 let mut branches = Vec::with_capacity(operands.len());
                 for path in operands {
                     let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
@@ -12130,7 +12249,11 @@ impl<'a> Compiler<'a> {
                     Self::correlate_path_select(&mut ps, alias);
                     branches.push(ps);
                 }
-                Ok(IrExpr::ObjectPathUnion { branches, limit: None })
+                Ok(IrExpr::ObjectPathUnion {
+                    branches,
+                    limit: None,
+                    multi,
+                })
             }
 
             // `([is Conditional].configs ?? [is Loop].configs) { … }` — the
@@ -12142,40 +12265,13 @@ impl<'a> Compiler<'a> {
                 let (td, alias) = ctx.expect("checked by the guard");
                 let operands =
                     Self::coalesce_of_relative_paths(sh.expr.as_ref().expect("checked")).expect("checked by the guard");
-                let elements = sh.elements.clone();
-                let mut branches: Vec<IrPathSelect> = Vec::with_capacity(operands.len());
-                for path in operands {
-                    let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
-                    steps.extend(path.steps.iter().cloned());
-                    let rooted = ast::Path { steps, partial: false };
-                    let synthetic = ast::SelectStmt {
-                        result: Expr::Path(rooted.clone()),
-                        filter: None,
-                        order_by: vec![],
-                        offset: None,
-                        limit: None,
-                        lock: None,
-                    };
-                    let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
-                    Self::correlate_path_select(&mut ps, alias);
-                    let guards: Vec<IrExpr> = branches
-                        .iter()
-                        .map(|earlier| {
-                            IrExpr::UnaryOp(Box::new(IrUnaryOp {
-                                op: ast::UnaryOpKind::Not,
-                                operand: IrExpr::UnaryOp(Box::new(IrUnaryOp {
-                                    op: ast::UnaryOpKind::Exists,
-                                    operand: IrExpr::PathSubquery(Box::new(earlier.clone())),
-                                })),
-                            }))
-                        })
-                        .collect();
-                    if !guards.is_empty() {
-                        ps.filter = and_conditions(ps.filter, guards);
-                    }
-                    branches.push(ps);
-                }
-                Ok(IrExpr::ObjectPathUnion { branches, limit: None })
+                let multi = self.relative_paths_reach_many(td, &operands);
+                let branches = self.coalesce_path_branches(td, alias, &operands, &sh.elements)?;
+                Ok(IrExpr::ObjectPathUnion {
+                    branches,
+                    limit: None,
+                    multi,
+                })
             }
 
             Expr::Shape(sh) if matches!(sh.expr.as_ref(), Some(Expr::SubQuery(_))) => {

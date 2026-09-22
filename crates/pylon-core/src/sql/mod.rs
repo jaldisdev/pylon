@@ -2128,7 +2128,7 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
 fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match expr {
-        IrExpr::ObjectPathUnion { branches, .. } => {
+        IrExpr::ObjectPathUnion { branches, multi, .. } => {
             let first = branches.first().expect("a union has at least one branch");
             let IrPathResult::Object {
                 alias,
@@ -2139,12 +2139,21 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                 unreachable!("an object path union's branches always land on objects")
             };
             let (_, pointer_nodes) = build_shape(shape, alias);
-            ShapeNode::Object {
-                name: name.to_string(),
+            let object = ShapeNode::Object {
+                name: if *multi { String::new() } else { name.to_string() },
                 type_name: Some(type_name.clone()),
-                position,
-                cardinality: Cardinality::Optional,
+                position: if *multi { 0 } else { position },
+                cardinality: if *multi { Cardinality::Many } else { Cardinality::Optional },
                 pointers: prepend_type(pointer_nodes),
+            };
+            if *multi {
+                ShapeNode::Array {
+                    name: name.to_string(),
+                    position,
+                    element: Box::new(object),
+                }
+            } else {
+                object
             }
         }
         IrExpr::ObjectPathSubquery(ps) => {
@@ -4028,7 +4037,10 @@ fn emit_shape_pointer(pointer: &IrShapePointer, table_alias: &str, pos: usize) -
 fn emits_one_object(pointer: &IrShapePointer) -> bool {
     match pointer {
         IrShapePointer::SingleLink(_) => true,
-        IrShapePointer::Computed(c) => matches!(c.expr, IrExpr::ObjectPathSubquery(_) | IrExpr::ObjectPathUnion { .. }),
+        IrShapePointer::Computed(c) => matches!(
+            c.expr,
+            IrExpr::ObjectPathSubquery(_) | IrExpr::ObjectPathUnion { multi: false, .. }
+        ),
         IrShapePointer::Asserted(a) => emits_one_object(&a.inner),
         _ => false,
     }
@@ -4877,7 +4889,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             sql
         }
 
-        IrExpr::ObjectPathUnion { branches, limit } => {
+        IrExpr::ObjectPathUnion { branches, limit, multi } => {
             let arms: Vec<String> = branches
                 .iter()
                 .map(|ps| {
@@ -4901,7 +4913,11 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                     sql
                 })
                 .collect();
-            let mut sql = format!("(SELECT \"r\" FROM (\n{}\n) AS \"_u\"", arms.join("\nUNION ALL\n"));
+            let mut sql = format!(
+                "{}(SELECT \"r\" FROM (\n{}\n) AS \"_u\"",
+                if *multi { "ARRAY" } else { "" },
+                arms.join("\nUNION ALL\n")
+            );
             if let Some(limit) = limit {
                 sql.push_str(&format!("\nLIMIT {}", emit_expr(limit)));
             }
@@ -6402,6 +6418,54 @@ mod tests {
             &make_schema(),
         );
         assert!(out.sql.contains("UNION ALL"), "one branch per side:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_bare_coalesce_of_correlated_walks_reaching_many_objects() {
+        // Without a shape the walks stand for the ids they reach, which is
+        // still a set -- SQL's COALESCE takes one value per side.
+        let out = compile_and_emit_with(
+            "SELECT Post { owners := .<posts[is Person] ?? .<posts[is Person] }",
+            &make_schema(),
+        );
+        assert!(!out.sql.contains("COALESCE("), "not a value-by-value choice:\n{}", out.sql);
+        assert!(
+            out.sql.contains("ARRAY(SELECT \"r\" FROM ("),
+            "the arms are aggregated:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_union_of_correlated_walks_reaching_many() {
+        // Without the LIMIT the union stands for every object both walks
+        // reach, so its arms have to be aggregated. Read as a lone record it
+        // compiled fine and failed in PostgreSQL on the second row, with
+        // "more than one row returned by a subquery used as an expression".
+        let out = compile_and_emit_with(
+            "SELECT Post { owners := (.<posts[is Person] UNION .<posts[is Person]) { name } }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("ARRAY(SELECT \"r\" FROM ("),
+            "the arms are aggregated:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_coalesce_of_correlated_walks_reaching_many() {
+        // `([is A].links ?? [is B].links) { … }` — the same set a union of
+        // them gives, so it aggregates the same way.
+        let out = compile_and_emit_with(
+            "SELECT Post { owners := (.<posts[is Person] ?? .<posts[is Person]) { name } }",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("ARRAY(SELECT \"r\" FROM ("),
+            "the arms are aggregated:\n{}",
+            out.sql
+        );
     }
 
     #[test]

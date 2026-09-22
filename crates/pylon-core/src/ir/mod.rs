@@ -993,6 +993,10 @@ pub enum IrExpr {
     ObjectPathUnion {
         branches: Vec<IrPathSelect>,
         limit: Option<Box<IrExpr>>,
+        /// True when the operands reach many objects, so the arms are
+        /// aggregated to an array instead of being read as one record --
+        /// a scalar subquery over more than one row is a run-time error.
+        multi: bool,
     },
     /// The object a single-valued walk lands on, with its shape — the
     /// path-select twin of `ObjectSubquery`. `PathSubquery` over the same
