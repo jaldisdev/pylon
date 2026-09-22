@@ -996,7 +996,7 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         parts.push(emit_ml_append_cte(app, &ids_name, &upd.target.alias, &format!("{}__ml_add_{}", name, i)));
     }
     for (i, rem) in upd.multi_link_removals.iter().enumerate() {
-        parts.push(emit_ml_remove_cte(rem, &ids_name, &format!("{}__ml_rm_{}", name, i)));
+        parts.push(emit_ml_remove_cte(rem, &ids_name, &upd.target.alias, &format!("{}__ml_rm_{}", name, i)));
     }
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
         parts.push(emit_ml_append_cte(rep, &ids_name, &upd.target.alias, &format!("{}__ml_rep_{}", name, i)));
@@ -1721,16 +1721,21 @@ fn emit_ml_append_cte(mutation: &IrMultiLinkMutation, ids_name: &str, ids_alias:
 }
 
 /// Emit the CTE clause for a junction table DELETE (remove). See
-/// emit_ml_append_cte re: `ids_name`.
-fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, ids_name: &str, cte_name: &str) -> String {
+/// emit_ml_append_cte re: `ids_name` and `ids_alias`.
+fn emit_ml_remove_cte(mutation: &IrMultiLinkMutation, ids_name: &str, ids_alias: &str, cte_name: &str) -> String {
     // Removal never carries link-property assignments (rejected at compile
     // time in ir/compiler.rs), so no extra columns are ever needed here.
     let vals_ref = emit_multilink_values_subquery(&mutation.values, &[]);
+    // A walk off the row (`-= (select .line_items …)`) is correlated to
+    // `ids_alias`, so the rows being written are joined in under that name
+    // rather than read through an uncorrelated `IN`.
     let del = format!(
-        "DELETE FROM {}\nWHERE {} IN (SELECT \"id\" FROM \"{}\")\n  AND {} IN (SELECT \"id\" FROM {})\nRETURNING {}, {}",
+        "DELETE FROM {} AS \"_jn\"\nUSING \"{}\" AS {}\nWHERE \"_jn\".{} = {}.\"id\"\n  AND \"_jn\".{} IN (SELECT \"id\" FROM {})\nRETURNING \"_jn\".{}, \"_jn\".{}",
         qn(&mutation.module, &mutation.junction_table),
-        qi(&mutation.source_col),
         ids_name,
+        qi(ids_alias),
+        qi(&mutation.source_col),
+        qi(ids_alias),
         qi(&mutation.target_col),
         vals_ref,
         qi(&mutation.source_col),
@@ -3700,7 +3705,7 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Junction removals (`-=`).
     for (i, rem) in upd.multi_link_removals.iter().enumerate() {
-        cte_parts.push(emit_ml_remove_cte(rem, "_ids", &format!("_ml_rm_{}", i)));
+        cte_parts.push(emit_ml_remove_cte(rem, "_ids", &upd.target.alias, &format!("_ml_rm_{}", i)));
     }
 
     // Junction inserts for replace (`:= expr` — insert after the clear).
