@@ -3,7 +3,7 @@ requires = ["maturin>=1.15.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pylon"
+name = "pylon-db"
 version = "0.1.0"
 authors = [
     { name = "Mario Ritzerfeld" }
@@ -29,6 +29,9 @@ pylon = 'pylon.cli:main'
 manifest-path = "crates/pylon-py/Cargo.toml"
 python-packages = ["pylon"]
 module-name = "pylon._core"
+# The sdist is enumerated from the crate, so the licence files at the
+# workspace root are declared in the metadata but not otherwise shipped.
+include = [{ path = "LICENSE-*", format = "sdist" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

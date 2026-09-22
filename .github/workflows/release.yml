@@ -1,0 +1,134 @@
+name: Release
+
+# Wheels carry a compiled extension, so there is one per platform rather than
+# one pure-Python wheel for everything. The build matrix is what makes a
+# release take a while; it runs only on a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (otherwise build and keep the artefacts)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: ${{ matrix.platform.runner }} ${{ matrix.platform.target }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # pylon-py reads calendar components straight off CPython's datetime
+        # C struct, which the stable ABI does not expose, so the extension is
+        # not abi3 and every supported interpreter needs its own wheel. A new
+        # Python release means adding it here, same as in test.yml.
+        python-version: ["3.13", "3.14"]
+        platform:
+          - runner: ubuntu-26.04
+            target: x86_64
+          - runner: ubuntu-26.04-arm
+            target: aarch64
+          - runner: macos-latest
+            target: aarch64
+          - runner: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      # aws-lc-sys, which reqwest's rustls pulls in, assembles by hand on
+      # Windows and the runner image carries no assembler for it.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          # The Linux build runs inside the manylinux container and so cannot
+          # see the interpreter set up above; it is told which of the
+          # container's own to build against. Everywhere else maturin uses the
+          # single Python on PATH.
+          args: >-
+            --release --locked --out dist
+            ${{ runner.os == 'Linux' && format('--interpreter {0}', matrix.python-version) || '' }}
+          # manylinux containers are what make a Linux wheel installable
+          # somewhere other than the runner that built it.
+          manylinux: auto
+          # aws-lc-sys again: its build drives cmake, which that container
+          # does not ship.
+          before-script-linux: |
+            if command -v yum >/dev/null; then
+              yum install -y cmake3 perl
+              ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
+            elif command -v apt-get >/dev/null; then
+              apt-get update && apt-get install -y cmake perl
+            fi
+
+      - name: Check the wheel is installable and carries its licence
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/pylon_db-*.whl
+          python -m zipfile -l dist/pylon_db-*.whl | grep -i LICENSE
+
+          # Imported from somewhere else on purpose. The checkout has a `pylon`
+          # directory at its root, which Python puts ahead of site-packages, so
+          # running this here would import the source tree rather than the
+          # wheel just installed — and the source tree has no compiled
+          # extension, because it is only ever built into the wheel.
+          cd "$RUNNER_TEMP"
+          python -c "import importlib.metadata as m; print('pylon-db', m.version('pylon-db'))"
+          python -c "import pylon; print(pylon.__file__)"
+          python -c "import pylon._core; print('compiled core ok')"
+          python -c "from pylon.cli import main; print('cli entrypoint ok')"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}-py${{ matrix.python-version }}
+          path: dist
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Wheels cover the four platforms above and nothing else, so without an
+      # sdist there is no install at all on anything they miss, and nothing
+      # for a distribution that packages from source.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    name: Publish pylon-db to PyPI
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # Trusted publishing: PyPI verifies the workflow rather than a token
+      # somebody has to store and rotate.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
