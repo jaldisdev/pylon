@@ -6684,6 +6684,40 @@ mod tests {
     }
 
     #[test]
+    fn test_a_computed_field_access_onto_an_object_takes_a_shape() {
+        use crate::schema::ComputedDescriptor;
+        // Compiled as an expression, the pointer came back as the bare id of
+        // the object it lands on, whatever shape was written on it.
+        let mut schema = make_schema_with_computed_links();
+        let post = schema.types.iter_mut().find(|t| t.name == "Post").expect("Post");
+        post.links.push(LinkDescriptor {
+            name: "author".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            through: None,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        });
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+        person.computed.retain(|c| c.name != "looper");
+        person.computed.push(ComputedDescriptor {
+            name: "latest_author".into(),
+            expression: "((select .posts order by .title desc limit 1)).author".into(),
+            return_type: None,
+        });
+        let out = compile_and_emit_with("SELECT Person { latest_author: { name } }", &schema);
+        assert!(out.sql.contains("\"name\""), "{}", out.sql);
+        assert!(out.sql.contains("\"title\" DESC"), "the order stays on the posts:\n{}", out.sql);
+        assert!(out.sql.contains("LIMIT"), "the computed's own limit survives:\n{}", out.sql);
+        let splat = compile_and_emit_with("SELECT Person { * }", &schema);
+        assert!(!splat.sql.contains("latest_author"), "`*` leaves links out:\n{}", splat.sql);
+    }
+
+    #[test]
     fn test_a_narrowed_pointer_can_carry_a_shape() {
         // `[is T].posts: { title }` — the parser stopped at the `:`, and the
         // route behind it resolved a stored property and nothing else, so a
@@ -13233,3 +13267,4 @@ select owner { posts := (select owner.posts.title) };",
         );
     }
 }
+
