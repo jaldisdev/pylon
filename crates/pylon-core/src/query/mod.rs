@@ -641,6 +641,7 @@ mod tests {
                 description: None,
                 parents: vec![],
                 interfaces: vec![],
+                bases: vec![],
                 properties: vec![PropertyDescriptor {
                     name: "id".into(),
                     pg_type: "uuid".into(),

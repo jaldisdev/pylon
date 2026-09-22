@@ -33,7 +33,11 @@ use crate::value::{Group, Object, Range, Value};
 /// into a `DecodedValue`) using `shape` (the compiled query's own output
 /// shape) into the crate's generic [`Value`].
 pub fn decode(shape: &ShapeNode, value: &DecodedValue) -> Value {
-    decode_inner(shape, value, None)
+    match shape {
+        // The row is the root object's own tuple.
+        ShapeNode::Object { position: 0, .. } => decode_inner(shape, value, Some(0)),
+        _ => decode_inner(shape, value, None),
+    }
 }
 
 /// `position_override` is `Some(0)` when `value` has already been extracted
@@ -52,12 +56,15 @@ fn decode_inner(shape: &ShapeNode, value: &DecodedValue, position_override: Opti
             position,
             pointers,
             ..
-        } => decode_object(
-            value,
-            position_override.unwrap_or(*position),
-            type_name.as_deref(),
-            pointers,
-        ),
+        } => {
+            // An object at position 0 of the enclosing tuple is a free
+            // object's first field, not the tuple itself.
+            let obj_tuple = match position_override {
+                Some(_) => value.clone(),
+                None => composite_at(value, *position),
+            };
+            decode_object(&obj_tuple, type_name.as_deref(), pointers)
+        }
         ShapeNode::Array { position, element, .. } => {
             decode_array(value, position_override.unwrap_or(*position), element)
         }
@@ -148,29 +155,32 @@ fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
     }
 }
 
-fn decode_object(value: &DecodedValue, position: usize, type_name: Option<&str>, pointers: &[ShapeNode]) -> Value {
-    // Root object sits at the top level (`value` IS its own tuple already);
-    // a nested one is a sub-tuple at `position` within the enclosing one.
-    let obj_tuple = if position == 0 {
-        value.clone()
-    } else {
-        composite_at(value, position)
-    };
+fn decode_object(obj_tuple: &DecodedValue, type_name: Option<&str>, pointers: &[ShapeNode]) -> Value {
     if matches!(obj_tuple, DecodedValue::Null) {
         return Value::Null;
     }
     // pointers[0] is always the auto-injected __type__ discriminator
     // (position 0); skip it — an explicit __type__ the user asked for
     // appears at position > 0 and is included like any other field.
-    let fields: Vec<(String, Value)> = pointers
+    let mut fields: Vec<(String, Value)> = Vec::new();
+    for p in pointers
         .iter()
         .filter(|p| !(pointer_name(p) == "__type__" && pointer_position(p) == 0))
-        .map(|p| (pointer_name(p).to_string(), decode_inner(p, &obj_tuple, None)))
-        .collect();
+    {
+        let value = decode_inner(p, obj_tuple, None);
+        // A name repeats only where splats overlap (`*` beside
+        // `[is Sub].*`, or two intersections), and an intersection the row
+        // is not of reads nothing: the value it does have wins.
+        match fields.iter_mut().find(|(name, _)| name == pointer_name(p)) {
+            Some((_, existing)) if is_nothing(existing) => *existing = value,
+            Some(_) => {}
+            None => fields.push((pointer_name(p).to_string(), value)),
+        }
+    }
     // Use the actual per-row __type__ value for the reported type name —
     // for a polymorphic (interface) query this is the real concrete type,
     // not the interface's own static type_name.
-    let resolved_type_name = type_name.map(|static_name| match composite_at(&obj_tuple, 0) {
+    let resolved_type_name = type_name.map(|static_name| match composite_at(obj_tuple, 0) {
         DecodedValue::Str(s) if !s.is_empty() => s,
         _ => static_name.to_string(),
     });
@@ -178,6 +188,14 @@ fn decode_object(value: &DecodedValue, position: usize, type_name: Option<&str>,
         type_name: resolved_type_name,
         fields,
     })
+}
+
+fn is_nothing(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
 }
 
 fn decode_array(value: &DecodedValue, position: usize, element: &ShapeNode) -> Value {
@@ -367,7 +385,7 @@ fn as_f64(value: &DecodedValue) -> f64 {
 /// for `RawScalar`/`JsonScalar` leaves (the value's own native decoded type
 /// is already correct) and as the fallback when no member shape was known
 /// at compile time.
-fn cached_to_value(value: &DecodedValue) -> Value {
+pub(crate) fn cached_to_value(value: &DecodedValue) -> Value {
     match value {
         DecodedValue::Null => Value::Null,
         DecodedValue::Bool(b) => Value::Bool(*b),
@@ -454,6 +472,77 @@ mod tests {
         // The injected __type__ pointer at position 0 must not appear as a
         // field of its own.
         assert_eq!(obj.get("__type__"), None);
+        assert_eq!(obj.len(), 1);
+    }
+
+    #[test]
+    fn a_free_objects_first_field_is_read_at_its_position() {
+        // `select { b := (…).latest_data { address } }` — no discriminator in
+        // a free object, so its first field sits at position 0.
+        let value = comp(vec![comp(vec![
+            DecodedValue::Str("default::Address".into()),
+            DecodedValue::Str("Main St".into()),
+        ])]);
+        let shape = ShapeNode::Object {
+            name: String::new(),
+            type_name: None,
+            position: 0,
+            cardinality: Cardinality::Many,
+            pointers: vec![ShapeNode::Object {
+                name: "b".into(),
+                type_name: Some("default::Address".into()),
+                position: 0,
+                cardinality: Cardinality::Optional,
+                pointers: vec![
+                    ShapeNode::Scalar {
+                        name: "__type__".into(),
+                        position: 0,
+                    },
+                    ShapeNode::Scalar {
+                        name: "address".into(),
+                        position: 1,
+                    },
+                ],
+            }],
+        };
+        let Value::Object(root) = decode(&shape, &value) else { panic!() };
+        let Some(Value::Object(b)) = root.get("b") else { panic!("{root:?}") };
+        assert_eq!(b.get("address"), Some(&Value::Str("Main St".into())));
+    }
+
+    #[test]
+    fn a_name_two_splats_share_keeps_the_value_it_has() {
+        // `[is A].*` beside `[is B].*`: the intersection the row is not of
+        // reads nothing, whichever comes last.
+        let value = comp(vec![
+            DecodedValue::Str("default::A".into()),
+            DecodedValue::Str("kept".into()),
+            DecodedValue::Null,
+        ]);
+        let shape = ShapeNode::Object {
+            name: String::new(),
+            type_name: Some("default::A".into()),
+            position: 0,
+            cardinality: Cardinality::Required,
+            pointers: vec![
+                ShapeNode::Scalar {
+                    name: "__type__".into(),
+                    position: 0,
+                },
+                ShapeNode::Scalar {
+                    name: "identifier".into(),
+                    position: 1,
+                },
+                ShapeNode::Scalar {
+                    name: "identifier".into(),
+                    position: 2,
+                },
+            ],
+        };
+        let Value::Object(obj) = decode(&shape, &value) else {
+            panic!("expected Object")
+        };
+        assert_eq!(obj.get("identifier"), Some(&Value::Str("kept".into())));
         assert_eq!(obj.len(), 1);
     }
 

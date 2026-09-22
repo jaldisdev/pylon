@@ -554,6 +554,22 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
 
     let extensions: Vec<String> = required_extensions(schema).iter().map(|s| s.to_string()).collect();
 
+    // A link into a polymorphic type has no foreign key; its triggers stand in.
+    let polymorphic_tables: HashSet<(&str, &str)> = {
+        let polymorphic = crate::export::polymorphic_types(schema);
+        schema
+            .types
+            .iter()
+            .filter(|t| polymorphic.contains(&format!("{}::{}", t.module, t.name)))
+            .map(|t| (t.module.as_str(), t.table.as_str()))
+            .collect()
+    };
+    for table in &mut tables {
+        table.foreign_keys.retain(|fk| {
+            fk.local_column == "source" || !polymorphic_tables.contains(&(fk.ref_schema.as_str(), fk.ref_table.as_str()))
+        });
+    }
+
     DbState {
         schemas,
         tables,
@@ -2939,6 +2955,56 @@ fn diff_inner(
         }
     }
 
+    // A link whose target became polymorphic (a concrete type gaining a
+    // subtype) loses its foreign key: the subtype's rows live in another table.
+    let polymorphic_targets = crate::export::polymorphic_types(target);
+    let mut unwanted_fks: HashSet<(String, String, String)> = HashSet::new();
+    for t in target.types.iter().filter(|t| !t.abstract_ && !t.junction) {
+        for l in &t.links {
+            if !polymorphic_targets.contains(&l.target) {
+                continue;
+            }
+            unwanted_fks.insert(if l.is_junction_backed() {
+                (t.module.clone(), format!("{}.{}", t.table, l.name), format!("{}_{}_target_fkey", t.table, l.name))
+            } else {
+                (t.module.clone(), t.table.clone(), format!("{}_{}_fkey", t.table, l.name))
+            });
+        }
+        for ml in t.multilinks.iter().filter(|ml| polymorphic_targets.contains(&ml.target)) {
+            unwanted_fks.insert((
+                t.module.clone(),
+                format!("{}.{}", t.table, ml.name),
+                format!("{}_{}_target_fkey", t.table, ml.name),
+            ));
+        }
+    }
+    for cur_table in &current.tables {
+        for fk in &cur_table.foreign_keys {
+            let key = (cur_table.schema.clone(), cur_table.name.clone(), fk.constraint_name.clone());
+            // A key into an interface's view was never created to begin with.
+            let references_a_table = target
+                .types
+                .iter()
+                .any(|t| !t.abstract_ && t.module == fk.ref_schema && t.table == fk.ref_table);
+            if !unwanted_fks.contains(&key) || !references_a_table {
+                continue;
+            }
+            steps.extend(
+                OpKey::ForeignKey(cur_table.schema.clone(), cur_table.name.clone()),
+                Verb::Alter,
+                verbosename_type(&cur_table.schema, &cur_table.name),
+                vec![DiffOp {
+                    sql: format!(
+                        "ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};",
+                        qn(&cur_table.schema, &cur_table.name),
+                        qi(&fk.constraint_name)
+                    ),
+                    non_transactional: false,
+                }],
+            );
+        }
+    }
+
     // ── Phase 12: drop removed tables ────────────────────────────────────────
     for cur_table in &current.tables {
         let key = (cur_table.schema.clone(), cur_table.name.clone());
@@ -3925,6 +3991,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: vec![prop("id", "uuid", false), prop("name", "text", true)],
             links: vec![],
             multilinks: vec![],
@@ -4238,6 +4305,45 @@ mod tests {
             steps.is_empty(),
             "expected zero further migration steps, got: {steps:?}"
         );
+    }
+
+    #[test]
+    fn a_link_target_gaining_a_subtype_loses_its_foreign_key() {
+        let mut order = simple_type("default", "Order", "Order");
+        order.links.push(LinkDescriptor {
+            name: "customer".into(),
+            target: "default::Person".into(),
+            nullable: false,
+            through: None,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        });
+        let before = SchemaDescriptor {
+            types: vec![order, simple_type("default", "Person", "Person")],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        };
+        let mut after = before.clone();
+        let mut vip = simple_type("default", "Vip", "Vip");
+        vip.bases = vec!["default::Person".into()];
+        after.types.push(vip);
+
+        let joined = diff_schema(&after, &schema_to_db_state(&before)).unwrap().join("\n");
+        assert!(
+            joined.contains("ALTER TABLE \"public\".\"Order\" DROP CONSTRAINT IF EXISTS \"Order_customer_fkey\""),
+            "got:\n{joined}"
+        );
+        let settled = diff_schema_steps(&after, &schema_to_db_state(&after), &HashMap::new()).unwrap();
+        assert!(settled.is_empty(), "nothing further once applied, got: {settled:?}");
     }
 
     #[test]

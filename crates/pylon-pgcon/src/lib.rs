@@ -278,6 +278,29 @@ impl PgPool {
         query_typed_named_on(&client, sql, params, ext).await
     }
 
+    /// `query_typed`, with the session globals database triggers read
+    /// (`pylon.globals`) set first on the same connection. Each mutating
+    /// statement sets them anew, so a pooled connection never hands one
+    /// statement's globals to the next.
+    pub async fn query_typed_with_globals(
+        &self,
+        sql: &str,
+        params: &[DecodedValue],
+        ext: &ExtensionOids,
+        globals: &str,
+    ) -> Result<Vec<DecodedValue>> {
+        let client = self.checkout().await?;
+        set_globals_on(&client, globals, false).await?;
+        query_typed_on(&client, sql, params, ext).await
+    }
+
+    /// `execute_typed`, with `pylon.globals` set — see `query_typed_with_globals`.
+    pub async fn execute_typed_with_globals(&self, sql: &str, params: &[DecodedValue], globals: &str) -> Result<u64> {
+        let client = self.checkout().await?;
+        set_globals_on(&client, globals, false).await?;
+        execute_typed_on(&client, sql, params).await
+    }
+
     /// Runs `sql` with bound `params` (same convention as `query_typed`)
     /// and discards the result, returning the number of rows affected —
     /// for `INSERT`/`UPDATE`/`DELETE` where the caller has no `RETURNING`
@@ -479,6 +502,18 @@ pub(crate) async fn query_typed_named_on(
     query_named_with_stmt(client, &stmt, params, ext).await
 }
 
+/// Sets `pylon.globals`, which a database trigger reads its session globals
+/// from; `local` scopes it to the current transaction.
+async fn set_globals_on(client: &deadpool_postgres::Object, globals: &str, local: bool) -> Result<()> {
+    let sql = if local {
+        "SELECT set_config('pylon.globals', $1, true)"
+    } else {
+        "SELECT set_config('pylon.globals', $1, false)"
+    };
+    execute_typed_on(client, sql, &[DecodedValue::Str(globals.to_string())]).await?;
+    Ok(())
+}
+
 /// See `query_typed_on` — same caching, result discarded.
 pub(crate) async fn execute_typed_on(
     client: &deadpool_postgres::Object,
@@ -567,6 +602,25 @@ impl PgTransaction {
     /// The type OIDs discovered when the owning pool connected.
     pub fn types(&self) -> &ExtensionOids {
         &self.types
+    }
+
+    /// `query_typed`, with `pylon.globals` set for the rest of this
+    /// transaction — see `PgPool::query_typed_with_globals`.
+    pub async fn query_typed_with_globals(
+        &self,
+        sql: &str,
+        params: &[DecodedValue],
+        ext: &ExtensionOids,
+        globals: &str,
+    ) -> Result<Vec<DecodedValue>> {
+        set_globals_on(&self.client, globals, true).await?;
+        query_typed_on(&self.client, sql, params, ext).await
+    }
+
+    /// `execute_typed`, with `pylon.globals` set — see `query_typed_with_globals`.
+    pub async fn execute_typed_with_globals(&self, sql: &str, params: &[DecodedValue], globals: &str) -> Result<u64> {
+        set_globals_on(&self.client, globals, true).await?;
+        execute_typed_on(&self.client, sql, params).await
     }
 
     pub async fn query_typed(

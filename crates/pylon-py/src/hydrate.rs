@@ -217,7 +217,7 @@ fn decode<'py>(
             position,
             pointers,
             ..
-        } => decode_object(py, value, *position, type_name.as_deref(), pointers, reg),
+        } => decode_object(py, item(value, *position).unwrap_or(&NULL), type_name.as_deref(), pointers, reg),
         ShapeNode::NamedTuple {
             position,
             type_name,
@@ -273,7 +273,7 @@ fn decode<'py>(
                         ..
                     } => {
                         let element = item(value, *position).unwrap_or(&NULL);
-                        decode_object(py, element, 0, type_name.as_deref(), pointers, reg)
+                        decode_object(py, element, type_name.as_deref(), pointers, reg)
                     }
                     _ => decode(py, value, e, reg),
                 })
@@ -358,7 +358,7 @@ fn decode_at_root<'py>(
     match node {
         ShapeNode::Object {
             type_name, pointers, ..
-        } => decode_object(py, value, 0, type_name.as_deref(), pointers, reg),
+        } => decode_object(py, value, type_name.as_deref(), pointers, reg),
         ShapeNode::NamedTuple { type_name, members, .. } => {
             let raw = if matches!(value, DecodedValue::Null) || is_json_container(value) {
                 value
@@ -385,18 +385,11 @@ fn decode_at_root<'py>(
 
 fn decode_object<'py>(
     py: Python<'py>,
-    value: &DecodedValue,
-    position: usize,
+    obj_tuple: &DecodedValue,
     type_name: Option<&str>,
     pointers: &[ShapeNode],
     reg: &HydrationRegistry,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // The root object is the whole tuple; a nested one sits at a position.
-    let obj_tuple = if position == 0 {
-        value
-    } else {
-        item(value, position).unwrap_or(&NULL)
-    };
     if matches!(obj_tuple, DecodedValue::Null) {
         return Ok(py.None().into_bound(py));
     }
@@ -409,7 +402,16 @@ fn decode_object<'py>(
         if shape_node_name(p) == "__type__" && shape_node_position(p) == Some(0) {
             continue;
         }
-        kwargs.set_item(shape_node_name(p), decode(py, obj_tuple, p, reg)?)?;
+        let value = decode(py, obj_tuple, p, reg)?;
+        // A name repeats only where splats overlap (`*` beside `[is Sub].*`,
+        // or two intersections), and an intersection the row is not of reads
+        // nothing: the value it does have wins.
+        if let Some(existing) = kwargs.get_item(shape_node_name(p))?
+            && !(existing.is_none() || existing.len().is_ok_and(|n| n == 0) && !existing.is_instance_of::<PyString>())
+        {
+            continue;
+        }
+        kwargs.set_item(shape_node_name(p), value)?;
     }
 
     // A free object literal (`select { a := 1 }`) has no schema type, so no
@@ -583,9 +585,24 @@ pub(crate) fn hydrate<'py>(
     let decoded = rows
         .rows
         .iter()
-        .map(|row| decode(py, row, root, registry))
+        .map(|row| decode_row(py, row, root, registry))
         .collect::<PyResult<Vec<_>>>()?;
     PyList::new(py, decoded)
+}
+
+/// One result row: a root object is the row's own tuple, not a field of it.
+fn decode_row<'py>(
+    py: Python<'py>,
+    row: &DecodedValue,
+    root: &ShapeNode,
+    reg: &HydrationRegistry,
+) -> PyResult<Bound<'py, PyAny>> {
+    match root {
+        ShapeNode::Object {
+            type_name, pointers, ..
+        } => decode_object(py, row, type_name.as_deref(), pointers, reg),
+        _ => decode(py, row, root, reg),
+    }
 }
 
 /// Every row as a JSON document, rendered from the same shape `hydrate`

@@ -45,7 +45,7 @@
 
 use crate::error::{Position, PyQLError, PyQLFragmentError};
 use crate::ir::{
-    IrFreeExpr, IrRowSource, IrStmt, compile, compile_expr_in_type, compile_fn_body, compile_scalar_default_typed,
+    IrFreeExpr, IrRowSource, IrStmt, compile, compile_fn_body, compile_scalar_default_typed,
     compile_trigger_handler, infer_ir_type, types_compatible,
 };
 use crate::schema::SchemaDescriptor;
@@ -332,36 +332,36 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             }
         }
 
-        // Mutation rewrites: only `PropertyDescriptor.rewrites` is ever read
-        // by the real INSERT/UPDATE compiler (`Compiler::compile_rewrites`)
-        // — `LinkDescriptor.rewrites` exists on the struct but nothing
-        // compiles it, so there's nothing to validate there yet.
-        for prop in &td.properties {
-            for rw in &prop.rewrites {
-                let context = format!("{}.{} (rewrite)", type_name, prop.name);
-                let expr_ast = match crate::parse::parse_expr(&rw.handler) {
-                    Ok(e) => e,
+        // Mutation rewrites, compiled the way the type's `BEFORE` triggers
+        // run them: against the row being written.
+        if !td.abstract_ && !td.junction {
+            for on in [1u8, 2] {
+                let assignments = match crate::ir::compile_rewrite_assignments(&type_name, on, schema) {
+                    Ok(assignments) => assignments,
                     Err(e) => {
-                        errors.push(PyQLError::Syntax(e));
+                        let context = format!("{type_name} (rewrite)");
+                        errors.push(mismatch(context.clone(), format!("{context}: {e}")));
                         continue;
                     }
                 };
-                let ir = match compile_expr_in_type(&expr_ast, &type_name, schema) {
-                    Ok((ir, _params)) => ir,
-                    Err(e) => {
-                        errors.push(e);
-                        continue;
+                for assignment in assignments {
+                    let pg_type = td
+                        .properties
+                        .iter()
+                        .find(|p| p.name == assignment.pointer)
+                        .map(|p| p.pg_type.as_str())
+                        .unwrap_or("uuid");
+                    let Some(actual) = infer_ir_type(&assignment.ir) else { continue };
+                    if !types_compatible(actual, pg_type) {
+                        let context = format!("{}.{} (rewrite)", type_name, assignment.pointer);
+                        errors.push(mismatch(
+                            context.clone(),
+                            format!(
+                                "rewrite handler type mismatch for '{}': expected {}, handler produces {}",
+                                context, pg_type, actual
+                            ),
+                        ));
                     }
-                };
-                let Some(actual) = infer_ir_type(&ir) else { continue };
-                if !types_compatible(actual, &prop.pg_type) {
-                    errors.push(mismatch(
-                        context.clone(),
-                        format!(
-                            "rewrite handler type mismatch for '{}': expected {}, handler produces {}",
-                            context, prop.pg_type, actual
-                        ),
-                    ));
                 }
             }
         }
@@ -374,7 +374,9 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         // `finalize()` silently.
         for trig in &td.triggers {
             if let Err(e) = compile_trigger_handler(&trig.handler, &type_name, trig.on, schema) {
-                errors.push(e);
+                let context = format!("{type_name} (trigger)");
+                let handler: String = trig.handler.chars().take(80).collect();
+                errors.push(mismatch(context.clone(), format!("{context} `{handler}…`: {e}")));
             }
         }
     }
@@ -590,6 +592,7 @@ mod tests {
             description: None,
             parents: vec![],
             interfaces: vec![],
+            bases: vec![],
             properties: props,
             links: vec![],
             multilinks: vec![],

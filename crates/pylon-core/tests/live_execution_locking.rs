@@ -63,6 +63,7 @@ fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDesc
         description: None,
         parents: vec![],
         interfaces: vec![],
+        bases: vec![],
         properties,
         links: vec![],
         multilinks: vec![],

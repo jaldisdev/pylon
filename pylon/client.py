@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import re
 from collections.abc import AsyncGenerator
@@ -66,9 +67,17 @@ class AsyncTransaction:
     and exits quietly — the exception is suppressed and the loop ends.
     """
 
-    def __init__(self, tx: PgconTransaction) -> None:
+    def __init__(
+        self,
+        tx: PgconTransaction,
+        globals_: dict[str, Any] | None = None,
+        config_options: dict[str, Any] | None = None,
+    ) -> None:
         self._tx = tx
         self._retry_exc: Exception | None = None
+        # The client's own, as in Gel: a transaction sees the globals it was opened with.
+        self._globals: dict[str, Any] = globals_ or {}
+        self._config_options: dict[str, Any] = config_options or {}
 
     async def __aenter__(self) -> AsyncTransaction:
         return self
@@ -122,21 +131,21 @@ class AsyncTransaction:
 
     async def _run_compiled(self, compiled: CompiledQuery, params: list[Any]) -> list[Any]:
         """Run an already-compiled statement — what a script's statements are."""
-        rows = await self._tx.query_compiled(compiled, params)
+        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
         return rows
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all results as a list."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query_compiled(compiled, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
         return _hydrate(rows, compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query_compiled(compiled, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
@@ -153,8 +162,8 @@ class AsyncTransaction:
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
-        await self._tx.execute_compiled(compiled, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        await self._tx.execute_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
 
     async def query_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
@@ -162,15 +171,15 @@ class AsyncTransaction:
 
         Returns ``"[]"`` when the result set is empty.
         """
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query_compiled(compiled, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
         return _json_array(rows, compiled)
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query_compiled(compiled, params)
+        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
@@ -236,7 +245,7 @@ class RetryingTransaction:
 
         pool = await self._client._connected_pool()
         pgcon_tx = await pool.transaction(self._isolation)
-        tx = AsyncTransaction(pgcon_tx)
+        tx = AsyncTransaction(pgcon_tx, self._client._globals, self._client._config_options)
         self._prev_tx = tx
         self._attempt += 1
         return tx
@@ -382,7 +391,8 @@ class Client:
         c._config = self._config
         c._ref = self._ref
         c._warnings = self._warnings
-        c._globals = {**self._globals, **globals_}
+        # An unqualified name is a global of the `default` module, as in Gel.
+        c._globals = {**self._globals, **{name if '::' in name else f'default::{name}': value for name, value in globals_.items()}}
         c._config_options = self._config_options
         return c
 
@@ -465,7 +475,7 @@ class Client:
         # `pool.query_compiled` already raises the correctly-mapped
         # `pylon.exceptions.*` instance on failure (see `pgcon_err` in
         # `pgcon.rs`) — no exception translation needed here.
-        rows = await pool.query_compiled(compiled, params)
+        rows = await pool.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         _cache.put(compiled, params, rows, self._config.cache)
         # `client.query("insert ... ")` is a normal way to insert and read the
         # row back, so a read path can be a write path too.
@@ -495,7 +505,7 @@ class Client:
                 return None
             return _hydrate(cached, compiled)[0]
 
-        rows = await pool.query_compiled(compiled, params)
+        rows = await pool.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
         _cache.put(compiled, params, rows, self._config.cache)
@@ -519,7 +529,7 @@ class Client:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
         pool = await self._connected_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
-        await pool.execute_compiled(compiled, params)
+        await pool.execute_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         from pylon import cache as _cache
 
         _cache.invalidate_for(compiled)
@@ -586,7 +596,7 @@ class Client:
         if hit:
             return cached if cached is not None else '[]'
 
-        rows = await pool.query_compiled(compiled, params)
+        rows = await pool.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         value = _json_array(rows, compiled)
         _cache.put_json(compiled, params, value, self._config.cache, kind='json_all')
         _cache.invalidate_for(compiled)
@@ -607,7 +617,7 @@ class Client:
         if hit:
             return cached
 
-        rows = await pool.query_compiled(compiled, params)
+        rows = await pool.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:
@@ -1012,6 +1022,26 @@ def _bind_positional(
         (globals_ or {}).get(name[len('__global__') :]) if name.startswith('__global__') else kwargs[name]
         for name in compiled.param_names
     ]
+
+
+def _trigger_globals(compiled: CompiledQuery, globals_: dict[str, Any]) -> str | None:
+    """The session globals, as the JSON a database trigger reads them from
+    (`pylon.globals`), for a statement that writes — only a write fires one."""
+    if not compiled.mutates:
+        return None
+
+    def encode(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return [encode(v) for v in value]
+        if isinstance(value, enum.Enum):
+            return value.value
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if hasattr(value, 'isoformat'):
+            return value.isoformat()
+        return str(value)
+
+    return json.dumps({name: encode(value) for name, value in globals_.items()})
 
 
 def _compile_and_bind(

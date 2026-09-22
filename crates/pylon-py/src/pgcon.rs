@@ -312,11 +312,13 @@ impl PgconPool {
     /// into `query()`. Here the SQL never leaves Rust-owned memory as a
     /// Python object; only `compiled` (an opaque handle) and the
     /// already-resolved `params` cross the boundary.
+    #[pyo3(signature = (compiled, params, globals=None))]
     fn query_compiled<'py>(
         &self,
         py: Python<'py>,
         compiled: &CompiledQuery,
         params: Vec<Bound<'py, PyAny>>,
+        globals: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
@@ -326,7 +328,10 @@ impl PgconPool {
         let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let started = std::time::Instant::now();
-            let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
+            let result = match &globals {
+                Some(globals) => pool.query_typed_with_globals(&sql, &cached_params, pool.types(), globals).await,
+                None => pool.query_typed(&sql, &cached_params, pool.types()).await,
+            };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(RowSet::new(rows))
@@ -380,11 +385,13 @@ impl PgconPool {
 
     /// Like `execute`, but reads the SQL text directly out of an
     /// already-compiled `CompiledQuery` — see `query_compiled`.
+    #[pyo3(signature = (compiled, params, globals=None))]
     fn execute_compiled<'py>(
         &self,
         py: Python<'py>,
         compiled: &CompiledQuery,
         params: Vec<Bound<'py, PyAny>>,
+        globals: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
@@ -394,7 +401,10 @@ impl PgconPool {
         let shape_id = compiled.inner.shape_id();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let started = std::time::Instant::now();
-            let result = pool.execute_typed(&sql, &cached_params).await;
+            let result = match &globals {
+                Some(globals) => pool.execute_typed_with_globals(&sql, &cached_params, globals).await,
+                None => pool.execute_typed(&sql, &cached_params).await,
+            };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             result.map_err(pgcon_err)
         })
@@ -488,11 +498,13 @@ impl PgconTransaction {
 
     /// See `PgconPool::query_compiled` — same "read SQL straight out of an
     /// already-compiled `CompiledQuery`" fusion, on a transaction handle.
+    #[pyo3(signature = (compiled, params, globals=None))]
     fn query_compiled<'py>(
         &self,
         py: Python<'py>,
         compiled: &CompiledQuery,
         params: Vec<Bound<'py, PyAny>>,
+        globals: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
@@ -504,7 +516,10 @@ impl PgconTransaction {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
             let started = std::time::Instant::now();
-            let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
+            let result = match &globals {
+                Some(globals) => tx.query_typed_with_globals(&sql, &cached_params, tx.types(), globals).await,
+                None => tx.query_typed(&sql, &cached_params, tx.types()).await,
+            };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
             Ok(RowSet::new(rows))
@@ -512,11 +527,13 @@ impl PgconTransaction {
     }
 
     /// See `PgconPool::execute_compiled`.
+    #[pyo3(signature = (compiled, params, globals=None))]
     fn execute_compiled<'py>(
         &self,
         py: Python<'py>,
         compiled: &CompiledQuery,
         params: Vec<Bound<'py, PyAny>>,
+        globals: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
@@ -528,7 +545,10 @@ impl PgconTransaction {
             let guard = inner.lock().await;
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
             let started = std::time::Instant::now();
-            let result = tx.execute_typed(&sql, &cached_params).await;
+            let result = match &globals {
+                Some(globals) => tx.execute_typed_with_globals(&sql, &cached_params, globals).await,
+                None => tx.execute_typed(&sql, &cached_params).await,
+            };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             result.map_err(pgcon_err)
         })

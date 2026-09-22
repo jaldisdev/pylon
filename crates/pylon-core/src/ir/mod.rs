@@ -33,6 +33,7 @@ pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_scalar_default;
 pub use compiler::compile_scalar_default_typed;
+pub use compiler::{RewriteAssignment, compile_rewrite_assignments};
 pub use compiler::compile_trigger_handler;
 pub use compiler::compile_with_config;
 pub(crate) use compiler::infer_ir_type;
@@ -41,6 +42,7 @@ pub(crate) use compiler::types_compatible;
 pub use compiler::{GLOBALS_ARG, compile_fn_body, functions_needing_globals};
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
+use std::collections::HashMap;
 
 // ── Session config ───────────────────────────────────────────────────────────────
 
@@ -579,6 +581,9 @@ pub struct IrMultiLinkPointer {
     pub link_properties: Vec<IrLinkProp>,
     /// See `IrScalarPointer::marker_offset`.
     pub marker_offset: Option<usize>,
+    /// Read as one object: `(select .data … limit 1)` is at most one row,
+    /// where a shape element on the link itself keeps the link's many.
+    pub single: bool,
 }
 
 /// A single link property pulled from a junction table.
@@ -1316,6 +1321,42 @@ pub struct IrOutput {
     /// forwards the globals argument to a callee that does — i.e. when the
     /// function needs `GLOBALS_ARG` in its signature.
     pub uses_globals_arg: bool,
+    /// `(module, table)` of every concrete type with subtypes → the fan-out
+    /// that reads it with them. A plain source over one of these tables reads
+    /// through its fan-out; a write to it does not.
+    pub subtype_fanouts: HashMap<(String, String), IrPolyFanout>,
+}
+
+
+/// `(module, table)`.
+pub type QualifiedTable = (String, String);
+
+/// Marks a junction table name that stands for the union of one multi-link's
+/// junction tables across a concrete type and its subtypes, which each keep
+/// their own (`"BrandAddon.prices"` beside `"BrandAddonBundle.prices"`).
+const INHERITED_JUNCTION: &str = "@inherited:";
+
+/// The junction name a read of an inherited multi-link uses: every
+/// `(module, table)` in `tables`, read through `columns`.
+pub fn inherited_junction(tables: &[QualifiedTable], columns: &[String]) -> String {
+    let tables = tables
+        .iter()
+        .map(|(module, table)| format!("{module}\u{1f}{table}"))
+        .collect::<Vec<_>>()
+        .join("\u{1e}");
+    format!("{INHERITED_JUNCTION}{tables}\u{1d}{}", columns.join("\u{1f}"))
+}
+
+/// The `(module, table)` pairs and columns an `inherited_junction` name
+/// stands for, or `None` for a plain table name.
+pub fn parse_inherited_junction(name: &str) -> Option<(Vec<QualifiedTable>, Vec<String>)> {
+    let (tables, columns) = name.strip_prefix(INHERITED_JUNCTION)?.split_once('\u{1d}')?;
+    let tables = tables
+        .split('\u{1e}')
+        .filter_map(|entry| entry.split_once('\u{1f}'))
+        .map(|(module, table)| (module.to_string(), table.to_string()))
+        .collect();
+    Some((tables, columns.split('\u{1f}').map(str::to_string).collect()))
 }
 
 #[cfg(test)]
@@ -1341,6 +1382,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![
                         PropertyDescriptor {
                             name: "id".into(),
@@ -1428,6 +1470,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![PropertyDescriptor {
                         name: "name".into(),
                         pg_type: "text".into(),
@@ -1464,6 +1507,7 @@ mod tests {
                     description: None,
                     parents: vec![],
                     interfaces: vec![],
+                    bases: vec![],
                     properties: vec![PropertyDescriptor {
                         name: "title".into(),
                         pg_type: "text".into(),
