@@ -33,6 +33,7 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
 use pylon_core::ir::SessionConfig;
+use pylon_core::schema::SchemaDescriptor;
 use pylon_value::DecodedValue;
 
 use crate::json::json_response;
@@ -289,34 +290,26 @@ pub fn handle_config_options() -> Response<Full<Bytes>> {
 /// all of them), so these two routes just need *some* connected `Client` to
 /// read `.schema()` off of; the base/"main" connection always exists in
 /// `config.connections`.
-async fn any_client(state: &AppState) -> Result<std::sync::Arc<pylon_client::Client>, Response<Full<Bytes>>> {
+async fn render_from_any_client(
+    state: &AppState,
+    render: impl FnOnce(&SchemaDescriptor) -> serde_json::Value,
+) -> Response<Full<Bytes>> {
     match state.resolve_client("main").await {
-        Ok(Some(c)) => Ok(c),
-        Ok(None) => Err(json_response(
+        Ok(Some(c)) => json_response(StatusCode::OK, &render(&c.schema())),
+        Ok(None) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &serde_json::json!({"error": "no [database] connection configured"}),
-        )),
-        Err(e) => Err(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &client_error_payload(&e),
-        )),
+        ),
+        Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     }
 }
 
 /// `GET /api/schema`.
 pub async fn handle_schema(state: Arc<AppState>) -> Response<Full<Bytes>> {
-    let client = match any_client(&state).await {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-    json_response(StatusCode::OK, &crate::schema_json::schema_json(&client.schema()))
+    render_from_any_client(&state, crate::schema_json::schema_json).await
 }
 
 /// `GET /api/globals`.
 pub async fn handle_globals(state: Arc<AppState>) -> Response<Full<Bytes>> {
-    let client = match any_client(&state).await {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-    json_response(StatusCode::OK, &crate::schema_json::globals_json(&client.schema()))
+    render_from_any_client(&state, crate::schema_json::globals_json).await
 }
