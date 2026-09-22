@@ -11553,6 +11553,16 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_index_into_array_returning_function_emits_array_subscript() {
+        let out = compile_and_emit("SELECT str_split('a::b', '::')[-1]");
+        assert!(
+            out.sql.contains("_pylon.array_subscript(string_to_array"),
+            "expected _pylon.array_subscript() over str_split, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_array_slice_emits_subscript() {
         let out = compile_and_emit("SELECT [1, 2, 3][0:2]");
         assert!(
