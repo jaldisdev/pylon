@@ -491,9 +491,15 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         self.eat(&Token::Insert)?;
         let subject = self.parse_object_ref()?;
-        self.eat(&Token::LBrace)?;
-        let shape = self.parse_shape_body()?;
-        self.eat(&Token::RBrace)?;
+        // `insert T` with nothing to set is `insert T {}`.
+        let shape = if matches!(self.current(), Token::LBrace) {
+            self.advance();
+            let shape = self.parse_shape_body()?;
+            self.eat(&Token::RBrace)?;
+            shape
+        } else {
+            vec![]
+        };
 
         let unless_conflict = if matches!(self.current(), Token::Unless) {
             self.advance();
@@ -1186,8 +1192,8 @@ impl Parser {
         if i >= n {
             return false;
         }
-        // optional `::` Name
-        if matches!(self.tokens[i].token, Token::ColonColon) {
+        // any number of `::` Name — `<std::cal::relative_duration>`
+        while matches!(self.tokens[i].token, Token::ColonColon) {
             i += 1;
             if i >= n {
                 return false;
@@ -1196,6 +1202,9 @@ impl Parser {
                 return false;
             }
             i += 1;
+            if i >= n {
+                return false;
+            }
         }
         // must be followed by `>`
         i < n && matches!(self.tokens[i].token, Token::Gt)
@@ -1232,10 +1241,16 @@ impl Parser {
             });
         }
 
-        let first = self.eat_ident()?;
+        let mut first = self.eat_ident()?;
         if matches!(self.current(), Token::ColonColon) {
             self.advance();
-            let name = self.eat_ident()?;
+            let mut name = self.eat_ident()?;
+            // `std::cal::relative_duration` — Gel's full spelling of a module
+            // that lives under `std`.
+            if first == "std" && matches!(self.current(), Token::ColonColon) {
+                self.advance();
+                first = std::mem::replace(&mut name, self.eat_ident()?);
+            }
             // See the matching check in parse_primary: PyQL module names
             // are a single segment, so a further `::` here is an error
             // worth naming rather than a confusing dangling token later.
@@ -1612,7 +1627,13 @@ impl Parser {
                 // `Module::Name` qualified reference or function call
                 if matches!(self.current(), Token::ColonColon) {
                     self.advance();
-                    let member = self.eat_ident()?;
+                    let mut member = self.eat_ident()?;
+                    // `std::cal::to_local_date(…)` — see `parse_type_expr`.
+                    let mut name = name;
+                    if name == "std" && matches!(self.current(), Token::ColonColon) {
+                        self.advance();
+                        name = std::mem::replace(&mut member, self.eat_ident()?);
+                    }
                     // A third `::` here means the module path has more than
                     // one segment, which PyQL doesn't support — say so
                     // clearly instead of leaving the trailing `::` to
