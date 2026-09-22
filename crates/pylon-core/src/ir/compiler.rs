@@ -4294,7 +4294,7 @@ impl<'a> Compiler<'a> {
             };
             ps.result = IrPathResult::Scalar(
                 IrExpr::BinOp(Box::new(IrBinOp {
-                    left: l,
+                    left: true_division_operand(&b.op, l, &r),
                     op: b.op.clone(),
                     right: r,
                 })),
@@ -10932,7 +10932,7 @@ impl<'a> Compiler<'a> {
                     }));
                 }
                 Ok(IrExpr::BinOp(Box::new(IrBinOp {
-                    left,
+                    left: true_division_operand(&b.op, left, &right),
                     op: b.op.clone(),
                     right,
                 })))
@@ -16074,6 +16074,12 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
         }
         IrExpr::UnaryOp(u) if u.op == crate::parse::ast::UnaryOpKind::Distinct => infer_ir_type(&u.operand),
+        IrExpr::BinOp(b) => arithmetic_result_type(&b.op, infer_ir_type(&b.left)?, infer_ir_type(&b.right)?),
+        IrExpr::FunctionCall(f) if f.schema.is_none() && matches!(f.name.as_str(), "max" | "min" | "sum") => {
+            aggregate_result_type(&f.name, infer_ir_type(f.args.first()?)?)
+        }
+        IrExpr::AggOverSet { fn_name, schema: None, .. } if fn_name == "count" => Some("int8"),
+        IrExpr::AggOverSet { fn_name, schema: None, elems } => aggregate_result_type(fn_name, infer_ir_type(elems.first()?)?),
         // `enc::base64_decode(…)` — a stdlib call is typed by what it
         // returns, when every overload of that name agrees.
         IrExpr::FunctionCall(f) if f.schema.is_none() => {
@@ -16086,6 +16092,62 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         }
         _ => None,
     }
+}
+
+/// The type Gel gives an arithmetic operator's result, from its operands'.
+/// `None` for anything but a pair of numbers.
+fn arithmetic_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Option<&'static str> {
+    use ast::BinOpKind::*;
+    if !matches!(op, Add | Sub | Mul | Div | FloorDiv | Mod | Pow) {
+        return None;
+    }
+    let (left, right) = (literal_sentinel_to_pg(left), literal_sentinel_to_pg(right));
+    let int = |t: &str| INT_TYPES.contains(&t);
+    let float = |t: &str| FLOAT_TYPES.contains(&t);
+    let numeric = |t: &str| NUMERIC_TYPES.contains(&t);
+    if int(left) && int(right) {
+        return Some(if matches!(op, Div | Pow) {
+            "float8"
+        } else if left == "int8" || right == "int8" {
+            "int8"
+        } else if left == "int4" || right == "int4" {
+            "int4"
+        } else {
+            "int2"
+        });
+    }
+    if (float(left) || int(left)) && (float(right) || int(right)) {
+        return Some(if left == "float4" && right == "float4" { "float4" } else { "float8" });
+    }
+    if (numeric(left) || int(left)) && (numeric(right) || int(right)) {
+        return Some("numeric");
+    }
+    None
+}
+
+/// What `max`, `min` and `sum` over values of `element` yield in Gel.
+fn aggregate_result_type<'a>(name: &str, element: &'a str) -> Option<&'a str> {
+    let element = literal_sentinel_to_pg(element);
+    match name {
+        "max" | "min" => Some(element),
+        "sum" if INT_TYPES.contains(&element) => Some("int8"),
+        "sum" if FLOAT_TYPES.contains(&element) || NUMERIC_TYPES.contains(&element) => Some(element),
+        _ => None,
+    }
+}
+
+/// The left operand of `left op right`, cast to `float8` when `op` divides
+/// two integers: Gel's `/` yields a float64 there, Postgres's truncates.
+fn true_division_operand(op: &ast::BinOpKind, left: IrExpr, right: &IrExpr) -> IrExpr {
+    let integer = |expr: &IrExpr| infer_ir_type(expr).is_some_and(|t| INT_TYPES.contains(&literal_sentinel_to_pg(t)));
+    if *op != ast::BinOpKind::Div || !integer(&left) || !integer(right) {
+        return left;
+    }
+    IrExpr::TypeCast(Box::new(IrTypeCast {
+        expr: left,
+        pg_type: "float8".to_string(),
+        tuple_shape: None,
+    }))
 }
 
 /// Maps a resolved element `pg_type` (as `infer_ir_type` reports it) to the
