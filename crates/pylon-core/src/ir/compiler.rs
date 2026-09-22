@@ -15804,6 +15804,13 @@ fn literal_sentinel_to_pg(t: &str) -> &str {
 fn is_array_expr(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::Array(_) | IrExpr::ArrayFromSelect(_) => true,
+        // `str_split(…)[-1]` — a stdlib call declared to return an array,
+        // which `infer_ir_type` cannot spell because it only names scalars.
+        IrExpr::FunctionCall(f) if f.schema.is_none() => {
+            let mut overloads = crate::stdlib::registry().iter().filter(|d| d.name == f.name).peekable();
+            overloads.peek().is_some()
+                && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Array(_)))
+        }
         // Everything else an array can arrive as — a column, a cast, a
         // global, a `with` binding, a concatenation of any of those — is
         // known by the type it carries.
