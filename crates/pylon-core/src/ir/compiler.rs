@@ -26,7 +26,7 @@ use crate::schema::{
     TypeDescriptor,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     IrArraySource, IrAssertedPointer, IrBinOp, IrComputedGlobalCte, IrComputedPointer, IrConflict, IrCteDef, IrDelete,
@@ -785,6 +785,7 @@ pub fn compile_fn_body_with(
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let type_name = cte_stmt_type(&ir_stmt);
             c.cte_types.insert(alias.name.clone(), type_name.clone());
+            c.note_cte_cardinality(&alias.name, &ir_stmt);
             cte_defs.push(super::IrCteDef {
                 name: alias.name.clone(),
                 stmt: ir_stmt,
@@ -934,6 +935,7 @@ pub fn compile_trigger_handler(
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
             let cte_type_name = cte_stmt_type(&ir_stmt);
             c.cte_types.insert(alias.name.clone(), cte_type_name.clone());
+            c.note_cte_cardinality(&alias.name, &ir_stmt);
             cte_defs.push(super::IrCteDef {
                 name: alias.name.clone(),
                 stmt: ir_stmt,
@@ -1127,6 +1129,11 @@ struct Compiler<'a> {
     /// resolve to `IrExpr::CteFieldRef` when `root` is such a binding,
     /// instead of failing as an unresolvable schema-path root.
     cte_free_items: HashMap<String, IrFreeExpr>,
+    /// CTE names whose binding can hold more than one row. Comparing a value
+    /// against one has to become set membership: `IrExpr::CteRef` reads the
+    /// binding as a scalar subquery, which Postgres aborts on the second row
+    /// ("more than one row returned by a subquery used as an expression").
+    multi_row_ctes: HashSet<String>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
     /// For-loop variables that iterate objects, by qualified type name. The
@@ -1295,6 +1302,7 @@ impl<'a> Compiler<'a> {
             cte_types: HashMap::new(),
             group_bindings: HashMap::new(),
             cte_free_items: HashMap::new(),
+            multi_row_ctes: HashSet::new(),
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
             for_var_ctes: HashMap::new(),
@@ -1364,7 +1372,35 @@ impl<'a> Compiler<'a> {
         {
             self.cte_free_items.insert(name.to_string(), item.clone());
         }
+        self.note_cte_cardinality(name, ir_stmt);
         type_name
+    }
+
+    /// Record `name` when its binding can hold more than one row, so a later
+    /// comparison against it compiles to membership rather than a scalar
+    /// subquery read. Anything whose row count isn't statically one counts as
+    /// multi: a needless membership test still answers correctly, a needless
+    /// scalar read aborts the query.
+    fn note_cte_cardinality(&mut self, name: &str, ir_stmt: &IrStmt) {
+        let single = match ir_stmt {
+            IrStmt::Insert(_) => true,
+            IrStmt::Select(sel) => {
+                matches!(sel.limit, Some(IrExpr::Literal(IrLiteral::Int(1))))
+                    || matches!(
+                        sel.rows.as_slice(),
+                        [IrRowSource::Free(
+                            IrFreeExpr::Scalar(_)
+                                | IrFreeExpr::FreeObject(_)
+                                | IrFreeExpr::NamedTupleRow(_)
+                                | IrFreeExpr::Tuple(_)
+                        )]
+                    )
+            }
+            _ => false,
+        };
+        if !single {
+            self.multi_row_ctes.insert(name.to_string());
+        }
     }
 
     /// Resolve `root.field1.field2. ... fieldN` where `root` is a WITH-bound
@@ -11029,8 +11065,15 @@ impl<'a> Compiler<'a> {
                 // its elements — holds when any element matches, which is what
                 // the equality means in PyQL and what `= ANY` says in SQL.
                 if matches!(b.op, ast::BinOpKind::Eq | ast::BinOpKind::Ne) {
-                    let flipped = matches!(left, IrExpr::ArrayFromSelect(_)) && !is_array_expr(&right);
-                    let straight = matches!(right, IrExpr::ArrayFromSelect(_)) && !is_array_expr(&left);
+                    // A `with` binding of more than one row is the same kind
+                    // of set, reached through its CTE rather than an array.
+                    let is_set = |e: &IrExpr| match e {
+                        IrExpr::ArrayFromSelect(_) => true,
+                        IrExpr::CteRef { name, .. } => self.multi_row_ctes.contains(name),
+                        _ => false,
+                    };
+                    let flipped = is_set(&left) && !is_set(&right) && !is_array_expr(&right);
+                    let straight = is_set(&right) && !is_set(&left) && !is_array_expr(&left);
                     if flipped || straight {
                         let (value, set) = if straight { (left, right) } else { (right, left) };
                         let membership = IrExpr::BinOp(Box::new(IrBinOp {

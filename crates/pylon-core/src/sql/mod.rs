@@ -5589,6 +5589,47 @@ mod tests {
     }
 
     #[test]
+    fn a_comparison_against_a_multi_row_with_binding_tests_membership() {
+        // Read as a scalar subquery, the binding aborts the query on its
+        // second row: "more than one row returned by a subquery used as an
+        // expression".
+        let out = compile_and_emit_with(
+            "WITH companies := (SELECT Company FILTER .name = 'x') SELECT Person FILTER .company = companies",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("= ANY((SELECT \"id\" FROM \"companies\"))"),
+            "{}",
+            out.sql
+        );
+
+        let out = compile_and_emit_with(
+            "WITH companies := (SELECT Company) SELECT Person FILTER any(.company = companies)",
+            &make_schema(),
+        );
+        assert!(
+            out.sql.contains("= ANY((SELECT \"id\" FROM \"companies\"))"),
+            "{}",
+            out.sql
+        );
+
+        let out = compile_and_emit_with(
+            "WITH companies := (SELECT Company) SELECT Person FILTER .company != companies",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("NOT (\"t1\".\"company_id\" = ANY("), "{}", out.sql);
+    }
+
+    #[test]
+    fn a_comparison_against_a_single_row_with_binding_stays_a_scalar_read() {
+        let out = compile_and_emit_with(
+            "WITH company := (SELECT Company LIMIT 1) SELECT Person FILTER .company = company",
+            &make_schema(),
+        );
+        assert!(out.sql.contains("= (SELECT \"id\" FROM \"company\")"), "{}", out.sql);
+    }
+
+    #[test]
     fn an_aggregate_over_a_backlink_counts_inside_a_subquery() {
         let out = compile_and_emit_with("SELECT Post { n := count(.<posts) }", &make_schema());
         assert!(
