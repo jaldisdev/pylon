@@ -8532,6 +8532,30 @@ mod tests {
     }
 
     #[test]
+    fn test_coalesce_over_backlinked_values_is_a_set_choice() {
+        // The backlink was taken for a comparison and rewritten to an EXISTS,
+        // with a COALESCE of a value and an array inside it.
+        let out = compile_and_emit("SELECT Post ORDER BY max(.<posts[is Person].age ?? .<posts[is Person].age)");
+        assert!(!out.sql.contains("EXISTS"), "{}", out.sql);
+        assert!(!out.sql.contains("COALESCE("), "{}", out.sql);
+        assert!(out.sql.contains("CASE WHEN (cardinality("), "{}", out.sql);
+        assert!(out.sql.contains("(SELECT coalesce(max(\"_s\".\"v\"), NULL) FROM unnest("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_coalesce_over_multilink_values_is_a_set_choice() {
+        let out = compile_and_emit("SELECT Person { t := .posts.title ?? .posts.title }");
+        assert!(!out.sql.contains("EXISTS"), "{}", out.sql);
+        assert!(out.sql.contains("CASE WHEN (cardinality("), "{}", out.sql);
+    }
+
+    #[test]
+    fn test_coalesce_of_a_set_with_a_single_value_falls_back_to_it() {
+        let out = compile_and_emit("SELECT Post { a := .<posts[is Person].age ?? 0 }");
+        assert!(out.sql.contains("ELSE array_remove(ARRAY[0], NULL) END"), "{}", out.sql);
+    }
+
+    #[test]
     fn test_traversal_after_a_backlink() {
         let out = compile_and_emit("SELECT Post { t := .<posts[is Person].name }");
         assert!(out.sql.contains("ARRAY(SELECT \"t2\".\"name\""), "{}", out.sql);
