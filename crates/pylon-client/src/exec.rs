@@ -178,11 +178,9 @@ pub(crate) async fn execute<E: Executor>(
     Ok(())
 }
 
-/// Runs `sql` wrapped so Postgres itself materializes the JSON, matching
-/// `pylon-py`'s `query_compiled_json_agg`/`query_compiled_row_to_json`
-/// (`crates/pylon-py/src/pgcon.rs:300-325`) — the same string-wrapping
-/// convention, just applied here instead of at the pyo3 boundary, since
-/// this crate has direct, non-opaque access to `compiled.sql`.
+/// The query's rows rendered as a JSON array, each against the compiled
+/// shape (see `crate::json`) — so it runs once, and objects keep the names
+/// of the pointers they selected.
 pub(crate) async fn query_json<E: Executor>(
     executor: &E,
     pyql: &str,
@@ -196,12 +194,12 @@ pub(crate) async fn query_json<E: Executor>(
     if let Some(value) = crate::cache::get_json(access, "json_all", &compiled, &bound)? {
         return Ok(value.unwrap_or_else(|| "[]".to_string()));
     }
-    let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.sql);
-    let rows = executor.run_query(&sql, &bound).await.map_err(Error::Db)?;
-    let value = match rows.into_iter().next() {
-        Some(DecodedValue::Str(s)) => s,
-        _ => "[]".to_string(),
-    };
+    let rows = executor.run_query(&compiled.sql, &bound).await.map_err(Error::Db)?;
+    let documents: Vec<String> = rows
+        .iter()
+        .map(|row| crate::json::row_to_json(&compiled.shape.root, row))
+        .collect();
+    let value = format!("[{}]", documents.join(", "));
     crate::cache::invalidate_for(access, &compiled)?;
     crate::cache::put_json(access, "json_all", &compiled, &bound, Some(&value))?;
     Ok(value)
@@ -229,12 +227,7 @@ pub(crate) async fn query_single_json<E: Executor>(
         crate::cache::put_json(access, "json_single", &compiled, &bound, None)?;
         return Ok(None);
     }
-    let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.sql);
-    let json_rows = executor.run_query(&sql, &bound).await.map_err(Error::Db)?;
-    let value = match json_rows.into_iter().next() {
-        Some(DecodedValue::Str(s)) => Some(s),
-        _ => None,
-    };
+    let value = rows.first().map(|row| crate::json::row_to_json(&compiled.shape.root, row));
     crate::cache::invalidate_for(access, &compiled)?;
     crate::cache::put_json(access, "json_single", &compiled, &bound, value.as_deref())?;
     Ok(value)

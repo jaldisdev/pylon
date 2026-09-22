@@ -213,6 +213,38 @@ async fn query_and_execute_round_trip() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn json_names_every_field_and_runs_the_query_once() {
+    let module = unique_module("live_client_json");
+    let client = setup(&person_schema(&module)).await;
+
+    // Run once: rendered from the rows the insert returned, not a second,
+    // rewrapped run that would insert again.
+    let inserted = client
+        .query_single_json(&format!("select (insert {module}::Person {{ name := 'Dora' }}) {{ name }}"), &[])
+        .await
+        .unwrap();
+    assert_eq!(inserted.as_deref(), Some(r#"{"name": "Dora"}"#));
+    let count = client
+        .query_json(&format!("select count({module}::Person)"), &[])
+        .await
+        .unwrap();
+    assert_eq!(count, "[1]");
+
+    // A query with a `limit` of its own.
+    let limited = client
+        .query_single_json(&format!("select {module}::Person {{ name }} limit 1"), &[])
+        .await
+        .unwrap();
+    assert_eq!(limited.as_deref(), Some(r#"{"name": "Dora"}"#));
+    let all = client
+        .query_json(&format!("select {module}::Person {{ name }}"), &[])
+        .await
+        .unwrap();
+    assert_eq!(all, r#"[{"name": "Dora"}]"#);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn query_single_enforces_cardinality() {
     let module = unique_module("live_client_single");
     let client = setup(&person_schema(&module)).await;

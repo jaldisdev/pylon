@@ -588,8 +588,17 @@ pub(crate) fn hydrate<'py>(
     PyList::new(py, decoded)
 }
 
+/// Every row as a JSON document, rendered from the same shape `hydrate`
+/// reads — so the query runs once, and objects keep their pointers' names.
+#[pyfunction]
+pub(crate) fn rows_to_json(rows: &RowSet, compiled: &CompiledQuery) -> Vec<String> {
+    let root = &compiled.inner.shape.root;
+    rows.rows.iter().map(|row| pylon_client::json::row_to_json(root, row)).collect()
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HydrationRegistry>()?;
     m.add_function(wrap_pyfunction!(hydrate, m)?)?;
+    m.add_function(wrap_pyfunction!(rows_to_json, m)?)?;
     Ok(())
 }
