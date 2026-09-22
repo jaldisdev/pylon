@@ -13012,10 +13012,11 @@ impl<'a> Compiler<'a> {
     }
 
     /// Whether the type's rows come from more than one table — an interface,
-    /// or a concrete type with subtypes — and so are read through the union
-    /// that carries each row's own `__type__`.
+    /// an abstract type (which has no table of its own), or a concrete type
+    /// with subtypes — and so are read through the union that carries each
+    /// row's own `__type__`.
     fn is_polymorphic(&self, td: &TypeDescriptor) -> bool {
-        (td.abstract_ && td.materialized) || self.has_subtypes(td)
+        td.abstract_ || self.has_subtypes(td)
     }
 
     /// One owner type's half of `compile_backlink_as_exists`: EXISTS over the
