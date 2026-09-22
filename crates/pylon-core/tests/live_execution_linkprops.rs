@@ -475,3 +475,42 @@ async fn a_link_property_value_reads_the_walked_links_current_value() {
     let weights: Vec<f64> = tags.iter().map(|t| as_f64(field(t, 2))).collect();
     assert_eq!(weights, vec![1.0, 2.5], "only the walked-and-filtered link moves, got {tags:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_splat_over_a_link_reads_its_link_properties() {
+    let module = unique_module("live_lp_splat");
+    let sd = schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ name := 'sale' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Product {{ name := 'Widget', \
+             tags := (select {module}::Tag) {{ @weight := 2.5 }} }}"
+        ),
+    )
+    .await;
+
+    for pyql in [
+        format!("select {module}::Product {{ tags: {{ * }} }}"),
+        format!("select {module}::Product {{ ** }}"),
+    ] {
+        let rows = rows_of(&pool, &sd, &pyql).await;
+        let DecodedValue::Composite(shape) = &rows[0] else {
+            panic!("expected Composite")
+        };
+        let Some(DecodedValue::Array(tags)) = shape.last() else {
+            panic!("expected an Array for tags, got {shape:?}")
+        };
+        let DecodedValue::Composite(tag) = &tags[0] else {
+            panic!("expected a Composite tag, got {:?}", tags[0])
+        };
+        let weight = tag.last().map(as_f64);
+        assert_eq!(weight, Some(2.5), "{pyql} did not read @weight, got {tag:?}");
+    }
+}

@@ -8378,18 +8378,37 @@ impl<'a> Compiler<'a> {
                     sub_shape,
                 );
 
+                let link_properties = self.splat_link_properties(ml)?;
                 pointers.push(IrShapePointer::MultiLink(IrMultiLinkPointer {
                     marker_offset: None,
                     alias: ml.name.clone(),
                     join,
                     subquery,
-                    link_properties: vec![],
+                    link_properties,
                     single: false,
                 }));
             }
         }
 
         Ok(pointers)
+    }
+
+    /// The link properties a splat over a multi-link's targets carries: every
+    /// property of its `@pylon.junction` through type, as Gel's splat does.
+    fn splat_link_properties(&self, ml: &MultiLinkDescriptor) -> Result<Vec<IrLinkProp>, PyQLError> {
+        let Some(through_qname) = &ml.through else {
+            return Ok(vec![]);
+        };
+        let through_td = self.resolve_type(through_qname)?;
+        if !through_td.junction {
+            return Ok(vec![]);
+        }
+        Ok(through_td
+            .properties
+            .iter()
+            .filter(|p| p.name != "id")
+            .map(|p| IrLinkProp { name: p.name.clone() })
+            .collect())
     }
 
     // ── Type-intersection helpers ─────────────────────────────────────────────────
@@ -9076,6 +9095,16 @@ impl<'a> Compiler<'a> {
                 link_properties.push(IrLinkProp { name: name.clone() });
             } else {
                 regular_els.push(nel.clone());
+            }
+        }
+        let has_splat = nested_elements
+            .iter()
+            .any(|nel| nel.splat.is_some() && !matches!(nel.path.steps.first(), Some(ast::PathStep::TypeIntersection(_))));
+        if has_splat {
+            for prop in self.splat_link_properties(&ml)? {
+                if !link_properties.iter().any(|existing| existing.name == prop.name) {
+                    link_properties.push(prop);
+                }
             }
         }
 
