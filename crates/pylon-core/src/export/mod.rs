@@ -2183,10 +2183,31 @@ fn make_excl_info(
 /// `interface_junction_view_ddl_with_names`'s helper view) and the constraint
 /// trigger's attachment point (the junction table, not `impl_t` itself)
 /// differ from the plain-property/plain-link case.
-fn make_excl_junction_info(iface: &TypeDescriptor, link_name: &str, impl_t: &TypeDescriptor) -> ExclTriggerInfo {
+fn make_excl_junction_info(
+    iface: &TypeDescriptor,
+    link_name: &str,
+    impl_t: &TypeDescriptor,
+    impls: &[&TypeDescriptor],
+) -> ExclTriggerInfo {
     let fn_name = excl_fn_name(&iface.table, std::slice::from_ref(&link_name.to_string()));
     let fn_qname = format!("{}.{}", pg_schema(&iface.module), qi(&fn_name));
-    let view_qname = qn(&iface.module, &interface_junction_view_name(&iface.table, link_name));
+    // A concrete type with subtypes has no view spanning their junctions; its
+    // own junction table carries the name the view would have had.
+    let view_qname = if iface.abstract_ {
+        qn(&iface.module, &interface_junction_view_name(&iface.table, link_name))
+    } else {
+        let branches = impls
+            .iter()
+            .map(|t| {
+                format!(
+                    "SELECT \"source\", \"target\" FROM {}",
+                    qn(&t.module, &format!("{}.{}", t.table, link_name))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        format!("({branches}) AS \"_spanned\"")
+    };
     let jt_name = format!("{}.{}", impl_t.table, link_name);
     let jt_qname = qn(&impl_t.module, &jt_name);
 
@@ -2307,7 +2328,7 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             // object-column path every other exclusive pointer here uses.
             if l.is_junction_backed() {
                 for impl_t in impls {
-                    result.push(make_excl_junction_info(t, &l.name, impl_t));
+                    result.push(make_excl_junction_info(t, &l.name, impl_t, impls));
                 }
                 continue;
             }
@@ -2321,7 +2342,7 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
                 continue;
             }
             for impl_t in impls {
-                result.push(make_excl_junction_info(t, &ml.name, impl_t));
+                result.push(make_excl_junction_info(t, &ml.name, impl_t, impls));
             }
         }
         for c in &t.constraints {
@@ -2993,6 +3014,42 @@ mod tests {
         staff.bases = vec!["default::Individual".into()];
         schema.types.push(staff);
         schema
+    }
+
+    #[test]
+    fn an_exclusive_multilink_on_a_type_with_subtypes_is_unique_across_them() {
+        let mut schema = schema_with_a_link_to_a_type_with_subtypes();
+        for t in schema.types.iter_mut().filter(|t| t.name == "Individual" || t.name == "Staff") {
+            t.multilinks.push(MultiLinkDescriptor {
+                name: "keys".into(),
+                target: "default::Session".into(),
+                through: None,
+                nullable: false,
+                description: None,
+                default_pyql: None,
+                on_delete: vec![],
+                is_exclusive: true,
+            });
+        }
+        let ddl = export_schema(&schema).unwrap();
+        for table in ["Individual.keys", "Staff.keys"] {
+            assert!(
+                ddl.contains(&format!("CREATE TABLE \"public\".\"{table}\"")),
+                "got:\n{ddl}"
+            );
+            assert!(
+                ddl.contains(&format!("AFTER INSERT ON \"public\".\"{table}\"")),
+                "missing exclusive trigger on {table}, got:\n{ddl}"
+            );
+        }
+        assert!(ddl.contains("UNIQUE (target)"), "got:\n{ddl}");
+        assert!(
+            ddl.contains(
+                "SELECT \"source\", \"target\" FROM \"public\".\"Individual.keys\" UNION ALL \
+                 SELECT \"source\", \"target\" FROM \"public\".\"Staff.keys\""
+            ),
+            "the trigger must check every subtype's junction, got:\n{ddl}"
+        );
     }
 
     #[test]
