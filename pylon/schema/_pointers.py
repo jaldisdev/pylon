@@ -125,12 +125,19 @@ class LinkAnnotation:
 
 
 class MultiLinkAnnotation:
-    __slots__ = ('on_delete', 'target_type', 'through_type')
+    __slots__ = ('constraints', 'on_delete', 'target_type', 'through_type')
 
-    def __init__(self, target_type: Any, through_type: Any = None, on_delete: list[OnDelete] | None = None) -> None:
+    def __init__(
+        self,
+        target_type: Any,
+        through_type: Any = None,
+        on_delete: list[OnDelete] | None = None,
+        constraints: list[Any] | None = None,
+    ) -> None:
         self.target_type = target_type
         self.through_type = through_type
         self.on_delete = on_delete or []
+        self.constraints = constraints or []
 
     def __or__(self, other: Any) -> Any:
         if other is None:
@@ -285,12 +292,20 @@ class MultiLink:
         target_type = params[0]
         through_type = None
         on_delete: list[OnDelete] = []
+        remaining: list[Any] = []
         for p in params[1:]:
             if isinstance(p, Through):
                 through_type = p.type_
             elif isinstance(p, OnDelete):
                 on_delete.append(p)
-        return MultiLinkAnnotation(target_type=target_type, through_type=through_type, on_delete=on_delete)
+            else:
+                remaining.append(p)
+        return MultiLinkAnnotation(
+            target_type=target_type,
+            through_type=through_type,
+            on_delete=on_delete,
+            constraints=_consume_registered(remaining),
+        )
 
 
 class TupleElement:

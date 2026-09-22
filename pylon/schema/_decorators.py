@@ -171,14 +171,16 @@ def _annotation_to_meta(
         )
 
     if isinstance(annotation, MultiLinkAnnotation):
+        description = next((c.text for c in annotation.constraints if isinstance(c, Description)), None)
         return PointerMeta(
             name=name,
             kind='multilink',
             scalar_type=None,
             nullable=nullable,
-            constraints=[],
+            constraints=[c for c in annotation.constraints if not isinstance(c, Description)],
             default=MISSING,
             default_factory=list,
+            description=description,
             link_target=annotation.target_type,
             through=annotation.through_type,
             on_delete=list(annotation.on_delete),

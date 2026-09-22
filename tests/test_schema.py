@@ -128,6 +128,7 @@ class ProductTag(Auditable):
 class Catalog:
     products: MultiLink[Product, Through[ProductTag]]
     optional_tags: MultiLink[Tag] | None
+    featured_tags: MultiLink[Tag, Exclusive, Description('Tags no other catalog features')]
 
 
 @pylon.interface
@@ -554,6 +555,14 @@ class TestMultiLinkField:
 
     def test_nullable_multilink_flag(self):
         assert Catalog.__pylon_config__.pointers['optional_tags'].nullable is True
+
+    def test_exclusive_and_description_are_kept(self):
+        pointer = Catalog.__pylon_config__.pointers['featured_tags']
+        assert Exclusive in pointer.constraints
+        assert pointer.description == 'Tags no other catalog features'
+
+    def test_no_constraints_when_absent(self):
+        assert Catalog.__pylon_config__.pointers['optional_tags'].constraints == []
 
 
 # ---------------------------------------------------------------------------
