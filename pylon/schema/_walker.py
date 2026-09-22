@@ -1557,6 +1557,7 @@ def walk(
     named_tuples: list[type] | None = None,
     signals: list[Any] | None = None,
     channels: list[Any] | None = None,
+    validate_types: bool = True,
 ) -> Any:
     """Walk the collected schema and return a pylon._core.SchemaDescriptor.
 
@@ -1627,5 +1628,6 @@ def walk(
     # mismatch found, not just the first) if anything's off. See
     # crates/pylon-core/src/validate.rs for the (best-effort, not exhaustive)
     # scope of what this can detect.
-    _core.validate_schema_types(schema)
+    if validate_types:
+        _core.validate_schema_types(schema)
     return schema

@@ -111,6 +111,14 @@ class TestReturnTypeConsistency:
         with pytest.raises(pylon_exceptions.SchemaError, match='return type mismatch in function'):
             walk([], [], [], [], functions=functions_snapshot())
 
+    def test_type_check_can_be_left_to_the_migration_commands(self):
+        @pylon.function_decorator(module='t', name='bad_fn')
+        def bad_fn(a: pylon.Int64) -> pylon.Str:
+            """select a"""
+
+        schema = walk([], [], [], [], functions=functions_snapshot(), validate_types=False)
+        assert schema is not None
+
     def test_computed_return_type_match_passes(self):
         @pylon.type(module='t', name='Person')
         class Person:
