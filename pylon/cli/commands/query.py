@@ -360,24 +360,51 @@ async def _execute(
         return
 
     # Schema object or free object
-    # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
-    selected = {p['name'] for p in shape.get('pointers', []) if not (p['name'] == '__type__' and p['position'] == 0)}
-    type_name = shape.get('type_name') or ''
-
     display = []
     for obj in results:
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            d = {k: v for k, v in vars(obj).items() if k in selected}
-            # __display_type__ is the internal sentinel used as the type label in _format_results.
-            # Keeping it separate from __type__ lets an explicit `__type__` pointer show in the output.
-            d['__display_type__'] = vars(obj).get('__pylon_type__') or type_name or type(obj).__name__
-        elif isinstance(obj, dict):
-            d = {k: v for k, v in obj.items() if k in selected}
-            d['__display_type__'] = type_name
-        else:
+        d = _selected(obj, shape)
+        if not isinstance(d, dict):
             d = {'__display_type__': type(obj).__name__, 'value': str(obj)}
         display.append(d)
     click.echo(_format_results(display, wrap=repl))
+
+
+def _selected(value: object, node: dict) -> object:
+    """`value` with every object in it reduced to the pointers its shape node
+    selected, as a dict labelled by `__display_type__`.
+
+    An object carries every pointer of its type, and a multi-link the query
+    did not fetch refuses to be read — so a linked object is shown through
+    its own shape, exactly as the top-level one is.
+    """
+    from pylon.datatypes import PylonSet
+    from pylon.schema._named_tuples import NamedTuple as PylonNamedTuple
+
+    if isinstance(value, list):
+        element = node.get('element') if node.get('kind') == 'array' else node
+        items = [_selected(item, element or {}) for item in value]
+        return PylonSet(items) if isinstance(value, PylonSet) else items
+    if node.get('kind') != 'object':
+        return value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type) and not isinstance(value, PylonNamedTuple):
+        pointers = vars(value)
+        # __display_type__ is the internal sentinel used as the type label in _format_results.
+        # Keeping it separate from __type__ lets an explicit `__type__` pointer show in the output.
+        display_type = pointers.get('__pylon_type__') or node.get('type_name') or type(value).__name__
+    elif isinstance(value, dict):
+        pointers = value
+        display_type = node.get('type_name') or ''
+    else:
+        return value
+    # Auto-injected __type__ at position 0 is excluded; explicit __type__ (pos > 0) is included.
+    children = {
+        child['name']: child
+        for child in node.get('pointers', [])
+        if not (child['name'] == '__type__' and child['position'] == 0)
+    }
+    reduced = {name: _selected(item, children[name]) for name, item in pointers.items() if name in children}
+    reduced['__display_type__'] = display_type
+    return reduced
 
 
 # --- one-shot query command ---------------------------------------------------
@@ -611,8 +638,9 @@ def _value(v: object) -> str:
         pairs = ', '.join(f'{_key(k)}: {_value(val)}' for k, val in vars(v).items() if not k.startswith('__pylon_'))
         return f'{_type(qname)} {_brace("{")}{pairs}{_brace("}")}'
     if isinstance(v, dict):
-        pairs = ', '.join(f'{_key(k)}: {_value(val)}' for k, val in v.items())
-        return f'{_brace("{")}{pairs}{_brace("}")}'
+        pairs = ', '.join(f'{_key(k)}: {_value(val)}' for k, val in v.items() if k != '__display_type__')
+        prefix = f'{_type(v["__display_type__"])} ' if v.get('__display_type__') else ''
+        return f'{prefix}{_brace("{")}{pairs}{_brace("}")}'
     return str(v)
 
 
@@ -658,12 +686,19 @@ def _pformat_value(v: object, depth: int, max_width: int) -> str:
         pointers = {k: val for k, val in vars(v).items() if not k.startswith('__pylon_')}
         return _pformat_object(qname, pointers, depth, max_width)
     if isinstance(v, dict):
-        return _pformat_object('', v, depth, max_width)
+        pointers = {k: val for k, val in v.items() if k != '__display_type__'}
+        return _pformat_object(v.get('__display_type__') or '', pointers, depth, max_width)
     from pylon.datatypes import PylonSet
 
     if isinstance(v, PylonSet):
+        compact = _value(v)
+        if not v or _visual_len(compact) <= max_width - depth * 2:
+            return compact
+        indent = '  ' * (depth + 1)
+        closing = '  ' * depth
         elem_strs = [_pformat_value(e, depth + 1, max_width) for e in v]
-        return _format_set(elem_strs)
+        inner = f',\n{indent}'.join(elem_strs)
+        return f'{_brace("{")}\n{indent}{inner}\n{closing}{_brace("}")}'
     return _value(v)
 
 
