@@ -10747,7 +10747,23 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::BinOp(b) => {
-                if let Some((td, alias)) = ctx {
+                // Only a condition can become an EXISTS — `.<pins.updated_at ??
+                // .<pins.created_at` is a set of values, not a test on each pin.
+                let yields_values = matches!(
+                    b.op,
+                    ast::BinOpKind::Add
+                        | ast::BinOpKind::Sub
+                        | ast::BinOpKind::Mul
+                        | ast::BinOpKind::Div
+                        | ast::BinOpKind::FloorDiv
+                        | ast::BinOpKind::Mod
+                        | ast::BinOpKind::Pow
+                        | ast::BinOpKind::Coalesce
+                        | ast::BinOpKind::Concat
+                );
+                if let Some((td, alias)) = ctx
+                    && !yields_values
+                {
                     if let Some(exists) = self.try_backlink_exists(b, td, alias)? {
                         return Ok(exists);
                     }
@@ -10812,6 +10828,35 @@ impl<'a> Compiler<'a> {
                 }
                 let left = self.compile_expr_ctx(&b.left, ctx)?;
                 let right = self.compile_expr_ctx(&b.right, ctx)?;
+                // `A ?? B` over sets is A unless A is empty. An empty set
+                // gathered as an array is `{}`, not NULL, so `COALESCE` would
+                // never fall through to B.
+                if b.op == ast::BinOpKind::Coalesce && (yields_array(&left) || yields_array(&right)) {
+                    let as_set = |value: IrExpr| {
+                        if yields_array(&value) {
+                            value
+                        } else {
+                            IrExpr::FunctionCall(IrFunctionCall {
+                                schema: None,
+                                name: "array_remove".to_string(),
+                                args: vec![value],
+                                sql_template: Some("array_remove(ARRAY[$1], NULL)".to_string()),
+                            })
+                        }
+                    };
+                    let left = as_set(left);
+                    let condition = IrExpr::FunctionCall(IrFunctionCall {
+                        schema: None,
+                        name: "cardinality".to_string(),
+                        args: vec![left.clone()],
+                        sql_template: Some("(cardinality($1) > 0)".to_string()),
+                    });
+                    return Ok(IrExpr::IfElse(Box::new(IrIfElse {
+                        condition,
+                        if_: left,
+                        else_: as_set(right),
+                    })));
+                }
                 // Comparing a value against a *set* — a path that crosses a
                 // multi-link or a backlink, which arrives here as an array of
                 // its elements — holds when any element matches, which is what
@@ -11056,6 +11101,38 @@ impl<'a> Compiler<'a> {
                                 sql_template: None,
                             }));
                         }
+                    }
+                    // `max(.<pins.updated_at ?? .<pins.created_at)` — the
+                    // coalesce picks one whole set, gathered as an array, and
+                    // the aggregate takes its elements.
+                    if let Expr::BinOp(b) = arg
+                        && b.op == ast::BinOpKind::Coalesce
+                    {
+                        let values = self.compile_expr_ctx(arg, ctx)?;
+                        let ns = f.module.as_deref().unwrap_or("std");
+                        let aggregate = crate::stdlib::lookup(ns, &f.name).into_iter().find_map(|d| match &d.impl_strategy {
+                            crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
+                            _ => None,
+                        });
+                        if let Some(sql_name) = aggregate
+                            && yields_array(&values)
+                        {
+                            let over_nothing = match f.name.as_str() {
+                                "any" => "false",
+                                "all" => "true",
+                                "sum" => "0",
+                                _ => "NULL",
+                            };
+                            return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                schema: None,
+                                name: sql_name.clone(),
+                                args: vec![values],
+                                sql_template: Some(format!(
+                                    "(SELECT coalesce({sql_name}(\"_s\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_s\"(\"v\"))"
+                                )),
+                            }));
+                        }
+                        return self.resolve_fn_call(f.module.as_deref(), &f.name, vec![values]);
                     }
                     // `count(memberships)` — a binding names a set, so the
                     // aggregate runs over its rows. Compiled as an ordinary
