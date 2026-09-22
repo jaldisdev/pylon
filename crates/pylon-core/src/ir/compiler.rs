@@ -9026,11 +9026,16 @@ impl<'a> Compiler<'a> {
         } else {
             self.compile_shape(nested, return_td, &alias, &return_td.module)?
         };
-        let args = fc
+        let mut args = fc
             .args
             .iter()
             .map(|a| self.compile_free_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
+        // A function reading a session global takes them as its first
+        // argument — the same forwarding a select over the call gets.
+        if let Some(globals) = self.globals_arg_for_call(&format!("{fn_module}::{fn_name}"))? {
+            args.insert(0, globals);
+        }
         Ok(Some(IrFunctionSelect {
             fn_module,
             fn_name,
