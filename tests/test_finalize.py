@@ -908,3 +908,45 @@ class TestWalkIntegration:
 
         # Clean up the dynamically imported module to avoid polluting other tests.
         sys.modules.pop('things', None)
+
+    def test_finalize_imports_a_package_schema_dir_under_its_package_name(self, tmp_path):
+        """A schema-dir with an `__init__.py` is imported as a package, so the application can
+        import `pkgschema.things` and get the very class Pylon registered."""
+        import importlib
+        import sys
+
+        import pylon as _pylon
+
+        schema_dir = tmp_path / 'pkgschema'
+        schema_dir.mkdir()
+        (schema_dir / '__init__.py').write_text('')
+        (schema_dir / 'owners.py').write_text('import pylon\n\n@pylon.type\nclass Owner:\n    name: str\n')
+        (schema_dir / 'things.py').write_text(
+            'from __future__ import annotations\n\n'
+            'from typing import Annotated\n\n'
+            'import pylon\n\n'
+            'from .owners import Owner\n\n'
+            '@pylon.type\nclass Widget:\n    label: str\n'
+            '    owner: pylon.Link[Annotated["Owner", pylon.lazy(".owners")]] | None\n'
+        )
+        toml = tmp_path / 'pylon.toml'
+        toml.write_text(
+            '[project]\nschema-dir = "pkgschema"\n\n'
+            '[database]\nhost = "localhost"\nport = 5432\n'
+            'name = "mydb"\nuser = "u"\n'
+        )
+
+        try:
+            _pylon.finalize(config=toml)
+
+            from pylon.schema._registry import snapshot as _snap
+
+            types, _, _ = _snap()
+            widget_cls = next(t for t in types if t.__name__ == 'Widget')
+            assert widget_cls.__pylon_config__.module == 'things'
+            assert widget_cls is importlib.import_module('pkgschema.things').Widget
+            assert 'things' not in sys.modules
+        finally:
+            for name in ('pkgschema', 'pkgschema.things', 'pkgschema.owners'):
+                sys.modules.pop(name, None)
+            sys.path[:] = [entry for entry in sys.path if entry != str(tmp_path)]

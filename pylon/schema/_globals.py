@@ -151,11 +151,12 @@ def collect_all_globals(schema_dir: Path, modules: list[Any] | None = None) -> l
     when handing it to the Rust walker) and pylon-server's /api/globals
     handler (which needs the real, structured type to render a proper
     typeName string for non-scalar globals — see _global_type_text)."""
+    from pylon._finalize import schema_import_names
+
     result: list[GlobalDescriptor] = []
-    for py_file in sorted(schema_dir.glob('*.py')):
-        stem = py_file.stem
-        if not stem.startswith('_') and stem in sys.modules:
-            result.extend(collect_module_globals(sys.modules[stem]))
+    for name in schema_import_names(schema_dir):
+        if name in sys.modules:
+            result.extend(collect_module_globals(sys.modules[name]))
     if modules:
         for mod in modules:
             result.extend(collect_module_globals(mod))
