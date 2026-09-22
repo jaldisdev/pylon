@@ -474,7 +474,7 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
         }
         IrExpr::AggOverQuery { inner, .. } => collect_select(inner, tags),
         // The binding it reads carries its own tags, collected where it is bound.
-        IrExpr::AggOverCte { .. } => {}
+        IrExpr::AggOverCte { .. } | IrExpr::ExistsOverCte { .. } => {}
         IrExpr::SetOp { left, right, .. } => {
             collect_expr(left, tags);
             collect_expr(right, tags);

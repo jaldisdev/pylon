@@ -4505,6 +4505,16 @@ impl<'a> Compiler<'a> {
             // exists (select ...) → EXISTS(SELECT 1 FROM ...)
             Expr::SubQuery(stmt) => self.compile_subquery_exists(stmt),
 
+            // `exists licenses` — a binding names a set, so it exists when it
+            // has a row; the fallback's scalar subquery aborts on the second.
+            operand if let Some(name) = self.resolve_cte_name(operand) => {
+                let object = self.cte_types.get(name).is_some_and(|bound| bound.contains("::"));
+                Ok(IrExpr::ExistsOverCte {
+                    cte: name.to_string(),
+                    column: (!object).then(|| "v".to_string()),
+                })
+            }
+
             // Fallback: any scalar expression → expr IS NOT NULL. When `ctx`
             // is `None` and `operand` is a partial `Path` not caught above
             // (guards failed since ctx.is_some() was false), this recurses

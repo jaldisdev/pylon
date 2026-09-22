@@ -917,6 +917,12 @@ pub enum IrExpr {
         cte: String,
         column: Option<String>,
     },
+    /// `exists memberships` over a whole `with` binding. Emits
+    /// `EXISTS(SELECT 1 FROM "cte")`, restricted to a non-null `column` for a
+    /// scalar binding, whose single-value form holds a NULL row when empty.
+    /// Read through `CteRef` instead, a binding of more than one row aborts
+    /// the query the same way `AggOverCte` describes.
+    ExistsOverCte { cte: String, column: Option<String> },
     /// `array_unpack(a) intersect array_unpack(b)` — a set operation between
     /// two set-valued expressions. Emits the array of what it yields, or
     /// `EXISTS` over it when that is all the caller wanted.

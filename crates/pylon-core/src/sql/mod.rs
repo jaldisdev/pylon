@@ -4654,6 +4654,10 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             column.as_deref().map(qi).unwrap_or_else(|| "*".to_string()),
             qi(cte),
         ),
+        IrExpr::ExistsOverCte { cte, column } => match column {
+            Some(column) => format!("EXISTS(SELECT 1 FROM {} WHERE {} IS NOT NULL)", qi(cte), qi(column)),
+            None => format!("EXISTS(SELECT 1 FROM {})", qi(cte)),
+        },
         IrExpr::AggOverQuery { fn_name, inner } => {
             let inner_sql = emit_select_stmt(inner, &[]).sql;
             format!("(SELECT {}(*) FROM ({}) _agg)", fn_name, inner_sql)
@@ -6389,6 +6393,19 @@ mod tests {
     }
 
     #[test]
+    fn test_exists_of_a_binding_asks_for_any_row() {
+        let out = compile_and_emit("WITH people := (SELECT Person) SELECT exists people");
+        assert!(out.sql.contains("EXISTS(SELECT 1 FROM \"people\")"), "{}", out.sql);
+
+        let out = compile_and_emit("WITH names := {'a', 'b'} SELECT exists names");
+        assert!(
+            out.sql.contains("EXISTS(SELECT 1 FROM \"names\" WHERE \"v\" IS NOT NULL)"),
+            "{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_a_conditional_insert_beside_a_read_branch_unions_both() {
         let out = compile_and_emit(
             "WITH existing := (SELECT Person FILTER .name = $n LIMIT 1) \
@@ -6396,7 +6413,7 @@ mod tests {
         );
         assert!(out.sql.contains("UNION ALL"), "{}", out.sql);
         assert!(
-            out.sql.contains("INSERT INTO") && out.sql.contains("WHERE (NOT ("),
+            out.sql.contains("INSERT INTO") && out.sql.contains("WHERE (NOT EXISTS(SELECT 1 FROM \"existing\"))"),
             "the insert carries the condition itself:\n{}",
             out.sql
         );
