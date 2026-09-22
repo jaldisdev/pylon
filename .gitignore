@@ -48,7 +48,6 @@ pyrightconfig.json
 
 # Rust
 target/
-Cargo.lock
 
 # maturin / PyO3 built extension modules
 *.so
