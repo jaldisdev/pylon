@@ -6393,6 +6393,23 @@ mod tests {
     }
 
     #[test]
+    fn test_a_free_object_under_a_condition_stays_an_object() {
+        for query in [
+            "SELECT { a := 1 } IF true ELSE {}",
+            "SELECT {} IF true ELSE { a := 1 }",
+            "SELECT { a := 1 } IF true ELSE {} LIMIT 1",
+        ] {
+            let out = compile_and_emit(query);
+            assert!(
+                matches!(&out.shape.root, ShapeNode::Object { type_name: None, pointers, .. } if pointers.len() == 1),
+                "{query}: {:?}\n{}",
+                out.shape.root,
+                out.sql
+            );
+        }
+    }
+
+    #[test]
     fn test_exists_of_a_binding_asks_for_any_row() {
         let out = compile_and_emit("WITH people := (SELECT Person) SELECT exists people");
         assert!(out.sql.contains("EXISTS(SELECT 1 FROM \"people\")"), "{}", out.sql);

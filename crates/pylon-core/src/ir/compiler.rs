@@ -4999,6 +4999,34 @@ impl<'a> Compiler<'a> {
         result_expr: &Expr,
         distinct: bool,
     ) -> Result<IrSelect, PyQLError> {
+        // `{ a := 1 } if cond else {}` — read as a scalar `CASE` it comes back
+        // as a bare record instead of an object, so the object is the row and
+        // the condition decides whether there is one.
+        if let Expr::IfElse(ie) = result_expr {
+            let is_empty_set = |expr: &Expr| matches!(expr, Expr::Set(items) if items.is_empty());
+            let is_free_object = |expr: &Expr| matches!(expr, Expr::Shape(sh) if sh.expr.is_none());
+            let guarded = if is_free_object(&ie.if_expr) && is_empty_set(&ie.else_expr) {
+                Some((&ie.if_expr, false))
+            } else if is_empty_set(&ie.if_expr) && is_free_object(&ie.else_expr) {
+                Some((&ie.else_expr, true))
+            } else {
+                None
+            };
+            if let Some((object, negated)) = guarded {
+                let condition = self.compile_free_expr(&ie.condition)?;
+                let condition = if negated {
+                    IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                        op: ast::UnaryOpKind::Not,
+                        operand: condition,
+                    }))
+                } else {
+                    condition
+                };
+                let mut select = self.compile_free_select(sel, object, distinct)?;
+                select.filter = and_conditions(select.filter, vec![condition]);
+                return Ok(select);
+            }
+        }
         let items: Vec<IrFreeExpr> = match result_expr {
             Expr::Union(_, _) | Expr::Set(_) => {
                 let mut union_items = vec![];
