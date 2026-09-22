@@ -392,7 +392,10 @@ class Client:
         c._ref = self._ref
         c._warnings = self._warnings
         # An unqualified name is a global of the `default` module, as in the upstream engine.
-        c._globals = {**self._globals, **{name if '::' in name else f'default::{name}': value for name, value in globals_.items()}}
+        c._globals = {
+            **self._globals,
+            **{name if '::' in name else f'default::{name}': value for name, value in globals_.items()},
+        }
         c._config_options = self._config_options
         return c
 

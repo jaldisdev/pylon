@@ -801,6 +801,12 @@ async fn a_multilink_append_through_the_interface_reaches_each_implementors_rows
         [DecodedValue::Composite(fields)] => fields.get(1).cloned(),
         other => panic!("expected one row, got {other:?}"),
     };
-    assert_eq!(count_of(rows_of(&pool, &schema, &tag_counts("Individual")).await), Some(DecodedValue::I64(0)));
-    assert_eq!(count_of(rows_of(&pool, &schema, &tag_counts("Organization")).await), Some(DecodedValue::I64(1)));
+    assert_eq!(
+        count_of(rows_of(&pool, &schema, &tag_counts("Individual")).await),
+        Some(DecodedValue::I64(0))
+    );
+    assert_eq!(
+        count_of(rows_of(&pool, &schema, &tag_counts("Organization")).await),
+        Some(DecodedValue::I64(1))
+    );
 }

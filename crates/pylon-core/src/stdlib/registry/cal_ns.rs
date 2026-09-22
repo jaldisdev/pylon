@@ -217,8 +217,10 @@ END"#,
                 pn("microseconds", Int64, NamedDefault::Int(0)),
             ],
             RelativeDuration,
-            E("(make_interval(years => $1::int, months => $2::int, days => $3::int, hours => $4::int, \
-               mins => $5::int, secs => $6) + make_interval(secs => $7 / 1000000.0))"),
+            E(
+                "(make_interval(years => $1::int, months => $2::int, days => $3::int, hours => $4::int, \
+               mins => $5::int, secs => $6) + make_interval(secs => $7 / 1000000.0))",
+            ),
         ),
         f(
             "cal",

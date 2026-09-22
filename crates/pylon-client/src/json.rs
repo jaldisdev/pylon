@@ -166,7 +166,11 @@ fn fraction_suffix(fraction_micros: i64) -> String {
 fn iso_duration(months: i32, days: i32, micros: i64) -> String {
     let mut out = String::from("P");
     let (years, months) = (months / 12, months % 12);
-    for (amount, unit) in [(i64::from(years), 'Y'), (i64::from(months), 'M'), (i64::from(days), 'D')] {
+    for (amount, unit) in [
+        (i64::from(years), 'Y'),
+        (i64::from(months), 'M'),
+        (i64::from(days), 'D'),
+    ] {
         if amount != 0 {
             out.push_str(&format!("{amount}{unit}"));
         }
@@ -202,7 +206,10 @@ fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(ALPHABET[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
@@ -224,7 +231,10 @@ mod tests {
         assert_eq!(date(9760).to_string(), "2026-09-21");
         assert_eq!(time(71_076_000_000), "19:44:36");
         assert_eq!(time(71_076_500_000), "19:44:36.5");
-        assert_eq!(timestamp(9760 * 86_400_000_000 + 71_076_224_624), "2026-09-21T19:44:36.224624");
+        assert_eq!(
+            timestamp(9760 * 86_400_000_000 + 71_076_224_624),
+            "2026-09-21T19:44:36.224624"
+        );
     }
 
     #[test]

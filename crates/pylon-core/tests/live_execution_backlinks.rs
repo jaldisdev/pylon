@@ -513,7 +513,10 @@ async fn a_bare_multilink_reads_as_the_set_of_rows_on_its_far_side() {
     let pylon_value::DecodedValue::Composite(fields) = &rows[0] else {
         panic!("expected a Composite-shaped Person row, got {:?}", rows[0]);
     };
-    assert_eq!(fields.get(1), Some(&pylon_value::DecodedValue::Str("Alice".to_string())));
+    assert_eq!(
+        fields.get(1),
+        Some(&pylon_value::DecodedValue::Str("Alice".to_string()))
+    );
 }
 
 async fn rows(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<pylon_value::DecodedValue> {
@@ -554,7 +557,12 @@ async fn a_union_of_walks_yields_the_values_of_both() {
     let (module, schema, pool) = setup().await;
     seed_teams(&pool, &schema, &module).await;
 
-    let found = rows(&pool, &schema, &format!("select {module}::Team.name union {module}::Member.name")).await;
+    let found = rows(
+        &pool,
+        &schema,
+        &format!("select {module}::Team.name union {module}::Member.name"),
+    )
+    .await;
     let mut names: Vec<_> = text_fields(&found, 0).into_iter().flatten().collect();
     names.sort();
     assert_eq!(names, vec!["Alpha", "Beta", "Mo"]);
@@ -585,7 +593,10 @@ async fn a_pointer_read_off_a_walks_shape_is_evaluated_per_row() {
     // An org with no teams has nothing to be true of: `any` of nothing is false.
     assert_eq!(
         flags,
-        vec![Some(pylon_value::DecodedValue::Bool(true)), Some(pylon_value::DecodedValue::Bool(false))]
+        vec![
+            Some(pylon_value::DecodedValue::Bool(true)),
+            Some(pylon_value::DecodedValue::Bool(false))
+        ]
     );
 }
 
@@ -678,7 +689,10 @@ async fn an_empty_element_is_not_in_a_set_literal() {
     let [pylon_value::DecodedValue::Composite(team)] = gamma.as_slice() else {
         panic!("expected Gamma, got {gamma:?}")
     };
-    assert_eq!(text_fields(std::slice::from_ref(&team[1]), 1), vec![Some("HasTeam".to_string())]);
+    assert_eq!(
+        text_fields(std::slice::from_ref(&team[1]), 1),
+        vec![Some("HasTeam".to_string())]
+    );
 }
 
 #[tokio::test]

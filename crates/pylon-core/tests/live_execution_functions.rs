@@ -471,7 +471,10 @@ async fn a_negative_index_counts_from_the_end() {
     let last = eval_scalar(&pool, "str_split('marketplace::MemberPlanLicense', '::')[-1]").await;
     assert_eq!(last, DecodedValue::Str("MemberPlanLicense".to_string()));
     assert_eq!(eval_scalar(&pool, "[1, 2, 3][-3]").await, DecodedValue::I64(1));
-    assert_eq!(eval_scalar(&pool, "'abc'[-1]").await, DecodedValue::Str("c".to_string()));
+    assert_eq!(
+        eval_scalar(&pool, "'abc'[-1]").await,
+        DecodedValue::Str("c".to_string())
+    );
 
     let empty = SchemaDescriptor::default();
     for (expr, message) in [

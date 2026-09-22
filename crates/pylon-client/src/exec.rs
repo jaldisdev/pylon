@@ -165,7 +165,10 @@ pub(crate) async fn query<E: Executor>(
     if let Some(rows) = crate::cache::get_rows(access, &compiled, &bound)? {
         return Ok(rows.iter().map(|row| decode(&compiled.shape.root, row)).collect());
     }
-    let rows = executor.run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref()).await.map_err(Error::Db)?;
+    let rows = executor
+        .run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref())
+        .await
+        .map_err(Error::Db)?;
     crate::cache::invalidate_for(access, &compiled)?;
     crate::cache::put_rows(access, &compiled, &bound, &rows)?;
     Ok(rows.iter().map(|row| decode(&compiled.shape.root, row)).collect())
@@ -187,7 +190,10 @@ pub(crate) async fn query_single<E: Executor>(
         }
         return Ok(rows.first().map(|row| decode(&compiled.shape.root, row)));
     }
-    let rows = executor.run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref()).await.map_err(Error::Db)?;
+    let rows = executor
+        .run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref())
+        .await
+        .map_err(Error::Db)?;
     if rows.len() > 1 {
         return Err(Error::ResultCardinality { got: rows.len() });
     }
@@ -220,7 +226,10 @@ pub(crate) async fn execute<E: Executor>(
     access: crate::cache::CacheAccess<'_>,
 ) -> Result<()> {
     let (compiled, bound) = compile_and_bind(pyql, params, schema, config, globals)?;
-    executor.run_execute(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref()).await.map_err(Error::Db)?;
+    executor
+        .run_execute(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref())
+        .await
+        .map_err(Error::Db)?;
     crate::cache::invalidate_for(access, &compiled)?;
     Ok(())
 }
@@ -241,7 +250,10 @@ pub(crate) async fn query_json<E: Executor>(
     if let Some(value) = crate::cache::get_json(access, "json_all", &compiled, &bound)? {
         return Ok(value.unwrap_or_else(|| "[]".to_string()));
     }
-    let rows = executor.run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref()).await.map_err(Error::Db)?;
+    let rows = executor
+        .run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref())
+        .await
+        .map_err(Error::Db)?;
     let documents: Vec<String> = rows
         .iter()
         .map(|row| crate::json::row_to_json(&compiled.shape.root, row))
@@ -265,7 +277,10 @@ pub(crate) async fn query_single_json<E: Executor>(
     if let Some(value) = crate::cache::get_json(access, "json_single", &compiled, &bound)? {
         return Ok(value);
     }
-    let rows = executor.run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref()).await.map_err(Error::Db)?;
+    let rows = executor
+        .run_query(&compiled.sql, &bound, trigger_globals(&compiled, globals).as_deref())
+        .await
+        .map_err(Error::Db)?;
     if rows.len() > 1 {
         return Err(Error::ResultCardinality { got: rows.len() });
     }
@@ -274,7 +289,9 @@ pub(crate) async fn query_single_json<E: Executor>(
         crate::cache::put_json(access, "json_single", &compiled, &bound, None)?;
         return Ok(None);
     }
-    let value = rows.first().map(|row| crate::json::row_to_json(&compiled.shape.root, row));
+    let value = rows
+        .first()
+        .map(|row| crate::json::row_to_json(&compiled.shape.root, row));
     crate::cache::invalidate_for(access, &compiled)?;
     crate::cache::put_json(access, "json_single", &compiled, &bound, value.as_deref())?;
     Ok(value)

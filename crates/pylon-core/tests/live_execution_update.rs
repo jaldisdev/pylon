@@ -378,7 +378,11 @@ async fn an_upsert_runs_exactly_one_of_its_two_branches() {
 
     exec(&pool, &sd, &upsert).await;
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }}")).await;
-    assert_eq!(rows.len(), 1, "the first run should insert exactly one row, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first run should insert exactly one row, got {rows:?}"
+    );
     assert_eq!(as_i64(field(&rows[0], 2)), 30, "the update branch must not have run");
 
     exec(&pool, &sd, &upsert).await;
@@ -432,14 +436,17 @@ async fn an_assert_on_a_pointer_actually_raises() {
     )
     .await;
     let rows = rows_of(&pool, &sd, &pyql).await;
-    assert_eq!(rows.len(), 1, "with a post present the assert should pass, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "with a post present the assert should pass, got {rows:?}"
+    );
 
     // The limited form's other direction: a set that does satisfy the assert
     // must still come back, rather than the wider check tripping on rows the
     // limit was there to drop.
-    let limited = format!(
-        "select {module}::Person {{ name, p := (select assert_distinct(.posts {{ title }}) limit 1) }}"
-    );
+    let limited =
+        format!("select {module}::Person {{ name, p := (select assert_distinct(.posts {{ title }}) limit 1) }}");
     let rows = rows_of(&pool, &sd, &limited).await;
     assert_eq!(rows.len(), 1, "a distinct set should pass under a limit, got {rows:?}");
 }
@@ -529,8 +536,9 @@ async fn an_assert_on_a_single_object_pointer_checks_its_row() {
     let rows = rows_of(&pool, &sd, &single).await;
     assert_eq!(rows.len(), 1, "a single author is distinct, got {rows:?}");
 
-    let repeated_union =
-        format!("select {module}::Post {{ title, a := (select assert_distinct(.author union .author) {{ name }} limit 1) }}");
+    let repeated_union = format!(
+        "select {module}::Post {{ title, a := (select assert_distinct(.author union .author) {{ name }} limit 1) }}"
+    );
     let compiled = query::compile(&repeated_union, &sd).unwrap();
     let error = pool
         .query_typed(&compiled.sql, &[], &ExtensionOids::default())
@@ -611,11 +619,18 @@ async fn a_single_link_upsert_writes_exactly_one_branch() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}")).await;
     exec(
         &pool,
         &sd,
-        &format!("insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"),
+        &format!("insert {module}::Person {{ name := 'Alice', age := 30 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Post {{ title := 'Hello', author := (select {module}::Person filter .name = 'Alice') }}"
+        ),
     )
     .await;
 
@@ -631,7 +646,12 @@ async fn a_single_link_upsert_writes_exactly_one_branch() {
     exec(&pool, &sd, &upsert("Bob")).await;
     exec(&pool, &sd, &upsert("Alice")).await;
 
-    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }} order by .name")).await;
+    let people = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name, age }} order by .name"),
+    )
+    .await;
     let got: Vec<(String, i64)> = people
         .iter()
         .map(|r| (as_str(field(r, 1)).to_string(), as_i64(field(r, 2))))

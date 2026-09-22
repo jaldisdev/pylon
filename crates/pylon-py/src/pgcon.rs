@@ -329,7 +329,10 @@ impl PgconPool {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let started = std::time::Instant::now();
             let result = match &globals {
-                Some(globals) => pool.query_typed_with_globals(&sql, &cached_params, pool.types(), globals).await,
+                Some(globals) => {
+                    pool.query_typed_with_globals(&sql, &cached_params, pool.types(), globals)
+                        .await
+                }
                 None => pool.query_typed(&sql, &cached_params, pool.types()).await,
             };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
@@ -517,7 +520,10 @@ impl PgconTransaction {
             let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
             let started = std::time::Instant::now();
             let result = match &globals {
-                Some(globals) => tx.query_typed_with_globals(&sql, &cached_params, tx.types(), globals).await,
+                Some(globals) => {
+                    tx.query_typed_with_globals(&sql, &cached_params, tx.types(), globals)
+                        .await
+                }
                 None => tx.query_typed(&sql, &cached_params, tx.types()).await,
             };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());

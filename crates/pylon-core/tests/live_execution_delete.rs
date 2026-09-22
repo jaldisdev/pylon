@@ -321,9 +321,5 @@ async fn deleting_a_binding_removes_only_the_rows_it_names() {
     .await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
-    assert_eq!(
-        rows.len(),
-        2,
-        "only the rows the binding names should go, got {rows:?}"
-    );
+    assert_eq!(rows.len(), 2, "only the rows the binding names should go, got {rows:?}");
 }

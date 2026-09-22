@@ -103,7 +103,13 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("math", "sqrt", vec![p("x", Int64)], Float64, E("sqrt($1::float8)")),
         f("math", "sqrt", vec![p("x", Float64)], Float64, B("sqrt")),
         f("math", "sqrt", vec![p("x", Decimal)], Decimal, B("sqrt")),
-        f("math", "mean", vec![p("vals", set_of(Int64))], Float64, E("avg($1)::float8")),
+        f(
+            "math",
+            "mean",
+            vec![p("vals", set_of(Int64))],
+            Float64,
+            E("avg($1)::float8"),
+        ),
         f("math", "mean", vec![p("vals", set_of(Float64))], Float64, B("avg")),
         f("math", "mean", vec![p("vals", set_of(Decimal))], Decimal, B("avg")),
     ]

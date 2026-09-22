@@ -507,8 +507,12 @@ mod tests {
                 ],
             }],
         };
-        let Value::Object(root) = decode(&shape, &value) else { panic!() };
-        let Some(Value::Object(b)) = root.get("b") else { panic!("{root:?}") };
+        let Value::Object(root) = decode(&shape, &value) else {
+            panic!()
+        };
+        let Some(Value::Object(b)) = root.get("b") else {
+            panic!("{root:?}")
+        };
         assert_eq!(b.get("address"), Some(&Value::Str("Main St".into())));
     }
 

@@ -149,7 +149,9 @@ class _Not(_Node):
 class _FuncCall(_Node):
     __slots__ = ('args', 'kwargs', 'module', 'name')
 
-    def __init__(self, module: str | None, name: str, args: list[_Node], kwargs: dict[str, _Node] | None = None) -> None:
+    def __init__(
+        self, module: str | None, name: str, args: list[_Node], kwargs: dict[str, _Node] | None = None
+    ) -> None:
         self.module = module
         self.name = name
         self.args = args
@@ -471,7 +473,8 @@ def _render(node: _Node, ctx: _RenderCtx) -> str:
             # which it's in until something renders it.
             stdlib.check_context(node.module, node.name, len(node.args), ctx.context, tuple(node.kwargs))
         args_text = ', '.join(
-            [_render(a, ctx) for a in node.args] + [f'{key} := {_render(value, ctx)}' for key, value in node.kwargs.items()]
+            [_render(a, ctx) for a in node.args]
+            + [f'{key} := {_render(value, ctx)}' for key, value in node.kwargs.items()]
         )
         prefix = f'{node.module}::' if node.module else ''
         return f'{prefix}{node.name}({args_text})'

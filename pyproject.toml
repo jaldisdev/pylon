@@ -57,7 +57,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 # the DSL builds. Scoped to the three test modules that exercise that syntax
 # rather than disabled globally, so a genuine undefined name elsewhere still
 # fails.
-"tests/test_finalize.py" = ["F821", "UP037"]
+"tests/test_finalize.py" = ["F722", "F821", "UP037"]
 "tests/test_functions.py" = ["F722", "UP037"]
 # RUF012: a Pylon schema class declares its default *in* the class body
 # (`tags_list: list[str] = []`), which is the DSL's own syntax for a default,

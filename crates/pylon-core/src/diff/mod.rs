@@ -572,7 +572,8 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
     };
     for table in &mut tables {
         table.foreign_keys.retain(|fk| {
-            fk.local_column == "source" || !polymorphic_tables.contains(&(fk.ref_schema.as_str(), fk.ref_table.as_str()))
+            fk.local_column == "source"
+                || !polymorphic_tables.contains(&(fk.ref_schema.as_str(), fk.ref_table.as_str()))
         });
     }
 
@@ -2979,12 +2980,24 @@ fn diff_inner(
                 continue;
             }
             unwanted_fks.insert(if l.is_junction_backed() {
-                (t.module.clone(), format!("{}.{}", t.table, l.name), format!("{}_{}_target_fkey", t.table, l.name))
+                (
+                    t.module.clone(),
+                    format!("{}.{}", t.table, l.name),
+                    format!("{}_{}_target_fkey", t.table, l.name),
+                )
             } else {
-                (t.module.clone(), t.table.clone(), format!("{}_{}_fkey", t.table, l.name))
+                (
+                    t.module.clone(),
+                    t.table.clone(),
+                    format!("{}_{}_fkey", t.table, l.name),
+                )
             });
         }
-        for ml in t.multilinks.iter().filter(|ml| polymorphic_targets.contains(&ml.target)) {
+        for ml in t
+            .multilinks
+            .iter()
+            .filter(|ml| polymorphic_targets.contains(&ml.target))
+        {
             unwanted_fks.insert((
                 t.module.clone(),
                 format!("{}.{}", t.table, ml.name),
@@ -2994,7 +3007,11 @@ fn diff_inner(
     }
     for cur_table in &current.tables {
         for fk in &cur_table.foreign_keys {
-            let key = (cur_table.schema.clone(), cur_table.name.clone(), fk.constraint_name.clone());
+            let key = (
+                cur_table.schema.clone(),
+                cur_table.name.clone(),
+                fk.constraint_name.clone(),
+            );
             // A key into an interface's view was never created to begin with.
             let references_a_table = target
                 .types
@@ -5011,7 +5028,6 @@ mod tests {
         };
         assert!(drop < retype, "the drop must come first:\n{joined}");
     }
-
 
     #[test]
     fn test_property_type_change_surfaces_a_required_cast_expression_step() {

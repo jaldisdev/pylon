@@ -260,7 +260,9 @@ fn collect_path_select(ps: &IrPathSelect, tags: &mut Vec<String>) {
     }
     for j in &ps.joins {
         match j {
-            IrPathJoin::Single { target, .. } | IrPathJoin::BacklinkSingle { target, .. } => push_source_tags(target, tags),
+            IrPathJoin::Single { target, .. } | IrPathJoin::BacklinkSingle { target, .. } => {
+                push_source_tags(target, tags)
+            }
             // A junction is involved — a write to it (e.g. re-linking a
             // junction-backed single link, or appending/removing a
             // multi-link target) must also invalidate this query's cache

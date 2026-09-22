@@ -345,9 +345,7 @@ impl Parser {
     fn substitute_alias(expr: Expr, alias: &str, value: &Expr) -> Expr {
         match expr {
             Expr::Path(ref p)
-                if !p.partial
-                    && p.steps.len() == 1
-                    && matches!(&p.steps[0], PathStep::Name(n) if n == alias) =>
+                if !p.partial && p.steps.len() == 1 && matches!(&p.steps[0], PathStep::Name(n) if n == alias) =>
             {
                 value.clone()
             }
@@ -363,7 +361,11 @@ impl Parser {
             Expr::FunctionCall(f) => Expr::FunctionCall(FunctionCall {
                 module: f.module,
                 name: f.name,
-                args: f.args.into_iter().map(|a| Self::substitute_alias(a, alias, value)).collect(),
+                args: f
+                    .args
+                    .into_iter()
+                    .map(|a| Self::substitute_alias(a, alias, value))
+                    .collect(),
                 kwargs: f
                     .kwargs
                     .into_iter()
@@ -551,10 +553,9 @@ impl Parser {
         let shape = self.parse_shape_body()?;
         self.eat(&Token::RBrace)?;
 
-        Ok(Self::returning_subject_shape(
-            subject,
-            |subject| Stmt::Update(UpdateStmt { subject, filter, shape }),
-        ))
+        Ok(Self::returning_subject_shape(subject, |subject| {
+            Stmt::Update(UpdateStmt { subject, filter, shape })
+        }))
     }
 
     /// `update T { * } filter … set { … }` — the upstream engine parses a DML subject as a
@@ -596,10 +597,9 @@ impl Parser {
             None
         };
 
-        Ok(Self::returning_subject_shape(
-            subject,
-            |subject| Stmt::Delete(DeleteStmt { subject, filter }),
-        ))
+        Ok(Self::returning_subject_shape(subject, |subject| {
+            Stmt::Delete(DeleteStmt { subject, filter })
+        }))
     }
 
     // ── WITH ────────────────────────────────────────────────────────────────────

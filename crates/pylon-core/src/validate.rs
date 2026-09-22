@@ -45,8 +45,8 @@
 
 use crate::error::{Position, PyQLError, PyQLFragmentError};
 use crate::ir::{
-    IrFreeExpr, IrRowSource, IrStmt, compile, compile_fn_body, compile_scalar_default_typed,
-    compile_trigger_handler, infer_ir_type, types_compatible,
+    IrFreeExpr, IrRowSource, IrStmt, compile, compile_fn_body, compile_scalar_default_typed, compile_trigger_handler,
+    infer_ir_type, types_compatible,
 };
 use crate::schema::SchemaDescriptor;
 
@@ -352,7 +352,9 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
                         .find(|p| p.name == assignment.pointer)
                         .map(|p| p.pg_type.as_str())
                         .unwrap_or("uuid");
-                    let Some(actual) = infer_ir_type(&assignment.ir) else { continue };
+                    let Some(actual) = infer_ir_type(&assignment.ir) else {
+                        continue;
+                    };
                     if !types_compatible(actual, pg_type) {
                         let context = format!("{}.{} (rewrite)", type_name, assignment.pointer);
                         errors.push(mismatch(

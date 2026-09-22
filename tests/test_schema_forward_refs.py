@@ -51,7 +51,6 @@ from pylon.schema._registry import clear as clear_registry
 from pylon.schema._registry import snapshot
 from pylon.schema._walker import SchemaError, walk
 
-
 _written: list[tuple[str, str]] = []
 
 

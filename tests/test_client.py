@@ -26,10 +26,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pylon.exceptions import ClientConnectionClosedError
-
 from pylon.config import DatabaseConfig
 from pylon.exceptions import (
+    ClientConnectionClosedError,
     InterfaceError,
     InternalServerError,
     NoDataError,
@@ -148,9 +147,10 @@ class TestCompileAndBind:
         from pylon.exceptions import MissingParameterError
 
         compiled = self._make_compiled('SELECT $1', param_names=['name'])
+        expected = r"expected \{'name'\} arguments, got nothing, missed \{'name'\}"
         with (
             patch('pylon.query.compile', return_value=compiled),
-            pytest.raises(MissingParameterError, match=r"expected \{'name'\} arguments, got nothing, missed \{'name'\}"),
+            pytest.raises(MissingParameterError, match=expected),
         ):
             _compile_and_bind('select $name', {})
 
@@ -898,9 +898,11 @@ class TestEnsureConnected:
             cfg.cache = CacheConfig(enabled=False)
 
             client = Client(cfg)
-            with patch.object(Client, 'ensure_connected', new=AsyncMock()) as connect:
-                with pytest.raises(ClientConnectionClosedError):
-                    await client._connected_pool()
+            with (
+                patch.object(Client, 'ensure_connected', new=AsyncMock()) as connect,
+                pytest.raises(ClientConnectionClosedError),
+            ):
+                await client._connected_pool()
             connect.assert_awaited_once()
 
         run(_run())
@@ -918,9 +920,11 @@ class TestEnsureConnected:
             client._ref.pool = MagicMock()
             await client.aclose()
 
-            with patch.object(Client, 'ensure_connected', new=AsyncMock()) as connect:
-                with pytest.raises(ClientConnectionClosedError):
-                    await client._connected_pool()
+            with (
+                patch.object(Client, 'ensure_connected', new=AsyncMock()) as connect,
+                pytest.raises(ClientConnectionClosedError),
+            ):
+                await client._connected_pool()
             connect.assert_not_awaited()
 
         run(_run())
@@ -1133,6 +1137,7 @@ class TestInternalSchemaCheck:
         """A client holds an application role that may lack DDL rights, and
         having every process that connects mutate shared internal structures
         is how a rolling deploy becomes an outage."""
+
         async def _run():
             from pylon.client import _check_internal_schema
 

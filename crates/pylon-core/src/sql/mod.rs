@@ -19,11 +19,11 @@
 
 use crate::ir::{
     IrArraySource, IrCteDef, IrDelete, IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionSelect,
-    IrGlobalCte, IrGroup, IrGroupOutput, IrInsert, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkJoin,
-    IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource, IrScalarPointer, IrScalarSetPointer,
-    IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt,
-    IrUpdate, IrVectorSearch, SearchEnqueueInfo, VectorEnqueueInfo,
+    IrGlobalCte, IrGroup, IrGroupOutput, IrInsert, IrLiteral, IrLockClause, IrLockStrength, IrLockWait,
+    IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls,
+    IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRewrite, IrRowSource,
+    IrScalarPointer, IrScalarSetPointer, IrSelect, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer,
+    IrSort, IrSortDir, IrSource, IrStmt, IrUpdate, IrVectorSearch, SearchEnqueueInfo, VectorEnqueueInfo,
 };
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use crate::query::{Cardinality, InferencePlan, ShapeDescriptor, ShapeNode};
@@ -589,7 +589,12 @@ fn emit_scalar_union(branches: &[IrStmt]) -> String {
     let operands: Vec<String> = branches
         .iter()
         .enumerate()
-        .map(|(i, branch)| format!("SELECT \"v\" FROM (\n{}\n) AS \"_u{i}\"", emit_dml_as_cte_source(branch)))
+        .map(|(i, branch)| {
+            format!(
+                "SELECT \"v\" FROM (\n{}\n) AS \"_u{i}\"",
+                emit_dml_as_cte_source(branch)
+            )
+        })
         .collect();
     format!(
         "SELECT ROW(v) AS result, v FROM (\n{}\n) AS _scalar",
@@ -993,13 +998,28 @@ fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         parts.push(format!("\"{}__clr_{}\" AS (\n{}\n)", name, i, del));
     }
     for (i, app) in upd.multi_link_appends.iter().enumerate() {
-        parts.push(emit_ml_append_cte(app, &ids_name, &upd.target.alias, &format!("{}__ml_add_{}", name, i)));
+        parts.push(emit_ml_append_cte(
+            app,
+            &ids_name,
+            &upd.target.alias,
+            &format!("{}__ml_add_{}", name, i),
+        ));
     }
     for (i, rem) in upd.multi_link_removals.iter().enumerate() {
-        parts.push(emit_ml_remove_cte(rem, &ids_name, &upd.target.alias, &format!("{}__ml_rm_{}", name, i)));
+        parts.push(emit_ml_remove_cte(
+            rem,
+            &ids_name,
+            &upd.target.alias,
+            &format!("{}__ml_rm_{}", name, i),
+        ));
     }
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
-        parts.push(emit_ml_append_cte(rep, &ids_name, &upd.target.alias, &format!("{}__ml_rep_{}", name, i)));
+        parts.push(emit_ml_append_cte(
+            rep,
+            &ids_name,
+            &upd.target.alias,
+            &format!("{}__ml_rep_{}", name, i),
+        ));
     }
 
     parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
@@ -1027,7 +1047,12 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
     parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, insert_sql));
 
     for (i, app) in ins.multi_link_appends.iter().enumerate() {
-        parts.push(emit_ml_append_cte(app, &ids_name, &ins.target.alias, &format!("{}__ml_add_{}", name, i)));
+        parts.push(emit_ml_append_cte(
+            app,
+            &ids_name,
+            &ins.target.alias,
+            &format!("{}__ml_add_{}", name, i),
+        ));
     }
 
     parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
@@ -1077,7 +1102,12 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
             sql.push_str("\nRETURNING *");
             parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
             for (i, append) in ins.multi_link_appends.iter().enumerate() {
-                parts.push(emit_ml_append_cte(append, &ids_name, &ins.target.alias, &format!("{}__ml_add_{}", name, i)));
+                parts.push(emit_ml_append_cte(
+                    append,
+                    &ids_name,
+                    &ins.target.alias,
+                    &format!("{}__ml_add_{}", name, i),
+                ));
             }
         }
         IrStmt::Update(upd) => {
@@ -1197,7 +1227,12 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
             sql.push_str("\nRETURNING *");
             parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
             for (i, append) in ins.multi_link_appends.iter().enumerate() {
-                parts.push(emit_ml_append_cte(append, &ids_name, &ins.target.alias, &format!("{}__ml_add_{}", name, i)));
+                parts.push(emit_ml_append_cte(
+                    append,
+                    &ids_name,
+                    &ins.target.alias,
+                    &format!("{}__ml_add_{}", name, i),
+                ));
             }
         }
         // Unreachable: only a mutating body is routed here.
@@ -1257,10 +1292,7 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             continue;
         }
         if let IrStmt::For(f) = &c.stmt
-            && matches!(
-                f.body.as_ref(),
-                IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::For(_)
-            )
+            && matches!(f.body.as_ref(), IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::For(_))
         {
             parts.extend(emit_for_dml_ctes(f, &c.name));
             continue;
@@ -1335,7 +1367,12 @@ fn emit_multilink_values_inner(vals: &IrMultiLinkValues, prop_names: &[String], 
     // through the check, and unnested back into rows. Reading the inner value
     // twice — once for the check, once for the rows — would run any `insert`
     // inside it twice.
-    if let IrMultiLinkValueSource::Asserted { fn_name, inner, message } = &vals.source {
+    if let IrMultiLinkValueSource::Asserted {
+        fn_name,
+        inner,
+        message,
+    } = &vals.source
+    {
         let inner_sql = emit_multilink_values_inner(inner, &[], false);
         let prop_cols = emit_link_prop_cols(vals, prop_names);
         return format!(
@@ -1585,10 +1622,7 @@ pub(crate) fn append_value_is_the_loop_variable(values: &IrMultiLinkValues, var:
 /// The nested insert a multi-link append's value names, when it is one of this
 /// update's own hoisted CTEs. Inside a `for` body such an insert runs once per
 /// iteration, so it cannot stay a standalone CTE.
-pub(crate) fn per_iteration_insert<'c>(
-    mutation: &IrMultiLinkMutation,
-    nested: &'c [IrCteDef],
-) -> Option<&'c IrInsert> {
+pub(crate) fn per_iteration_insert<'c>(mutation: &IrMultiLinkMutation, nested: &'c [IrCteDef]) -> Option<&'c IrInsert> {
     let IrMultiLinkValueSource::CteRef(name) = &mutation.values.source else {
         return None;
     };
@@ -1836,7 +1870,11 @@ fn emit_free_rows(sel: &IrSelect, rows: &[IrRowSource], ctes: &[IrCteDef]) -> Sq
 
     // assert_exists / assert_distinct: set-returning — emit as unnest, not UNION ALL
     if items.len() == 1
-        && let IrFreeExpr::AssertSet { fn_name, inner, message } = items[0]
+        && let IrFreeExpr::AssertSet {
+            fn_name,
+            inner,
+            message,
+        } = items[0]
     {
         let array_sql = emit_array_source(inner) + &assert_message_arg(message);
         let mut sql = format!(
@@ -3523,7 +3561,10 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             concrete.target.table = imp.table.clone();
             concrete.target.type_name = imp.type_name.clone();
             concrete.target.poly = None;
-            concrete.multi_link_clears.iter_mut().for_each(|c| own_junction(&mut c.junction_table));
+            concrete
+                .multi_link_clears
+                .iter_mut()
+                .for_each(|c| own_junction(&mut c.junction_table));
             concrete
                 .multi_link_replaces
                 .iter_mut()
@@ -3533,12 +3574,12 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             cte_parts.extend(emit_update_multilink_ctes(&concrete, &cte_name));
         } else {
             let mut upd_sql = format!(
-            "UPDATE {} AS {}\nSET {}{}",
-            qn(&imp.module, &imp.table),
-            qi(alias),
-            sets.join(", "),
-            from_ctes,
-        );
+                "UPDATE {} AS {}\nSET {}{}",
+                qn(&imp.module, &imp.table),
+                qi(alias),
+                sets.join(", "),
+                from_ctes,
+            );
             append_filter(&mut upd_sql, &upd.filter);
             upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
             cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
@@ -3700,17 +3741,32 @@ fn emit_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
 
     // Junction appends (`+=`).
     for (i, app) in upd.multi_link_appends.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(app, "_ids", &upd.target.alias, &format!("_ml_add_{}", i)));
+        cte_parts.push(emit_ml_append_cte(
+            app,
+            "_ids",
+            &upd.target.alias,
+            &format!("_ml_add_{}", i),
+        ));
     }
 
     // Junction removals (`-=`).
     for (i, rem) in upd.multi_link_removals.iter().enumerate() {
-        cte_parts.push(emit_ml_remove_cte(rem, "_ids", &upd.target.alias, &format!("_ml_rm_{}", i)));
+        cte_parts.push(emit_ml_remove_cte(
+            rem,
+            "_ids",
+            &upd.target.alias,
+            &format!("_ml_rm_{}", i),
+        ));
     }
 
     // Junction inserts for replace (`:= expr` — insert after the clear).
     for (i, rep) in upd.multi_link_replaces.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(rep, "_ids", &upd.target.alias, &format!("_ml_rep_{}", i)));
+        cte_parts.push(emit_ml_append_cte(
+            rep,
+            "_ids",
+            &upd.target.alias,
+            &format!("_ml_rep_{}", i),
+        ));
     }
 
     // Enqueue CTEs (source is _ids which has all columns including id).
@@ -5535,7 +5591,11 @@ mod tests {
     #[test]
     fn an_aggregate_over_a_backlink_counts_inside_a_subquery() {
         let out = compile_and_emit_with("SELECT Post { n := count(.<posts) }", &make_schema());
-        assert!(!out.sql.contains("count((SELECT"), "an aggregate over a scalar subquery:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("count((SELECT"),
+            "an aggregate over a scalar subquery:\n{}",
+            out.sql
+        );
         assert!(out.sql.contains("count("), "{}", out.sql);
     }
 
@@ -5545,8 +5605,16 @@ mod tests {
             "SELECT Post { n := count((SELECT .<posts FILTER .age > 1)) }",
             &make_schema(),
         );
-        assert!(!out.sql.contains("count((SELECT"), "an aggregate over a scalar subquery:\n{}", out.sql);
-        assert!(out.sql.contains(r#"(SELECT count("_s"."v") FROM unnest(ARRAY("#), "{}", out.sql);
+        assert!(
+            !out.sql.contains("count((SELECT"),
+            "an aggregate over a scalar subquery:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains(r#"(SELECT count("_s"."v") FROM unnest(ARRAY("#),
+            "{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5555,8 +5623,17 @@ mod tests {
             "SELECT Company { name } FILTER any(.<company.posts IS Post)",
             &make_schema(),
         );
-        assert!(!out.sql.contains("bool_or(ARRAY"), "an aggregate over outer rows:\n{}", out.sql);
-        assert!(out.sql.contains("FROM unnest(ARRAY(SELECT ('default::Post' = 'default::Post')"), "{}", out.sql);
+        assert!(
+            !out.sql.contains("bool_or(ARRAY"),
+            "an aggregate over outer rows:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("FROM unnest(ARRAY(SELECT ('default::Post' = 'default::Post')"),
+            "{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -5623,7 +5700,11 @@ mod tests {
             "expected both tables updated:\n{}",
             out.sql
         );
-        assert!(!out.sql.contains("UPDATE (\n"), "a write never targets the union:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("UPDATE (\n"),
+            "a write never targets the union:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6354,9 +6435,7 @@ mod tests {
     fn test_a_walk_off_a_for_loop_variable_reads_the_binding() {
         // The rows a sibling CTE just wrote are not in the base table yet, so
         // a walk that re-reads the table finds nothing.
-        let out = compile_and_emit(
-            "WITH ps := (SELECT Post) FOR q IN ps UNION (SELECT Person FILTER .name = q.title)",
-        );
+        let out = compile_and_emit("WITH ps := (SELECT Post) FOR q IN ps UNION (SELECT Person FILTER .name = q.title)");
         assert!(
             out.sql.contains("FROM \"ps\""),
             "the walk reads the binding:\n{}",
@@ -6386,11 +6465,7 @@ mod tests {
         // Read as an ordinary expression a binding becomes a scalar subquery,
         // which aborts on the second row.
         let out = compile_and_emit("WITH people := (SELECT Person) SELECT count(people)");
-        assert!(
-            out.sql.contains("(SELECT count(*) FROM \"people\")"),
-            "{}",
-            out.sql
-        );
+        assert!(out.sql.contains("(SELECT count(*) FROM \"people\")"), "{}", out.sql);
     }
 
     #[test]
@@ -6450,7 +6525,8 @@ mod tests {
 
         let out = compile_and_emit("WITH names := {'a', 'b'} SELECT exists names");
         assert!(
-            out.sql.contains("EXISTS(SELECT 1 FROM \"names\" WHERE \"v\" IS NOT NULL)"),
+            out.sql
+                .contains("EXISTS(SELECT 1 FROM \"names\" WHERE \"v\" IS NOT NULL)"),
             "{}",
             out.sql
         );
@@ -6489,7 +6565,11 @@ mod tests {
         archivable.links = vec![];
         archivable.multilinks = vec![];
         schema.types.push(archivable);
-        let person = schema.types.iter_mut().find(|t| t.name == "Person").expect("just found");
+        let person = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Person")
+            .expect("just found");
         person.parents.push("default::Archivable".into());
         schema
     }
@@ -6645,13 +6725,21 @@ mod tests {
                FOR q IN p.posts UNION (INSERT Company { name := q.title }) \
              )) SELECT count(made)",
         );
-        assert!(out.sql.contains("\"_outer\""), "the inner iterator carries the bond:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"_outer\""),
+            "the inner iterator carries the bond:\n{}",
+            out.sql
+        );
         assert!(
             out.sql.contains("JOIN \"_for_p\" ON"),
             "the insert reads both loop variables:\n{}",
             out.sql
         );
-        assert!(!out.sql.contains("LATERAL (\nINSERT"), "DML cannot sit in a LATERAL:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("LATERAL (\nINSERT"),
+            "DML cannot sit in a LATERAL:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6706,9 +6794,7 @@ mod tests {
         // Falling through instead put the aggregate back through the very
         // expression route that sent it here, and the recursion took the
         // process down with it.
-        let out = compile_and_emit(
-            "WITH c := (SELECT Company) SELECT c { n := count(.<company[is default::Person]) }",
-        );
+        let out = compile_and_emit("WITH c := (SELECT Company) SELECT c { n := count(.<company[is default::Person]) }");
         assert!(out.sql.contains("count("), "{}", out.sql);
         assert!(out.sql.contains("\"public\".\"Person\""), "{}", out.sql);
     }
@@ -6720,7 +6806,11 @@ mod tests {
         let out = compile_and_emit("SELECT oldest := max(Person.age)");
         assert!(out.sql.contains("max("), "{}", out.sql);
         let filtered = compile_and_emit("SELECT n := Person.age FILTER n > 18");
-        assert!(filtered.sql.contains("18"), "the alias resolves to the result:\n{}", filtered.sql);
+        assert!(
+            filtered.sql.contains("18"),
+            "the alias resolves to the result:\n{}",
+            filtered.sql
+        );
     }
 
     #[test]
@@ -6731,7 +6821,11 @@ mod tests {
         let schema = make_schema_with_computed_links();
         let out = compile_and_emit_with("SELECT Person FILTER EXISTS .published", &schema);
         assert!(out.sql.contains("EXISTS"), "{}", out.sql);
-        assert!(out.sql.contains("\"public\".\"Post\""), "the computed's own path:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"public\".\"Post\""),
+            "the computed's own path:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6748,7 +6842,11 @@ mod tests {
         });
         let out = compile_and_emit_with("SELECT Person { x := .latest_title }", &schema);
         assert!(out.sql.contains("\"title\""), "{}", out.sql);
-        assert!(out.sql.contains("LIMIT"), "the computed's own limit survives:\n{}", out.sql);
+        assert!(
+            out.sql.contains("LIMIT"),
+            "the computed's own limit survives:\n{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -6779,10 +6877,22 @@ mod tests {
         });
         let out = compile_and_emit_with("SELECT Person { latest_author: { name } }", &schema);
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
-        assert!(out.sql.contains("\"title\" DESC"), "the order stays on the posts:\n{}", out.sql);
-        assert!(out.sql.contains("LIMIT"), "the computed's own limit survives:\n{}", out.sql);
+        assert!(
+            out.sql.contains("\"title\" DESC"),
+            "the order stays on the posts:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("LIMIT"),
+            "the computed's own limit survives:\n{}",
+            out.sql
+        );
         let splat = compile_and_emit_with("SELECT Person { * }", &schema);
-        assert!(!splat.sql.contains("latest_author"), "`*` leaves links out:\n{}", splat.sql);
+        assert!(
+            !splat.sql.contains("latest_author"),
+            "`*` leaves links out:\n{}",
+            splat.sql
+        );
     }
 
     #[test]
@@ -7546,7 +7656,8 @@ mod tests {
         // the call legal at all, since PL/pgSQL cannot take a `record[]`.
         let out = compile_and_emit("SELECT Person { name, p := assert_exists(.posts { title }) }");
         assert!(
-            out.sql.contains(r#"cardinality("_pylon"."assert_exists"("_a"."v"::text[]))"#),
+            out.sql
+                .contains(r#"cardinality("_pylon"."assert_exists"("_a"."v"::text[]))"#),
             "the assert should read the aggregated rows:\n{}",
             out.sql
         );
@@ -7701,10 +7812,7 @@ mod tests {
         // `<bool>exists x` is valid PyQL — the upstream engine's cast takes a whole `Expr` at
         // CAST precedence. Pylon's cast went straight to a postfix expression,
         // so any prefix operator after one failed to parse.
-        for query in [
-            "SELECT <bool>EXISTS (SELECT Person LIMIT 1)",
-            "SELECT <int64>-1",
-        ] {
+        for query in ["SELECT <bool>EXISTS (SELECT Person LIMIT 1)", "SELECT <int64>-1"] {
             let ast = parse::parse(query).unwrap_or_else(|e| panic!("{query} should parse: {e}"));
             assert!(ir::compile(&ast, &make_schema()).is_ok(), "{query} should compile");
         }
@@ -7716,9 +7824,8 @@ mod tests {
         // The single-step resolver knew properties, links and computeds but
         // never multi-links, so the pointer reported itself as unknown while
         // the suggester, which does know them, offered the name straight back.
-        let out = compile_and_emit(
-            "WITH p := (SELECT DETACHED Post LIMIT 1) SELECT Person { name } FILTER p IN .posts",
-        );
+        let out =
+            compile_and_emit("WITH p := (SELECT DETACHED Post LIMIT 1) SELECT Person { name } FILTER p IN .posts");
         assert!(
             out.sql.contains(r#""public"."Person.posts""#),
             "the membership test should read the link's junction:\n{}",
@@ -7784,9 +7891,7 @@ mod tests {
         // shape on it projects that source. The pointer route only took
         // relative paths, so this fell through to the expression route and was
         // rejected as "shapes are not valid in expression context".
-        let out = compile_and_emit(
-            "WITH c := (SELECT Company LIMIT 1) SELECT Person { name, employer := c { name } }",
-        );
+        let out = compile_and_emit("WITH c := (SELECT Company LIMIT 1) SELECT Person { name, employer := c { name } }");
         assert!(
             out.sql.contains("\"c\""),
             "the pointer should read the binding's CTE:\n{}",
@@ -8608,7 +8713,12 @@ mod tests {
         assert!(!out.sql.contains("EXISTS"), "{}", out.sql);
         assert!(!out.sql.contains("COALESCE("), "{}", out.sql);
         assert!(out.sql.contains("CASE WHEN (cardinality("), "{}", out.sql);
-        assert!(out.sql.contains("(SELECT coalesce(max(\"_s\".\"v\"), NULL) FROM unnest("), "{}", out.sql);
+        assert!(
+            out.sql
+                .contains("(SELECT coalesce(max(\"_s\".\"v\"), NULL) FROM unnest("),
+            "{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -10481,8 +10591,14 @@ select owner { posts := (select owner.posts.title) };",
 
     #[test]
     fn a_link_assigned_from_a_select_keeps_its_clauses() {
-        let out = compile_and_emit("INSERT Person { name := 'a', age := 1, company := (SELECT Company ORDER BY .name LIMIT 1) }");
-        assert!(out.sql.contains("ORDER BY") && out.sql.contains("LIMIT 1"), "{}", out.sql);
+        let out = compile_and_emit(
+            "INSERT Person { name := 'a', age := 1, company := (SELECT Company ORDER BY .name LIMIT 1) }",
+        );
+        assert!(
+            out.sql.contains("ORDER BY") && out.sql.contains("LIMIT 1"),
+            "{}",
+            out.sql
+        );
     }
 
     #[test]
@@ -10513,7 +10629,10 @@ select owner { posts := (select owner.posts.title) };",
     fn rewrites_become_before_triggers() {
         let ddl = crate::export::export_schema(&make_schema_with_rewrite()).unwrap();
         for event in ["BEFORE INSERT", "BEFORE UPDATE"] {
-            assert!(ddl.contains(&format!("{event} ON \"public\".\"Person\"")), "{event}:\n{ddl}");
+            assert!(
+                ddl.contains(&format!("{event} ON \"public\".\"Person\"")),
+                "{event}:\n{ddl}"
+            );
         }
         assert!(ddl.contains("NEW.\"slug\" := _pylon_rewrites.\"v0\";"), "{ddl}");
     }
@@ -10532,7 +10651,10 @@ select owner { posts := (select owner.posts.title) };",
         let assignments = crate::ir::compile_rewrite_assignments("default::Person", 1, &schema).unwrap();
         let sql = &assignments[0].sql;
         assert!(!sql.contains("\"public\".\"Person\""), "{sql}");
-        assert!(sql.contains("(SELECT (NEW).*)") && sql.contains("NEW.\"company_id\""), "{sql}");
+        assert!(
+            sql.contains("(SELECT (NEW).*)") && sql.contains("NEW.\"company_id\""),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -11568,9 +11690,7 @@ select owner { posts := (select owner.posts.title) };",
 
     #[test]
     fn an_aggregated_binding_of_an_interface_carries_the_concrete_type() {
-        assert_rows_carry_their_concrete_type(
-            "WITH a := (SELECT Account) SELECT (xs := array_agg((SELECT a { id })))",
-        );
+        assert_rows_carry_their_concrete_type("WITH a := (SELECT Account) SELECT (xs := array_agg((SELECT a { id })))");
     }
 
     #[test]
@@ -11636,7 +11756,10 @@ select owner { posts := (select owner.posts.title) };",
 
     #[test]
     fn a_backlink_to_an_interface_carries_the_concrete_type() {
-        let out = compile_and_emit_with("SELECT Note { pinners := .<pinned[is Account] { id } }", &make_note_schema());
+        let out = compile_and_emit_with(
+            "SELECT Note { pinners := .<pinned[is Account] { id } }",
+            &make_note_schema(),
+        );
         assert!(
             !out.sql.contains("'default::Account'::text"),
             "the backlink's rows are labelled with the interface instead of their own type:\n{}",
@@ -13510,4 +13633,3 @@ select owner { posts := (select owner.posts.title) };",
         );
     }
 }
-

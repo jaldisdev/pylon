@@ -72,7 +72,9 @@ mod tests {
 
     #[test]
     fn an_insert_needs_no_shape() {
-        let Stmt::Insert(ins) = parse("insert Person").unwrap() else { panic!() };
+        let Stmt::Insert(ins) = parse("insert Person").unwrap() else {
+            panic!()
+        };
         assert!(ins.shape.is_empty());
     }
 

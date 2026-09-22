@@ -348,7 +348,12 @@ async fn nested_for_loops_insert_once_per_pair() {
     )
     .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ title }} order by .title")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Post {{ title }} order by .title"),
+    )
+    .await;
     let titles: Vec<&str> = rows.iter().map(|row| as_str(field(row, 1))).collect();
     assert_eq!(
         titles,
@@ -368,17 +373,29 @@ async fn set_operations_run_over_their_elements() {
     bootstrap(&pool, &sd).await;
 
     for (pyql, expected) in [
-        ("select count((array_unpack(['x','y','z']) intersect array_unpack(['y','z','w'])))", 2),
+        (
+            "select count((array_unpack(['x','y','z']) intersect array_unpack(['y','z','w'])))",
+            2,
+        ),
         ("select count((array_unpack(['x']) intersect array_unpack(['y'])))", 0),
-        ("select count((array_unpack(['x','y','z']) except array_unpack(['y'])))", 2),
+        (
+            "select count((array_unpack(['x','y','z']) except array_unpack(['y'])))",
+            2,
+        ),
     ] {
         let rows = rows_of(&pool, &sd, pyql).await;
         assert_eq!(as_i64(field(&rows[0], 0)), expected, "{pyql}");
     }
 
     for (pyql, expected) in [
-        ("select exists(array_unpack(['x','y']) intersect array_unpack(['y']))", true),
-        ("select exists(array_unpack(['x']) intersect array_unpack(['y']))", false),
+        (
+            "select exists(array_unpack(['x','y']) intersect array_unpack(['y']))",
+            true,
+        ),
+        (
+            "select exists(array_unpack(['x']) intersect array_unpack(['y']))",
+            false,
+        ),
     ] {
         let rows = rows_of(&pool, &sd, pyql).await;
         let got = matches!(field(&rows[0], 0), DecodedValue::Bool(b) if *b);
@@ -413,7 +430,12 @@ async fn updating_the_loop_variable_touches_only_the_iterated_rows() {
     )
     .await;
 
-    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }} order by .name")).await;
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name }} order by .name"),
+    )
+    .await;
     let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 1)).to_string()).collect();
     assert_eq!(
         names,

@@ -726,9 +726,7 @@ class TestClassBodyConstraints:
 
         assert Unrelated.__pylon_config__.constraints == []
         assert not any(isinstance(c, Expression) for c in Rate.__pylon_config__.constraints)
-        assert any(
-            isinstance(c, Expression) for c in Rate.__pylon_config__.pointers['currency'].constraints
-        )
+        assert any(isinstance(c, Expression) for c in Rate.__pylon_config__.pointers['currency'].constraints)
 
 
 # ---------------------------------------------------------------------------
@@ -817,7 +815,10 @@ class TestEnum:
         assert str(Status.Active) == 'Active'
         assert f'{Status.Active}' == 'Active'
         assert format(Status.Active) == 'Active'
-        assert '%s' % Status.Active == 'Active'
+        # UP031 is suppressed below because the percent form *is* the assertion:
+        # it is one of the rendering paths the mixin has to keep working, not a
+        # style choice.
+        assert '%s' % Status.Active == 'Active'  # noqa: UP031
         assert json.dumps({'status': Status.Active}) == '{"status": "Active"}'
         assert '-'.join([Status.Active, 'x']) == 'Active-x'
 

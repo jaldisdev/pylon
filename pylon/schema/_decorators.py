@@ -462,7 +462,7 @@ def _collect_annotations(cls: type) -> dict[str, Any]:
             resolved[name] = annotation
             continue
         try:
-            resolved[name] = eval(annotation, globalns, localns)  # noqa: S307
+            resolved[name] = eval(annotation, globalns, localns)
         except Exception as exc:
             unresolved[name] = (annotation, exc)
     if unresolved:

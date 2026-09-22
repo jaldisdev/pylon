@@ -33,13 +33,13 @@ pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
 pub use compiler::compile_scalar_default;
 pub use compiler::compile_scalar_default_typed;
-pub use compiler::{RewriteAssignment, compile_rewrite_assignments};
 pub use compiler::compile_trigger_handler;
 pub use compiler::compile_with_config;
 pub(crate) use compiler::infer_ir_type;
 pub use compiler::pg_type_to_pyql;
 pub(crate) use compiler::types_compatible;
 pub use compiler::{GLOBALS_ARG, compile_fn_body, functions_needing_globals};
+pub use compiler::{RewriteAssignment, compile_rewrite_assignments};
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use std::collections::HashMap;
@@ -922,7 +922,10 @@ pub enum IrExpr {
     /// scalar binding, whose single-value form holds a NULL row when empty.
     /// Read through `CteRef` instead, a binding of more than one row aborts
     /// the query the same way `AggOverCte` describes.
-    ExistsOverCte { cte: String, column: Option<String> },
+    ExistsOverCte {
+        cte: String,
+        column: Option<String>,
+    },
     /// `array_unpack(a) intersect array_unpack(b)` — a set operation between
     /// two set-valued expressions. Emits the array of what it yields, or
     /// `EXISTS` over it when that is all the caller wanted.
@@ -1332,7 +1335,6 @@ pub struct IrOutput {
     /// through its fan-out; a write to it does not.
     pub subtype_fanouts: HashMap<(String, String), IrPolyFanout>,
 }
-
 
 /// `(module, table)`.
 pub type QualifiedTable = (String, String);

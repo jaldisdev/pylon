@@ -473,7 +473,11 @@ async fn a_link_property_value_reads_the_walked_links_current_value() {
         panic!("expected an Array for tags")
     };
     let weights: Vec<f64> = tags.iter().map(|t| as_f64(field(t, 2))).collect();
-    assert_eq!(weights, vec![1.0, 2.5], "only the walked-and-filtered link moves, got {tags:?}");
+    assert_eq!(
+        weights,
+        vec![1.0, 2.5],
+        "only the walked-and-filtered link moves, got {tags:?}"
+    );
 }
 
 #[tokio::test]

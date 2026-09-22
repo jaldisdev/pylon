@@ -221,7 +221,10 @@ async fn json_names_every_field_and_runs_the_query_once() {
     // Run once: rendered from the rows the insert returned, not a second,
     // rewrapped run that would insert again.
     let inserted = client
-        .query_single_json(&format!("select (insert {module}::Person {{ name := 'Dora' }}) {{ name }}"), &[])
+        .query_single_json(
+            &format!("select (insert {module}::Person {{ name := 'Dora' }}) {{ name }}"),
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(inserted.as_deref(), Some(r#"{"name": "Dora"}"#));

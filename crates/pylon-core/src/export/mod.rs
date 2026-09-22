@@ -410,7 +410,11 @@ fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
 /// at all; their deletion policy is enforced by the per-implementor triggers
 /// `interface_link_trigger_infos` builds instead.
 pub(crate) fn polymorphic_types(schema: &SchemaDescriptor) -> HashSet<String> {
-    let extended: HashSet<&str> = schema.types.iter().flat_map(|t| t.bases.iter().map(String::as_str)).collect();
+    let extended: HashSet<&str> = schema
+        .types
+        .iter()
+        .flat_map(|t| t.bases.iter().map(String::as_str))
+        .collect();
     schema
         .types
         .iter()
@@ -436,7 +440,11 @@ pub(crate) fn interface_implementors(schema: &SchemaDescriptor) -> HashMap<Strin
     // A concrete type with subtypes spans its own table and theirs.
     for t in &schema.types {
         for base in &t.bases {
-            if let Some(base_td) = schema.types.iter().find(|b| format!("{}::{}", b.module, b.name) == *base) {
+            if let Some(base_td) = schema
+                .types
+                .iter()
+                .find(|b| format!("{}::{}", b.module, b.name) == *base)
+            {
                 let entry = implementors.entry(base.clone()).or_default();
                 if entry.is_empty() {
                     entry.push(base_td);
@@ -1645,7 +1653,13 @@ fn trigger_return_statement(timing: &str, on: u8) -> &'static str {
 fn trigger_ddl_name(table: &str, trig: &crate::schema::TriggerDescriptor, body_sql: &str) -> String {
     // The compiled body is part of the name, so a handler Pylon now compiles
     // differently replaces the trigger rather than keeping the old one.
-    let hash = fnv(&[table, &trig.on.to_string(), trig.timing.as_str(), trig.handler.as_str(), body_sql]);
+    let hash = fnv(&[
+        table,
+        &trig.on.to_string(),
+        trig.timing.as_str(),
+        trig.handler.as_str(),
+        body_sql,
+    ]);
     format!("{table}_{}", &hash[..12])
 }
 
@@ -1653,7 +1667,8 @@ fn trigger_ddl_name(table: &str, trig: &crate::schema::TriggerDescriptor, body_s
 /// compile falls back to its own text here; `user_trigger_infos` reports the
 /// error when it builds the DDL.
 fn trigger_name_body(trig: &crate::schema::TriggerDescriptor, type_name: &str, schema: &SchemaDescriptor) -> String {
-    crate::query::compile_trigger_handler(&trig.handler, type_name, trig.on, schema).unwrap_or_else(|_| trig.handler.clone())
+    crate::query::compile_trigger_handler(&trig.handler, type_name, trig.on, schema)
+        .unwrap_or_else(|_| trig.handler.clone())
 }
 
 /// Just the `(module, table, trigger_name)` every user-declared `Trigger`
@@ -1670,7 +1685,11 @@ pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, Str
         let type_name = format!("{}::{}", t.module, t.name);
         for trig in &t.triggers {
             let body = trigger_name_body(trig, &type_name, schema);
-            result.push((t.module.clone(), t.table.clone(), trigger_ddl_name(&t.table, trig, &body)));
+            result.push((
+                t.module.clone(),
+                t.table.clone(),
+                trigger_ddl_name(&t.table, trig, &body),
+            ));
         }
         for (on, _) in REWRITE_EVENTS {
             if let Some(name) = rewrite_trigger_name(t, on, schema) {
@@ -1724,7 +1743,9 @@ fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigge
         }
         let type_name = format!("{}::{}", t.module, t.name);
         for (on, event) in REWRITE_EVENTS {
-            let Some(fname) = rewrite_trigger_name(t, on, schema) else { continue };
+            let Some(fname) = rewrite_trigger_name(t, on, schema) else {
+                continue;
+            };
             let assignments = crate::ir::compile_rewrite_assignments(&type_name, on, schema).map_err(|e| {
                 PyQLError::Fragment(PyQLFragmentError {
                     message: format!("error in a rewrite of '{type_name}': {e}"),
@@ -2294,7 +2315,9 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             schema
                 .types
                 .iter()
-                .filter(|i| i.abstract_ && i.materialized && t.interfaces.contains(&format!("{}::{}", i.module, i.name)))
+                .filter(|i| {
+                    i.abstract_ && i.materialized && t.interfaces.contains(&format!("{}::{}", i.module, i.name))
+                })
                 .collect()
         };
         let declared_by_interface = |name: &str| {
@@ -2428,7 +2451,11 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
         )
         && let Some(columns) = fn_return_column_names(fd, schema)
     {
-        body_sql = format!("SELECT {} FROM (\n    {}\n    ) AS \"_returned\"", columns.join(", "), body_sql);
+        body_sql = format!(
+            "SELECT {} FROM (\n    {}\n    ) AS \"_returned\"",
+            columns.join(", "),
+            body_sql
+        );
     }
 
     // Parameter list: "name" pg_type, ...
@@ -3021,7 +3048,11 @@ mod tests {
     #[test]
     fn an_exclusive_multilink_on_a_type_with_subtypes_is_unique_across_them() {
         let mut schema = schema_with_a_link_to_a_type_with_subtypes();
-        for t in schema.types.iter_mut().filter(|t| t.name == "Individual" || t.name == "Staff") {
+        for t in schema
+            .types
+            .iter_mut()
+            .filter(|t| t.name == "Individual" || t.name == "Staff")
+        {
             t.multilinks.push(MultiLinkDescriptor {
                 name: "keys".into(),
                 target: "default::Session".into(),

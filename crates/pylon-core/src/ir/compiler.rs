@@ -29,15 +29,14 @@ use crate::schema::{
 use std::collections::HashMap;
 
 use super::{
-    IrArraySource, IrBinOp, IrComputedGlobalCte, IrComputedPointer, IrConflict, IrCteDef, IrDelete, IrExpr, IrFor,
-    IrAssertedPointer, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup, IrGroupOutput, IrGroupProjection,
-    IrIfElse, IrInsert,
-    IrLinkProp, IrLiteral, IrLockClause, IrLockStrength, IrLockWait, IrMultiLinkClear, IrMultiLinkJoin,
-    IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource, IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin,
-    IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor, IrRowSource, IrScalarPointer,
-    IrScalarSetPointer, IrSelect, IrSessionGlobalCte, IrShapePointer, IrSingleLinkCorrelation, IrSingleLinkPointer,
-    IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate, IrVectorSearch, SearchEnqueueInfo,
-    TupleCastShape, VectorEnqueueInfo,
+    IrArraySource, IrAssertedPointer, IrBinOp, IrComputedGlobalCte, IrComputedPointer, IrConflict, IrCteDef, IrDelete,
+    IrExpr, IrFor, IrForIterator, IrFreeExpr, IrFtsSearch, IrFunctionCall, IrFunctionSelect, IrGlobalCte, IrGroup,
+    IrGroupOutput, IrGroupProjection, IrIfElse, IrInsert, IrLinkProp, IrLiteral, IrLockClause, IrLockStrength,
+    IrLockWait, IrMultiLinkClear, IrMultiLinkJoin, IrMultiLinkMutation, IrMultiLinkPointer, IrMultiLinkValueSource,
+    IrMultiLinkValues, IrNulls, IrOutput, IrPathJoin, IrPathResult, IrPathSelect, IrPolyFanout, IrPolyImplementor,
+    IrRowSource, IrScalarPointer, IrScalarSetPointer, IrSelect, IrSessionGlobalCte, IrShapePointer,
+    IrSingleLinkCorrelation, IrSingleLinkPointer, IrSort, IrSortDir, IrSource, IrStmt, IrTypeCast, IrUnaryOp, IrUpdate,
+    IrVectorSearch, SearchEnqueueInfo, TupleCastShape, VectorEnqueueInfo,
 };
 
 // ── Compiled-clause tuples ──────────────────────────────────────────────────────
@@ -308,7 +307,9 @@ fn guarded_object_branch(expr: &Expr) -> Option<Expr> {
             Expr::UnaryOp(u) => reads_relative(&u.operand),
             Expr::TypeCast(c) => reads_relative(&c.expr),
             Expr::FunctionCall(f) => f.args.iter().chain(f.kwargs.iter().map(|(_, v)| v)).any(reads_relative),
-            Expr::IfElse(ie) => reads_relative(&ie.if_expr) || reads_relative(&ie.condition) || reads_relative(&ie.else_expr),
+            Expr::IfElse(ie) => {
+                reads_relative(&ie.if_expr) || reads_relative(&ie.condition) || reads_relative(&ie.else_expr)
+            }
             _ => true,
         }
     }
@@ -408,7 +409,10 @@ fn per_element_of_one_multilink(condition: &Expr, td: &TypeDescriptor) -> Option
                 if rest.is_empty() {
                     return None;
                 }
-                Expr::Path(ast::Path { steps: rest, partial: true })
+                Expr::Path(ast::Path {
+                    steps: rest,
+                    partial: true,
+                })
             }
             Expr::Path(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Global(_) => expr.clone(),
             Expr::BinOp(b) => Expr::BinOp(Box::new(ast::BinOp {
@@ -485,7 +489,8 @@ fn flatten_shape_subject(expr: &Expr) -> Option<Expr> {
                 .map(|el| {
                     let declared = match (&el.compexpr, el.path.steps.as_slice()) {
                         (None, [ast::PathStep::Name(name)]) => inner.elements.iter().find(|d| {
-                            d.compexpr.is_some() && matches!(d.path.steps.as_slice(), [ast::PathStep::Name(n)] if n == name)
+                            d.compexpr.is_some()
+                                && matches!(d.path.steps.as_slice(), [ast::PathStep::Name(n)] if n == name)
                         }),
                         _ => None,
                     };
@@ -493,7 +498,11 @@ fn flatten_shape_subject(expr: &Expr) -> Option<Expr> {
                         Some(d) => ShapeElement {
                             nested: el.nested.clone().or_else(|| d.nested.clone()),
                             filter: el.filter.clone().or_else(|| d.filter.clone()),
-                            order_by: if el.order_by.is_empty() { d.order_by.clone() } else { el.order_by.clone() },
+                            order_by: if el.order_by.is_empty() {
+                                d.order_by.clone()
+                            } else {
+                                el.order_by.clone()
+                            },
                             offset: el.offset.clone().or_else(|| d.offset.clone()),
                             limit: el.limit.clone().or_else(|| d.limit.clone()),
                             ..d.clone()
@@ -864,7 +873,9 @@ pub fn compile_rewrite_assignments(
             let ir = c.compile_expr(&expr, owner_td, "NEW")?;
             if !c.params.is_empty() || !c.hoisted_ctes.is_empty() {
                 return Err(PyQLError::Type(PyQLTypeError {
-                    message: format!("the rewrite of '{type_name}.{name}' has nowhere to bind a parameter or a binding"),
+                    message: format!(
+                        "the rewrite of '{type_name}.{name}' has nowhere to bind a parameter or a binding"
+                    ),
                     position: Position { line: 0, col: 0 },
                 }));
             }
@@ -1445,7 +1456,11 @@ impl<'a> Compiler<'a> {
     /// was emitted with.
     fn for_var_ref(&self, name: &str) -> IrExpr {
         IrExpr::ForVar {
-            name: self.for_var_slots.get(name).cloned().unwrap_or_else(|| name.to_string()),
+            name: self
+                .for_var_slots
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_string()),
         }
     }
 
@@ -3019,7 +3034,9 @@ impl<'a> Compiler<'a> {
             // The actual CTE SQL is handled at the top-level compile() boundary.
             Stmt::With(w) => {
                 for alias in &w.aliases {
-                    if self.bind_inline_if_correlated(&alias.name, &alias.expr, None)? || self.bind_group(&alias.name, &alias.expr)? {
+                    if self.bind_inline_if_correlated(&alias.name, &alias.expr, None)?
+                        || self.bind_group(&alias.name, &alias.expr)?
+                    {
                         continue;
                     }
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
@@ -3318,12 +3335,15 @@ impl<'a> Compiler<'a> {
                         .types
                         .iter()
                         // The base, not a subtype inheriting the link from it.
-                        .filter(|t| t.bases.is_empty() || !t.bases.iter().any(|base| {
-                            self.resolve_type(base).is_ok_and(|b| {
-                                b.links.iter().any(|l| l.name == *link_name)
-                                    || b.multilinks.iter().any(|ml| ml.name == *link_name)
-                            })
-                        }))
+                        .filter(|t| {
+                            t.bases.is_empty()
+                                || !t.bases.iter().any(|base| {
+                                    self.resolve_type(base).is_ok_and(|b| {
+                                        b.links.iter().any(|l| l.name == *link_name)
+                                            || b.multilinks.iter().any(|ml| ml.name == *link_name)
+                                    })
+                                })
+                        })
                         .find(|t| {
                             t.links
                                 .iter()
@@ -3400,8 +3420,13 @@ impl<'a> Compiler<'a> {
                         type_name: format!("{}::{}", owner_td.module, owner_td.name),
                         shape,
                     };
-                    let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers_scoped(sel, owner_td, &target_alias, junction_scope.clone(), shape_elements)?;
+                    let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                        sel,
+                        owner_td,
+                        &target_alias,
+                        junction_scope.clone(),
+                        shape_elements,
+                    )?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -3453,8 +3478,13 @@ impl<'a> Compiler<'a> {
                 } else {
                     vec![]
                 };
-                let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
+                let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                    sel,
+                    current_td,
+                    &current_alias,
+                    junction_scope.clone(),
+                    shape_elements,
+                )?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -3524,8 +3554,13 @@ impl<'a> Compiler<'a> {
                     },
                     tuple_shape,
                 );
-                let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
+                let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                    sel,
+                    current_td,
+                    &current_alias,
+                    junction_scope.clone(),
+                    shape_elements,
+                )?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -3571,15 +3606,24 @@ impl<'a> Compiler<'a> {
                     });
                 }
                 if is_last(0) {
-                    let shape =
-                        self.compile_shape_anchored(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                    let shape = self.compile_shape_anchored(
+                        shape_elements,
+                        target_td,
+                        &target_alias,
+                        &target_td.module.clone(),
+                    )?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         shape,
                     };
-                    let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone(), shape_elements)?;
+                    let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                        sel,
+                        target_td,
+                        &target_alias,
+                        junction_scope.clone(),
+                        shape_elements,
+                    )?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -3669,15 +3713,24 @@ impl<'a> Compiler<'a> {
                     target,
                 });
                 if is_last(0) {
-                    let shape =
-                        self.compile_shape_anchored(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                    let shape = self.compile_shape_anchored(
+                        shape_elements,
+                        target_td,
+                        &target_alias,
+                        &target_td.module.clone(),
+                    )?;
                     let result = IrPathResult::Object {
                         alias: target_alias.clone(),
                         type_name: format!("{}::{}", target_td.module, target_td.name),
                         shape,
                     };
-                    let (filter, order_by, offset, limit) =
-                        self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone(), shape_elements)?;
+                    let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                        sel,
+                        target_td,
+                        &target_alias,
+                        junction_scope.clone(),
+                        shape_elements,
+                    )?;
                     return Ok(IrPathSelect {
                         root,
                         joins,
@@ -3734,7 +3787,10 @@ impl<'a> Compiler<'a> {
                     && p.partial
                     && !p.steps.is_empty()
                     && (!is_last(0)
-                        || self.walk_path_types(current_td, &p.steps, MAX_COMPUTED_SPLICES).1.is_some())
+                        || self
+                            .walk_path_types(current_td, &p.steps, MAX_COMPUTED_SPLICES)
+                            .1
+                            .is_some())
                 {
                     // Order/offset/limit of its own pick one row *per source
                     // row*, which no plain join expresses — so the computed's
@@ -3780,14 +3836,20 @@ impl<'a> Compiler<'a> {
                         });
                         if is_last(0) {
                             let module = target_td.module.clone();
-                            let shape = self.compile_shape_anchored(shape_elements, target_td, &target_alias, &module)?;
+                            let shape =
+                                self.compile_shape_anchored(shape_elements, target_td, &target_alias, &module)?;
                             let result = IrPathResult::Object {
                                 alias: target_alias.clone(),
                                 type_name: format!("{}::{}", target_td.module, target_td.name),
                                 shape,
                             };
-                            let (filter, order_by, offset, limit) =
-                                self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope, shape_elements)?;
+                            let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                                sel,
+                                target_td,
+                                &target_alias,
+                                junction_scope,
+                                shape_elements,
+                            )?;
                             return Ok(IrPathSelect {
                                 root,
                                 joins,
@@ -3880,15 +3942,24 @@ impl<'a> Compiler<'a> {
                         extra_conditions.push(cond);
                     }
                     if is_last(0) {
-                        let shape =
-                            self.compile_shape_anchored(shape_elements, target_td, &target_alias, &target_td.module.clone())?;
+                        let shape = self.compile_shape_anchored(
+                            shape_elements,
+                            target_td,
+                            &target_alias,
+                            &target_td.module.clone(),
+                        )?;
                         let result = IrPathResult::Object {
                             alias: target_alias.clone(),
                             type_name: format!("{}::{}", target_td.module, target_td.name),
                             shape,
                         };
-                        let (filter, order_by, offset, limit) =
-                            self.compile_path_modifiers_scoped(sel, target_td, &target_alias, junction_scope.clone(), shape_elements)?;
+                        let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                            sel,
+                            target_td,
+                            &target_alias,
+                            junction_scope.clone(),
+                            shape_elements,
+                        )?;
                         return Ok(IrPathSelect {
                             root,
                             joins,
@@ -3923,8 +3994,13 @@ impl<'a> Compiler<'a> {
                 let expr = self.compile_expr(&expr_ast, current_td, &current_alias);
                 self.expanding_computeds.pop();
                 let expr = expr?;
-                let (filter, order_by, offset, limit) =
-                    self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
+                let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                    sel,
+                    current_td,
+                    &current_alias,
+                    junction_scope.clone(),
+                    shape_elements,
+                )?;
                 return Ok(IrPathSelect {
                     root,
                     joins,
@@ -3950,8 +4026,13 @@ impl<'a> Compiler<'a> {
             let module = current_td.module.clone();
             let type_name = format!("{}::{}", current_td.module, current_td.name);
             let shape = self.compile_shape_anchored(shape_elements, current_td, &current_alias, &module)?;
-            let (filter, order_by, offset, limit) =
-                self.compile_path_modifiers_scoped(sel, current_td, &current_alias, junction_scope.clone(), shape_elements)?;
+            let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
+                sel,
+                current_td,
+                &current_alias,
+                junction_scope.clone(),
+                shape_elements,
+            )?;
             return Ok(IrPathSelect {
                 root,
                 joins,
@@ -5115,7 +5196,9 @@ impl<'a> Compiler<'a> {
                 let holds_an_object = ir.iter().any(|(_, e)| match e {
                     IrExpr::ObjectSubquery(_) | IrExpr::ObjectPathSubquery(_) => true,
                     IrExpr::ArrayFromSelect(source) => match source.as_ref() {
-                        IrArraySource::ObjectSelect(_) | IrArraySource::ObjectFunction(_) | IrArraySource::Group(_) => true,
+                        IrArraySource::ObjectSelect(_) | IrArraySource::ObjectFunction(_) | IrArraySource::Group(_) => {
+                            true
+                        }
                         IrArraySource::PathSelect(ps) => matches!(ps.result, IrPathResult::Object { .. }),
                         _ => false,
                     },
@@ -5225,7 +5308,6 @@ impl<'a> Compiler<'a> {
             .find(|ancestor| covers_all(ancestor))
             .cloned()
     }
-
 
     fn object_union_branches(&self, expr: &Expr) -> Option<Vec<(String, String)>> {
         fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
@@ -5721,7 +5803,11 @@ impl<'a> Compiler<'a> {
             .into_iter()
             .map(|(type_name, table)| IrRowSource::Bound {
                 source: IrSource {
-                    poly: if heterogeneous { self.poly_fanout_for(&type_name) } else { None },
+                    poly: if heterogeneous {
+                        self.poly_fanout_for(&type_name)
+                    } else {
+                        None
+                    },
                     type_name,
                     table,
                     alias: alias.clone(),
@@ -6171,7 +6257,11 @@ impl<'a> Compiler<'a> {
             let seen = self.for_slot_counts.entry(f.var.clone()).or_insert(0);
             let n = *seen;
             *seen += 1;
-            if n == 0 { f.var.clone() } else { format!("{}_{}", f.var, n) }
+            if n == 0 {
+                f.var.clone()
+            } else {
+                format!("{}_{}", f.var, n)
+            }
         };
         let prev_slot = self.for_var_slots.insert(f.var.clone(), slot.clone());
         // Register the for variable so the body can reference it.
@@ -6640,7 +6730,8 @@ impl<'a> Compiler<'a> {
         let Stmt::Select(body) = f.body.as_ref() else {
             return Ok(None);
         };
-        let unmodified = body.filter.is_none() && body.order_by.is_empty() && body.offset.is_none() && body.limit.is_none();
+        let unmodified =
+            body.filter.is_none() && body.order_by.is_empty() && body.offset.is_none() && body.limit.is_none();
         let (inner, shape) = match &body.result {
             Expr::Shape(sh) if unmodified => match &sh.expr {
                 Some(Expr::SubQuery(stmt)) => match stmt.as_ref() {
@@ -6835,7 +6926,13 @@ impl<'a> Compiler<'a> {
                 module: Some(root_td.module.clone()),
                 name: root_td.name.clone(),
             });
-            (ast::Path { steps: vec![base.steps[0].clone(), narrowing], partial: false }, None)
+            (
+                ast::Path {
+                    steps: vec![base.steps[0].clone(), narrowing],
+                    partial: false,
+                },
+                None,
+            )
         } else {
             return Ok(None);
         };
@@ -6852,7 +6949,9 @@ impl<'a> Compiler<'a> {
             Self::correlate_path_select(&mut ps, &alias);
         }
         let IrPathResult::Object { alias, type_name, .. } = &ps.result else {
-            return Err(self.type_err(&format!("'{field}' is read off a walk that lands on a value, which has no shape")));
+            return Err(self.type_err(&format!(
+                "'{field}' is read off a walk that lands on a value, which has no shape"
+            )));
         };
         let (alias, type_name) = (alias.clone(), type_name.clone());
         let td = self.resolve_type(&type_name)?;
@@ -6925,8 +7024,17 @@ impl<'a> Compiler<'a> {
         }
         let types: Vec<String> = branches.iter().map(cte_stmt_type).collect();
         let first = types.iter().find(|t| !t.is_empty()).cloned().unwrap_or_default();
-        if let Some(other) = types.iter().find(|t| t.contains("::") || (!t.is_empty() && **t != first)) {
-            let display = |t: &str| if t.contains("::") { t.to_string() } else { pg_type_to_pyql(t).to_string() };
+        if let Some(other) = types
+            .iter()
+            .find(|t| t.contains("::") || (!t.is_empty() && **t != first))
+        {
+            let display = |t: &str| {
+                if t.contains("::") {
+                    t.to_string()
+                } else {
+                    pg_type_to_pyql(t).to_string()
+                }
+            };
             return Err(self.type_err(&format!(
                 "operator 'UNION' cannot be applied to operands of type '{}' and '{}'",
                 display(&first),
@@ -7028,8 +7136,12 @@ impl<'a> Compiler<'a> {
 
     fn expr_as_type_name(&self, expr: &Expr) -> Result<String, PyQLError> {
         if std::env::var("PYLON_DBG_SUBJ").is_ok() {
-            eprintln!("DBG subj {:.90?}
-{}", expr, std::backtrace::Backtrace::force_capture());
+            eprintln!(
+                "DBG subj {:.90?}
+{}",
+                expr,
+                std::backtrace::Backtrace::force_capture()
+            );
         }
         match expr {
             // `detached T` names the same type; the prefix only says the set
@@ -7058,8 +7170,7 @@ impl<'a> Compiler<'a> {
                     && p.steps.len() > 1
                     && let Some(ast::PathStep::Name(root)) = p.steps.first()
                     && let Ok(root_td) = self.resolve_path_root(root)
-                    && let (_, Some(target)) =
-                        self.walk_path_types(root_td, &p.steps[1..], MAX_COMPUTED_SPLICES) =>
+                    && let (_, Some(target)) = self.walk_path_types(root_td, &p.steps[1..], MAX_COMPUTED_SPLICES) =>
             {
                 Ok(format!("{}::{}", target.module, target.name))
             }
@@ -7137,7 +7248,8 @@ impl<'a> Compiler<'a> {
                     }
                     ShapeOp::Assign | ShapeOp::Append => {
                         if let Some(expr) = &el.compexpr {
-                            let (jt, module, src_col, tgt_col, through_td) = self.own_multilink_junction_info(td, ml)?;
+                            let (jt, module, src_col, tgt_col, through_td) =
+                                self.own_multilink_junction_info(td, ml)?;
                             let values = self.compile_multilink_values(expr, td, &alias, through_td)?;
                             multi_link_appends.push(IrMultiLinkMutation {
                                 junction_table: jt,
@@ -7215,8 +7327,8 @@ impl<'a> Compiler<'a> {
         // Only a `for` body's nested insert needs to name its own id (see
         // `IrInsert::id_default_sql`); carried here because the schema is in
         // scope, and ignored everywhere else.
-        let id_default_sql = Self::resolve_property(td, "id")
-            .map(|p| p.default_sql.clone().unwrap_or_else(|| "uuidv7()".to_string()));
+        let id_default_sql =
+            Self::resolve_property(td, "id").map(|p| p.default_sql.clone().unwrap_or_else(|| "uuidv7()".to_string()));
         Ok(IrInsert {
             guard,
             target,
@@ -7904,9 +8016,10 @@ impl<'a> Compiler<'a> {
             && let Stmt::Select(sel) = inner.as_ref()
             && let Expr::Shape(sh) = &sel.result
             && !sh.elements.is_empty()
-            && sh.elements.iter().all(|el| {
-                matches!(el.path.steps.as_slice(), [ast::PathStep::LinkProp(_)])
-            })
+            && sh
+                .elements
+                .iter()
+                .all(|el| matches!(el.path.steps.as_slice(), [ast::PathStep::LinkProp(_)]))
             && let Some(base) = sh.expr.clone()
         {
             let lifted = Expr::Shape(Box::new(ast::ShapeExpr {
@@ -7932,18 +8045,20 @@ impl<'a> Compiler<'a> {
             // walk of a link with properties, `@prop` reads the row's current
             // value off the junction that walk crosses.
             let walked_junction = match (&inner.source, inner_expr) {
-                (IrMultiLinkValueSource::PathSelect(ps), Expr::SubQuery(stmt)) => match (stmt.as_ref(), ps.joins.last()) {
-                    (Stmt::Select(sel), Some(IrPathJoin::Multi { junction_alias, .. })) => match &sel.result {
-                        Expr::Path(p) if p.partial => match p.steps.as_slice() {
-                            [ast::PathStep::Name(link)] => Self::resolve_multilink(td, link)
-                                .and_then(|m| m.through.clone())
-                                .map(|through| (through, junction_alias.clone())),
+                (IrMultiLinkValueSource::PathSelect(ps), Expr::SubQuery(stmt)) => {
+                    match (stmt.as_ref(), ps.joins.last()) {
+                        (Stmt::Select(sel), Some(IrPathJoin::Multi { junction_alias, .. })) => match &sel.result {
+                            Expr::Path(p) if p.partial => match p.steps.as_slice() {
+                                [ast::PathStep::Name(link)] => Self::resolve_multilink(td, link)
+                                    .and_then(|m| m.through.clone())
+                                    .map(|through| (through, junction_alias.clone())),
+                                _ => None,
+                            },
                             _ => None,
                         },
                         _ => None,
-                    },
-                    _ => None,
-                },
+                    }
+                }
                 _ => None,
             };
 
@@ -9157,9 +9272,9 @@ impl<'a> Compiler<'a> {
                 regular_els.push(nel.clone());
             }
         }
-        let has_splat = nested_elements
-            .iter()
-            .any(|nel| nel.splat.is_some() && !matches!(nel.path.steps.first(), Some(ast::PathStep::TypeIntersection(_))));
+        let has_splat = nested_elements.iter().any(|nel| {
+            nel.splat.is_some() && !matches!(nel.path.steps.first(), Some(ast::PathStep::TypeIntersection(_)))
+        });
         if has_splat {
             for prop in self.splat_link_properties(&ml)? {
                 if !link_properties.iter().any(|existing| existing.name == prop.name) {
@@ -9862,7 +9977,16 @@ impl<'a> Compiler<'a> {
                 let path = path.clone();
                 let nested = nested.to_vec();
                 return self
-                    .compile_chained_link_pointer(pointer_name, &path, td, alias, &nested, modifiers, multi && !limits_to_one(modifiers), 0)
+                    .compile_chained_link_pointer(
+                        pointer_name,
+                        &path,
+                        td,
+                        alias,
+                        &nested,
+                        modifiers,
+                        multi && !limits_to_one(modifiers),
+                        0,
+                    )
                     .map(Some);
             }
             _ => return Ok(None),
@@ -9918,7 +10042,9 @@ impl<'a> Compiler<'a> {
         // statement's own WITH clause and the inner statement takes over.
         if let Stmt::With(w) = stmt {
             for alias in &w.aliases {
-                if self.bind_inline_if_correlated(&alias.name, &alias.expr, ctx)? || self.bind_group(&alias.name, &alias.expr)? {
+                if self.bind_inline_if_correlated(&alias.name, &alias.expr, ctx)?
+                    || self.bind_group(&alias.name, &alias.expr)?
+                {
                     continue;
                 }
                 let ir_stmt = compile_cte_binding(self, &alias.expr)?;
@@ -11034,10 +11160,15 @@ impl<'a> Compiler<'a> {
                         return Err(self.type_err("a shape's pointer read off a walk is a value"));
                     };
                     let ns = f.module.as_deref().unwrap_or("std");
-                    let aggregate = crate::stdlib::lookup(ns, &f.name).into_iter().find_map(|d| match &d.impl_strategy {
-                        crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
-                        _ => None,
-                    });
+                    let aggregate =
+                        crate::stdlib::lookup(ns, &f.name)
+                            .into_iter()
+                            .find_map(|d| match &d.impl_strategy {
+                                crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => {
+                                    Some(sql_name.to_string())
+                                }
+                                _ => None,
+                            });
                     let Some(sql_name) = aggregate else {
                         return Err(self.type_err(&format!(
                             "'{}' over a shape's pointer read off a walk needs an aggregate",
@@ -11054,12 +11185,15 @@ impl<'a> Compiler<'a> {
                     };
                     // An unnested set cannot sit inside the aggregate call;
                     // the walk's rows are aggregated from outside instead.
-                    let subquery = if matches!(&column, IrExpr::FunctionCall(f) if f.name == "unnest" && f.sql_template.is_none()) {
+                    let subquery = if matches!(&column, IrExpr::FunctionCall(f) if f.name == "unnest" && f.sql_template.is_none())
+                    {
                         ps.result = IrPathResult::Scalar(column, None);
                         IrExpr::FunctionCall(IrFunctionCall {
                             schema: None,
                             name: sql_name.clone(),
-                            args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps))))],
+                            args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
+                                ps,
+                            ))))],
                             sql_template: Some(format!(
                                 "(SELECT {sql_name}(\"_s\".\"v\") FROM unnest($1) AS \"_s\"(\"v\"))"
                             )),
@@ -11113,10 +11247,15 @@ impl<'a> Compiler<'a> {
                         && matches!(Self::peel_field_access_chain(arg).0, Expr::SubQuery(_))
                     {
                         let ns = f.module.as_deref().unwrap_or("std");
-                        let aggregate = crate::stdlib::lookup(ns, &f.name).into_iter().find_map(|d| match &d.impl_strategy {
-                            crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
-                            _ => None,
-                        });
+                        let aggregate =
+                            crate::stdlib::lookup(ns, &f.name)
+                                .into_iter()
+                                .find_map(|d| match &d.impl_strategy {
+                                    crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => {
+                                        Some(sql_name.to_string())
+                                    }
+                                    _ => None,
+                                });
                         if let Some(sql_name) = aggregate {
                             let values = self.compile_expr_ctx(arg, ctx)?;
                             if matches!(values, IrExpr::ArrayFromSelect(_)) {
@@ -11151,10 +11290,15 @@ impl<'a> Compiler<'a> {
                     {
                         let values = self.compile_expr_ctx(arg, ctx)?;
                         let ns = f.module.as_deref().unwrap_or("std");
-                        let aggregate = crate::stdlib::lookup(ns, &f.name).into_iter().find_map(|d| match &d.impl_strategy {
-                            crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
-                            _ => None,
-                        });
+                        let aggregate =
+                            crate::stdlib::lookup(ns, &f.name)
+                                .into_iter()
+                                .find_map(|d| match &d.impl_strategy {
+                                    crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => {
+                                        Some(sql_name.to_string())
+                                    }
+                                    _ => None,
+                                });
                         if let Some(sql_name) = aggregate
                             && yields_array(&values)
                         {
@@ -11190,10 +11334,7 @@ impl<'a> Compiler<'a> {
                         if let Some(ImplStrategy::SqlBuiltin(sql_name)) = best.map(|d| &d.impl_strategy)
                             && best.is_some_and(|d| d.params.first().is_some_and(|p| p.ty.is_set()))
                         {
-                            let object = self
-                                .cte_types
-                                .get(name)
-                                .is_some_and(|bound| bound.contains("::"));
+                            let object = self.cte_types.get(name).is_some_and(|bound| bound.contains("::"));
                             return Ok(IrExpr::AggOverCte {
                                 fn_name: sql_name.to_string(),
                                 cte: name.to_string(),
@@ -11229,7 +11370,9 @@ impl<'a> Compiler<'a> {
                             let aggregate = IrExpr::FunctionCall(IrFunctionCall {
                                 schema: None,
                                 name: sql_name.clone(),
-                                args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps))))],
+                                args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
+                                    ps,
+                                ))))],
                                 sql_template: Some(format!(
                                     "(SELECT {sql_name}(\"_s\".\"v\") FROM unnest($1) AS \"_s\"(\"v\"))"
                                 )),
@@ -11428,9 +11571,7 @@ impl<'a> Compiler<'a> {
                             // same as one on the argument, and that is where the
                             // aggregate can act on it.
                             let (inner_result, inner_distinct) = match &sel.result {
-                                Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOpKind::Distinct) => {
-                                    (&u.operand, true)
-                                }
+                                Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOpKind::Distinct) => (&u.operand, true),
                                 other => (other, false),
                             };
                             if let Expr::Path(inner_path) = inner_result
@@ -11546,7 +11687,10 @@ impl<'a> Compiler<'a> {
                     let exists = Expr::UnaryOp(Box::new(ast::UnaryOp {
                         op: ast::UnaryOpKind::Exists,
                         operand: Expr::SubQuery(Box::new(Stmt::Select(ast::SelectStmt {
-                            result: Expr::Path(ast::Path { steps: link, partial: true }),
+                            result: Expr::Path(ast::Path {
+                                steps: link,
+                                partial: true,
+                            }),
                             filter: Some(condition),
                             order_by: vec![],
                             offset: None,
@@ -11572,7 +11716,11 @@ impl<'a> Compiler<'a> {
                     && let [arg @ Expr::TypeIs { .. }] = f.args.as_slice()
                     && let answers @ IrExpr::ArrayFromSelect(_) = self.compile_expr_ctx(arg, ctx)?
                 {
-                    let (aggregate, over_nothing) = if f.name == "all" { ("bool_and", "true") } else { ("bool_or", "false") };
+                    let (aggregate, over_nothing) = if f.name == "all" {
+                        ("bool_and", "true")
+                    } else {
+                        ("bool_or", "false")
+                    };
                     return Ok(IrExpr::FunctionCall(IrFunctionCall {
                         schema: None,
                         name: aggregate.to_string(),
@@ -11608,7 +11756,11 @@ impl<'a> Compiler<'a> {
                         ctx,
                     );
                     self.inline_bindings.remove(&element);
-                    let (aggregate, over_nothing) = if f.name == "all" { ("bool_and", "true") } else { ("bool_or", "false") };
+                    let (aggregate, over_nothing) = if f.name == "all" {
+                        ("bool_and", "true")
+                    } else {
+                        ("bool_or", "false")
+                    };
                     return Ok(IrExpr::FunctionCall(IrFunctionCall {
                         schema: None,
                         name: aggregate.to_string(),
@@ -11717,7 +11869,9 @@ impl<'a> Compiler<'a> {
                     return self.compile_expr_ctx(val, ctx);
                 }
                 if let Some(ps) = self.compile_shape_field_select(expr, ctx)? {
-                    return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps)))));
+                    return Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
+                        ps,
+                    )))));
                 }
                 // `(select .emails filter .primary limit 1).address` — the
                 // field chain is spliced onto the sub-select's own path so
@@ -11940,12 +12094,7 @@ impl<'a> Compiler<'a> {
             // same correlated walks a union of them gives, except each operand
             // after the first only stands in when the ones before it are empty.
             Expr::Shape(sh)
-                if ctx.is_some()
-                    && sh
-                        .expr
-                        .as_ref()
-                        .and_then(Self::coalesce_of_relative_paths)
-                        .is_some() =>
+                if ctx.is_some() && sh.expr.as_ref().and_then(Self::coalesce_of_relative_paths).is_some() =>
             {
                 let (td, alias) = ctx.expect("checked by the guard");
                 let operands =
@@ -12221,7 +12370,10 @@ impl<'a> Compiler<'a> {
         let src_td = self.resolve_type(&source_qname)?;
         let source_table = src_td.table.clone();
         let (poly_implementors, poly_columns) = if self.is_polymorphic(src_td) {
-            (self.find_poly_implementors(&source_qname), Self::poly_dml_columns(src_td))
+            (
+                self.find_poly_implementors(&source_qname),
+                Self::poly_dml_columns(src_td),
+            )
         } else {
             (vec![], vec![])
         };
@@ -12530,8 +12682,11 @@ impl<'a> Compiler<'a> {
             // `line[is BrandOrderLineItem].brand` — the narrowing picks the row
             // out of the narrowed type's own table, and the walk continues from
             // there. Without the tail this is the row itself, handled below.
-            if let [ast::PathStep::Name(var), ast::PathStep::TypeIntersection(type_ref), rest @ ..] =
-                p.steps.as_slice()
+            if let [
+                ast::PathStep::Name(var),
+                ast::PathStep::TypeIntersection(type_ref),
+                rest @ ..,
+            ] = p.steps.as_slice()
                 && !rest.is_empty()
                 && self.for_var_types.contains_key(var)
             {
@@ -13066,10 +13221,9 @@ impl<'a> Compiler<'a> {
             .links
             .iter()
             .any(|l| l.name == backlink_name && l.is_exclusive && self.link_target_reaches(&l.target, current_qname))
-            || owner
-                .multilinks
-                .iter()
-                .any(|ml| ml.name == backlink_name && ml.is_exclusive && self.link_target_reaches(&ml.target, current_qname))
+            || owner.multilinks.iter().any(|ml| {
+                ml.name == backlink_name && ml.is_exclusive && self.link_target_reaches(&ml.target, current_qname)
+            })
     }
 
     /// Does `td` declare the link a backlink names, pointing at the type the
@@ -13504,7 +13658,11 @@ impl<'a> Compiler<'a> {
                 if matches!(op, ast::BinOpKind::Eq | ast::BinOpKind::Ne)
                     && matches!(l, IrExpr::ArrayFromSelect(_)) != matches!(r, IrExpr::ArrayFromSelect(_))
                 {
-                    let (value, set) = if matches!(r, IrExpr::ArrayFromSelect(_)) { (l, r) } else { (r, l) };
+                    let (value, set) = if matches!(r, IrExpr::ArrayFromSelect(_)) {
+                        (l, r)
+                    } else {
+                        (r, l)
+                    };
                     let membership = IrExpr::BinOp(Box::new(IrBinOp {
                         left: value,
                         op: ast::BinOpKind::In,
@@ -14328,7 +14486,10 @@ impl<'a> Compiler<'a> {
         let Some(desc) = overloads.iter().find(fits) else {
             if let Some((name, _)) = f.kwargs.first() {
                 let message = if overloads.iter().all(|d| named(d) == 0) {
-                    format!("function '{ns}::{}' does not take named arguments, got '{name}'", f.name)
+                    format!(
+                        "function '{ns}::{}' does not take named arguments, got '{name}'",
+                        f.name
+                    )
                 } else {
                     format!("function '{ns}::{}' has no parameter '{name}'", f.name)
                 };
@@ -14342,7 +14503,10 @@ impl<'a> Compiler<'a> {
             .map(|a| self.compile_expr_ctx(a, ctx))
             .collect::<Result<Vec<_>, _>>()?;
         for param in desc.params.iter().filter(|p| p.named_only.is_some()) {
-            let arg = match (f.kwargs.iter().find(|(name, _)| name == param.keyword()), param.named_only) {
+            let arg = match (
+                f.kwargs.iter().find(|(name, _)| name == param.keyword()),
+                param.named_only,
+            ) {
                 (Some((_, value)), _) => self.compile_expr_ctx(value, ctx)?,
                 (None, Some(NamedDefault::Int(n))) => IrExpr::Literal(IrLiteral::Int(n)),
                 (None, _) => IrExpr::Null,
@@ -14373,11 +14537,17 @@ impl<'a> Compiler<'a> {
         // check rejects.
         let exact = overloads.iter().find(|d| {
             d.params.len() == args.len()
-                && d.params.iter().zip(&args).any(|(p, a)| p.ty.scalar_pg_type().is_some() && infer_ir_type(a).is_some())
-                && d.params.iter().zip(&args).all(|(p, a)| match (p.ty.scalar_pg_type(), infer_ir_type(a)) {
-                    (Some(declared), Some(known)) => declared == known,
-                    _ => pylon_type_matches(a, &p.ty),
-                })
+                && d.params
+                    .iter()
+                    .zip(&args)
+                    .any(|(p, a)| p.ty.scalar_pg_type().is_some() && infer_ir_type(a).is_some())
+                && d.params
+                    .iter()
+                    .zip(&args)
+                    .all(|(p, a)| match (p.ty.scalar_pg_type(), infer_ir_type(a)) {
+                        (Some(declared), Some(known)) => declared == known,
+                        _ => pylon_type_matches(a, &p.ty),
+                    })
         });
         let best = exact
             .or_else(|| {
@@ -15722,8 +15892,11 @@ impl<'a> Compiler<'a> {
 
     fn field_err(&self, field: &str, type_name: &str) -> PyQLError {
         if std::env::var("PYLON_DBG_FIELD_ERR").is_ok() {
-            eprintln!("DBG field_err {field} on {type_name}
-{}", std::backtrace::Backtrace::force_capture());
+            eprintln!(
+                "DBG field_err {field} on {type_name}
+{}",
+                std::backtrace::Backtrace::force_capture()
+            );
         }
         let suggestion = self
             .schema
@@ -15784,7 +15957,6 @@ impl<'a> Compiler<'a> {
             })
             .collect()
     }
-
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -15970,8 +16142,7 @@ fn is_array_expr(expr: &IrExpr) -> bool {
         // which `infer_ir_type` cannot spell because it only names scalars.
         IrExpr::FunctionCall(f) if f.schema.is_none() => {
             let mut overloads = crate::stdlib::registry().iter().filter(|d| d.name == f.name).peekable();
-            overloads.peek().is_some()
-                && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Array(_)))
+            overloads.peek().is_some() && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Array(_)))
         }
         // Everything else an array can arrive as — a column, a cast, a
         // global, a `with` binding, a concatenation of any of those — is
@@ -16084,8 +16255,14 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         IrExpr::FunctionCall(f) if f.schema.is_none() && matches!(f.name.as_str(), "max" | "min" | "sum") => {
             aggregate_result_type(&f.name, infer_ir_type(f.args.first()?)?)
         }
-        IrExpr::AggOverSet { fn_name, schema: None, .. } if fn_name == "count" => Some("int8"),
-        IrExpr::AggOverSet { fn_name, schema: None, elems } => aggregate_result_type(fn_name, infer_ir_type(elems.first()?)?),
+        IrExpr::AggOverSet {
+            fn_name, schema: None, ..
+        } if fn_name == "count" => Some("int8"),
+        IrExpr::AggOverSet {
+            fn_name,
+            schema: None,
+            elems,
+        } => aggregate_result_type(fn_name, infer_ir_type(elems.first()?)?),
         // `enc::base64_decode(…)` — a stdlib call is typed by what it
         // returns, when every overload of that name agrees.
         IrExpr::FunctionCall(f) if f.schema.is_none() => {
@@ -16123,7 +16300,11 @@ fn arithmetic_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Optio
         });
     }
     if (float(left) || int(left)) && (float(right) || int(right)) {
-        return Some(if left == "float4" && right == "float4" { "float4" } else { "float8" });
+        return Some(if left == "float4" && right == "float4" {
+            "float4"
+        } else {
+            "float8"
+        });
     }
     if (numeric(left) || int(left)) && (numeric(right) || int(right)) {
         return Some("numeric");
@@ -16304,4 +16485,3 @@ pub fn pg_type_to_pyql(pg: &str) -> &str {
         other => other,
     }
 }
-

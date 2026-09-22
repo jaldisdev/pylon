@@ -460,11 +460,18 @@ fn optional_department(mut sd: SchemaDescriptor) -> SchemaDescriptor {
 }
 
 async fn seed_departments(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) {
-    for (name, dept, age) in [("Alice", "eng", 30), ("Bob", "eng", 32), ("Carol", "sales", 28), ("Dave", "sales", 40)] {
+    for (name, dept, age) in [
+        ("Alice", "eng", 30),
+        ("Bob", "eng", 32),
+        ("Carol", "sales", 28),
+        ("Dave", "sales", 40),
+    ] {
         exec(
             pool,
             sd,
-            &format!("insert {module}::Employee {{ name := '{name}', department := '{dept}', age := {age}, active := true }}"),
+            &format!(
+                "insert {module}::Employee {{ name := '{name}', department := '{dept}', age := {age}, active := true }}"
+            ),
         )
         .await;
     }
@@ -541,7 +548,10 @@ async fn for_over_a_group_takes_the_first_elements_of_each_key() {
         ),
     )
     .await;
-    assert_eq!(element_names(&oldest), HashSet::from(["Bob", "Dave", "Eve"].map(String::from)));
+    assert_eq!(
+        element_names(&oldest),
+        HashSet::from(["Bob", "Dave", "Eve"].map(String::from))
+    );
 
     let youngest = group_rows(
         &pool,
@@ -552,7 +562,10 @@ async fn for_over_a_group_takes_the_first_elements_of_each_key() {
         ),
     )
     .await;
-    assert_eq!(element_names(&youngest), HashSet::from(["Alice", "Carol", "Eve"].map(String::from)));
+    assert_eq!(
+        element_names(&youngest),
+        HashSet::from(["Alice", "Carol", "Eve"].map(String::from))
+    );
 
     // Bound in a `with` itself, the loop is read back like any object binding.
     let bound = group_rows(
@@ -565,7 +578,10 @@ async fn for_over_a_group_takes_the_first_elements_of_each_key() {
         ),
     )
     .await;
-    assert_eq!(element_names(&bound), HashSet::from(["Alice", "Carol"].map(String::from)));
+    assert_eq!(
+        element_names(&bound),
+        HashSet::from(["Alice", "Carol"].map(String::from))
+    );
 }
 
 #[tokio::test]
@@ -591,7 +607,9 @@ async fn free_object_field_holds_every_row_its_select_yields() {
         ),
     )
     .await;
-    let [row] = rows.as_slice() else { panic!("expected one free object, got {rows:?}") };
+    let [row] = rows.as_slice() else {
+        panic!("expected one free object, got {rows:?}")
+    };
     let f = fields(row);
     assert_eq!(element_names(as_array(&f[0])).len(), 5);
     assert_eq!(as_str(&fields(&f[1])[1]), "Carol");
@@ -620,7 +638,9 @@ async fn asserted_select_over_a_binding_keeps_the_shape_written_after_it() {
         ),
     )
     .await;
-    let [team] = rows.as_slice() else { panic!("expected one team, got {rows:?}") };
+    let [team] = rows.as_slice() else {
+        panic!("expected one team, got {rows:?}")
+    };
     assert_eq!(
         element_names(as_array(&fields(team)[1])),
         HashSet::from(["Alice", "Bob"].map(String::from))

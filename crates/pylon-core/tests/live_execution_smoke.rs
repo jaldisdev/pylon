@@ -172,8 +172,14 @@ async fn an_abstract_type_reads_the_rows_of_the_types_inheriting_it() {
         assert_eq!(
             read,
             vec![
-                (DecodedValue::Str(format!("{module}::Widget")), DecodedValue::Str("a".to_string())),
-                (DecodedValue::Str(format!("{module}::Gadget")), DecodedValue::Str("b".to_string())),
+                (
+                    DecodedValue::Str(format!("{module}::Widget")),
+                    DecodedValue::Str("a".to_string())
+                ),
+                (
+                    DecodedValue::Str(format!("{module}::Gadget")),
+                    DecodedValue::Str("b".to_string())
+                ),
             ],
             "{pyql}"
         );

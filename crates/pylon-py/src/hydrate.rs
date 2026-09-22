@@ -217,7 +217,13 @@ fn decode<'py>(
             position,
             pointers,
             ..
-        } => decode_object(py, item(value, *position).unwrap_or(&NULL), type_name.as_deref(), pointers, reg),
+        } => decode_object(
+            py,
+            item(value, *position).unwrap_or(&NULL),
+            type_name.as_deref(),
+            pointers,
+            reg,
+        ),
         ShapeNode::NamedTuple {
             position,
             type_name,
@@ -614,7 +620,10 @@ fn decode_row<'py>(
 #[pyfunction]
 pub(crate) fn rows_to_json(rows: &RowSet, compiled: &CompiledQuery) -> Vec<String> {
     let root = &compiled.inner.shape.root;
-    rows.rows.iter().map(|row| pylon_client::json::row_to_json(root, row)).collect()
+    rows.rows
+        .iter()
+        .map(|row| pylon_client::json::row_to_json(root, row))
+        .collect()
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
