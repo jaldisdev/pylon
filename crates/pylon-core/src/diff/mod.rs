@@ -4397,6 +4397,7 @@ mod tests {
             description: None,
             default_pyql: None,
             on_delete: vec![],
+            is_exclusive: false,
         });
         let mut junction = simple_type("default", "ProductTag", "Product.tags");
         junction.junction = true;

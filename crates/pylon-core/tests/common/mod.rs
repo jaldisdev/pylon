@@ -131,6 +131,7 @@ pub fn multilink(name: &str, target_qname: &str) -> MultiLinkDescriptor {
         description: None,
         default_pyql: None,
         on_delete: vec![],
+        is_exclusive: false,
     }
 }
 
@@ -146,6 +147,7 @@ pub fn multilink_through(name: &str, target_qname: &str, through_qname: &str) ->
         description: None,
         default_pyql: None,
         on_delete: vec![],
+        is_exclusive: false,
     }
 }
 

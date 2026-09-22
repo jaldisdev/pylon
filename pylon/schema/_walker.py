@@ -909,6 +909,8 @@ def _make_link_desc(name: str, meta: Any, _core: Any) -> Any:
 
 
 def _make_multilink_desc(name: str, meta: Any, _core: Any) -> Any:
+    from ._constraints import Exclusive
+
     return _core.MultiLinkDescriptor(
         name=name,
         target=meta.link_target,  # already a qualified string
@@ -917,6 +919,7 @@ def _make_multilink_desc(name: str, meta: Any, _core: Any) -> Any:
         default_pyql=_make_default_pyql(meta),
         description=meta.description,
         on_delete=_make_on_delete_policies(meta.on_delete, _core),
+        is_exclusive=any(c is Exclusive for c in meta.constraints),
     )
 
 

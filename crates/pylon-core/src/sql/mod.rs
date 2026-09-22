@@ -5392,6 +5392,7 @@ mod tests {
                         description: None,
                         default_pyql: None,
                         on_delete: vec![],
+                        is_exclusive: false,
                     }],
                     computed: vec![],
                     constraints: vec![],
@@ -8675,6 +8676,7 @@ mod tests {
                         description: None,
                         default_pyql: None,
                         on_delete: vec![],
+                        is_exclusive: false,
                     }],
                     computed: vec![],
                     constraints: vec![],
@@ -9155,6 +9157,7 @@ mod tests {
                         description: None,
                         default_pyql: None,
                         on_delete: vec![],
+                        is_exclusive: false,
                     }],
                     computed: vec![],
                     constraints: vec![],
@@ -12508,6 +12511,47 @@ select owner { posts := (select owner.posts.title) };",
         // the emitted SQL returns the right rows, nested 2 levels deep.
         let out = compile_and_emit("SELECT Post { title, authors := .<posts[is Person] { name } }");
         assert!(out.sql.contains("array_agg(ROW("), "got:\n{}", out.sql);
+    }
+
+    fn schema_with_exclusive_posts() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        for td in schema.types.iter_mut().filter(|td| td.name == "Person") {
+            for ml in td.multilinks.iter_mut().filter(|ml| ml.name == "posts") {
+                ml.is_exclusive = true;
+            }
+        }
+        schema
+    }
+
+    #[test]
+    fn test_backlink_through_an_exclusive_multilink_is_single() {
+        let out = compile_and_emit_with(
+            "SELECT Post { title, author := .<posts[is Person] { name } }",
+            &schema_with_exclusive_posts(),
+        );
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected an object root, got {:?}", out.shape.root)
+        };
+        assert!(
+            matches!(pointers.last(), Some(ShapeNode::Object { name, .. }) if name == "author"),
+            "got {pointers:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_path_through_an_exclusive_backlink_is_single() {
+        let out = compile_and_emit_with(
+            "SELECT Post { title, author_name := .<posts[is Person].name }",
+            &schema_with_exclusive_posts(),
+        );
+        let ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected an object root, got {:?}", out.shape.root)
+        };
+        assert!(
+            matches!(pointers.last(), Some(ShapeNode::Scalar { name, .. }) if name == "author_name"),
+            "got {pointers:?}"
+        );
+        assert!(!out.sql.contains("ARRAY("), "got:\n{}", out.sql);
     }
 
     #[test]
