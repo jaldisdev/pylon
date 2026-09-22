@@ -461,3 +461,30 @@ async fn base64_round_trips_without_line_breaks() {
     assert_eq!(text.len(), 80);
     assert!(!text.contains('\n'), "got {text:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_negative_index_counts_from_the_end() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    let last = eval_scalar(&pool, "str_split('marketplace::MemberPlanLicense', '::')[-1]").await;
+    assert_eq!(last, DecodedValue::Str("MemberPlanLicense".to_string()));
+    assert_eq!(eval_scalar(&pool, "[1, 2, 3][-3]").await, DecodedValue::I64(1));
+    assert_eq!(eval_scalar(&pool, "'abc'[-1]").await, DecodedValue::Str("c".to_string()));
+
+    let empty = SchemaDescriptor::default();
+    for (expr, message) in [
+        ("[1, 2][-3]", "array index -3 is out of bounds"),
+        ("'ab'[-3]", "string index -3 is out of bounds"),
+        ("to_bytes('ab', 'UTF8')[-3]", "byte string index -3 is out of bounds"),
+    ] {
+        let compiled = query::compile(&format!("select {expr}"), &empty).unwrap();
+        let error = pool
+            .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+            .await
+            .expect_err("an index before the start is out of bounds")
+            .to_string();
+        assert!(error.contains(message), "{expr}: expected {message:?}, got: {error}");
+    }
+}
