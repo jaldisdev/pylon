@@ -119,7 +119,11 @@ fn inherited_from_an_interface(schema: &SchemaDescriptor, td: &TypeDescriptor, p
             .types
             .iter()
             .filter(|t| format!("{}::{}", t.module, t.name) == *iface)
-            .any(|t| t.properties.iter().any(|p| p.name == pointer) || t.links.iter().any(|l| l.name == pointer))
+            .any(|t| {
+                t.properties.iter().any(|p| p.name == pointer)
+                    || t.links.iter().any(|l| l.name == pointer)
+                    || t.multilinks.iter().any(|ml| ml.name == pointer)
+            })
     })
 }
 
@@ -502,15 +506,16 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 &ml.name,
                 &ml.target,
                 ml.through.as_deref(),
+                ml.is_exclusive,
                 &expected_trigger_names,
             ));
         }
         // Junction tables for junction-backed single links — same shape
         // (source/target + through columns); cardinality is enforced via
-        // an inline PRIMARY KEY/UNIQUE table constraint the diff engine
-        // doesn't track as a separate index (mirroring how a plain
-        // multi-link's own inline `PRIMARY KEY (source, target)` isn't
-        // tracked as an index here either).
+        // an inline PRIMARY KEY table constraint the diff engine doesn't
+        // track as a separate index (mirroring how a plain multi-link's own
+        // inline `PRIMARY KEY (source, target)` isn't tracked as an index
+        // here either).
         for l in &td.links {
             if !l.is_junction_backed() {
                 continue;
@@ -522,6 +527,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 &l.name,
                 &l.target,
                 l.through.as_deref(),
+                l.is_exclusive,
                 &expected_trigger_names,
             ));
         }
@@ -615,9 +621,10 @@ pub fn missing_extension_ddl(target: &SchemaDescriptor, current: &DbState) -> Ve
 /// Builds the expected `DbTable` for one junction table — shared by a
 /// multi-link and a junction-backed single link, since both store
 /// (source, target, through-type properties) identically; only the
-/// caller-supplied cardinality constraint (a `PRIMARY KEY`/`UNIQUE` table
-/// constraint, not tracked here as a separate index — see
-/// `schema_to_db_state`) differs between the two.
+/// caller-supplied `PRIMARY KEY` (not tracked here as a separate index — see
+/// `schema_to_db_state`) differs between the two. An exclusive one is also
+/// unique on `target`.
+#[allow(clippy::too_many_arguments)]
 fn build_junction_db_table(
     schema: &SchemaDescriptor,
     type_map: &HashMap<String, (&str, &str)>,
@@ -625,6 +632,7 @@ fn build_junction_db_table(
     name: &str,
     target: &str,
     through: Option<&str>,
+    exclusive: bool,
     expected_trigger_names: &HashMap<(String, String), HashSet<String>>,
 ) -> DbTable {
     let jt_name = format!("{}.{}", td.table, name);
@@ -685,6 +693,20 @@ fn build_junction_db_table(
         });
     }
 
+    // An exclusive declared by an interface spans every implementor's
+    // junction, which the shared constraint triggers enforce instead.
+    let mut indexes = Vec::new();
+    if exclusive && !inherited_from_an_interface(schema, td, name) {
+        indexes.push(DbIndex {
+            name: format!("{jt_name}_target_key"),
+            is_unique: true,
+            method: "btree".to_string(),
+            columns: vec!["target".to_string()],
+            predicate: None,
+            key: None,
+        });
+    }
+
     let triggers: Vec<String> = expected_trigger_names
         .get(&(td.module.clone(), jt_name.clone()))
         .cloned()
@@ -697,7 +719,7 @@ fn build_junction_db_table(
         name: jt_name,
         columns: jt_columns,
         foreign_keys: jt_fks,
-        indexes: vec![],
+        indexes,
         checks: vec![],
         triggers,
     }
@@ -2259,7 +2281,7 @@ fn diff_inner(
             let jt = format!("{}.{}", td.table, ml.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
                 let mut local: Vec<DiffOp> = Vec::new();
-                emit_junction_table(td, &ml.name, ml.through.as_deref(), target, false, false, &mut local);
+                emit_junction_table(td, &ml.name, ml.through.as_deref(), target, false, &mut local);
                 steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
@@ -2271,15 +2293,7 @@ fn diff_inner(
             let jt = format!("{}.{}", td.table, l.name);
             if !cur_tables.contains_key(&(td.module.as_str(), jt.as_str())) {
                 let mut local: Vec<DiffOp> = Vec::new();
-                emit_junction_table(
-                    td,
-                    &l.name,
-                    l.through.as_deref(),
-                    target,
-                    true,
-                    l.is_exclusive,
-                    &mut local,
-                );
+                emit_junction_table(td, &l.name, l.through.as_deref(), target, true, &mut local);
                 steps.extend(owner_key.clone(), owner_verb, owner_desc.clone(), local);
                 new_tables.insert((td.module.clone(), jt));
             }
@@ -3608,8 +3622,8 @@ fn emit_fk_diff(
 // ── Junction table for a new multi-link ───────────────────────────────────────
 
 // Every parameter here is one independent axis of a junction table's shape
-// (name, target, through-type, delete policy, cardinality, exclusivity), and
-// they come from three different places in the caller. Bundling them into a
+// (name, target, through-type, delete policy, cardinality), and they come
+// from three different places in the caller. Bundling them into a
 // params struct would move the same ten fields one level out without making
 // any call site clearer.
 #[allow(clippy::too_many_arguments)]
@@ -3619,7 +3633,6 @@ fn emit_junction_table(
     through: Option<&str>,
     schema: &SchemaDescriptor,
     single: bool,
-    exclusive: bool,
     ops: &mut Vec<DiffOp>,
 ) {
     let jt_name = format!("{}.{}", td.table, ml_name);
@@ -3653,15 +3666,15 @@ fn emit_junction_table(
     } else {
         "PRIMARY KEY (source, target)"
     };
-    let unique_clause = if exclusive { ",\n    UNIQUE (target)" } else { "" };
+    // An exclusive junction's `UNIQUE (target)` is left to the index pass,
+    // which also adds it to a junction that already exists.
     push_tx(
         ops,
         format!(
-            "CREATE TABLE IF NOT EXISTS {} (\n{},\n    {}{}\n);",
+            "CREATE TABLE IF NOT EXISTS {} (\n{},\n    {}\n);",
             qn(&td.module, &jt_name),
             col_lines,
             pk_clause,
-            unique_clause,
         ),
     );
 }
@@ -4385,6 +4398,44 @@ mod tests {
     }
 
     #[test]
+    fn test_an_existing_exclusive_multilink_junction_gains_its_unique_target() {
+        use crate::schema::MultiLinkDescriptor;
+
+        let mut person = simple_type("default", "Person", "Person");
+        person.multilinks.push(MultiLinkDescriptor {
+            name: "keys".into(),
+            target: "default::Key".into(),
+            through: None,
+            nullable: false,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![],
+            is_exclusive: true,
+        });
+        let schema = SchemaDescriptor {
+            types: vec![person, simple_type("default", "Key", "Key")],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+        };
+        let mut state = schema_to_db_state(&schema);
+        assert!(diff_schema(&schema, &state).unwrap().is_empty());
+
+        for table in state.tables.iter_mut().filter(|t| t.name == "Person.keys") {
+            table.indexes.clear();
+        }
+        let joined = diff_schema(&schema, &state).unwrap().join("\n");
+        assert!(
+            joined.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"Person.keys_target_key\" ON \"public\".\"Person.keys\" (\"target\")"),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
     fn test_cache_invalidate_trigger_not_duplicated_for_junction_through_type() {
         use crate::schema::MultiLinkDescriptor;
 
@@ -4467,7 +4518,10 @@ mod tests {
             "got:\n{joined}"
         );
         assert!(joined.contains("PRIMARY KEY (source)"), "got:\n{joined}");
-        assert!(joined.contains("UNIQUE (target)"), "got:\n{joined}");
+        assert!(
+            joined.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"Person.spouse_target_key\" ON \"public\".\"Person.spouse\" (\"target\")"),
+            "got:\n{joined}"
+        );
     }
 
     #[test]
@@ -4547,7 +4601,14 @@ mod tests {
                             ref_table: "Person".into(),
                         },
                     ],
-                    indexes: vec![],
+                    indexes: vec![DbIndex {
+                        name: "Person.spouse_target_key".into(),
+                        is_unique: true,
+                        method: "btree".into(),
+                        columns: vec!["target".into()],
+                        predicate: None,
+                        key: None,
+                    }],
                     checks: vec![],
                     triggers: vec!["pylon_cache_invalidate".into()],
                 },

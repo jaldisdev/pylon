@@ -823,7 +823,7 @@ fn emit_junction_tables(schema: &SchemaDescriptor, out: &mut String) {
                 &ml.on_delete,
                 ml.through.as_deref(),
                 false,
-                false,
+                ml.is_exclusive,
                 out,
             );
         }
@@ -2280,6 +2280,7 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             interfaces.iter().any(|i| {
                 i.properties.iter().any(|p| p.name == name && p.is_exclusive)
                     || i.links.iter().any(|l| l.name == name && l.is_exclusive)
+                    || i.multilinks.iter().any(|ml| ml.name == name && ml.is_exclusive)
             })
         };
 
@@ -2313,6 +2314,14 @@ pub fn interface_exclusive_trigger_infos(schema: &SchemaDescriptor) -> Vec<ExclT
             let fields = vec![format!("{}_id", l.name)];
             for impl_t in impls {
                 result.push(make_excl_info(t, &fields, &fields, impl_t, impls));
+            }
+        }
+        for ml in &t.multilinks {
+            if !ml.is_exclusive || declared_by_interface(&ml.name) {
+                continue;
+            }
+            for impl_t in impls {
+                result.push(make_excl_junction_info(t, &ml.name, impl_t));
             }
         }
         for c in &t.constraints {
