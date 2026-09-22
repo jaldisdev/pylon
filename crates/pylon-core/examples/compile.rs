@@ -237,6 +237,7 @@ fn main() {
         functions: vec![],
         aliases: vec![],
         channels: vec![],
+        ..Default::default()
     };
 
     let queries = [

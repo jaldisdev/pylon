@@ -4041,6 +4041,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let schema_after = SchemaDescriptor {
             types: vec![after],
@@ -4051,6 +4052,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -4073,6 +4075,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let schema_after = SchemaDescriptor {
             types: vec![after],
@@ -4083,6 +4086,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -4099,6 +4103,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let other = schema.clone();
         assert!(!schema_content_changed(&schema, Some(&other)));
@@ -4116,6 +4121,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         assert!(
             schema_content_changed(&schema, None),
@@ -4144,6 +4150,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         assert!(schema_content_changed(&schema_after, Some(&schema_before)));
     }
@@ -4179,6 +4186,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -4227,6 +4235,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -4258,6 +4267,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let mut stale = schema_to_db_state(&schema);
         let current_name = stale
@@ -4311,6 +4321,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let baseline = schema_to_db_state(&schema);
         let steps = diff_schema_steps(&schema, &baseline, &HashMap::new()).unwrap();
@@ -4344,6 +4355,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let mut after = before.clone();
         let mut vip = simple_type("default", "Vip", "Vip");
@@ -4388,6 +4400,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -4421,6 +4434,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let mut state = schema_to_db_state(&schema);
         assert!(diff_schema(&schema, &state).unwrap().is_empty());
@@ -4462,6 +4476,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let trigger_count = ops
@@ -4501,6 +4516,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -4636,6 +4652,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -4686,6 +4703,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -4737,6 +4755,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -4785,6 +4804,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -4836,6 +4856,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5005,6 +5026,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5082,6 +5104,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5269,6 +5292,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
 
         // The view's own SELECT text never mentions column types, so its
@@ -5367,6 +5391,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
@@ -5507,6 +5532,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -5527,6 +5553,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5571,6 +5598,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         // The table already exists in the DB (pre-existing).
         let state = DbState {
@@ -5627,6 +5655,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         assert!(required_extensions(&schema).is_empty());
     }
@@ -5651,6 +5680,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         assert_eq!(required_extensions(&schema), vec!["vector"]);
 
@@ -5684,6 +5714,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         // Table does NOT exist in the DB → it's new.
         let ops = diff_schema_ops(&schema, &empty_state()).unwrap();
@@ -5718,6 +5749,7 @@ mod tests {
             aliases: vec![],
             channels: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
+            ..Default::default()
         };
         let ops = diff_schema(&schema, &empty_state()).unwrap();
         let joined = ops.join("\n");
@@ -5746,6 +5778,7 @@ mod tests {
             aliases: vec![],
             channels: vec![],
             scalars: vec![sequence_scalar("default", "OrderNumber")],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5779,6 +5812,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5821,6 +5855,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],
@@ -5885,6 +5920,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let steps = diff_schema_steps(&schema, &empty_state(), &HashMap::new()).unwrap();
         let table_steps: Vec<&MigrationStep> = steps
@@ -5926,6 +5962,7 @@ mod tests {
             functions: vec![],
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         };
         let state = DbState {
             schemas: vec!["default".into()],

@@ -637,6 +637,7 @@ mod tests {
             functions,
             aliases: vec![],
             channels: vec![],
+            ..Default::default()
         }
     }
 
