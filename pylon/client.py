@@ -163,9 +163,9 @@ class AsyncTransaction:
         Returns ``"[]"`` when the result set is empty.
         """
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs))
-        rows = await self._tx.query_compiled_json_agg(compiled, params)
+        rows = await self._tx.query_compiled(compiled, params)
         self._evict(compiled)
-        return rows[0] if rows else '[]'
+        return _json_array(rows, compiled)
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
@@ -176,8 +176,7 @@ class AsyncTransaction:
             raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:
             return None
-        json_rows = await self._tx.query_compiled_row_to_json(compiled, params)
-        return json_rows[0] if json_rows else None
+        return _json_documents(rows, compiled)[0]
 
     async def query_required_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str:
         """Return exactly one result as a JSON string; raise if the set is empty."""
@@ -587,8 +586,8 @@ class Client:
         if hit:
             return cached if cached is not None else '[]'
 
-        rows = await pool.query_compiled_json_agg(compiled, params)
-        value = rows[0] if rows else '[]'
+        rows = await pool.query_compiled(compiled, params)
+        value = _json_array(rows, compiled)
         _cache.put_json(compiled, params, value, self._config.cache, kind='json_all')
         _cache.invalidate_for(compiled)
         return value
@@ -615,8 +614,7 @@ class Client:
             _cache.put_json(compiled, params, None, self._config.cache, kind='json_single')
             _cache.invalidate_for(compiled)
             return None
-        json_rows = await pool.query_compiled_row_to_json(compiled, params)
-        value = json_rows[0] if json_rows else None
+        value = _json_documents(rows, compiled)[0]
         _cache.put_json(compiled, params, value, self._config.cache, kind='json_single')
         _cache.invalidate_for(compiled)
         return value
@@ -1059,6 +1057,18 @@ def _looks_like_a_script(pyql: str) -> bool:
     says no.
     """
     return ';' in pyql.strip().rstrip(';')
+
+
+def _json_documents(rows: Any, compiled: CompiledQuery) -> list[str]:
+    """Each row as the JSON document the upstream engine would render for it, from the rows
+    the query already returned rather than a second, rewrapped run."""
+    from pylon._core import rows_to_json
+
+    return rows_to_json(rows, compiled)
+
+
+def _json_array(rows: Any, compiled: CompiledQuery) -> str:
+    return '[' + ', '.join(_json_documents(rows, compiled)) + ']'
 
 
 def _hydrate(rows: list[Any], compiled: CompiledQuery) -> list[Any]:

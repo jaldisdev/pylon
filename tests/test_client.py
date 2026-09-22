@@ -401,9 +401,13 @@ def _make_pool(query_result=None, execute_result=None):
     pool.execute = AsyncMock(return_value=execute_result)
     pool.query_compiled = AsyncMock(return_value=query_result if query_result is not None else [])
     pool.execute_compiled = AsyncMock(return_value=execute_result)
-    pool.query_compiled_json_agg = AsyncMock(return_value=query_result if query_result is not None else [])
-    pool.query_compiled_row_to_json = AsyncMock(return_value=query_result if query_result is not None else [])
     return pool
+
+
+def _rows_as_documents():
+    """Stands in for `rows_to_json`, which needs a real native row set: each
+    fake row is taken as the JSON document it would render to."""
+    return patch('pylon.client._json_documents', side_effect=lambda rows, compiled: list(rows))
 
 
 class TestClientQuery:
@@ -515,11 +519,11 @@ class TestClientQuery:
 
     def test_query_json_returns_string(self):
         async def _run():
-            pool = _make_pool(query_result=['[{"id": 1}]'])
+            pool = _make_pool(query_result=['{"id": 1}'])
             client = _client_with_pool(pool)
 
             compile_patch, _ = self._patch_compile()
-            with compile_patch:
+            with compile_patch, _rows_as_documents():
                 result = await client.query_json('select User')
 
             assert result == '[{"id": 1}]'
@@ -532,7 +536,7 @@ class TestClientQuery:
             client = _client_with_pool(pool)
 
             compile_patch, _ = self._patch_compile()
-            with compile_patch:
+            with compile_patch, _rows_as_documents():
                 result = await client.query_json('select User')
 
             assert result == '[]'
@@ -656,45 +660,42 @@ class TestClientCaching:
 
     def test_query_json_cache_hit_skips_db_fetchval(self, tmp_path):
         async def _run():
-            pool = _make_pool(query_result=['[{"id": 1}]'])
+            pool = _make_pool(query_result=['{"id": 1}'])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
 
             _cache.init(client._config.cache)
 
             compile_patch, _ = self._patch_compile(tags=['public.person'])
-            with compile_patch:
+            with compile_patch, _rows_as_documents():
                 first = await client.query_json('select Person')
                 second = await client.query_json('select Person')
 
             assert first == '[{"id": 1}]'
             assert second == '[{"id": 1}]'
-            pool.query_compiled_json_agg.assert_awaited_once()
+            pool.query_compiled.assert_awaited_once()
 
         run(_run())
 
     def test_query_single_json_cache_hit_skips_db_round_trip(self, tmp_path):
         async def _run():
             pool = _make_pool()
-            # query_single_json issues two fused calls on a cache miss:
-            # `query_compiled` first (to check emptiness/cardinality), then
-            # `query_compiled_row_to_json` for the actual JSON text.
-            pool.query_compiled = AsyncMock(return_value=['row1'])
-            pool.query_compiled_row_to_json = AsyncMock(return_value=['{"id": 1}'])
+            # One round trip on a cache miss: the JSON is rendered from the
+            # rows the query returned, not from a second, rewrapped run.
+            pool.query_compiled = AsyncMock(return_value=['{"id": 1}'])
             client = _client_with_pool(pool, cache_config=self._cache_config(tmp_path))
             from pylon import cache as _cache
 
             _cache.init(client._config.cache)
 
             compile_patch, _ = self._patch_compile(tags=['public.person'])
-            with compile_patch:
+            with compile_patch, _rows_as_documents():
                 first = await client.query_single_json('select Person')
                 second = await client.query_single_json('select Person')
 
             assert first == '{"id": 1}'
             assert second == '{"id": 1}'
             pool.query_compiled.assert_awaited_once()
-            pool.query_compiled_row_to_json.assert_awaited_once()
 
         run(_run())
 

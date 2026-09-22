@@ -35,6 +35,7 @@ mod client;
 mod decode;
 mod error;
 mod exec;
+pub mod json;
 mod listen;
 mod schema;
 mod transaction;

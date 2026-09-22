@@ -333,57 +333,6 @@ impl PgconPool {
         })
     }
 
-    /// Like `query_compiled`, but wraps the compiled SQL in `SELECT
-    /// COALESCE(json_agg(q), '[]') FROM (...) q` before executing — the
-    /// Rust-side equivalent of `Client.query_json`'s old Python
-    /// string-wrapping (`f"SELECT COALESCE(json_agg(q), '[]') FROM
-    /// ({sql}) q"`). Still just plain string formatting, but it happens
-    /// here instead of in Python, so no Python code ever touches `.sql`.
-    fn query_compiled_json_agg<'py>(
-        &self,
-        py: Python<'py>,
-        compiled: &CompiledQuery,
-        params: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let pool = self.inner.clone();
-        let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-        // Read before the async block: `compiled` is borrowed, and the
-        // future below outlives this call.
-        let shape_id = compiled.inner.shape_id();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let started = std::time::Instant::now();
-            let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
-            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
-            let rows = result.map_err(pgcon_err)?;
-            Ok(RowSet::new(rows))
-        })
-    }
-
-    /// Like `query_compiled`, but wraps the compiled SQL in `SELECT
-    /// row_to_json(q) FROM (... LIMIT 1) q` — the Rust-side equivalent of
-    /// `Client.query_single_json`'s second (JSON-materializing) query.
-    fn query_compiled_row_to_json<'py>(
-        &self,
-        py: Python<'py>,
-        compiled: &CompiledQuery,
-        params: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let pool = self.inner.clone();
-        let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-        // Read before the async block: `compiled` is borrowed, and the
-        // future below outlives this call.
-        let shape_id = compiled.inner.shape_id();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let started = std::time::Instant::now();
-            let result = pool.query_typed(&sql, &cached_params, pool.types()).await;
-            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
-            let rows = result.map_err(pgcon_err)?;
-            Ok(RowSet::new(rows))
-        })
-    }
-
     /// Runs `compiled`'s SQL through `EXPLAIN (ANALYZE, FORMAT JSON,
     /// VERBOSE)` and correlates the result against `compiled`'s own
     /// `analyze_paths` (populated only for `analyze <query>` — see
@@ -582,54 +531,6 @@ impl PgconTransaction {
             let result = tx.execute_typed(&sql, &cached_params).await;
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             result.map_err(pgcon_err)
-        })
-    }
-
-    /// See `PgconPool::query_compiled_json_agg`.
-    fn query_compiled_json_agg<'py>(
-        &self,
-        py: Python<'py>,
-        compiled: &CompiledQuery,
-        params: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let sql = format!("SELECT COALESCE(json_agg(q), '[]') FROM ({}) q", compiled.inner.sql);
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-        // Read before the async block: `compiled` is borrowed, and the
-        // future below outlives this call.
-        let shape_id = compiled.inner.shape_id();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
-            let started = std::time::Instant::now();
-            let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
-            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
-            let rows = result.map_err(pgcon_err)?;
-            Ok(RowSet::new(rows))
-        })
-    }
-
-    /// See `PgconPool::query_compiled_row_to_json`.
-    fn query_compiled_row_to_json<'py>(
-        &self,
-        py: Python<'py>,
-        compiled: &CompiledQuery,
-        params: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let sql = format!("SELECT row_to_json(q) FROM ({} LIMIT 1) q", compiled.inner.sql);
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
-        // Read before the async block: `compiled` is borrowed, and the
-        // future below outlives this call.
-        let shape_id = compiled.inner.shape_id();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = guard.as_ref().ok_or_else(closed_tx_err)?;
-            let started = std::time::Instant::now();
-            let result = tx.query_typed(&sql, &cached_params, tx.types()).await;
-            pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
-            let rows = result.map_err(pgcon_err)?;
-            Ok(RowSet::new(rows))
         })
     }
 
