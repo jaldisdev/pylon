@@ -3790,6 +3790,34 @@ fn build_shape(pointers: &[IrShapePointer], table_alias: &str) -> (Vec<String>, 
     (exprs, nodes)
 }
 
+/// A `$1`, `$2`, … template with each placeholder replaced by its argument's
+/// SQL, in one pass over the template alone. Replacing one number at a time
+/// over the growing string would rewrite a query parameter an argument
+/// carries (`$5` inside the first argument, replaced again as the fifth), and
+/// `$1` also matches the start of `$10`.
+fn fill_template(template: &str, args: &[String]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let mut end = start + 1;
+        while let Some((i, d)) = chars.peek().copied()
+            && d.is_ascii_digit()
+        {
+            end = i + d.len_utf8();
+            chars.next();
+        }
+        match template[start + 1..end].parse::<usize>() {
+            Ok(n) if (1..=args.len()).contains(&n) => out.push_str(&args[n - 1]),
+            _ => out.push_str(&template[start..end]),
+        }
+    }
+    out
+}
+
 /// `, message` for an assert given `message := …`, else nothing.
 fn assert_message_arg(message: &Option<IrExpr>) -> String {
     message
@@ -4380,12 +4408,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
         IrExpr::FunctionCall(f) => {
             let args: Vec<_> = f.args.iter().map(emit_expr).collect();
             if let Some(tmpl) = &f.sql_template {
-                // SqlExpression impl: substitute $1, $2, … with emitted arg SQL
-                let mut sql = tmpl.to_string();
-                for (i, arg) in args.iter().enumerate() {
-                    sql = sql.replace(&format!("${}", i + 1), arg);
-                }
-                return sql;
+                return fill_template(tmpl, &args);
             }
             let name = match &f.schema {
                 Some(s) => format!("{}.{}", pg_schema(s), qi(&f.name)),
@@ -5114,6 +5137,14 @@ mod tests {
         FunctionDescriptor, FunctionParamDescriptor, GlobalDescriptor, LinkDescriptor, MultiLinkDescriptor,
         NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
     };
+
+    #[test]
+    fn a_template_argument_keeps_the_parameters_it_carries() {
+        // The first argument carries query parameter `$2`; filled one number
+        // at a time, it would be rewritten into the second argument.
+        let filled = fill_template("f($1, $2, $10)", &["($2)::int".to_string(), "b".to_string()]);
+        assert_eq!(filled, "f(($2)::int, b, $10)");
+    }
 
     fn make_schema() -> SchemaDescriptor {
         SchemaDescriptor {
