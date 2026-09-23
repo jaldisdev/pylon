@@ -875,6 +875,62 @@ fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     cte_parts
 }
 
+/// One implementor's own copy of a polymorphic update: it writes to that
+/// implementor's table, and to that implementor's own junction tables — an
+/// interface's junction is a view over them, which Postgres refuses to
+/// insert into.
+fn concrete_poly_update(upd: &IrUpdate, imp: &IrPolyImplementor) -> IrUpdate {
+    let interface_prefix = format!("{}.", upd.target.table);
+    let own_prefix = format!("{}.", imp.table);
+    let own_junction = |table: &mut String, module: &mut String| {
+        if let Some(link) = table.strip_prefix(&interface_prefix) {
+            *table = format!("{own_prefix}{link}");
+            module.clone_from(&imp.module);
+        }
+    };
+    let mut concrete = upd.clone();
+    concrete.poly_implementors = vec![];
+    concrete.target.table = imp.table.clone();
+    concrete.target.type_name = imp.type_name.clone();
+    concrete.target.poly = None;
+    concrete
+        .multi_link_clears
+        .iter_mut()
+        .for_each(|c| own_junction(&mut c.junction_table, &mut c.module));
+    concrete
+        .multi_link_replaces
+        .iter_mut()
+        .chain(concrete.multi_link_appends.iter_mut())
+        .chain(concrete.multi_link_removals.iter_mut())
+        .for_each(|m| own_junction(&mut m.junction_table, &mut m.module));
+    concrete
+}
+
+/// `emit_poly_update_dml_ctes` for an update that also mutates a multi-link:
+/// each implementor gets the whole sibling set `emit_update_multilink_ctes`
+/// builds, against its own tables.
+fn emit_poly_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
+    let col_list = upd.poly_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+    let mut cte_parts = emit_user_cte_parts(&upd.nested_ctes);
+    let mut union_parts = vec![];
+    for (i, imp) in upd.poly_implementors.iter().enumerate() {
+        let cte_name = format!("{}__u{}", name, i);
+        cte_parts.extend(emit_update_multilink_cte_parts(
+            &concrete_poly_update(upd, imp),
+            &cte_name,
+            false,
+        ));
+        union_parts.push(format!(
+            "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
+            sql_str(&imp.type_name),
+            col_list,
+            cte_name,
+        ));
+    }
+    cte_parts.push(format!("\"{}\" AS (\n{}\n)", name, union_parts.join("\nUNION ALL\n")));
+    cte_parts
+}
+
 fn emit_poly_delete_dml_ctes(del: &IrDelete, name: &str) -> Vec<String> {
     let alias = &del.target.alias;
     let col_list = del.poly_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
@@ -953,11 +1009,23 @@ fn ml_clear_exclusion(rep: Option<&IrMultiLinkMutation>) -> String {
 /// seeing the updated row's full columns exactly as `RETURNING *` would have
 /// exposed them.
 fn emit_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
+    emit_update_multilink_cte_parts(upd, name, true)
+}
+
+/// `emit_nested` is false for a caller that has already emitted
+/// `upd.nested_ctes` beside this one: a polymorphic update emits one branch
+/// per implementor off the same `IrUpdate`, and a `WITH` may name each
+/// hoisted statement only once.
+fn emit_update_multilink_cte_parts(upd: &IrUpdate, name: &str, emit_nested: bool) -> Vec<String> {
     let alias = &upd.target.alias;
     let has_scalar_changes = !upd.assignments.is_empty() || !upd.rewrites.is_empty();
     let ids_name = format!("{}__ids", name);
     // The nested statements its values read from, ahead of it.
-    let mut parts: Vec<String> = emit_user_cte_parts(&upd.nested_ctes);
+    let mut parts: Vec<String> = if emit_nested {
+        emit_user_cte_parts(&upd.nested_ctes)
+    } else {
+        vec![]
+    };
 
     if has_scalar_changes {
         let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
@@ -1270,12 +1338,16 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             parts.extend(emit_user_cte_parts(nested));
         }
         if let IrStmt::Update(upd) = &c.stmt {
-            if update_has_any_multilink(upd) {
-                parts.extend(emit_update_multilink_ctes(upd, &c.name));
+            if !upd.poly_implementors.is_empty() {
+                parts.extend(if update_has_any_multilink(upd) {
+                    emit_poly_update_multilink_ctes(upd, &c.name)
+                } else {
+                    emit_poly_update_dml_ctes(upd, &c.name)
+                });
                 continue;
             }
-            if !upd.poly_implementors.is_empty() {
-                parts.extend(emit_poly_update_dml_ctes(upd, &c.name));
+            if update_has_any_multilink(upd) {
+                parts.extend(emit_update_multilink_ctes(upd, &c.name));
                 continue;
             }
         }
@@ -3557,30 +3629,11 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
         // with any to write each implementor is updated as the concrete type
         // it is.
         if has_any_multilink {
-            let interface_prefix = format!("{}.", upd.target.table);
-            let own_prefix = format!("{}.", imp.table);
-            let own_junction = |table: &mut String| {
-                if let Some(link) = table.strip_prefix(&interface_prefix) {
-                    *table = format!("{own_prefix}{link}");
-                }
-            };
-            let mut concrete = upd.clone();
-            concrete.poly_implementors = vec![];
-            concrete.nested_ctes = vec![];
-            concrete.target.table = imp.table.clone();
-            concrete.target.type_name = imp.type_name.clone();
-            concrete.target.poly = None;
-            concrete
-                .multi_link_clears
-                .iter_mut()
-                .for_each(|c| own_junction(&mut c.junction_table));
-            concrete
-                .multi_link_replaces
-                .iter_mut()
-                .chain(concrete.multi_link_appends.iter_mut())
-                .chain(concrete.multi_link_removals.iter_mut())
-                .for_each(|m| own_junction(&mut m.junction_table));
-            cte_parts.extend(emit_update_multilink_ctes(&concrete, &cte_name));
+            cte_parts.extend(emit_update_multilink_cte_parts(
+                &concrete_poly_update(upd, imp),
+                &cte_name,
+                false,
+            ));
         } else {
             let mut upd_sql = format!(
                 "UPDATE {} AS {}\nSET {}{}",

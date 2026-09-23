@@ -136,6 +136,154 @@ fn as_uuid(v: &DecodedValue) -> [u8; 16] {
     }
 }
 
+/// An interface with two implementors, each carrying the interface's own
+/// `access_grants` multi-link. The interface's junction table is a view
+/// over the implementors' own, so only those can be written to.
+fn brand_schema(module: &str) -> SchemaDescriptor {
+    let brand_q = format!("{module}::Brand");
+    let grant_q = format!("{module}::AccessGrant");
+    let implementor = |name: &str| {
+        let mut td = ty(name, module, vec![id_prop(), text_prop("name")]);
+        td.interfaces = vec![brand_q.clone()];
+        td.multilinks = vec![multilink("access_grants", &grant_q)];
+        td
+    };
+    let mut brand = ty("Brand", module, vec![id_prop(), text_prop("name")]);
+    brand.abstract_ = true;
+    brand.multilinks = vec![multilink("access_grants", &grant_q)];
+    SchemaDescriptor {
+        types: vec![
+            brand,
+            implementor("CorporateBrand"),
+            implementor("ProductBrand"),
+            ty("AccessGrant", module, vec![id_prop(), text_prop("role")]),
+        ],
+        ..Default::default()
+    }
+}
+
+/// The grant roles one brand of `type_name` named `name` holds.
+async fn grant_roles(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, type_name: &str, name: &str) -> Vec<String> {
+    let rows = rows_of(
+        pool,
+        sd,
+        &format!("select {type_name} {{ name, access_grants: {{ role }} }} filter .name = '{name}'"),
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "expected exactly one {type_name} named {name}");
+    let DecodedValue::Composite(shape) = &rows[0] else {
+        panic!("expected a Composite-shaped row, got {:?}", rows[0])
+    };
+    let DecodedValue::Array(grants) = &shape[2] else {
+        panic!("expected an Array for access_grants, got {:?}", shape[2])
+    };
+    grants.iter().map(|g| as_str(field(g, 1)).to_string()).collect()
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_with_bound_update_of_an_interface_appends_to_the_implementors_junction() {
+    // The rows a `with` binding names still belong to one concrete
+    // implementor each, so the append has to fan out to that implementor's
+    // own junction table — the interface's is a view, and Postgres refuses
+    // to insert into it ("cannot insert into view").
+    let module = unique_module("live_update_iface_ml");
+    let sd = brand_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::CorporateBrand {{ name := 'Test Brand' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::ProductBrand {{ name := 'Other Brand' }}"),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with brand := (select detached {module}::Brand filter .name = 'Test Brand' limit 1), \
+             grant := (insert {module}::AccessGrant {{ role := 'User' }}), \
+             addition := (update brand set {{ access_grants += grant }}) \
+             select grant {{ id }} limit 1"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        grant_roles(&pool, &sd, &format!("{module}::CorporateBrand"), "Test Brand").await,
+        vec!["User".to_string()],
+        "the grant should land on the brand the binding named"
+    );
+    assert!(
+        grant_roles(&pool, &sd, &format!("{module}::ProductBrand"), "Other Brand")
+            .await
+            .is_empty(),
+        "the other implementor's rows must be untouched"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_with_bound_update_of_an_interface_removes_from_the_implementors_junction() {
+    let module = unique_module("live_update_iface_ml_rm");
+    let sd = brand_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::CorporateBrand {{ name := 'Test Brand' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::AccessGrant {{ role := 'User' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::AccessGrant {{ role := 'Viewer' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "update {module}::CorporateBrand filter .name = 'Test Brand' \
+             set {{ access_grants := (select {module}::AccessGrant) }}"
+        ),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with brand := (select detached {module}::Brand filter .name = 'Test Brand' limit 1), \
+             removal := (update brand set {{ access_grants -= (select {module}::AccessGrant filter .role = 'Viewer') }}) \
+             select removal {{ id }}"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        grant_roles(&pool, &sd, &format!("{module}::CorporateBrand"), "Test Brand").await,
+        vec!["User".to_string()],
+        "only the removed grant should be gone"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn update_with_filter_modifies_only_matching_rows() {
