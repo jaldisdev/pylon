@@ -6346,6 +6346,8 @@ mod tests {
             name: "recent".into(),
             expression: "default::recent()".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         });
         let out = compile_and_emit_with("SELECT Person { recent }", &schema);
         assert!(
@@ -6771,6 +6773,8 @@ mod tests {
             name: "staff".into(),
             expression: ".<company[is default::Person]".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         schema
     }
@@ -6997,6 +7001,8 @@ mod tests {
             name: "latest_title".into(),
             expression: "(select .posts order by .title desc limit 1).title".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         });
         let out = compile_and_emit_with("SELECT Person { x := .latest_title }", &schema);
         assert!(out.sql.contains("\"title\""), "{}", out.sql);
@@ -7032,6 +7038,8 @@ mod tests {
             name: "latest_author".into(),
             expression: "((select .posts order by .title desc limit 1)).author".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         });
         let out = compile_and_emit_with("SELECT Person { latest_author: { name } }", &schema);
         assert!(out.sql.contains("\"name\""), "{}", out.sql);
@@ -7448,6 +7456,8 @@ mod tests {
             name: "shouted".into(),
             expression: "(with own := .name select std::str_upper(own))".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         };
         let ir = ir::compile_computed_in_type(&cd, "default::Person", &schema)
             .expect("a computed may read the object it is declared on");
@@ -8407,26 +8417,36 @@ mod tests {
                 name: "published".into(),
                 expression: "(select .posts filter .title != '')".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
             ComputedDescriptor {
                 name: "plain".into(),
                 expression: ".posts".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
             ComputedDescriptor {
                 name: "featured".into(),
                 expression: "(select .published filter .title != 'draft')".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
             ComputedDescriptor {
                 name: "looper".into(),
                 expression: "(select .looper)".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
             ComputedDescriptor {
                 name: "capped".into(),
                 expression: "(select .posts limit 1)".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
         ];
         schema
@@ -8457,11 +8477,15 @@ mod tests {
                 name: "recent".into(),
                 expression: "latest(.id)".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
             ComputedDescriptor {
                 name: "vetted".into(),
                 expression: "(select latest(.id) filter .title != '')".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
         ];
         schema
@@ -8527,6 +8551,8 @@ mod tests {
             name: "recent".into(),
             expression: "latest()".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         let ast = parse::parse("SELECT Person { t := .recent.title }").unwrap();
         let err = match ir::compile(&ast, &schema) {
@@ -8717,6 +8743,8 @@ mod tests {
             name: "tier".into(),
             expression: "'gold'".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         let individual = schema.types.iter_mut().find(|t| t.name == "Individual").unwrap();
         individual.computed = vec![];
@@ -8737,6 +8765,8 @@ mod tests {
             name: "recent".into(),
             expression: ".posts order by .title desc limit 5".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         // A schema fragment has no statement around it to hang modifiers
         // off, so this used to be "expected an expression, found 'order'".
@@ -8754,6 +8784,8 @@ mod tests {
             name: "recent".into(),
             expression: "select .posts order by .title desc limit 5".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         let out = compile_and_emit_with("SELECT Person { recent { title } }", &schema);
         assert!(out.sql.contains("LIMIT 5"), "{}", out.sql);
@@ -8908,6 +8940,8 @@ mod tests {
             name: "shout".into(),
             expression: ".name ++ '!'".into(),
             return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
         }];
         // `.company.shout` used to report "has no link or property 'shout'"
         // while helpfully suggesting 'shout' — path traversal never looked
@@ -8934,6 +8968,8 @@ mod tests {
             name: "shout".into(),
             expression: ".name ++ '!'".into(),
             return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
         }];
         let ast = parse::parse("SELECT Person { t := .company.shout.nope }").unwrap();
         let err = match ir::compile(&ast, &schema) {
@@ -8989,6 +9025,8 @@ mod tests {
             name: "authors".into(),
             expression: ".<posts[is Person]".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         // A backlink computed used to compile as an EXISTS boolean here —
         // the pointer builders were only reachable from an inline `:=`.
@@ -9009,6 +9047,8 @@ mod tests {
             name: "everything".into(),
             expression: ".posts".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         }];
         let out = compile_and_emit_with("SELECT Person { everything }", &schema);
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
@@ -9026,11 +9066,15 @@ mod tests {
                 name: "recent".into(),
                 expression: "(select .posts order by .title desc limit 1)".into(),
                 return_type: None,
+                link_target: None,
+                link_multi: false,
             },
             ComputedDescriptor {
                 name: "recent_title".into(),
                 expression: "(select .posts order by .title desc limit 1).title".into(),
                 return_type: Some("text".into()),
+                link_target: None,
+                link_multi: false,
             },
         ];
         let out = compile_and_emit_with("SELECT Person { recent { title }, recent_title }", &schema);
@@ -11352,6 +11396,8 @@ select owner { posts := (select owner.posts.title) };",
             name: "upper_name".into(),
             expression: "str_upper(.name)".into(),
             return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
         });
         let out = compile_and_emit_with("SELECT Person { upper_name }", &schema);
         assert!(
@@ -11457,6 +11503,8 @@ select owner { posts := (select owner.posts.title) };",
                         name: "full_name".into(),
                         expression: "str_upper(.first_name)".into(),
                         return_type: Some("text".into()),
+                        link_target: None,
+                        link_multi: false,
                     }],
                     constraints: vec![],
                     indexes: vec![],
@@ -11659,11 +11707,15 @@ select owner { posts := (select owner.posts.title) };",
             name: "authors".into(),
             expression: ".posts".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         });
         schema.types[0].computed.push(crate::schema::ComputedDescriptor {
             name: "age_next".into(),
             expression: ".age + 1".into(),
             return_type: Some("int8".into()),
+            link_target: None,
+            link_multi: false,
         });
 
         let shallow = compile_and_emit_with("SELECT Person { * }", &schema);
@@ -12017,6 +12069,8 @@ select owner { posts := (select owner.posts.title) };",
             name: "coauthors".into(),
             expression: ".posts.author".into(),
             return_type: None,
+            link_target: None,
+            link_multi: false,
         });
         let post = schema
             .types

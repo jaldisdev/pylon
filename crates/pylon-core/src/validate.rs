@@ -716,6 +716,8 @@ mod tests {
             name: "double_id".into(),
             expression: ".id".into(),
             return_type: Some("uuid".into()),
+            link_target: None,
+            link_multi: false,
         };
         let td = person_type(vec![cd], vec![]);
         let schema = minimal_schema(vec![td], vec![]);
@@ -728,6 +730,8 @@ mod tests {
             name: "bad".into(),
             expression: ".id".into(),
             return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
         };
         let td = person_type(vec![cd], vec![]);
         let schema = minimal_schema(vec![td], vec![]);

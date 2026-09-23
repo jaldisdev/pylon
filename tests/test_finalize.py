@@ -668,6 +668,42 @@ class TestWalkIntegration:
         assert schema.scalar_count == 0
         assert schema.enum_count == 0
 
+    def test_computed_link_reports_the_type_it_selects(self):
+        import json
+
+        from pylon.schema._walker import walk
+
+        @pylon.type(module='account', name='Email')
+        class Email:
+            address: str
+
+        @pylon.type(module='account', name='Member')
+        class Member:
+            name: str
+
+        @pylon.type(module='account', name='Org')
+        class Org:
+            name: str
+            emails: pylon.MultiLink[Email]
+            staff: pylon.MultiLink[Member]
+            primary_email: pylon.Computed[pylon.Link[Email], 'select .emails limit 1']
+            members: pylon.Computed[pylon.MultiLink[Member], '.staff']
+            label: pylon.Computed[str, '.name']
+
+        types, enums, scalars = snapshot()
+        schema = json.loads(walk(types, enums, scalars, []).to_json())
+        org = next(t for t in schema['types'] if t['name'] == 'Org')
+        computed = {c['name']: c for c in org['computed']}
+        # A computed selecting objects is a link in everything but name — the
+        # schema browser reads this to render and walk into it as one.
+        assert computed['primary_email']['link_target'] == 'account::Email'
+        assert computed['primary_email']['link_multi'] is False
+        assert computed['members']['link_target'] == 'account::Member'
+        assert computed['members']['link_multi'] is True
+        # A scalar computed still carries its own return type and no link.
+        assert computed['label']['link_target'] is None
+        assert computed['label']['return_type'] == 'text'
+
     def test_schema_with_enum(self):
         from pylon.schema._walker import walk
 

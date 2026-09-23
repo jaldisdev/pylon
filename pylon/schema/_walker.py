@@ -188,7 +188,14 @@ def _resolve_links(
     type_map: dict[str, type],
     class_to_qname: dict[int, str],
 ) -> None:
-    """Mutate PointerMeta.link_target / .through to qualified name strings."""
+    """Mutate PointerMeta.link_target / .through to qualified name strings.
+
+    A computed selecting objects (`Computed[Link[Email], '...']`) carries its
+    target on the annotation it wraps rather than on the meta itself, and is
+    resolved in place there — see `_make_computed_desc`, which reads it back.
+    """
+    from ._pointers import LinkAnnotation, MultiLinkAnnotation
+
     for cls in types:
         cfg = cls.__pylon_config__
         for pointer_name, meta in cfg.pointers.items():
@@ -198,6 +205,11 @@ def _resolve_links(
             if meta.kind in ('link', 'multilink') and meta.through is not None:
                 label = f'{cfg.module}::{cfg.name}.{pointer_name} through'
                 meta.through = _resolve_target(meta.through, cls, class_to_qname, type_map, label)
+            if meta.kind == 'computed' and isinstance(meta.scalar_type, (LinkAnnotation, MultiLinkAnnotation)):
+                label = f'{cfg.module}::{cfg.name}.{pointer_name} computed link_target'
+                meta.scalar_type.target_type = _resolve_target(
+                    meta.scalar_type.target_type, cls, class_to_qname, type_map, label
+                )
 
 
 # ── Cycle detection ────────────────────────────────────────────────────────────
@@ -934,7 +946,19 @@ def _make_computed_desc(name: str, meta: Any, _core: Any) -> Any:
     # check", which is exactly the truth here; the pointer's real shape comes
     # from the link it selects.
     declared = meta.scalar_type
-    if isinstance(declared, (LinkAnnotation, MultiLinkAnnotation)) or _is_pylon_type(declared):
+    if isinstance(declared, (LinkAnnotation, MultiLinkAnnotation)):
+        # The type it selects is still worth reporting: it is what a reader of
+        # the schema alone (the schema browser) needs to show the pointer as
+        # the link it is, rather than as an untyped expression.
+        return _core.ComputedDescriptor(
+            name=name,
+            expression=meta.expression,
+            return_type=None,
+            # Already a qualified string — resolved in place by `_resolve_links`.
+            link_target=declared.target_type,
+            link_multi=isinstance(declared, MultiLinkAnnotation),
+        )
+    if _is_pylon_type(declared):
         return _core.ComputedDescriptor(name=name, expression=meta.expression, return_type=None)
     return _core.ComputedDescriptor(
         name=name,

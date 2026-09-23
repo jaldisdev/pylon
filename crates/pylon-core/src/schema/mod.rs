@@ -162,6 +162,16 @@ pub struct ComputedDescriptor {
     pub expression: String,
     /// PostgreSQL return type, if known at schema-build time.
     pub return_type: Option<String>,
+    /// The qualified object type a link-valued computed selects
+    /// (`Computed[Link[Email], "…"]`) — `None` for a scalar computed, whose
+    /// type is `return_type` instead. A consumer that has only the schema to
+    /// go on (the schema browser, an editor) cannot tell the two apart
+    /// otherwise: both carry a bare expression string.
+    #[serde(default)]
+    pub link_target: Option<String>,
+    /// Whether that link-valued computed selects many.
+    #[serde(default)]
+    pub link_multi: bool,
 }
 
 // ── Type-level constructs ──────────────────────────────────────────────────────

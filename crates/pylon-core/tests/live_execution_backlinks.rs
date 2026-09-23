@@ -707,6 +707,8 @@ async fn a_computed_read_off_a_binding_keeps_its_own_bindings_on_that_row() {
         name: "label".into(),
         expression: "(with org_name := .org.name select org_name ++ '!')".into(),
         return_type: Some("text".into()),
+        link_target: None,
+        link_multi: false,
     }];
     let pool = test_pool().await;
     pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();

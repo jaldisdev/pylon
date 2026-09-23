@@ -159,9 +159,20 @@ fn multilink_json(ml: &MultiLinkDescriptor) -> Json {
 }
 
 fn computed_json(c: &ComputedDescriptor) -> Json {
-    let mut obj = match &c.return_type {
-        Some(rt) => json!({"kind": "computed", "typeName": pg_type_to_pyql(rt)}),
-        None => json!({"kind": "computed"}),
+    // A link-valued computed reports the type it selects, the same `target` a
+    // real link pointer carries, so the browser can render and walk into it
+    // like one instead of printing its raw object JSON.
+    let mut obj = match (&c.link_target, &c.return_type) {
+        (Some(target), _) => json!({"kind": "computed", "target": target, "multi": c.link_multi}),
+        // An enum return type arrives as its quoted Postgres type
+        // (`"account"."AccountTier"`) — reported as the qualified PyQL name a
+        // stored enum property gets, so the column reads as one and its
+        // values resolve to real member labels.
+        (None, Some(rt)) if rt.starts_with('"') => {
+            json!({"kind": "computed", "typeName": pg_quoted_to_qualified(rt)})
+        }
+        (None, Some(rt)) => json!({"kind": "computed", "typeName": pg_type_to_pyql(rt)}),
+        (None, None) => json!({"kind": "computed"}),
     };
     obj["name"] = Json::from(c.name.clone());
     obj
@@ -224,4 +235,66 @@ pub fn globals_json(schema: &SchemaDescriptor) -> Json {
         .map(global_json)
         .collect();
     json!({"globals": globals})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn computed(
+        name: &str,
+        link_target: Option<&str>,
+        link_multi: bool,
+        return_type: Option<&str>,
+    ) -> ComputedDescriptor {
+        ComputedDescriptor {
+            name: name.to_string(),
+            expression: ".x".to_string(),
+            return_type: return_type.map(str::to_string),
+            link_target: link_target.map(str::to_string),
+            link_multi,
+        }
+    }
+
+    #[test]
+    fn a_scalar_computed_reports_its_return_type() {
+        let json = computed_json(&computed("label", None, false, Some("text")));
+        assert_eq!(json["kind"], "computed");
+        assert_eq!(json["typeName"], "std::str");
+        assert!(
+            json.get("target").is_none(),
+            "a scalar computed links to nothing: {json}"
+        );
+    }
+
+    #[test]
+    fn a_computed_link_reports_the_type_it_selects() {
+        let json = computed_json(&computed("primary_email", Some("account::Email"), false, None));
+        assert_eq!(json["kind"], "computed");
+        assert_eq!(json["target"], "account::Email");
+        assert_eq!(json["multi"], false);
+    }
+
+    #[test]
+    fn a_computed_multi_link_reports_that_it_selects_many() {
+        let json = computed_json(&computed("members", Some("account::Account"), true, None));
+        assert_eq!(json["target"], "account::Account");
+        assert_eq!(json["multi"], true);
+    }
+
+    /// Nothing to report at all — the shape every computed had before the
+    /// link-valued ones carried their target.
+    #[test]
+    fn a_computed_enum_reports_its_qualified_name() {
+        let json = computed_json(&computed("tier", None, false, Some("\"account\".\"AccountTier\"")));
+        assert_eq!(json["typeName"], "account::AccountTier");
+    }
+
+    #[test]
+    fn an_untyped_computed_reports_only_its_kind() {
+        let json = computed_json(&computed("mystery", None, false, None));
+        assert_eq!(json["kind"], "computed");
+        assert_eq!(json["name"], "mystery");
+        assert!(json.get("typeName").is_none() && json.get("target").is_none());
+    }
 }

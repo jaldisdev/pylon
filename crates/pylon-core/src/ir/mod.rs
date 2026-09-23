@@ -1838,6 +1838,8 @@ mod tests {
             name: "upper_name".into(),
             expression: "str_upper(.name)".into(),
             return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
         });
         schema
     }

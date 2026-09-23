@@ -521,13 +521,21 @@ pub struct ComputedDescriptor {
 #[pymethods]
 impl ComputedDescriptor {
     #[new]
-    #[pyo3(signature = (name, expression, *, return_type = None))]
-    fn new(name: String, expression: String, return_type: Option<String>) -> Self {
+    #[pyo3(signature = (name, expression, *, return_type = None, link_target = None, link_multi = false))]
+    fn new(
+        name: String,
+        expression: String,
+        return_type: Option<String>,
+        link_target: Option<String>,
+        link_multi: bool,
+    ) -> Self {
         Self {
             inner: core::schema::ComputedDescriptor {
                 name,
                 expression,
                 return_type,
+                link_target,
+                link_multi,
             },
         }
     }
@@ -545,6 +553,16 @@ impl ComputedDescriptor {
     #[getter]
     fn return_type(&self) -> Option<&str> {
         self.inner.return_type.as_deref()
+    }
+
+    #[getter]
+    fn link_target(&self) -> Option<&str> {
+        self.inner.link_target.as_deref()
+    }
+
+    #[getter]
+    fn link_multi(&self) -> bool {
+        self.inner.link_multi
     }
 }
 
