@@ -11606,10 +11606,18 @@ impl<'a> Compiler<'a> {
                         // for the array of its elements, leaving the aggregate
                         // with an array argument and no overload to match.
                         // A backlink is as many-valued: `count(.<revisions)`.
+                        // So is a computed selecting a set
+                        // (`Computed[MultiLink[Member], '.staff']`) — one step,
+                        // but the junction-only count below cannot see through
+                        // it to a junction table, so it walks the path the
+                        // computed splices into instead.
                         if let Expr::Path(p) = arg
                             && p.partial
                             && (p.steps.len() > 1 && self.path_crosses_multi(td, &p.steps)
-                                || matches!(p.steps.first(), Some(ast::PathStep::Backlink(_))))
+                                || matches!(p.steps.first(), Some(ast::PathStep::Backlink(_)))
+                                || matches!(p.steps.as_slice(), [ast::PathStep::Name(name)]
+                                    if Self::resolve_multilink(td, name).is_none()
+                                        && self.path_crosses_multi(td, &p.steps)))
                         {
                             let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
                             steps.extend(p.steps.iter().cloned());

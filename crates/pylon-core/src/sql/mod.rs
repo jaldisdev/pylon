@@ -6962,6 +6962,41 @@ mod tests {
     }
 
     #[test]
+    fn an_aggregate_over_a_computed_set_counts_inside_a_subquery() {
+        // `count(.plain)` is one step, so the junction-only count a stored
+        // multi-link gets cannot apply — it has no junction to read. Taking
+        // the walk as a value instead made the whole select an aggregate
+        // query, which Postgres rejects ("column must appear in the GROUP BY
+        // clause").
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person { n := count(.plain) }", &schema);
+        assert!(
+            !out.sql.contains("count((SELECT"),
+            "the aggregate belongs inside the walk's subquery, not around it:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("(SELECT count(") && out.sql.contains("\"public\".\"Post\""),
+            "it counts the rows the computed's own path lands on:\n{}",
+            out.sql
+        );
+    }
+
+    /// The specialized count for a stored multi-link reads its junction table
+    /// alone — the computed case above must not have pulled it off that route.
+    #[test]
+    fn an_aggregate_over_a_stored_multi_link_still_counts_its_junction_rows() {
+        let schema = make_schema_with_computed_links();
+        let out = compile_and_emit_with("SELECT Person { n := count(.posts) }", &schema);
+        assert!(out.sql.contains("\"public\".\"Person.posts\""), "{}", out.sql);
+        assert!(
+            !out.sql.contains("JOIN \"public\".\"Post\""),
+            "counting junction rows needs no join onto the targets:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn test_a_select_can_name_its_own_result() {
         // `SELECT OptionallyAliasedExpr` in PyQL: the alias names the result
         // and the select's own clauses may read it by that name.

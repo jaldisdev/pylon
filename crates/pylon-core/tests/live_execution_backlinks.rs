@@ -519,6 +519,60 @@ async fn a_bare_multilink_reads_as_the_set_of_rows_on_its_far_side() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn counting_a_computed_set_counts_the_rows_it_selects() {
+    // `count(.mates)` names one step, so the junction-only count a stored
+    // multi-link gets cannot apply. Taking the walk as a value instead made
+    // the whole select an aggregate query, which Postgres rejects outright:
+    // "column must appear in the GROUP BY clause or be used in an aggregate
+    // function" — a compile-clean query that could never run.
+    let module = unique_module("live_backlinks_computed_count");
+    let mut schema = backlinks_schema(&module);
+    let person = schema.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+    person.computed = vec![pylon_core::schema::ComputedDescriptor {
+        name: "mates".into(),
+        expression: ".friends".into(),
+        return_type: None,
+        link_target: Some(format!("{module}::Person")),
+        link_multi: true,
+    }];
+    let pool = test_pool().await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    for name in ["Alice", "Bob", "Carol"] {
+        let compiled = query::compile(&format!("insert {module}::Person {{ name := '{name}' }}"), &schema).unwrap();
+        pool.execute_typed(&compiled.sql, &[]).await.unwrap();
+    }
+    let update = query::compile(
+        &format!(
+            "update {module}::Person filter .name = 'Alice' \
+             set {{ friends += (select {module}::Person filter .name != 'Alice') }}"
+        ),
+        &schema,
+    )
+    .unwrap();
+    pool.execute_typed(&update.sql, &[]).await.unwrap();
+
+    let counted = rows(
+        &pool,
+        &schema,
+        &format!("select {module}::Person {{ name, n := count(.mates) }} order by .name"),
+    )
+    .await;
+    let counts: Vec<i64> = counted
+        .iter()
+        .map(|row| match row {
+            pylon_value::DecodedValue::Composite(fields) => match fields.get(2) {
+                Some(pylon_value::DecodedValue::I64(n)) => *n,
+                other => panic!("expected a count, got {other:?}"),
+            },
+            other => panic!("expected a Composite-shaped Person row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(counts, vec![2, 0, 0], "Alice has two friends, the others none");
+}
+
 async fn rows(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, pyql: &str) -> Vec<pylon_value::DecodedValue> {
     let compiled = query::compile(pyql, schema).unwrap();
     pool.query_typed(&compiled.sql, &[], &pylon_pgcon::ExtensionOids::default())
