@@ -656,6 +656,44 @@ fn cte_stmt_type(stmt: &IrStmt) -> String {
 /// Compile a WITH binding value: a subquery becomes its statement; any other
 /// expression is wrapped in a synthetic `select expr` so it can be used as a CTE.
 fn compile_cte_binding(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQLError> {
+    let stmt = compile_cte_binding_stmt(c, expr)?;
+    Ok(hoist_binding_dml(c, stmt))
+}
+
+/// `g := (insert T { … }) if cond else {}` — the binding's value compiles to a
+/// select *over* a mutation. A data-modifying statement may only sit at the top
+/// level of a `WITH`, never inside another CTE's body, so the mutation becomes a
+/// CTE of its own ahead of this binding — where `g := existing ?? (insert T { …
+/// })` already puts one — and the binding reads its rows back from there.
+/// Emitted as-is, the mutation was dropped and the binding read the whole table.
+fn hoist_binding_dml(c: &mut Compiler<'_>, stmt: IrStmt) -> IrStmt {
+    let IrStmt::Select(mut select) = stmt else {
+        return stmt;
+    };
+    let Some(dml) = select
+        .dml_source
+        .take_if(|dml| matches!(dml.as_ref(), IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::Delete(_)))
+    else {
+        return IrStmt::Select(select);
+    };
+    let cte_name = c.fresh_nested_cte_name();
+    for row in &mut select.rows {
+        if let IrRowSource::Bound { source, .. } = row {
+            source.table = format!("@cte:{cte_name}");
+            // The CTE's rows are already the concrete ones the mutation
+            // touched, each carrying its own `__type__`.
+            source.poly = None;
+        }
+    }
+    c.hoisted_ctes.push(IrCteDef {
+        name: cte_name,
+        type_name: cte_stmt_type(&dml),
+        stmt: *dml,
+    });
+    IrStmt::Select(select)
+}
+
+fn compile_cte_binding_stmt(c: &mut Compiler<'_>, expr: &Expr) -> Result<IrStmt, PyQLError> {
     if let Expr::SubQuery(s) = expr {
         let stmt = c.compile_stmt(s)?;
         if let IrStmt::Group(grp) = &stmt

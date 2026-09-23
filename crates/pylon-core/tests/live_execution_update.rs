@@ -230,6 +230,111 @@ async fn a_with_bound_update_of_an_interface_appends_to_the_implementors_junctio
     );
 }
 
+/// Every grant role in the database, in order.
+async fn all_grant_roles(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) -> Vec<String> {
+    let rows = rows_of(
+        pool,
+        sd,
+        &format!("select {module}::AccessGrant {{ role }} order by .role"),
+    )
+    .await;
+    rows.iter().map(|r| as_str(field(r, 1)).to_string()).collect()
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_with_bound_guarded_insert_runs_its_insert() {
+    // `g := (insert T { … }) if cond else {}` compiles to a select *over* an
+    // insert, and a data-modifying statement cannot sit inside another CTE's
+    // body — so the insert has to be hoisted into a CTE of its own. Emitted
+    // in place it was dropped, leaving the binding reading the whole table.
+    let module = unique_module("live_update_guarded_insert");
+    let sd = brand_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::CorporateBrand {{ name := 'Test Brand' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::AccessGrant {{ role := 'Unrelated' }}"),
+    )
+    .await;
+
+    let guarded = |name: &str| {
+        format!(
+            "with brand := (select {module}::CorporateBrand filter .name = '{name}' limit 1), \
+             grant := (insert {module}::AccessGrant {{ role := 'User' }}) if exists(brand) else {{}} \
+             select grant {{ role }}"
+        )
+    };
+
+    let rows = rows_of(&pool, &sd, &guarded("No Such Brand")).await;
+    assert!(
+        rows.is_empty(),
+        "a guarded insert whose condition fails inserts nothing"
+    );
+    assert_eq!(
+        all_grant_roles(&pool, &sd, &module).await,
+        vec!["Unrelated".to_string()],
+        "the binding must not read rows the insert never wrote"
+    );
+
+    let rows = rows_of(&pool, &sd, &guarded("Test Brand")).await;
+    assert_eq!(rows.len(), 1, "the guarded insert should yield its one new row");
+    assert_eq!(as_str(field(&rows[0], 1)), "User");
+    assert_eq!(
+        all_grant_roles(&pool, &sd, &module).await,
+        vec!["Unrelated".to_string(), "User".to_string()]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_guarded_insert_appended_to_an_interface_links_only_the_new_row() {
+    let module = unique_module("live_update_guarded_append");
+    let sd = brand_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::CorporateBrand {{ name := 'Test Brand' }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::AccessGrant {{ role := 'Unrelated' }}"),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with grantee := (select {module}::CorporateBrand filter .name = 'Test Brand' limit 1), \
+             brand := (select detached {module}::Brand filter .name = 'Test Brand' limit 1), \
+             grant := (insert {module}::AccessGrant {{ role := 'User' }}) if exists(grantee) else {{}}, \
+             addition := (update brand set {{ access_grants += grant }}) \
+             select grant {{ role }} limit 1"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        grant_roles(&pool, &sd, &format!("{module}::CorporateBrand"), "Test Brand").await,
+        vec!["User".to_string()],
+        "only the inserted grant should be linked, not every grant in the table"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn a_with_bound_update_of_an_interface_removes_from_the_implementors_junction() {
