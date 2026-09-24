@@ -2397,6 +2397,25 @@ mod tests {
         );
     }
 
+    /// Two `for` bodies may each declare `line`. One WITH clause cannot hold
+    /// that name twice, so the second binding is emitted under a suffixed one.
+    #[test]
+    fn test_two_sibling_bindings_of_one_name_get_separate_with_names() {
+        let ast = parse::parse(
+            "WITH a := (FOR p IN (SELECT Person) UNION (WITH line := (SELECT Person) SELECT line.name)), \
+             b := (FOR p IN (SELECT Person) UNION (WITH line := (SELECT Post) SELECT line.title)) \
+             SELECT {a := a, b := b}",
+        )
+        .unwrap();
+        let ir = super::compile(&ast, &make_schema()).expect("IR compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert_eq!(
+            sql.matches("\"line\" AS (").count(),
+            1,
+            "one name can only be claimed once:\n{sql}"
+        );
+    }
+
     /// One computed reached from two places in a statement inlines its `with`
     /// bindings twice, which used to emit two CTEs of one name — PostgreSQL's
     /// "WITH query name specified more than once". The bindings are identical,

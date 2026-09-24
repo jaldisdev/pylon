@@ -1275,6 +1275,11 @@ struct Compiler<'a> {
     /// twice (one computed inlined from two places) is recognised as the same
     /// rather than emitted twice under one CTE name.
     hoisted_binding_sources: HashMap<String, Expr>,
+    /// The WITH name a binding is actually emitted under. Two `for` bodies may
+    /// each declare `line`; one WITH clause cannot hold that name twice, so the
+    /// second is emitted under a suffixed one and every reference to it reads
+    /// from here.
+    cte_sql_names: HashMap<String, String>,
     /// `(through type, junction alias)` of the multi-link whose own
     /// modifiers are being compiled — what a bare `@prop` in `filter
     /// (@primary = true)` resolves against. `None` on the stack means a link
@@ -1429,6 +1434,7 @@ impl<'a> Compiler<'a> {
             link_prop_scope: Vec::new(),
             hoisted_ctes: Vec::new(),
             hoisted_binding_sources: HashMap::new(),
+            cte_sql_names: HashMap::new(),
             pending_detached: false,
             modifier_anchor: None,
             inline_bindings: std::collections::HashMap::new(),
@@ -1466,6 +1472,32 @@ impl<'a> Compiler<'a> {
         let ir = self.compile_expr_ctx(expr, ctx)?;
         self.inline_bindings.insert(name.to_string(), ir);
         Ok(true)
+    }
+
+    /// The WITH name `name` is emitted under — itself, unless it collided.
+    fn cte_sql_name(&self, name: &str) -> String {
+        self.cte_sql_names
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Claim a WITH name for `name`, suffixing it while one statement already
+    /// holds it. Returns the name the CTE is emitted under.
+    fn claim_cte_sql_name(&mut self, name: &str) -> String {
+        if !self.hoisted_binding_sources.contains_key(name) {
+            self.cte_sql_names.remove(name);
+            return name.to_string();
+        }
+        let mut suffix = 1;
+        let taken: std::collections::HashSet<&String> = self.cte_sql_names.values().collect();
+        let mut candidate = format!("{name}__{suffix}");
+        while self.hoisted_binding_sources.contains_key(&candidate) || taken.contains(&candidate) {
+            suffix += 1;
+            candidate = format!("{name}__{suffix}");
+        }
+        self.cte_sql_names.insert(name.to_string(), candidate.clone());
+        candidate
     }
 
     fn register_cte(&mut self, name: &str, ir_stmt: &IrStmt) -> String {
@@ -2778,7 +2810,7 @@ impl<'a> Compiler<'a> {
             return format!("@cte:{cte}");
         }
         if self.cte_object_type(name).is_some() {
-            return format!("@cte:{name}");
+            return format!("@cte:{}", self.cte_sql_name(name));
         }
         td.table.clone()
     }
@@ -3451,9 +3483,12 @@ impl<'a> Compiler<'a> {
                         continue;
                     }
                     let ir_inner = compile_cte_binding(self, &alias.expr)?;
+                    let sql_name = self.claim_cte_sql_name(&alias.name);
                     let type_name = self.register_cte(&alias.name, &ir_inner);
+                    self.hoisted_binding_sources
+                        .insert(sql_name.clone(), alias.expr.clone());
                     self.hoisted_ctes.push(IrCteDef {
-                        name: alias.name.clone(),
+                        name: sql_name,
                         stmt: ir_inner,
                         type_name,
                     });
@@ -5848,7 +5883,7 @@ impl<'a> Compiler<'a> {
                 return None;
             };
             match self.cte_object_type(name) {
-                Some(qualified) => branches.push((qualified, format!("@cte:{name}"))),
+                Some(qualified) => branches.push((qualified, format!("@cte:{}", self.cte_sql_name(name)))),
                 None => match self.resolve_type(name) {
                     Ok(td) => branches.push((format!("{}::{}", td.module, td.name), td.table.clone())),
                     Err(_) => return None,
@@ -6681,7 +6716,7 @@ impl<'a> Compiler<'a> {
     fn compile_for(&mut self, f: &ast::ForStmt) -> Result<IrFor, PyQLError> {
         // A loop straight over a binding: the rows are that binding's, so a
         // walk off the variable reads it rather than the type's own table.
-        let iterated_binding = self.resolve_cte_name(&f.iterator).map(str::to_string);
+        let iterated_binding = self.resolve_cte_name(&f.iterator).map(|name| self.cte_sql_name(name));
         // Compile the iterator to determine what one loop variable binds to.
         let (iterator, pg_type, yielded_object_type) = match &f.iterator {
             Expr::Set(elems) => {
@@ -6747,7 +6782,7 @@ impl<'a> Compiler<'a> {
                 let source = IrSource {
                     poly: None,
                     type_name: yielded.clone(),
-                    table: format!("@cte:{name}"),
+                    table: format!("@cte:{}", self.cte_sql_name(name)),
                     alias: self.fresh_alias(),
                 };
                 (
@@ -13289,7 +13324,7 @@ impl<'a> Compiler<'a> {
             // pg type and must not be handed to type inference.
             let scalar = !t.contains("::");
             return Some(IrExpr::CteRef {
-                name: name.to_string(),
+                name: self.cte_sql_name(name),
                 scalar,
                 pg_type: (scalar && !t.is_empty()).then(|| literal_sentinel_to_pg(t).to_string()),
             });
