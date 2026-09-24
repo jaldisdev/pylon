@@ -1443,6 +1443,43 @@ impl<'a> Compiler<'a> {
     /// subquery read. Anything whose row count isn't statically one counts as
     /// multi: a needless membership test still answers correctly, a needless
     /// scalar read aborts the query.
+    /// True when `sel`'s filter pins an exclusive property to one value, which
+    /// makes it single-valued however many rows the table holds. the upstream engine makes the
+    /// same inference, and it is why
+    /// `(select Installation filter .id = <uuid>$x).connector.provider.staff`
+    /// is a value there rather than a one-element set.
+    fn pins_an_exclusive_property(&self, sel: &IrSelect) -> bool {
+        let [IrRowSource::Bound { source, .. }] = sel.rows.as_slice() else {
+            return false;
+        };
+        let Some(filter) = &sel.filter else { return false };
+        let Ok(td) = self.resolve_type(&source.type_name) else {
+            return false;
+        };
+        Self::pins_exclusive(td, filter)
+    }
+
+    /// Walks the conjuncts of `filter` for an equality against an exclusive or
+    /// primary-key column. Only `and` is descended: under `or` either side
+    /// could match a different row, so neither pins anything.
+    fn pins_exclusive(td: &TypeDescriptor, filter: &IrExpr) -> bool {
+        let IrExpr::BinOp(binop) = filter else { return false };
+        match binop.op {
+            ast::BinOpKind::And => Self::pins_exclusive(td, &binop.left) || Self::pins_exclusive(td, &binop.right),
+            ast::BinOpKind::Eq => {
+                let column = match (&binop.left, &binop.right) {
+                    (IrExpr::ColumnRef { column, .. }, _) => column,
+                    (_, IrExpr::ColumnRef { column, .. }) => column,
+                    _ => return false,
+                };
+                td.properties
+                    .iter()
+                    .any(|p| &p.name == column && (p.is_exclusive || p.is_pk))
+            }
+            _ => false,
+        }
+    }
+
     fn note_cte_cardinality(&mut self, name: &str, ir_stmt: &IrStmt) {
         let single = match ir_stmt {
             IrStmt::Insert(_) => true,
@@ -1457,6 +1494,7 @@ impl<'a> Compiler<'a> {
                                 | IrFreeExpr::Tuple(_)
                         )]
                     )
+                    || self.pins_an_exclusive_property(sel)
             }
             _ => false,
         };
@@ -13609,7 +13647,13 @@ impl<'a> Compiler<'a> {
                 lock: None,
             };
             let ps = self.compile_path_select(&synthetic, p, &[], false)?;
-            let multi = matches!(ps.result, IrPathResult::Scalar(..)) && !ps.joins.is_empty();
+            // A walk made only of forward single links does not multiply rows,
+            // so its cardinality is the root binding's. Treating every join as
+            // widening made `(select T filter .id = $x).link.prop` a
+            // one-element set where the upstream engine gives the value itself.
+            let widens = ps.joins.iter().any(|join| !matches!(join, IrPathJoin::Single { .. }));
+            let root_is_multi = self.multi_row_ctes.contains(root.as_str());
+            let multi = matches!(ps.result, IrPathResult::Scalar(..)) && (widens || root_is_multi);
             return Ok(if multi {
                 IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(ps))))
             } else {

@@ -2393,6 +2393,42 @@ mod tests {
         );
     }
 
+    /// `(select T filter .id = $x).link.prop` is one value, not a one-element
+    /// set: the filter pins an exclusive property and every step is a forward
+    /// single link, so nothing multiplies. the upstream engine infers the same, and conduit
+    /// decodes the result straight into a `bool`.
+    #[test]
+    fn test_a_single_link_walk_off_a_pinned_row_is_not_a_set() {
+        let schema = make_schema();
+        let ast =
+            parse::parse("WITH i := (SELECT Person FILTER .id = <uuid>$0) SELECT { c := i.company.name }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(!sql.contains("ARRAY(SELECT"), "expected a value, not a set:\n{sql}");
+    }
+
+    /// The same walk off a row the filter does *not* pin stays a set — there
+    /// may be many matching rows, so there may be many values.
+    #[test]
+    fn test_a_single_link_walk_off_an_unpinned_row_is_still_a_set() {
+        let schema = make_schema();
+        let ast = parse::parse("WITH i := (SELECT Person FILTER .name = 'x') SELECT { c := i.company.name }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("ARRAY(SELECT"), "a walk off many rows is a set:\n{sql}");
+    }
+
+    /// And a step through a multi-link is a set however the root is pinned.
+    #[test]
+    fn test_a_multi_link_step_is_a_set_even_off_a_pinned_row() {
+        let schema = make_schema();
+        let ast =
+            parse::parse("WITH i := (SELECT Person FILTER .id = <uuid>$0) SELECT { t := i.posts.title }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("ARRAY(SELECT"), "a multi-link step is a set:\n{sql}");
+    }
+
     /// `(update T set { multi += (insert X …) }).multi { … }` — automator reads
     /// back the config field it just appended. Postgres shows a sibling CTE's
     /// inserts neither in the junction table nor in the target's own, so both
