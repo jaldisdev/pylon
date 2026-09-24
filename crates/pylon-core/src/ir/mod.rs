@@ -2387,6 +2387,39 @@ mod tests {
         );
     }
 
+    /// A `<json>` cast as a shape element is an ordinary column of the row, so
+    /// it must carry the pointer's name and position. Describing it with the
+    /// root-only `JsonScalar` (which carries neither) made `pylon-client` panic
+    /// with "shape node kind never appears as an object's own pointer".
+    #[test]
+    fn test_a_json_cast_in_a_shape_is_a_named_pointer() {
+        use crate::query::ShapeNode;
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Person { j := <json>.name }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let shape = crate::sql::emit(&ir).shape;
+        let ShapeNode::Object { pointers, .. } = &shape.root else {
+            panic!("expected an object shape, got {:?}", shape.root);
+        };
+        let pointer = pointers
+            .iter()
+            .find(|node| matches!(node, ShapeNode::Scalar { name, .. } if name == "j"))
+            .unwrap_or_else(|| panic!("no scalar pointer named 'j' in {pointers:?}"));
+        assert!(matches!(pointer, ShapeNode::Scalar { .. }));
+    }
+
+    /// The same cast at the top level keeps `JsonScalar`: there the result
+    /// column is the value itself rather than a field of a row tuple.
+    #[test]
+    fn test_a_top_level_json_cast_stays_a_root_shaped_node() {
+        use crate::query::ShapeNode;
+        let schema = make_schema();
+        let ast = parse::parse("SELECT <json>'x'").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let shape = crate::sql::emit(&ir).shape;
+        assert!(matches!(shape.root, ShapeNode::JsonScalar), "got {:?}", shape.root);
+    }
+
     /// `std::Endian` is a stdlib enum with no PostgreSQL enum type behind it,
     /// so its members have to compile to a plain text literal.
     #[test]

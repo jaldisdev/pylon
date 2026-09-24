@@ -2256,7 +2256,15 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                 is_free_object: false,
             }
         }
-        IrExpr::TypeCast(c) if c.pg_type == "jsonb" => ShapeNode::JsonScalar,
+        // A `<json>` cast at a shape position is an ordinary column of the row
+        // tuple, so it needs the pointer's own name and position like any
+        // other leaf. `JsonScalar` is the *root-only* form, where the result
+        // column itself is the value and there is no pointer to name — it
+        // carries neither field, and `free_item_shape` is what selects it.
+        IrExpr::TypeCast(c) if c.pg_type == "jsonb" => ShapeNode::Scalar {
+            name: name.to_string(),
+            position,
+        },
         IrExpr::NamedTuple { is_free_object, .. } => ShapeNode::NamedTuple {
             name: name.to_string(),
             position,
@@ -2340,7 +2348,13 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
 fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match item {
-        IrFreeExpr::Scalar(e) => expr_shape_node("", 0, e),
+        IrFreeExpr::Scalar(e) => match e {
+            // Top level: the result column *is* the jsonb value rather than a
+            // field inside a row tuple. A tuple-shaped cast is excluded because
+            // `expr_shape_node` decodes that as a `NamedTuple`.
+            IrExpr::TypeCast(c) if c.pg_type == "jsonb" && c.tuple_shape.is_none() => ShapeNode::JsonScalar,
+            _ => expr_shape_node("", 0, e),
+        },
         IrFreeExpr::FreeObject(fields) => ShapeNode::Object {
             name: String::new(),
             type_name: None,
