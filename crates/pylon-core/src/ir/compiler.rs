@@ -3044,6 +3044,24 @@ impl<'a> Compiler<'a> {
                         lock: None,
                     }));
                 }
+                // `array_agg(array_unpack(teams.permissions))` — the unpacking
+                // has to happen in a row source, so the aggregate is left with
+                // no walk of its own and the select stands free.
+                if let Some(expr) = self.aggregate_over_unpacked(s, result, distinct)? {
+                    return Ok(IrStmt::Select(IrSelect {
+                        rows: vec![IrRowSource::Free(IrFreeExpr::Scalar(expr))],
+                        filter: None,
+                        order_by: vec![],
+                        offset: None,
+                        limit: None,
+                        distinct: false,
+                        dml_source: None,
+                        polymorphic: false,
+                        poly_implementors: vec![],
+                        poly_columns: vec![],
+                        lock: None,
+                    }));
+                }
                 // Expression containing a type-rooted path: `select fn(TypeName.link.prop, ...)`.
                 if let Some(root) = self.find_path_root_in_expr(result) {
                     return self
@@ -4359,6 +4377,93 @@ impl<'a> Compiler<'a> {
             })),
             other => other,
         }
+    }
+
+    /// `array_agg(array_unpack(X))` — the aggregate runs over the elements the
+    /// array unpacks to. PostgreSQL rejects a set-returning call inside an
+    /// aggregate ("aggregate function calls cannot contain set-returning
+    /// function calls"), so the unpacking moves to a row source of its own and
+    /// the aggregate reads that from outside. `None` when the result is not an
+    /// aggregate over an unpacked array, leaving the ordinary routes to it.
+    fn aggregate_over_unpacked(
+        &mut self,
+        sel: &ast::SelectStmt,
+        result: &Expr,
+        distinct: bool,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        let Expr::FunctionCall(f) = result else {
+            return Ok(None);
+        };
+        let [Expr::FunctionCall(unpack)] = f.args.as_slice() else {
+            return Ok(None);
+        };
+        if !f.kwargs.is_empty()
+            || !unpack.kwargs.is_empty()
+            || unpack.module.as_deref().unwrap_or("std") != "std"
+            || unpack.name != "array_unpack"
+        {
+            return Ok(None);
+        }
+        let [array] = unpack.args.as_slice() else {
+            return Ok(None);
+        };
+        let namespace = f.module.as_deref().unwrap_or("std");
+        let Some(sql_name) = crate::stdlib::lookup(namespace, &f.name)
+            .into_iter()
+            .find_map(|d| match &d.impl_strategy {
+                crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+
+        // A walk is unpacked one row at a time, so the unnest belongs in that
+        // walk's own projection; anything else is a single array standing on
+        // its own and unnests directly.
+        let elements = match array {
+            Expr::Path(path) if !path.partial && path.steps.len() > 1 => {
+                let walk = ast::Path {
+                    partial: false,
+                    steps: path.steps.clone(),
+                };
+                let mut path_select = self.compile_path_select(sel, &walk, &[], distinct)?;
+                let IrPathResult::Scalar(column, _) = path_select.result else {
+                    return Ok(None);
+                };
+                path_select.result = IrPathResult::Scalar(
+                    IrExpr::FunctionCall(IrFunctionCall {
+                        schema: None,
+                        name: "unnest".to_string(),
+                        args: vec![column],
+                        sql_template: None,
+                    }),
+                    None,
+                );
+                IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(path_select))))
+            }
+            _ if sel.filter.is_none()
+                && sel.order_by.is_empty()
+                && sel.offset.is_none()
+                && sel.limit.is_none()
+                && !distinct =>
+            {
+                self.compile_expr_ctx(array, None)?
+            }
+            _ => return Ok(None),
+        };
+
+        // Over no rows SQL's aggregates give NULL where the upstream engine's give the empty
+        // set's own value.
+        let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
+        Ok(Some(IrExpr::FunctionCall(IrFunctionCall {
+            schema: None,
+            name: sql_name.clone(),
+            args: vec![elements],
+            sql_template: Some(format!(
+                "(SELECT coalesce({sql_name}(\"_s\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_s\"(\"v\"))"
+            )),
+        })))
     }
 
     /// Compile an expression that contains a type-rooted absolute path as a flat
@@ -11461,6 +11566,40 @@ impl<'a> Compiler<'a> {
                                 right,
                                 mode: super::SetOpMode::Aggregate(sql_name.to_string()),
                             });
+                        }
+                    }
+                    // `array_agg(array_unpack(.permissions))` — the elements
+                    // of one row's array. PostgreSQL rejects a set-returning
+                    // call inside an aggregate, so the unpacking becomes the
+                    // row source the aggregate reads.
+                    if let Expr::FunctionCall(unpack) = arg
+                        && unpack.module.as_deref().unwrap_or("std") == "std"
+                        && unpack.name == "array_unpack"
+                        && unpack.kwargs.is_empty()
+                        && let [array] = unpack.args.as_slice()
+                        && let Some(sql_name) = crate::stdlib::lookup(f.module.as_deref().unwrap_or("std"), &f.name)
+                            .into_iter()
+                            .find_map(|d| match &d.impl_strategy {
+                                crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => {
+                                    Some(sql_name.to_string())
+                                }
+                                _ => None,
+                            })
+                    {
+                        let values = self.compile_expr_ctx(array, ctx)?;
+                        // A walk gathered as an array holds one array per row,
+                        // which `unnest` would only flatten one level; that
+                        // shape is aggregated where the walk is built instead.
+                        if !yields_array(&values) {
+                            let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
+                            return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                schema: None,
+                                name: sql_name.clone(),
+                                args: vec![values],
+                                sql_template: Some(format!(
+                                    "(SELECT coalesce({sql_name}(\"_s\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_s\"(\"v\"))"
+                                )),
+                            }));
                         }
                     }
                     // `sum((select T filter …).amount)` — the sub-select's

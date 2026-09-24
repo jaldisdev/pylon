@@ -8294,6 +8294,89 @@ mod tests {
         assert!(out.sql.contains("_unnested"), "got:\n{}", out.sql);
     }
 
+    /// A schema with a `text[]` property, which `make_schema` has none of.
+    fn schema_with_array_property() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        schema.types[0].properties.push(crate::schema::PropertyDescriptor {
+            name: "perms".into(),
+            pg_type: "text[]".into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        schema
+    }
+
+    /// `array_agg(array_unpack(teams.perms))` flattens every row's array into
+    /// one. Compiled as written it emitted `array_agg(unnest(...))`, which
+    /// PostgreSQL rejects at execution time ("aggregate function calls cannot
+    /// contain set-returning function calls"), so the unpacking has to happen
+    /// in a row source the aggregate reads from outside.
+    #[test]
+    fn test_aggregate_over_an_unpacked_walk_unnests_in_a_row_source() {
+        let out = compile_and_emit_with(
+            "WITH teams := (SELECT Person { perms } FILTER .age > 1) SELECT std::array_agg(std::array_unpack(teams.perms))",
+            &schema_with_array_property(),
+        );
+        assert!(!out.sql.contains("array_agg(unnest("), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(
+                r#"coalesce(array_agg("_s"."v"), '{}') FROM unnest(ARRAY(SELECT unnest("t1"."perms") FROM "teams" AS "t1"))"#
+            ),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_aggregate_over_an_unpacked_type_rooted_path_unnests_in_a_row_source() {
+        let out = compile_and_emit_with(
+            "SELECT std::count(std::array_unpack(Person.perms))",
+            &schema_with_array_property(),
+        );
+        assert!(!out.sql.contains("count(unnest("), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(r#"FROM unnest(ARRAY(SELECT unnest("t0"."perms") FROM "public"."Person" AS "t0"))"#),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    /// One array standing on its own — a parameter, or one row's property —
+    /// is already the row source, so it needs no walk gathered around it.
+    #[test]
+    fn test_aggregate_over_an_unpacked_parameter_unnests_the_array_itself() {
+        let out = compile_and_emit("SELECT std::array_agg(std::array_unpack(<array<str>>$names))");
+        assert!(!out.sql.contains("array_agg(unnest("), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(r#"FROM unnest(($1)::text[]) AS "_s"("v")"#),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_aggregate_over_an_unpacked_property_unnests_that_row_s_array() {
+        let out = compile_and_emit_with(
+            "SELECT Person { n := std::array_agg(std::array_unpack(.perms)) }",
+            &schema_with_array_property(),
+        );
+        assert!(!out.sql.contains("array_agg(unnest("), "got:\n{}", out.sql);
+        assert!(
+            out.sql.contains(r#"FROM unnest("t0"."perms") AS "_s"("v")"#),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
     /// `array_agg` over no rows is `[]` in the upstream engine and NULL in SQL, which reaches
     /// a caller as a missing value where a list was promised.
     #[test]
@@ -8305,6 +8388,18 @@ mod tests {
             let out = compile_and_emit(query);
             assert!(out.sql.contains("coalesce(") && out.sql.contains("'{}'"), "{query} got:\n{}", out.sql);
         }
+    }
+
+    /// An aggregate over a walk that is *not* unpacked keeps its own row
+    /// source — the rewrite above must not reach it.
+    #[test]
+    fn test_aggregate_over_a_plain_walk_keeps_its_row_source() {
+        let out = compile_and_emit("SELECT std::array_agg(Person.name)");
+        assert!(
+            out.sql.contains(r#"array_agg("t0"."name")"#) && out.sql.contains(r#"FROM "public"."Person""#),
+            "got:\n{}",
+            out.sql
+        );
     }
 
     /// A bare `array_unpack` outside `IN` still has to unnest — the unwrap is
