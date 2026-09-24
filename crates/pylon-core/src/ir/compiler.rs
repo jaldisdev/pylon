@@ -3181,6 +3181,41 @@ impl<'a> Compiler<'a> {
                         return self.compile_stmt(&Stmt::Select(rerooted));
                     }
                 }
+                // `select (select (A union B) { … } limit 1) { … }` — a nested
+                // select whose own subject is a union has no single type name
+                // for the outer select to take. Hoisting it into a binding and
+                // reading that back is the `with l := (select …) select l { … }`
+                // spelling, which already compiles.
+                if let Expr::Shape(sh) = result
+                    && let Some(Expr::SubQuery(inner_stmt)) = sh.expr.as_ref()
+                    && matches!(inner_stmt.as_ref(), Stmt::Select(_))
+                    && self.dml_subject_type(inner_stmt).is_err()
+                {
+                    let inner = self.compile_stmt(inner_stmt)?;
+                    let cte_name = self.fresh_nested_cte_name();
+                    let type_name = self.register_cte(&cte_name, &inner);
+                    self.hoisted_ctes.push(IrCteDef {
+                        name: cte_name.clone(),
+                        stmt: inner,
+                        type_name,
+                    });
+                    let rerooted = ast::SelectStmt {
+                        result: Expr::Shape(Box::new(ast::ShapeExpr {
+                            expr: Some(Expr::Path(ast::Path {
+                                steps: vec![ast::PathStep::Name(cte_name)],
+                                partial: false,
+                            })),
+                            elements: sh.elements.clone(),
+                            marker_offset: None,
+                        })),
+                        filter: s.filter.clone(),
+                        order_by: s.order_by.clone(),
+                        offset: s.offset.clone(),
+                        limit: s.limit.clone(),
+                        lock: s.lock.clone(),
+                    };
+                    return self.compile_stmt(&Stmt::Select(rerooted));
+                }
                 // `select (for … union …)` — the select adds nothing the loop has
                 // not already produced, so it *is* the loop. Written with
                 // modifiers of its own it would need the loop bound in a CTE

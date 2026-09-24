@@ -2387,6 +2387,26 @@ mod tests {
         );
     }
 
+    /// `select (select (A union B) { … } limit 1) { … }` — ledger resolves a
+    /// listing from either of two backlinks this way. The inner select
+    /// compiles alone and the `with l := … select l { … }` spelling works;
+    /// only wrapping it inline was rejected, because a union subject has no
+    /// single type name for the outer select to take.
+    #[test]
+    fn test_a_select_may_wrap_a_nested_union_subject_select() {
+        let schema = make_schema();
+        let ast =
+            parse::parse("SELECT (SELECT (Person.company UNION Person.company) { name } LIMIT 1) { name }").unwrap();
+        let error = super::compile(&ast, &schema)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            !error.contains("expected a type name as SELECT subject"),
+            "the union subject must be hoisted, got: {error}"
+        );
+    }
+
     /// `select (update T …).link { … }` — automator reads back the config
     /// field it just appended. `(select …).link { … }` already worked; only a
     /// walk off a *mutation* was rejected.
