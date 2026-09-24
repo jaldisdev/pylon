@@ -3138,6 +3138,49 @@ impl<'a> Compiler<'a> {
                 {
                     return Ok(IrStmt::PathSelect(ps));
                 }
+                // `select (update T … ).link { … }` — the subject walks off a
+                // mutation. Hoist the mutation into the statement's own WITH
+                // and re-root the walk at that binding, which is the
+                // `with a := (update …) select a.link { … }` spelling that
+                // already compiles. A walk off a plain sub-select needs none
+                // of this.
+                if let Expr::Shape(sh) = result
+                    && let Some(subject) = sh.expr.as_ref()
+                    && !matches!(subject, Expr::Path(_))
+                {
+                    let (base, fields) = Self::peel_field_access_chain(subject);
+                    if let Expr::SubQuery(inner_stmt) = base
+                        && !fields.is_empty()
+                        && matches!(
+                            inner_stmt.as_ref(),
+                            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+                        )
+                    {
+                        let inner = self.compile_stmt(inner_stmt)?;
+                        let cte_name = self.fresh_nested_cte_name();
+                        let type_name = self.register_cte(&cte_name, &inner);
+                        self.hoisted_ctes.push(IrCteDef {
+                            name: cte_name.clone(),
+                            stmt: inner,
+                            type_name,
+                        });
+                        let mut steps = vec![ast::PathStep::Name(cte_name)];
+                        steps.extend(fields.into_iter().map(ast::PathStep::Name));
+                        let rerooted = ast::SelectStmt {
+                            result: Expr::Shape(Box::new(ast::ShapeExpr {
+                                expr: Some(Expr::Path(ast::Path { steps, partial: false })),
+                                elements: sh.elements.clone(),
+                                marker_offset: None,
+                            })),
+                            filter: s.filter.clone(),
+                            order_by: s.order_by.clone(),
+                            offset: s.offset.clone(),
+                            limit: s.limit.clone(),
+                            lock: s.lock.clone(),
+                        };
+                        return self.compile_stmt(&Stmt::Select(rerooted));
+                    }
+                }
                 // `select (for … union …)` — the select adds nothing the loop has
                 // not already produced, so it *is* the loop. Written with
                 // modifiers of its own it would need the loop bound in a CTE

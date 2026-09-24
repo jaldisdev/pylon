@@ -2387,6 +2387,23 @@ mod tests {
         );
     }
 
+    /// `select (update T …).link { … }` — automator reads back the config
+    /// field it just appended. `(select …).link { … }` already worked; only a
+    /// walk off a *mutation* was rejected.
+    #[test]
+    fn test_a_select_subject_may_walk_off_a_mutation() {
+        let schema = make_schema();
+        let ast =
+            parse::parse("SELECT (UPDATE Person FILTER .name = 'a' SET { name := 'b' }).company { name }").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(
+            sql.contains("\"_nested_dml_0\" AS ("),
+            "the mutation must run as a CTE:\n{sql}"
+        );
+        assert!(sql.contains("UPDATE"), "the mutation must still run:\n{sql}");
+    }
+
     /// `update (select T filter …).link set { … }` — conduit refreshes a
     /// connector's stored credentials this way. The equivalent
     /// `with s := (select …) update s.link set …` already worked; only the
