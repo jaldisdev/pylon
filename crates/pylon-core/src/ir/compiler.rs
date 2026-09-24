@@ -571,6 +571,7 @@ fn aggregate_over_nothing(name: &str, aggregate: IrExpr) -> IrExpr {
         return aggregate;
     };
     IrExpr::FunctionCall(IrFunctionCall {
+        return_pg_type: None,
         schema: None,
         name: "coalesce".to_string(),
         args: vec![aggregate, IrExpr::RawSql(value.to_string())],
@@ -3027,6 +3028,7 @@ impl<'a> Compiler<'a> {
                         .try_compile_fn_object_select(inner, &[], &unchecked, false)?
                         .ok_or_else(|| self.type_err("assert subject is not an object-returning function"))?;
                     let checked = IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
                         schema: Some("_pylon".to_string()),
                         name: assert.name.clone(),
                         args: std::iter::once(IrExpr::ArrayFromSelect(Box::new(IrArraySource::StmtColumn {
@@ -3039,6 +3041,7 @@ impl<'a> Compiler<'a> {
                     });
                     let check = IrExpr::BinOp(Box::new(IrBinOp {
                         left: IrExpr::FunctionCall(IrFunctionCall {
+                            return_pg_type: None,
                             schema: None,
                             name: "cardinality".to_string(),
                             args: vec![checked],
@@ -3283,6 +3286,7 @@ impl<'a> Compiler<'a> {
                         let inner_ir = self.compile_stmt(inner_stmt)?;
                         let alias = self.fresh_alias();
                         let vetted = IrExpr::FunctionCall(IrFunctionCall {
+                            return_pg_type: None,
                             schema: Some("_pylon".to_string()),
                             name: f.name.clone(),
                             args: std::iter::once(IrExpr::ArrayFromSelect(Box::new(IrArraySource::StmtColumn {
@@ -4845,6 +4849,7 @@ impl<'a> Compiler<'a> {
                 };
                 path_select.result = IrPathResult::Scalar(
                     IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
                         schema: None,
                         name: "unnest".to_string(),
                         args: vec![column],
@@ -4869,6 +4874,7 @@ impl<'a> Compiler<'a> {
         // set's own value.
         let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
         Ok(Some(IrExpr::FunctionCall(IrFunctionCall {
+            return_pg_type: None,
             schema: None,
             name: sql_name.clone(),
             args: vec![elements],
@@ -7521,6 +7527,7 @@ impl<'a> Compiler<'a> {
                     other => other,
                 };
                 Ok(Some(IrExpr::FunctionCall(IrFunctionCall {
+                    return_pg_type: None,
                     schema: None,
                     name: "coalesce".to_string(),
                     args: vec![hoisted(left), hoisted(right)],
@@ -7629,6 +7636,7 @@ impl<'a> Compiler<'a> {
         // its elements, so the rows of all of them make up one set.
         let value = if yields_array(&value) {
             IrExpr::FunctionCall(IrFunctionCall {
+                return_pg_type: None,
                 schema: None,
                 name: "unnest".to_string(),
                 args: vec![value],
@@ -11763,6 +11771,7 @@ impl<'a> Compiler<'a> {
                         let sql_template =
                             format!("ARRAY(SELECT (elem #>> '{{}}')::{elem_pg} FROM jsonb_array_elements($1) AS elem)");
                         return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                            return_pg_type: None,
                             schema: None,
                             name: "jsonb_array_cast".to_string(),
                             args: vec![inner],
@@ -11775,6 +11784,7 @@ impl<'a> Compiler<'a> {
                     ) {
                         let sql_template = format!("(($1 #>> '{{}}'))::{pg_type}");
                         return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                            return_pg_type: None,
                             schema: None,
                             name: "jsonb_scalar_cast".to_string(),
                             args: vec![inner],
@@ -11916,6 +11926,7 @@ impl<'a> Compiler<'a> {
                             value
                         } else {
                             IrExpr::FunctionCall(IrFunctionCall {
+                                return_pg_type: None,
                                 schema: None,
                                 name: "array_remove".to_string(),
                                 args: vec![value],
@@ -11925,6 +11936,7 @@ impl<'a> Compiler<'a> {
                     };
                     let left = as_set(left);
                     let condition = IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
                         schema: None,
                         name: "cardinality".to_string(),
                         args: vec![left.clone()],
@@ -12036,6 +12048,7 @@ impl<'a> Compiler<'a> {
                     let mut args = vec![IrExpr::ArrayFromSelect(Box::new(inner))];
                     args.extend(self.assert_message(f, ctx)?);
                     return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
                         schema: Some("_pylon".to_string()),
                         name: fn_pg.to_string(),
                         args,
@@ -12103,6 +12116,7 @@ impl<'a> Compiler<'a> {
                     {
                         ps.result = IrPathResult::Scalar(column, None);
                         IrExpr::FunctionCall(IrFunctionCall {
+                            return_pg_type: None,
                             schema: None,
                             name: sql_name.clone(),
                             args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
@@ -12114,6 +12128,7 @@ impl<'a> Compiler<'a> {
                         })
                     } else {
                         let aggregate = IrExpr::FunctionCall(IrFunctionCall {
+                            return_pg_type: None,
                             schema: None,
                             name: sql_name,
                             args: vec![column],
@@ -12124,6 +12139,7 @@ impl<'a> Compiler<'a> {
                     };
                     return Ok(match over_nothing {
                         Some(value) => IrExpr::FunctionCall(IrFunctionCall {
+                            return_pg_type: None,
                             schema: None,
                             name: "coalesce".to_string(),
                             args: vec![subquery, IrExpr::RawSql(value.to_string())],
@@ -12179,6 +12195,7 @@ impl<'a> Compiler<'a> {
                         if !yields_array(&values) {
                             let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
                             return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                return_pg_type: None,
                                 schema: None,
                                 name: sql_name.clone(),
                                 args: vec![values],
@@ -12209,6 +12226,7 @@ impl<'a> Compiler<'a> {
                             if matches!(values, IrExpr::ArrayFromSelect(_)) {
                                 let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
                                 return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                    return_pg_type: None,
                                     schema: None,
                                     name: sql_name.clone(),
                                     args: vec![values],
@@ -12218,6 +12236,7 @@ impl<'a> Compiler<'a> {
                                 }));
                             }
                             return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                return_pg_type: None,
                                 schema: None,
                                 name: sql_name,
                                 args: vec![values],
@@ -12247,6 +12266,7 @@ impl<'a> Compiler<'a> {
                         {
                             let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
                             return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                                return_pg_type: None,
                                 schema: None,
                                 name: sql_name.clone(),
                                 args: vec![values],
@@ -12306,6 +12326,7 @@ impl<'a> Compiler<'a> {
                                 ps.result = IrPathResult::Scalar(id, None);
                             }
                             let aggregate = IrExpr::FunctionCall(IrFunctionCall {
+                                return_pg_type: None,
                                 schema: None,
                                 name: sql_name.clone(),
                                 args: vec![IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
@@ -12668,6 +12689,7 @@ impl<'a> Compiler<'a> {
                         ("bool_or", "false")
                     };
                     return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
                         schema: None,
                         name: aggregate.to_string(),
                         args: vec![answers],
@@ -12708,6 +12730,7 @@ impl<'a> Compiler<'a> {
                         ("bool_or", "false")
                     };
                     return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
                         schema: None,
                         name: aggregate.to_string(),
                         args: vec![per_element?, array],
@@ -15529,35 +15552,50 @@ impl<'a> Compiler<'a> {
         }
         let overloads = lookup(ns, name);
 
-        // Pick the overload whose parameter types best match the argument types.
-        // Fall back to the first registered overload when no type info is available.
-        // An overload whose declared types are exactly what is known of the
-        // arguments beats one that merely accepts them: `to_str(<bytes>)`
-        // is the bytes overload, not the first one whose parameter type no
-        // check rejects.
-        let exact = overloads.iter().find(|d| {
-            d.params.len() == args.len()
-                && d.params
-                    .iter()
-                    .zip(&args)
-                    .any(|(p, a)| p.ty.scalar_pg_type().is_some() && infer_ir_type(a).is_some())
-                && d.params
-                    .iter()
-                    .zip(&args)
-                    .all(|(p, a)| match (p.ty.scalar_pg_type(), infer_ir_type(a)) {
+        // Arity is decided first and on its own, so a call no overload could
+        // accept is never type-matched against one anyway. Named-only
+        // parameters are already materialized into `args` by
+        // `compile_named_call_args`, so the comparison is against the full
+        // parameter list; a trailing variadic absorbs zero or more, matching
+        // `pylon.stdlib._arity_matches`, the same rule the Python surface
+        // has always applied to `std.foo(...)`.
+        let by_arity: Vec<&crate::stdlib::FnDescriptor> = overloads
+            .iter()
+            .copied()
+            .filter(|d| {
+                if d.is_variadic() {
+                    args.len() + 1 >= d.params.len()
+                } else {
+                    d.params.len() == args.len()
+                }
+            })
+            .collect();
+
+        // Pick the overload whose parameter types best match the argument
+        // types. An overload whose declared types are exactly what is known
+        // of the arguments beats one that merely accepts them:
+        // `to_str(<bytes>)` is the bytes overload, not the first one whose
+        // parameter type no check rejects.
+        let exact = by_arity.iter().copied().find(|d| {
+            params_for_args(d, args.len())
+                .zip(&args)
+                .any(|(p, a)| p.ty.scalar_pg_type().is_some() && infer_ir_type(a).is_some())
+                && params_for_args(d, args.len()).zip(&args).all(|(p, a)| {
+                    match (p.ty.scalar_pg_type(), infer_ir_type(a)) {
                         (Some(declared), Some(known)) => declared == known,
                         _ => pylon_type_matches(a, &p.ty),
-                    })
-        });
-        let best = exact
-            .or_else(|| {
-                overloads.iter().find(|d| {
-                    d.params.len() == args.len()
-                        && d.params.iter().zip(&args).all(|(p, a)| pylon_type_matches(a, &p.ty))
+                    }
                 })
+        });
+        let best = exact.or_else(|| {
+            by_arity.iter().copied().find(|d| {
+                params_for_args(d, args.len())
+                    .zip(&args)
+                    .all(|(p, a)| pylon_type_matches(a, &p.ty))
             })
-            .or_else(|| overloads.first());
+        });
 
+        let stdlib_return = best.and_then(|d| d.return_type.scalar_pg_type()).map(str::to_string);
         let (schema, resolved_name, sql_template) = if let Some(desc) = best {
             match &desc.impl_strategy {
                 ImplStrategy::SqlBuiltin(sql_name) => (None, sql_name.to_string(), None),
@@ -15637,7 +15675,13 @@ impl<'a> Compiler<'a> {
                 if let Some(globals) = self.globals_arg_for_call(&qualified)? {
                     call_args.insert(0, globals);
                 }
+                // A set-returning function has no single value to type, and
+                // the declared type of an object-returning one names a type,
+                // not a column — neither is a scalar `infer_ir_type` may
+                // report.
+                let return_pg_type = (!fd.return_is_set).then(|| fd.return_pg_type.clone());
                 return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    return_pg_type,
                     schema: Some(fn_module),
                     name: fn_name,
                     args: call_args,
@@ -15664,10 +15708,33 @@ impl<'a> Compiler<'a> {
                 Some(m) => format!("{m}::{name}"),
                 None => name.to_string(),
             };
-            return Err(self.type_err(&format!("function '{qualified}' does not exist")));
+            // The name is real and only the call is wrong — say which,
+            // rather than resolving to whichever overload happened to be
+            // registered first and letting PostgreSQL reject the emitted
+            // SQL at query time with a signature the author never wrote.
+            if !overloads.is_empty() {
+                return Err(self.type_err(&if by_arity.is_empty() {
+                    format!(
+                        "function '{qualified}' takes {}, got {}",
+                        describe_arities(&overloads),
+                        args.len()
+                    )
+                } else {
+                    format!(
+                        "function '{qualified}' has no overload accepting ({}) — it accepts {}",
+                        describe_args(&args),
+                        describe_signatures(&by_arity),
+                    )
+                }));
+            }
+            return Err(self.type_err(&format!(
+                "function '{qualified}' does not exist{}",
+                self.suggest_function_name(ns, name)
+            )));
         };
 
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+            return_pg_type: stdlib_return,
             schema,
             name: resolved_name,
             args,
@@ -15717,7 +15784,13 @@ impl<'a> Compiler<'a> {
                 // call can identify the element family — emission always
                 // goes through `sql_template` above, so this doesn't change
                 // the SQL text.
+                // A PostgreSQL range constructor shares its name with the
+                // type it builds (`int8range(…)` is an `int8range`), so the
+                // ctor doubles as the return type — which is what lets a
+                // range reach a `range<anypoint>` parameter as itself rather
+                // than as an untyped expression.
                 Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    return_pg_type: Some(ctor.to_string()),
                     schema: None,
                     name: ctor.to_string(),
                     args,
@@ -15747,6 +15820,7 @@ impl<'a> Compiler<'a> {
                 // are VARIADIC — they don't accept a plain array argument
                 // without the VARIADIC keyword.
                 Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    return_pg_type: Some(ctor.to_string()),
                     schema: None,
                     name: name.to_string(),
                     args,
@@ -15770,6 +15844,7 @@ impl<'a> Compiler<'a> {
             }
             let sql = format!("nextval('\"{}\".\"{}_seq\"')", module, scalar_name);
             return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                return_pg_type: None,
                 schema: None,
                 name: "nextval".into(),
                 args: vec![],
@@ -15782,6 +15857,7 @@ impl<'a> Compiler<'a> {
             1 => {
                 let sql = format!("setval('\"{}\".\"{}_seq\"', 1, false)", module, scalar_name);
                 Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    return_pg_type: None,
                     schema: None,
                     name: "setval".into(),
                     args: vec![],
@@ -15792,6 +15868,7 @@ impl<'a> Compiler<'a> {
                 let val = self.compile_free_expr(&fc.args[1])?;
                 let sql = format!("setval('\"{}\".\"{}_seq\"', $1, true)", module, scalar_name);
                 Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                    return_pg_type: None,
                     schema: None,
                     name: "setval".into(),
                     args: vec![val],
@@ -16068,6 +16145,7 @@ impl<'a> Compiler<'a> {
 
         let sql = format!("pg_notify('{}', ($1)::text)", wire_name.replace('\'', "''"));
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+            return_pg_type: None,
             schema: None,
             name: "pg_notify".to_string(),
             args: vec![payload_ir],
@@ -16099,6 +16177,7 @@ impl<'a> Compiler<'a> {
         }
 
         Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+            return_pg_type: None,
             schema: None,
             name: "pg_notify".to_string(),
             args: vec![channel_ir, payload_ir],
@@ -16139,6 +16218,7 @@ impl<'a> Compiler<'a> {
             args.push(value);
         }
         Ok(Some(IrExpr::FunctionCall(super::IrFunctionCall {
+            return_pg_type: None,
             schema: None,
             name: "jsonb_build_object".to_string(),
             args,
@@ -16914,6 +16994,46 @@ impl<'a> Compiler<'a> {
         }))
     }
 
+    /// A ` — did you mean …?` fragment for an unresolvable function name, or
+    /// an empty string.
+    ///
+    /// Mirrors `pylon.stdlib.unknown_function_message`, which has always
+    /// offered this for the `std.foo(...)` attribute form; a name written as
+    /// PyQL text got nothing, which is how a schema converted from a system
+    /// that spelled it `uuid_generate_v7j` stayed broken instead of being
+    /// pointed one character back at `uuid_generate_v7`.
+    ///
+    /// The wrong-namespace check comes first and is worth its own wording:
+    /// the namespaces overlap unevenly — `sqrt`/`abs`/`ceil` are in both
+    /// `std` and `math`, while `pi`/`ln`/`exp` are only in `math` — so
+    /// guessing the wrong one is routine, and naming where the function
+    /// actually lives recovers from it in a way a fuzzy match over the
+    /// namespace that lacks it cannot.
+    fn suggest_function_name(&self, ns: &str, name: &str) -> String {
+        const MIN_SIMILARITY: f64 = 0.7;
+        if let Some(other) = ["std", "math", "cal", "sys"]
+            .into_iter()
+            .find(|o| *o != ns && !crate::stdlib::lookup(o, name).is_empty())
+        {
+            return format!(" — it lives in {other}, use {other}::{name}()");
+        }
+        crate::stdlib::registry()
+            .iter()
+            .filter(|d| d.namespace == ns)
+            .map(|d| (format!("{ns}::{}", d.name), d.name))
+            .chain(
+                self.schema
+                    .functions
+                    .iter()
+                    .map(|f| (format!("{}::{}", f.module, f.name), f.name.as_str())),
+            )
+            .map(|(qualified, candidate)| (qualified, strsim::jaro_winkler(name, candidate)))
+            .filter(|(_, score)| *score >= MIN_SIMILARITY)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(qualified, _)| format!(" — did you mean {qualified}()?"))
+            .unwrap_or_default()
+    }
+
     /// Fuzzy-matches `name` against every pointer (property/link/multilink/
     /// computed — Pylon's term for a type's own attributes; "field" is a
     /// Postgres-level term that doesn't apply here) on `td`, returning the
@@ -17098,10 +17218,63 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
 /// Emit `($1 IS NOT NULL)` for a given IR expression.
 fn ir_is_not_null(expr: IrExpr) -> IrExpr {
     IrExpr::FunctionCall(IrFunctionCall {
+        return_pg_type: None,
         schema: None,
         name: String::new(),
         args: vec![expr],
         sql_template: Some("($1 IS NOT NULL)".to_string()),
+    })
+}
+
+/// "1 argument(s)" / "2 or 3 argument(s)" / "at least 1 argument(s)" — the
+/// arities an overload set accepts, worded as `pylon.stdlib._arity_error`
+/// words the same rejection on the Python side.
+fn describe_arities(overloads: &[&crate::stdlib::FnDescriptor]) -> String {
+    let mut arities: Vec<usize> = overloads.iter().map(|d| d.params.len()).collect();
+    arities.sort_unstable();
+    arities.dedup();
+    if overloads.iter().any(|d| d.is_variadic()) {
+        return format!("at least {} argument(s)", arities[0].saturating_sub(1));
+    }
+    let list = arities.iter().map(usize::to_string).collect::<Vec<_>>().join(" or ");
+    format!("{list} argument(s)")
+}
+
+/// The argument types as far as they could be inferred, for an error that
+/// has to show the caller what it actually passed.
+fn describe_args(args: &[IrExpr]) -> String {
+    args.iter()
+        .map(|a| infer_ir_type(a).map_or("?", literal_sentinel_to_pg))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The parameter lists of the overloads that did match on arity, in PyQL
+/// spelling — what the caller should have passed.
+fn describe_signatures(overloads: &[&crate::stdlib::FnDescriptor]) -> String {
+    overloads
+        .iter()
+        .map(|d| {
+            let params = d.params.iter().map(|p| p.ty.pyql_name()).collect::<Vec<_>>().join(", ");
+            format!("({params})")
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// The parameter each of `argc` arguments is checked against.
+///
+/// One per declared parameter, except that a trailing variadic one stands in
+/// for every argument past the fixed ones — `json_get(j, 'a', 'b')` checks
+/// both path elements against the single variadic `str` parameter rather
+/// than leaving the third argument unchecked, which a plain `params.iter()`
+/// zipped against the arguments would do.
+fn params_for_args(d: &crate::stdlib::FnDescriptor, argc: usize) -> impl Iterator<Item = &crate::stdlib::Param> {
+    let last = d.params.len().saturating_sub(1);
+    let repeat_from = d.is_variadic().then_some(last);
+    (0..argc).filter_map(move |i| match repeat_from {
+        Some(v) if i >= v => d.params.get(v),
+        _ => d.params.get(i),
     })
 }
 
@@ -17111,19 +17284,30 @@ fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
         // Wildcard params always match.
         PT::Any | PT::AnyOrderable | PT::AnyPoint => true,
         PT::Array(_) => is_array_expr(expr),
-        PT::Json => infer_ir_type(expr) == Some("jsonb"),
-        PT::Bytes => infer_ir_type(expr) == Some("bytea"),
-        PT::Str => infer_ir_type(expr) == Some("text"),
-        PT::Bool => infer_ir_type(expr) == Some("boolean"),
-        PT::Uuid => infer_ir_type(expr) == Some("uuid"),
-        PT::Int16 | PT::Int32 | PT::Int64 | PT::BigInt => {
-            matches!(infer_ir_type(expr), Some(t) if INT_TYPES.contains(&t))
-        }
-        PT::Float32 | PT::Float64 => matches!(infer_ir_type(expr), Some(t) if FLOAT_TYPES.contains(&t)),
-        PT::Range(_) => matches!(infer_ir_type(expr), Some(t) if t.ends_with("range") && !t.starts_with('m')),
-        PT::Multirange(_) => matches!(infer_ir_type(expr), Some(t) if t.starts_with("multi")),
-        // For unrecognised / complex types, allow (don't reject).
-        _ => true,
+        // Matched on the concrete PostgreSQL type name, which for a
+        // multirange is `int8multirange`/`tstzmultirange`/… — it carries the
+        // element family as a prefix, so "is a multirange" is a `contains`,
+        // not a `starts_with`, and "is a plain range" has to exclude it.
+        PT::Range(_) => matches!(infer_ir_type(expr), Some(t) if t.ends_with("range") && !t.contains("multirange")),
+        PT::Multirange(_) => matches!(infer_ir_type(expr), Some(t) if t.contains("multirange")),
+        // Every parameter type that names a concrete PostgreSQL scalar is
+        // judged by `types_compatible` — the one implicit-cast graph the
+        // rest of the compiler already resolves operators against — rather
+        // than by an exact type-name match. Exactness rejected an integer
+        // literal reaching a `float64` parameter, which is how
+        // `cal::to_relative_duration(seconds := 3)` and every other
+        // int-for-float argument reads.
+        //
+        // An argument whose type cannot be inferred does *not* match a
+        // parameter that names one: an overload is chosen only on evidence,
+        // and `resolve_fn_call` reports the call rather than guessing.
+        // For a parameter type with no scalar spelling (`optional<…>` and
+        // friends) there is nothing to judge, so allow.
+        _ => match (ty.scalar_pg_type(), infer_ir_type(expr)) {
+            (Some(declared), Some(known)) => types_compatible(known, declared),
+            (Some(_), None) => false,
+            (None, _) => true,
+        },
     }
 }
 
@@ -17262,6 +17446,12 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
         }
         IrExpr::UnaryOp(u) if u.op == crate::parse::ast::UnaryOpKind::Distinct => infer_ir_type(&u.operand),
+        // A slice is the same type as the thing sliced — `substr` of text is
+        // text, of bytea is bytea, and an array slice is still that array.
+        // Without this a `to_bytes(x)[12:16]` reaching a `bytes` parameter
+        // reads as untyped, which is the difference between resolving the
+        // bytes overload and resolving nothing at all.
+        IrExpr::Slice { expr, .. } => infer_ir_type(expr),
         IrExpr::BinOp(b) => arithmetic_result_type(&b.op, infer_ir_type(&b.left)?, infer_ir_type(&b.right)?),
         IrExpr::FunctionCall(f) if f.schema.is_none() && matches!(f.name.as_str(), "max" | "min" | "sum") => {
             aggregate_result_type(&f.name, infer_ir_type(f.args.first()?)?)
@@ -17274,16 +17464,11 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             schema: None,
             elems,
         } => aggregate_result_type(fn_name, infer_ir_type(elems.first()?)?),
-        // `enc::base64_decode(…)` — a stdlib call is typed by what it
-        // returns, when every overload of that name agrees.
-        IrExpr::FunctionCall(f) if f.schema.is_none() => {
-            let mut returns = crate::stdlib::registry()
-                .iter()
-                .filter(|d| d.name == f.name)
-                .map(|d| d.return_type.scalar_pg_type());
-            let first = returns.next()??;
-            returns.all(|t| t == Some(first)).then_some(first)
-        }
+        // Any call whose resolution recorded a scalar return type — a stdlib
+        // overload (`enc::base64_decode(…)` is bytea) or a user-defined
+        // function, which is how a computed pointer's declared type gets
+        // checked against the function it calls at all.
+        IrExpr::FunctionCall(f) => f.return_pg_type.as_deref(),
         _ => None,
     }
 }

@@ -61,4 +61,4 @@ name: pylon.Property[str, Rewrite(On.Insert, "1")]
 # SchemaError: rewrite handler type mismatch for '...Person.name (rewrite)': expected text, handler produces __int_literal
 ```
 
-See [Validation](validation.md) for the same best-effort scope every other type-consistency check shares.
+See [Validation](validation.md) for the inference scope every other type-consistency check shares.

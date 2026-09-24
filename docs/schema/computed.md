@@ -74,4 +74,11 @@ The declared `return_type` isn't just documentation — `pylon.finalize()` compi
 bad: pylon.Computed[pylon.Int64, ".first_name"]   # SchemaError: declared int8, expression produces text
 ```
 
-This check is best-effort, not exhaustive — see [Validation](validation.md) for exactly which expression shapes it can and can't verify. A mismatch it *can* detect is rejected at `finalize()` time, well before the expression would otherwise only fail the first time some query happened to select it.
+Cardinality is checked alongside the type: a single-valued declaration whose expression crosses a multi-link or calls a `set[...]`-returning function is rejected, since it would quietly hand back an array (or expand into rows) behind a pointer that promised one value.
+
+```python
+bad: pylon.Computed[pylon.Str, ".tags.label"]              # SchemaError: cardinality mismatch
+ok:  pylon.Computed[pylon.Array[pylon.Str], ".tags.label"]
+```
+
+Type inference is not exhaustive — see [Validation](validation.md) for exactly which expression shapes it can and can't verify. A mismatch it *can* detect is rejected at `finalize()` time, well before the expression would otherwise only fail the first time some query happened to select it.

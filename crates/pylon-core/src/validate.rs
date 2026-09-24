@@ -31,13 +31,19 @@
 //! Two kinds of check:
 //! - **Type consistency** (functions, computed pointers, defaults, rewrites)
 //!   — the body compiles *and* its inferred return type matches what's
-//!   declared. Best-effort, not exhaustive: `infer_ir_type` only recognizes a
-//!   handful of `IrExpr` variants (column refs, casts, literals, enum
-//!   members, named tuples, function params, global params) — anything else
-//!   (a binop, a function call, an if/else) is silently skipped rather than
-//!   rejected. This still catches the common, real-world cases while leaving
-//!   complex expressions as a known limitation a future pass can extend
-//!   `infer_ir_type` to cover.
+//!   declared. A body that does not compile at all is an error here, not a
+//!   skip: nothing downstream re-reports it, because `export`'s
+//!   `column_default` and `diff`'s `resolve_default` both drop an
+//!   uncompilable default with `.ok()`, which is how a pointer declared
+//!   `Default('std::uuid_generate_v7j()')` — a function that does not exist
+//!   — used to reach Postgres as a column with no default at all and fail
+//!   on the first insert instead.
+//!
+//!   The type half is still not exhaustive: `infer_ir_type` types what it
+//!   recognizes (column refs, casts, literals, enum members, named tuples,
+//!   function params, global params, slices, arithmetic, and any function
+//!   call whose resolution recorded a scalar return type) and anything it
+//!   cannot type is skipped rather than rejected.
 //! - **Compile-only** (triggers, aliases, computed globals) — these have no
 //!   single declared scalar type to compare against (a trigger handler is
 //!   void, an alias/computed-global can select any shape), so only "does it
@@ -49,6 +55,47 @@ use crate::ir::{
     infer_ir_type, types_compatible,
 };
 use crate::schema::SchemaDescriptor;
+
+/// Why `expr` yields more than one value, if it does.
+///
+/// A pointer declared with a single scalar type (`Computed[pylon.Str, …]`)
+/// promises one value per row. Two expressions quietly break that promise:
+/// a path crossing a multilink, which compiles to `ARRAY(SELECT …)` and so
+/// hands back a `text[]` behind a declared `text`; and a call to a
+/// set-returning function, which PostgreSQL expands into rows wherever it
+/// sits. Neither produced an error before — the first widened the value
+/// silently and the second only failed once a query ran.
+///
+/// Only the top of the expression is examined, looking through the wrappers
+/// a computed routinely picks up (a cast, a `coalesce`) — which covers a
+/// pointer whose whole body is the offending expression, the form both of
+/// these actually take. One buried inside a larger expression is not caught
+/// here.
+fn multi_valued(expr: &crate::ir::IrExpr, schema: &SchemaDescriptor) -> Option<String> {
+    use crate::ir::IrExpr as E;
+    match expr {
+        E::FunctionCall(f) if f.schema.is_none() && f.name == "coalesce" => {
+            f.args.first().and_then(|a| multi_valued(a, schema))
+        }
+        E::TypeCast(c) => multi_valued(&c.expr, schema),
+        E::ArrayFromSelect(_) => Some("a path that crosses a multilink, so it yields many values".into()),
+        E::SetOp { mode, .. } if *mode == crate::ir::SetOpMode::Array => {
+            Some("a set operation, so it yields many values".into())
+        }
+        E::FunctionCall(f) => {
+            let module = f.schema.as_deref()?;
+            let fd = schema
+                .functions
+                .iter()
+                .find(|d| d.module == module && d.name == f.name && d.return_is_set)?;
+            Some(format!(
+                "a call to set-returning function '{}::{}', so it yields many values",
+                fd.module, fd.name
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// What in `expr` disqualifies it from being a column DEFAULT, if anything.
 ///
@@ -257,6 +304,25 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
                     continue;
                 }
             };
+            // Cardinality before type: an array-valued expression has no
+            // scalar type to compare, so reporting the mismatch as a *type*
+            // error would name the wrong problem even when one is inferable.
+            // A computed that declares an array type is asking for the many
+            // values and is left alone.
+            if !declared.ends_with("[]")
+                && let Some(why) = multi_valued(&ir, schema)
+            {
+                errors.push(mismatch(
+                    context.clone(),
+                    format!(
+                        "cardinality mismatch in computed pointer '{context}': declared {declared}, a single \
+                         value, but the expression is {why} — declare it as an array \
+                         (e.g. Computed[pylon.Array[...], …]) or reduce it to one value \
+                         (e.g. with 'limit 1', 'assert_single()', or an aggregate)"
+                    ),
+                ));
+                continue;
+            }
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, declared) {
                 errors.push(mismatch(
@@ -271,16 +337,15 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
 
         for prop in &td.properties {
             let Some(pyql) = &prop.default_pyql else { continue };
-            // Best-effort: a default that fails to compile here is silently
-            // skipped rather than collected — `pylon migrate` is still the
-            // authority on default-expression validity itself, this pass
-            // only adds a type-consistency check on top of an already-valid
-            // one.
-            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
-                continue;
+            let context = format!("{}.{} (default)", type_name, prop.name);
+            let ir = match compile_scalar_default_typed(pyql, schema) {
+                Ok((_, ir)) => ir,
+                Err(e) => {
+                    errors.push(mismatch(context.clone(), format!("default for '{context}': {e}")));
+                    continue;
+                }
             };
             if let Some(blocker) = default_blocker(&ir) {
-                let context = format!("{}.{} (default)", type_name, prop.name);
                 errors.push(mismatch(
                     context.clone(),
                     format!(
@@ -292,7 +357,6 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             }
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, &prop.pg_type) {
-                let context = format!("{}.{} (default)", type_name, prop.name);
                 errors.push(mismatch(
                     context.clone(),
                     format!(
@@ -305,11 +369,15 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
 
         for link in &td.links {
             let Some(pyql) = &link.default_pyql else { continue };
-            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
-                continue;
+            let context = format!("{}.{} (default)", type_name, link.name);
+            let ir = match compile_scalar_default_typed(pyql, schema) {
+                Ok((_, ir)) => ir,
+                Err(e) => {
+                    errors.push(mismatch(context.clone(), format!("default for '{context}': {e}")));
+                    continue;
+                }
             };
             if let Some(blocker) = default_blocker(&ir) {
-                let context = format!("{}.{} (default)", type_name, link.name);
                 errors.push(mismatch(
                     context.clone(),
                     format!(
@@ -322,7 +390,6 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
             }
             let Some(actual) = infer_ir_type(&ir) else { continue };
             if !types_compatible(actual, "uuid") {
-                let context = format!("{}.{} (default)", type_name, link.name);
                 errors.push(mismatch(
                     context.clone(),
                     format!(
@@ -689,12 +756,11 @@ mod tests {
     }
 
     #[test]
-    fn function_call_body_is_skipped_not_rejected() {
-        // `infer_ir_type` doesn't recognize FunctionCall, so a body built
-        // from a stdlib call (or anything else it can't type) must be
-        // silently skipped rather than falsely flagged — even though this
-        // one's declared type is deliberately wrong (str_lower returns
-        // text, not int8).
+    fn function_call_body_return_type_is_checked() {
+        // A body that is a stdlib call is typed by the overload that call
+        // resolves to, so a declared type the call cannot produce is caught
+        // here rather than at the first query that runs it. `str_lower`
+        // returns text, not int8.
         let fd = FunctionDescriptor {
             name: "caller".into(),
             module: "default".into(),
@@ -707,7 +773,44 @@ mod tests {
             volatility: "immutable".into(),
         };
         let schema = minimal_schema(vec![], vec![fd]);
-        assert!(validate_schema_types(&schema).is_ok());
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let msg = errs[0].to_string();
+        assert!(msg.contains("declared int8"), "{msg}");
+        assert!(msg.contains("produces text"), "{msg}");
+    }
+
+    #[test]
+    fn a_function_body_calling_a_user_function_checks_its_return_type() {
+        // The caller's declared type is checked against the *callee's*
+        // declared type — which needs the call itself to carry a type, not
+        // just the stdlib ones.
+        let callee = FunctionDescriptor {
+            name: "gives_text".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "text".into(),
+            body: "'x'".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+        };
+        let caller = FunctionDescriptor {
+            name: "caller".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "int8".into(),
+            body: "default::gives_text()".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+        };
+        let schema = minimal_schema(vec![], vec![callee, caller]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let msg = errs[0].to_string();
+        assert!(msg.contains("declared int8"), "{msg}");
+        assert!(msg.contains("produces text"), "{msg}");
     }
 
     #[test]
@@ -760,6 +863,125 @@ mod tests {
         assert_eq!(errs.len(), 1);
         let (_, msg, _) = errs[0].class_name_message_position();
         assert!(msg.contains("Person.score"), "{msg}");
+    }
+
+    #[test]
+    fn a_default_naming_a_function_that_does_not_exist_is_rejected() {
+        // The case this whole hard-fail exists for: a schema converted from
+        // a system whose own spelling was `uuid_generate_v7j` kept the name,
+        // and every consumer of the default dropped it with `.ok()` — so the
+        // column shipped with no DEFAULT at all and the first insert failed
+        // on NOT NULL, a long way from the declaration that caused it.
+        let mut prop = base_property("token", "uuid");
+        prop.default_pyql = Some("std::uuid_generate_v7j()".into());
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("Person.token"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+    }
+
+    #[test]
+    fn a_default_calling_a_real_function_wrongly_is_rejected() {
+        let mut prop = base_property("name", "text");
+        prop.default_pyql = Some("std::str_lower('A', 'B')".into());
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("Person.name"), "{msg}");
+        assert!(msg.contains("takes 1 argument(s), got 2"), "{msg}");
+    }
+
+    #[test]
+    fn a_default_that_is_a_valid_stdlib_call_still_passes() {
+        let mut prop = base_property("token", "uuid");
+        prop.default_pyql = Some("std::uuid_generate_v7()".into());
+        let td = person_type(vec![], vec![prop]);
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    #[test]
+    fn a_computed_calling_a_set_returning_function_declared_single_is_rejected() {
+        let fd = FunctionDescriptor {
+            name: "gives_many".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "int8".into(),
+            body: "{1, 2}".into(),
+            return_is_object: false,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "immutable".into(),
+        };
+        let cd = ComputedDescriptor {
+            name: "n".into(),
+            expression: "default::gives_many()".into(),
+            return_type: Some("int8".into()),
+            link_target: None,
+            link_multi: false,
+        };
+        let td = person_type(vec![cd], vec![]);
+        let schema = minimal_schema(vec![td], vec![fd]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("cardinality mismatch"), "{msg}");
+        assert!(msg.contains("gives_many"), "{msg}");
+    }
+
+    #[test]
+    fn a_computed_crossing_a_multilink_declared_single_is_rejected() {
+        // `.friends.name` compiles to `ARRAY(SELECT …)` — a text[] behind a
+        // pointer that declared plain text.
+        let cd = ComputedDescriptor {
+            name: "friend_names".into(),
+            expression: ".friends.name".into(),
+            return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
+        };
+        let mut td = person_type(vec![cd], vec![base_property("name", "text")]);
+        td.multilinks = vec![crate::schema::MultiLinkDescriptor {
+            name: "friends".into(),
+            target: "default::Person".into(),
+            through: None,
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![],
+            is_exclusive: false,
+        }];
+        let schema = minimal_schema(vec![td], vec![]);
+        let errs = validate_schema_types(&schema).unwrap_err();
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("cardinality mismatch"), "{msg}");
+        assert!(msg.contains("multilink"), "{msg}");
+    }
+
+    #[test]
+    fn the_same_computed_declared_as_an_array_passes() {
+        let cd = ComputedDescriptor {
+            name: "friend_names".into(),
+            expression: ".friends.name".into(),
+            return_type: Some("text[]".into()),
+            link_target: None,
+            link_multi: false,
+        };
+        let mut td = person_type(vec![cd], vec![base_property("name", "text")]);
+        td.multilinks = vec![crate::schema::MultiLinkDescriptor {
+            name: "friends".into(),
+            target: "default::Person".into(),
+            through: None,
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![],
+            is_exclusive: false,
+        }];
+        let schema = minimal_schema(vec![td], vec![]);
+        assert!(validate_schema_types(&schema).is_ok());
     }
 
     #[test]

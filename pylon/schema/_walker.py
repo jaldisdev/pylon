@@ -1647,11 +1647,13 @@ def walk(
         channels=channel_descs,
     )
     # Every function body, computed-pointer expression, and property/link
-    # default gets compiled and its actual produced type checked against its
-    # own declared type — raises pylon.exceptions.SchemaError (wrapping every
-    # mismatch found, not just the first) if anything's off. See
-    # crates/pylon-core/src/validate.rs for the (best-effort, not exhaustive)
-    # scope of what this can detect.
+    # default gets compiled, and its produced type and cardinality checked
+    # against what it declared — raises pylon.exceptions.SchemaError
+    # (wrapping every mismatch found, not just the first) if anything's off.
+    # Failing to compile at all counts as a mismatch: nothing downstream
+    # re-reports a default that doesn't compile, it just goes missing from
+    # the generated DDL. See crates/pylon-core/src/validate.rs for the scope
+    # of what the type half can and can't infer.
     if validate_types:
         _core.validate_schema_types(schema)
     return schema

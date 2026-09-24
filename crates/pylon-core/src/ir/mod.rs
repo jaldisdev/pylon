@@ -1202,6 +1202,20 @@ pub struct IrUnaryOp {
 
 #[derive(Debug, Clone)]
 pub struct IrFunctionCall {
+    /// What the resolved overload returns, when that is a nameable scalar.
+    ///
+    /// `name` alone cannot answer this: a `SqlBuiltin` overload is rewritten
+    /// to its PostgreSQL name here (`str_lower` becomes `lower`), so looking
+    /// the result back up in the stdlib registry by `name` finds nothing and
+    /// silently types the call as unknown. Recording it at resolution time —
+    /// the one place the chosen `FnDescriptor`/`FunctionDescriptor` is in
+    /// hand — is what lets `infer_ir_type` see through a call at all, which
+    /// in turn is what lets a nested call (`str_lower(str_trim(x))`) resolve
+    /// its outer overload by type rather than by falling back to the first
+    /// one registered. `None` for a synthesised call the compiler builds
+    /// itself and for a polymorphic result (`max`, `min`, `sum`) that is
+    /// typed from its argument instead.
+    pub return_pg_type: Option<String>,
     pub schema: Option<String>,
     pub name: String,
     pub args: Vec<IrExpr>,
@@ -2731,6 +2745,89 @@ mod tests {
         let sql = crate::sql::emit(&ir).sql;
         assert!(sql.contains("to_bytes_uuid"), "expected to_bytes_uuid, got: {sql}");
         assert!(sql.contains("to_int32_bytes"), "expected to_int32_bytes, got: {sql}");
+    }
+
+    /// A call no overload can accept used to resolve to whichever overload
+    /// was registered first, so `str_lower(a, b)` compiled to `lower(a, b)`
+    /// and only failed once PostgreSQL saw a signature nobody wrote.
+    #[test]
+    fn a_stdlib_call_with_the_wrong_argument_count_is_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::str_lower('A', 'B')").unwrap();
+        let Err(err) = super::compile(&ast, &schema) else {
+            panic!("wrong arity must not compile")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("std::str_lower"), "{msg}");
+        assert!(msg.contains("takes 1 argument(s), got 2"), "{msg}");
+    }
+
+    /// A near-miss name gets pointed at the real one — the shape the
+    /// `uuid_generate_v7j` default took, one character away from a function
+    /// that does exist.
+    #[test]
+    fn an_unknown_function_suggests_the_closest_real_one() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::uuid_generate_v7j()").unwrap();
+        let Err(err) = super::compile(&ast, &schema) else {
+            panic!("an unknown function must not compile")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains("did you mean std::uuid_generate_v7()?"), "{msg}");
+    }
+
+    /// A name that is real but reached for in the wrong namespace gets told
+    /// which one holds it, rather than fuzzy-matched against a neighbour
+    /// that merely looks similar.
+    #[test]
+    fn a_function_in_another_namespace_says_where_it_lives() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::pi()").unwrap();
+        let Err(err) = super::compile(&ast, &schema) else {
+            panic!("pi lives in math, not std")
+        };
+        assert!(err.to_string().contains("it lives in math, use math::pi()"), "{err}");
+    }
+
+    /// The arities are listed, not just the first overload's — `str_trim`
+    /// takes one argument or two, and a three-argument call has to say so.
+    #[test]
+    fn an_arity_error_names_every_arity_the_overload_set_accepts() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::str_trim('A', 'B', 'C')").unwrap();
+        let Err(err) = super::compile(&ast, &schema) else {
+            panic!("wrong arity must not compile")
+        };
+        assert!(err.to_string().contains("takes 1 or 2 argument(s), got 3"), "{err}");
+    }
+
+    /// A trailing variadic parameter absorbs any number of arguments, so the
+    /// arity gate must not reject the calls it exists to allow.
+    #[test]
+    fn a_variadic_stdlib_call_accepts_extra_arguments() {
+        let schema = make_schema();
+        for query in [
+            "SELECT std::json_get(<json>$0, 'a')",
+            "SELECT std::json_get(<json>$0, 'a', 'b', 'c')",
+        ] {
+            let ast = parse::parse(query).unwrap();
+            super::compile(&ast, &schema).unwrap_or_else(|e| panic!("{query} must compile: {e}"));
+        }
+    }
+
+    /// Right count, wrong types — reported as the overload mismatch it is,
+    /// listing what the function does accept.
+    #[test]
+    fn a_stdlib_call_with_an_unacceptable_argument_type_is_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::str_lower(<int64>$0)").unwrap();
+        let Err(err) = super::compile(&ast, &schema) else {
+            panic!("wrong argument type must not compile")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("no overload accepting (int8)"), "{msg}");
+        assert!(msg.contains("(str)"), "{msg}");
     }
 
     /// The byte-order forms sit beside the one-argument `to_intN(str)` casts,

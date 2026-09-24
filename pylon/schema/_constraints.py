@@ -73,10 +73,16 @@ class Default(_PointerConstraint):
     * a ``std``/``math``/``cal`` expression —
       ``Default(std.uuid_generate_v7())``
 
-    The last form is checked when the schema is walked: unknown functions and
+    The last form is checked the moment it is written: unknown functions and
     wrong argument counts are rejected there, and so are functions that can't
     work as a default at all (an aggregate has no set to aggregate over, and a
     set-returning call can't produce the single value a column needs).
+
+    The expression-string form is checked when the schema is walked, by
+    compiling it — a default that doesn't compile is an error, not a default
+    that quietly goes missing from the generated DDL, which is how
+    ``Default('std::uuid_generate_v7j()')`` used to reach Postgres as a
+    column with no default at all.
     """
 
     def __init__(self, sentinel: object) -> None:
