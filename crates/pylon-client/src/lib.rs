@@ -19,9 +19,10 @@
 
 //! A native Rust query client for Pylon — lets a Rust project run PyQL
 //! queries against a Pylon-managed Postgres database directly, without
-//! going through `pylon-py`/pyo3. Query results decode into a generic,
-//! dynamically-typed [`Value`]/[`Object`] rather than per-schema-type
-//! structs.
+//! going through `pylon-py`/pyo3. Query results decode either into a
+//! generic, dynamically-typed [`Value`]/[`Object`] or into a caller's own
+//! row struct via [`Queryable`] and `#[derive(Queryable)]` — there is no
+//! generated per-schema-type code either way.
 //!
 //! Compilation reuses `pylon_core::query::compile` as-is; connection
 //! execution reuses `pylon_pgcon::PgPool`/`PgTransaction` as-is. The one
@@ -37,6 +38,8 @@ mod error;
 mod exec;
 pub mod json;
 mod listen;
+pub mod query_arg;
+pub mod queryable;
 mod schema;
 mod transaction;
 mod value;
@@ -46,5 +49,12 @@ pub use error::{Error, Result};
 pub use listen::ChannelListener;
 pub use pylon_cache::CacheStats;
 pub use pylon_value::DecodedValue;
+pub use query_arg::{QueryArg, QueryArgs, ValueOpt};
+pub use queryable::{DecodeError, DecodeErrorKind, Queryable};
 pub use transaction::{Isolation, Transaction};
 pub use value::{Group, Object, Range, Value};
+
+/// `#[derive(Queryable)]`. Shares the trait's name the way `serde`'s derives
+/// share theirs — a macro and a trait live in separate namespaces, so one
+/// `use pylon_client::Queryable;` brings in both.
+pub use pylon_derive::Queryable;

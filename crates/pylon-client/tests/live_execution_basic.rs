@@ -201,7 +201,7 @@ async fn query_and_execute_round_trip() {
         .unwrap();
 
     let rows = client
-        .query(&format!("select {module}::Person {{ name }}"), &[])
+        .query::<Value, _>(&format!("select {module}::Person {{ name }}"), &[])
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -255,7 +255,7 @@ async fn query_single_enforces_cardinality() {
 
     assert_eq!(
         client
-            .query_single(&format!("select {module}::Person"), &[])
+            .query_single::<Value, _>(&format!("select {module}::Person"), &[])
             .await
             .unwrap(),
         None
@@ -277,7 +277,7 @@ async fn query_single_enforces_cardinality() {
         .unwrap();
 
     let err = client
-        .query_single(&format!("select {module}::Person"), &[])
+        .query_single::<Value, _>(&format!("select {module}::Person"), &[])
         .await
         .unwrap_err();
     assert!(
@@ -302,11 +302,17 @@ async fn globals_fill_the_dunder_global_param_slot() {
     let client = setup(&schema).await;
 
     let authed = client.with_globals([(format!("{module}::viewer_name"), DecodedValue::Str("Dave".into()))]);
-    let rows = authed.query("select global viewer_name", &[]).await.unwrap();
+    let rows = authed
+        .query::<Value, _>("select global viewer_name", &[])
+        .await
+        .unwrap();
     assert_eq!(rows, vec![Value::Str("Dave".into())]);
 
     // A sibling view without the global sees it as unset (NULL).
-    let rows = client.query("select global viewer_name", &[]).await.unwrap();
+    let rows = client
+        .query::<Value, _>("select global viewer_name", &[])
+        .await
+        .unwrap();
     assert_eq!(rows, vec![Value::Null]);
 }
 
@@ -331,7 +337,7 @@ async fn transaction_commits_on_success() {
         .unwrap();
 
     let rows = client
-        .query(&format!("select {module}::Person {{ name }}"), &[])
+        .query::<Value, _>(&format!("select {module}::Person {{ name }}"), &[])
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -366,7 +372,10 @@ async fn transaction_rolls_back_on_error_and_does_not_retry_non_retriable_errors
     assert!(result.is_err());
     assert_eq!(attempts, 1, "a non-retriable error must not be retried");
 
-    let rows = client.query(&format!("select {module}::Person"), &[]).await.unwrap();
+    let rows = client
+        .query::<Value, _>(&format!("select {module}::Person"), &[])
+        .await
+        .unwrap();
     assert!(rows.is_empty(), "the insert must have been rolled back, got: {rows:?}");
 }
 
@@ -388,7 +397,9 @@ async fn a_body_returning_rollback_sees_its_own_writes_and_leaves_nothing_behind
                 )
                 .await?;
                 // The write is visible to the transaction that made it ...
-                let seen = tx.query(&format!("select {module}::Person {{ name }}"), &[]).await?;
+                let seen = tx
+                    .query::<Value, _>(&format!("select {module}::Person {{ name }}"), &[])
+                    .await?;
                 assert_eq!(seen.len(), 1);
                 Err(pylon_client::Error::Rollback)
             })
@@ -401,7 +412,10 @@ async fn a_body_returning_rollback_sees_its_own_writes_and_leaves_nothing_behind
     assert!(committed.is_none());
     assert_eq!(attempts, 1, "a deliberate rollback must not be retried");
 
-    let rows = client.query(&format!("select {module}::Person"), &[]).await.unwrap();
+    let rows = client
+        .query::<Value, _>(&format!("select {module}::Person"), &[])
+        .await
+        .unwrap();
     assert!(rows.is_empty(), "the insert must have been rolled back, got: {rows:?}");
 }
 
@@ -432,7 +446,10 @@ async fn rollback_still_propagates_as_an_error_through_plain_transaction() {
     assert!(err.is_rollback());
     assert!(!err.is_retriable());
 
-    let rows = client.query(&format!("select {module}::Person"), &[]).await.unwrap();
+    let rows = client
+        .query::<Value, _>(&format!("select {module}::Person"), &[])
+        .await
+        .unwrap();
     assert!(rows.is_empty(), "the insert must have been rolled back, got: {rows:?}");
 }
 
@@ -451,7 +468,7 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
         .unwrap();
 
     let query = format!("select {module}::Person {{ name }}");
-    let first = client.query(&query, &[]).await.unwrap();
+    let first = client.query::<Value, _>(&query, &[]).await.unwrap();
     assert_eq!(first.len(), 1);
     let Value::Object(person) = &first[0] else {
         panic!("expected Object")
@@ -467,7 +484,7 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
 
     // No invalidation listener is running (by design — see Builder::cache's
     // docs), so the second call must still serve the stale cached value.
-    let second = client.query(&query, &[]).await.unwrap();
+    let second = client.query::<Value, _>(&query, &[]).await.unwrap();
     assert_eq!(
         second, first,
         "a read-through cache hit must return the stale cached value"
@@ -484,7 +501,7 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
 
     // After clearing the cache, the same query now genuinely re-fetches
     // and observes the mutation.
-    let third = client.query(&query, &[]).await.unwrap();
+    let third = client.query::<Value, _>(&query, &[]).await.unwrap();
     let Value::Object(person) = &third[0] else {
         panic!("expected Object")
     };
@@ -572,7 +589,7 @@ async fn listen_decodes_a_type_channel_payload_as_the_rows_id() {
     };
 
     let rows = client
-        .query(&format!("select {module}::Person {{ id }}"), &[])
+        .query::<Value, _>(&format!("select {module}::Person {{ id }}"), &[])
         .await
         .unwrap();
     let Value::Object(person) = &rows[0] else {

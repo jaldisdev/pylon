@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pylon-core", "crates/pylon-py", "crates/pylon-lsp", "crates/pylon-cache", "crates/pylon-value", "crates/pylon-pgcon", "crates/pylon-providers", "crates/pylon-workers", "crates/pylon-client", "crates/pylon-server", "crates/pylon-config"]
+members = ["crates/pylon-core", "crates/pylon-py", "crates/pylon-lsp", "crates/pylon-cache", "crates/pylon-value", "crates/pylon-pgcon", "crates/pylon-providers", "crates/pylon-workers", "crates/pylon-client", "crates/pylon-derive", "crates/pylon-server", "crates/pylon-config"]
 resolver = "2"
 
 [workspace.package]

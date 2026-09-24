@@ -1530,8 +1530,10 @@ dependencies = [
  "chrono",
  "pylon-cache",
  "pylon-core",
+ "pylon-derive",
  "pylon-pgcon",
  "pylon-value",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -1563,6 +1565,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "pylon-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]

@@ -35,6 +35,11 @@ pub enum Error {
     /// PyQL failed to compile — a syntax/type/resolution/cardinality error.
     #[error(transparent)]
     Compile(#[from] pylon_core::error::PyQLError),
+    /// A row didn't fit the type `query::<R, _>` was asked to decode it
+    /// into — a shape missing a field the struct declares, an enum label
+    /// with no matching variant, an integer too wide for its Rust type.
+    #[error(transparent)]
+    Decode(#[from] crate::queryable::DecodeError),
     /// A required query parameter (named or `__global__`-prefixed) had no
     /// matching entry in the params/globals passed by the caller.
     #[error("missing query parameter: {0}")]

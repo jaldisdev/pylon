@@ -33,9 +33,10 @@ use pylon_value::DecodedValue;
 
 use crate::error::{Error, Result};
 use crate::exec;
+use crate::query_arg::QueryArgs;
+use crate::queryable::{Queryable, decode_optional_row, decode_row, decode_rows};
 use crate::schema;
 use crate::transaction::{Isolation, Transaction};
-use crate::value::Value;
 
 /// A transaction attempt body's return type — boxed since a plain generic
 /// `Fut: Future` can't express "this future borrows the `&Transaction` it
@@ -224,54 +225,61 @@ impl Client {
         self.cache.clone()
     }
 
-    pub async fn query(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Vec<Value>> {
+    pub async fn query<R: Queryable, A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<Vec<R>> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
-        exec::query(
+        let values = exec::query(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
             crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
-        .await
+        .await?;
+        decode_rows(values)
     }
 
-    pub async fn query_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<Value>> {
+    pub async fn query_single<R: Queryable, A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<Option<R>> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
-        exec::query_single(
+        let values = exec::query_single(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
             crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
-        .await
+        .await?;
+        decode_optional_row(values)
     }
 
-    pub async fn query_required_single(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Value> {
+    pub async fn query_required_single<R: Queryable, A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<R> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
-        exec::query_required_single(
+        let values = exec::query_required_single(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
             crate::cache::CacheAccess::read_write(self.cache.as_deref()),
         )
-        .await
+        .await?;
+        decode_row(values)
     }
 
-    pub async fn execute(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<()> {
+    pub async fn execute<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<()> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
         exec::execute(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
@@ -307,12 +315,13 @@ impl Client {
         crate::listen::listen(&self.dsn, &schema, channel).await
     }
 
-    pub async fn query_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
+    pub async fn query_json<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<String> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
         exec::query_json(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
@@ -321,12 +330,13 @@ impl Client {
         .await
     }
 
-    pub async fn query_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<Option<String>> {
+    pub async fn query_single_json<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<Option<String>> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
         exec::query_single_json(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
@@ -335,12 +345,13 @@ impl Client {
         .await
     }
 
-    pub async fn query_required_single_json(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
+    pub async fn query_required_single_json<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<String> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
         exec::query_required_single_json(
             &*self.pool,
             pyql,
-            params,
+            &params,
             &schema,
             &self.config,
             &self.globals,
@@ -371,9 +382,10 @@ impl Client {
     /// returns a query plan grouped by the query's own shape instead of raw
     /// SQL relation names. `pyql` doesn't need the leading `analyze`
     /// keyword already written. Mirrors `pylon/client.py:461-480`.
-    pub async fn analyze(&self, pyql: &str, params: &[(&str, DecodedValue)]) -> Result<String> {
+    pub async fn analyze<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<String> {
+        let params = args.to_params();
         let schema = self.schema.read().unwrap().clone();
-        exec::analyze(&*self.pool, pyql, params, &schema, &self.config, &self.globals).await
+        exec::analyze(&*self.pool, pyql, &params, &schema, &self.config, &self.globals).await
     }
 
     /// Runs a retrying transaction with the default isolation level
