@@ -2387,6 +2387,38 @@ mod tests {
         );
     }
 
+    /// `(select …).company[is Company].name` — conduit derives a trust tier
+    /// through a walk like this, and the upstream engine accepts it. A `[is T]` step has no
+    /// expression form, so the parser used to reject the whole walk; it is now
+    /// carried as `PathStepOn` and re-rooted at a binding.
+    #[test]
+    fn test_a_type_intersection_may_follow_a_sub_select() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT (SELECT Person LIMIT 1).company[is Company].name").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        // The trailing field must be read as a column. Reading it as jsonb off
+        // the object id compiled fine and then failed at execution with
+        // `operator does not exist: uuid -> unknown`.
+        assert!(
+            !sql.contains("->'name'"),
+            "the field must not be jsonb off an id:\n{sql}"
+        );
+        assert!(sql.contains("\"name\""), "the field must be read as a column:\n{sql}");
+    }
+
+    /// A step that has no path, binding or sub-select to walk off is still an
+    /// error — it just reports at compile time now rather than at parse time.
+    #[test]
+    fn test_a_type_intersection_on_a_value_is_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT (1 + 2)[is Company]").unwrap();
+        let Err(error) = super::compile(&ast, &schema) else {
+            panic!("a type intersection on a number is not meaningful");
+        };
+        assert!(error.to_string().contains("needs a path, a binding"), "got: {error}");
+    }
+
     /// `select (select (A union B) { … } limit 1) { … }` — ledger resolves a
     /// listing from either of two backlinks this way. The inner select
     /// compiles alone and the `with l := … select l { … }` spelling works;

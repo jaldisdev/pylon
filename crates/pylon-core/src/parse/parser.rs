@@ -1402,16 +1402,15 @@ impl Parser {
                 p.steps.push(step);
                 Ok(Expr::Path(p))
             }
-            _other => {
-                // For non-path expressions (e.g. `(SELECT ...).field`), we'd need
-                // a Path with an Expr head — not supported in Phase 1.
-                Err(PyQLSyntaxError {
-                    message: "field access with '.' is only supported on paths (e.g. `.field`), \
-                              not on a parenthesized sub-expression"
-                        .to_string(),
-                    position: self.current_pos(),
-                })
-            }
+            // `(select …).provider[is Individual]` — a step with no expression
+            // form of its own, applied to something that is not a path. the upstream engine
+            // accepts this, so it is carried as `PathStepOn` and the compiler
+            // re-roots the whole walk at a binding. A base that genuinely
+            // cannot be walked fails there, with a message that can say why.
+            other => Ok(Expr::PathStepOn {
+                expr: Box::new(other),
+                step: Box::new(step),
+            }),
         }
     }
 

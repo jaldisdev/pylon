@@ -188,6 +188,17 @@ pub enum Expr {
         expr: Box<Expr>,
         field: String,
     },
+    /// A path step applied to something that is not itself a path — the
+    /// `[is Individual]` in `(select Installation limit 1).provider[is
+    /// Individual].staff`, which the upstream engine accepts. `.name` on such a base is
+    /// already a `FieldAccess`; this carries the steps that have no
+    /// expression form of their own (a type intersection, a link property, a
+    /// backlink). The compiler rewrites a chain of these into an ordinary
+    /// `Path` rooted at a binding, so nothing downstream has to know about it.
+    PathStepOn {
+        expr: Box<Expr>,
+        step: Box<PathStep>,
+    },
     /// Positional tuple element on a non-path expression: `(1, 3.14, 'red').2`.
     TupleIndex {
         expr: Box<Expr>,

@@ -1843,6 +1843,77 @@ impl<'a> Compiler<'a> {
     /// Peel nested `Expr::FieldAccess` layers (`X.a.b` parses as
     /// `FieldAccess{FieldAccess{X, "a"}, "b"}`) into the innermost root
     /// expression plus the ordered chain of field names.
+    /// `(select …).provider[is Individual].staff` — a walk off a sub-select
+    /// that includes a step with no expression form of its own. The select is
+    /// hoisted into the statement's own WITH and the walk re-rooted at that
+    /// binding, which is the `with i := (select …) select i.provider[is …].staff`
+    /// spelling that already compiles.
+    ///
+    /// `None` when this is not that shape — in particular a walk made only of
+    /// `.field` steps, which the `FieldAccess` arm already handles and must go
+    /// on handling: re-rooting one of those reads the trailing field as jsonb
+    /// off an object id instead of as a column.
+    fn try_compile_walk_off_subquery(
+        &mut self,
+        expr: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        if !matches!(expr, Expr::PathStepOn { .. } | Expr::FieldAccess { .. }) {
+            return Ok(None);
+        }
+        let (base, steps) = Self::peel_path_step_chain(expr);
+        if !steps.iter().any(|step| !matches!(step, ast::PathStep::Name(_))) {
+            return Ok(None);
+        }
+        let Expr::SubQuery(inner_stmt) = base else {
+            return Ok(None);
+        };
+        // Bound exactly as a `with` alias would be, not via `compile_stmt`.
+        let inner = compile_cte_binding(self, &Expr::SubQuery(inner_stmt.clone()))?;
+        let cte_name = self.fresh_nested_cte_name();
+        let type_name = self.register_cte(&cte_name, &inner);
+        self.hoisted_ctes.push(IrCteDef {
+            name: cte_name.clone(),
+            stmt: inner,
+            type_name,
+        });
+        let mut path_steps = vec![ast::PathStep::Name(cte_name)];
+        path_steps.extend(steps);
+        let path = ast::Path {
+            steps: path_steps,
+            partial: false,
+        };
+        let ir = match ctx {
+            Some((td, alias)) => self.compile_path(&path, td, alias)?,
+            None => self.compile_free_path(&path)?,
+        };
+        Ok(Some(ir))
+    }
+
+    /// Peel a mixed `.field` / `[is T]` / `@prop` / `.<backlink` walk off a
+    /// base that is not itself a path, outermost step last. The counterpart of
+    /// `peel_field_access_chain` for a chain that contains a step with no
+    /// expression form of its own (see `ast::Expr::PathStepOn`).
+    fn peel_path_step_chain(expr: &Expr) -> (&Expr, Vec<ast::PathStep>) {
+        let mut steps = Vec::new();
+        let mut current = expr;
+        loop {
+            match current {
+                Expr::FieldAccess { expr: inner, field } => {
+                    steps.push(ast::PathStep::Name(field.clone()));
+                    current = inner;
+                }
+                Expr::PathStepOn { expr: inner, step } => {
+                    steps.push((**step).clone());
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        steps.reverse();
+        (current, steps)
+    }
+
     fn peel_field_access_chain(expr: &Expr) -> (&Expr, Vec<String>) {
         let mut fields = Vec::new();
         let mut current = expr;
@@ -3151,10 +3222,7 @@ impl<'a> Compiler<'a> {
                     let (base, fields) = Self::peel_field_access_chain(subject);
                     if let Expr::SubQuery(inner_stmt) = base
                         && !fields.is_empty()
-                        && matches!(
-                            inner_stmt.as_ref(),
-                            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
-                        )
+                        && matches!(inner_stmt.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
                     {
                         let inner = self.compile_stmt(inner_stmt)?;
                         let cte_name = self.fresh_nested_cte_name();
@@ -11229,6 +11297,16 @@ impl<'a> Compiler<'a> {
                 None => self.compile_free_path(p),
             },
 
+            // `(select … limit 1).connector.provider[is Individual].staff` — a
+            // walk off a sub-select including a step with no expression form.
+            Expr::PathStepOn { .. } => match self.try_compile_walk_off_subquery(expr, ctx)? {
+                Some(ir) => Ok(ir),
+                None => Err(self.type_err(
+                    "a type intersection, link property or backlink needs a path, a binding \
+                     or a sub-select to walk off",
+                )),
+            },
+
             Expr::Literal(lit) => Ok(IrExpr::Literal(match lit {
                 Literal::Str(s) => IrLiteral::Str(s.clone()),
                 Literal::Int(n) => IrLiteral::Int(*n),
@@ -12378,6 +12456,11 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::FieldAccess { expr: inner, field } => {
+                // `(select …).provider[is Individual].staff` arrives here, not
+                // at the `PathStepOn` arm: the trailing `.staff` is outermost.
+                if let Some(ir) = self.try_compile_walk_off_subquery(expr, ctx)? {
+                    return Ok(ir);
+                }
                 if let Expr::NamedTuple(fields) = inner.as_ref() {
                     let (_, val) = fields.iter().find(|(k, _)| k == field).ok_or_else(|| {
                         self.type_err(&format!("{field} is not a member of {}", named_tuple_type_str(fields)))
