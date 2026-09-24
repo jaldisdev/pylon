@@ -23,7 +23,7 @@ use super::{
 };
 use super::{
     B, E, I, NamedDefault, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_stable_nullable, plpgsql_stable_nullable_bool,
-    plpgsql_stable_nullable_elem, plpgsql_stable_returns, pn_as, pv, ro, set_of, sql, sql_returns, tup,
+    plpgsql_stable_nullable_elem, plpgsql_stable_returns, pn, pn_as, pv, ro, set_of, sql, sql_returns, tup,
 };
 use crate::stdlib::FnVolatility::{Modifying, Stable, Volatile};
 
@@ -1188,11 +1188,20 @@ END"#,
         f(
             "std",
             "to_duration",
-            vec![p("hours", Int64), p("minutes", Int64), p("seconds", Float64)],
+            // Named-only, each defaulting to 0, and `microseconds` alongside
+            // the rest — the upstream engine's own signature, which `to_duration(seconds := …)`
+            // relies on. Declared positionally these were unreachable by the
+            // names every call site actually writes.
+            vec![
+                pn("hours", Int64, NamedDefault::Int(0)),
+                pn("minutes", Int64, NamedDefault::Int(0)),
+                pn("seconds", Float64, NamedDefault::Int(0)),
+                pn("microseconds", Int64, NamedDefault::Int(0)),
+            ],
             Duration,
             sql(
                 "to_duration",
-                "SELECT make_interval(hours => $1::int, mins => $2::int, secs => $3)",
+                "SELECT make_interval(hours => $1::int, mins => $2::int, secs => $3 + ($4::float8 / 1000000))",
             ),
         ),
         // ── std:: type conversion ────────────────────────────────────────────
