@@ -748,10 +748,6 @@ END"#,
         // rather than guessed at: PostgreSQL only casts `bit` to `int4`/`int8`,
         // so a 16-bit version needs different arithmetic than this, and nothing
         // exercises either yet.
-        // `to_int16`/`to_int32`/`to_int64` over raw bytes, selecting byte order
-        // with `std::Endian` — the upstream engine's own signatures. The width of the `bit(N)`
-        // cast is what fixes how many bytes each one consumes; a `Little`
-        // argument reverses them first. Verified against the upstream engine for both orders.
         f(
             "std",
             "to_int32",
