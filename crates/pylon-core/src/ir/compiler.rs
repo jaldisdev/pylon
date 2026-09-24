@@ -432,6 +432,16 @@ fn per_element_of_one_multilink(condition: &Expr, td: &TypeDescriptor) -> Option
                 expr: Box::new(rewrite(expr, link)?),
                 ty: ty.clone(),
             },
+            // A set-returning call (`array_unpack`) is a second set the
+            // quantifier ranges over, so turning the condition into one asked
+            // per link element would change what it asks.
+            Expr::FunctionCall(f)
+                if crate::stdlib::lookup(f.module.as_deref().unwrap_or("std"), &f.name)
+                    .iter()
+                    .any(|d| d.returns_set()) =>
+            {
+                return None;
+            }
             Expr::FunctionCall(f) => Expr::FunctionCall(ast::FunctionCall {
                 module: f.module.clone(),
                 name: f.name.clone(),

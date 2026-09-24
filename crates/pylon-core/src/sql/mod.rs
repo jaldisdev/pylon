@@ -8260,6 +8260,40 @@ mod tests {
         assert!(out.sql.contains("<> ALL("), "got:\n{}", out.sql);
     }
 
+    /// `all(array_unpack($t) in .posts.title)` quantifies over the unpacked
+    /// array, not over `.posts`. Read as a condition on one `.posts` element
+    /// it would both ask the opposite question and leave the `unnest()` in a
+    /// `WHERE`, which PostgreSQL rejects at execution time.
+    #[test]
+    fn test_all_over_unpacked_array_aggregates_the_array_not_the_multilink() {
+        let out = compile_and_emit(
+            "SELECT Person { name } FILTER all(std::array_unpack(<array<str>>$titles) IN .posts.title)",
+        );
+        assert!(out.sql.contains("bool_and("), "got:\n{}", out.sql);
+        assert!(out.sql.contains("_unnested"), "got:\n{}", out.sql);
+    }
+
+    /// The mirror of the above: the multilink is what is quantified over and
+    /// the array is only the haystack, so `IN` still folds into `= ANY(array)`
+    /// and nothing unnests.
+    #[test]
+    fn test_any_over_a_multilink_against_an_unpacked_array_still_folds_into_any() {
+        let out = compile_and_emit(
+            "SELECT Person { name } FILTER any(.posts.title IN std::array_unpack(<array<str>>$titles))",
+        );
+        assert!(!out.sql.contains("unnest("), "got:\n{}", out.sql);
+        assert!(out.sql.contains("= ANY("), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_any_over_unpacked_array_aggregates_the_array_not_the_multilink() {
+        let out = compile_and_emit(
+            "SELECT Person { name } FILTER any(std::array_unpack(<array<str>>$titles) IN .posts.title)",
+        );
+        assert!(out.sql.contains("bool_or("), "got:\n{}", out.sql);
+        assert!(out.sql.contains("_unnested"), "got:\n{}", out.sql);
+    }
+
     /// A bare `array_unpack` outside `IN` still has to unnest — the unwrap is
     /// specific to `ANY`/`ALL`, which take an array rather than a set.
     #[test]
