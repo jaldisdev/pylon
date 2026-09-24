@@ -1293,6 +1293,12 @@ struct Compiler<'a> {
     /// (a nested insert whose own link value nests another insert) attaches
     /// each level's discoveries to the right statement.
     pending_nested_ctes: Vec<IrCteDef>,
+    /// Junction tables this statement also *writes*, mapped to the CTE that
+    /// wrote them — installed only while a walk off a hoisted mutation is
+    /// being compiled. Postgres does not show a sibling CTE's inserts in the
+    /// base table, so `(update T set { multi += … }).multi` has to read the
+    /// rows back out of the append CTE or it sees none of them.
+    junction_read_overrides: HashMap<String, JunctionReadOverride>,
     nested_cte_counter: usize,
     /// Non-fatal warnings collected during compilation.
     warnings: Vec<String>,
@@ -1373,6 +1379,7 @@ impl<'a> Compiler<'a> {
             special_anchors: HashMap::new(),
             global_ctes: vec![],
             pending_nested_ctes: vec![],
+            junction_read_overrides: HashMap::new(),
             nested_cte_counter: 0,
             warnings: vec![],
             explicit_set_depth: 0,
@@ -1843,6 +1850,40 @@ impl<'a> Compiler<'a> {
     /// Peel nested `Expr::FieldAccess` layers (`X.a.b` parses as
     /// `FieldAccess{FieldAccess{X, "a"}, "b"}`) into the innermost root
     /// expression plus the ordered chain of field names.
+    /// The junction tables `dml` writes, mapped to the CTE the emitter names
+    /// for each append (`{cte}__ml_add_{i}`, see `emit_ml_append_cte`). A walk
+    /// off that mutation reads them from there, because Postgres shows a
+    /// sibling CTE's inserts nowhere else. Only appends carrying no link
+    /// properties qualify: the append CTE returns just the two id columns, so
+    /// a walk reading `@prop` off one would name a column it does not have.
+    fn junction_overrides_for(dml: &IrStmt, cte_name: &str) -> HashMap<String, JunctionReadOverride> {
+        let appends = match dml {
+            IrStmt::Insert(ins) => &ins.multi_link_appends,
+            IrStmt::Update(upd) => &upd.multi_link_appends,
+            _ => return HashMap::new(),
+        };
+        appends
+            .iter()
+            .enumerate()
+            .filter(|(_, append)| append.values.link_props.is_empty())
+            .map(|(i, append)| {
+                // The targets themselves may also have been inserted by this
+                // statement, in which case they are only in their own CTE too.
+                let targets = match &append.values.source {
+                    IrMultiLinkValueSource::CteRef(target_cte) => Some(format!("@cte:{target_cte}")),
+                    _ => None,
+                };
+                (
+                    append.junction_table.clone(),
+                    JunctionReadOverride {
+                        junction: format!("@cte:{cte_name}__ml_add_{i}"),
+                        targets,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// `(select …).provider[is Individual].staff` — a walk off a sub-select
     /// that includes a step with no expression form of its own. The select is
     /// hoisted into the statement's own WITH and the walk re-rooted at that
@@ -1871,6 +1912,7 @@ impl<'a> Compiler<'a> {
         // Bound exactly as a `with` alias would be, not via `compile_stmt`.
         let inner = compile_cte_binding(self, &Expr::SubQuery(inner_stmt.clone()))?;
         let cte_name = self.fresh_nested_cte_name();
+        let overrides = Self::junction_overrides_for(&inner, &cte_name);
         let type_name = self.register_cte(&cte_name, &inner);
         self.hoisted_ctes.push(IrCteDef {
             name: cte_name.clone(),
@@ -1883,11 +1925,13 @@ impl<'a> Compiler<'a> {
             steps: path_steps,
             partial: false,
         };
+        let previous = std::mem::replace(&mut self.junction_read_overrides, overrides);
         let ir = match ctx {
-            Some((td, alias)) => self.compile_path(&path, td, alias)?,
-            None => self.compile_free_path(&path)?,
+            Some((td, alias)) => self.compile_path(&path, td, alias),
+            None => self.compile_free_path(&path),
         };
-        Ok(Some(ir))
+        self.junction_read_overrides = previous;
+        Ok(Some(ir?))
     }
 
     /// Peel a mixed `.field` / `[is T]` / `@prop` / `.<backlink` walk off a
@@ -3226,6 +3270,9 @@ impl<'a> Compiler<'a> {
                     {
                         let inner = self.compile_stmt(inner_stmt)?;
                         let cte_name = self.fresh_nested_cte_name();
+                        // The walk may read a junction this very mutation
+                        // appended to; those rows live only in the append CTE.
+                        let overrides = Self::junction_overrides_for(&inner, &cte_name);
                         let type_name = self.register_cte(&cte_name, &inner);
                         self.hoisted_ctes.push(IrCteDef {
                             name: cte_name.clone(),
@@ -3246,7 +3293,10 @@ impl<'a> Compiler<'a> {
                             limit: s.limit.clone(),
                             lock: s.lock.clone(),
                         };
-                        return self.compile_stmt(&Stmt::Select(rerooted));
+                        let previous = std::mem::replace(&mut self.junction_read_overrides, overrides);
+                        let compiled = self.compile_stmt(&Stmt::Select(rerooted));
+                        self.junction_read_overrides = previous;
+                        return compiled;
                     }
                 }
                 // `select (select (A union B) { … } limit 1) { … }` — a nested
@@ -3928,10 +3978,20 @@ impl<'a> Compiler<'a> {
                 let target_td = self.resolve_type(&ml.target)?;
                 let target_alias = self.fresh_alias();
                 let junction_alias = self.fresh_alias();
+                // Set only while walking off a mutation this statement made:
+                // both the junction rows and, when they were inserted here
+                // too, the targets live in CTEs rather than their tables.
+                let override_for_step = self
+                    .junction_read_overrides
+                    .get(&self.owner_junction(current_td, &ml.name, None))
+                    .cloned();
                 let target = IrSource {
                     poly: None,
                     type_name: format!("{}::{}", target_td.module, target_td.name),
-                    table: target_td.table.clone(),
+                    table: match override_for_step.as_ref().and_then(|o| o.targets.clone()) {
+                        Some(cte) => cte,
+                        None => target_td.table.clone(),
+                    },
                     alias: target_alias.clone(),
                 };
                 let join_info = if let Some(through_qname) = &ml.through {
@@ -3981,8 +4041,12 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 } else {
+                    let junction_table = self.owner_junction(current_td, &ml.name, None);
                     IrMultiLinkJoin::Standard {
-                        junction_table: self.owner_junction(current_td, &ml.name, None),
+                        junction_table: match &override_for_step {
+                            Some(o) => o.junction.clone(),
+                            None => junction_table,
+                        },
                         module: current_td.module.clone(),
                     }
                 };
@@ -8365,8 +8429,12 @@ impl<'a> Compiler<'a> {
                 })
             }
         } else {
+            let junction_table = self.owner_junction(td, name, None);
             Ok(IrMultiLinkJoin::Standard {
-                junction_table: self.owner_junction(td, name, None),
+                junction_table: match self.junction_read_overrides.get(&junction_table) {
+                    Some(o) => o.junction.clone(),
+                    None => junction_table,
+                },
                 module: td.module.clone(),
             })
         }
@@ -14740,6 +14808,15 @@ impl<'a> Compiler<'a> {
             operand: inner,
         })))
     }
+}
+
+/// Where a walk reads a multi-link this statement also wrote: the CTE holding
+/// the junction rows, and — when the targets were inserted here too — the CTE
+/// holding those.
+#[derive(Clone)]
+struct JunctionReadOverride {
+    junction: String,
+    targets: Option<String>,
 }
 
 /// What an `UNLESS CONFLICT … ELSE (UPDATE …)` clause contributes: the

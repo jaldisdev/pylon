@@ -2393,6 +2393,30 @@ mod tests {
         );
     }
 
+    /// `(update T set { multi += (insert X …) }).multi { … }` — automator reads
+    /// back the config field it just appended. Postgres shows a sibling CTE's
+    /// inserts neither in the junction table nor in the target's own, so both
+    /// sides of the walk have to read the CTEs that wrote them; reading the
+    /// base tables returned no rows at all.
+    #[test]
+    fn test_a_walk_off_a_mutation_sees_the_rows_it_just_wrote() {
+        let schema = make_schema();
+        let ast = parse::parse(
+            "SELECT (UPDATE Person FILTER .name = 'a' SET { posts += (INSERT Post { title := 't' }) }).posts { title }",
+        )
+        .unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(
+            sql.contains("__ml_add_0\" AS \"") || sql.contains("JOIN \"_nested_dml_1__ml_add_0\""),
+            "the junction must be read from the CTE that wrote it:\n{sql}"
+        );
+        assert!(
+            !sql.contains("JOIN \"public\".\"Post\""),
+            "the targets must come from their own CTE, not the base table:\n{sql}"
+        );
+    }
+
     /// `(select …).company[is Company].name` — conduit derives a trust tier
     /// through a walk like this, and the upstream engine accepts it. A `[is T]` step has no
     /// expression form, so the parser used to reject the whole walk; it is now
