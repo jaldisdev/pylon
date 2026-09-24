@@ -2588,6 +2588,29 @@ mod tests {
         assert!(sql.contains("to_int32_bytes"), "expected to_int32_bytes, got: {sql}");
     }
 
+    /// The byte-order forms sit beside the one-argument `to_intN(str)` casts,
+    /// so each has to resolve on arity to its own `_bytes` function rather
+    /// than to the cast that shares its name.
+    #[test]
+    fn test_to_int16_and_to_int64_over_bytes_select_the_bytes_overload() {
+        let schema = make_schema();
+        for (query, expected) in [
+            (
+                "SELECT std::to_int16(std::to_bytes(<uuid>$0)[14:16], std::Endian.Big)",
+                "to_int16_bytes",
+            ),
+            (
+                "SELECT std::to_int64(std::to_bytes(<uuid>$0)[0:8], std::Endian.Little)",
+                "to_int64_bytes",
+            ),
+        ] {
+            let ast = parse::parse(query).unwrap();
+            let ir = super::compile(&ast, &schema).expect("compile failed");
+            let sql = crate::sql::emit(&ir).sql;
+            assert!(sql.contains(expected), "expected {expected}, got: {sql}");
+        }
+    }
+
     #[test]
     fn test_positional_param_names() {
         let schema = make_schema();

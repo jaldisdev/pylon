@@ -737,17 +737,29 @@ END"#,
             Bytes,
             sql("to_bytes_uuid", "SELECT decode(replace(($1)::text, '-', ''), 'hex')"),
         ),
-        // `to_int32` over raw bytes, with byte order selected by `std::Endian`
-        // — the upstream engine's own signature. The `bit(32)` cast is what fixes it at four
-        // bytes; `Little` reverses them first. Both orders were checked against
-        // a live the upstream engine instance, which gives -1638451077/2067290014 for the last
-        // four bytes of `0199a144-5473-8c2a-af9a-00049e57387b`.
+        // `to_int16`/`to_int32`/`to_int64` over raw bytes, with byte order
+        // selected by `std::Endian`. The width of the `bit(N)` cast is what
+        // fixes how many bytes each one consumes; `Little` reverses them first.
+        // The 32-bit orders were checked against a live instance, which gives
+        // -1638451077/2067290014 for the last four bytes of
+        // `0199a144-5473-8c2a-af9a-00049e57387b`.
         //
-        // The upstream engine also has `to_int16`/`to_int64` of the same shape, and
-        // `to_bytes(intN, Endian)` in the other direction. They are left out
-        // rather than guessed at: PostgreSQL only casts `bit` to `int4`/`int8`,
-        // so a 16-bit version needs different arithmetic than this, and nothing
-        // exercises either yet.
+        // `to_int16` needs the extra arithmetic because PostgreSQL casts `bit`
+        // to `int4`/`int8` but not to `int2`: `bit(16)::int4` zero-extends, so
+        // 0x9E57 arrives as 40535 rather than -25001, and the `+ 32768 % 65536
+        // - 32768` wrap is what restores the sign before narrowing to `int2`.
+        //
+        // `to_bytes(intN, Endian)` in the other direction is still missing.
+        f(
+            "std",
+            "to_int16",
+            vec![p("val", Bytes), p("endian", Str)],
+            Int16,
+            sql(
+                "to_int16_bytes",
+                "SELECT ((CASE WHEN $2 = 'Big' THEN ('x' || encode($1, 'hex'))::bit(16)::int4 ELSE ('x' || encode(substr($1, 2, 1) || substr($1, 1, 1), 'hex'))::bit(16)::int4 END + 32768) % 65536 - 32768)::int2",
+            ),
+        ),
         f(
             "std",
             "to_int32",
@@ -756,6 +768,16 @@ END"#,
             sql(
                 "to_int32_bytes",
                 "SELECT CASE WHEN $2 = 'Big'                  THEN ('x' || encode($1, 'hex'))::bit(32)::int4                  ELSE ('x' || encode(substr($1, 4, 1) || substr($1, 3, 1) || substr($1, 2, 1) || substr($1, 1, 1), 'hex'))::bit(32)::int4 END",
+            ),
+        ),
+        f(
+            "std",
+            "to_int64",
+            vec![p("val", Bytes), p("endian", Str)],
+            Int64,
+            sql(
+                "to_int64_bytes",
+                "SELECT CASE WHEN $2 = 'Big' THEN ('x' || encode($1, 'hex'))::bit(64)::int8 ELSE ('x' || encode(substr($1, 8, 1) || substr($1, 7, 1) || substr($1, 6, 1) || substr($1, 5, 1) || substr($1, 4, 1) || substr($1, 3, 1) || substr($1, 2, 1) || substr($1, 1, 1), 'hex'))::bit(64)::int8 END",
             ),
         ),
         // ── std:: array ──────────────────────────────────────────────────────
