@@ -1258,6 +1258,10 @@ struct Compiler<'a> {
     /// emitter has no WITH clause of its own — an expression, say. They are
     /// appended to the statement's own CTEs at the top-level boundary.
     hoisted_ctes: Vec<IrCteDef>,
+    /// What each hoisted binding was defined as, so the same one arriving
+    /// twice (one computed inlined from two places) is recognised as the same
+    /// rather than emitted twice under one CTE name.
+    hoisted_binding_sources: HashMap<String, Expr>,
     /// `(through type, junction alias)` of the multi-link whose own
     /// modifiers are being compiled — what a bare `@prop` in `filter
     /// (@primary = true)` resolves against. `None` on the stack means a link
@@ -1411,6 +1415,7 @@ impl<'a> Compiler<'a> {
             anchors: Vec::new(),
             link_prop_scope: Vec::new(),
             hoisted_ctes: Vec::new(),
+            hoisted_binding_sources: HashMap::new(),
             pending_detached: false,
             modifier_anchor: None,
             inline_bindings: std::collections::HashMap::new(),
@@ -10577,8 +10582,28 @@ impl<'a> Compiler<'a> {
                 {
                     continue;
                 }
+                // The same computed inlined twice — `select M { * } filter … .role`
+                // reaches `Membership.role` from both the splat and the filter —
+                // hoists its `with` bindings once per inlining, and two CTEs of
+                // one name is "WITH query name specified more than once". The
+                // bindings are identical, so the first one stands for both; a
+                // *different* binding under a name already taken is a real
+                // collision and says so rather than silently shadowing.
+                match self.hoisted_binding_sources.get(&alias.name) {
+                    Some(existing) if *existing == alias.expr => continue,
+                    Some(_) => {
+                        return Err(self.type_err(&format!(
+                            "two different `with` bindings named '{}' end up in one statement; \
+                             rename one of them",
+                            alias.name
+                        )));
+                    }
+                    None => {}
+                }
                 let ir_stmt = compile_cte_binding(self, &alias.expr)?;
                 let type_name = self.register_cte(&alias.name, &ir_stmt);
+                self.hoisted_binding_sources
+                    .insert(alias.name.clone(), alias.expr.clone());
                 self.hoisted_ctes.push(IrCteDef {
                     name: alias.name.clone(),
                     stmt: ir_stmt,

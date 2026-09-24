@@ -2393,6 +2393,30 @@ mod tests {
         );
     }
 
+    /// One computed reached from two places in a statement inlines its `with`
+    /// bindings twice, which used to emit two CTEs of one name — PostgreSQL's
+    /// "WITH query name specified more than once". The bindings are identical,
+    /// so the first stands for both.
+    #[test]
+    fn test_a_computed_inlined_twice_hoists_its_binding_once() {
+        let mut schema = make_schema();
+        schema.types[0].computed.push(ComputedDescriptor {
+            name: "ranked".into(),
+            expression: "(with ordering := ['a', 'b'] select array_get(ordering, 0))".into(),
+            return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
+        });
+        let ast = parse::parse("SELECT Person { ranked } FILTER .ranked = 'a'").unwrap();
+        let ir = super::compile(&ast, &schema).expect("IR compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert_eq!(
+            sql.matches("\"ordering\" AS (").count(),
+            1,
+            "the shared binding must be hoisted once:\n{sql}"
+        );
+    }
+
     /// `to_duration(seconds := …)` — the upstream engine's signature is named-only, and every
     /// call site writes the names.
     #[test]
