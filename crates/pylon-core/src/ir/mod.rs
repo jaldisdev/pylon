@@ -2393,6 +2393,30 @@ mod tests {
         );
     }
 
+    /// `to_duration(seconds := …)` — the upstream engine's signature is named-only, and every
+    /// call site writes the names.
+    #[test]
+    fn test_to_duration_takes_its_arguments_by_name() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::to_duration(seconds := 90.0)").unwrap();
+        super::compile(&ast, &schema).expect("named arguments must resolve");
+    }
+
+    /// `(.<backlink[is T].when < now) ?? true` — conduit's backoff gate. The
+    /// walk is set-valued, so it was gathered as an array and the comparison
+    /// came out as `timestamptz[] < timestamptz`, which PostgreSQL rejects
+    /// outright. Read back as a scalar subquery the empty case is NULL and the
+    /// `??` supplies the default, as the upstream engine does.
+    #[test]
+    fn test_an_ordering_comparison_reads_a_set_walk_as_one_value() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Company FILTER ((.<company[is Person].age < 30) ?? true)").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(!sql.contains("ARRAY(SELECT"), "the operand must be one value:\n{sql}");
+        assert!(sql.contains("COALESCE"), "the coalesce must survive:\n{sql}");
+    }
+
     /// `(select T filter .id = $x).link.prop` is one value, not a one-element
     /// set: the filter pins an exclusive property and every step is a forward
     /// single link, so nothing multiplies. the upstream engine infers the same, and conduit

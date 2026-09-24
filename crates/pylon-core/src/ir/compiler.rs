@@ -577,6 +577,30 @@ fn aggregate_over_nothing(name: &str, aggregate: IrExpr) -> IrExpr {
 }
 
 /// An expression whose value is a whole set, gathered as an array.
+/// A set-valued walk gathered as an array, read back as a scalar subquery
+/// instead — what an ordering comparison against a single value needs.
+///
+/// `(.installation.<installation[is RateLimitState].backoff_until < now) ?? true`
+/// is conduit's backoff gate, and the upstream engine evaluates it element-wise: empty set →
+/// `{}` → the `??` supplies `true`. Rendered as an array the comparison is
+/// `timestamptz[] < timestamptz`, which PostgreSQL has no operator for, so the
+/// statement failed outright. As a scalar subquery the empty case is NULL, the
+/// comparison is NULL, and `COALESCE` supplies the default — matching the upstream engine for
+/// the nought-or-one sets these walks actually produce (an `exclusive`
+/// constraint guarantees it here). A genuinely many-valued walk now raises
+/// PostgreSQL's own "more than one row returned by a subquery" rather than
+/// comparing element-wise as the upstream engine would; that is a narrower gap than emitting
+/// SQL that cannot run at all.
+fn set_walk_as_scalar(expr: IrExpr) -> IrExpr {
+    match expr {
+        IrExpr::ArrayFromSelect(source) => match *source {
+            IrArraySource::PathSelect(ps) => IrExpr::PathSubquery(ps),
+            other => IrExpr::ArrayFromSelect(Box::new(other)),
+        },
+        other => other,
+    }
+}
+
 fn yields_array(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::ArrayFromSelect(_) => true,
@@ -11659,8 +11683,19 @@ impl<'a> Compiler<'a> {
                         })));
                     }
                 }
-                let left = self.compile_expr_ctx(&b.left, ctx)?;
-                let right = self.compile_expr_ctx(&b.right, ctx)?;
+                let mut left = self.compile_expr_ctx(&b.left, ctx)?;
+                let mut right = self.compile_expr_ctx(&b.right, ctx)?;
+                // An ordering comparison takes one value a side, so a walk
+                // gathered as an array is read back as a scalar subquery — see
+                // `set_walk_as_scalar`.
+                if matches!(
+                    b.op,
+                    ast::BinOpKind::Lt | ast::BinOpKind::Le | ast::BinOpKind::Gt | ast::BinOpKind::Ge
+                ) && yields_array(&left) != yields_array(&right)
+                {
+                    left = set_walk_as_scalar(left);
+                    right = set_walk_as_scalar(right);
+                }
                 // `A ?? B` over sets is A unless A is empty. An empty set
                 // gathered as an array is `{}`, not NULL, so `COALESCE` would
                 // never fall through to B.
