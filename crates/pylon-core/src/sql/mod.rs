@@ -8478,6 +8478,26 @@ mod tests {
         }
     }
 
+    /// The `coalesce` that empty array wears must not hide what the binding
+    /// holds: `contains(ids, .id)` picks its overload off the binding's type,
+    /// and an array read as text silently becomes a substring search.
+    #[test]
+    fn test_an_array_agg_binding_stays_an_array_through_its_coalesce() {
+        let out = compile_and_emit(
+            "WITH ids := std::array_agg(Person.id) SELECT Person { name } FILTER std::contains(ids, .id)",
+        );
+        assert!(
+            out.sql.contains("@> ARRAY["),
+            "expected the array overload, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("strpos("),
+            "the string overload must not win, got:\n{}",
+            out.sql
+        );
+    }
+
     /// An aggregate over a walk that is *not* unpacked keeps its own row
     /// source — the rewrite above must not reach it.
     #[test]

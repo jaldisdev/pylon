@@ -613,7 +613,20 @@ fn yields_array(expr: &IrExpr) -> bool {
     }
 }
 
+/// Look through the `coalesce` an aggregate over no rows is wrapped in — see
+/// `aggregate_over_nothing`. The default only stands in for the aggregate, so
+/// the type is the aggregate's.
+fn through_coalesce(expr: &IrExpr) -> &IrExpr {
+    match expr {
+        IrExpr::FunctionCall(f) if f.schema.is_none() && f.name == "coalesce" => {
+            f.args.first().map(through_coalesce).unwrap_or(expr)
+        }
+        other => other,
+    }
+}
+
 fn ir_value_type_name(expr: &IrExpr) -> String {
+    let expr = through_coalesce(expr);
     if let IrExpr::Array(elements) = expr {
         let element = elements.first().and_then(infer_ir_type).unwrap_or("text");
         return format!("{}[]", literal_sentinel_to_pg(element));
@@ -17007,7 +17020,7 @@ fn literal_sentinel_to_pg(t: &str) -> &str {
 }
 
 fn is_array_expr(expr: &IrExpr) -> bool {
-    match expr {
+    match through_coalesce(expr) {
         IrExpr::Array(_) | IrExpr::ArrayFromSelect(_) => true,
         // `str_split(…)[-1]` — a stdlib call declared to return an array,
         // which `infer_ir_type` cannot spell because it only names scalars.
