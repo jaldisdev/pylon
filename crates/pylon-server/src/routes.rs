@@ -170,7 +170,10 @@ pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Fu
         }
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     };
-    let schema = client.schema();
+    let schema = match client.schema().await {
+        Ok(s) => s,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
+    };
 
     let mut junction_tables: Vec<(String, String)> = Vec::new();
     for t in &schema.types {
@@ -205,8 +208,11 @@ pub async fn handle_stats(state: Arc<AppState>, connection: &str) -> Response<Fu
         "SELECT (SUM(n_live_tup)::bigint) AS result FROM pg_stat_user_tables \
          WHERE schemaname NOT IN ('pg_catalog', 'information_schema', '_pylon') {junction_filter}"
     );
-    let rows = match client
-        .raw_connection()
+    let pool = match client.raw_connection().await {
+        Ok(p) => p,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
+    };
+    let rows = match pool
         .query_typed(&sql, &[], &pylon_pgcon::ExtensionOids::default())
         .await
     {
@@ -295,7 +301,10 @@ async fn render_from_any_client(
     render: impl FnOnce(&SchemaDescriptor) -> serde_json::Value,
 ) -> Response<Full<Bytes>> {
     match state.resolve_client("main").await {
-        Ok(Some(c)) => json_response(StatusCode::OK, &render(&c.schema())),
+        Ok(Some(c)) => match c.schema().await {
+            Ok(schema) => json_response(StatusCode::OK, &render(&schema)),
+            Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
+        },
         Ok(None) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &serde_json::json!({"error": "no [database] connection configured"}),

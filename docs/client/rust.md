@@ -7,11 +7,20 @@
 ```rust
 let client = pylon_client::Client::builder(dsn)
     .max_pool_size(10)
-    .build()
-    .await?;
+    .build()?;
 ```
 
-`Builder::build()` connects eagerly (a bad DSN/host/credentials fails right here) and fetches the schema snapshot from `_pylon."Schema"` — fails with `Error::NoSchemaSnapshot` if neither `pylon migration apply` nor `pylon migration watch` has ever run against this database. A bare schema-file edit has no effect here until one of those does — same rule as the Python client's `ensure_connected()`. This crate never parses `pylon.toml` itself; the DSN is passed in directly.
+`Builder::build()` is synchronous and reaches nothing over the network, so a client can be constructed outside an async context and a configured-but-never-queried connection costs nothing. The connection pool and the schema snapshot from `_pylon."Schema"` are opened together on first use — the same laziness the Python client has.
+
+Clones share one connection, and so does every `with_globals`/`with_config` view, so connecting through any of them connects all of them. Concurrent first queries are serialised into a single connection attempt, and a failed attempt leaves the client unconnected rather than broken: a database that simply isn't up yet is retried by the next query.
+
+To fail at startup instead of on the first request — for a bad DSN/host/credentials, or a database where neither `pylon migration apply` nor `pylon migration watch` has ever run and there is therefore no schema snapshot (`Error::NoSchemaSnapshot`) — call `ensure_connected()`, which is idempotent and costs one atomic load after the first success:
+
+```rust
+client.ensure_connected().await?;
+```
+
+A bare schema-file edit has no effect until a migration applies or a dev-mode watch syncs — same rule as the Python client's `ensure_connected()`. This crate never parses `pylon.toml` itself; the DSN is passed in directly.
 
 Optional: `.cache(path, max_size_mb)` (or `.cache_handle(existing)` to attach to an already-open handle) opts into read-through LMDB caching — mirrors `pylon.toml`'s `[cache]` section (a single global on/off, no per-type overrides). Nothing evicts entries automatically; pair it with something that invalidates the same directory when data changes (e.g. `pylon worker start`).
 
@@ -104,11 +113,11 @@ Like the Python client, `listen()` opens its own dedicated (non-pooled) connecti
 ## Escape hatch: raw SQL
 
 ```rust
-let pool: &pylon_pgcon::PgPool = client.raw_connection();
+let pool: &pylon_pgcon::PgPool = client.raw_connection().await?;
 let rows = pool.query_typed("SELECT count(*) FROM some_table", &[], &pylon_pgcon::ExtensionOids::default()).await?;
 ```
 
-`client.raw_connection()` returns the underlying `pylon_pgcon::PgPool` directly, bypassing PyQL entirely — nothing here is validated or type-checked the way a compiled PyQL query is.
+`client.raw_connection()` returns the underlying `pylon_pgcon::PgPool` directly, bypassing PyQL entirely — nothing here is validated or type-checked the way a compiled PyQL query is. It connects like any query method does; `client.pool_if_connected()` is the non-connecting counterpart, returning `None` rather than opening a pool, for an observer (pool-status metrics, say) that shouldn't be the thing that causes a connection.
 
 ## Errors
 

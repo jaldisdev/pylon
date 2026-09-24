@@ -26,10 +26,10 @@
 //! A bare edit to a Python schema file has no effect here: nothing writes
 //! this snapshot until a migration actually applies (or a dev-mode watch
 //! syncs), by design — see `pylon_core::migrate::write_schema_snapshot`'s
-//! doc comment. A `Client` fetches this once at construction — a
-//! query-serving process doesn't want an extra round trip on every request
-//! — and only re-fetches when a caller explicitly asks via
-//! `Client::reload_schema()`.
+//! doc comment. A `Client` fetches this once, together with opening its
+//! pool on first use — a query-serving process doesn't want an extra round
+//! trip on every request — and only re-fetches when a caller explicitly
+//! asks via `Client::reload_schema()`.
 
 use pylon_core::schema::SchemaDescriptor;
 

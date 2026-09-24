@@ -100,9 +100,13 @@ async fn serve(
         }
     }
 
+    let main_schema = main_client
+        .schema()
+        .await
+        .map_err(|e| Error::Invalid(format!("failed to load the schema snapshot: {e}")))?;
     let worker_handles = match state.config.connections.get("default") {
         Some(db) => crate::workers::spawn(
-            &main_client.schema(),
+            &main_schema,
             &state.config,
             &db.dsn_string(),
             state.cache.clone(),
@@ -185,7 +189,7 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
     let path = req.uri().path().to_string();
 
     if method == Method::GET && path == "/metrics" && state.config.metrics.enabled {
-        state.record_pool_metrics().await;
+        state.record_pool_metrics();
         state.record_outbox_metrics().await;
         return crate::json::text_response(
             StatusCode::OK,

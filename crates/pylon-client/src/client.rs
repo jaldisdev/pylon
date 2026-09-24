@@ -30,6 +30,7 @@ use std::time::Duration;
 use pylon_core::ir::SessionConfig;
 use pylon_core::schema::SchemaDescriptor;
 use pylon_value::DecodedValue;
+use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
 use crate::exec;
@@ -113,16 +114,23 @@ impl Builder {
         self
     }
 
-    /// Connects (eagerly — a bad DSN/host/credentials fails right here,
-    /// matching `PgPool::connect`'s own eager-connect behavior) and fetches
-    /// the schema snapshot from `_pylon."Schema"` — fails with
-    /// `Error::NoSchemaSnapshot` if neither `pylon migration apply` nor
-    /// `pylon migration watch` has ever run against this database.
-    pub async fn build(self) -> Result<Client> {
-        let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size)
-            .await
-            .map_err(Error::Db)?;
-        let schema = schema::fetch(&pool).await?;
+    /// Builds the client without touching the database: the connection pool
+    /// and the schema snapshot are opened together on first use, or on an
+    /// explicit [`Client::ensure_connected`]. A `Client` can therefore be
+    /// constructed outside an async context, and a configured-but-never-queried
+    /// connection costs nothing.
+    ///
+    /// The cache, when [`Builder::cache`] configured one, *is* opened here —
+    /// it's a local LMDB directory rather than a network resource, and a bad
+    /// path is worth failing on at construction rather than on whichever
+    /// query happens to run first.
+    ///
+    /// A process that wants a bad DSN/host/credentials — or a database where
+    /// neither `pylon migration apply` nor `pylon migration watch` has ever
+    /// run, so there is no schema snapshot to fetch — to fail at startup
+    /// instead of on its first query should call [`Client::ensure_connected`]
+    /// right after this.
+    pub fn build(self) -> Result<Client> {
         let cache = match self.cache {
             None => None,
             Some(CacheSource::Open { path, max_size_mb }) => Some(Arc::new(
@@ -132,8 +140,8 @@ impl Builder {
         };
         Ok(Client {
             dsn: Arc::new(self.dsn),
-            pool: Arc::new(pool),
-            schema: Arc::new(RwLock::new(schema)),
+            max_pool_size: self.max_pool_size,
+            connected: Arc::new(OnceCell::new()),
             globals: Arc::new(HashMap::new()),
             config: SessionConfig::default(),
             cache,
@@ -141,28 +149,48 @@ impl Builder {
     }
 }
 
+/// The half of a [`Client`] that only exists once it has actually reached
+/// the database — held behind a `OnceCell` so construction stays cheap and
+/// synchronous. The pool and the schema snapshot are initialised together
+/// because a client with one and not the other can't serve a query anyway.
+struct Connected {
+    pool: pylon_pgcon::PgPool,
+    /// An `Arc` rather than a plain `RwLock` so `Client::transaction` can
+    /// hand a `Transaction` its own handle on the same schema slot without
+    /// borrowing from the `OnceCell` for the transaction's whole lifetime.
+    schema: Arc<RwLock<SchemaDescriptor>>,
+}
+
 /// An async Pylon client — a connection pool plus a compiled schema,
 /// shared cheaply across every [`Client::with_globals`]/[`Client::with_config`]
 /// view of it (mirrors `pylon/client.py`'s own shared-pool-ref pattern).
+///
+/// Connecting is lazy: [`Builder::build`] reaches nothing over the network,
+/// and the first query (or an explicit [`Client::ensure_connected`]) opens
+/// the pool and fetches the schema. Clones — including every
+/// `with_globals`/`with_config` view — share one connection, so connecting
+/// through any of them connects all of them, exactly as
+/// `pylon/client.py`'s `_PoolRef` is shared across its own views.
 #[derive(Clone)]
 pub struct Client {
-    /// Kept around solely for `Client::listen()` — every other method
-    /// operates through `pool`; a `LISTEN` subscription needs its own
-    /// dedicated (non-pooled) connection instead, opened fresh from this
-    /// DSN each time `listen()` is called.
+    /// Used to open the pool on first use, and on every `Client::listen()`
+    /// call — a `LISTEN` subscription needs its own dedicated (non-pooled)
+    /// connection, opened fresh from this DSN each time.
     dsn: Arc<String>,
-    pool: Arc<pylon_pgcon::PgPool>,
-    /// Every query method clones this out from behind the lock before
-    /// compiling/awaiting anything — a `std::sync::RwLockReadGuard` isn't
-    /// `Send`, and holding one across an `.await` point would make the
-    /// resulting future non-`Send` (fatal for `Client::transaction`'s boxed
-    /// futures, and a footgun on a multi-threaded runtime generally).
-    schema: Arc<RwLock<SchemaDescriptor>>,
+    max_pool_size: usize,
+    /// Shared across clones so that all of them see one pool and one schema
+    /// slot. `tokio::sync::OnceCell` (not `std`'s) because initialising it
+    /// has to await; it serialises concurrent initialisers, so N requests
+    /// racing to be the first make one connection attempt between them, and
+    /// it stays empty when an attempt fails, so a database that is merely
+    /// not up yet is retried by the next query rather than poisoning the
+    /// client for good.
+    connected: Arc<OnceCell<Connected>>,
     globals: Arc<HashMap<String, DecodedValue>>,
     config: SessionConfig,
     /// `None` unless `Builder::cache` was called — read-through caching is
     /// opt-in. Shared across `with_globals`/`with_config` clones, same as
-    /// `pool`/`schema`.
+    /// `connected`. Opened eagerly by `Builder::build`, since it's local.
     cache: Option<Arc<pylon_cache::Cache>>,
 }
 
@@ -171,14 +199,56 @@ impl Client {
         Builder::new(dsn)
     }
 
+    /// The pool and schema, opening them on first use.
+    ///
+    /// A client is reached from request handlers, background workers and CLI
+    /// commands alike, which share no startup between them to connect from,
+    /// so every query method goes through here rather than making callers
+    /// remember an explicit connect step — the same reasoning as
+    /// `pylon/client.py`'s `_connected_pool`.
+    ///
+    /// Note that every caller clones the schema out from behind the lock
+    /// rather than holding the guard: a `std::sync::RwLockReadGuard` isn't
+    /// `Send`, and holding one across an `.await` point would make the
+    /// resulting future non-`Send` (fatal for `Client::transaction`'s boxed
+    /// futures, and a footgun on a multi-threaded runtime generally).
+    async fn connected(&self) -> Result<&Connected> {
+        self.connected
+            .get_or_try_init(|| async {
+                let pool = pylon_pgcon::PgPool::connect(&self.dsn, self.max_pool_size)
+                    .await
+                    .map_err(Error::Db)?;
+                let schema = schema::fetch(&pool).await?;
+                Ok(Connected {
+                    pool,
+                    schema: Arc::new(RwLock::new(schema)),
+                })
+            })
+            .await
+    }
+
+    /// Opens the connection pool and fetches the schema snapshot if that
+    /// hasn't happened yet. Safe to call repeatedly; after the first success
+    /// it costs one atomic load.
+    ///
+    /// Queries connect on their own, so this is never required — it exists
+    /// for a process that would rather learn about an unreachable database,
+    /// bad credentials or a database with no schema snapshot
+    /// ([`Error::NoSchemaSnapshot`]) at startup than on whichever request
+    /// arrives first. Mirrors `pylon/client.py`'s `Client.ensure_connected`.
+    pub async fn ensure_connected(&self) -> Result<()> {
+        self.connected().await.map(|_| ())
+    }
+
     /// Re-fetches the schema snapshot from `_pylon."Schema"`. Visible to
     /// every clone sharing this client's pool (`with_globals`/`with_config`
     /// views included) — there's only one schema slot per underlying
     /// connection pool, matching `pylon/client.py`'s single process-level
     /// singleton.
     pub async fn reload_schema(&self) -> Result<()> {
-        let fresh = schema::fetch(&self.pool).await?;
-        *self.schema.write().unwrap() = fresh;
+        let conn = self.connected().await?;
+        let fresh = schema::fetch(&conn.pool).await?;
+        *conn.schema.write().unwrap() = fresh;
         pylon_core::query::clear_query_cache();
         Ok(())
     }
@@ -202,17 +272,27 @@ impl Client {
     }
 
     /// Escape hatch for hand-written SQL outside PyQL — mirrors
-    /// `pylon/client.py:567-579`.
-    pub fn raw_connection(&self) -> &pylon_pgcon::PgPool {
-        &self.pool
+    /// `pylon/client.py:567-579`. Connects if this client hasn't yet.
+    pub async fn raw_connection(&self) -> Result<&pylon_pgcon::PgPool> {
+        Ok(&self.connected().await?.pool)
+    }
+
+    /// The pool, but only if this client is already connected — `None`
+    /// rather than connecting. For an observer that wants to report on
+    /// whatever connections a process happens to be holding (pool-status
+    /// metrics, say) without a metrics scrape being the thing that opens
+    /// them.
+    pub fn pool_if_connected(&self) -> Option<&pylon_pgcon::PgPool> {
+        self.connected.get().map(|conn| &conn.pool)
     }
 
     /// A clone of the currently-loaded schema — for callers that need to
     /// introspect it directly (e.g. a schema-browser endpoint), not just
-    /// compile queries against it. Clones out from behind the lock rather
-    /// than returning a guard, same reasoning as every query method here.
-    pub fn schema(&self) -> SchemaDescriptor {
-        self.schema.read().unwrap().clone()
+    /// compile queries against it. Connects (and so fetches the snapshot) if
+    /// this client hasn't yet. Clones out from behind the lock rather than
+    /// returning a guard, same reasoning as every query method here.
+    pub async fn schema(&self) -> Result<SchemaDescriptor> {
+        Ok(self.connected().await?.schema.read().unwrap().clone())
     }
 
     /// The `Arc<pylon_cache::Cache>` this client reads/writes through, if
@@ -227,9 +307,10 @@ impl Client {
 
     pub async fn query<R: Queryable, A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<Vec<R>> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         let values = exec::query(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -243,9 +324,10 @@ impl Client {
 
     pub async fn query_single<R: Queryable, A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<Option<R>> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         let values = exec::query_single(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -259,9 +341,10 @@ impl Client {
 
     pub async fn query_required_single<R: Queryable, A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<R> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         let values = exec::query_required_single(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -275,9 +358,10 @@ impl Client {
 
     pub async fn execute<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<()> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         exec::execute(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -311,15 +395,17 @@ impl Client {
     /// async generator; here, a `recv()`-based handle instead, since this
     /// crate has no `Stream`/async-generator precedent to build on.
     pub async fn listen(&self, channel: &str) -> Result<crate::ChannelListener> {
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         crate::listen::listen(&self.dsn, &schema, channel).await
     }
 
     pub async fn query_json<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<String> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         exec::query_json(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -332,9 +418,10 @@ impl Client {
 
     pub async fn query_single_json<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<Option<String>> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         exec::query_single_json(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -347,9 +434,10 @@ impl Client {
 
     pub async fn query_required_single_json<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<String> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
         exec::query_required_single_json(
-            &*self.pool,
+            &conn.pool,
             pyql,
             &params,
             &schema,
@@ -384,8 +472,9 @@ impl Client {
     /// keyword already written. Mirrors `pylon/client.py:461-480`.
     pub async fn analyze<A: QueryArgs + ?Sized>(&self, pyql: &str, args: &A) -> Result<String> {
         let params = args.to_params();
-        let schema = self.schema.read().unwrap().clone();
-        exec::analyze(&*self.pool, pyql, &params, &schema, &self.config, &self.globals).await
+        let conn = self.connected().await?;
+        let schema = conn.schema.read().unwrap().clone();
+        exec::analyze(&conn.pool, pyql, &params, &schema, &self.config, &self.globals).await
     }
 
     /// Runs a retrying transaction with the default isolation level
@@ -477,16 +566,17 @@ impl Client {
     where
         F: for<'a> FnMut(&'a Transaction) -> TxFuture<'a, T>,
     {
+        let conn = self.connected().await?;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             if attempt > 1 {
                 tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt - 1))).await;
             }
-            let pg_tx = self.pool.begin(isolation.as_str()).await.map_err(Error::Db)?;
+            let pg_tx = conn.pool.begin(isolation.as_str()).await.map_err(Error::Db)?;
             let tx = Transaction {
                 inner: pg_tx,
-                schema: self.schema.clone(),
+                schema: conn.schema.clone(),
                 config: self.config.clone(),
                 globals: self.globals.clone(),
                 cache: self.cache.clone(),
@@ -511,5 +601,42 @@ impl Client {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A DSN nothing is listening on, so a connection attempt fails fast
+    /// without needing a live Postgres — port 1 is reserved and never bound.
+    const UNREACHABLE_DSN: &str = "postgresql://nobody@127.0.0.1:1/nothing";
+
+    #[test]
+    fn build_does_not_connect() {
+        let client = Client::builder(UNREACHABLE_DSN).build().unwrap();
+        assert!(client.pool_if_connected().is_none());
+    }
+
+    /// A failed attempt must leave the cell empty rather than storing the
+    /// failure, or a client built before its database finished starting
+    /// would stay broken for the life of the process.
+    #[tokio::test]
+    async fn a_failed_connect_is_retried_rather_than_remembered() {
+        let client = Client::builder(UNREACHABLE_DSN).build().unwrap();
+
+        assert!(client.ensure_connected().await.is_err());
+        assert!(client.pool_if_connected().is_none());
+        assert!(client.ensure_connected().await.is_err());
+    }
+
+    /// Views share the one connection slot, the way `with_globals` siblings
+    /// share `pylon/client.py`'s `_PoolRef`.
+    #[test]
+    fn views_share_the_connection_slot() {
+        let client = Client::builder(UNREACHABLE_DSN).build().unwrap();
+        let view = client.with_globals([]);
+
+        assert!(Arc::ptr_eq(&client.connected, &view.connected));
     }
 }

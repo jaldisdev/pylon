@@ -159,7 +159,20 @@ async fn setup(schema: &SchemaDescriptor) -> Client {
         .await
         .unwrap();
 
-    Client::builder(test_dsn()).max_pool_size(5).build().await.unwrap()
+    connected(Client::builder(test_dsn()).max_pool_size(5).build().unwrap()).await
+}
+
+/// Fetches the schema snapshot now, rather than leaving it to whenever the
+/// test's first query runs.
+///
+/// `_pylon."Schema"` holds one row for the whole database, so every `setup`
+/// overwrites the previous test's snapshot. A client that reads it lazily
+/// would pick up whichever test wrote last, not the module this one just
+/// exported — harmless under this suite's `--test-threads=1` convention,
+/// but there's no reason to leave the fixture depending on that.
+async fn connected(client: Client) -> Client {
+    client.ensure_connected().await.unwrap();
+    client
 }
 
 /// Like `setup`, but also opts into read-through caching at a fresh temp
@@ -178,12 +191,14 @@ async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let cache_dir = std::env::temp_dir().join(format!("pylon-client-live-test-cache-{nanos}"));
 
-    Client::builder(test_dsn())
-        .max_pool_size(5)
-        .cache(cache_dir, 10)
-        .build()
-        .await
-        .unwrap()
+    connected(
+        Client::builder(test_dsn())
+            .max_pool_size(5)
+            .cache(cache_dir, 10)
+            .build()
+            .unwrap(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -478,6 +493,8 @@ async fn cached_query_serves_stale_data_until_something_else_invalidates_it() {
     // Mutate the underlying row directly, bypassing the cache entirely.
     client
         .raw_connection()
+        .await
+        .unwrap()
         .execute_typed(&format!("UPDATE \"{module}\".\"Person\" SET name = 'Mutated'"), &[])
         .await
         .unwrap();
@@ -660,6 +677,8 @@ async fn listen_raises_on_a_malformed_payload() {
     // drop.
     client
         .raw_connection()
+        .await
+        .unwrap()
         .execute_typed(&format!("SELECT pg_notify('{module}__ids', 'not-a-uuid')"), &[])
         .await
         .unwrap();

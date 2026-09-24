@@ -24,8 +24,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use crate::config::Config;
 
 /// "main" is the frontend's fixed name for the base `[database]` block,
@@ -39,7 +37,13 @@ pub struct AppState {
     /// `--static-dir`, for iterating on the frontend without a Rust
     /// rebuild each time. `None` (the default) serves the embedded build.
     static_dir_override: Option<PathBuf>,
-    clients: Mutex<HashMap<String, Arc<pylon_client::Client>>>,
+    /// One `Client` per configured connection, all built during `new` and
+    /// never mutated afterwards — so the request path is a plain map lookup
+    /// with no lock to contend on. Building a client opens no connection
+    /// (see `pylon_client::Builder::build`); each one connects on the first
+    /// request that actually resolves it, and a configured connection
+    /// nothing ever queries stays closed for the process's whole life.
+    clients: HashMap<String, Arc<pylon_client::Client>>,
     /// Opened once here (not per-connection) and handed to every `Client`
     /// via `Builder::cache_handle` — `heed` (the LMDB binding
     /// `pylon-cache` uses) refuses a second `Env::open` on the same
@@ -67,10 +71,21 @@ impl AppState {
         } else {
             None
         };
+        let mut clients = HashMap::new();
+        for (name, db) in &config.connections {
+            let mut builder = pylon_client::Client::builder(db.dsn_string()).max_pool_size(db.pool_max_size as usize);
+            if let Some(cache) = &cache {
+                builder = builder.cache_handle(cache.clone());
+            }
+            let client = builder.build().map_err(|e| {
+                crate::error::Error::Invalid(format!("failed to build the {name:?} connection's client: {e}"))
+            })?;
+            clients.insert(name.clone(), Arc::new(client));
+        }
         Ok(Self {
             config,
             static_dir_override,
-            clients: Mutex::new(HashMap::new()),
+            clients,
             cache,
         })
     }
@@ -79,9 +94,15 @@ impl AppState {
         self.static_dir_override.as_deref()
     }
 
-    /// Looks up (or lazily connects) the `Client` for `connection_name`.
-    /// `Ok(None)` means the name isn't a configured connection at all (the
-    /// caller turns that into a 404).
+    /// Looks up the `Client` for `connection_name`, connecting it if this is
+    /// the first request to reach it. `Ok(None)` means the name isn't a
+    /// configured connection at all (the caller turns that into a 404);
+    /// `Err` means it is configured but unreachable (a 500).
+    ///
+    /// Connecting here rather than leaving it to the client's own first
+    /// query keeps an unreachable database reported as a server-side
+    /// failure, instead of it surfacing as whatever status the query that
+    /// happened to trip over it maps to.
     pub async fn resolve_client(
         &self,
         connection_name: &str,
@@ -91,21 +112,11 @@ impl AppState {
         } else {
             connection_name
         };
-        let Some(db) = self.config.connections.get(key) else {
+        let Some(client) = self.clients.get(key) else {
             return Ok(None);
         };
-        let mut clients = self.clients.lock().await;
-        if let Some(existing) = clients.get(key) {
-            return Ok(Some(existing.clone()));
-        }
-        let mut builder = pylon_client::Client::builder(db.dsn_string()).max_pool_size(db.pool_max_size as usize);
-        if let Some(cache) = &self.cache {
-            builder = builder.cache_handle(cache.clone());
-        }
-        let client = builder.build().await?;
-        let client = Arc::new(client);
-        clients.insert(key.to_string(), client.clone());
-        Ok(Some(client))
+        client.ensure_connected().await?;
+        Ok(Some(client.clone()))
     }
 
     /// Samples every currently-connected client's pool accounting
@@ -113,10 +124,15 @@ impl AppState {
     /// Prometheus gauges, labeled by connection name — called right before
     /// rendering `/metrics`. Only already-connected clients are sampled; a
     /// named connection nothing has touched yet has no pool to sample.
-    pub async fn record_pool_metrics(&self) {
-        let clients = self.clients.lock().await;
-        for (name, client) in clients.iter() {
-            pylon_workers::metrics::record_pool_status(name, &client.raw_connection().status());
+    pub fn record_pool_metrics(&self) {
+        for (name, client) in &self.clients {
+            // `pool_if_connected` rather than a connecting accessor: a
+            // metrics scrape must never be the thing that opens a pool, or
+            // every configured connection would report as live purely
+            // because something asked about it.
+            if let Some(pool) = client.pool_if_connected() {
+                pylon_workers::metrics::record_pool_status(name, &pool.status());
+            }
         }
     }
 
@@ -130,11 +146,12 @@ impl AppState {
     /// Best-effort — a failure here must not fail the `/metrics` response.
     pub async fn record_outbox_metrics(&self) {
         // Keyed by the config name, not the frontend's "main" alias —
-        // `resolve_client` maps the latter onto the former before inserting.
-        let Some(client) = self.clients.lock().await.get("default").cloned() else {
+        // `resolve_client` maps the latter onto the former before looking up.
+        // Only sampled once something has actually connected it, for the
+        // same reason `record_pool_metrics` checks.
+        let Some(pool) = self.clients.get("default").and_then(|c| c.pool_if_connected()) else {
             return;
         };
-        let pool = client.raw_connection();
         let rows = match pool
             .query_typed_named(pylon_workers::metrics::OUTBOX_DEPTH_SQL, &[], pool.types())
             .await

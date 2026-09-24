@@ -169,7 +169,11 @@ pub async fn handle_ai_chat(state: Arc<AppState>, connection: &str, body: serde_
         );
     };
 
-    let Some(vector_index) = resolve_vector_index(&client.schema(), &pylon_type, index_name.as_deref()) else {
+    let schema = match client.schema().await {
+        Ok(s) => s,
+        Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
+    };
+    let Some(vector_index) = resolve_vector_index(&schema, &pylon_type, index_name.as_deref()) else {
         return json_response(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({
