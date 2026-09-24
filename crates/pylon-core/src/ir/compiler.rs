@@ -1578,11 +1578,6 @@ impl<'a> Compiler<'a> {
         type_name
     }
 
-    /// Record `name` when its binding can hold more than one row, so a later
-    /// comparison against it compiles to membership rather than a scalar
-    /// subquery read. Anything whose row count isn't statically one counts as
-    /// multi: a needless membership test still answers correctly, a needless
-    /// scalar read aborts the query.
     /// True when `sel`'s filter pins an exclusive property to one value, which
     /// makes it single-valued however many rows the table holds. the upstream engine makes the
     /// same inference, and it is why
@@ -1620,6 +1615,11 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Record `name` when its binding can hold more than one row, so a later
+    /// comparison against it compiles to membership rather than a scalar
+    /// subquery read. Anything whose row count isn't statically one counts as
+    /// multi: a needless membership test still answers correctly, a needless
+    /// scalar read aborts the query.
     fn note_cte_cardinality(&mut self, name: &str, ir_stmt: &IrStmt) {
         let single = match ir_stmt {
             IrStmt::Insert(_) => true,
