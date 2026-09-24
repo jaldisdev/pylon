@@ -4568,12 +4568,13 @@ impl<'a> Compiler<'a> {
             return Ok(None);
         };
         let namespace = f.module.as_deref().unwrap_or("std");
-        let Some(sql_name) = crate::stdlib::lookup(namespace, &f.name)
-            .into_iter()
-            .find_map(|d| match &d.impl_strategy {
-                crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
-                _ => None,
-            })
+        let Some(sql_name) =
+            crate::stdlib::lookup(namespace, &f.name)
+                .into_iter()
+                .find_map(|d| match &d.impl_strategy {
+                    crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() => Some(sql_name.to_string()),
+                    _ => None,
+                })
         else {
             return Ok(None);
         };
@@ -10502,8 +10503,7 @@ impl<'a> Compiler<'a> {
                 .map(|l| self.compile_free_expr(l))
                 .transpose()?
                 .map(Box::new);
-            let multi = !matches!(limit.as_deref(), Some(IrExpr::Literal(IrLiteral::Int(1))))
-                && operands_reach_many;
+            let multi = !matches!(limit.as_deref(), Some(IrExpr::Literal(IrLiteral::Int(1)))) && operands_reach_many;
             return Ok(IrExpr::ObjectPathUnion { branches, limit, multi });
         }
         // `(insert T { … }).id` — a mutation read through a path. The statement

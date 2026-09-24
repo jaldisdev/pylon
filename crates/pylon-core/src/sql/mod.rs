@@ -2215,7 +2215,11 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                 name: if *multi { String::new() } else { name.to_string() },
                 type_name: Some(type_name.clone()),
                 position: if *multi { 0 } else { position },
-                cardinality: if *multi { Cardinality::Many } else { Cardinality::Optional },
+                cardinality: if *multi {
+                    Cardinality::Many
+                } else {
+                    Cardinality::Optional
+                },
                 pointers: prepend_type(pointer_nodes),
             };
             if *multi {
@@ -6497,7 +6501,11 @@ mod tests {
             "SELECT Post { owners := .<posts[is Person] ?? .<posts[is Person] }",
             &make_schema(),
         );
-        assert!(!out.sql.contains("COALESCE("), "not a value-by-value choice:\n{}", out.sql);
+        assert!(
+            !out.sql.contains("COALESCE("),
+            "not a value-by-value choice:\n{}",
+            out.sql
+        );
         assert!(
             out.sql.contains("ARRAY(SELECT \"r\" FROM ("),
             "the arms are aggregated:\n{}",
@@ -8344,7 +8352,8 @@ mod tests {
         );
         assert!(!out.sql.contains("count(unnest("), "got:\n{}", out.sql);
         assert!(
-            out.sql.contains(r#"FROM unnest(ARRAY(SELECT unnest("t0"."perms") FROM "public"."Person" AS "t0"))"#),
+            out.sql
+                .contains(r#"FROM unnest(ARRAY(SELECT unnest("t0"."perms") FROM "public"."Person" AS "t0"))"#),
             "got:\n{}",
             out.sql
         );
@@ -8386,7 +8395,11 @@ mod tests {
             "SELECT std::array_agg((SELECT Person).name)",
         ] {
             let out = compile_and_emit(query);
-            assert!(out.sql.contains("coalesce(") && out.sql.contains("'{}'"), "{query} got:\n{}", out.sql);
+            assert!(
+                out.sql.contains("coalesce(") && out.sql.contains("'{}'"),
+                "{query} got:\n{}",
+                out.sql
+            );
         }
     }
 
