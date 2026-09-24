@@ -2387,6 +2387,16 @@ mod tests {
         );
     }
 
+    /// `select (for … union …)` — automator counts runs per status this way.
+    /// The loop compiles on its own; only the wrapper was rejected.
+    #[test]
+    fn test_a_for_loop_may_be_a_select_subject() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT (FOR s IN {1, 2} UNION (SELECT { a := s }))").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        assert!(matches!(ir.stmt, super::IrStmt::For(_)), "expected the loop itself");
+    }
+
     /// A `<json>` cast as a shape element is an ordinary column of the row, so
     /// it must carry the pointer's name and position. Describing it with the
     /// root-only `JsonScalar` (which carries neither) made `pylon-client` panic

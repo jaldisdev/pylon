@@ -3138,6 +3138,20 @@ impl<'a> Compiler<'a> {
                 {
                     return Ok(IrStmt::PathSelect(ps));
                 }
+                // `select (for … union …)` — the select adds nothing the loop has
+                // not already produced, so it *is* the loop. Written with
+                // modifiers of its own it would need the loop bound in a CTE
+                // first, which nothing supports yet, so that still errors.
+                if let Expr::SubQuery(inner) = result
+                    && matches!(inner.as_ref(), Stmt::For(_))
+                    && !distinct
+                    && s.filter.is_none()
+                    && s.order_by.is_empty()
+                    && s.offset.is_none()
+                    && s.limit.is_none()
+                {
+                    return self.compile_stmt(inner);
+                }
                 // Catch mixed object/scalar UNION before dispatching further.
                 self.check_union_type_compat(result)?;
                 if self.is_free_result(result) {
