@@ -322,6 +322,32 @@ pub fn lookup(namespace: &str, name: &str) -> Vec<&'static FnDescriptor> {
         .collect()
 }
 
+/// Enums the stdlib itself defines, as opposed to a schema's own. Kept here
+/// rather than in a `SchemaDescriptor` because they have no PostgreSQL enum
+/// type behind them — no migration creates one — so a member compiles to a
+/// plain `text` literal that the function consuming it switches on.
+///
+/// Mirrors the upstream engine's `std::Endian`, member order included (verified against a live
+/// instance: `enum_values` is `["Little", "Big"]`).
+static STDLIB_ENUMS: OnceLock<Vec<crate::schema::EnumDescriptor>> = OnceLock::new();
+
+pub fn stdlib_enums() -> &'static [crate::schema::EnumDescriptor] {
+    STDLIB_ENUMS.get_or_init(|| {
+        vec![crate::schema::EnumDescriptor {
+            name: "Endian".to_string(),
+            module: "std".to_string(),
+            members: vec!["Little".to_string(), "Big".to_string()],
+        }]
+    })
+}
+
+/// Resolve a stdlib enum by bare (`Endian`) or qualified (`std::Endian`) name.
+pub fn lookup_enum(name: &str) -> Option<&'static crate::schema::EnumDescriptor> {
+    stdlib_enums()
+        .iter()
+        .find(|e| e.name == name || format!("{}::{}", e.module, e.name) == name)
+}
+
 /// Iterate over every overload that backs a `Function`-strategy cast.
 pub fn cast_targets() -> impl Iterator<Item = &'static FnDescriptor> {
     registry().iter().filter(|f| f.cast_target)

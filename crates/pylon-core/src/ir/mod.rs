@@ -2387,6 +2387,41 @@ mod tests {
         );
     }
 
+    /// `std::Endian` is a stdlib enum with no PostgreSQL enum type behind it,
+    /// so its members have to compile to a plain text literal.
+    #[test]
+    fn test_stdlib_enum_member_compiles_to_a_text_literal() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::Endian.Big").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("'Big'::text"), "expected a text literal, got: {sql}");
+    }
+
+    #[test]
+    fn test_unknown_stdlib_enum_member_is_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::Endian.Middle").unwrap();
+        let Err(error) = super::compile(&ast, &schema) else {
+            panic!("Middle is not a member of std::Endian");
+        };
+        assert!(error.to_string().contains("has no member 'Middle'"), "got: {error}");
+    }
+
+    /// The single-argument form has to reach `to_bytes_uuid`, not the
+    /// two-argument `to_bytes(str, encoding)` — picking the latter compiled
+    /// fine and then failed at runtime with "function _pylon.to_bytes(uuid)
+    /// does not exist".
+    #[test]
+    fn test_to_bytes_of_a_uuid_selects_the_uuid_overload() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::to_int32(std::to_bytes(<uuid>$0)[12:16], std::Endian.Big)").unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(sql.contains("to_bytes_uuid"), "expected to_bytes_uuid, got: {sql}");
+        assert!(sql.contains("to_int32_bytes"), "expected to_int32_bytes, got: {sql}");
+    }
+
     #[test]
     fn test_positional_param_names() {
         let schema = make_schema();

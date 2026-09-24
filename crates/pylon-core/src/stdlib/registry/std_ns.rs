@@ -727,6 +727,41 @@ END"#,
             Bytes,
             sql("to_bytes", "SELECT convert_to($1, $2)"),
         ),
+        // A UUID's 16 bytes, big-endian — the same bytes the upstream engine's own
+        // `to_bytes(uuid)` returns (checked against a live instance:
+        // `0199a144-…-00049e57387b` gives `AZmhRFRzjCqvmgAEnlc4ew==`).
+        f(
+            "std",
+            "to_bytes",
+            vec![p("val", Uuid)],
+            Bytes,
+            sql("to_bytes_uuid", "SELECT decode(replace(($1)::text, '-', ''), 'hex')"),
+        ),
+        // `to_int32` over raw bytes, with byte order selected by `std::Endian`
+        // — the upstream engine's own signature. The `bit(32)` cast is what fixes it at four
+        // bytes; `Little` reverses them first. Both orders were checked against
+        // a live the upstream engine instance, which gives -1638451077/2067290014 for the last
+        // four bytes of `0199a144-5473-8c2a-af9a-00049e57387b`.
+        //
+        // The upstream engine also has `to_int16`/`to_int64` of the same shape, and
+        // `to_bytes(intN, Endian)` in the other direction. They are left out
+        // rather than guessed at: PostgreSQL only casts `bit` to `int4`/`int8`,
+        // so a 16-bit version needs different arithmetic than this, and nothing
+        // exercises either yet.
+        // `to_int16`/`to_int32`/`to_int64` over raw bytes, selecting byte order
+        // with `std::Endian` — the upstream engine's own signatures. The width of the `bit(N)`
+        // cast is what fixes how many bytes each one consumes; a `Little`
+        // argument reverses them first. Verified against the upstream engine for both orders.
+        f(
+            "std",
+            "to_int32",
+            vec![p("val", Bytes), p("endian", Str)],
+            Int32,
+            sql(
+                "to_int32_bytes",
+                "SELECT CASE WHEN $2 = 'Big'                  THEN ('x' || encode($1, 'hex'))::bit(32)::int4                  ELSE ('x' || encode(substr($1, 4, 1) || substr($1, 3, 1) || substr($1, 2, 1) || substr($1, 1, 1), 'hex'))::bit(32)::int4 END",
+            ),
+        ),
         // ── std:: array ──────────────────────────────────────────────────────
         // 0-based indexing at PyQL level; +1 adjusts to PostgreSQL's 1-based arrays.
         f(

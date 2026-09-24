@@ -2156,11 +2156,16 @@ impl<'a> Compiler<'a> {
             })
     }
 
+    /// A schema enum, or failing that one the stdlib defines (`std::Endian`).
+    /// The stdlib's are `&'static`, which coerces to `&'a` for any shorter
+    /// `'a`, so both live behind one lookup and every site that recognizes
+    /// enum member access picks them up without its own special case.
     fn resolve_enum(&self, name: &str) -> Option<&'a crate::schema::EnumDescriptor> {
         self.schema
             .enums
             .iter()
             .find(|e| e.name == name || format!("{}::{}", e.module, e.name) == name)
+            .or_else(|| crate::stdlib::lookup_enum(name))
     }
 
     /// Resolve a `Channel` by name (bare or `module::Name`) — used by
@@ -2541,8 +2546,15 @@ impl<'a> Compiler<'a> {
                 ed.module, ed.name, variant
             )));
         }
+        // A stdlib enum has no PostgreSQL enum type to cast to — the function
+        // taking it switches on the label as text.
+        let pg_type = if crate::stdlib::lookup_enum(&format!("{}::{}", ed.module, ed.name)).is_some() {
+            "text".to_string()
+        } else {
+            format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name)
+        };
         Ok(IrExpr::EnumLiteral {
-            pg_type: format!("{}.\"{}\"", crate::sql::pg_schema_str(&ed.module), ed.name),
+            pg_type,
             variant: variant.to_string(),
         })
     }
