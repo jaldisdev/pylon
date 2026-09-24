@@ -13754,7 +13754,13 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        if p.steps.len() == 2 {
+        // A walk that ends in a type intersection (`exists .provider[is
+        // account::Individual]`) narrows to objects rather than reading a
+        // pointer, so there is no trailing column for the two-step form to
+        // read and it goes the way a longer traversal already does.
+        let narrows_last = matches!(p.steps.last(), Some(ast::PathStep::TypeIntersection(_)));
+
+        if p.steps.len() == 2 && !narrows_last {
             return self.compile_path_2step(p, td, alias);
         }
 

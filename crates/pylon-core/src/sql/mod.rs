@@ -12094,6 +12094,43 @@ select owner { posts := (select owner.posts.title) };",
         );
     }
 
+    /// `exists .account[is Individual]` — a walk narrowed to an implementor
+    /// with no pointer read after it. The two-step form needs a trailing
+    /// column to read, so it rejected the intersection outright ("type
+    /// intersections are not valid in expression context") even though the
+    /// same walk with a pointer on the end (`[is Individual].email`) has
+    /// always compiled.
+    #[test]
+    fn a_walk_ending_in_a_type_intersection_is_valid_in_a_filter() {
+        let out = compile_and_emit_with(
+            "SELECT Token { id } FILTER EXISTS .account[is Individual]",
+            &interface_link_schema(),
+        );
+        assert!(
+            out.sql.contains("\"public\".\"Individual\""),
+            "the narrowing must reach the implementor's table:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("IS NOT NULL"),
+            "exists over the narrowed walk is a nullness test:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_walk_ending_in_a_type_intersection_is_valid_off_a_binding() {
+        let out = compile_and_emit_with(
+            "WITH t := (SELECT Token LIMIT 1) SELECT { e := EXISTS t.account[is Individual] }",
+            &interface_link_schema(),
+        );
+        assert!(
+            out.sql.contains("\"public\".\"Individual\""),
+            "the narrowing must reach the implementor's table:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn test_reading_a_link_through_an_interface_target() {
         let schema = interface_link_schema();
