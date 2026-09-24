@@ -196,15 +196,26 @@ fn emit_output(ir: &IrOutput) -> SqlOutput {
 /// Falls back to the pre-rendered form for anything else, including
 /// `unnest()` reached by some route other than a direct `array_unpack` call.
 fn unwrap_unnest_for_any(right: &IrExpr, rendered: &str) -> String {
-    if let IrExpr::FunctionCall(call) = right
-        && call.schema.is_none()
-        && call.name == "unnest"
-        && call.sql_template.is_none()
-        && call.args.len() == 1
+    if let Some(array) = unnest_argument(right) {
+        return array;
+    }
+    // `<Enum>array_unpack($1)` — the cast is written over the set, so over the
+    // array the same cast is to that type's array.
+    if let IrExpr::TypeCast(cast) = right
+        && let Some(array) = unnest_argument(&cast.expr)
     {
-        return emit_expr(&call.args[0]);
+        return format!("({})::{}[]", array, cast.pg_type);
     }
     rendered.to_string()
+}
+
+/// The array a direct `array_unpack` call unpacks, already rendered.
+fn unnest_argument(expr: &IrExpr) -> Option<String> {
+    let IrExpr::FunctionCall(call) = expr else {
+        return None;
+    };
+    (call.schema.is_none() && call.name == "unnest" && call.sql_template.is_none() && call.args.len() == 1)
+        .then(|| emit_expr(&call.args[0]))
 }
 
 fn merge_into_existing_with(sql: &str, parts: &[String]) -> Option<String> {
@@ -8508,6 +8519,20 @@ mod tests {
             "got:\n{}",
             out.sql
         );
+    }
+
+    /// `.status IN <Enum>array_unpack($1)` — the cast sits between `IN` and
+    /// the unpack, and used to hide it, leaving a set-returning function in a
+    /// `WHERE` that PostgreSQL rejects at execution time.
+    #[test]
+    fn test_a_cast_unpacked_array_still_folds_into_any() {
+        let out = compile_and_emit("SELECT Person { name } FILTER .name IN <str>std::array_unpack(<array<str>>$names)");
+        assert!(
+            !out.sql.contains("unnest("),
+            "the unpack must fold into ANY, got:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("= ANY("), "got:\n{}", out.sql);
     }
 
     /// A bare `array_unpack` outside `IN` still has to unnest — the unwrap is
