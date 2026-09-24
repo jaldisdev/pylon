@@ -107,6 +107,16 @@ impl DecodeError {
         &self.kind
     }
 
+    /// A decode failure the caller produced itself, for a consumer that
+    /// deserializes a `query_*_json` result with its own deserializer instead
+    /// of going through [`Queryable`]. The counterpart of the upstream engine's
+    /// `ClientError::with_message`, so such a function can keep returning
+    /// this crate's own [`Error`](crate::Error) rather than growing a
+    /// bespoke error type.
+    pub fn custom(message: impl Into<String>) -> Self {
+        Self::new(DecodeErrorKind::Invalid(message.into()))
+    }
+
     fn wrong_type(expected: &'static str, actual: &Value) -> Self {
         Self::new(DecodeErrorKind::WrongType {
             expected,
@@ -606,6 +616,17 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(row.latest_version, None);
+    }
+
+    /// A caller decoding `query_*_json` itself still reports through this
+    /// crate's error type.
+    #[test]
+    fn a_custom_decode_failure_converts_into_the_crate_error() {
+        let error: crate::Error = DecodeError::custom("failed to decode query result JSON: eof").into();
+        assert_eq!(
+            error.to_string(),
+            "cannot decode query result: failed to decode query result JSON: eof"
+        );
     }
 
     #[test]
