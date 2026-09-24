@@ -7703,6 +7703,37 @@ impl<'a> Compiler<'a> {
         let pending_guard = self.pending_update_guard.take();
         // See `compile_insert`'s identical save/restore of `pending_nested_ctes`.
         let outer_pending_nested_ctes = std::mem::take(&mut self.pending_nested_ctes);
+        // `update (select T filter …).link set { … }` — the subject walks off a
+        // sub-select rather than off a named root. The select is hoisted into
+        // the statement's own WITH and the walk re-rooted at that binding,
+        // giving the `with s := (select …) update s.link set { … }` spelling
+        // the path branch below already handles.
+        if !matches!(&upd.subject, Expr::Path(_)) {
+            let (base, fields) = Self::peel_field_access_chain(&upd.subject);
+            if let Expr::SubQuery(inner_stmt) = base
+                && !fields.is_empty()
+                && matches!(inner_stmt.as_ref(), Stmt::Select(_))
+            {
+                let inner = self.compile_stmt(inner_stmt)?;
+                let cte_name = self.fresh_nested_cte_name();
+                let type_name = self.register_cte(&cte_name, &inner);
+                self.hoisted_ctes.push(IrCteDef {
+                    name: cte_name.clone(),
+                    stmt: inner,
+                    type_name,
+                });
+                let mut steps = vec![ast::PathStep::Name(cte_name)];
+                steps.extend(fields.into_iter().map(ast::PathStep::Name));
+                let rerooted = ast::UpdateStmt {
+                    subject: Expr::Path(ast::Path { steps, partial: false }),
+                    filter: upd.filter.clone(),
+                    shape: upd.shape.clone(),
+                };
+                self.pending_nested_ctes = outer_pending_nested_ctes;
+                self.pending_update_guard = pending_guard;
+                return self.compile_update(&rerooted);
+            }
+        }
         // `update account.preferences[is IndividualPreferences] set …` — the
         // subject is a traversal rather than a name, so the rows to update are
         // the ones it lands on: the table is the type the walk ends on, and the

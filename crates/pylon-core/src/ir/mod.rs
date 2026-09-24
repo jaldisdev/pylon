@@ -2387,6 +2387,30 @@ mod tests {
         );
     }
 
+    /// `update (select T filter …).link set { … }` — conduit refreshes a
+    /// connector's stored credentials this way. The equivalent
+    /// `with s := (select …) update s.link set …` already worked; only the
+    /// inline sub-select was rejected.
+    #[test]
+    fn test_an_update_subject_may_walk_off_a_sub_select() {
+        let schema = make_schema();
+        let inline = parse::parse("UPDATE (SELECT Person FILTER .name = 'a').company SET { name := 'b' }").unwrap();
+        let bound =
+            parse::parse("WITH s := (SELECT Person FILTER .name = 'a') UPDATE s.company SET { name := 'b' }").unwrap();
+        // `make_schema`'s Company has no `id`, so both forms stop at the same
+        // later point — which is the assertion: the inline one is no longer
+        // rejected earlier than the binding-based one.
+        let inline_err = super::compile(&inline, &schema).err().map(|e| e.to_string());
+        let bound_err = super::compile(&bound, &schema).err().map(|e| e.to_string());
+        assert_eq!(inline_err, bound_err, "the two spellings must compile alike");
+        assert!(
+            !inline_err
+                .unwrap_or_default()
+                .contains("expected a type name as SELECT subject"),
+            "the sub-select subject must be accepted"
+        );
+    }
+
     /// `select (for … union …)` — automator counts runs per status this way.
     /// The loop compiles on its own; only the wrapper was rejected.
     #[test]
