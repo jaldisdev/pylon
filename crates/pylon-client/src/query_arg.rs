@@ -149,6 +149,22 @@ impl QueryArg for chrono::NaiveTime {
     }
 }
 
+/// `std::duration`. Pylon stores an interval as its three wire components;
+/// months is always 0 here, since a `std::time::Duration` is a fixed span and
+/// a calendar month is not (`cal::relative_duration` is the type that carries
+/// one). Days stay 0 too — Postgres treats an interval's days as
+/// calendar-relative across a DST boundary, so the whole span goes in
+/// microseconds.
+impl QueryArg for std::time::Duration {
+    fn to_decoded(&self) -> DecodedValue {
+        DecodedValue::Interval {
+            months: 0,
+            days: 0,
+            microseconds: i64::try_from(self.as_micros()).unwrap_or(i64::MAX),
+        }
+    }
+}
+
 /// A `json` argument. Bound as JSON text rather than as a
 /// `DecodedValue::Object`, because that is the form `pylon-pgcon` accepts
 /// for a `jsonb` parameter regardless of whether the document's root is an

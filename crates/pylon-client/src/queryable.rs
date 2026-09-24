@@ -676,6 +676,21 @@ mod tests {
         assert_eq!(row.payload.unwrap()["email"], "a@b.test");
     }
 
+    /// A duration binds as an interval whose whole span is microseconds —
+    /// months and days are calendar-relative and a `std::time::Duration` is not.
+    #[test]
+    fn a_duration_binds_as_a_fixed_microsecond_interval() {
+        let bound = crate::QueryArg::to_decoded(&std::time::Duration::from_secs(90));
+        assert_eq!(
+            bound,
+            pylon_value::DecodedValue::Interval {
+                months: 0,
+                days: 0,
+                microseconds: 90_000_000
+            }
+        );
+    }
+
     #[test]
     fn positional_arguments_bind_by_index() {
         let id = uuid::Uuid::from_u128(9);
