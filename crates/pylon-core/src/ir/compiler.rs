@@ -1671,6 +1671,7 @@ impl<'a> Compiler<'a> {
         let mut expr = IrExpr::CteFieldRef {
             name: root.to_string(),
             field: first.to_string(),
+            pg_type: infer_ir_type(current).map(str::to_string),
         };
         for step in rest {
             if let IrExpr::NamedTuple {
@@ -1740,7 +1741,8 @@ impl<'a> Compiler<'a> {
             .cloned()
             .unwrap_or_else(|| name.to_string());
         self.for_vars_read.insert(slot.clone());
-        IrExpr::ForVar { name: slot }
+        let pg_type = self.for_vars.get(name).cloned();
+        IrExpr::ForVar { name: slot, pg_type }
     }
 
     fn fresh_alias(&mut self) -> String {
@@ -17446,13 +17448,51 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
             infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
         }
         IrExpr::UnaryOp(u) if u.op == crate::parse::ast::UnaryOpKind::Distinct => infer_ir_type(&u.operand),
+        // `-x` is a number of x's own type; `not x` and `exists x` are always
+        // boolean.
+        IrExpr::UnaryOp(u) if u.op == crate::parse::ast::UnaryOpKind::Minus => infer_ir_type(&u.operand),
+        IrExpr::UnaryOp(u)
+            if matches!(
+                u.op,
+                crate::parse::ast::UnaryOpKind::Not | crate::parse::ast::UnaryOpKind::Exists
+            ) =>
+        {
+            Some("boolean")
+        }
+        // `a ?? b` and `a if c else b` yield a value of their branches' own
+        // type, so a call over either resolves the overload the bare value
+        // would. Whichever side carries a type decides: the other is routinely
+        // the untypeable one — an empty set, or a path the upstream engine only knows is
+        // optional.
+        IrExpr::BinOp(b) if b.op == crate::parse::ast::BinOpKind::Coalesce => {
+            infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
+        }
+        IrExpr::IfElse(ie) => infer_ir_type(&ie.if_).or_else(|| infer_ir_type(&ie.else_)),
         // A slice is the same type as the thing sliced — `substr` of text is
         // text, of bytea is bytea, and an array slice is still that array.
         // Without this a `to_bytes(x)[12:16]` reaching a `bytes` parameter
         // reads as untyped, which is the difference between resolving the
         // bytes overload and resolving nothing at all.
         IrExpr::Slice { expr, .. } => infer_ir_type(expr),
+        // `xs[0]` is one element of what `xs` holds — the array type with its
+        // `[]` taken off. A string or bytes subscript stays the type it
+        // indexes, the way the `substr` it emits does.
+        IrExpr::CteFieldRef { pg_type, .. } | IrExpr::ForVar { pg_type, .. } => pg_type.as_deref(),
+        IrExpr::Subscript { expr, is_array, .. } => {
+            // `str_split(s, '::')[0]`: the array a stdlib call returns is not a
+            // type `infer_ir_type` can name (it only names scalars), so the
+            // element type comes from the overload's own declared return type.
+            let Some(base) = infer_ir_type(expr) else {
+                return stdlib_array_element_type(expr);
+            };
+            if *is_array { base.strip_suffix("[]") } else { Some(base) }
+        }
         IrExpr::BinOp(b) => arithmetic_result_type(&b.op, infer_ir_type(&b.left)?, infer_ir_type(&b.right)?),
+        // The `coalesce` the compiler itself builds — around an aggregate that
+        // ran over nothing, or a `??` whose sides name rows — carries no
+        // recorded return type, so it is typed from its arguments like the
+        // operator it stands in for.
+        IrExpr::FunctionCall(f) if f.schema.is_none() && f.name == "coalesce" => f.args.iter().find_map(infer_ir_type),
         IrExpr::FunctionCall(f) if f.schema.is_none() && matches!(f.name.as_str(), "max" | "min" | "sum") => {
             aggregate_result_type(&f.name, infer_ir_type(f.args.first()?)?)
         }
@@ -17473,6 +17513,58 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
     }
 }
 
+/// The element type of an array a stdlib call returns, for an expression whose
+/// own type `infer_ir_type` cannot name. `None` unless every overload of the
+/// name returns an array of the same scalar — the call would be ambiguous
+/// otherwise, and guessing is what overload resolution exists to avoid.
+fn stdlib_array_element_type(expr: &IrExpr) -> Option<&'static str> {
+    let IrExpr::FunctionCall(f) = expr else {
+        return None;
+    };
+    if f.schema.is_some() {
+        return None;
+    }
+    let mut element: Option<&'static str> = None;
+    for descriptor in crate::stdlib::registry().iter().filter(|d| d.name == f.name) {
+        let crate::stdlib::PylonType::Array(inner) = &descriptor.return_type else {
+            return None;
+        };
+        let scalar = inner.scalar_pg_type()?;
+        if element.is_some_and(|seen| seen != scalar) {
+            return None;
+        }
+        element = Some(scalar);
+    }
+    element
+}
+
+/// What `+` and `-` yield over instants and durations — a datetime minus a
+/// datetime is a duration, a datetime shifted by one is a datetime. the upstream engine's
+/// `duration_to_seconds(datetime_of_transaction() - .started_at)` is the shape
+/// this exists for, and it resolves no overload while the subtraction reads as
+/// untyped.
+fn temporal_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Option<&'static str> {
+    use ast::BinOpKind::*;
+    let instant = |t: &str| matches!(t, "timestamptz" | "timestamp" | "date" | "time");
+    match (op, left, right) {
+        (Sub, l, r) if instant(l) && instant(r) => Some("interval"),
+        (Sub | Add, l, "interval") if instant(l) => Some(match l {
+            "timestamptz" => "timestamptz",
+            "timestamp" => "timestamp",
+            "date" => "date",
+            _ => "time",
+        }),
+        (Add, "interval", r) if instant(r) => Some(match r {
+            "timestamptz" => "timestamptz",
+            "timestamp" => "timestamp",
+            "date" => "date",
+            _ => "time",
+        }),
+        (Add | Sub, "interval", "interval") => Some("interval"),
+        _ => None,
+    }
+}
+
 /// The type the upstream engine gives an arithmetic operator's result, from its operands'.
 /// `None` for anything but a pair of numbers.
 fn arithmetic_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Option<&'static str> {
@@ -17481,6 +17573,9 @@ fn arithmetic_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Optio
         return None;
     }
     let (left, right) = (literal_sentinel_to_pg(left), literal_sentinel_to_pg(right));
+    if let Some(temporal) = temporal_result_type(op, left, right) {
+        return Some(temporal);
+    }
     let int = |t: &str| INT_TYPES.contains(&t);
     let float = |t: &str| FLOAT_TYPES.contains(&t);
     let numeric = |t: &str| NUMERIC_TYPES.contains(&t);

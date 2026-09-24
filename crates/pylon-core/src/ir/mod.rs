@@ -966,11 +966,18 @@ pub enum IrExpr {
     CteFieldRef {
         name: String,
         field: String,
+        /// The field's PostgreSQL type, so a call over `x.a` resolves the same
+        /// overload a call over the value bound to `a` would.
+        pg_type: Option<String>,
     },
     /// Reference to the current for-loop iterator variable.
     /// Emits `"_for_{name}"."v"`.
     ForVar {
         name: String,
+        /// The type of one iteration's value — the iterator's element type, or
+        /// `uuid` for a loop over objects, whose variable holds the row key.
+        /// Carried for the same reason `CteFieldRef` carries one.
+        pg_type: Option<String>,
     },
     /// `ARRAY(SELECT scalar FROM source [JOINs] [WHERE filter])`.
     /// Used as the array argument to `_pylon.assert_single/exists/distinct`.
@@ -2828,6 +2835,65 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no overload accepting (int8)"), "{msg}");
         assert!(msg.contains("(str)"), "{msg}");
+    }
+
+    /// `??` and `if … else` are transparent to overload resolution: both yield
+    /// a value of their branches' own type. While they read as untyped, every
+    /// `str_lower(x ?? default)` — the shape a jurisdiction, a locale or any
+    /// other optional-with-a-fallback is written in — failed to resolve.
+    #[test]
+    fn a_stdlib_call_over_a_coalesce_or_conditional_resolves_its_branch_type() {
+        let schema = make_schema();
+        for query in [
+            "SELECT std::str_lower(<optional str>$0 ?? 'DE')",
+            "SELECT std::str_lower('DE' ?? <optional str>$0)",
+            "WITH j := (<optional str>$0 ?? 'DE') SELECT std::str_lower(j)",
+            "SELECT std::str_lower(<str>$0 if <bool>$1 else 'DE')",
+            "SELECT std::len(<optional str>$0 ?? 'DE')",
+        ] {
+            let ast = parse::parse(query).unwrap();
+            super::compile(&ast, &schema).unwrap_or_else(|e| panic!("{query} must compile: {e}"));
+        }
+    }
+
+    /// Every other expression that carries a value of a type it does not spell
+    /// out itself. Each of these reads as untyped without inference of its own,
+    /// which under overload resolution is the difference between compiling and
+    /// not.
+    #[test]
+    fn a_stdlib_call_over_a_pass_through_expression_resolves_the_value_type() {
+        let schema = make_schema();
+        for query in [
+            // A loop variable holds one element of what it iterates.
+            "SELECT (FOR code IN std::array_unpack(<array<str>>$0) UNION (SELECT std::str_lower(code)))",
+            // A free object's field is typed by what the field binds.
+            "WITH x := { a := 'DE' } SELECT std::str_lower(x.a)",
+            // Negation keeps its operand's type.
+            "SELECT math::abs(-3)",
+            "SELECT math::abs(-(<int64>$0))",
+            // An array subscript is one element, not the array.
+            "SELECT std::str_lower((<array<str>>$0)[0])",
+            // The array a stdlib call returns is named by its own overload.
+            "SELECT std::str_title(std::str_split(<str>$0, '::')[0])",
+            // A datetime minus a datetime is a duration.
+            "SELECT std::duration_to_seconds(std::datetime_of_transaction() - <datetime>$0)",
+            "SELECT std::duration_to_seconds(<duration>$0 + <duration>$0)",
+        ] {
+            let ast = parse::parse(query).unwrap();
+            super::compile(&ast, &schema).unwrap_or_else(|e| panic!("{query} must compile: {e}"));
+        }
+    }
+
+    /// Looking through a `??` types the call, it does not excuse it: a branch
+    /// whose type is known and wrong is still no overload's argument.
+    #[test]
+    fn a_stdlib_call_over_a_coalesce_of_the_wrong_type_is_still_rejected() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT std::str_lower(<optional int64>$0 ?? 3)").unwrap();
+        let Err(err) = super::compile(&ast, &schema) else {
+            panic!("wrong argument type must not compile")
+        };
+        assert!(err.to_string().contains("no overload accepting (int8)"), "{err}");
     }
 
     /// The byte-order forms sit beside the one-argument `to_intN(str)` casts,

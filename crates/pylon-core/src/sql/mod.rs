@@ -1838,7 +1838,7 @@ pub(crate) fn append_value_is_the_loop_variable(values: &IrMultiLinkValues, var:
         (
             IrExpr::ColumnRef { column, .. },
             crate::parse::ast::BinOpKind::Eq,
-            IrExpr::ForVar { name },
+            IrExpr::ForVar { name, .. },
         ) if column == "id" && name == var
     ) && values.link_props.is_empty()
 }
@@ -5177,11 +5177,11 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("(SELECT \"{}\" FROM \"{}\")", col, name)
         }
 
-        IrExpr::CteFieldRef { name, field } => {
+        IrExpr::CteFieldRef { name, field, .. } => {
             format!("(SELECT {} FROM {})", qi(field), qi(name))
         }
 
-        IrExpr::ForVar { name } => format!("\"_for_{}\".\"v\"", name),
+        IrExpr::ForVar { name, .. } => format!("\"_for_{}\".\"v\"", name),
 
         IrExpr::EnumLiteral { pg_type, variant } => {
             format!("'{}'::{}", variant.replace('\'', "''"), pg_type)
