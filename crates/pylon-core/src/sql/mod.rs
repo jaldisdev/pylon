@@ -7199,7 +7199,7 @@ mod tests {
              SELECT x",
         );
         assert!(out.sql.contains("\"_for_p\" AS"), "{}", out.sql);
-        assert!(out.sql.contains("\"_for_p_1\" AS"), "{}", out.sql);
+        assert!(out.sql.contains("\"_for_p__1\" AS"), "{}", out.sql);
     }
 
     #[test]

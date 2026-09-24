@@ -116,12 +116,13 @@ pub fn compile_with_config(
                 continue;
             }
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
+            let sql_name = c.claim_cte_sql_name(&alias.name);
             let type_name = c.register_cte(&alias.name, &ir_stmt);
             // What the binding hoisted (`p := existing ?? (insert …)`) goes
             // right before it: a CTE only sees the ones ahead of it.
             cte_defs.append(&mut c.hoisted_ctes);
             cte_defs.push(IrCteDef {
-                name: alias.name.clone(),
+                name: sql_name,
                 stmt: ir_stmt,
                 type_name,
             });
@@ -1025,11 +1026,12 @@ pub fn compile_trigger_handler(
                 continue;
             }
             let ir_stmt = compile_cte_binding(&mut c, &alias.expr)?;
+            let sql_name = c.claim_cte_sql_name(&alias.name);
             let cte_type_name = cte_stmt_type(&ir_stmt);
             c.cte_types.insert(alias.name.clone(), cte_type_name.clone());
             c.note_cte_cardinality(&alias.name, &ir_stmt);
             cte_defs.push(super::IrCteDef {
-                name: alias.name.clone(),
+                name: sql_name,
                 stmt: ir_stmt,
                 type_name: cte_type_name,
             });
@@ -1241,7 +1243,6 @@ struct Compiler<'a> {
     /// sibling loops may use the same variable name, and a WITH clause cannot
     /// hold the same CTE name twice.
     for_var_slots: HashMap<String, String>,
-    for_slot_counts: HashMap<String, usize>,
     /// The condition a `(insert …) if cond else {}` puts on the insert about
     /// to be compiled — see `IrInsert::guard`.
     pending_insert_guard: Option<Expr>,
@@ -1280,6 +1281,10 @@ struct Compiler<'a> {
     /// second is emitted under a suffixed one and every reference to it reads
     /// from here.
     cte_sql_names: HashMap<String, String>,
+    /// Every WITH name this statement will carry, whoever asked for it — a
+    /// user binding, a loop's iterator, a hoisted mutation. One set so no two
+    /// can claim the same name and no guard has to know about the others.
+    cte_namespace: std::collections::HashSet<String>,
     /// `(through type, junction alias)` of the multi-link whose own
     /// modifiers are being compiled — what a bare `@prop` in `filter
     /// (@primary = true)` resolves against. `None` on the stack means a link
@@ -1414,7 +1419,6 @@ impl<'a> Compiler<'a> {
             for_var_types: HashMap::new(),
             for_var_ctes: HashMap::new(),
             for_var_slots: HashMap::new(),
-            for_slot_counts: HashMap::new(),
             pending_insert_guard: None,
             pending_update_guard: None,
             pending_delete_guard: None,
@@ -1435,6 +1439,7 @@ impl<'a> Compiler<'a> {
             hoisted_ctes: Vec::new(),
             hoisted_binding_sources: HashMap::new(),
             cte_sql_names: HashMap::new(),
+            cte_namespace: std::collections::HashSet::new(),
             pending_detached: false,
             modifier_anchor: None,
             inline_bindings: std::collections::HashMap::new(),
@@ -1482,22 +1487,53 @@ impl<'a> Compiler<'a> {
             .unwrap_or_else(|| name.to_string())
     }
 
-    /// Claim a WITH name for `name`, suffixing it while one statement already
-    /// holds it. Returns the name the CTE is emitted under.
-    fn claim_cte_sql_name(&mut self, name: &str) -> String {
-        if !self.hoisted_binding_sources.contains_key(name) {
-            self.cte_sql_names.remove(name);
-            return name.to_string();
-        }
+    /// Claim a WITH name, suffixing `base` until it is free. Names the SQL
+    /// emitter derives from a claimed one — `x__ids`, `x__rows`,
+    /// `x__ml_add_0` — are claimed with it, which is why anything under a
+    /// taken name's `__` prefix counts as taken too.
+    fn claim_in_cte_namespace(&mut self, base: &str) -> String {
+        // A suffixed candidate is itself an extension of `base`, so `base` is
+        // the one claimed name that never rules its own suffixes out.
+        let taken = |namespace: &std::collections::HashSet<String>, candidate: &String| {
+            namespace.contains(candidate)
+                || namespace
+                    .iter()
+                    .any(|claimed| claimed != base && candidate.starts_with(&format!("{claimed}__")))
+        };
+        let mut candidate = base.to_string();
         let mut suffix = 1;
-        let taken: std::collections::HashSet<&String> = self.cte_sql_names.values().collect();
-        let mut candidate = format!("{name}__{suffix}");
-        while self.hoisted_binding_sources.contains_key(&candidate) || taken.contains(&candidate) {
+        while taken(&self.cte_namespace, &candidate) {
+            candidate = format!("{base}__{suffix}");
             suffix += 1;
-            candidate = format!("{name}__{suffix}");
         }
-        self.cte_sql_names.insert(name.to_string(), candidate.clone());
+        self.cte_namespace.insert(candidate.clone());
         candidate
+    }
+
+    /// Claim a WITH name the compiler spelled itself — a loop's iterator, a
+    /// hoisted mutation. These already live in the underscore-prefixed space
+    /// that user names are kept out of, so they are claimed as written.
+    fn claim_generated_cte_name(&mut self, preferred: &str) -> String {
+        self.claim_in_cte_namespace(preferred)
+    }
+
+    /// Claim a WITH name for a `with` binding, recording the name to read it
+    /// back by when the one it asked for was already spoken for.
+    fn claim_cte_sql_name(&mut self, name: &str) -> String {
+        // Every generated WITH name starts with an underscore. Keeping user
+        // names out of that space is what makes the two sets disjoint, so a
+        // binding named `_dml` cannot collide with the wrapper of that name.
+        let base = match name.starts_with('_') {
+            true => format!("w{name}"),
+            false => name.to_string(),
+        };
+        let claimed = self.claim_in_cte_namespace(&base);
+        if claimed == name {
+            self.cte_sql_names.remove(name);
+        } else {
+            self.cte_sql_names.insert(name.to_string(), claimed.clone());
+        }
+        claimed
     }
 
     fn register_cte(&mut self, name: &str, ir_stmt: &IrStmt) -> String {
@@ -1686,7 +1722,7 @@ impl<'a> Compiler<'a> {
     fn fresh_nested_cte_name(&mut self) -> String {
         let n = self.nested_cte_counter;
         self.nested_cte_counter += 1;
-        format!("_nested_dml_{n}")
+        self.claim_generated_cte_name(&format!("_nested_dml_{n}"))
     }
 
     /// Register a named parameter and return its 0-based index.
@@ -6849,19 +6885,14 @@ impl<'a> Compiler<'a> {
             }
         };
 
-        // The CTE name this loop's iterator is emitted under. Two sibling
-        // loops over the same variable name would otherwise both claim
-        // `_for_<name>`, which one WITH clause cannot hold twice.
-        let slot = {
-            let seen = self.for_slot_counts.entry(f.var.clone()).or_insert(0);
-            let n = *seen;
-            *seen += 1;
-            if n == 0 {
-                f.var.clone()
-            } else {
-                format!("{}_{}", f.var, n)
-            }
-        };
+        // The CTE name this loop's iterator is emitted under, claimed from the
+        // statement's one namespace so no sibling loop and no binding can end
+        // up under it too. The emitter spells it `_for_<slot>`.
+        let slot = self
+            .claim_generated_cte_name(&format!("_for_{}", f.var))
+            .strip_prefix("_for_")
+            .unwrap_or(&f.var)
+            .to_string();
         let prev_slot = self.for_var_slots.insert(f.var.clone(), slot.clone());
         // Register the for variable so the body can reference it.
         let prev = self.for_vars.insert(f.var.clone(), pg_type.clone());
@@ -10700,11 +10731,12 @@ impl<'a> Compiler<'a> {
                     None => {}
                 }
                 let ir_stmt = compile_cte_binding(self, &alias.expr)?;
+                let sql_name = self.claim_cte_sql_name(&alias.name);
                 let type_name = self.register_cte(&alias.name, &ir_stmt);
                 self.hoisted_binding_sources
                     .insert(alias.name.clone(), alias.expr.clone());
                 self.hoisted_ctes.push(IrCteDef {
-                    name: alias.name.clone(),
+                    name: sql_name,
                     stmt: ir_stmt,
                     type_name,
                 });

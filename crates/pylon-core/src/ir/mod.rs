@@ -2397,6 +2397,21 @@ mod tests {
         );
     }
 
+    /// Every generated WITH name starts with an underscore, so a binding that
+    /// starts with one is moved out of that space — `_dml` beside the wrapper
+    /// of that name used to emit one name five times.
+    #[test]
+    fn test_a_binding_named_like_a_generated_cte_gets_its_own_name() {
+        let ast = parse::parse("WITH _dml := (SELECT Person LIMIT 1) SELECT (UPDATE Person FILTER .id = _dml.id SET { age := 1 }) { name }").unwrap();
+        let ir = super::compile(&ast, &make_schema()).expect("IR compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert_eq!(
+            sql.matches("\"_dml\" AS (").count(),
+            1,
+            "the generated wrapper must keep the name to itself:\n{sql}"
+        );
+    }
+
     /// Two `for` bodies may each declare `line`. One WITH clause cannot hold
     /// that name twice, so the second binding is emitted under a suffixed one.
     #[test]
