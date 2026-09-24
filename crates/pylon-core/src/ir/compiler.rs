@@ -550,21 +550,28 @@ fn and_conditions(filter: Option<IrExpr>, extra: Vec<IrExpr>) -> Option<IrExpr> 
 
 const MAX_COMPUTED_SPLICES: usize = 32;
 
-/// `infer_ir_type` as an owned name, plus the array literal it cannot report:
-/// an array's type is built from its elements rather than carried on the node.
-/// `sum`, `any` and `all` over no rows: SQL gives NULL, the upstream engine the empty set's
-/// own value.
+/// `sum`, `any`, `all` and `array_agg` over no rows: SQL gives NULL, the upstream engine the
+/// empty set's own value. `'{}'` rather than `ARRAY[]`, whose element type
+/// PostgreSQL cannot infer on its own — inside a `coalesce` it takes the one
+/// the aggregate already carries.
+fn aggregate_over_nothing_sql(name: &str) -> Option<&'static str> {
+    match name {
+        "sum" => Some("0"),
+        "any" => Some("false"),
+        "all" => Some("true"),
+        "array_agg" => Some("'{}'"),
+        _ => None,
+    }
+}
+
 fn aggregate_over_nothing(name: &str, aggregate: IrExpr) -> IrExpr {
-    let value = match name {
-        "sum" => IrLiteral::Int(0),
-        "any" => IrLiteral::Bool(false),
-        "all" => IrLiteral::Bool(true),
-        _ => return aggregate,
+    let Some(value) = aggregate_over_nothing_sql(name) else {
+        return aggregate;
     };
     IrExpr::FunctionCall(IrFunctionCall {
         schema: None,
         name: "coalesce".to_string(),
-        args: vec![aggregate, IrExpr::Literal(value)],
+        args: vec![aggregate, IrExpr::RawSql(value.to_string())],
         sql_template: None,
     })
 }
@@ -4430,7 +4437,7 @@ impl<'a> Compiler<'a> {
                     }
                     fc.sql_template = Some(format!("{}(DISTINCT $1)", fc.name));
                 }
-                ps.result = IrPathResult::Scalar(call, None);
+                ps.result = IrPathResult::Scalar(aggregate_over_nothing(&f.name, call), None);
                 return Ok(ps);
             }
         }
@@ -11398,12 +11405,7 @@ impl<'a> Compiler<'a> {
                     };
                     // Over no rows SQL's aggregates give NULL where the upstream engine's give
                     // the empty set's own value.
-                    let over_nothing = match f.name.as_str() {
-                        "any" => Some(IrLiteral::Bool(false)),
-                        "all" => Some(IrLiteral::Bool(true)),
-                        "sum" => Some(IrLiteral::Int(0)),
-                        _ => None,
-                    };
+                    let over_nothing = aggregate_over_nothing_sql(&f.name);
                     // An unnested set cannot sit inside the aggregate call;
                     // the walk's rows are aggregated from outside instead.
                     let subquery = if matches!(&column, IrExpr::FunctionCall(f) if f.name == "unnest" && f.sql_template.is_none())
@@ -11433,7 +11435,7 @@ impl<'a> Compiler<'a> {
                         Some(value) => IrExpr::FunctionCall(IrFunctionCall {
                             schema: None,
                             name: "coalesce".to_string(),
-                            args: vec![subquery, IrExpr::Literal(value)],
+                            args: vec![subquery, IrExpr::RawSql(value.to_string())],
                             sql_template: None,
                         }),
                         None => subquery,
@@ -11480,12 +11482,7 @@ impl<'a> Compiler<'a> {
                         if let Some(sql_name) = aggregate {
                             let values = self.compile_expr_ctx(arg, ctx)?;
                             if matches!(values, IrExpr::ArrayFromSelect(_)) {
-                                let over_nothing = match f.name.as_str() {
-                                    "any" => "false",
-                                    "all" => "true",
-                                    "sum" => "0",
-                                    _ => "NULL",
-                                };
+                                let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
                                 return Ok(IrExpr::FunctionCall(IrFunctionCall {
                                     schema: None,
                                     name: sql_name.clone(),
@@ -11523,12 +11520,7 @@ impl<'a> Compiler<'a> {
                         if let Some(sql_name) = aggregate
                             && yields_array(&values)
                         {
-                            let over_nothing = match f.name.as_str() {
-                                "any" => "false",
-                                "all" => "true",
-                                "sum" => "0",
-                                _ => "NULL",
-                            };
+                            let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
                             return Ok(IrExpr::FunctionCall(IrFunctionCall {
                                 schema: None,
                                 name: sql_name.clone(),

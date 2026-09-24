@@ -8294,6 +8294,19 @@ mod tests {
         assert!(out.sql.contains("_unnested"), "got:\n{}", out.sql);
     }
 
+    /// `array_agg` over no rows is `[]` in the upstream engine and NULL in SQL, which reaches
+    /// a caller as a missing value where a list was promised.
+    #[test]
+    fn test_array_agg_over_nothing_is_an_empty_array_not_null() {
+        for query in [
+            "SELECT std::array_agg(Person.name)",
+            "SELECT std::array_agg((SELECT Person).name)",
+        ] {
+            let out = compile_and_emit(query);
+            assert!(out.sql.contains("coalesce(") && out.sql.contains("'{}'"), "{query} got:\n{}", out.sql);
+        }
+    }
+
     /// A bare `array_unpack` outside `IN` still has to unnest — the unwrap is
     /// specific to `ANY`/`ALL`, which take an array rather than a set.
     #[test]
