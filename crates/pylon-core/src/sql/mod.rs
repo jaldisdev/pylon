@@ -12033,6 +12033,67 @@ select owner { posts := (select owner.posts.title) };",
         }
     }
 
+    /// `Token`, but reached through a second single link and narrowed to the
+    /// interface's implementor -- conduit's trust-tier walk,
+    /// `installation.connector.provider[is Individual].staff`.
+    fn two_hop_interface_schema() -> SchemaDescriptor {
+        let mut schema = interface_link_schema();
+        let token = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Token")
+            .expect("the helper declares Token")
+            .clone();
+        let mut connector = token.clone();
+        connector.name = "Connector".into();
+        connector.table = "Connector".into();
+        connector.links[0].name = "provider".into();
+        let mut installation = token;
+        installation.name = "Installation".into();
+        installation.table = "Installation".into();
+        installation.links[0].name = "connector".into();
+        installation.links[0].target = "default::Connector".into();
+        schema.types.push(connector);
+        schema.types.push(installation);
+        schema
+    }
+
+    #[test]
+    fn a_narrowed_two_hop_walk_off_a_pinned_row_is_one_value() {
+        // Every step is a forward single link and the filter pins the id, so
+        // the `[is Individual]` narrowing does not make the walk set-valued.
+        // Gathered as an array the `??` default became `array_remove(ARRAY[…])`
+        // and the result decoded as a one-element set where the upstream engine gives the
+        // value itself.
+        let out = compile_and_emit_with(
+            "SELECT { s := ((SELECT Installation FILTER .id = <uuid>$0).connector.provider[is Individual].email) ?? 'y' }",
+            &two_hop_interface_schema(),
+        );
+        assert!(
+            !out.sql.contains("ARRAY(SELECT"),
+            "expected a value, not a set:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("COALESCE("),
+            "the default must stay a scalar one:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_narrowed_two_hop_walk_off_an_unpinned_row_stays_a_set() {
+        let out = compile_and_emit_with(
+            "SELECT { s := (SELECT Installation FILTER .value = 'x').connector.provider[is Individual].email }",
+            &two_hop_interface_schema(),
+        );
+        assert!(
+            out.sql.contains("ARRAY(SELECT"),
+            "a walk off many rows is a set:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn test_reading_a_link_through_an_interface_target() {
         let schema = interface_link_schema();
