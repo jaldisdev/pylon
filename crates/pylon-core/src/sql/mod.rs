@@ -3389,26 +3389,59 @@ fn emit_for_insert(
         .collect();
 
     let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
-    cte_parts.extend(emit_user_cte_parts(body_ctes));
+    // The iterator first: a body CTE, and any DML nested in the row's values,
+    // may read the loop variable, and a WITH name is only in scope for the
+    // bindings that follow it.
     cte_parts.push(iter_cte.to_string());
+    cte_parts.extend(emit_user_cte_parts(body_ctes));
+    cte_parts.extend(emit_user_cte_parts(&ins.nested_ctes));
 
-    let mut sql = format!(
-        "WITH {}\nINSERT INTO {} ({})\nSELECT {} FROM {}",
-        cte_parts.join(",\n"),
+    let mut insert_sql = format!(
+        "INSERT INTO {} ({})\nSELECT {} FROM {}",
         target_ref(&ins.target),
         cols.join(", "),
         sel_exprs.join(", "),
         qi(iter_alias),
     );
     if let Some(conflict) = &ins.unless_conflict {
-        emit_conflict(&mut sql, conflict);
+        emit_conflict(&mut insert_sql, conflict);
     }
     let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
-    if let Some(r) = returning_sql {
-        sql.push_str(&r);
+
+    if ins.multi_link_appends.is_empty() {
+        let mut sql = format!("WITH {}\n{}", cte_parts.join(",\n"), insert_sql);
+        if let Some(r) = returning_sql {
+            sql.push_str(&r);
+        }
+        return SqlOutput {
+            sql,
+            shape,
+            inference_plan: None,
+        };
     }
+
+    // A junction row needs the id of the row this iteration just wrote, so
+    // the insert becomes a CTE the junction inserts read back from.
+    const IDS: &str = "_for_dml__ids";
+    insert_sql.push_str("\nRETURNING *");
+    cte_parts.push(format!("\"{}\" AS (\n{}\n)", IDS, insert_sql));
+    for (i, append) in ins.multi_link_appends.iter().enumerate() {
+        cte_parts.push(emit_ml_append_cte(
+            append,
+            IDS,
+            &ins.target.alias,
+            &format!("_for_dml__ml_add_{}", i),
+        ));
+    }
+
+    let projection = match &returning_sql {
+        // `emit_returning_shape` spells the projection as a RETURNING clause;
+        // read off a CTE it is the same tuple in a SELECT list.
+        Some(r) => r.trim_start_matches('\n').replacen("RETURNING ", "SELECT ", 1),
+        None => "SELECT 1".to_string(),
+    };
     SqlOutput {
-        sql,
+        sql: format!("WITH {}\n{}\nFROM \"{}\"", cte_parts.join(",\n"), projection, IDS),
         shape,
         inference_plan: None,
     }
@@ -12496,6 +12529,18 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("#>> '{}'"),
             "expected the json value to be extracted, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// A multi link assigned in a `for`-bodied insert used to be dropped: the
+    /// rows went in, the junction rows never did, and nothing reported it.
+    #[test]
+    fn test_for_bodied_insert_writes_its_multi_link() {
+        let out = compile_and_emit("FOR n IN {'a', 'b'} UNION (INSERT Person { name := n, posts := (SELECT Post) })");
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Person.posts\""),
+            "the junction rows must be written too, got:\n{}",
             out.sql
         );
     }
