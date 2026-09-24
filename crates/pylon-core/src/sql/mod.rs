@@ -9281,6 +9281,25 @@ mod tests {
         crate::validate::validate_schema_types(&schema).expect("schema should validate");
     }
 
+    /// `select (insert T { … }).id` — the mutation is hoisted into the
+    /// statement's own WITH and the field read off it, which is what the
+    /// `with x := (insert …) select x.id` spelling already produced. Without
+    /// the CTE the projection would read the whole table instead.
+    #[test]
+    fn test_a_mutation_read_through_a_path_runs_as_a_hoisted_cte() {
+        let out = compile_and_emit("SELECT (INSERT Person { name := 'x' }).name");
+        assert!(
+            out.sql.contains("\"_nested_dml_0\" AS (") && out.sql.contains("INSERT INTO"),
+            "the mutation must run as a CTE:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("FROM \"_nested_dml_0\""),
+            "the projection must read the mutation's own rows:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn test_dml_sub_statement_in_expression_position_still_rejected() {
         let err = compile_err("SELECT Person { x := (insert Company { name := 'c' }).name }");

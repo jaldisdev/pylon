@@ -10315,6 +10315,39 @@ impl<'a> Compiler<'a> {
                 && operands_reach_many;
             return Ok(IrExpr::ObjectPathUnion { branches, limit, multi });
         }
+        // `(insert T { … }).id` — a mutation read through a path. The statement
+        // itself may only run at the top level of a WITH, so it is hoisted into
+        // one and the path is read back off that binding: exactly what the
+        // `with x := (insert …) select x.id` spelling already compiles to. With
+        // no path to read there is nothing for the mutation to stand in for,
+        // which stays an error.
+        // Only in free context. Inside a schema-bound shape element
+        // (`select Person { x := (insert Company { … }).name }`) the mutation
+        // would run once while every row read its result, which is not what
+        // writing it there says — that stays rejected.
+        if matches!(stmt, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_))
+            && !extra_fields.is_empty()
+            && ctx.is_none()
+        {
+            let type_name = self.dml_subject_type(stmt)?;
+            let inner = self.compile_stmt(stmt)?;
+            let cte_name = self.fresh_nested_cte_name();
+            // `hoisted_ctes`, not `pending_nested_ctes`: this mutation came out
+            // of an expression in the enclosing statement, not out of another
+            // statement's link assignment, so it belongs to that statement's
+            // own WITH. Registering it is what lets the path below resolve
+            // against it like any other binding.
+            self.register_cte(&cte_name, &inner);
+            self.hoisted_ctes.push(IrCteDef {
+                name: cte_name.clone(),
+                stmt: inner,
+                type_name,
+            });
+            let mut steps = vec![ast::PathStep::Name(cte_name)];
+            steps.extend(extra_fields.iter().cloned().map(ast::PathStep::Name));
+            return self.compile_free_path(&ast::Path { steps, partial: false });
+        }
+
         let Stmt::Select(sel) = stmt else {
             return Err(self.subquery_expr_err(stmt));
         };
