@@ -2526,6 +2526,24 @@ mod tests {
     /// sides of the walk have to read the CTEs that wrote them; reading the
     /// base tables returned no rows at all.
     #[test]
+    fn test_a_plain_read_does_not_see_the_statements_own_write() {
+        // The other side of the boundary the test below draws. One statement
+        // is one snapshot: a read of the table sees what was there before it
+        // ran, and only a walk rooted at the mutation sees what it wrote.
+        // Checked against the upstream engine, which answers 1 and 1 for this shape.
+        let schema = make_schema();
+        let ast =
+            parse::parse("WITH made := (INSERT Person { name := 'a', age := 1 }) SELECT { after := count(Person) }")
+                .unwrap();
+        let ir = super::compile(&ast, &schema).expect("compile failed");
+        let sql = crate::sql::emit(&ir).sql;
+        assert!(
+            sql.to_lowercase().contains("from \"public\".\"person\""),
+            "the count must read the table, not the CTE that wrote to it:\n{sql}"
+        );
+    }
+
+    #[test]
     fn test_a_walk_off_a_mutation_sees_the_rows_it_just_wrote() {
         let schema = make_schema();
         let ast = parse::parse(
