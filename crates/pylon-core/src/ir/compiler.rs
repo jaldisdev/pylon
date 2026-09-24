@@ -14740,7 +14740,17 @@ impl<'a> Compiler<'a> {
             operand: inner,
         })))
     }
+}
 
+/// What an `UNLESS CONFLICT … ELSE (UPDATE …)` clause contributes: the
+/// `DO UPDATE SET` assignments, and the predicate deciding whether the
+/// conflicting row is touched at all when the ELSE UPDATE carried a filter.
+struct ConflictElse {
+    sets: Vec<(String, IrExpr)>,
+    predicate: Option<IrExpr>,
+}
+
+impl<'a> Compiler<'a> {
     /// Compile `UNLESS CONFLICT [ON expr] [ELSE (UPDATE …)]` into `IrConflict`.
     fn compile_conflict(
         &mut self,
@@ -14751,11 +14761,23 @@ impl<'a> Compiler<'a> {
         // so the emitter produces `ON CONFLICT ("name")` not `ON CONFLICT ("t0"."name")`.
         let on = uc.on.as_ref().map(|e| self.compile_expr(e, td, "")).transpose()?;
         let mut appends = vec![];
+        let mut do_update_where = None;
         let do_update = match uc.else_.as_ref() {
-            Some(e) => Some(self.compile_conflict_else(e, &mut appends)?),
+            Some(e) => {
+                let resolved = self.compile_conflict_else(e, &mut appends)?;
+                do_update_where = resolved.predicate;
+                Some(resolved.sets)
+            }
             None => None,
         };
-        Ok((IrConflict { on, do_update }, appends))
+        Ok((
+            IrConflict {
+                on,
+                do_update,
+                do_update_where,
+            },
+            appends,
+        ))
     }
 
     /// Compile the ELSE clause of UNLESS CONFLICT, which must be `(UPDATE Type SET { … })`.
@@ -14776,7 +14798,7 @@ impl<'a> Compiler<'a> {
         &mut self,
         expr: &Expr,
         appends: &mut Vec<IrMultiLinkMutation>,
-    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+    ) -> Result<ConflictElse, PyQLError> {
         let Expr::SubQuery(stmt) = expr else {
             return Err(self.type_err("UNLESS CONFLICT ELSE must be an UPDATE expression, e.g. ELSE (UPDATE …)"));
         };
@@ -14797,14 +14819,17 @@ impl<'a> Compiler<'a> {
                 .iter()
                 .find(|p| p.is_pk)
                 .ok_or_else(|| self.type_err(&format!("type '{type_name}' has no primary key to read back")))?;
-            return Ok(vec![(
-                pk.name.clone(),
-                IrExpr::ColumnRef {
-                    alias: table,
-                    column: pk.name.clone(),
-                    pg_type: pk.pg_type.clone(),
-                },
-            )]);
+            return Ok(ConflictElse {
+                sets: vec![(
+                    pk.name.clone(),
+                    IrExpr::ColumnRef {
+                        alias: table,
+                        column: pk.name.clone(),
+                        pg_type: pk.pg_type.clone(),
+                    },
+                )],
+                predicate: None,
+            });
         }
         let Stmt::Update(upd) = stmt.as_ref() else {
             return Err(self.type_err(
@@ -14814,9 +14839,19 @@ impl<'a> Compiler<'a> {
         };
         let type_name = self.expr_as_type_name(&upd.subject)?;
         let upd_td = self.resolve_type(&type_name)?;
-        // Filter on the ELSE UPDATE is ignored — PostgreSQL infers the conflicting
-        // row from the ON CONFLICT target automatically.
         let table = upd_td.table.clone();
+        // The ON CONFLICT target says *which* row conflicts; the ELSE UPDATE's
+        // own filter says whether to touch it at all, and the upstream engine honours it.
+        // Dropping it silently turned `unless conflict on .key else (update T
+        // filter .expires_at < now() set { … })` into an unconditional steal of
+        // a live advisory lock. Compiled against the table name, which is what
+        // refers to the *existing* row inside `DO UPDATE` (`excluded` is the
+        // proposed one).
+        let do_update_where = upd
+            .filter
+            .as_ref()
+            .map(|f| self.compile_expr(f, upd_td, &table))
+            .transpose()?;
         // A multi-link cannot be written by `DO UPDATE SET` — junction rows
         // are separate DML. Appending them to the enclosing insert instead
         // applies them to whichever row comes back, inserted or conflicting,
@@ -14848,7 +14883,11 @@ impl<'a> Compiler<'a> {
                 single: false,
             });
         }
-        self.compile_assignments_for_update(&scalar_shape, upd_td, &table)
+        let sets = self.compile_assignments_for_update(&scalar_shape, upd_td, &table)?;
+        Ok(ConflictElse {
+            sets,
+            predicate: do_update_where,
+        })
     }
 
     /// Compile a nested INSERT/UPDATE/DELETE into its own CTE and return that

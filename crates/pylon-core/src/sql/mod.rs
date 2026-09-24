@@ -1876,6 +1876,11 @@ fn emit_conflict(sql: &mut String, conflict: &IrConflict) {
             ));
         }
     }
+    if conflict.do_update.is_some()
+        && let Some(predicate) = &conflict.do_update_where
+    {
+        sql.push_str(&format!(" WHERE {}", emit_expr(predicate)));
+    }
 }
 
 fn do_update_sets(updates: &[(String, IrExpr)]) -> String {
@@ -9745,6 +9750,42 @@ mod tests {
         // existing row conflicts regardless of target, so the upsert above
         // is what actually makes reassignment work, not the exclusion here.
         assert!(out.sql.contains("NOT IN"), "got:\n{}", out.sql);
+    }
+
+    /// `unless conflict on .k else (update T filter … set { … })` — the ON
+    /// CONFLICT target says which row conflicts, the filter says whether to
+    /// touch it. Dropping the filter turned automator's advisory lock into an
+    /// unconditional steal of a live holder's row.
+    #[test]
+    fn test_unless_conflict_else_update_keeps_its_filter() {
+        let out = compile_and_emit(
+            "INSERT Person { name := 'a' } UNLESS CONFLICT ON .name \
+             ELSE (UPDATE Person FILTER .age < 30 SET { name := 'b' })",
+        );
+        assert!(
+            out.sql.contains("DO UPDATE SET") && out.sql.contains("WHERE"),
+            "the ELSE UPDATE's filter must survive as a DO UPDATE predicate:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"Person\".\"age\""),
+            "the predicate must read the existing row, not `excluded`:\n{}",
+            out.sql
+        );
+    }
+
+    /// No filter, no predicate — an unconditional ELSE UPDATE still updates.
+    #[test]
+    fn test_unless_conflict_else_update_without_a_filter_has_no_predicate() {
+        let out = compile_and_emit(
+            "INSERT Person { name := 'a' } UNLESS CONFLICT ON .name ELSE (UPDATE Person SET { name := 'b' })",
+        );
+        let after_set = out.sql.split("DO UPDATE SET").nth(1).unwrap_or_default();
+        assert!(
+            !after_set.contains("WHERE"),
+            "got a predicate we never asked for:\n{}",
+            out.sql
+        );
     }
 
     #[test]

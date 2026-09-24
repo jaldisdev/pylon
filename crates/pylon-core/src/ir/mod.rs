@@ -720,6 +720,12 @@ pub struct IrConflict {
     pub on: Option<IrExpr>,
     /// `DO UPDATE SET` assignments. None → `DO NOTHING`.
     pub do_update: Option<Vec<(String, IrExpr)>>,
+    /// Predicate from the ELSE UPDATE's own `filter`, emitted as the
+    /// `DO UPDATE … WHERE` clause. Postgres infers *which* row conflicts from
+    /// the ON CONFLICT target, but whether to update it at all is still the
+    /// filter's business — `unless conflict on .key else (update T filter
+    /// .expires_at < now() set { … })` must leave a live row alone.
+    pub do_update_where: Option<IrExpr>,
 }
 
 // ── UPDATE ──────────────────────────────────────────────────────────────────────
