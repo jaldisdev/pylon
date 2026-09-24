@@ -6624,6 +6624,47 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// True when `expr` is known to hold json, so `expr[…]` reaches into it
+    /// with `->` rather than indexing a string or an array. A loop variable
+    /// carries no type in the IR, so its `for` registration answers for it.
+    fn is_json_expr(&self, ast: &Expr, ir: &IrExpr) -> bool {
+        if matches!(infer_ir_type(ir), Some("jsonb")) {
+            return true;
+        }
+        let Expr::Path(path) = ast else {
+            return false;
+        };
+        if path.partial || path.steps.len() != 1 {
+            return false;
+        }
+        let ast::PathStep::Name(name) = &path.steps[0] else {
+            return false;
+        };
+        self.for_vars.get(name.as_str()).is_some_and(|t| t == "jsonb")
+    }
+
+    /// The pg type one row of a set-returning call yields — the element type
+    /// of the array it unpacks. `None` when the call is not set-returning or
+    /// its argument's type is not an array.
+    fn set_returning_element_type(&mut self, expr: &Expr) -> Result<Option<String>, PyQLError> {
+        if !expr_returns_set(expr) {
+            return Ok(None);
+        }
+        let Expr::FunctionCall(call) = expr else {
+            return Ok(None);
+        };
+        let [argument] = call.args.as_slice() else {
+            return Ok(None);
+        };
+        let compiled = self.compile_free_expr(argument)?;
+        let Some(array_type) = infer_ir_type(&compiled) else {
+            return Ok(None);
+        };
+        Ok(array_type
+            .strip_suffix("[]")
+            .map(|element| literal_sentinel_to_pg(element).to_string()))
+    }
+
     fn compile_for(&mut self, f: &ast::ForStmt) -> Result<IrFor, PyQLError> {
         // A loop straight over a binding: the rows are that binding's, so a
         // walk off the variable reads it rather than the type's own table.
@@ -6737,16 +6778,26 @@ impl<'a> Compiler<'a> {
             }
             other => {
                 let e = self.compile_free_expr(other)?;
-                let raw = infer_ir_type(&e).unwrap_or("text");
-                let pg_type = literal_sentinel_to_pg(raw).to_string();
-                (
+                // A set-returning call is registered as `set of any`, so its
+                // own type says nothing — the rows are the argument array's
+                // elements, which is where the type comes from.
+                let raw = match self.set_returning_element_type(other)? {
+                    Some(element) => element,
+                    None => literal_sentinel_to_pg(infer_ir_type(&e).unwrap_or("text")).to_string(),
+                };
+                let pg_type = raw;
+                let iterator = if expr_returns_set(other) {
+                    IrForIterator::SetReturning {
+                        expr: e,
+                        pg_type: pg_type.clone(),
+                    }
+                } else {
                     IrForIterator::Values {
                         exprs: vec![e],
                         pg_type: pg_type.clone(),
-                    },
-                    pg_type,
-                    None,
-                )
+                    }
+                };
+                (iterator, pg_type, None)
             }
         };
 
@@ -11478,6 +11529,19 @@ impl<'a> Compiler<'a> {
 
             Expr::Index { expr: e, index: i } => {
                 let ir_expr = self.compile_expr_ctx(e, ctx)?;
+                if self.is_json_expr(e, &ir_expr) {
+                    return match &**i {
+                        Expr::Literal(Literal::Str(key)) => Ok(IrExpr::JsonbField {
+                            expr: Box::new(ir_expr),
+                            field: key.clone(),
+                        }),
+                        Expr::Literal(Literal::Int(n)) if *n >= 0 => Ok(IrExpr::JsonbIndex {
+                            expr: Box::new(ir_expr),
+                            index: *n as usize,
+                        }),
+                        _ => Err(self.type_err("indexing json needs a literal key or a literal position")),
+                    };
+                }
                 let ir_index = self.compile_expr_ctx(i, ctx)?;
                 let is_array = is_array_expr(&ir_expr);
                 Ok(IrExpr::Subscript {
@@ -16924,6 +16988,16 @@ fn pylon_type_matches(expr: &IrExpr, ty: &crate::stdlib::PylonType) -> bool {
     }
 }
 
+/// True for a call like `array_unpack` that yields a set rather than one value.
+fn expr_returns_set(expr: &Expr) -> bool {
+    let Expr::FunctionCall(call) = expr else {
+        return false;
+    };
+    crate::stdlib::lookup(call.module.as_deref().unwrap_or("std"), &call.name)
+        .iter()
+        .any(|d| d.returns_set())
+}
+
 fn literal_sentinel_to_pg(t: &str) -> &str {
     match t {
         "__int_literal" => "int8",
@@ -17031,6 +17105,7 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         }),
         IrExpr::EnumLiteral { pg_type, .. } => Some(pg_type.as_str()),
         IrExpr::NamedTuple { .. } => Some("jsonb"),
+        IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } => Some("jsonb"),
         IrExpr::GlobalParam { pg_type, .. } => Some(pg_type.as_str()),
         // A `with`-bound scalar is typed by what it binds, so a call over one
         // resolves to the same overload the bare value would.

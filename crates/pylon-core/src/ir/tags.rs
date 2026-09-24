@@ -168,6 +168,7 @@ fn collect_stmt(stmt: &IrStmt, tags: &mut Vec<String>) {
                     }
                 }
                 IrForIterator::Query { stmt, .. } => collect_stmt(stmt, tags),
+                IrForIterator::SetReturning { expr, .. } => collect_expr(expr, tags),
             }
             collect_stmt(&f.body, tags);
         }

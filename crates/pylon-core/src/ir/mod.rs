@@ -117,6 +117,10 @@ pub enum IrForIterator {
         /// objects and the loop variable binds their `id`.
         scalar: bool,
     },
+    /// A set-returning call — `for line in array_unpack(<array<json>>$lines)`.
+    /// Kept apart from `Values` because PostgreSQL forbids a set-returning
+    /// function inside `VALUES`; it goes in a select list instead.
+    SetReturning { expr: IrExpr, pg_type: String },
 }
 
 // ── GROUP ─────────────────────────────────────────────────────────────────────────

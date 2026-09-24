@@ -3051,6 +3051,22 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
 
 /// The loop's iterator as a relation with a single column named `v`, in both
 /// the forms the two body kinds need: one for a `FROM` clause, one for a CTE.
+/// True for an expression PostgreSQL hands back as `jsonb`, whose value a
+/// scalar cast has to reach into rather than render.
+fn yields_jsonb(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::NamedTuple { .. } => true,
+        IrExpr::TypeCast(c) => c.pg_type == "jsonb",
+        IrExpr::ColumnRef { pg_type, .. } | IrExpr::FnParam { pg_type, .. } => pg_type == "jsonb",
+        IrExpr::CteRef { pg_type, .. } => pg_type.as_deref() == Some("jsonb"),
+        IrExpr::FunctionCall(f) if f.schema.is_none() => {
+            let mut overloads = crate::stdlib::registry().iter().filter(|d| d.name == f.name).peekable();
+            overloads.peek().is_some() && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Json))
+        }
+        _ => false,
+    }
+}
+
 fn emit_for_iterator(it: &IrForIterator, iter_alias: &str) -> (String, String) {
     match it {
         IrForIterator::Values { exprs, pg_type } => {
@@ -3073,6 +3089,13 @@ fn emit_for_iterator(it: &IrForIterator, iter_alias: &str) -> (String, String) {
             } else {
                 format!("    SELECT \"id\" AS v FROM (\n{}\n    ) AS _src", inner)
             };
+            (
+                format!("(\n{}\n) AS {}", body, qi(iter_alias)),
+                format!("{} AS (\n{}\n)", qi(iter_alias), body),
+            )
+        }
+        IrForIterator::SetReturning { expr, pg_type } => {
+            let body = format!("    SELECT {}::{} AS v", emit_expr(expr), pg_type);
             (
                 format!("(\n{}\n) AS {}", body, qi(iter_alias)),
                 format!("{} AS (\n{}\n)", qi(iter_alias), body),
@@ -3115,6 +3138,15 @@ fn emit_nested_for_iterator(it: &IrForIterator, iter_alias: &str, outer_alias: &
                 inner,
             )
         }
+        IrForIterator::SetReturning { expr, pg_type } => format!(
+            "{} AS (\nSELECT {}.\"v\" AS {}, \"_vals\".\"v\" AS v\nFROM {}, LATERAL (SELECT {}::{} AS v) AS \"_vals\"\n)",
+            qi(iter_alias),
+            qi(outer_alias),
+            qi(OUTER),
+            qi(outer_alias),
+            emit_expr(expr),
+            pg_type,
+        ),
     }
 }
 
@@ -4761,6 +4793,11 @@ pub fn emit_expr(expr: &IrExpr) -> String {
                     }
                     _ => format!("to_jsonb({})", emit_expr(&c.expr)),
                 }
+            } else if yields_jsonb(&c.expr) {
+                // Casting json to a scalar yields the value, not its JSON
+                // spelling — `<str>` of a json string is the string, with no
+                // quotes around it. `::text` would keep them.
+                format!("(({}) #>> '{{}}')::{}", emit_expr(&c.expr), c.pg_type)
             } else {
                 format!("({})::{}", emit_expr(&c.expr), c.pg_type)
             }
@@ -12401,6 +12438,64 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("_pylon.str_subscript"),
             "expected _pylon.str_subscript() for string index, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// PostgreSQL forbids a set-returning function inside `VALUES`, so a loop
+    /// over `array_unpack` has to iterate a select instead.
+    #[test]
+    fn test_for_over_a_set_returning_call_is_not_a_values_clause() {
+        let out = compile_and_emit("FOR n IN array_unpack(<array<int64>>$ns) UNION (SELECT n)");
+        assert!(
+            !out.sql.contains("VALUES (unnest"),
+            "a set-returning iterator must not land in VALUES, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("SELECT unnest"),
+            "expected the iterator in a select list, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// The loop variable's type is the unpacked array's element type, not
+    /// whatever the generically-declared call says.
+    #[test]
+    fn test_for_over_array_unpack_binds_the_element_type() {
+        let out = compile_and_emit("FOR j IN array_unpack(<array<json>>$rows) UNION (SELECT <str>j['k'])");
+        assert!(
+            out.sql.contains("::jsonb AS v"),
+            "the loop variable should carry the element type, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// Indexing json reaches into it with `->`; neither string nor array
+    /// subscripting applies.
+    #[test]
+    fn test_indexing_json_emits_a_jsonb_accessor() {
+        let out = compile_and_emit("SELECT (<json>$payload)['label']");
+        assert!(
+            out.sql.contains("->'label'"),
+            "expected a jsonb field access, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("str_subscript"),
+            "json must not be subscripted as a string, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// Casting json to a scalar yields the value, not its JSON spelling —
+    /// `<str>` of a json string has no quotes around it.
+    #[test]
+    fn test_casting_json_to_a_scalar_unwraps_it() {
+        let out = compile_and_emit("SELECT <str>to_json(<str>$s)");
+        assert!(
+            out.sql.contains("#>> '{}'"),
+            "expected the json value to be extracted, got:\n{}",
             out.sql
         );
     }
