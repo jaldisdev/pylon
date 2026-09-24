@@ -114,7 +114,45 @@ fn emit_global_cte_parts(global_ctes: &[IrGlobalCte]) -> Vec<String> {
 }
 
 pub fn emit(ir: &IrOutput) -> SqlOutput {
-    with_subtype_fanouts(&ir.subtype_fanouts, || emit_output(ir))
+    let out = with_subtype_fanouts(&ir.subtype_fanouts, || emit_output(ir));
+    #[cfg(debug_assertions)]
+    if let Some(problem) = forward_cte_reference(&out.sql) {
+        panic!("{problem}\n{}", out.sql);
+    }
+    out
+}
+
+/// A WITH name is in scope only for the bindings that follow it, so a CTE
+/// that reads one defined after it fails at execution time — and does so
+/// complaining about a FROM clause, far from what actually put the two in
+/// the wrong order. Checked here rather than left to PostgreSQL because the
+/// parts are assembled in a dozen places, none of which owns the ordering.
+#[cfg(debug_assertions)]
+fn forward_cte_reference(sql: &str) -> Option<String> {
+    let definitions: Vec<(String, usize)> = sql
+        .match_indices("\" AS (")
+        .filter_map(|(end, _)| {
+            let head = &sql[..end];
+            let start = head.rfind('"')?;
+            Some((head[start + 1..].to_string(), start))
+        })
+        .collect();
+    for (name, defined_at) in &definitions {
+        // A bare quoted name is a CTE; a real relation is always schema
+        // qualified (`"marketplace"."Order"`), so these never collide.
+        let quoted = qi(name);
+        for prefix in ["FROM ", "JOIN ", "CROSS JOIN "] {
+            let needle = format!("{prefix}{quoted}");
+            if let Some(used_at) = sql.find(&needle)
+                && used_at < *defined_at
+            {
+                return Some(format!(
+                    "CTE {quoted} is read at byte {used_at} but not defined until {defined_at}"
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn emit_output(ir: &IrOutput) -> SqlOutput {
@@ -8697,6 +8735,19 @@ mod tests {
             "got:\n{}",
             out.sql
         );
+    }
+
+    /// The order check is a safety net for every emitter that assembles a
+    /// WITH clause, so it has to actually catch one.
+    #[test]
+    fn test_the_cte_order_check_catches_a_forward_reference() {
+        let bad = "WITH \"b\" AS (\n SELECT * FROM \"a\"\n),\n\"a\" AS (\n SELECT 1\n)\nSELECT 1";
+        assert!(
+            super::forward_cte_reference(bad).is_some(),
+            "expected a forward reference"
+        );
+        let good = "WITH \"a\" AS (\n SELECT 1\n),\n\"b\" AS (\n SELECT * FROM \"a\"\n)\nSELECT 1";
+        assert_eq!(super::forward_cte_reference(good), None, "ordered CTEs must pass");
     }
 
     /// `.status IN <Enum>array_unpack($1)` — the cast sits between `IN` and
