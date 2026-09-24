@@ -48,6 +48,12 @@ use rkyv::{Archive, Deserialize, Serialize};
     derive(Debug),
     serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator),
     deserialize_bounds(__D::Error: rkyv::rancor::Source),
+    // Needed for the same reason as `omit_bounds` below, but on the
+    // validation side: when a *consumer* turns on rkyv's `bytecheck` feature
+    // (this crate does not), the derive also emits a `Verify` impl, and the
+    // recursive fields leave it without the context bound. Only parsed when
+    // that feature is on, so it costs nothing when it is off.
+    bytecheck(bounds(__C: rkyv::validation::ArchiveContext)),
 )]
 pub enum DecodedValue {
     Null,
