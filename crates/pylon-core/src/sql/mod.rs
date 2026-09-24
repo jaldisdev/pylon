@@ -1143,12 +1143,39 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
 /// into sibling CTE parts. A data-modifying statement can neither sit inside
 /// another CTE's body nor in a LATERAL, so the loop cannot be emitted as the
 /// binding's own subquery the way a select-bodied one is.
-fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
+/// A `for` whose body mutates, bound to a WITH name. `outer_alias` names an
+/// enclosing loop's iteration when this loop reads it, which makes every row
+/// this one writes belong to one iteration of it rather than to all of them. `outer_alias` names
+/// that loop's iteration when this loop reads it, which makes every row this
+/// one writes belong to one iteration of it rather than to all of them.
+fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) -> Vec<String> {
     let iter_alias = format!("_for_{}", f.var_name);
-    let (_, iter_cte) = emit_for_iterator(&f.iterator, &iter_alias);
-    let mut parts: Vec<String> = emit_user_cte_parts(&f.body_ctes);
-    parts.push(iter_cte);
+    let (_, plain_iter_cte) = emit_for_iterator(&f.iterator, &iter_alias);
+    let correlated = outer_alias.filter(|outer| reads_iteration(&plain_iter_cte, outer));
+    let iter_cte = match correlated {
+        Some(outer) => emit_nested_for_iterator(&f.iterator, &iter_alias, outer),
+        None => plain_iter_cte,
+    };
+    // The iterator first: a body CTE may read the loop variable, and a WITH
+    // name is only in scope for the bindings that follow it.
+    let mut parts: Vec<String> = vec![iter_cte];
+    let body_parts = emit_user_cte_parts_within(&f.body_ctes, Some(&iter_alias));
+    parts.extend(body_parts.iter().cloned());
     let ids_name = format!("{}__ids", name);
+
+    // Rows written under a correlated loop carry their iteration key, so the
+    // enclosing statement can pair them with the row that iteration wrote.
+    if correlated.is_some()
+        && let IrStmt::Insert(ins) = f.body.as_ref()
+        && ins.multi_link_appends.is_empty()
+    {
+        let rows_name = format!("{}__rows", name);
+        let outer_source = format!("{}.{}", qi(&iter_alias), qi(OUTER_KEY));
+        parts.push(emit_iteration_rows_cte(ins, &rows_name, &iter_alias, &outer_source));
+        parts.push(emit_insert_from_rows_cte(ins, &ids_name, &rows_name));
+        parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, rows_name));
+        return parts;
+    }
 
     match f.body.as_ref() {
         IrStmt::Insert(ins) => {
@@ -1168,25 +1195,41 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
                 .map(|(_, e)| emit_expr(e))
                 .chain(ins.rewrites.iter().map(|r| emit_expr(&r.expr)))
                 .collect();
-            let mut sql = format!(
-                "INSERT INTO {} ({})\nSELECT {} FROM {}",
-                target_ref(&ins.target),
-                cols.join(", "),
-                values.join(", "),
-                qi(&iter_alias),
-            );
-            if let Some(conflict) = &ins.unless_conflict {
-                emit_conflict(&mut sql, conflict);
+            // A nested loop that carried the iteration key back means these
+            // rows need one too, to pair with.
+            let rows_name = format!("{}__rows", name);
+            let correlated_targets = correlated_append_indices(&ins.multi_link_appends, &body_parts);
+            if correlated_targets.is_empty() {
+                let mut sql = format!(
+                    "INSERT INTO {} ({})\nSELECT {} FROM {}",
+                    target_ref(&ins.target),
+                    cols.join(", "),
+                    values.join(", "),
+                    qi(&iter_alias),
+                );
+                if let Some(conflict) = &ins.unless_conflict {
+                    emit_conflict(&mut sql, conflict);
+                }
+                sql.push_str("\nRETURNING *");
+                parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
+            } else {
+                let outer_source = match correlated {
+                    Some(_) => format!("{}.{}", qi(&iter_alias), qi(OUTER_KEY)),
+                    None => format!("{}.{}", qi(&iter_alias), qi("v")),
+                };
+                parts.push(emit_iteration_rows_cte(ins, &rows_name, &iter_alias, &outer_source));
+                parts.push(emit_insert_from_rows_cte(ins, &ids_name, &rows_name));
             }
-            sql.push_str("\nRETURNING *");
-            parts.push(format!("\"{}\" AS (\n{}\n)", ids_name, sql));
             for (i, append) in ins.multi_link_appends.iter().enumerate() {
-                parts.push(emit_ml_append_cte(
-                    append,
-                    &ids_name,
-                    &ins.target.alias,
-                    &format!("{}__ml_add_{}", name, i),
-                ));
+                let cte_name = format!("{}__ml_add_{}", name, i);
+                if correlated_targets.contains(&i) {
+                    let IrMultiLinkValueSource::CteRef(target) = &append.values.source else {
+                        unreachable!("only a CTE-backed value can carry an iteration key")
+                    };
+                    parts.push(emit_correlated_ml_append_cte(append, &rows_name, target, &cte_name));
+                } else {
+                    parts.push(emit_ml_append_cte(append, &ids_name, &ins.target.alias, &cte_name));
+                }
             }
         }
         IrStmt::Update(upd) => {
@@ -1331,6 +1374,12 @@ fn emit_for_dml_ctes(f: &IrFor, name: &str) -> Vec<String> {
 /// emit_poly_delete_dml_ctes) — neither can be nested inside a single name's
 /// own CTE body.
 fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
+    emit_user_cte_parts_within(ctes, None)
+}
+
+/// As above, inside a `for` body: `outer_alias` names the iteration a hoisted
+/// loop may read, so what it writes can be tied back to one iteration of it.
+fn emit_user_cte_parts_within(ctes: &[IrCteDef], outer_alias: Option<&str>) -> Vec<String> {
     let mut parts: Vec<String> = vec![];
     for c in ctes {
         // A hoisted statement may have hoisted one of its own —
@@ -1377,7 +1426,7 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
         if let IrStmt::For(f) = &c.stmt
             && matches!(f.body.as_ref(), IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::For(_))
         {
-            parts.extend(emit_for_dml_ctes(f, &c.name));
+            parts.extend(emit_for_dml_ctes_within(f, &c.name, outer_alias));
             continue;
         }
         parts.push(format!("\"{}\" AS (\n{}\n)", c.name, emit_dml_as_cte_source(&c.stmt)));
@@ -3375,6 +3424,121 @@ fn emit_for_update(
     }
 }
 
+/// The iteration key a correlated nested CTE carries, so rows written per
+/// iteration can be paired back with the row that iteration wrote. `RETURNING`
+/// can only name the inserted row's own columns, so the pairing is computed in
+/// a staging CTE beside the insert rather than read back out of it.
+const OUTER_KEY: &str = "_outer";
+
+/// True when `sql` reads the loop variable of the iteration named by
+/// `iter_alias`. `IrExpr::ForVar` emits exactly `"_for_<name>"."v"`, so the
+/// rendered reference is what identifies the correlation.
+fn reads_iteration(sql: &str, iter_alias: &str) -> bool {
+    sql.contains(&format!("{}.", qi(iter_alias)))
+}
+
+/// `SELECT <id> AS "id", <iter>."v" AS "_outer", <value> AS "<column>", …` —
+/// the rows one iteration-driven insert will write, with their ids generated
+/// here rather than by the column default so a junction can name them before
+/// the insert has run.
+fn emit_iteration_rows_cte(ins: &IrInsert, cte_name: &str, iter_alias: &str, outer_source: &str) -> String {
+    let rewrite_cols: std::collections::HashSet<&str> = ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+    let mut selected = vec![
+        format!(
+            "{} AS {}",
+            ins.id_default_sql.as_deref().unwrap_or("uuidv7()"),
+            qi("id")
+        ),
+        format!("{} AS {}", outer_source, qi(OUTER_KEY)),
+    ];
+    selected.extend(
+        ins.assignments
+            .iter()
+            .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+            .map(|(c, e)| format!("{} AS {}", emit_expr(e), qi(c)))
+            .chain(
+                ins.rewrites
+                    .iter()
+                    .map(|r| format!("{} AS {}", emit_expr(&r.expr), qi(&r.column))),
+            ),
+    );
+    format!(
+        "\"{}\" AS (\nSELECT {}\nFROM {}\n)",
+        cte_name,
+        selected.join(", "),
+        qi(iter_alias),
+    )
+}
+
+/// The insert that reads its rows back out of the staging CTE above.
+fn emit_insert_from_rows_cte(ins: &IrInsert, cte_name: &str, rows_name: &str) -> String {
+    let rewrite_cols: std::collections::HashSet<&str> = ins.rewrites.iter().map(|r| r.column.as_str()).collect();
+    let cols: Vec<String> = std::iter::once(qi("id"))
+        .chain(
+            ins.assignments
+                .iter()
+                .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
+                .map(|(c, _)| qi(c)),
+        )
+        .chain(ins.rewrites.iter().map(|r| qi(&r.column)))
+        .collect();
+    let mut sql = format!(
+        "INSERT INTO {} ({})\nSELECT {} FROM \"{}\"",
+        target_ref(&ins.target),
+        cols.join(", "),
+        cols.join(", "),
+        rows_name,
+    );
+    if let Some(conflict) = &ins.unless_conflict {
+        emit_conflict(&mut sql, conflict);
+    }
+    sql.push_str("\nRETURNING *");
+    format!("\"{}\" AS (\n{}\n)", cte_name, sql)
+}
+
+/// A junction append whose targets were written per iteration: pair the two
+/// staging CTEs on the iteration key rather than cross-joining every row
+/// written against every row that wrote one.
+fn emit_correlated_ml_append_cte(
+    mutation: &IrMultiLinkMutation,
+    rows_name: &str,
+    targets_name: &str,
+    cte_name: &str,
+) -> String {
+    format!(
+        "\"{}\" AS (\nINSERT INTO {} ({}, {})\nSELECT \"_src\".{}, \"_tgt\".{} FROM \"{}\" AS \"_src\" JOIN \"{}\" AS \"_tgt\" ON \"_tgt\".{} = \"_src\".{}\nON CONFLICT DO NOTHING\nRETURNING {}, {}\n)",
+        cte_name,
+        qn(&mutation.module, &mutation.junction_table),
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+        qi("id"),
+        qi("id"),
+        rows_name,
+        targets_name,
+        qi(OUTER_KEY),
+        qi(OUTER_KEY),
+        qi(&mutation.source_col),
+        qi(&mutation.target_col),
+    )
+}
+
+/// Which of `appends` name a CTE that staged its rows per iteration, and so
+/// pair on the iteration key instead of cross-joining.
+fn correlated_append_indices(appends: &[IrMultiLinkMutation], parts: &[String]) -> Vec<usize> {
+    appends
+        .iter()
+        .enumerate()
+        .filter(|(_, append)| match &append.values.source {
+            IrMultiLinkValueSource::CteRef(target) => {
+                let staged = qi(&format!("{}__rows", target));
+                parts.iter().any(|part| part.starts_with(&format!("{} AS", staged)))
+            }
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 fn emit_for_insert(
     ins: &IrInsert,
     iter_alias: &str,
@@ -3404,8 +3568,12 @@ fn emit_for_insert(
     // may read the loop variable, and a WITH name is only in scope for the
     // bindings that follow it.
     cte_parts.push(iter_cte.to_string());
-    cte_parts.extend(emit_user_cte_parts(body_ctes));
-    cte_parts.extend(emit_user_cte_parts(&ins.nested_ctes));
+    let mut nested_parts = emit_user_cte_parts_within(body_ctes, Some(iter_alias));
+    nested_parts.extend(emit_user_cte_parts_within(&ins.nested_ctes, Some(iter_alias)));
+    // A nested loop that carried the iteration key back means this insert's
+    // own rows need one too, to pair with.
+    let correlated_targets = correlated_append_indices(&ins.multi_link_appends, &nested_parts);
+    cte_parts.extend(nested_parts);
 
     let mut insert_sql = format!(
         "INSERT INTO {} ({})\nSELECT {} FROM {}",
@@ -3434,15 +3602,25 @@ fn emit_for_insert(
     // A junction row needs the id of the row this iteration just wrote, so
     // the insert becomes a CTE the junction inserts read back from.
     const IDS: &str = "_for_dml__ids";
-    insert_sql.push_str("\nRETURNING *");
-    cte_parts.push(format!("\"{}\" AS (\n{}\n)", IDS, insert_sql));
+    const ROWS: &str = "_for_dml__rows";
+    if correlated_targets.is_empty() {
+        insert_sql.push_str("\nRETURNING *");
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", IDS, insert_sql));
+    } else {
+        let outer_source = format!("{}.{}", qi(iter_alias), qi("v"));
+        cte_parts.push(emit_iteration_rows_cte(ins, ROWS, iter_alias, &outer_source));
+        cte_parts.push(emit_insert_from_rows_cte(ins, IDS, ROWS));
+    }
     for (i, append) in ins.multi_link_appends.iter().enumerate() {
-        cte_parts.push(emit_ml_append_cte(
-            append,
-            IDS,
-            &ins.target.alias,
-            &format!("_for_dml__ml_add_{}", i),
-        ));
+        let cte_name = format!("_for_dml__ml_add_{}", i);
+        if correlated_targets.contains(&i) {
+            let IrMultiLinkValueSource::CteRef(target) = &append.values.source else {
+                unreachable!("only a CTE-backed value can carry an iteration key")
+            };
+            cte_parts.push(emit_correlated_ml_append_cte(append, ROWS, target, &cte_name));
+        } else {
+            cte_parts.push(emit_ml_append_cte(append, IDS, &ins.target.alias, &cte_name));
+        }
     }
 
     let projection = match &returning_sql {
@@ -12574,6 +12752,26 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("#>> '{}'"),
             "expected the json value to be extracted, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// A `for … union (insert …)` assigned to a multi link *inside another
+    /// loop* writes rows per iteration. They used to be cross-joined onto
+    /// every row the outer loop wrote; they belong to one iteration of it.
+    #[test]
+    fn test_a_loop_nested_in_a_loop_pairs_its_rows_by_iteration() {
+        let out = compile_and_emit(
+            "FOR n IN {'a', 'b'} UNION (INSERT Person { name := n, posts := (FOR t IN {n} UNION (INSERT Post { title := t })) })",
+        );
+        assert!(
+            out.sql.contains("\"_outer\""),
+            "the nested rows must carry an iteration key, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("CROSS JOIN \"_nested_dml_0\""),
+            "they must not be cross-joined onto every row, got:\n{}",
             out.sql
         );
     }
