@@ -1289,6 +1289,11 @@ pub struct IrCteDef {
     /// Qualified type name of the result set (e.g. `"default::Person"`).
     /// Empty for free expressions.
     pub type_name: String,
+    /// The `_for_<slot>` iterator this binding reads, when it reads one. Such
+    /// a binding holds one value *per iteration*, not one for the statement,
+    /// so it cannot be evaluated once ahead of the loop — it joins the
+    /// iterator and carries its key for consumers to pair on.
+    pub correlated_to: Option<String>,
 }
 
 /// A session global CTE: `WITH "cte_name" AS (SELECT $N::pg_type AS "value")`.

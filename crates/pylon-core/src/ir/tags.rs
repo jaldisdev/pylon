@@ -805,6 +805,7 @@ mod tests {
             name: "c".into(),
             stmt: IrStmt::Select(cte_sel),
             type_name: "default::Company".into(),
+            correlated_to: None,
         });
         out.global_ctes
             .push(IrGlobalCte::Computed(Box::new(IrComputedGlobalCte {

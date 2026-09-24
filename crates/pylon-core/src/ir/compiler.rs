@@ -125,6 +125,7 @@ pub fn compile_with_config(
                 name: sql_name,
                 stmt: ir_stmt,
                 type_name,
+                correlated_to: None,
             });
         }
         let main = c.compile_stmt(&w.stmt)?;
@@ -744,6 +745,7 @@ fn hoist_binding_dml(c: &mut Compiler<'_>, stmt: IrStmt) -> IrStmt {
         name: cte_name,
         type_name: cte_stmt_type(&dml),
         stmt: *dml,
+        correlated_to: None,
     });
     IrStmt::Select(select)
 }
@@ -883,6 +885,7 @@ pub fn compile_fn_body_with(
                 name: alias.name.clone(),
                 stmt: ir_stmt,
                 type_name,
+                correlated_to: None,
             });
         }
         let main = c.compile_stmt(&w.stmt)?;
@@ -1034,6 +1037,7 @@ pub fn compile_trigger_handler(
                 name: sql_name,
                 stmt: ir_stmt,
                 type_name: cte_type_name,
+                correlated_to: None,
             });
         }
         let main = c.compile_stmt(&w.stmt)?;
@@ -1285,6 +1289,11 @@ struct Compiler<'a> {
     /// user binding, a loop's iterator, a hoisted mutation. One set so no two
     /// can claim the same name and no guard has to know about the others.
     cte_namespace: std::collections::HashSet<String>,
+    /// Loop slots whose variable has been read since the last time this was
+    /// cleared — see `for_var_ref`.
+    for_vars_read: std::collections::HashSet<String>,
+    /// The loops whose bodies are being compiled, innermost last.
+    for_scope: Vec<String>,
     /// `(through type, junction alias)` of the multi-link whose own
     /// modifiers are being compiled — what a bare `@prop` in `filter
     /// (@primary = true)` resolves against. `None` on the stack means a link
@@ -1440,6 +1449,8 @@ impl<'a> Compiler<'a> {
             hoisted_binding_sources: HashMap::new(),
             cte_sql_names: HashMap::new(),
             cte_namespace: std::collections::HashSet::new(),
+            for_vars_read: std::collections::HashSet::new(),
+            for_scope: Vec::new(),
             pending_detached: false,
             modifier_anchor: None,
             inline_bindings: std::collections::HashMap::new(),
@@ -1485,6 +1496,25 @@ impl<'a> Compiler<'a> {
             .get(name)
             .cloned()
             .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Compile a `with` binding, reporting the loop slot it reads if it reads
+    /// one. A binding that names the loop variable holds a different value
+    /// each iteration, which is not something a statement-level CTE can be.
+    fn compile_binding_in_scope(&mut self, expr: &Expr) -> Result<(IrStmt, Option<String>), PyQLError> {
+        let before = std::mem::take(&mut self.for_vars_read);
+        let ir_stmt = compile_cte_binding(self, expr);
+        let read = std::mem::replace(&mut self.for_vars_read, before);
+        // The innermost loop read is the one it belongs to; an outer loop's
+        // variable is reachable from there anyway.
+        let correlated_to = self
+            .for_scope
+            .iter()
+            .rev()
+            .find(|slot| read.contains(*slot))
+            .map(|slot| format!("_for_{slot}"));
+        self.for_vars_read.extend(read);
+        Ok((ir_stmt?, correlated_to))
     }
 
     /// Claim a WITH name, suffixing `base` until it is free. Names the SQL
@@ -1699,15 +1729,17 @@ impl<'a> Compiler<'a> {
     }
 
     /// A reference to the loop variable `name`, under the CTE name its loop
-    /// was emitted with.
-    fn for_var_ref(&self, name: &str) -> IrExpr {
-        IrExpr::ForVar {
-            name: self
-                .for_var_slots
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| name.to_string()),
-        }
+    /// was emitted with. Recorded as read, which is what tells a `with`
+    /// binding compiled around it that it belongs to one iteration rather
+    /// than to the statement.
+    fn for_var_ref(&mut self, name: &str) -> IrExpr {
+        let slot = self
+            .for_var_slots
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        self.for_vars_read.insert(slot.clone());
+        IrExpr::ForVar { name: slot }
     }
 
     fn fresh_alias(&mut self) -> String {
@@ -2066,6 +2098,7 @@ impl<'a> Compiler<'a> {
             name: cte_name.clone(),
             stmt: inner,
             type_name,
+            correlated_to: None,
         });
         let mut path_steps = vec![ast::PathStep::Name(cte_name)];
         path_steps.extend(steps);
@@ -3426,6 +3459,7 @@ impl<'a> Compiler<'a> {
                             name: cte_name.clone(),
                             stmt: inner,
                             type_name,
+                            correlated_to: None,
                         });
                         let mut steps = vec![ast::PathStep::Name(cte_name)];
                         steps.extend(fields.into_iter().map(ast::PathStep::Name));
@@ -3464,6 +3498,7 @@ impl<'a> Compiler<'a> {
                         name: cte_name.clone(),
                         stmt: inner,
                         type_name,
+                        correlated_to: None,
                     });
                     let rerooted = ast::SelectStmt {
                         result: Expr::Shape(Box::new(ast::ShapeExpr {
@@ -3518,7 +3553,7 @@ impl<'a> Compiler<'a> {
                     {
                         continue;
                     }
-                    let ir_inner = compile_cte_binding(self, &alias.expr)?;
+                    let (ir_inner, correlated_to) = self.compile_binding_in_scope(&alias.expr)?;
                     let sql_name = self.claim_cte_sql_name(&alias.name);
                     let type_name = self.register_cte(&alias.name, &ir_inner);
                     self.hoisted_binding_sources
@@ -3527,6 +3562,7 @@ impl<'a> Compiler<'a> {
                         name: sql_name,
                         stmt: ir_inner,
                         type_name,
+                        correlated_to,
                     });
                 }
                 self.compile_stmt(&w.stmt)
@@ -6905,7 +6941,10 @@ impl<'a> Compiler<'a> {
             None => self.for_var_types.remove(&f.var),
         };
         let hoisted_before = self.hoisted_ctes.len();
-        let body = self.compile_stmt(&f.body)?;
+        self.for_scope.push(slot.clone());
+        let body = self.compile_stmt(&f.body);
+        self.for_scope.pop();
+        let body = body?;
         let body_ctes: Vec<IrCteDef> = self.hoisted_ctes.split_off(hoisted_before);
         // Restore previous for-var (or remove if none existed).
         match prev {
@@ -8129,6 +8168,7 @@ impl<'a> Compiler<'a> {
                     name: cte_name.clone(),
                     stmt: inner,
                     type_name,
+                    correlated_to: None,
                 });
                 let mut steps = vec![ast::PathStep::Name(cte_name)];
                 steps.extend(fields.into_iter().map(ast::PathStep::Name));
@@ -10730,7 +10770,7 @@ impl<'a> Compiler<'a> {
                     }
                     None => {}
                 }
-                let ir_stmt = compile_cte_binding(self, &alias.expr)?;
+                let (ir_stmt, correlated_to) = self.compile_binding_in_scope(&alias.expr)?;
                 let sql_name = self.claim_cte_sql_name(&alias.name);
                 let type_name = self.register_cte(&alias.name, &ir_stmt);
                 self.hoisted_binding_sources
@@ -10739,6 +10779,7 @@ impl<'a> Compiler<'a> {
                     name: sql_name,
                     stmt: ir_stmt,
                     type_name,
+                    correlated_to,
                 });
             }
             let inner = (*w.stmt).clone();
@@ -10819,6 +10860,7 @@ impl<'a> Compiler<'a> {
                 name: cte_name.clone(),
                 stmt: inner,
                 type_name,
+                correlated_to: None,
             });
             let mut steps = vec![ast::PathStep::Name(cte_name)];
             steps.extend(extra_fields.iter().cloned().map(ast::PathStep::Name));
@@ -13327,7 +13369,7 @@ impl<'a> Compiler<'a> {
     /// unnoticed. A bare one-step name can only be a variable, CTE binding or
     /// parameter in either context (a property is always written `.name`), so
     /// there is nothing here for a parameter to shadow.
-    fn resolve_name_ref(&self, name: &str, allow_fn_param: bool) -> Option<IrExpr> {
+    fn resolve_name_ref(&mut self, name: &str, allow_fn_param: bool) -> Option<IrExpr> {
         if self.for_vars.contains_key(name) {
             return Some(self.for_var_ref(name));
         }
@@ -15226,12 +15268,22 @@ impl<'a> Compiler<'a> {
     /// to attach to — the select that names it *is* the top level.
     fn hoist_dml_as_cte(&mut self, stmt: &Stmt) -> Result<(String, String), PyQLError> {
         let type_name = self.dml_subject_type(stmt)?;
-        let inner = self.compile_stmt(stmt)?;
+        let before = std::mem::take(&mut self.for_vars_read);
+        let inner = self.compile_stmt(stmt);
+        let read = std::mem::replace(&mut self.for_vars_read, before);
+        let correlated_to = self
+            .for_scope
+            .iter()
+            .rev()
+            .find(|slot| read.contains(*slot))
+            .map(|slot| format!("_for_{slot}"));
+        self.for_vars_read.extend(read);
         let cte_name = self.fresh_nested_cte_name();
         self.hoisted_ctes.push(IrCteDef {
             name: cte_name.clone(),
-            stmt: inner,
+            stmt: inner?,
             type_name: type_name.clone(),
+            correlated_to,
         });
         Ok((cte_name, type_name))
     }
@@ -15244,6 +15296,7 @@ impl<'a> Compiler<'a> {
             name: cte_name.clone(),
             stmt: inner,
             type_name,
+            correlated_to: None,
         });
         Ok(cte_name)
     }
