@@ -162,7 +162,7 @@ async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
         .unwrap();
     assert_eq!(rows1.len(), 1);
     assert_eq!(
-        as_i64(field(&rows1[0], 1)),
+        as_i64(field(&rows1[0], 2)),
         1,
         "tx1 should have claimed the lowest-priority pending job"
     );
@@ -178,7 +178,7 @@ async fn skip_locked_lets_a_second_transaction_claim_a_different_row() {
         .unwrap();
     assert_eq!(rows2.len(), 1);
     assert_eq!(
-        as_i64(field(&rows2[0], 1)),
+        as_i64(field(&rows2[0], 2)),
         2,
         "tx2 must skip tx1's locked row and claim the other one"
     );

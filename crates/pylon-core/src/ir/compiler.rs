@@ -1370,6 +1370,13 @@ struct Compiler<'a> {
     /// User-configurable session options — see `SessionConfig`. Always
     /// `default()` for every entry point except `compile_with_config`.
     config: crate::ir::SessionConfig,
+    /// Whether a shape compiled right now gets an `id` it did not ask for —
+    /// see `prepend_implicit_id`. True at the top level and cleared, conventional,
+    /// for the two places the upstream engine clears it: a mutation's own body, where a link
+    /// value compiles to a one-column correlated subquery that a second column
+    /// would break, and under a cast to `json`, which is an output sink whose
+    /// text an added key would change.
+    implicit_id_in_shapes: bool,
 }
 
 /// One schema-bound select in the enclosing chain — see `Compiler::anchors`.
@@ -1444,6 +1451,7 @@ impl<'a> Compiler<'a> {
             warnings: vec![],
             explicit_set_depth: 0,
             config,
+            implicit_id_in_shapes: true,
             anchors: Vec::new(),
             link_prop_scope: Vec::new(),
             hoisted_ctes: Vec::new(),
@@ -3309,6 +3317,7 @@ impl<'a> Compiler<'a> {
                             right: vetted,
                         }));
                         let shape = vec![IrShapePointer::Scalar(IrScalarPointer {
+                            implicit_id: false,
                             marker_offset: None,
                             alias: "id".to_string(),
                             column: pk.0,
@@ -5401,6 +5410,7 @@ impl<'a> Compiler<'a> {
                 alias: jt_alias,
             },
             vec![IrShapePointer::Scalar(IrScalarPointer {
+                implicit_id: false,
                 marker_offset: None,
                 alias: "target".to_string(),
                 column: jt_tgt_col,
@@ -5560,6 +5570,7 @@ impl<'a> Compiler<'a> {
             // An empty shape would emit the `SELECT 1` an EXISTS wants, which
             // says nothing about which rows the value stands for.
             vec![IrShapePointer::Scalar(IrScalarPointer {
+                implicit_id: false,
                 marker_offset: None,
                 alias: "id".to_string(),
                 column: "id".to_string(),
@@ -7290,7 +7301,10 @@ impl<'a> Compiler<'a> {
         }
         let alias = grp.source.alias.clone();
         let module = td.module.clone();
-        let pointers = self.compile_shape(&rewritten, td, &alias, &module)?;
+        // `td` is here so `.key`/`.elements` resolve, but the row this
+        // projects is the group's, not one of `td`'s: an `id` added to it
+        // reads a column no GROUP BY covers.
+        let pointers = self.without_implicit_id(|this| this.compile_shape(&rewritten, td, &alias, &module))?;
         let order_by = sel
             .order_by
             .iter()
@@ -8048,6 +8062,19 @@ impl<'a> Compiler<'a> {
         alias: &str,
         deny_readonly: bool,
     ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
+        // A value assigned in a mutation body is not output, and a link value
+        // among them compiles to a one-column correlated subquery — an implicit
+        // `id` beside the column it selects would make that subquery illegal.
+        self.without_implicit_id(|this| this.compile_assignments_rows(elements, td, alias, deny_readonly))
+    }
+
+    fn compile_assignments_rows(
+        &mut self,
+        elements: &[ShapeElement],
+        td: &TypeDescriptor,
+        alias: &str,
+        deny_readonly: bool,
+    ) -> Result<Vec<(String, IrExpr)>, PyQLError> {
         elements
             .iter()
             .map(|el| {
@@ -8702,6 +8729,19 @@ impl<'a> Compiler<'a> {
         alias: &str,
         through_td: Option<&'a TypeDescriptor>,
     ) -> Result<IrMultiLinkValues, PyQLError> {
+        // Same reason as `compile_assignments_inner`: these rows are the
+        // junction's target ids, not output, and each value is read as one
+        // column.
+        self.without_implicit_id(|this| this.compile_multilink_values_inner(expr, td, alias, through_td))
+    }
+
+    fn compile_multilink_values_inner(
+        &mut self,
+        expr: &Expr,
+        td: &'a TypeDescriptor,
+        alias: &str,
+        through_td: Option<&'a TypeDescriptor>,
+    ) -> Result<IrMultiLinkValues, PyQLError> {
         // `a union b` — combine both sides; each keeps its own link_props
         // (different targets in one `+=` can carry different property values).
         if let Expr::Union(a, b) = expr {
@@ -9114,7 +9154,50 @@ impl<'a> Compiler<'a> {
                 pointers.push(self.compile_shape_element(el, td, alias, module)?);
             }
         }
+        self.prepend_implicit_id(&mut pointers, td);
         Ok(pointers)
+    }
+
+    /// Put `id` at the front of a shape that did not select one, as the upstream engine's
+    /// `_get_shape_configuration_inner` does for every binary-protocol query
+    /// (`the upstream Python client` asks for it unconditionally, so every query jaldis ever
+    /// ran against the upstream engine had it). Without it, `o.id` on a shape like
+    /// `options: { value }` reads as unset rather than as the row's id.
+    ///
+    /// Skipped wherever the upstream engine skips it: inside a mutation's own body and under
+    /// a cast to `json` — see `implicit_id_in_shapes`. A shape that names `id`
+    /// itself keeps its own pointer, and its position, untouched.
+    fn prepend_implicit_id(&self, pointers: &mut Vec<IrShapePointer>, td: &TypeDescriptor) {
+        if !self.implicit_id_in_shapes {
+            return;
+        }
+        let Some(pk) = td.properties.iter().find(|p| p.is_pk) else {
+            return;
+        };
+        if pointers.iter().any(|p| p.alias() == pk.name) {
+            return;
+        }
+        pointers.insert(
+            0,
+            IrShapePointer::Scalar(IrScalarPointer {
+                implicit_id: true,
+                marker_offset: None,
+                alias: pk.name.clone(),
+                column: pk.name.clone(),
+                pg_type: pk.pg_type.clone(),
+                tuple_shape: None,
+            }),
+        );
+    }
+
+    /// Run `body` with implicit ids suppressed, restoring the previous setting
+    /// however it ends — the upstream engine spells this `with ctx.new(): bodyctx
+    /// .implicit_id_in_shapes = False` around the same constructs.
+    fn without_implicit_id<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T, PyQLError>) -> Result<T, PyQLError> {
+        let saved = std::mem::replace(&mut self.implicit_id_in_shapes, false);
+        let result = body(self);
+        self.implicit_id_in_shapes = saved;
+        result
     }
 
     /// Expand `*` → all scalars; `**` → all scalars + all single links with implicit `{ id }`.
@@ -9130,6 +9213,7 @@ impl<'a> Compiler<'a> {
             .iter()
             .map(|p| {
                 IrShapePointer::Scalar(IrScalarPointer {
+                    implicit_id: false,
                     marker_offset: None,
                     alias: p.name.clone(),
                     column: p.name.clone(),
@@ -9374,6 +9458,7 @@ impl<'a> Compiler<'a> {
                     alias: sub_alias,
                 },
                 vec![IrShapePointer::Scalar(IrScalarPointer {
+                    implicit_id: false,
                     marker_offset: None,
                     alias: prop.name.clone(),
                     column: prop.name.clone(),
@@ -9617,6 +9702,7 @@ impl<'a> Compiler<'a> {
                 alias: sub_alias,
             },
             vec![IrShapePointer::Scalar(IrScalarPointer {
+                implicit_id: false,
                 marker_offset: None,
                 alias: prop_name.clone(),
                 column: prop_name,
@@ -9813,6 +9899,7 @@ impl<'a> Compiler<'a> {
         // Scalar property
         if let Some(p) = Self::resolve_property(td, pointer_name) {
             return Ok(IrShapePointer::Scalar(IrScalarPointer {
+                implicit_id: false,
                 marker_offset: el.marker_offset,
                 alias: pointer_name.to_string(),
                 column: p.name.clone(),
@@ -11059,6 +11146,7 @@ impl<'a> Compiler<'a> {
             // quietly become `SELECT 1` instead of a key.
             let pk = root_td.properties.iter().find(|p| p.is_pk);
             let shape = vec![IrShapePointer::Scalar(IrScalarPointer {
+                implicit_id: false,
                 marker_offset: None,
                 alias: "id".to_string(),
                 column: pk.map(|p| p.name.clone()).unwrap_or_else(|| "id".to_string()),
@@ -11755,7 +11843,14 @@ impl<'a> Compiler<'a> {
                         return self.compile_expr_ctx(&tc.expr, ctx);
                     }
                 }
-                let inner = self.compile_expr_ctx(&tc.expr, ctx)?;
+                // A cast to `json` is an output sink: the text it produces is
+                // the value, so an `id` nobody asked for would show up in it.
+                // The upstream engine clears the same flag here (`compiler/expr.py`).
+                let inner = if casts_to_json(&tc.ty) {
+                    self.without_implicit_id(|this| this.compile_expr_ctx(&tc.expr, ctx))?
+                } else {
+                    self.compile_expr_ctx(&tc.expr, ctx)?
+                };
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
 
                 // PostgreSQL has no native jsonb -> {uuid, date/time family,
@@ -13991,6 +14086,7 @@ impl<'a> Compiler<'a> {
                         alias: ft_alias.clone(),
                     },
                     vec![IrShapePointer::Scalar(IrScalarPointer {
+                        implicit_id: false,
                         marker_offset: None,
                         alias: prop.name.clone(),
                         column: prop.name.clone(),
@@ -17070,6 +17166,7 @@ impl<'a> Compiler<'a> {
             .filter(|p| p.is_pk)
             .map(|p| {
                 IrShapePointer::Scalar(IrScalarPointer {
+                    implicit_id: false,
                     marker_offset: None,
                     alias: p.name.clone(),
                     column: p.name.clone(),
@@ -17082,6 +17179,12 @@ impl<'a> Compiler<'a> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
+
+/// True for `<json>` / `<std::json>` — the one cast target that turns its
+/// operand into output text rather than another value.
+fn casts_to_json(ty: &ast::TypeExpr) -> bool {
+    matches!(ty.as_named(), Some((module, "json")) if module.is_none_or(|m| m == "std"))
+}
 
 /// True if any node in a multilink value tree (including both sides of any
 /// nested `union`) carries a `@prop := value` link-property assignment.

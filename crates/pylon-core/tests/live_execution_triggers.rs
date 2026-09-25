@@ -140,7 +140,7 @@ async fn insert_writes_to_another_type() {
         1,
         "trigger should have written exactly one Log row, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("gadget".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("gadget".to_string()));
 }
 
 #[tokio::test]
@@ -186,7 +186,7 @@ async fn delete_reads_old_row() {
         1,
         "trigger should have captured the pre-delete name, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("doomed".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("doomed".to_string()));
 }
 
 #[tokio::test]
@@ -232,8 +232,8 @@ async fn update_reads_both_old_and_new() {
         1,
         "trigger should have captured both old and new names, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("before".to_string()));
-    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("after".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("before".to_string()));
+    assert_eq!(field(&rows[0], 3), &DecodedValue::Str("after".to_string()));
 }
 
 #[tokio::test]
@@ -368,7 +368,7 @@ async fn trigger_updates_a_linked_row_of_another_type() {
     let rows = rows_of(&pool, &schema, &format!("select {module}::Purchase {{ total }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::I64(99),
         "trigger should have updated the linked Purchase's total"
     );

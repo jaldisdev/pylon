@@ -129,7 +129,7 @@ async fn insert_rewrite_overrides_assigned_value() {
     let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::Str("inserted".to_string()),
         "insert rewrite should override the assigned value"
     );
@@ -158,7 +158,7 @@ async fn update_rewrite_overrides_assigned_value() {
     .await;
     // Insert rewrite is not declared, so the insert itself is unaffected.
     let after_insert = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
-    assert_eq!(field(&after_insert[0], 1), &DecodedValue::Str("Whiplash".to_string()));
+    assert_eq!(field(&after_insert[0], 2), &DecodedValue::Str("Whiplash".to_string()));
 
     exec(
         &pool,
@@ -168,7 +168,7 @@ async fn update_rewrite_overrides_assigned_value() {
     .await;
     let after_update = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
     assert_eq!(
-        field(&after_update[0], 1),
+        field(&after_update[0], 2),
         &DecodedValue::Str("updated".to_string()),
         "update rewrite should override the assigned value"
     );
@@ -209,11 +209,11 @@ async fn insert_rewrite_applies_to_defaulted_value() {
     .await;
     assert_eq!(rows.len(), 2);
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::Str("untitled (new)".to_string()),
         "rewrite should still apply to the defaulted value"
     );
-    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Whiplash (new)".to_string()));
+    assert_eq!(field(&rows[1], 2), &DecodedValue::Str("Whiplash (new)".to_string()));
 }
 
 #[tokio::test]
@@ -254,9 +254,9 @@ async fn update_rewrite_references_sibling_property() {
 
     let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name, shout }}")).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("loud".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("loud".to_string()));
     assert_eq!(
-        field(&rows[0], 2),
+        field(&rows[0], 3),
         &DecodedValue::Str("LOUD".to_string()),
         "update rewrite should fire and see the sibling property's new value even though shout wasn't itself assigned"
     );
@@ -295,7 +295,7 @@ async fn insert_only_rewrite_does_not_fire_on_update() {
     let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ name }}")).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::Str("my-real-name".to_string()),
         "an insert-only rewrite must not fire on update"
     );
@@ -326,9 +326,9 @@ async fn multiple_rewrites_on_different_properties_do_not_interfere() {
 
     let rows = rows_of(&pool, &schema, &format!("select {module}::Widget {{ a, b }}")).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("A".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("A".to_string()));
     assert_eq!(
-        field(&rows[0], 2),
+        field(&rows[0], 3),
         &DecodedValue::Str("B".to_string()),
         "two independent rewrites on the same insert must not interfere with each other"
     );
@@ -369,7 +369,7 @@ async fn trigger_observes_rewritten_value_not_original() {
     let log_rows = rows_of(&pool, &schema, &format!("select {module}::Log {{ new_name }}")).await;
     assert_eq!(log_rows.len(), 1);
     assert_eq!(
-        field(&log_rows[0], 1),
+        field(&log_rows[0], 2),
         &DecodedValue::Str("rewritten".to_string()),
         "trigger should observe the rewritten value, not the originally-assigned one"
     );

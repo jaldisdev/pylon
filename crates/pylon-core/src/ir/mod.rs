@@ -492,6 +492,18 @@ pub struct IrAssertedPointer {
 }
 
 impl IrShapePointer {
+    /// The output key this pointer contributes to its object.
+    pub fn alias(&self) -> &str {
+        match self {
+            IrShapePointer::Scalar(p) => &p.alias,
+            IrShapePointer::SingleLink(p) => &p.alias,
+            IrShapePointer::MultiLink(p) => &p.alias,
+            IrShapePointer::Computed(p) => &p.alias,
+            IrShapePointer::ScalarSet(p) => &p.alias,
+            IrShapePointer::Asserted(p) => p.inner.alias(),
+        }
+    }
+
     /// True when the pointer stands for a set of objects — the only thing a
     /// cardinality assert can wrap. A scalar pointer's assert is an ordinary
     /// function call and belongs on the expression path.
@@ -534,6 +546,11 @@ pub struct IrScalarPointer {
     /// marker placement — see `analyze.rs`); `None` for a pointer synthesized
     /// by the compiler itself (splat expansion, implicit `{ id }`, etc.).
     pub marker_offset: Option<usize>,
+    /// True only for the `id` the compiler injects into a shape that did not
+    /// ask for one — see `Compiler::implicit_id_in_shapes`. The value decodes
+    /// like any other property; the flag exists so JSON output can leave it
+    /// out, which is where the upstream engine's own implicit id is absent too.
+    pub implicit_id: bool,
 }
 
 /// A single-valued link included in the output shape. Emitted as a
@@ -1631,8 +1648,10 @@ mod tests {
         let (source, shape) = bound(&sel);
         assert_eq!(source.table, "person");
         assert_eq!(source.type_name, "default::Person");
-        assert_eq!(shape.len(), 2);
-        assert!(matches!(shape[0], IrShapePointer::Scalar(_)));
+        // `id` the query never asked for, then `name` and `age`.
+        assert_eq!(shape.len(), 3);
+        assert!(matches!(&shape[0], IrShapePointer::Scalar(p) if p.alias == "id" && p.implicit_id));
+        assert!(matches!(shape[1], IrShapePointer::Scalar(_)));
     }
 
     #[test]
@@ -1648,8 +1667,8 @@ mod tests {
         let ir = compile("SELECT Person { name, company { name } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         let (_, shape) = bound(&sel);
-        assert_eq!(shape.len(), 2);
-        let IrShapePointer::SingleLink(link) = &shape[1] else {
+        assert_eq!(shape.len(), 3);
+        let IrShapePointer::SingleLink(link) = &shape[2] else {
             panic!("expected SingleLink")
         };
         assert_eq!(link.alias, "company");
@@ -1665,7 +1684,7 @@ mod tests {
         let ir = compile("SELECT Person { name, posts { title } }");
         let IrStmt::Select(sel) = ir.stmt else { panic!() };
         let (_, shape) = bound(&sel);
-        let IrShapePointer::MultiLink(ml) = &shape[1] else {
+        let IrShapePointer::MultiLink(ml) = &shape[2] else {
             panic!("expected MultiLink")
         };
         assert_eq!(ml.alias, "posts");

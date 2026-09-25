@@ -38,6 +38,7 @@ on, passing the test while testing nothing.
 
 import enum as _enum
 import sys
+import uuid as _uuid
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,16 @@ def _rowset(rows: list):
 _cache_ready = False
 
 
+def _id(n: int) -> _uuid.UUID:
+    """A stable id for position 1 of a schema-object row.
+
+    Every object shape now carries an `id` the query never named — the upstream engine does
+    the same — so a hand-written row has to supply one right after the type
+    discriminator.
+    """
+    return _uuid.UUID(int=n)
+
+
 def assert_parity(rows: list, compiled):
     """Run both implementations over the same rows and compare.
 
@@ -207,53 +218,53 @@ def assert_parity(rows: list, compiled):
 class TestObjects:
     def test_a_plain_object_row(self):
         compiled = _compile('select m::Tag { label }')
-        native = assert_parity([('m::Tag', 'red'), ('m::Tag', 'blue')], compiled)
+        native = assert_parity([('m::Tag', _id(1), 'red'), ('m::Tag', _id(2), 'blue')], compiled)
         assert native[0].label == 'red'
         assert native[0].__pylon_type__ == 'm::Tag'
 
     def test_a_nested_object(self):
         compiled = _compile('select m::Post { title, author: { name } }')
-        assert_parity([('m::Post', 'Hello', ('m::Author', 'Ada'))], compiled)
+        assert_parity([('m::Post', _id(1), 'Hello', ('m::Author', _id(2), 'Ada'))], compiled)
 
     def test_a_null_nested_object(self):
         compiled = _compile('select m::Post { title, author: { name } }')
-        assert_parity([('m::Post', 'Hello', None)], compiled)
+        assert_parity([('m::Post', _id(1), 'Hello', None)], compiled)
 
     def test_saved_shadow_copy_matches(self):
         compiled = _compile('select m::Tag { label }')
-        native = assert_parity([('m::Tag', 'red')], compiled)
-        assert native[0].__dict__['__pylon_saved__'] == {'label': 'red'}
+        native = assert_parity([('m::Tag', _id(1), 'red')], compiled)
+        assert native[0].__dict__['__pylon_saved__'] == {'id': _id(1), 'label': 'red'}
 
     def test_an_explicitly_requested_type_discriminator_is_kept(self):
         """The auto-injected `__type__` at position 0 is skipped, but one the
         user asked for sits at a later position and must survive."""
         compiled = _compile('select m::Tag { __type__, label }')
-        native = assert_parity([('m::Tag', 'm::Tag', 'red')], compiled)
+        native = assert_parity([('m::Tag', _id(1), 'm::Tag', 'red')], compiled)
         assert native[0].__dict__['__type__'] == 'm::Tag'
 
 
 class TestMultiLinks:
     def test_a_requested_multilink_is_hydrated(self):
         compiled = _compile('select m::Post { title, tags: { label } }')
-        rows = [('m::Post', 'Hello', [('m::Tag', 'red'), ('m::Tag', 'blue')])]
+        rows = [('m::Post', _id(1), 'Hello', [('m::Tag', _id(2), 'red'), ('m::Tag', _id(3), 'blue')])]
         native = assert_parity(rows, compiled)
         assert native[0].tags.is_hydrated
         assert [t.label for t in native[0].tags] == ['red', 'blue']
 
     def test_an_unrequested_multilink_gets_an_unhydrated_placeholder(self):
         compiled = _compile('select m::Post { title }')
-        native = assert_parity([('m::Post', 'Hello')], compiled)
+        native = assert_parity([('m::Post', _id(1), 'Hello')], compiled)
         assert isinstance(native[0].tags, LinkSet)
         assert not native[0].tags.is_hydrated
 
     def test_multilinks_are_excluded_from_the_saved_copy(self):
         compiled = _compile('select m::Post { title, tags: { label } }')
-        native = assert_parity([('m::Post', 'Hi', [('m::Tag', 'red')])], compiled)
+        native = assert_parity([('m::Post', _id(1), 'Hi', [('m::Tag', _id(2), 'red')])], compiled)
         assert 'tags' not in native[0].__dict__['__pylon_saved__']
 
     def test_an_empty_multilink(self):
         compiled = _compile('select m::Post { title, tags: { label } }')
-        native = assert_parity([('m::Post', 'Hello', None)], compiled)
+        native = assert_parity([('m::Post', _id(1), 'Hello', None)], compiled)
         assert native[0].tags.is_hydrated
         assert len(native[0].tags) == 0
 
@@ -261,21 +272,21 @@ class TestMultiLinks:
 class TestEnums:
     def test_an_enum_property(self):
         compiled = _compile('select m::Post { shade }')
-        native = assert_parity([('m::Post', 'RED')], compiled)
+        native = assert_parity([('m::Post', _id(1), 'RED')], compiled)
         assert native[0].shade is Colour.RED
 
     def test_a_null_enum(self):
         compiled = _compile('select m::Post { shade }')
-        assert_parity([('m::Post', None)], compiled)
+        assert_parity([('m::Post', _id(1), None)], compiled)
 
     def test_an_enum_array_property(self):
         compiled = _compile('select m::Post { palette }')
-        native = assert_parity([('m::Post', ['RED', 'BLUE'])], compiled)
+        native = assert_parity([('m::Post', _id(1), ['RED', 'BLUE'])], compiled)
         assert list(native[0].palette) == [Colour.RED, Colour.BLUE]
 
     def test_an_unset_enum_array_property(self):
         compiled = _compile('select m::Post { palette }')
-        native = assert_parity([('m::Post', None)], compiled)
+        native = assert_parity([('m::Post', _id(1), None)], compiled)
         assert native[0].palette is None
 
 
@@ -293,7 +304,7 @@ class TestFreeObjectsAndScalars:
         neighbours' values."""
 
         compiled = _compile('with a := (select m::Author limit 1) select (a { name }, 1)')
-        native = assert_parity([(('m::Author', 'Alice'), 1)], compiled)
+        native = assert_parity([(('m::Author', _id(1), 'Alice'), 1)], compiled)
         author, number = native[0]
         assert (author.name, number) == ('Alice', 1)
 
@@ -303,7 +314,7 @@ class TestFreeObjectsAndScalars:
         a named tuple gives, not as a plain tuple."""
 
         compiled = _compile('with a := (select m::Author limit 1) select (who := a { name }, n := 1)')
-        native = assert_parity([(('m::Author', 'Alice'), 1)], compiled)
+        native = assert_parity([(('m::Author', _id(1), 'Alice'), 1)], compiled)
         assert isinstance(native[0], NamedTupleValue)
         assert (native[0].who.name, native[0].n) == ('Alice', 1)
 
@@ -336,7 +347,7 @@ class TestRegistryMemo:
 
         assert hydration_registry() is not built
         compiled = _compile('select m::Latecomer { note }')
-        native = assert_parity([('m::Latecomer', 'x')], compiled)
+        native = assert_parity([('m::Latecomer', _id(1), 'x')], compiled)
         assert type(native[0]).__name__ == 'Latecomer'
 
     def test_clearing_the_registry_invalidates_the_memo(self):

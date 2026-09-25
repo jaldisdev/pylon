@@ -148,7 +148,7 @@ async fn for_loop_bulk_inserts_one_row_per_iterator_value() {
     )
     .await;
     assert_eq!(rows.len(), 3, "expected one row per iterator value, got {rows:?}");
-    let names: Vec<&str> = rows.iter().map(|r| as_str(field(r, 1))).collect();
+    let names: Vec<&str> = rows.iter().map(|r| as_str(field(r, 2))).collect();
     assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
 }
 
@@ -172,7 +172,7 @@ async fn for_loop_variable_composes_inside_insert_body_expression() {
     .await;
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }} order by .age")).await;
-    let ages: Vec<i64> = rows.iter().map(|r| as_i64(field(r, 1))).collect();
+    let ages: Vec<i64> = rows.iter().map(|r| as_i64(field(r, 2))).collect();
     assert_eq!(ages, vec![10, 20, 30]);
 }
 
@@ -212,7 +212,7 @@ async fn for_loop_select_body_cross_joins_lateral_per_iterator_value() {
         &format!("for age in {{30, 65}} union (select {module}::Person {{ name }} filter .age = age)"),
     )
     .await;
-    let names: HashSet<&str> = rows.iter().map(|r| as_str(field(r, 1))).collect();
+    let names: HashSet<&str> = rows.iter().map(|r| as_str(field(r, 2))).collect();
     assert_eq!(names, HashSet::from(["Alice", "Bob"]), "got {rows:?}");
 }
 
@@ -279,8 +279,8 @@ async fn for_loop_appends_only_the_row_it_is_iterating() {
     let friend_counts: Vec<(String, usize)> = rows
         .iter()
         .map(|row| {
-            let name = as_str(field(row, 1)).to_string();
-            let friends = match field(row, 2) {
+            let name = as_str(field(row, 2)).to_string();
+            let friends = match field(row, 3) {
                 DecodedValue::Array(items) => items.len(),
                 DecodedValue::Null => 0,
                 other => panic!("expected an array of friends, got {other:?}"),
@@ -354,7 +354,7 @@ async fn nested_for_loops_insert_once_per_pair() {
         &format!("select {module}::Post {{ title }} order by .title"),
     )
     .await;
-    let titles: Vec<&str> = rows.iter().map(|row| as_str(field(row, 1))).collect();
+    let titles: Vec<&str> = rows.iter().map(|row| as_str(field(row, 2))).collect();
     assert_eq!(
         titles,
         vec!["ana->bo", "ana->cy", "di->cy"],
@@ -436,7 +436,7 @@ async fn updating_the_loop_variable_touches_only_the_iterated_rows() {
         &format!("select {module}::Person {{ name }} order by .name"),
     )
     .await;
-    let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 1)).to_string()).collect();
+    let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 2)).to_string()).collect();
     assert_eq!(
         names,
         vec!["Bo".to_string(), "Cy".to_string(), "TOUCHED".to_string()],
@@ -488,14 +488,14 @@ async fn a_nested_insert_in_a_for_body_pairs_with_its_own_iteration() {
     .await;
     assert_eq!(rows.len(), 2, "both people should come back, got {rows:?}");
     for row in &rows {
-        let name = as_str(field(row, 1)).to_string();
-        let notes = match field(row, 2) {
+        let name = as_str(field(row, 2)).to_string();
+        let notes = match field(row, 3) {
             pylon_value::DecodedValue::Array(items) => items.clone(),
             other => panic!("expected an array of notes, got {other:?}"),
         };
         assert_eq!(notes.len(), 1, "{name} should have exactly one note, got {notes:?}");
         assert_eq!(
-            as_str(field(&notes[0], 1)),
+            as_str(field(&notes[0], 2)),
             name,
             "each note should belong to the person whose name it carries"
         );

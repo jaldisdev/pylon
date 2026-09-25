@@ -265,8 +265,8 @@ async fn trigger_notify_on_type_channel_delivers_the_new_rows_id() {
     // Field 0 is always the implicit `id` column every shape carries;
     // `id_text` (the one explicit computed field) lands at index 1 —
     // matching this suite's own convention (see live_execution_triggers.rs's
-    // `field(&rows[0], 1)` for its own single-field shapes).
-    let inserted_id_text = field(&ids[0], 1);
+    // `field(&rows[0], 2)` for its own single-field shapes).
+    let inserted_id_text = field(&ids[0], 2);
     let pylon_value::DecodedValue::Str(inserted_id_text) = inserted_id_text else {
         panic!("expected str, got {inserted_id_text:?}")
     };

@@ -512,6 +512,7 @@ mod tests {
         Value::Object(Object {
             type_name: Some("test::Row".to_string()),
             fields: fields.into_iter().map(|(n, v)| (n.to_string(), v)).collect(),
+            implicit_id: false,
         })
     }
 
@@ -670,6 +671,7 @@ mod tests {
             Value::Object(Object {
                 type_name: None,
                 fields: vec![("email".to_string(), Value::Str("a@b.test".into()))],
+                implicit_id: false,
             }),
         )]))
         .unwrap();

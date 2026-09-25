@@ -73,7 +73,7 @@ fn write(value: &Value, out: &mut String) {
             out.push_str(&format!(r#", "inc_upper": {}}}"#, range.inc_upper));
         }
         Value::Array(items) | Value::Tuple(items) => write_list(items.iter(), out),
-        Value::Object(object) => write_fields(object.fields(), out),
+        Value::Object(object) => write_fields(object.json_fields(), out),
         Value::Enum { value, .. } => write_str(value, out),
         Value::Group(group) => {
             out.push_str(r#"{"key": "#);

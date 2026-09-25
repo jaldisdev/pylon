@@ -172,7 +172,7 @@ async fn session_global_of_uuid_type_filters_correctly() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -280,5 +280,5 @@ async fn computed_global_reads_a_session_global_it_references() {
         1,
         "computed global should resolve to exactly the referenced Person, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Ada".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Ada".to_string()));
 }

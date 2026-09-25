@@ -174,10 +174,10 @@ async fn grant_roles(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, type_nam
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected a Composite-shaped row, got {:?}", rows[0])
     };
-    let DecodedValue::Array(grants) = &shape[2] else {
-        panic!("expected an Array for access_grants, got {:?}", shape[2])
+    let DecodedValue::Array(grants) = &shape[3] else {
+        panic!("expected an Array for access_grants, got {:?}", shape[3])
     };
-    grants.iter().map(|g| as_str(field(g, 1)).to_string()).collect()
+    grants.iter().map(|g| as_str(field(g, 2)).to_string()).collect()
 }
 
 #[tokio::test]
@@ -238,7 +238,7 @@ async fn all_grant_roles(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, modu
         &format!("select {module}::AccessGrant {{ role }} order by .role"),
     )
     .await;
-    rows.iter().map(|r| as_str(field(r, 1)).to_string()).collect()
+    rows.iter().map(|r| as_str(field(r, 2)).to_string()).collect()
 }
 
 #[tokio::test]
@@ -287,7 +287,7 @@ async fn a_with_bound_guarded_insert_runs_its_insert() {
 
     let rows = rows_of(&pool, &sd, &guarded("Test Brand")).await;
     assert_eq!(rows.len(), 1, "the guarded insert should yield its one new row");
-    assert_eq!(as_str(field(&rows[0], 1)), "User");
+    assert_eq!(as_str(field(&rows[0], 2)), "User");
     assert_eq!(
         all_grant_roles(&pool, &sd, &module).await,
         vec!["Unrelated".to_string(), "User".to_string()]
@@ -423,8 +423,8 @@ async fn update_with_filter_modifies_only_matching_rows() {
         &format!("select {module}::Person {{ name, age }} order by .name"),
     )
     .await;
-    assert_eq!(as_i64(field(&rows[0], 2)), 99, "Alice should be updated");
-    assert_eq!(as_i64(field(&rows[1], 2)), 40, "Bob must be untouched");
+    assert_eq!(as_i64(field(&rows[0], 3)), 99, "Alice should be updated");
+    assert_eq!(as_i64(field(&rows[1], 3)), 40, "Bob must be untouched");
 }
 
 #[tokio::test]
@@ -451,7 +451,7 @@ async fn update_self_referential_expression_reads_the_existing_row_value() {
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }}")).await;
     assert_eq!(
-        as_i64(field(&rows[0], 1)),
+        as_i64(field(&rows[0], 2)),
         31,
         "age must be read-then-incremented, not overwritten blind"
     );
@@ -493,9 +493,9 @@ async fn update_replaces_a_single_link() {
     let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
     assert_eq!(rows.len(), 1);
     // Post's shape: [type-tag, author]; author link's own row: [type-tag, name].
-    let author = field(&rows[0], 1);
+    let author = field(&rows[0], 2);
     assert_eq!(
-        as_str(field(author, 1)),
+        as_str(field(author, 2)),
         "Bob",
         "the link should now point at Bob, got {rows:?}"
     );
@@ -551,9 +551,9 @@ async fn update_replaces_a_single_link_with_a_nested_insert() {
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
     assert_eq!(rows.len(), 1);
-    let author = field(&rows[0], 1);
+    let author = field(&rows[0], 2);
     assert_eq!(
-        as_str(field(author, 1)),
+        as_str(field(author, 2)),
         "Bob",
         "the link should now point at the newly-inserted Bob, got {rows:?}"
     );
@@ -606,7 +606,7 @@ async fn update_returns_the_ids_of_the_rows_it_touched() {
     let ages: HashSet<i64> = rows_of(&pool, &sd, &format!("select {module}::Person {{ age }}"))
         .await
         .iter()
-        .map(|r| as_i64(field(r, 1)))
+        .map(|r| as_i64(field(r, 2)))
         .collect();
     assert_eq!(ages, HashSet::from([31, 40]));
 }
@@ -636,12 +636,12 @@ async fn an_upsert_runs_exactly_one_of_its_two_branches() {
         1,
         "the first run should insert exactly one row, got {rows:?}"
     );
-    assert_eq!(as_i64(field(&rows[0], 2)), 30, "the update branch must not have run");
+    assert_eq!(as_i64(field(&rows[0], 3)), 30, "the update branch must not have run");
 
     exec(&pool, &sd, &upsert).await;
     let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name, age }}")).await;
     assert_eq!(rows.len(), 1, "the second run must not insert again, got {rows:?}");
-    assert_eq!(as_i64(field(&rows[0], 2)), 31, "the update branch should have run");
+    assert_eq!(as_i64(field(&rows[0], 3)), 31, "the update branch should have run");
 }
 
 #[tokio::test]
@@ -907,12 +907,12 @@ async fn a_single_link_upsert_writes_exactly_one_branch() {
     .await;
     let got: Vec<(String, i64)> = people
         .iter()
-        .map(|r| (as_str(field(r, 1)).to_string(), as_i64(field(r, 2))))
+        .map(|r| (as_str(field(r, 2)).to_string(), as_i64(field(r, 3))))
         .collect();
     assert_eq!(got, vec![("Alice".to_string(), 31), ("Bob".to_string(), 1)]);
 
     let posts = rows_of(&pool, &sd, &format!("select {module}::Post {{ author: {{ name }} }}")).await;
-    assert_eq!(as_str(field(field(&posts[0], 1), 1)), "Alice");
+    assert_eq!(as_str(field(field(&posts[0], 2), 2)), "Alice");
 }
 
 #[tokio::test]

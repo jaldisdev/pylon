@@ -96,6 +96,9 @@ pub struct Object {
     pub(crate) type_name: Option<String>,
     /// Field order matches the order the query's shape declared them in.
     pub(crate) fields: Vec<(String, Value)>,
+    /// True when `fields[0]` is the `id` the compiler added to a shape that
+    /// did not select one — see `pylon_core::query::ShapeNode::Object`.
+    pub(crate) implicit_id: bool,
 }
 
 impl Object {
@@ -103,12 +106,23 @@ impl Object {
         self.type_name.as_deref()
     }
 
-    pub fn get(&self, name: &str) -> Option<&Value> {
-        self.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
-    }
-
+    /// Every field, the implicit `id` included — what a caller decoding into
+    /// their own type reads, and what makes `o.id` work on a shape that only
+    /// named other pointers.
     pub fn fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.fields.iter().map(|(n, v)| (n.as_str(), v))
+    }
+
+    /// The fields JSON output carries — the same, less an `id` nobody asked
+    /// for. the upstream engine's JSON output leaves its own implicit id out too, so a query
+    /// ported from it renders the same document here.
+    pub fn json_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        let skip = usize::from(self.implicit_id);
+        self.fields.iter().skip(skip).map(|(n, v)| (n.as_str(), v))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
     }
 
     pub fn len(&self) -> usize {

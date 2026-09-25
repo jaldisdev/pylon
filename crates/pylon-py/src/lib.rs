@@ -2421,11 +2421,13 @@ fn shape_node_to_py<'py>(
             position,
             cardinality,
             pointers,
+            has_implicit_id,
         } => {
             d.set_item("kind", "object")?;
             d.set_item("name", name.as_str())?;
             d.set_item("type_name", type_name.as_deref())?;
             d.set_item("position", position)?;
+            d.set_item("has_implicit_id", has_implicit_id)?;
             d.set_item(
                 "cardinality",
                 match cardinality {

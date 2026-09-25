@@ -173,8 +173,8 @@ async fn plain_select_uses_the_aliases_own_filter() {
     )
     .await;
     assert_eq!(rows.len(), 2, "only the two active people should match, got {rows:?}");
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
-    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Carol".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[1], 2), &DecodedValue::Str("Carol".to_string()));
 }
 
 #[tokio::test]
@@ -207,7 +207,7 @@ async fn outer_filter_ands_with_the_aliases_own_filter() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -229,8 +229,8 @@ async fn outer_order_by_overrides_the_aliases_own_order_by() {
     )
     .await;
     assert_eq!(rows.len(), 2);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Carol".to_string()));
-    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Carol".to_string()));
+    assert_eq!(field(&rows[1], 2), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ async fn aliases_own_order_and_limit_apply_with_no_outer_override() {
     let rows = rows_of(&pool, &sd, &format!("select {module}::Youngest {{ name }}")).await;
     assert_eq!(rows.len(), 1, "the alias's own limit must apply, got {rows:?}");
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::Str("Bob".to_string()),
         "Bob is the youngest (25)"
     );
@@ -287,8 +287,8 @@ async fn outer_shape_replaces_the_aliases_own_shape() {
     // the alias's own).
     let rows = rows_of(&pool, &sd, &format!("select {module}::Youngest {{ name, age }}")).await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Bob".to_string()));
-    assert_eq!(field(&rows[0], 2), &DecodedValue::I64(25));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Bob".to_string()));
+    assert_eq!(field(&rows[0], 3), &DecodedValue::I64(25));
 }
 
 /// A pointer the query itself declares, read back by the *outer* select's
@@ -348,7 +348,7 @@ async fn a_path_select_orders_by_a_pointer_its_own_shape_declared() {
     .await;
     let names: Vec<String> = rows
         .iter()
-        .map(|r| match field(r, 1) {
+        .map(|r| match field(r, 2) {
             DecodedValue::Str(s) => s.clone(),
             other => panic!("expected a text label, got {other:?}"),
         })

@@ -55,6 +55,7 @@ fn decode_inner(shape: &ShapeNode, value: &DecodedValue, position_override: Opti
             type_name,
             position,
             pointers,
+            has_implicit_id,
             ..
         } => {
             // An object at position 0 of the enclosing tuple is a free
@@ -63,7 +64,7 @@ fn decode_inner(shape: &ShapeNode, value: &DecodedValue, position_override: Opti
                 Some(_) => value.clone(),
                 None => composite_at(value, *position),
             };
-            decode_object(&obj_tuple, type_name.as_deref(), pointers)
+            decode_object(&obj_tuple, type_name.as_deref(), pointers, *has_implicit_id)
         }
         ShapeNode::Array { position, element, .. } => {
             decode_array(value, position_override.unwrap_or(*position), element)
@@ -155,7 +156,12 @@ fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
     }
 }
 
-fn decode_object(obj_tuple: &DecodedValue, type_name: Option<&str>, pointers: &[ShapeNode]) -> Value {
+fn decode_object(
+    obj_tuple: &DecodedValue,
+    type_name: Option<&str>,
+    pointers: &[ShapeNode],
+    implicit_id: bool,
+) -> Value {
     if matches!(obj_tuple, DecodedValue::Null) {
         return Value::Null;
     }
@@ -187,6 +193,7 @@ fn decode_object(obj_tuple: &DecodedValue, type_name: Option<&str>, pointers: &[
     Value::Object(Object {
         type_name: resolved_type_name,
         fields,
+        implicit_id,
     })
 }
 
@@ -271,6 +278,7 @@ fn decode_json_tuple(value: &DecodedValue, type_name: Option<&str>, members: Opt
     Value::Object(Object {
         type_name: type_name.map(str::to_string),
         fields,
+        implicit_id: false,
     })
 }
 
@@ -320,6 +328,7 @@ fn decode_group(
     let key = Object {
         type_name: None,
         fields: key_fields,
+        implicit_id: false,
     };
 
     let grouping = match composite_at(value, grouping_position) {
@@ -415,6 +424,7 @@ pub(crate) fn cached_to_value(value: &DecodedValue) -> Value {
         DecodedValue::Object(fields) => Value::Object(Object {
             type_name: None,
             fields: fields.iter().map(|(k, v)| (k.clone(), cached_to_value(v))).collect(),
+            implicit_id: false,
         }),
         DecodedValue::Range {
             lower,
@@ -464,6 +474,7 @@ mod tests {
                     position: 1,
                 },
             ],
+            has_implicit_id: false,
         };
         let decoded = decode(&shape, &value);
         let Value::Object(obj) = decoded else {
@@ -475,6 +486,88 @@ mod tests {
         // field of its own.
         assert_eq!(obj.get("__type__"), None);
         assert_eq!(obj.len(), 1);
+    }
+
+    /// `select Person { name }` — the compiler puts an `id` in front that
+    /// the query never named. A caller decoding the row must see it (that is
+    /// the whole point: `o.id` has to work), and JSON output must not, since
+    /// the upstream engine's JSON output carries no implicit id either.
+    #[test]
+    fn an_implicit_id_decodes_as_a_field_but_is_left_out_of_json() {
+        let id = uuid::Uuid::from_u128(0x0199c3e1_9702_795c_b787_f93f7a88fd4c);
+        let value = comp(vec![
+            DecodedValue::Str("default::Person".into()),
+            DecodedValue::Uuid(*id.as_bytes()),
+            DecodedValue::Str("Bob".into()),
+        ]);
+        let shape = ShapeNode::Object {
+            name: String::new(),
+            type_name: Some("default::Person".into()),
+            position: 0,
+            cardinality: Cardinality::Required,
+            pointers: vec![
+                ShapeNode::Scalar {
+                    name: "__type__".into(),
+                    position: 0,
+                },
+                ShapeNode::Scalar {
+                    name: "id".into(),
+                    position: 1,
+                },
+                ShapeNode::Scalar {
+                    name: "name".into(),
+                    position: 2,
+                },
+            ],
+            has_implicit_id: true,
+        };
+
+        let decoded = decode(&shape, &value);
+        let Value::Object(obj) = &decoded else {
+            panic!("expected Object, got {decoded:?}")
+        };
+        assert_eq!(obj.get("id"), Some(&Value::Uuid(id)));
+        assert_eq!(obj.len(), 2);
+        assert_eq!(crate::json::to_json(&decoded), r#"{"name": "Bob"}"#);
+    }
+
+    /// The same row for a query that wrote `{ id, name }` itself: nothing was
+    /// injected, so the id is the caller's and JSON keeps it.
+    #[test]
+    fn an_id_the_query_asked_for_is_rendered_as_json() {
+        let id = uuid::Uuid::from_u128(0x0199c3e1_9702_795c_b787_f93f7a88fd4c);
+        let value = comp(vec![
+            DecodedValue::Str("default::Person".into()),
+            DecodedValue::Uuid(*id.as_bytes()),
+            DecodedValue::Str("Bob".into()),
+        ]);
+        let shape = ShapeNode::Object {
+            name: String::new(),
+            type_name: Some("default::Person".into()),
+            position: 0,
+            cardinality: Cardinality::Required,
+            pointers: vec![
+                ShapeNode::Scalar {
+                    name: "__type__".into(),
+                    position: 0,
+                },
+                ShapeNode::Scalar {
+                    name: "id".into(),
+                    position: 1,
+                },
+                ShapeNode::Scalar {
+                    name: "name".into(),
+                    position: 2,
+                },
+            ],
+            has_implicit_id: false,
+        };
+
+        let decoded = decode(&shape, &value);
+        assert_eq!(
+            crate::json::to_json(&decoded),
+            r#"{"id": "0199c3e1-9702-795c-b787-f93f7a88fd4c", "name": "Bob"}"#
+        );
     }
 
     #[test]
@@ -505,7 +598,9 @@ mod tests {
                         position: 1,
                     },
                 ],
+                has_implicit_id: false,
             }],
+            has_implicit_id: false,
         };
         let Value::Object(root) = decode(&shape, &value) else {
             panic!()
@@ -544,6 +639,7 @@ mod tests {
                     position: 2,
                 },
             ],
+            has_implicit_id: false,
         };
         let Value::Object(obj) = decode(&shape, &value) else {
             panic!("expected Object")
@@ -564,6 +660,7 @@ mod tests {
                 name: "__type__".into(),
                 position: 0,
             }],
+            has_implicit_id: false,
         };
         let Value::Object(obj) = decode(&shape, &value) else {
             panic!("expected Object")
@@ -580,6 +677,7 @@ mod tests {
             position: 1,
             cardinality: Cardinality::Optional,
             pointers: vec![],
+            has_implicit_id: false,
         };
         assert_eq!(decode(&shape, &value), Value::Null);
     }
@@ -612,6 +710,7 @@ mod tests {
                         position: 1,
                     },
                 ],
+                has_implicit_id: false,
             }),
         };
         let Value::Array(items) = decode(&shape, &value) else {
@@ -800,6 +899,7 @@ mod tests {
                         position: 1,
                     },
                 ],
+                has_implicit_id: false,
             }),
         };
         let Value::Group(group) = decode(&shape, &value) else {
@@ -839,6 +939,7 @@ mod tests {
                         position: 1,
                     },
                 ],
+                has_implicit_id: false,
             }),
         };
         let Value::VectorSearch { object, distance } = decode(&shape, &value) else {

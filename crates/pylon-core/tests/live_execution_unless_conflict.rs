@@ -149,7 +149,7 @@ async fn bare_unless_conflict_silently_keeps_the_original_row() {
         "bare unless conflict must not create a duplicate row, got {rows:?}"
     );
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::Str("Original".to_string()),
         "the original row must be left untouched"
     );
@@ -186,7 +186,7 @@ async fn unless_conflict_on_specific_property_no_ops() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Original".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Original".to_string()));
 }
 
 #[tokio::test]
@@ -226,7 +226,7 @@ async fn unless_conflict_else_update_upserts_in_place() {
         "an upsert must update the existing row in place, not create a second one, got {rows:?}"
     );
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::Str("New Name".to_string()),
         "the ELSE update must have taken effect"
     );
@@ -276,7 +276,7 @@ async fn unless_conflict_else_update_reads_the_existing_conflicting_rows_value()
     .await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        field(&rows[0], 1),
+        field(&rows[0], 2),
         &DecodedValue::I64(13),
         "stock should have incremented from the existing row's own value each time (10 -> 11 -> 12 -> 13), got {:?}",
         rows[0]
@@ -308,6 +308,6 @@ async fn no_conflict_inserts_a_genuinely_new_row() {
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::Product {{ sku }} order by .sku")).await;
     assert_eq!(rows.len(), 2, "two distinct skus must both be inserted, got {rows:?}");
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("A".to_string()));
-    assert_eq!(field(&rows[1], 1), &DecodedValue::Str("B".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("A".to_string()));
+    assert_eq!(field(&rows[1], 2), &DecodedValue::Str("B".to_string()));
 }

@@ -558,6 +558,7 @@ fn emit_bound_union_select(sel: &IrSelect, rows: &[IrRowSource]) -> SqlOutput {
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: prepend_type(shape_pointers),
+                has_implicit_id: shape_has_implicit_id(shape),
             },
         },
         inference_plan: None,
@@ -657,6 +658,7 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: root_pointers,
+                has_implicit_id: shape_has_implicit_id(shape),
             },
         },
         inference_plan: None,
@@ -2322,6 +2324,7 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
             position,
             cardinality: Cardinality::Optional,
             pointers: prepend_type(nodes),
+            has_implicit_id: shape_has_implicit_id(shape),
         };
     }
     // A walk landing on one object: `(select … limit 1).latest_data { … }`.
@@ -2380,6 +2383,7 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                     Cardinality::Optional
                 },
                 pointers: prepend_type(pointer_nodes),
+                has_implicit_id: shape_has_implicit_id(shape),
             };
             if *multi {
                 ShapeNode::Array {
@@ -2407,6 +2411,7 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                 position,
                 cardinality: Cardinality::Optional,
                 pointers: prepend_type(pointer_nodes),
+                has_implicit_id: shape_has_implicit_id(shape),
             }
         }
         IrExpr::TypeCast(c) if c.tuple_shape.is_some() => {
@@ -2449,6 +2454,7 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                         position: 0,
                         cardinality: Cardinality::Many,
                         pointers: prepend_type(nodes),
+                        has_implicit_id: shape_has_implicit_id(&fs.shape),
                     }),
                 }
             }
@@ -2471,6 +2477,7 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                         position: 0,
                         cardinality: Cardinality::Many,
                         pointers: prepend_type(nodes),
+                        has_implicit_id: shape_has_implicit_id(shape),
                     }),
                 }
             }
@@ -2490,6 +2497,7 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                             position: 0,
                             cardinality: Cardinality::Many,
                             pointers: prepend_type(pointer_nodes),
+                            has_implicit_id: shape_has_implicit_id(shape),
                         }),
                     }
                 }
@@ -2528,6 +2536,7 @@ fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeN
                 .enumerate()
                 .map(|(i, (name, e))| free_field_shape_node(name, i, e))
                 .collect(),
+            has_implicit_id: false,
         },
         IrFreeExpr::Tuple(exprs) => ShapeNode::Tuple {
             position: 0,
@@ -2956,6 +2965,7 @@ fn emit_group_projection(
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: nodes,
+                has_implicit_id: false,
             },
         },
         inference_plan: None,
@@ -2984,6 +2994,7 @@ fn emit_group_elements(grp: &IrGroup) -> SqlOutput {
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: prepend_type(nodes),
+                has_implicit_id: shape_has_implicit_id(&grp.shape),
             },
         },
         inference_plan: None,
@@ -3054,6 +3065,7 @@ fn emit_group_rows(grp: &IrGroup) -> SqlOutput {
         position: 0,
         cardinality: Cardinality::Many,
         pointers: prepend_type(shape_nodes),
+        has_implicit_id: shape_has_implicit_id(&grp.shape),
     };
 
     let root = ShapeNode::Group {
@@ -3184,6 +3196,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: prepend_type(pointer_nodes),
+                has_implicit_id: shape_has_implicit_id(shape),
             };
             (expr, shape_root)
         }
@@ -3475,6 +3488,7 @@ fn emit_for_update(
                     position: 0,
                     cardinality: Cardinality::Many,
                     pointers: prepend_type(shape_nodes),
+                    has_implicit_id: shape_has_implicit_id(&upd.returning),
                 },
             },
             inference_plan: None,
@@ -3512,6 +3526,7 @@ fn emit_for_update(
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: prepend_type(shape_nodes),
+                has_implicit_id: shape_has_implicit_id(&upd.returning),
             },
         },
         inference_plan: None,
@@ -3838,6 +3853,7 @@ fn shape_select_from_cte(
             position: 0,
             cardinality: Cardinality::Required,
             pointers: root_pointers,
+            has_implicit_id: shape_has_implicit_id(returning),
         },
     };
     (shape, Some(sql))
@@ -4327,6 +4343,7 @@ fn emit_returning_shape(
             position: 0,
             cardinality: Cardinality::Required,
             pointers: root_pointers,
+            has_implicit_id: shape_has_implicit_id(returning),
         },
     };
     (shape, Some(sql))
@@ -4362,6 +4379,12 @@ fn emit_scalar_set(f: &IrScalarSetPointer, pos: usize) -> (String, ShapeNode) {
 
 /// Build SQL expressions and ShapeNodes for `pointers`, starting at position 1
 /// (position 0 is always the type discriminator, added by the caller).
+/// True when the compiler put an `id` at the front of this shape that the
+/// query never asked for — see `IrScalarPointer::implicit_id`.
+fn shape_has_implicit_id(pointers: &[IrShapePointer]) -> bool {
+    matches!(pointers.first(), Some(IrShapePointer::Scalar(p)) if p.implicit_id)
+}
+
 fn build_shape(pointers: &[IrShapePointer], table_alias: &str) -> (Vec<String>, Vec<ShapeNode>) {
     let mut exprs = Vec::new();
     let mut nodes = Vec::new();
@@ -4692,6 +4715,7 @@ fn emit_single_link(f: &IrSingleLinkPointer, parent_alias: &str, pos: usize) -> 
         position: pos,
         cardinality: Cardinality::Optional,
         pointers: prepend_type(sub_nodes),
+        has_implicit_id: shape_has_implicit_id(shape),
     };
     (sql, node)
 }
@@ -4811,6 +4835,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
             position: pos,
             cardinality: Cardinality::Optional,
             pointers: prepend_type(sub_nodes),
+            has_implicit_id: shape_has_implicit_id(shape),
         };
         return (sql, node);
     }
@@ -4831,6 +4856,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
             position: pos,
             cardinality: Cardinality::Optional,
             pointers: prepend_type(sub_nodes),
+            has_implicit_id: shape_has_implicit_id(shape),
         };
         return (sql, node);
     }
@@ -4897,6 +4923,7 @@ fn emit_multi_link(f: &IrMultiLinkPointer, parent_alias: &str, pos: usize) -> (S
             position: 0,
             cardinality: Cardinality::Required,
             pointers: prepend_type(sub_nodes),
+            has_implicit_id: shape_has_implicit_id(shape),
         }),
     };
     (sql, node)
@@ -5508,6 +5535,7 @@ fn emit_vector_search(vs: &IrVectorSearch) -> SqlOutput {
         position: 1,
         cardinality: Cardinality::Many,
         pointers: object_shape_nodes,
+        has_implicit_id: shape_has_implicit_id(&vs.object_shape),
     };
     let shape = ShapeDescriptor {
         root: ShapeNode::VectorSearch {
@@ -5590,6 +5618,7 @@ fn emit_fts_search(fs: &IrFtsSearch) -> SqlOutput {
         position: 1,
         cardinality: Cardinality::Many,
         pointers: object_shape_nodes,
+        has_implicit_id: shape_has_implicit_id(&fs.object_shape),
     };
     let shape = ShapeDescriptor {
         root: ShapeNode::FtsSearch {
@@ -5675,6 +5704,7 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         position: 1,
         cardinality: Cardinality::Many,
         pointers: object_shape_nodes,
+        has_implicit_id: shape_has_implicit_id(&fs.object_shape),
     };
     let shape = ShapeDescriptor {
         root: ShapeNode::FtsSearch {
@@ -5743,6 +5773,7 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
                 position: 0,
                 cardinality: Cardinality::Many,
                 pointers: root_pointers,
+                has_implicit_id: shape_has_implicit_id(&sel.shape),
             },
         },
         inference_plan: None,
@@ -8932,9 +8963,9 @@ mod tests {
             name,
             pointers: elem_pointers,
             ..
-        } = &pointers[1]
+        } = &pointers[2]
         else {
-            panic!("{:?}", pointers[1])
+            panic!("{:?}", pointers[2])
         };
         assert_eq!(name, "recent");
         assert!(matches!(&elem_pointers[1], ShapeNode::Scalar { name, .. } if name == "title"));
@@ -8960,7 +8991,7 @@ mod tests {
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!()
         };
-        assert!(matches!(&pointers[1], ShapeNode::Scalar { name, .. } if name == "t"));
+        assert!(matches!(&pointers[2], ShapeNode::Scalar { name, .. } if name == "t"));
     }
 
     #[test]
@@ -9603,8 +9634,8 @@ mod tests {
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!()
         };
-        let ShapeNode::Array { name, element, .. } = &pointers[1] else {
-            panic!("{:?}", pointers[1])
+        let ShapeNode::Array { name, element, .. } = &pointers[2] else {
+            panic!("{:?}", pointers[2])
         };
         assert_eq!(name, "p");
         let ShapeNode::Object {
@@ -9655,7 +9686,7 @@ mod tests {
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!()
         };
-        assert!(matches!(&pointers[1], ShapeNode::Array { name, .. } if name == "everything"));
+        assert!(matches!(&pointers[2], ShapeNode::Array { name, .. } if name == "everything"));
     }
 
     #[test]
@@ -9684,8 +9715,8 @@ mod tests {
         };
         // A declared computed gets the same treatment as one written inline:
         // object-valued when it selects a link, scalar when it projects one.
-        assert!(matches!(&pointers[1], ShapeNode::Object { name, .. } if name == "recent"));
-        assert!(matches!(&pointers[2], ShapeNode::Scalar { name, .. } if name == "recent_title"));
+        assert!(matches!(&pointers[2], ShapeNode::Object { name, .. } if name == "recent"));
+        assert!(matches!(&pointers[3], ShapeNode::Scalar { name, .. } if name == "recent_title"));
         assert!(out.sql.contains("\"jt\".source = \"t0\".id"), "{}", out.sql);
         assert_eq!(out.sql.matches("LIMIT 1").count(), 2, "{}", out.sql);
         crate::validate::validate_schema_types(&schema).expect("schema should validate");
@@ -11101,10 +11132,11 @@ select owner { posts := (select owner.posts.title) };",
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!()
         };
-        assert_eq!(pointers.len(), 3); // __type__, name, age
+        assert_eq!(pointers.len(), 4); // __type__, the implicit id, name, age
         assert!(matches!(&pointers[0], ShapeNode::Scalar { name, position: 0 } if name == "__type__"));
-        assert!(matches!(&pointers[1], ShapeNode::Scalar { name, position: 1 } if name == "name"));
-        assert!(matches!(&pointers[2], ShapeNode::Scalar { name, position: 2 } if name == "age"));
+        assert!(matches!(&pointers[1], ShapeNode::Scalar { name, position: 1 } if name == "id"));
+        assert!(matches!(&pointers[2], ShapeNode::Scalar { name, position: 2 } if name == "name"));
+        assert!(matches!(&pointers[3], ShapeNode::Scalar { name, position: 3 } if name == "age"));
     }
 
     #[test]
@@ -11113,18 +11145,18 @@ select owner { posts := (select owner.posts.title) };",
         let ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!()
         };
-        // pointers: [__type__, name, posts]
-        assert_eq!(pointers.len(), 3);
+        // pointers: [__type__, id, name, posts]
+        assert_eq!(pointers.len(), 4);
         let ShapeNode::Array {
             name,
             position,
             element,
-        } = &pointers[2]
+        } = &pointers[3]
         else {
             panic!()
         };
         assert_eq!(name, "posts");
-        assert_eq!(*position, 2);
+        assert_eq!(*position, 3);
         let ShapeNode::Object {
             pointers: elem_pointers,
             ..
@@ -11132,7 +11164,8 @@ select owner { posts := (select owner.posts.title) };",
         else {
             panic!()
         };
-        // element pointers: [__type__, title]
+        // element pointers: [__type__, title] — `Post` has no pk property in
+        // this fixture, so nothing is injected into its shape.
         assert_eq!(elem_pointers.len(), 2);
     }
 

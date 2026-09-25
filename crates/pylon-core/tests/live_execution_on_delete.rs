@@ -362,12 +362,13 @@ async fn single_link_allow_sets_the_fk_null_on_target_delete() {
     let DecodedValue::Composite(fields) = &teams[0] else {
         panic!("expected Composite, got {:?}", teams[0])
     };
-    // [0] = __type__, [1] = name, [2] = org (nested Composite, or Null since the FK is now NULL)
+    // [0] = __type__, [1] = id, [2] = name, [3] = org (nested Composite, or
+    // Null since the FK is now NULL)
     assert_eq!(
-        fields.get(2),
+        fields.get(3),
         Some(&DecodedValue::Null),
         "org link should have been set NULL, got {:?}",
-        fields.get(2)
+        fields.get(3)
     );
 }
 
@@ -568,8 +569,8 @@ async fn multilink_allow_removes_the_junction_row_on_target_delete() {
     let DecodedValue::Composite(fields) = &products[0] else {
         panic!("expected Composite, got {:?}", products[0])
     };
-    let DecodedValue::Array(tags) = &fields[2] else {
-        panic!("expected tags to decode as an Array, got {:?}", fields[2])
+    let DecodedValue::Array(tags) = &fields[3] else {
+        panic!("expected tags to decode as an Array, got {:?}", fields[3])
     };
     assert_eq!(
         tags.len(),

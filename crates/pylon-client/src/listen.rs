@@ -225,6 +225,7 @@ fn decode_object_payload(declared_fields: &[(String, String)], raw_payload: &str
     Ok(Value::Object(Object {
         type_name: None,
         fields,
+        implicit_id: false,
     }))
 }
 

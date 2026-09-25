@@ -167,8 +167,8 @@ async fn insert_link_value_from_a_nested_insert_subquery() {
         1,
         "the nested insert must have actually created the Person row"
     );
-    assert_eq!(as_str(field(&people[0], 1)), "Alice");
-    assert_eq!(as_i64(field(&people[0], 2)), 30);
+    assert_eq!(as_str(field(&people[0], 2)), "Alice");
+    assert_eq!(as_i64(field(&people[0], 3)), 30);
 
     let posts = rows_of(
         &pool,
@@ -177,9 +177,9 @@ async fn insert_link_value_from_a_nested_insert_subquery() {
     )
     .await;
     assert_eq!(posts.len(), 1);
-    let author = field(&posts[0], 2);
+    let author = field(&posts[0], 3);
     assert_eq!(
-        as_str(field(author, 1)),
+        as_str(field(author, 2)),
         "Alice",
         "Post.author must point at the row the nested insert created"
     );
@@ -206,14 +206,14 @@ async fn select_insert_shape_chaining_reads_the_newly_inserted_rows_fields() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(as_str(field(&rows[0], 1)), "Bob");
-    assert_eq!(as_i64(field(&rows[0], 2)), 25);
+    assert_eq!(as_str(field(&rows[0], 2)), "Bob");
+    assert_eq!(as_i64(field(&rows[0], 3)), 25);
 
     // And the row is durably there afterward, not just visible transiently
     // in the chained shape.
     let after = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
     assert_eq!(after.len(), 1);
-    assert_eq!(as_str(field(&after[0], 1)), "Bob");
+    assert_eq!(as_str(field(&after[0], 2)), "Bob");
 }
 
 #[tokio::test]
@@ -251,7 +251,7 @@ async fn insert_assigns_a_multilink_directly_not_via_append() {
 
     let teams = rows_of(&pool, &sd, &format!("select {module}::Team {{ members: {{ name }} }}")).await;
     assert_eq!(teams.len(), 1);
-    let members = as_array(field(&teams[0], 1));
-    let names: HashSet<String> = members.iter().map(|m| as_str(field(m, 1)).to_string()).collect();
+    let members = as_array(field(&teams[0], 2));
+    let names: HashSet<String> = members.iter().map(|m| as_str(field(m, 2)).to_string()).collect();
     assert_eq!(names, HashSet::from(["Alice".to_string(), "Bob".to_string()]));
 }

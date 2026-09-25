@@ -559,6 +559,7 @@ mod tests {
 
     fn scalar_pointer(alias: &str) -> IrShapePointer {
         IrShapePointer::Scalar(IrScalarPointer {
+            implicit_id: false,
             marker_offset: None,
             alias: alias.into(),
             column: alias.into(),

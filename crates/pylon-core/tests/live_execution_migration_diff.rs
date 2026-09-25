@@ -245,7 +245,7 @@ async fn rename_detected_and_applied_survives_real_data() {
     );
     match &rows[0] {
         DecodedValue::Composite(fields) => {
-            assert_eq!(fields.get(1), Some(&DecodedValue::Str("keep-me".to_string())));
+            assert_eq!(fields.get(2), Some(&DecodedValue::Str("keep-me".to_string())));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
@@ -332,7 +332,7 @@ async fn property_type_change_casts_existing_data() {
     );
     match &rows[0] {
         DecodedValue::Composite(fields) => {
-            assert_eq!(fields.get(1), Some(&DecodedValue::I64(42)));
+            assert_eq!(fields.get(2), Some(&DecodedValue::I64(42)));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }

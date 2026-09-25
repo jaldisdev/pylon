@@ -153,7 +153,7 @@ async fn delete_with_filter_removes_only_matching_rows() {
         1,
         "only the matching row should have been deleted, got {rows:?}"
     );
-    assert_eq!(as_str(field(&rows[0], 1)), "Alice");
+    assert_eq!(as_str(field(&rows[0], 2)), "Alice");
 }
 
 #[tokio::test]

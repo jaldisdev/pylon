@@ -115,6 +115,11 @@ pub enum ShapeNode {
         position: usize,
         cardinality: Cardinality,
         pointers: Vec<ShapeNode>,
+        /// True when `pointers[0]` is an `id` the compiler added to a shape
+        /// that did not select one — see `IrScalarPointer::implicit_id`. Every
+        /// decoder hands it to the caller like any other property; only JSON
+        /// output drops it, which is what the upstream engine's JSON output does too.
+        has_implicit_id: bool,
     },
     /// `record[]` column decoded to a Python list.
     Array {

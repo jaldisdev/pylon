@@ -208,8 +208,8 @@ async fn group_by_single_property_partitions_rows_into_correct_groups() {
             .iter()
             .map(|el| {
                 let el_fields = fields(el);
-                // element row: [type-tag, name]
-                as_str(&el_fields[1]).to_string()
+                // element row: [type-tag, id, name]
+                as_str(&el_fields[2]).to_string()
             })
             .collect();
         by_department.insert(department, names);
@@ -278,7 +278,7 @@ async fn group_using_computed_alias_buckets_by_derived_value() {
             .iter()
             .map(|el| {
                 let el_fields = fields(el);
-                as_str(&el_fields[1]).to_string()
+                as_str(&el_fields[2]).to_string()
             })
             .collect();
         by_decade.insert(decade, names);
@@ -491,9 +491,9 @@ fn as_i64(v: &DecodedValue) -> i64 {
     }
 }
 
-/// Each row's `name`, read from an element row `[type-tag, name]`.
+/// Each row's `name`, read from an element row `[type-tag, id, name]`.
 fn element_names(rows: &[DecodedValue]) -> HashSet<String> {
-    rows.iter().map(|row| as_str(&fields(row)[1]).to_string()).collect()
+    rows.iter().map(|row| as_str(&fields(row)[2]).to_string()).collect()
 }
 
 #[tokio::test]
@@ -612,7 +612,7 @@ async fn free_object_field_holds_every_row_its_select_yields() {
     };
     let f = fields(row);
     assert_eq!(element_names(as_array(&f[0])).len(), 5);
-    assert_eq!(as_str(&fields(&f[1])[1]), "Carol");
+    assert_eq!(as_str(&fields(&f[1])[2]), "Carol");
     let mut counts: Vec<i64> = as_array(&f[2]).iter().map(|g| as_i64(&fields(g)[1])).collect();
     counts.sort();
     assert_eq!(counts, vec![1, 2, 2]);
@@ -642,7 +642,7 @@ async fn asserted_select_over_a_binding_keeps_the_shape_written_after_it() {
         panic!("expected one team, got {rows:?}")
     };
     assert_eq!(
-        element_names(as_array(&fields(team)[1])),
+        element_names(as_array(&fields(team)[2])),
         HashSet::from(["Alice", "Bob"].map(String::from))
     );
 }

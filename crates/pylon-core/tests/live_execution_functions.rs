@@ -200,7 +200,7 @@ async fn object_set_returning_function_filters_correctly() {
 
     let rows = rows_of(&pool, &sd, &format!("select {module}::adults() {{ name }}")).await;
     assert_eq!(rows.len(), 1, "only the adult should match, got {rows:?}");
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]
@@ -252,7 +252,7 @@ async fn function_composes_inside_a_larger_query() {
         1,
         "only Alice (age 30 -> double 60) should match, got {rows:?}"
     );
-    assert_eq!(field(&rows[0], 1), &DecodedValue::Str("Alice".to_string()));
+    assert_eq!(field(&rows[0], 2), &DecodedValue::Str("Alice".to_string()));
 }
 
 #[tokio::test]

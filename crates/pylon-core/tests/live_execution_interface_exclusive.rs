@@ -754,11 +754,11 @@ async fn junction_backed_read_through_the_interface_view_resolves_the_link() {
     let DecodedValue::Composite(fields) = &rows[0] else {
         panic!("expected Composite, got {:?}", rows[0])
     };
-    // fields: [type_tag, name, employer] — employer itself: [type_tag, name].
-    let DecodedValue::Composite(employer_fields) = &fields[2] else {
-        panic!("expected employer to decode as Composite, got {:?}", fields[2])
+    // fields: [type_tag, id, name, employer] — employer itself: [type_tag, id, name].
+    let DecodedValue::Composite(employer_fields) = &fields[3] else {
+        panic!("expected employer to decode as Composite, got {:?}", fields[3])
     };
-    assert_eq!(employer_fields[1], DecodedValue::Str("Acme".into()));
+    assert_eq!(employer_fields[2], DecodedValue::Str("Acme".into()));
 }
 
 #[tokio::test]
@@ -798,7 +798,7 @@ async fn a_multilink_append_through_the_interface_reaches_each_implementors_rows
 
     let tag_counts = |type_name: &str| format!("select {module}::{type_name} {{ n := count(.tags) }}");
     let count_of = |rows: Vec<DecodedValue>| match rows.as_slice() {
-        [DecodedValue::Composite(fields)] => fields.get(1).cloned(),
+        [DecodedValue::Composite(fields)] => fields.get(2).cloned(),
         other => panic!("expected one row, got {other:?}"),
     };
     assert_eq!(

@@ -111,11 +111,13 @@ async fn insert_and_select_round_trip_a_real_value() {
         // A schema-backed object row decodes as a positional `Composite`,
         // not a name-keyed `Object` — position 0 is always the
         // auto-injected `__type__` discriminator (see `pylon/query.py`'s
-        // `_decode()`, the `"object"` branch), remaining positions are the
-        // selected pointers in shape order.
+        // `_decode()`, the `"object"` branch), position 1 the implicit `id`
+        // every shape gets, and the rest are the selected pointers in shape
+        // order.
         DecodedValue::Composite(fields) => {
             assert_eq!(fields.first(), Some(&DecodedValue::Str(format!("{module}::Widget"))));
-            assert_eq!(fields.get(1), Some(&DecodedValue::Str("hello".to_string())));
+            assert!(matches!(fields.get(1), Some(DecodedValue::Uuid(_))));
+            assert_eq!(fields.get(2), Some(&DecodedValue::Str("hello".to_string())));
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
@@ -165,7 +167,7 @@ async fn an_abstract_type_reads_the_rows_of_the_types_inheriting_it() {
         let read: Vec<(DecodedValue, DecodedValue)> = rows
             .iter()
             .map(|row| match row {
-                DecodedValue::Composite(fields) => (fields[0].clone(), fields[1].clone()),
+                DecodedValue::Composite(fields) => (fields[0].clone(), fields[2].clone()),
                 other => panic!("expected a Composite-shaped row, got {other:?}"),
             })
             .collect();

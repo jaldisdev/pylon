@@ -172,13 +172,13 @@ async fn insert_with_link_property_round_trips() {
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let DecodedValue::Array(tags) = &shape[1] else {
-        panic!("expected an Array for tags, got {:?}", shape[1])
+    let DecodedValue::Array(tags) = &shape[2] else {
+        panic!("expected an Array for tags, got {:?}", shape[2])
     };
     assert_eq!(tags.len(), 1);
-    assert_eq!(field(&tags[0], 1), &DecodedValue::Str("electronics".to_string()));
+    assert_eq!(field(&tags[0], 2), &DecodedValue::Str("electronics".to_string()));
     assert!(
-        (as_f64(field(&tags[0], 2)) - 1.5).abs() < f64::EPSILON,
+        (as_f64(field(&tags[0], 3)) - 1.5).abs() < f64::EPSILON,
         "expected weight 1.5, got {:?}",
         tags[0]
     );
@@ -227,7 +227,7 @@ async fn append_link_property_upserts_on_reappend() {
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let DecodedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[2] else {
         panic!("expected an Array for tags")
     };
     assert_eq!(
@@ -236,7 +236,7 @@ async fn append_link_property_upserts_on_reappend() {
         "re-appending the same target must not create a duplicate junction row, got {tags:?}"
     );
     assert!(
-        (as_f64(field(&tags[0], 2)) - 9.0).abs() < f64::EPSILON,
+        (as_f64(field(&tags[0], 3)) - 9.0).abs() < f64::EPSILON,
         "re-append must update the weight in place, got {:?}",
         tags[0]
     );
@@ -278,19 +278,19 @@ async fn append_union_lands_distinct_values_on_correct_targets() {
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let DecodedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[2] else {
         panic!("expected an Array for tags")
     };
     assert_eq!(tags.len(), 2);
-    assert_eq!(field(&tags[0], 1), &DecodedValue::Str("a".to_string()));
+    assert_eq!(field(&tags[0], 2), &DecodedValue::Str("a".to_string()));
     assert!(
-        (as_f64(field(&tags[0], 2)) - 1.0).abs() < f64::EPSILON,
+        (as_f64(field(&tags[0], 3)) - 1.0).abs() < f64::EPSILON,
         "tag 'a' should carry weight 1.0, got {:?}",
         tags[0]
     );
-    assert_eq!(field(&tags[1], 1), &DecodedValue::Str("b".to_string()));
+    assert_eq!(field(&tags[1], 2), &DecodedValue::Str("b".to_string()));
     assert!(
-        (as_f64(field(&tags[1], 2)) - 2.0).abs() < f64::EPSILON,
+        (as_f64(field(&tags[1], 3)) - 2.0).abs() < f64::EPSILON,
         "tag 'b' should carry weight 2.0, got {:?}",
         tags[1]
     );
@@ -322,7 +322,7 @@ async fn remove_link_clears_the_junction_row() {
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let DecodedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[2] else {
         panic!("expected an Array for tags")
     };
     assert!(
@@ -401,15 +401,15 @@ async fn remove_link_reads_the_walked_links_of_each_row() {
             let DecodedValue::Composite(shape) = row else {
                 panic!("expected Composite")
             };
-            let DecodedValue::Str(name) = &shape[1] else {
+            let DecodedValue::Str(name) = &shape[2] else {
                 panic!("expected a Str for name")
             };
-            let DecodedValue::Array(tags) = &shape[2] else {
+            let DecodedValue::Array(tags) = &shape[3] else {
                 panic!("expected an Array for tags")
             };
             let names = tags
                 .iter()
-                .map(|tag| match field(tag, 1) {
+                .map(|tag| match field(tag, 2) {
                     DecodedValue::Str(tag_name) => tag_name.clone(),
                     other => panic!("expected a Str for the tag name, got {other:?}"),
                 })
@@ -469,10 +469,10 @@ async fn a_link_property_value_reads_the_walked_links_current_value() {
     let DecodedValue::Composite(shape) = &rows[0] else {
         panic!("expected Composite")
     };
-    let DecodedValue::Array(tags) = &shape[1] else {
+    let DecodedValue::Array(tags) = &shape[2] else {
         panic!("expected an Array for tags")
     };
-    let weights: Vec<f64> = tags.iter().map(|t| as_f64(field(t, 2))).collect();
+    let weights: Vec<f64> = tags.iter().map(|t| as_f64(field(t, 3))).collect();
     assert_eq!(
         weights,
         vec![1.0, 2.5],
