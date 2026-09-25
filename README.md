@@ -5,13 +5,24 @@ Async PostgreSQL mapper for the JALDIS platform. Provides a schema definition DS
 ## Requirements
 
 - Python 3.13+
-- PostgreSQL
+- PostgreSQL 18+
 
 ## Installation
 
 ```bash
-pip install pylon
+pip install pylon-db
 ```
+
+For the native Rust client — PyQL queries from Rust, no Python interpreter
+involved — add the `pylon-db-client` crate instead:
+
+```toml
+[dependencies]
+pylon-db-client = "0.1"
+```
+
+It is published as `pylon-db-client` and imported as `pylon_client`; see the
+[Rust client reference](docs/client/rust.md).
 
 ## Configuration
 

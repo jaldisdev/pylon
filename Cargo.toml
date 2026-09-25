@@ -3,4 +3,16 @@ members = ["crates/pylon-core", "crates/pylon-py", "crates/pylon-lsp", "crates/p
 resolver = "2"
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jaldisdev/pylon"
+
+[workspace.dependencies]
+pylon-db-cache = { path = "crates/pylon-cache", version = "0.1.0" }
+pylon-db-client = { path = "crates/pylon-client", version = "0.1.0" }
+pylon-db-core = { path = "crates/pylon-core", version = "0.1.0" }
+pylon-db-derive = { path = "crates/pylon-derive", version = "0.1.0" }
+pylon-db-pgcon = { path = "crates/pylon-pgcon", version = "0.1.0" }
+pylon-db-value = { path = "crates/pylon-value", version = "0.1.0" }

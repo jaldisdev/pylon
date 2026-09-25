@@ -1,9 +1,17 @@
 [package]
-name = "pylon-derive"
-version = "0.1.0"
+name = "pylon-db-derive"
+description = "#[derive(Queryable)] for the Pylon Rust client"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["pylon", "postgres", "postgresql", "database", "derive"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
 
 [lib]
+name = "pylon_derive"
 proc-macro = true
 
 [dependencies]

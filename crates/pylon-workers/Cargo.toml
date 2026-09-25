@@ -1,14 +1,16 @@
 [package]
 name = "pylon-workers"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
-pylon-core = { path = "../pylon-core" }
-pylon-pgcon = { path = "../pylon-pgcon" }
-pylon-cache = { path = "../pylon-cache" }
+pylon-db-core = { workspace = true }
+pylon-db-pgcon = { workspace = true }
+pylon-db-cache = { workspace = true }
 pylon-providers = { path = "../pylon-providers" }
-pylon-value = { path = "../pylon-value" }
+pylon-db-value = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 thiserror = "2.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

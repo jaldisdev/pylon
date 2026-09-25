@@ -1512,27 +1512,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "pylon-cache"
+name = "pylon-config"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "pylon-db-cache"
 version = "0.1.0"
 dependencies = [
  "heed",
  "hex",
- "pylon-value",
+ "pylon-db-value",
  "rkyv 0.8.17",
  "sha2",
  "tempfile",
 ]
 
 [[package]]
-name = "pylon-client"
+name = "pylon-db-client"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "pylon-cache",
- "pylon-core",
- "pylon-derive",
- "pylon-pgcon",
- "pylon-value",
+ "pylon-db-cache",
+ "pylon-db-core",
+ "pylon-db-derive",
+ "pylon-db-pgcon",
+ "pylon-db-value",
  "serde",
  "serde_json",
  "tempfile",
@@ -1543,21 +1551,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "pylon-config"
-version = "0.1.0"
-dependencies = [
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "pylon-core"
+name = "pylon-db-core"
 version = "0.1.0"
 dependencies = [
  "hex",
  "lru",
- "pylon-pgcon",
- "pylon-value",
+ "pylon-db-pgcon",
+ "pylon-db-value",
  "serde",
  "serde_json",
  "sha2",
@@ -1568,12 +1568,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "pylon-derive"
+name = "pylon-db-derive"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "pylon-db-pgcon"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "deadpool-postgres",
+ "hex",
+ "postgres-types",
+ "pylon-db-value",
+ "rust_decimal",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "pylon-db-value"
+version = "0.1.0"
+dependencies = [
+ "rkyv 0.8.17",
+ "uuid",
 ]
 
 [[package]]
@@ -1583,27 +1607,11 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "pylon-config",
- "pylon-core",
- "pylon-pgcon",
+ "pylon-db-core",
+ "pylon-db-pgcon",
  "serde",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "pylon-pgcon"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "deadpool-postgres",
- "hex",
- "postgres-types",
- "pylon-value",
- "rust_decimal",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-postgres",
 ]
 
 [[package]]
@@ -1623,12 +1631,12 @@ name = "pylon-py"
 version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
- "pylon-cache",
- "pylon-client",
- "pylon-core",
- "pylon-pgcon",
+ "pylon-db-cache",
+ "pylon-db-client",
+ "pylon-db-core",
+ "pylon-db-pgcon",
+ "pylon-db-value",
  "pylon-providers",
- "pylon-value",
  "pylon-workers",
  "pyo3",
  "pyo3-async-runtimes",
@@ -1648,13 +1656,13 @@ dependencies = [
  "hyper-util",
  "include_dir",
  "mime_guess",
- "pylon-cache",
- "pylon-client",
  "pylon-config",
- "pylon-core",
- "pylon-pgcon",
+ "pylon-db-cache",
+ "pylon-db-client",
+ "pylon-db-core",
+ "pylon-db-pgcon",
+ "pylon-db-value",
  "pylon-providers",
- "pylon-value",
  "pylon-workers",
  "serde_json",
  "thiserror",
@@ -1665,24 +1673,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "pylon-value"
-version = "0.1.0"
-dependencies = [
- "rkyv 0.8.17",
- "uuid",
-]
-
-[[package]]
 name = "pylon-workers"
 version = "0.1.0"
 dependencies = [
  "hex",
  "prometheus",
- "pylon-cache",
- "pylon-core",
- "pylon-pgcon",
+ "pylon-db-cache",
+ "pylon-db-core",
+ "pylon-db-pgcon",
+ "pylon-db-value",
  "pylon-providers",
- "pylon-value",
  "reqwest",
  "serde_json",
  "tempfile",

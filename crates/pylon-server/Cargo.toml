@@ -1,16 +1,18 @@
 [package]
 name = "pylon-server"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
-pylon-cache = { path = "../pylon-cache" }
+pylon-db-cache = { workspace = true }
 pylon-config = { path = "../pylon-config" }
-pylon-client = { path = "../pylon-client" }
-pylon-core = { path = "../pylon-core" }
-pylon-pgcon = { path = "../pylon-pgcon" }
+pylon-db-client = { workspace = true }
+pylon-db-core = { workspace = true }
+pylon-db-pgcon = { workspace = true }
 pylon-providers = { path = "../pylon-providers" }
-pylon-value = { path = "../pylon-value" }
+pylon-db-value = { workspace = true }
 pylon-workers = { path = "../pylon-workers" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 hyper = { version = "1", features = ["full"] }

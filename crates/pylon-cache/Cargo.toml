@@ -1,14 +1,24 @@
 [package]
-name = "pylon-cache"
-version = "0.1.0"
+name = "pylon-db-cache"
+description = "LMDB read-through query cache for Pylon"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["pylon", "postgres", "database", "cache", "lmdb"]
+categories = ["database", "caching"]
+
+[lib]
+name = "pylon_cache"
 
 [dependencies]
 heed = "0.22"
 rkyv = { version = "0.8", default-features = false, features = ["std"] }
 sha2 = "0.11"
 hex = "0.4"
-pylon-value = { path = "../pylon-value" }
+pylon-db-value = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

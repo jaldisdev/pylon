@@ -1,15 +1,17 @@
 [package]
 name = "pylon-lsp"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 
 [[bin]]
 name = "pylon-lsp"
 path = "src/main.rs"
 
 [dependencies]
-pylon-core = { path = "../pylon-core" }
-pylon-pgcon = { path = "../pylon-pgcon" }
+pylon-db-core = { workspace = true }
+pylon-db-pgcon = { workspace = true }
 pylon-config = { path = "../pylon-config" }
 lsp-server = "0.10"
 lsp-types = "0.97"

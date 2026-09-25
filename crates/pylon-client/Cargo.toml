@@ -1,14 +1,24 @@
 [package]
-name = "pylon-client"
-version = "0.1.0"
+name = "pylon-db-client"
+description = "Native Rust client for Pylon: run PyQL queries against a Pylon-managed PostgreSQL database"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["pylon", "pyql", "postgres", "postgresql", "database"]
+categories = ["database"]
+
+[lib]
+name = "pylon_client"
 
 [dependencies]
-pylon-cache = { path = "../pylon-cache" }
-pylon-core = { path = "../pylon-core" }
-pylon-pgcon = { path = "../pylon-pgcon" }
-pylon-value = { path = "../pylon-value" }
-pylon-derive = { path = "../pylon-derive" }
+pylon-db-cache = { workspace = true }
+pylon-db-core = { workspace = true }
+pylon-db-pgcon = { workspace = true }
+pylon-db-value = { workspace = true }
+pylon-db-derive = { workspace = true }
 tokio-postgres = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 serde = "1"

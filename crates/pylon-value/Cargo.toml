@@ -1,7 +1,17 @@
 [package]
-name = "pylon-value"
-version = "0.1.0"
+name = "pylon-db-value"
+description = "Decoded PostgreSQL values, shared across the Pylon crates"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["pylon", "postgres", "postgresql", "database"]
+categories = ["database"]
+
+[lib]
+name = "pylon_value"
 
 [dependencies]
 rkyv = { version = "0.8", default-features = false, features = ["std"] }
