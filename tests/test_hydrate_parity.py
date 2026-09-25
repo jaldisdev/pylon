@@ -192,9 +192,8 @@ _cache_ready = False
 def _id(n: int) -> _uuid.UUID:
     """A stable id for position 1 of a schema-object row.
 
-    Every object shape now carries an `id` the query never named — the upstream engine does
-    the same — so a hand-written row has to supply one right after the type
-    discriminator.
+    Every object shape carries an `id` the query never named, so a
+    hand-written row has to supply one right after the type discriminator.
     """
     return _uuid.UUID(int=n)
 
@@ -246,17 +245,14 @@ class TestObjects:
 class TestUnfetchedPointers:
     """A pointer the shape skipped must not read as a legitimate value.
 
-    Measured against the upstream Python client on the same kind of shape
-    (`select … { value }`, reading an unselected optional property):
+    Reading an unselected optional property off `select … { value }`:
 
-        o.order                    -> AttributeError: 'the upstream Object' object has
-                                      no attribute 'order'
+        o.order                    -> AttributeError: no attribute 'order'
         hasattr(o, 'order')        -> False
         getattr(o, 'order', None)  -> None
 
-    All three have to hold here too, or code that ran against the upstream engine changes
-    behaviour on the way over — `getattr(o, x, None)` silently handing back a
-    sentinel would be its own version of the bug this closes.
+    All three have to hold for a hydrated row — `getattr(o, x, None)` silently
+    handing back a sentinel would be its own version of the bug this closes.
     """
 
     def test_an_unselected_property_raises_rather_than_reading_as_none(self):
@@ -271,8 +267,8 @@ class TestUnfetchedPointers:
             getattr(post, 'shade')  # noqa: B009 — the point is that it raises
 
     def test_a_selected_null_is_still_a_null(self):
-        """The distinction the upstream engine cannot draw and this one can: selected-and-null
-        reads as None, unselected raises."""
+        """The distinction a plain `None` cannot draw and this one can:
+        selected-and-null reads as None, unselected raises."""
         compiled = _compile('select m::Post { title, shade }')
         native = assert_parity([('m::Post', _id(1), 'Hello', None)], compiled)
         assert native[0].shade is None

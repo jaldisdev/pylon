@@ -778,10 +778,10 @@ class TestWalkIntegration:
     def test_link_default_selecting_an_object_moves_into_the_insert(self):
         """`DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run.
 
-        So the column gets no default and the insert applies it instead, which
-        is how the upstream engine has always applied every default. Emitting it anyway used to
-        surface as a raw Postgres error against generated DDL at migration
-        time; rejecting the schema outright refused a default the upstream engine accepts.
+        So the column gets no default and the insert applies it instead.
+        Emitting it anyway used to surface as a raw Postgres error against
+        generated DDL at migration time; rejecting the schema outright refused
+        a default that is perfectly legal.
         """
         from pylon import _core
         from pylon.schema import Default, Link

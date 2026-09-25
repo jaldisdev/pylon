@@ -809,8 +809,8 @@ async fn a_format_is_optional_everywhere_to_str_takes_one() {
         );
     }
 
-    // Overloads the upstream engine does not declare are not callable here either, though
-    // the casts they used to back still are.
+    // An overload the stdlib does not declare is not callable, though the
+    // casts these used to back still are.
     let empty = SchemaDescriptor::default();
     for expr in [
         "to_str(<bool>true)",

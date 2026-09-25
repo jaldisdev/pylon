@@ -955,7 +955,7 @@ mod tests {
     fn link_default_selecting_an_object_moves_into_the_insert() {
         // `DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run, so this one
         // gets no column DEFAULT — the insert applies it instead, which is
-        // how the upstream engine has always applied every default.
+        // how every default reaching for an object is applied.
         let mut td = person_type(vec![], vec![base_property("name", "text")]);
         td.links = vec![LinkDescriptor {
             name: "manager".into(),

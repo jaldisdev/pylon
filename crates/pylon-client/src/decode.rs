@@ -490,8 +490,8 @@ mod tests {
 
     /// `select Person { name }` — the compiler puts an `id` in front that
     /// the query never named. A caller decoding the row must see it (that is
-    /// the whole point: `o.id` has to work), and JSON output must not, since
-    /// the upstream engine's JSON output carries no implicit id either.
+    /// the whole point: `o.id` has to work), and JSON output must not, which
+    /// carries no implicit id.
     #[test]
     fn an_implicit_id_decodes_as_a_field_but_is_left_out_of_json() {
         let id = uuid::Uuid::from_u128(0x0199c3e1_9702_795c_b787_f93f7a88fd4c);

@@ -140,8 +140,8 @@ pub(crate) fn compile_and_bind(
 ///
 /// PyQL has no `array<optional T>`, so a NULL element is never a value the
 /// query can mean — but bound as SQL NULL it compares equal to nothing and the
-/// statement quietly returns no rows rather than failing. the upstream engine rejects it
-/// client-side before execution; the wording is the upstream engine's own, matching what
+/// statement quietly returns no rows rather than failing. Rejected
+/// client-side before execution, with the wording
 /// `pylon/client.py`'s `_check_array_elements` raises on the Python side.
 fn check_array_elements(name: &str, value: &DecodedValue) -> Result<()> {
     let DecodedValue::Array(items) = value else {
@@ -157,8 +157,8 @@ fn check_array_elements(name: &str, value: &DecodedValue) -> Result<()> {
     )))
 }
 
-/// The array as the upstream engine's own message renders it — Python's `repr` of a list,
-/// which is what the message this mirrors was written against.
+/// The array as the message renders it — Python's `repr` of a list, which is
+/// the form the Python client's own wording was written against.
 fn render_array(items: &[DecodedValue]) -> String {
     let rendered: Vec<String> = items
         .iter()

@@ -190,7 +190,7 @@ pub enum Expr {
     },
     /// A path step applied to something that is not itself a path — the
     /// `[is Individual]` in `(select Installation limit 1).provider[is
-    /// Individual].staff`, which the upstream engine accepts. `.name` on such a base is
+    /// Individual].staff`, which is legal. `.name` on such a base is
     /// already a `FieldAccess`; this carries the steps that have no
     /// expression form of their own (a type intersection, a link property, a
     /// backlink). The compiler rewrites a chain of these into an ordinary

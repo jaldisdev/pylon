@@ -673,7 +673,7 @@ async fn a_second_shape_shapes_what_the_first_one_declared() {
     let [pylon_value::DecodedValue::Composite(org)] = found.as_slice() else {
         panic!("expected one org, got {found:?}")
     };
-    // `limit 1`: one object, as the upstream engine gives it.
+    // `limit 1`: one object, not a one-element set.
     let pylon_value::DecodedValue::Composite(first) = &org[2] else {
         panic!("expected the declared pointer's object, got {:?}", org[2])
     };
@@ -699,7 +699,7 @@ async fn an_object_computed_guarded_by_a_condition_keeps_its_shape() {
         let [pylon_value::DecodedValue::Composite(org)] = found.as_slice() else {
             panic!("expected one org, got {found:?}")
         };
-        // `limit 1`: one object or none, as the upstream engine gives it.
+        // `limit 1`: one object or none, not a set.
         let name = match &org[2] {
             pylon_value::DecodedValue::Composite(first) => match first.get(2) {
                 Some(pylon_value::DecodedValue::Str(name)) => Some(name.as_str()),

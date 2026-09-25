@@ -21,11 +21,11 @@
 //!
 //! PostgreSQL evaluates a column DEFAULT with no arguments and no query in
 //! scope, so a default that reads a session global or selects the object to
-//! link to can never be one. the upstream engine applies *every* default by expanding it into
-//! the insert's own shape (`_gen_pointers_from_defaults` in its PyQL
-//! compiler), which is why `created_by := account_of_transaction()` has always
-//! worked there; Pylon emitted a column DEFAULT or nothing, so that default
-//! silently left the column NULL on every insert.
+//! link to can never be one. Such a default has to be expanded into the
+//! insert's own shape instead, which is what makes
+//! `created_by := account_of_transaction()` work at all; Pylon emitted a column
+//! DEFAULT or nothing, so that default silently left the column NULL on every
+//! insert.
 //!
 //! The shape proven here is jaldis's own: an object-returning function reading
 //! a session global, named as a link's default.

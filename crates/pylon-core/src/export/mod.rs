@@ -3675,8 +3675,8 @@ mod tests {
         );
 
         // A function with no globals anywhere in reach keeps its own signature
-        // — this is the deliberate difference from the upstream engine, which adds the
-        // argument to every function.
+        // — the argument is added where a body can reach one, deliberately not
+        // to every function.
         let plain_ddl = emit_one_function(&plain, &schema).unwrap();
         assert!(
             !plain_ddl.contains("__pylon_json_globals__"),

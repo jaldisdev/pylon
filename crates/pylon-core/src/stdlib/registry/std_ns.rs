@@ -706,7 +706,7 @@ END"#,
             E("get_byte($1, $2)"),
         ),
         f("std", "from_hex", vec![p("s", Str)], Bytes, E("decode($1, 'hex')")),
-        // Postgres wraps its base64 output every 76 characters; the upstream engine does not.
+        // Postgres wraps its base64 output every 76 characters; this must not.
         f(
             "enc",
             "base64_encode",
@@ -728,9 +728,8 @@ END"#,
             Bytes,
             sql("to_bytes", "SELECT convert_to($1, $2)"),
         ),
-        // A UUID's 16 bytes, big-endian — the same bytes the upstream engine's own
-        // `to_bytes(uuid)` returns (checked against a live instance:
-        // `0199a144-…-00049e57387b` gives `AZmhRFRzjCqvmgAEnlc4ew==`).
+        // A UUID's 16 bytes, big-endian: `0199a144-…-00049e57387b` gives
+        // `AZmhRFRzjCqvmgAEnlc4ew==`.
         f(
             "std",
             "to_bytes",
@@ -1079,9 +1078,9 @@ END"#,
 END"#,
             ),
         ),
-        // `cal::local_datetime` reads the same units off the same table — the upstream engine
-        // declares this overload alongside the cal:: library rather than in
-        // the cal:: namespace.
+        // `cal::local_datetime` reads the same units off the same table. The
+        // overload belongs to `std::`, beside the `datetime` one, rather than
+        // to the `cal::` namespace its argument type comes from.
         f(
             "std",
             "datetime_get",
@@ -1260,9 +1259,9 @@ END"#,
             "std",
             "to_duration",
             // Named-only, each defaulting to 0, and `microseconds` alongside
-            // the rest — the upstream engine's own signature, which `to_duration(seconds := …)`
-            // relies on. Declared positionally these were unreachable by the
-            // names every call site actually writes.
+            // the rest, which `to_duration(seconds := …)` relies on. Declared
+            // positionally these were unreachable by the names every call site
+            // actually writes.
             vec![
                 pn("hours", Int64, NamedDefault::Int(0)),
                 pn("minutes", Int64, NamedDefault::Int(0)),
@@ -1335,9 +1334,9 @@ END"#,
         ),
         fc("std", "to_str", vec![p("v", LocalTime)], Str, E("$1::text")),
         // `to_char` has no `time` overload, so the time is composed onto a
-        // date first. the upstream engine uses *today's* date here and calls that a bug in
-        // its own source; a fixed one keeps the result deterministic, and
-        // only a format naming date fields can tell the difference.
+        // date first. A fixed date keeps the result deterministic — composing
+        // onto *today's* would leak the current date — and only a format
+        // naming date fields can tell which one was used.
         f(
             "std",
             "to_str",
@@ -1363,7 +1362,7 @@ END"#,
         fc("std", "to_str", vec![p("v", Int32)], Str, E("$1::text")),
         fc("std", "to_str", vec![p("v", Int64)], Str, E("$1::text")),
         // The narrower integers and `float32` reach the formatting overloads
-        // through the same implicit widening the upstream engine resolves them by.
+        // through implicit widening.
         f(
             "std",
             "to_str",
@@ -1409,8 +1408,7 @@ END"#,
             ),
         ),
         f("std", "to_str", vec![p("v", Bytes)], Str, E("convert_from($1, 'UTF8')")),
-        // Superseded by `array_join`, which is what the upstream engine's own deprecation
-        // note points at; kept because the call still resolves there.
+        // Superseded by `array_join`; kept because the call still resolves.
         f(
             "std",
             "to_str",

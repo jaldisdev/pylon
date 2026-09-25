@@ -19,23 +19,21 @@
 
 //! Live-Postgres tests for the `id` a shape gets without asking for one.
 //!
-//! The upstream engine puts `id` at the front of every object shape it compiles for the
-//! binary protocol, and `the upstream Python client` requests that unconditionally
-//! (`INJECT_OUTPUT_OBJECT_IDS` in `protocol.pyx`), so `o.id` works on a
-//! result even where the query only named other pointers. Pylon used to
-//! return the shape verbatim, which made `.id` on `options: { value }` read
-//! as unset rather than as the row's id — silently, since the field exists
-//! on the schema class either way.
+//! Every object shape compiled for the binary protocol carries `id` at the
+//! front, whether or not the query named it, so `o.id` works on a result even
+//! where the query only asked for other pointers. Pylon used to return the
+//! shape verbatim, which made `.id` on `options: { value }` read as unset
+//! rather than as the row's id — silently, since the field exists on the
+//! schema class either way.
 //!
-//! What these tests pin, following the upstream engine's `_get_shape_configuration_inner`:
+//! What these tests pin:
 //!
 //!   * an explicit shape gains an `id` in front, at the root and nested;
 //!   * a shape that names `id` itself keeps its own, once, where it wrote it;
 //!   * `*` already covers `id`, so nothing is added beside it;
 //!   * a mutation body gets nothing — a link value there is read as one
 //!     column, and a second column makes the subquery illegal;
-//!   * `<json>` gets nothing, matching the upstream engine, whose JSON output carries no
-//!     implicit id either.
+//!   * `<json>` gets nothing, since JSON output carries no implicit id.
 //!
 //! Gated behind `#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]` and `PYLON_PGCON_TEST_DSN`, mirroring every
 //! other file in this suite. Run with:
@@ -319,8 +317,7 @@ async fn a_json_cast_carries_no_id_it_was_not_given() {
     let (pool, sd, module) = fixture("live_implicit_id_json").await;
 
     // `<json>` renders the value as text, so an added key would show up in
-    // it. the upstream engine compiles its JSON output with implicit ids off for the same
-    // reason, and `a CLI query` on the same shape prints `{"name": ...}` alone.
+    // it — the document has to print `{"name": ...}` alone.
     let (rows, _) = run(
         &pool,
         &sd,

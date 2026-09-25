@@ -536,7 +536,7 @@ class TestLinkField:
 
 
 class TestLinkPropertyAccess:
-    """Errors mirror a the upstream engine object's, so ported `obj['@prop']` reads behave alike."""
+    """A missing link property raises rather than reading as `None`."""
 
     def _linked_product(self) -> Product:
         product = _make_product()

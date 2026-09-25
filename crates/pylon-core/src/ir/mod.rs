@@ -553,7 +553,7 @@ pub struct IrScalarPointer {
     /// True only for the `id` the compiler injects into a shape that did not
     /// ask for one — see `Compiler::implicit_id_in_shapes`. The value decodes
     /// like any other property; the flag exists so JSON output can leave it
-    /// out, which is where the upstream engine's own implicit id is absent too.
+    /// out.
     pub implicit_id: bool,
 }
 
@@ -1042,10 +1042,10 @@ pub enum IrExpr {
     /// position means; this is for a pointer that asked for the object.
     ObjectPathSubquery(Box<IrPathSelect>),
     /// An object, with its shape, standing as a value — a free object's
-    /// object-valued field (`{ device := d { id } }`). the upstream engine models a free shape
-    /// as a real object type whose fields are real pointers, so an object
-    /// field stays an object rather than degrading to its id; this is the
-    /// same composite row a single link emits, just uncorrelated.
+    /// object-valued field (`{ device := d { id } }`). A free shape is a real
+    /// object type whose fields are real pointers, so an object field stays an
+    /// object rather than degrading to its id; this is the same composite row
+    /// a single link emits, just uncorrelated.
     ObjectSubquery(Box<IrSelect>),
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
     Tuple(Vec<IrExpr>),
@@ -2504,7 +2504,7 @@ mod tests {
         );
     }
 
-    /// `to_duration(seconds := …)` — the upstream engine's signature is named-only, and every
+    /// `to_duration(seconds := …)` — the signature is named-only, and every
     /// call site writes the names.
     #[test]
     fn test_to_duration_takes_its_arguments_by_name() {
@@ -2517,7 +2517,7 @@ mod tests {
     /// walk is set-valued, so it was gathered as an array and the comparison
     /// came out as `timestamptz[] < timestamptz`, which PostgreSQL rejects
     /// outright. Read back as a scalar subquery the empty case is NULL and the
-    /// `??` supplies the default, as the upstream engine does.
+    /// `??` supplies the default.
     #[test]
     fn test_an_ordering_comparison_reads_a_set_walk_as_one_value() {
         let schema = make_schema();
@@ -2530,8 +2530,8 @@ mod tests {
 
     /// `(select T filter .id = $x).link.prop` is one value, not a one-element
     /// set: the filter pins an exclusive property and every step is a forward
-    /// single link, so nothing multiplies. the upstream engine infers the same, and conduit
-    /// decodes the result straight into a `bool`.
+    /// single link, so nothing multiplies — conduit decodes the result
+    /// straight into a `bool`.
     #[test]
     fn test_a_single_link_walk_off_a_pinned_row_is_not_a_set() {
         let schema = make_schema();
@@ -2574,7 +2574,7 @@ mod tests {
         // The other side of the boundary the test below draws. One statement
         // is one snapshot: a read of the table sees what was there before it
         // ran, and only a walk rooted at the mutation sees what it wrote.
-        // Checked against the upstream engine, which answers 1 and 1 for this shape.
+        // The answer for this shape is 1 and 1.
         let schema = make_schema();
         let ast =
             parse::parse("WITH made := (INSERT Person { name := 'a', age := 1 }) SELECT { after := count(Person) }")
@@ -2607,7 +2607,7 @@ mod tests {
     }
 
     /// `(select …).company[is Company].name` — conduit derives a trust tier
-    /// through a walk like this, and the upstream engine accepts it. A `[is T]` step has no
+    /// through a walk like this, which is legal. A `[is T]` step has no
     /// expression form, so the parser used to reject the whole walk; it is now
     /// carried as `PathStepOn` and re-rooted at a binding.
     #[test]

@@ -21,9 +21,9 @@
 //! so a caller writes `client.query::<Row, _>(pyql, &args)` instead of
 //! walking a generic [`Value`](pylon_client::Value) by hand.
 //!
-//! Deliberately mirrors `the upstream derive crate`'s surface (same derive name, same
+//! Deliberately conventional in its surface (the usual derive name, the usual
 //! `rename`/`json`/`crate_path` attributes under a `pylon` namespace), so a
-//! project moving off the upstream engine's Rust client keeps its row structs as-is. The one
+//! project arriving from another Rust client keeps its row structs as-is. The one
 //! semantic difference is spelled out on
 //! [`Queryable`](pylon_client::Queryable): fields are matched **by name**
 //! rather than by shape position, because Pylon's decoded objects are

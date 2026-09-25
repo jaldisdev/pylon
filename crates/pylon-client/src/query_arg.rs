@@ -21,9 +21,9 @@
 //! collection a query method takes, and [`ValueOpt`] + [`named_args!`] for
 //! building a named collection inline.
 //!
-//! Mirrors `the upstream Rust client's query_arg` closely enough that a call site moving
-//! off the upstream engine's Rust client keeps its argument expressions: `&()` for no
-//! arguments, `&(a, b)` for positional `$0`/`$1`, and
+//! Conventional enough in its surface that a call site arriving from another
+//! Rust client keeps its argument expressions: `&()` for no arguments,
+//! `&(a, b)` for positional `$0`/`$1`, and
 //! `&named_args! { "name" => value }` for `$name`.
 //!
 //! Positional arguments work because PyQL compiles `$0` to the parameter
@@ -84,7 +84,7 @@ impl QueryArg for str {
 }
 
 /// `Vec<u8>` is bytes, not an array of integers — matching
-/// `DecodedValue::from(Vec<u8>)` and the upstream engine's own precedence. That is also why
+/// `DecodedValue::from(Vec<u8>)`, which takes precedence. That is also why
 /// the array impls below are enumerated per element type instead of a
 /// blanket `impl<T: QueryArg> QueryArg for Vec<T>`: the blanket form would
 /// overlap this one, and Rust won't accept the pair on the grounds that
@@ -168,8 +168,8 @@ impl QueryArg for std::time::Duration {
 /// A `json` argument. Bound as JSON text rather than as a
 /// `DecodedValue::Object`, because that is the form `pylon-pgcon` accepts
 /// for a `jsonb` parameter regardless of whether the document's root is an
-/// object, and it matches what a the upstream engine call site was already doing by hand
-/// (`Json::new_unchecked(serde_json::to_string(&value)?)`).
+/// object, and it saves every call site the
+/// `serde_json::to_string(&value)?` it would otherwise write by hand.
 impl QueryArg for serde_json::Value {
     fn to_decoded(&self) -> DecodedValue {
         DecodedValue::Str(self.to_string())
@@ -193,9 +193,8 @@ fn pg_micros(value: chrono::NaiveDateTime) -> i64 {
 }
 
 /// An argument value inside [`named_args!`], constructible from anything
-/// that is a [`QueryArg`]. The Pylon counterpart of
-/// `the upstream Rust client's optional value`, and the reason `named_args!` can mix
-/// argument types in one collection.
+/// that is a [`QueryArg`]. The reason `named_args!` can mix argument types in
+/// one collection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValueOpt(DecodedValue);
 
@@ -253,8 +252,7 @@ impl QueryArgs for Vec<(&str, DecodedValue)> {
 /// Keyed by [`ValueOpt`] rather than by any `V: QueryArg`, because
 /// `ValueOpt` deliberately does *not* implement `QueryArg`: it is built from
 /// one via a blanket `From`, and making it a `QueryArg` too would collide
-/// with the standard library's reflexive `impl<T> From<T> for T`. the upstream engine's
-/// client draws the same line for the same reason.
+/// with the standard library's reflexive `impl<T> From<T> for T`.
 impl QueryArgs for HashMap<&str, ValueOpt> {
     fn to_params(&self) -> Vec<(&str, DecodedValue)> {
         self.iter().map(|(name, value)| (*name, value.0.clone())).collect()
@@ -306,8 +304,7 @@ impl_query_args_for_tuple!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I,
 /// # }
 /// ```
 ///
-/// Mirrors `the upstream Rust client's named_args!` — same syntax, same
-/// `HashMap<&str, ValueOpt>` result, with a trailing comma allowed.
+/// Builds a `HashMap<&str, ValueOpt>`, with a trailing comma allowed.
 #[macro_export]
 macro_rules! named_args {
     ($($key:expr => $value:expr,)+) => { $crate::named_args!($($key => $value),+) };

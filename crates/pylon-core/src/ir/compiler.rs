@@ -552,7 +552,7 @@ fn and_conditions(filter: Option<IrExpr>, extra: Vec<IrExpr>) -> Option<IrExpr> 
 
 const MAX_COMPUTED_SPLICES: usize = 32;
 
-/// `sum`, `any`, `all` and `array_agg` over no rows: SQL gives NULL, the upstream engine the
+/// `sum`, `any`, `all` and `array_agg` over no rows: SQL gives NULL, PyQL the
 /// empty set's own value. `'{}'` rather than `ARRAY[]`, whose element type
 /// PostgreSQL cannot infer on its own — inside a `coalesce` it takes the one
 /// the aggregate already carries.
@@ -584,16 +584,16 @@ fn aggregate_over_nothing(name: &str, aggregate: IrExpr) -> IrExpr {
 /// instead — what an ordering comparison against a single value needs.
 ///
 /// `(.installation.<installation[is RateLimitState].backoff_until < now) ?? true`
-/// is conduit's backoff gate, and the upstream engine evaluates it element-wise: empty set →
+/// is conduit's backoff gate, and it reads element-wise: empty set →
 /// `{}` → the `??` supplies `true`. Rendered as an array the comparison is
 /// `timestamptz[] < timestamptz`, which PostgreSQL has no operator for, so the
 /// statement failed outright. As a scalar subquery the empty case is NULL, the
-/// comparison is NULL, and `COALESCE` supplies the default — matching the upstream engine for
+/// comparison is NULL, and `COALESCE` supplies the default — right for
 /// the nought-or-one sets these walks actually produce (an `exclusive`
 /// constraint guarantees it here). A genuinely many-valued walk now raises
 /// PostgreSQL's own "more than one row returned by a subquery" rather than
-/// comparing element-wise as the upstream engine would; that is a narrower gap than emitting
-/// SQL that cannot run at all.
+/// comparing element-wise; that is a narrower gap than emitting SQL that
+/// cannot run at all.
 fn set_walk_as_scalar(expr: IrExpr) -> IrExpr {
     match expr {
         IrExpr::ArrayFromSelect(source) => match *source {
@@ -933,7 +933,7 @@ pub struct RewriteAssignment {
 /// compiled against the row being written (`NEW`) as `(column, SQL)`, for
 /// the `BEFORE` trigger that applies them. Evaluated on the row as the
 /// statement left it, every rewrite sees the others' inputs, not their
-/// results — as the upstream engine evaluates them.
+/// results.
 pub fn compile_rewrite_assignments(
     type_name: &str,
     on_mask: u8,
@@ -1268,11 +1268,11 @@ pub fn column_default_sql(pyql: &str, schema: &SchemaDescriptor) -> Option<Strin
 /// The pointers whose PyQL default an insert has to expand into its own shape,
 /// paired with that default, because `column_default_sql` cannot render it.
 ///
-/// The upstream engine expands *every* default this way — `_gen_pointers_from_defaults` in its
-/// PyQL compiler adds one shape element per unspecified pointer, which is why
-/// an object-returning default like `created_by := account_of_transaction()` has
-/// always worked there. Here the defaults a column DEFAULT does hold keep using
-/// it, so only the remainder needs the query.
+/// Expanding a default means adding one shape element per unspecified pointer,
+/// which is what makes an object-returning default like
+/// `created_by := account_of_transaction()` work at all. Here the defaults a
+/// column DEFAULT does hold keep using it, so only the remainder needs the
+/// query.
 pub fn inlined_pointer_defaults(td: &TypeDescriptor, schema: &SchemaDescriptor) -> Vec<(String, String)> {
     let properties = td
         .properties
@@ -1487,8 +1487,8 @@ struct Compiler<'a> {
     /// `default()` for every entry point except `compile_with_config`.
     config: crate::ir::SessionConfig,
     /// Whether a shape compiled right now gets an `id` it did not ask for —
-    /// see `prepend_implicit_id`. True at the top level and cleared, conventional,
-    /// for the two places the upstream engine clears it: a mutation's own body, where a link
+    /// see `prepend_implicit_id`. True at the top level and cleared for the
+    /// two places that cannot carry it: a mutation's own body, where a link
     /// value compiles to a one-column correlated subquery that a second column
     /// would break, and under a cast to `json`, which is an output sink whose
     /// text an added key would change.
@@ -1504,14 +1504,14 @@ struct SelectAnchor {
     /// The ancestor an inherited computed is declared on, set only for the
     /// anchor that computed is compiled under.
     ///
-    /// The upstream engine compiles a computed once, against the type that declares it, so
+    /// A computed is compiled once, against the type that declares it, so
     /// `BrandAddon.bundle := (BrandAddon is BrandAddonBundle)` reads its own
     /// row there and keeps doing so through every subtype that inherits it.
     /// Pylon materialises an inherited computed onto each subtype and compiles
     /// it again there, where `BrandAddon` no longer names the subject -- and a
     /// bare type name that anchors nothing reads the whole table. Naming a
-    /// supertype does *not* otherwise mean the subject (confirmed against the upstream engine:
-    /// `select BrandAddonBundle { n := count(BrandAddon) }` is the full count,
+    /// supertype does *not* otherwise mean the subject
+    /// (`select BrandAddonBundle { n := count(BrandAddon) }` is the full count,
     /// while the same shape naming `BrandAddonBundle` is 1), so this is scoped
     /// to the one anchor rather than folded into the general name match.
     declared_on: Option<(String, String)>,
@@ -1532,9 +1532,9 @@ impl SelectAnchor {
 /// The synthetic argument carrying session globals into a function body.
 ///
 /// A session global is normally a query parameter, which a `CREATE FUNCTION`
-/// body cannot have — it would emit a bare `$1` nothing binds. Following the upstream engine's
-/// `__edb_json_globals__`, the caller packs the globals into one jsonb value
-/// and passes it as a leading argument. One opaque argument rather than one
+/// body cannot have — it would emit a bare `$1` nothing binds. Instead the
+/// caller packs the globals into one jsonb value and passes it as a leading
+/// argument. One opaque argument rather than one
 /// per global keeps the function's signature independent of which globals its
 /// body happens to mention, so editing a body does not churn its signature
 /// (and, with PostgreSQL overloading, leave a stale one behind).
@@ -1730,10 +1730,9 @@ impl<'a> Compiler<'a> {
     }
 
     /// True when `sel`'s filter pins an exclusive property to one value, which
-    /// makes it single-valued however many rows the table holds. the upstream engine makes the
-    /// same inference, and it is why
+    /// makes it single-valued however many rows the table holds. It is why
     /// `(select Installation filter .id = <uuid>$x).connector.provider.staff`
-    /// is a value there rather than a one-element set.
+    /// is a value rather than a one-element set.
     fn pins_an_exclusive_property(&self, sel: &IrSelect) -> bool {
         let [IrRowSource::Bound { source, .. }] = sel.rows.as_slice() else {
             return false;
@@ -2047,8 +2046,8 @@ impl<'a> Compiler<'a> {
         Ok(Some(ir))
     }
 
-    /// Reading one field off a free object. the upstream engine compiles a free shape into a
-    /// real object type, so `{ device := d { id }, … }.device` is an ordinary
+    /// Reading one field off a free object. A free shape is a real object
+    /// type, so `{ device := d { id }, … }.device` is an ordinary
     /// path step through a pointer and yields whatever that pointer holds —
     /// an object stays an object. Extracting it out of the jsonb the free
     /// object would otherwise build flattens it back to raw JSON. Any field
@@ -2570,7 +2569,7 @@ impl<'a> Compiler<'a> {
         } else if self.in_fn_body {
             // Inside a function body there is no parameter to bind, so the
             // value is read out of the `__pylon_json_globals__` argument the
-            // caller packs. Mirrors the upstream engine's `__edb_json_globals__`.
+            // caller packs.
             let pg_type = self.resolve_global_pg_type(&global.scalar_type);
             self.used_globals_arg = true;
             // Wrapped in a cast rather than returned bare: `RawSql` carries no
@@ -5025,7 +5024,7 @@ impl<'a> Compiler<'a> {
             _ => return Ok(None),
         };
 
-        // Over no rows SQL's aggregates give NULL where the upstream engine's give the empty
+        // Over no rows SQL's aggregates give NULL where PyQL's give the empty
         // set's own value.
         let over_nothing = aggregate_over_nothing_sql(&f.name).unwrap_or("NULL");
         Ok(Some(IrExpr::FunctionCall(IrFunctionCall {
@@ -5058,7 +5057,7 @@ impl<'a> Compiler<'a> {
         // `array_agg(distinct X.p)` — the DISTINCT belongs *inside* the
         // aggregate. The unary `distinct` emits its operand unchanged (it is
         // normally applied where the set is built, which an aggregate argument
-        // is not), so left here it silently keeps the duplicates the upstream engine drops.
+        // is not), so left here it silently keeps the duplicates.
         let (agg_arg, agg_distinct) = match result {
             Expr::FunctionCall(f) if f.args.len() == 1 => match &f.args[0] {
                 Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOpKind::Distinct) => (Some(&u.operand), true),
@@ -5774,8 +5773,8 @@ impl<'a> Compiler<'a> {
     }
 
     /// A free object's field holding an object with a shape (`{ device := d
-    /// { id } }`). the upstream engine compiles a free shape into a real object type whose
-    /// fields are real pointers, so an object field stays an object; without
+    /// { id } }`). A free shape is a real object type whose fields are real
+    /// pointers, so an object field stays an object; without
     /// this it would compile to the object's bare id, which is not what was
     /// asked for.
     fn free_object_link_field(&mut self, expr: &Expr) -> Result<Option<IrExpr>, PyQLError> {
@@ -6064,7 +6063,7 @@ impl<'a> Compiler<'a> {
     /// reference to an object set (a WITH binding or a bare type name).
     /// The type a union of object sets carries: the one branch type every
     /// other branch is or implements. `A union (insert B)` where B implements
-    /// A is an A-set, which is what PyQL reads it as; requiring the branches
+    /// A is an A-set, which is how PyQL reads it; requiring the branches
     /// to name the same type refuses a get-or-create over an interface.
     fn common_union_type(&self, branches: &[(String, String)]) -> Option<String> {
         let covers_all = |candidate: &String| {
@@ -6286,7 +6285,7 @@ impl<'a> Compiler<'a> {
             _ => false,
         };
         // `{}` contributes no rows, so the union degenerates to the other
-        // branch under its own guard -- which is what the upstream engine's own rewrite
+        // branch under its own guard -- which is what the full rewrite
         // (`SELECT A WHERE Cond UNION ALL SELECT B WHERE NOT Cond`) reduces
         // to when one side is empty.
         // A mutation under a condition is *not* handled here. Guarding the
@@ -6358,7 +6357,7 @@ impl<'a> Compiler<'a> {
         }
         // `existing if exists existing else (insert …)` — the insert still has
         // to carry the condition itself, but the other branch is a set of its
-        // own, so the result is the upstream engine's full rewrite: both branches under
+        // own, so the result is the full rewrite: both branches under
         // opposite guards, unioned.
         let reads_objects = |branch: &Expr, yields: bool| mutating_stmt(branch).is_none() && yields;
         if mutating_stmt(&ie.if_expr).is_some() && reads_objects(&ie.else_expr, else_yields_objects) {
@@ -6726,10 +6725,9 @@ impl<'a> Compiler<'a> {
             let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
             // This select's own shape declares pointers the same way, and its
             // clauses read them the same way: `select T { x := … } order by .x`
-            // is valid PyQL, while one shape pointer reading another is not —
-            // verified against the upstream engine, which accepts the first and rejects the
-            // second. Added only now, after the shape is compiled, so the scope
-            // stops where the upstream engine's does.
+            // is legal, while one shape pointer reading another is not. Added
+            // only now, after the shape is compiled, so the scope stops at the
+            // clauses.
             compiler
                 .active_declared_pointers
                 .extend(shape_elements.iter().filter(|el| el.compexpr.is_some()).cloned());
@@ -8067,8 +8065,8 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        // Pointer defaults the shape leaves out. the upstream engine applies every default by
-        // expanding it into the insert's own shape (`_gen_pointers_from_defaults`);
+        // Pointer defaults the shape leaves out. Every default is applied by
+        // expanding it into the insert's own shape;
         // the ones a column DEFAULT can hold are left to it here, so only the
         // rest — a default reading a session global, or selecting the object to
         // link to — is expanded.
@@ -9316,13 +9314,12 @@ impl<'a> Compiler<'a> {
         Ok(pointers)
     }
 
-    /// Put `id` at the front of a shape that did not select one, as the upstream engine's
-    /// `_get_shape_configuration_inner` does for every binary-protocol query
-    /// (`the upstream Python client` asks for it unconditionally, so every query jaldis ever
-    /// ran against the upstream engine had it). Without it, `o.id` on a shape like
-    /// `options: { value }` reads as unset rather than as the row's id.
+    /// Put `id` at the front of a shape that did not select one, which every
+    /// binary-protocol query carries whether or not it asked. Without it,
+    /// `o.id` on a shape like `options: { value }` reads as unset rather than
+    /// as the row's id.
     ///
-    /// Skipped wherever the upstream engine skips it: inside a mutation's own body and under
+    /// Skipped in the two places that cannot carry it: inside a mutation's own body and under
     /// a cast to `json` — see `implicit_id_in_shapes`. A shape that names `id`
     /// itself keeps its own pointer, and its position, untouched.
     fn prepend_implicit_id(&self, pointers: &mut Vec<IrShapePointer>, td: &TypeDescriptor) {
@@ -9349,8 +9346,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Run `body` with implicit ids suppressed, restoring the previous setting
-    /// however it ends — the upstream engine spells this `with ctx.new(): bodyctx
-    /// .implicit_id_in_shapes = False` around the same constructs.
+    /// however it ends.
     fn without_implicit_id<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T, PyQLError>) -> Result<T, PyQLError> {
         let saved = std::mem::replace(&mut self.implicit_id_in_shapes, false);
         let result = body(self);
@@ -9525,7 +9521,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// The link properties a splat over a multi-link's targets carries: every
-    /// property of its `@pylon.junction` through type, as the upstream engine's splat does.
+    /// property of its `@pylon.junction` through type.
     fn splat_link_properties(&self, ml: &MultiLinkDescriptor) -> Result<Vec<IrLinkProp>, PyQLError> {
         let Some(through_qname) = &ml.through else {
             return Ok(vec![]);
@@ -12027,7 +12023,7 @@ impl<'a> Compiler<'a> {
                 }
                 // A cast to `json` is an output sink: the text it produces is
                 // the value, so an `id` nobody asked for would show up in it.
-                // The upstream engine clears the same flag here (`compiler/expr.py`).
+                // So the flag is cleared for the whole cast.
                 let inner = if casts_to_json(&tc.ty) {
                     self.without_implicit_id(|this| this.compile_expr_ctx(&tc.expr, ctx))?
                 } else {
@@ -12072,8 +12068,8 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
-                // The mirror of the `<str>x` routing below: the upstream engine declares every
-                // str → date/time cast `FROM FUNCTION`, and those functions
+                // The mirror of the `<str>x` routing below: every
+                // str → date/time cast goes through a function, and those
                 // are stricter than PostgreSQL's own input parsers, which
                 // accept `01/16/2026`, a zone-less datetime, or `1 month` as
                 // a duration. Keyed on the type as written, because
@@ -12093,8 +12089,8 @@ impl<'a> Compiler<'a> {
                     if let Some((ns, fn_name)) = parser {
                         return self.resolve_fn_call(Some(ns), fn_name, vec![inner]);
                     }
-                    // Neither of these is a function in the upstream engine either, only a
-                    // cast, so they are internal helpers rather than stdlib
+                    // Neither is reachable as a function, only as a cast, so
+                    // they are internal helpers rather than stdlib
                     // overloads (which would also be indistinguishable, both
                     // taking one `interval`).
                     let helper = match (module, name) {
@@ -12113,8 +12109,8 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
-                // `<str>` of a date/time value is `to_str` of it, the way the upstream engine
-                // declares that cast `FROM FUNCTION std::to_str`. `::text`
+                // `<str>` of a date/time value is `to_str` of it, so that the
+                // cast and the function cannot disagree. `::text`
                 // gives a different answer for the same value — a datetime
                 // renders as `2026-01-16 12:34:56+00` rather than ISO 8601 —
                 // and the two spellings must not disagree. The rest of the
@@ -12444,8 +12440,8 @@ impl<'a> Compiler<'a> {
                             f.name
                         )));
                     };
-                    // Over no rows SQL's aggregates give NULL where the upstream engine's give
-                    // the empty set's own value.
+                    // Over no rows SQL's aggregates give NULL where PyQL's
+                    // give the empty set's own value.
                     let over_nothing = aggregate_over_nothing_sql(&f.name);
                     // An unnested set cannot sit inside the aggregate call;
                     // the walk's rows are aggregated from outside instead.
@@ -13443,7 +13439,7 @@ impl<'a> Compiler<'a> {
             }
 
             // `account := account if cond else {}` — the empty set is a legal
-            // expression in PyQL and means "no value", which is what the
+            // expression and means "no value", which is what the
             // assignment paths already spell `IrExpr::Null`. Only a *non-empty*
             // set literal has no expression-position meaning.
             Expr::Set(items) if items.is_empty() => Ok(IrExpr::Null),
@@ -13941,9 +13937,9 @@ impl<'a> Compiler<'a> {
                     return self.compile_path(&relative, td, alias);
                 }
                 // A prefix naming a type an *enclosing* select already binds —
-                // `select Font { styles: { font := Font.id } }`. PyQL factors
-                // such a prefix out to the scope that binds it, so it reads that
-                // row rather than every row of the type.
+                // `select Font { styles: { font := Font.id } }`. Such a prefix
+                // factors out to the scope that binds it, so it reads that row
+                // rather than every row of the type.
                 if let Some((outer_qualified, outer_alias)) = self.outer_anchor(root) {
                     let relative = ast::Path {
                         steps: p.steps[1..].to_vec(),
@@ -14271,7 +14267,7 @@ impl<'a> Compiler<'a> {
             // A walk made only of forward single links does not multiply rows,
             // so its cardinality is the root binding's. Treating every join as
             // widening made `(select T filter .id = $x).link.prop` a
-            // one-element set where the upstream engine gives the value itself.
+            // one-element set rather than the value itself.
             let widens = ps.joins.iter().any(|join| !matches!(join, IrPathJoin::Single { .. }));
             let root_is_multi = self.multi_row_ctes.contains(root.as_str());
             let multi = matches!(ps.result, IrPathResult::Scalar(..)) && (widens || root_is_multi);
@@ -15591,7 +15587,7 @@ impl<'a> Compiler<'a> {
         let upd_td = self.resolve_type(&type_name)?;
         let table = upd_td.table.clone();
         // The ON CONFLICT target says *which* row conflicts; the ELSE UPDATE's
-        // own filter says whether to touch it at all, and the upstream engine honours it.
+        // own filter says whether to touch it at all, and it is honoured.
         // Dropping it silently turned `unless conflict on .key else (update T
         // filter .expires_at < now() set { … })` into an unconditional steal of
         // a live advisory lock. Compiled against the table name, which is what
@@ -17821,7 +17817,7 @@ pub(crate) fn infer_ir_type(expr: &IrExpr) -> Option<&str> {
         // `a ?? b` and `a if c else b` yield a value of their branches' own
         // type, so a call over either resolves the overload the bare value
         // would. Whichever side carries a type decides: the other is routinely
-        // the untypeable one — an empty set, or a path the upstream engine only knows is
+        // the untypeable one — an empty set, or a path known only to be
         // optional.
         IrExpr::BinOp(b) if b.op == crate::parse::ast::BinOpKind::Coalesce => {
             infer_ir_type(&b.left).or_else(|| infer_ir_type(&b.right))
@@ -17898,7 +17894,7 @@ fn stdlib_array_element_type(expr: &IrExpr) -> Option<&'static str> {
 }
 
 /// What `+` and `-` yield over instants and durations — a datetime minus a
-/// datetime is a duration, a datetime shifted by one is a datetime. the upstream engine's
+/// datetime is a duration, a datetime shifted by one is a datetime.
 /// `duration_to_seconds(datetime_of_transaction() - .started_at)` is the shape
 /// this exists for, and it resolves no overload while the subtraction reads as
 /// untyped.
@@ -17924,7 +17920,7 @@ fn temporal_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Option<
     }
 }
 
-/// The type the upstream engine gives an arithmetic operator's result, from its operands'.
+/// The type an arithmetic operator's result carries, from its operands'.
 /// `None` for anything but a pair of numbers.
 fn arithmetic_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Option<&'static str> {
     use ast::BinOpKind::*;
@@ -17962,7 +17958,7 @@ fn arithmetic_result_type(op: &ast::BinOpKind, left: &str, right: &str) -> Optio
     None
 }
 
-/// What `max`, `min` and `sum` over values of `element` yield in the upstream engine.
+/// What `max`, `min` and `sum` over values of `element` yield.
 fn aggregate_result_type<'a>(name: &str, element: &'a str) -> Option<&'a str> {
     let element = literal_sentinel_to_pg(element);
     match name {
@@ -17974,7 +17970,7 @@ fn aggregate_result_type<'a>(name: &str, element: &'a str) -> Option<&'a str> {
 }
 
 /// The left operand of `left op right`, cast to `float8` when `op` divides
-/// two integers: the upstream engine's `/` yields a float64 there, Postgres's truncates.
+/// two integers: PyQL's `/` yields a float64 there, Postgres's truncates.
 fn true_division_operand(op: &ast::BinOpKind, left: IrExpr, right: &IrExpr) -> IrExpr {
     let integer = |expr: &IrExpr| infer_ir_type(expr).is_some_and(|t| INT_TYPES.contains(&literal_sentinel_to_pg(t)));
     if *op != ast::BinOpKind::Div || !integer(&left) || !integer(right) {

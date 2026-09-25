@@ -17,7 +17,7 @@
 // limitations under the License.
 //
 
-//! A decoded result rendered as JSON, the way the upstream engine renders its own: objects
+//! A decoded result rendered as JSON: objects
 //! carry exactly the pointers their shape selected, in shape order;
 //! temporal values are ISO 8601 strings; durations are ISO 8601 durations;
 //! bytes are base64; enums are their label; decimals keep every digit.

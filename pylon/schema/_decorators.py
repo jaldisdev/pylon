@@ -287,7 +287,7 @@ def _inject_repr(cls: type) -> None:
 
 
 def _inject_link_property_access(cls: type) -> None:
-    """Read a fetched link property as ``obj['@name']``, with the upstream engine's errors."""
+    """Read a fetched link property as ``obj['@name']``, raising if absent."""
 
     def __getitem__(self, name: Any) -> Any:
         if isinstance(name, str) and name.startswith('@'):
@@ -333,8 +333,8 @@ def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None
     Those defaults are `Unfetched` descriptors rather than the bare value:
     `__init__` still gives a constructed instance the declared default, but a
     *hydrated* instance whose shape skipped the field has nothing in its
-    `__dict__`, so reading it raises the way the upstream engine does instead of handing back a
-    `None` that cannot be told apart from a real one. A descriptor only works
+    `__dict__`, so reading it raises instead of handing back a `None` that
+    cannot be told apart from a real one. A descriptor only works
     as a bare class attribute — passed through `dataclasses.field(default=…)`
     it is stored as the value itself — hence the plain `setattr` below.
     """

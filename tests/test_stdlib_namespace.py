@@ -232,7 +232,7 @@ class TestUnknownNames:
 
     @pytest.mark.parametrize('name', ['sqrt', 'abs', 'ceil', 'floor'])
     def test_math_functions_declared_in_math_resolve_there(self, name):
-        # PyQL spells these `math::ceil` and so does every ported query;
+        # PyQL spells these `math::ceil` and so does every call site;
         # answering "it lives in std" made a valid query fail to compile.
         assert getattr(math, name) is not None
 

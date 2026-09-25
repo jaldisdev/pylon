@@ -95,10 +95,10 @@ impl Parser {
         })
     }
 
-    /// The keywords the upstream engine classifies as *unreserved* — legal wherever an
-    /// identifier is, so a shape can carry a field called `last` or `order`.
-    /// The reserved ones (`select`, `filter`, `limit`, …) are not identifiers
-    /// there, and accepting them would take more than the upstream engine does.
+    /// The *unreserved* keywords — legal wherever an identifier is, so a
+    /// shape can carry a field called `last` or `order`. The reserved ones
+    /// (`select`, `filter`, `limit`, …) are not identifiers there, and
+    /// accepting them would take more than the grammar allows.
     fn unreserved_keyword_as_ident(&self) -> Option<String> {
         let spelling = self.keyword_ident_spelling()?;
         matches!(
@@ -268,11 +268,9 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Stmt, PyQLSyntaxError> {
         self.eat(&Token::Select)?;
-        // `select max_priority := max(…)` — PyQL lets a select name its own
-        // result (`SELECT OptionallyAliasedExpr`), and the select's own
-        // clauses may read it by that name. Substituted back in below, which
-        // is what the name means; the upstream engine keeps it as `result_alias` and scopes it
-        // the same way.
+        // `select max_priority := max(…)` — a select may name its own result,
+        // and its own clauses may read it by that name. Substituted back in
+        // below, which is what the name means.
         let result_alias = if matches!(self.current(), Token::Ident(_)) && matches!(self.peek_ahead(1), Token::ColonEq)
         {
             let name = self.eat_ident()?;
@@ -558,9 +556,9 @@ impl Parser {
         }))
     }
 
-    /// `update T { * } filter … set { … }` — the upstream engine parses a DML subject as a
-    /// whole `Expr` (`UPDATE Expr OptFilterClause SET Shape`), and a shape on
-    /// it is what the statement returns, not part of the subject. That is the
+    /// `update T { * } filter … set { … }` — a DML subject is a whole `Expr`,
+    /// and a shape on it is what the statement returns, not part of the
+    /// subject. That is the
     /// same thing as a shape written outside the statement, so it is moved
     /// there and the DML keeps a bare subject.
     fn returning_subject_shape(subject: Expr, build: impl FnOnce(Expr) -> Stmt) -> Stmt {
@@ -627,9 +625,7 @@ impl Parser {
             }
             self.advance();
             // A trailing comma closes the list rather than promising another
-            // binding, the same as every other comma-separated list here and
-            // in PyQL (`WithDeclList`, declared with
-            // `allow_trailing_separator=True`).
+            // binding, the same as every other comma-separated list here.
             if self.stmt_keyword_ahead() {
                 break;
             }
@@ -968,8 +964,8 @@ impl Parser {
             Token::In => BinOpKind::In,
             Token::Is => {
                 self.advance();
-                // `x IS NOT T` — the upstream engine's own `Expr IS NOT TypeExpr`, the negation
-                // of the type check rather than a comparison against `not T`.
+                // `x IS NOT T` is `Expr IS NOT TypeExpr`: the negation of the
+                // type check, not a comparison against `not T`.
                 let negated = matches!(self.current(), Token::Not);
                 if negated {
                     self.advance();
@@ -1037,8 +1033,8 @@ impl Parser {
             self.advance();
             // `x ?? not exists .y` — `??` binds tighter than `not`, but a
             // *prefix* operator opening the right operand is unambiguous, and
-            // PyQL takes it. Parsed at the arithmetic level alone, `not` has
-            // nowhere to go.
+            // so it is accepted. Parsed at the arithmetic level alone, `not`
+            // has nowhere to go.
             let right = if matches!(self.current(), Token::Not) {
                 self.parse_not()?
             } else {
@@ -1147,7 +1143,7 @@ impl Parser {
                 }
                 let ty = self.parse_type_expr()?;
                 self.eat(&Token::Gt)?;
-                // `<bool>exists x` — the upstream engine's cast takes a whole `Expr` at CAST
+                // `<bool>exists x` — a cast takes a whole `Expr` at CAST
                 // precedence, so a prefix operator is a legal operand. Going
                 // back through `parse_unary` (rather than straight to the next
                 // cast) is what lets `exists`/`distinct`/unary minus follow one.
@@ -1245,7 +1241,7 @@ impl Parser {
         if matches!(self.current(), Token::ColonColon) {
             self.advance();
             let mut name = self.eat_ident()?;
-            // `std::cal::relative_duration` — the upstream engine's full spelling of a module
+            // `std::cal::relative_duration` — the full spelling of a module
             // that lives under `std`.
             if first == "std" && matches!(self.current(), Token::ColonColon) {
                 self.advance();
@@ -1403,8 +1399,8 @@ impl Parser {
                 Ok(Expr::Path(p))
             }
             // `(select …).provider[is Individual]` — a step with no expression
-            // form of its own, applied to something that is not a path. the upstream engine
-            // accepts this, so it is carried as `PathStepOn` and the compiler
+            // form of its own, applied to something that is not a path. This
+            // is legal, so it is carried as `PathStepOn` and the compiler
             // re-roots the whole walk at a binding. A base that genuinely
             // cannot be walked fails there, with a message that can say why.
             other => Ok(Expr::PathStepOn {
@@ -1578,9 +1574,9 @@ impl Parser {
 
             // A bare sub-statement in expression position: `x := select .emails
             // filter .primary limit 1`, `x := with y := ... select ...`. The
-            // parenthesised form is handled in `parse_paren_expr`; PyQL accepts
-            // both, and the statement parsers stop on their own at the `,` or `}`
-            // that ends the shape element.
+            // parenthesised form is handled in `parse_paren_expr`; both are
+            // accepted, and the statement parsers stop on their own at the `,`
+            // or `}` that ends the shape element.
             _ if self.at_stmt_start() => {
                 let stmt = self.parse_inner_stmt()?;
                 Ok(Expr::SubQuery(Box::new(stmt)))
@@ -1731,10 +1727,9 @@ impl Parser {
         Ok(first)
     }
 
-    /// A function-call argument, with the `FILTER`/`ORDER BY` PyQL lets one
-    /// carry: `count(.<account[is Step] filter .status != Done)`. The clauses
-    /// belong to the set the argument names, so they become a select over it
-    /// — which is what the upstream engine's own grammar builds for this.
+    /// A function-call argument, with the `FILTER`/`ORDER BY` one may carry:
+    /// `count(.<account[is Step] filter .status != Done)`. The clauses belong
+    /// to the set the argument names, so they become a select over it.
     fn parse_call_arg(&mut self) -> Result<Expr, PyQLSyntaxError> {
         let expr = self.parse_expr()?;
         let filter = if matches!(self.current(), Token::Filter) {

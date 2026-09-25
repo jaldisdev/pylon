@@ -65,8 +65,7 @@ class Unfetched:
     only when the field is absent — which, for a hydrated row, means the shape
     did not ask for it.
 
-    Raising there is what the upstream engine does (`'the upstream Object' object has no attribute
-    'order'`), and it matters more than it sounds: a field that reads as `None`
+    Raising there matters more than it sounds: a field that reads as `None`
     whether it was null or never fetched is indistinguishable from a legitimate
     value, which is how an assessment answer once got written with `[None]` for
     its options. The same reasoning as `LinkSet`'s unhydrated mode, for the

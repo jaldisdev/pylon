@@ -114,8 +114,7 @@ impl Object {
     }
 
     /// The fields JSON output carries — the same, less an `id` nobody asked
-    /// for. the upstream engine's JSON output leaves its own implicit id out too, so a query
-    /// ported from it renders the same document here.
+    /// for. A rendered document holds exactly what the shape named.
     pub fn json_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
         let skip = usize::from(self.implicit_id);
         self.fields.iter().skip(skip).map(|(n, v)| (n.as_str(), v))

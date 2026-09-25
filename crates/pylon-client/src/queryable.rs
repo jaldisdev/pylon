@@ -20,16 +20,15 @@
 //! [`Queryable`] — decoding a generic [`Value`] into a caller's own type,
 //! and the helpers `#[derive(Queryable)]` generates calls to.
 //!
-//! Mirrors `the upstream Rust client`'s trait of the same name in role, not in
-//! mechanism: the upstream engine decodes straight off its binary wire format against a
-//! type descriptor, while Pylon has already walked the compiled shape into
-//! a [`Value`] by the time this runs, so this is a plain
-//! `&Value -> Result<Self>` conversion.
+//! Conventional in role rather than in mechanism: a client that decodes
+//! straight off a binary wire format does so against a type descriptor, while
+//! Pylon has already walked the compiled shape into a [`Value`] by the time
+//! this runs, so this is a plain `&Value -> Result<Self>` conversion.
 //!
-//! **Fields match by name, not by shape position.** the upstream engine's derive compares
-//! the struct's field order against the shape's pointer order and rejects a
-//! mismatch; a Pylon [`Object`] is name-keyed, so order is irrelevant here.
-//! The bug the upstream engine's positional check catches is still caught: a struct field
+//! **Fields match by name, not by shape position.** A positional derive would
+//! compare the struct's field order against the shape's pointer order and
+//! reject a mismatch; a Pylon [`Object`] is name-keyed, so order is irrelevant
+//! here. The bug a positional check catches is still caught: a struct field
 //! the query never selected is a [`DecodeErrorKind::MissingField`], not a
 //! silently-wrong value.
 
@@ -109,10 +108,9 @@ impl DecodeError {
 
     /// A decode failure the caller produced itself, for a consumer that
     /// deserializes a `query_*_json` result with its own deserializer instead
-    /// of going through [`Queryable`]. The counterpart of the upstream engine's
-    /// `ClientError::with_message`, so such a function can keep returning
-    /// this crate's own [`Error`](crate::Error) rather than growing a
-    /// bespoke error type.
+    /// of going through [`Queryable`]. Exists so such a function can keep
+    /// returning this crate's own [`Error`](crate::Error) rather than growing
+    /// a bespoke error type.
     pub fn custom(message: impl Into<String>) -> Self {
         Self::new(DecodeErrorKind::Invalid(message.into()))
     }
@@ -533,8 +531,8 @@ mod tests {
     }
 
     /// Pylon objects are name-keyed, so the shape listing its pointers in a
-    /// different order than the struct declares its fields is not an error —
-    /// unlike the upstream engine's positional check.
+    /// different order than the struct declares its fields is not an error,
+    /// as it would be under a positional check.
     #[test]
     fn field_order_does_not_matter() {
         let id = uuid::Uuid::from_u128(1);
@@ -549,8 +547,8 @@ mod tests {
         assert_eq!(row.id, id);
     }
 
-    /// The bug the upstream engine's positional check exists to catch: a struct field the
-    /// query never selected has to be an error, not a default.
+    /// The bug a positional check exists to catch: a struct field the query
+    /// never selected has to be an error, not a default.
     #[test]
     fn a_field_the_shape_omitted_is_an_error() {
         let error = Row::decode(&object(vec![

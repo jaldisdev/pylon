@@ -76,7 +76,7 @@ class AsyncTransaction:
     ) -> None:
         self._tx = tx
         self._retry_exc: Exception | None = None
-        # The client's own, as in the upstream engine: a transaction sees the globals it was opened with.
+        # The client's own: a transaction sees the globals it was opened with.
         self._globals: dict[str, Any] = globals_ or {}
         self._config_options: dict[str, Any] = config_options or {}
 
@@ -392,7 +392,7 @@ class Client:
         c._config = self._config
         c._ref = self._ref
         c._warnings = self._warnings
-        # An unqualified name is a global of the `default` module, as in the upstream engine.
+        # An unqualified name is a global of the `default` module.
         c._globals = {
             **self._globals,
             **{name if '::' in name else f'default::{name}': value for name, value in globals_.items()},
@@ -982,11 +982,10 @@ def _normalize_pyql_source(pyql: Any, kwargs: dict[str, Any]) -> tuple[str, dict
 def _check_arguments(expected: set[str], kwargs: dict[str, Any]) -> None:
     """Refuse arguments the query does not declare, and vice versa.
 
-    the upstream engine rejects a stray argument rather than ignoring it, and a silently
-    dropped one hides what it usually is: a condition that was edited out, or
-    a name that no longer matches. The wording is the upstream engine's own, from
-    `_make_missing_args_error_message` in its `object.pyx` codec, so a message
-    carried over from an older log or test still reads the same.
+    A stray argument is rejected rather than ignored: a silently dropped one
+    hides what it usually is — a condition that was edited out, or a name that
+    no longer matches. The wording is fixed, so a message carried over from an
+    older log or test still reads the same.
     """
     passed = set(kwargs)
     if not expected:
@@ -1009,10 +1008,9 @@ def _check_array_elements(kwargs: dict[str, Any]) -> None:
     PyQL has no `array<optional T>`, so a `None` element is never a value the
     query can mean — but bound as SQL NULL it compares equal to nothing and
     the query quietly returns no rows, which is how an assessment answer once
-    got written with none of its options linked. the upstream engine rejects it client-side,
-    before execution, and the wording here is the upstream engine's own (verified against
-    the upstream Python client, which raises `InvalidArgumentError`) so a message
-    carried over from an older log or test still reads the same.
+    got written with none of its options linked. Refused client-side, before
+    execution, and the wording is fixed, so a message carried over from an
+    older log or test still reads the same.
     """
     for name, value in kwargs.items():
         if not isinstance(value, (list, tuple)):
@@ -1117,8 +1115,8 @@ def _looks_like_a_script(pyql: str) -> bool:
 
 
 def _json_documents(rows: Any, compiled: CompiledQuery) -> list[str]:
-    """Each row as the JSON document the upstream engine would render for it, from the rows
-    the query already returned rather than a second, rewrapped run."""
+    """Each row as its own JSON document, built from the rows the query already
+    returned rather than from a second, rewrapped run."""
     from pylon._core import rows_to_json
 
     return rows_to_json(rows, compiled)

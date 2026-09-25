@@ -151,12 +151,10 @@ pub enum DecodedValue {
 // ── Native-type conversions ──────────────────────────────────────────────────
 //
 // Lets a caller write `"id".into()`/`some_uuid.into()` instead of spelling
-// out `DecodedValue::Uuid(...)` at every query-parameter call site — mirrors
-// `the upstream Rust client's value`'s own `From<T>` impls (verified against
-// `the upstream Rust client` 0.9.2's `value.rs`), which exist for exactly this reason:
-// the wrapper enum itself isn't going away (a query parameter/result still
-// has to carry its own runtime type tag), but constructing one shouldn't
-// require spelling out the variant name by hand for the common cases.
+// out `DecodedValue::Uuid(...)` at every query-parameter call site. The
+// wrapper enum itself isn't going away — a query parameter/result still has
+// to carry its own runtime type tag — but constructing one shouldn't require
+// spelling out the variant name by hand for the common cases.
 //
 // `i16`/`i32` and `f32` widen into this crate's single `I64`/`F64` variants
 // rather than getting their own — `DecodedValue` has never distinguished

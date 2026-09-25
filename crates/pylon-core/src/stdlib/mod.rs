@@ -327,8 +327,8 @@ pub fn lookup(namespace: &str, name: &str) -> Vec<&'static FnDescriptor> {
 /// type behind them — no migration creates one — so a member compiles to a
 /// plain `text` literal that the function consuming it switches on.
 ///
-/// Mirrors the upstream engine's `std::Endian`, member order included (verified against a live
-/// instance: `enum_values` is `["Little", "Big"]`).
+/// Member order is part of the contract, not an implementation detail:
+/// `enum_values` is `["Little", "Big"]`.
 static STDLIB_ENUMS: OnceLock<Vec<crate::schema::EnumDescriptor>> = OnceLock::new();
 
 pub fn stdlib_enums() -> &'static [crate::schema::EnumDescriptor] {

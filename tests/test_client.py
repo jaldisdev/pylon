@@ -155,8 +155,8 @@ class TestCompileAndBind:
             _compile_and_bind('select $name', {})
 
     def test_an_argument_the_query_does_not_declare_is_refused(self):
-        # The upstream engine raises rather than ignoring it, and a dropped argument hides the
-        # bug it usually is — a condition edited out, or a renamed parameter.
+        # Raising beats ignoring it: a dropped argument hides the bug it
+        # usually is — a condition edited out, or a renamed parameter.
         from pylon.client import _compile_and_bind
         from pylon.exceptions import UnknownParameterError
 
@@ -170,7 +170,7 @@ class TestCompileAndBind:
     def test_a_none_inside_an_array_argument_is_refused(self):
         # PyQL has no `array<optional T>`, so a None element is not a value the
         # query can mean; bound as SQL NULL it silently matches nothing. The
-        # message is the upstream engine's own, observed from the upstream Python client:
+        # The message is fixed:
         #   invalid input for query argument $ids: [None]
         #     (invalid array element at index 0: None is not allowed)
         from pylon.client import _compile_and_bind
@@ -815,7 +815,7 @@ class TestWithGlobals:
         assert view._require_pool() is pool
 
     def test_an_unqualified_name_is_a_default_global(self):
-        # As in the upstream engine: `with_globals({'current_account_id': …})` sets `default::current_account_id`.
+        # `with_globals({'current_account_id': …})` sets `default::current_account_id`.
         client = _client_with_pool(_make_pool())
         view = client.with_globals({'current_account_id': 1, 'account::region': 'eu'})
         assert view._globals == {'default::current_account_id': 1, 'account::region': 'eu'}
@@ -917,9 +917,9 @@ class TestEnsureConnected:
         run(_run())
 
     def test_a_query_opens_the_pool_when_nothing_connected_first(self):
-        # the upstream engine's client connects on its first query, and a client is reached
-        # from request handlers, workers and CLI commands alike, which share
-        # no startup to connect from.
+        # The client connects on its first query: it is reached from request
+        # handlers, workers and CLI commands alike, which share no startup to
+        # connect from.
         async def _run():
             from pylon.client import Client
             from pylon.config import CacheConfig

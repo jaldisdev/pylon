@@ -385,8 +385,7 @@ pub fn export_stdlib() -> String {
         "$$;\n\n",
         // PostgreSQL has no expression-level RAISE, so an overload whose
         // `optional<str>` format argument has to be rejected inline needs a
-        // function that only ever raises — the same trick the upstream engine's own
-        // `a raise helper` plays.
+        // function whose only job is to raise.
         "CREATE OR REPLACE FUNCTION _pylon.raise_invalid_parameter(msg text)\n",
         "\tRETURNS text\n",
         "\tLANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT\n",
@@ -396,8 +395,8 @@ pub fn export_stdlib() -> String {
         "END\n",
         "$$;\n\n",
         // `<duration>` and `<cal::date_duration>` of a string. Both are
-        // `interval`, so neither can be a stdlib overload keyed on its type —
-        // and neither is a function in the upstream engine either, only a cast.
+        // `interval`, so neither can be a stdlib overload keyed on its type,
+        // and neither is reachable as a function — only as a cast.
         "CREATE OR REPLACE FUNCTION _pylon.duration_in(val text)\n",
         "\tRETURNS interval\n",
         "\tLANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT\n",

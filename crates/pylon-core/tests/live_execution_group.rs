@@ -475,7 +475,7 @@ async fn seed_departments(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, mod
         )
         .await;
     }
-    // No department: the upstream engine groups the rows whose key is empty together too.
+    // No department: the rows whose key is empty group together too.
     exec(
         pool,
         sd,

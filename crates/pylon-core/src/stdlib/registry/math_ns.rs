@@ -89,8 +89,8 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("math", "var", vec![p("s", set_of(Decimal))], Decimal, B("var_samp")),
         f("math", "var_pop", vec![p("s", set_of(Float64))], Float64, B("var_pop")),
         f("math", "var_pop", vec![p("s", set_of(Decimal))], Decimal, B("var_pop")),
-        // The upstream engine declares these in `math::`, not `std::` — `std::ceil` alone
-        // leaves `math::ceil(…)` reading as a function that does not exist.
+        // These belong in `math::`, not `std::` — `std::ceil` alone would
+        // leave `math::ceil(…)` reading as a function that does not exist.
         f("math", "abs", vec![p("x", Int64)], Int64, B("abs")),
         f("math", "abs", vec![p("x", Float64)], Float64, B("abs")),
         f("math", "abs", vec![p("x", Decimal)], Decimal, B("abs")),

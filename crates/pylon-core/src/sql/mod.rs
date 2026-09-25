@@ -3275,7 +3275,7 @@ fn emit_for_iterator(it: &IrForIterator, iter_alias: &str) -> (String, String) {
 /// The iterator CTE of a `for` nested in another one. The enclosing iterator
 /// goes in its FROM, so the walk it iterates can read the outer loop variable,
 /// and its key rides along as `_outer` for the body to join back on — the bond
-/// the upstream engine's own `merge_iterator` puts between a chain of iterator CTEs.
+/// that holds a chain of iterator CTEs together.
 fn emit_nested_for_iterator(it: &IrForIterator, iter_alias: &str, outer_alias: &str) -> String {
     const OUTER: &str = "_outer";
     match it {
@@ -6390,9 +6390,9 @@ mod tests {
 
     #[test]
     fn test_a_free_object_field_holding_an_object_keeps_it_an_object() {
-        // The upstream engine compiles a free shape into a real object type whose fields are
-        // real pointers, so an object field stays an object. Pylon used to
-        // build the free object as jsonb, which flattened it to the bare id.
+        // A free shape is a real object type whose fields are real pointers,
+        // so an object field stays an object. Pylon used to build the free
+        // object as jsonb, which flattened it to the bare id.
         let out = compile_and_emit_with(
             "WITH c := (SELECT Company LIMIT 1) SELECT { co := c { name }, n := 1 }",
             &make_schema(),
@@ -6563,8 +6563,8 @@ mod tests {
     #[test]
     fn an_object_returning_link_default_is_applied_by_the_insert() {
         // A column DEFAULT cannot hold this one — PostgreSQL evaluates it with
-        // no query in scope — so the insert has to carry it, the way the upstream engine's
-        // `_gen_pointers_from_defaults` expands every default into the shape.
+        // no query in scope — so the insert has to carry it, expanded into
+        // the shape.
         let schema = make_schema_with_an_object_returning_default();
         let out = compile_and_emit_with("INSERT Person { name := $n }", &schema);
         assert!(
@@ -6642,7 +6642,7 @@ mod tests {
 
     #[test]
     fn an_inherited_computed_naming_its_declaring_type_still_means_the_row() {
-        // The upstream engine compiles a computed once, against the type that declares it, so
+        // A computed is compiled once, against the type that declares it, so
         // the name reaches the subject on every subtype that inherits it.
         // Pylon compiles it again per subtype, where the name matched nothing
         // and the reference read the whole table instead.
@@ -6689,9 +6689,9 @@ mod tests {
 
     #[test]
     fn a_shape_writing_the_computed_out_itself_does_not_get_the_anchor() {
-        // The rule the upstream engine actually has is narrow: only a *declared* computed is
-        // compiled against its declaring type. Naming a supertype anywhere
-        // else is that supertype's own set — confirmed against the upstream engine, where
+        // The rule is narrow: only a *declared* computed is compiled against
+        // its declaring type. Naming a supertype anywhere else is that
+        // supertype's own set —
         // `select BrandAddonBundle { n := count(BrandAddon) }` is the full
         // count while the same shape naming `BrandAddonBundle` is 1. So the
         // same expression written out in a shape keeps resolving on its own,
@@ -6709,8 +6709,8 @@ mod tests {
 
     #[test]
     fn a_default_that_compiles_nowhere_is_still_an_error() {
-        // jaldis carried `sequence_next(INTROSPECT marketplace::OrderNo)`, the upstream engine
-        // syntax Pylon cannot parse. Inlining must not turn that into silence.
+        // jaldis carried `sequence_next(INTROSPECT marketplace::OrderNo)`,
+        // which PyQL cannot parse. Inlining must not turn that into silence.
         let mut schema = make_schema();
         let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
         let age = person.properties.iter_mut().find(|p| p.name == "age").unwrap();
@@ -6982,7 +6982,7 @@ mod tests {
 
     #[test]
     fn test_one_branch_of_an_object_if_else_is_empty() {
-        // `{}` contributes no rows, so the upstream engine's own rewrite (`SELECT A WHERE
+        // `{}` contributes no rows, so the full rewrite (`SELECT A WHERE
         // Cond UNION ALL SELECT B WHERE NOT Cond`) reduces to the other
         // branch under its guard.
         let out = compile_and_emit_with(
@@ -7529,7 +7529,7 @@ mod tests {
 
     #[test]
     fn test_an_unreserved_keyword_names_a_free_shape_field() {
-        // `last`, `first` and `order` are unreserved in PyQL, so a shape can
+        // `last`, `first` and `order` are unreserved keywords, so a shape can
         // carry them. Read as a set literal, the `:=` has nowhere to go.
         let out = compile_and_emit("SELECT { last := 2, first := 1, order := 3 }");
         assert!(out.sql.contains("\"last\""), "{}", out.sql);
@@ -7604,7 +7604,7 @@ mod tests {
     #[test]
     fn test_a_nested_for_carries_the_outer_loops_key() {
         // The inner iterator has the outer one in its FROM, and the insert
-        // joins the two back on the key it carries — the upstream engine's own iterator bond.
+        // joins the two back on the key it carries.
         let out = compile_and_emit(
             "WITH made := (FOR p IN (SELECT Person) UNION ( \
                FOR q IN p.posts UNION (INSERT Company { name := q.title }) \
@@ -7721,8 +7721,8 @@ mod tests {
 
     #[test]
     fn test_a_select_can_name_its_own_result() {
-        // `SELECT OptionallyAliasedExpr` in PyQL: the alias names the result
-        // and the select's own clauses may read it by that name.
+        // A select may name its own result: the alias names it and the
+        // select's own clauses may read it by that name.
         let out = compile_and_emit("SELECT oldest := max(Person.age)");
         assert!(out.sql.contains("max("), "{}", out.sql);
         let filtered = compile_and_emit("SELECT n := Person.age FILTER n > 18");
@@ -8612,7 +8612,7 @@ mod tests {
         // `.<link[is T].multilink.prop` — the tail after a backlink was read
         // one arity at a time (property, or link-then-property), so anything
         // crossing a multi-link had no single column to read and was refused.
-        // Counted against the migrated data it agreed with the upstream engine: 4 and 4.
+        // Counted against the migrated data the answer is 4 and 4.
         let out = compile_and_emit("SELECT Post FILTER any(.<posts[is Person].posts.title = $t)");
         assert!(
             out.sql.contains(r#""public"."Person.posts""#),
@@ -8625,7 +8625,7 @@ mod tests {
     fn test_an_intersection_narrows_the_rest_of_a_multilink_walk() {
         // `.posts[is Post].title` — the narrowed type's own table is what the
         // remaining steps join to, so a row of any other type drops out
-        // without a separate check. Agreed with the upstream engine on real data (1 and 1).
+        // without a separate check. On real data the answer is 1 and 1.
         let out = compile_and_emit("SELECT Person FILTER any(.posts[is Post].title = $t)");
         assert!(
             out.sql.contains(r#""public"."Post""#),
@@ -8689,7 +8689,7 @@ mod tests {
         // which has no type name to be a schema select's subject. It means the
         // same as `array_agg(Person.name)` with the select's own modifiers on
         // the walk, which the path-select builder already handles. Checked
-        // against the upstream engine's own answer, element for element.
+        // element for element against the unwrapped spelling.
         let out = compile_and_emit("SELECT array_agg((SELECT Person.name))");
         assert!(
             out.sql.contains("array_agg") && out.sql.contains(r#""public"."Person""#),
@@ -8703,8 +8703,8 @@ mod tests {
         // `array_agg(distinct x)` used to emit `array_agg(x)`: the unary
         // `distinct` emits its operand unchanged, because it is normally
         // applied where the set is built — which an aggregate argument is not.
-        // Both spellings mean the same thing and both were checked against
-        // the upstream engine, which returns one element where the old output returned two.
+        // Both spellings mean the same thing, and both have to return one
+        // element where the old output returned two.
         for query in [
             "SELECT array_agg(DISTINCT Person.name)",
             "SELECT array_agg((SELECT DISTINCT Person.name))",
@@ -8720,9 +8720,9 @@ mod tests {
 
     #[test]
     fn test_is_not_negates_the_type_check() {
-        // `x IS NOT T` is the upstream engine's own `Expr IS NOT TypeExpr` — the negation of
-        // the check, not a comparison against some type `not T`. Counted
-        // against the migrated data it came out as 3 of 3, matching the upstream engine.
+        // `x IS NOT T` is `Expr IS NOT TypeExpr` — the negation of the check,
+        // not a comparison against some type `not T`. Counted against the
+        // migrated data it came out as 3 of 3.
         let positive = compile_and_emit("SELECT Person FILTER Person IS Person");
         let negative = compile_and_emit("SELECT Person FILTER Person IS NOT Person");
         assert!(
@@ -8735,9 +8735,9 @@ mod tests {
 
     #[test]
     fn test_a_cast_takes_a_prefix_operator_as_its_operand() {
-        // `<bool>exists x` is valid PyQL — the upstream engine's cast takes a whole `Expr` at
-        // CAST precedence. Pylon's cast went straight to a postfix expression,
-        // so any prefix operator after one failed to parse.
+        // `<bool>exists x` is legal — a cast takes a whole `Expr` at CAST
+        // precedence. Pylon's cast went straight to a postfix expression, so
+        // any prefix operator after one failed to parse.
         for query in ["SELECT <bool>EXISTS (SELECT Person LIMIT 1)", "SELECT <int64>-1"] {
             let ast = parse::parse(query).unwrap_or_else(|e| panic!("{query} should parse: {e}"));
             assert!(ir::compile(&ast, &make_schema()).is_ok(), "{query} should compile");
@@ -8761,9 +8761,9 @@ mod tests {
 
     #[test]
     fn test_a_select_reads_its_own_shape_computed_in_its_clauses() {
-        // `select T { x := … } order by .x` — the upstream engine puts a shape's computeds in
-        // scope for the select's own clauses (but not for a sibling pointer,
-        // which it rejects, so the scope stops at the clauses).
+        // `select T { x := … } order by .x` — a shape's computeds are in scope
+        // for the select's own clauses, but not for a sibling pointer, so the
+        // scope stops at the clauses.
         let out = compile_and_emit("SELECT Person { n := .name } ORDER BY .n ASC");
         assert!(
             out.sql.contains("ORDER BY"),
@@ -8804,8 +8804,8 @@ mod tests {
 
     #[test]
     fn test_a_sibling_shape_pointer_is_not_in_scope() {
-        // The upstream engine rejects one shape pointer reading another; matching that is what
-        // keeps four graph queries reported as the application bugs they are.
+        // One shape pointer reading another is refused, which is what keeps
+        // four graph queries reported as the application bugs they are.
         let schema = make_schema();
         let ast = parse::parse("SELECT Person { n := .name, copy := .n }").unwrap();
         assert!(ir::compile(&ast, &schema).is_err());
@@ -8837,7 +8837,7 @@ mod tests {
     #[test]
     fn test_nested_shape_reads_a_prefix_bound_by_the_outer_select() {
         // `Person.name` inside the `posts` shape names a type the enclosing
-        // select binds, so PyQL reads the outer row — not every Person. The
+        // select binds, so it reads the outer row — not every Person. The
         // prefix used to be rejected outright because only the *innermost*
         // subject was checked.
         let out = compile_and_emit("SELECT Person { name, posts: { title, who := Person.name } }");
@@ -9087,7 +9087,7 @@ mod tests {
         );
     }
 
-    /// `array_agg` over no rows is `[]` in the upstream engine and NULL in SQL, which reaches
+    /// `array_agg` over no rows is `[]` in PyQL and NULL in SQL, which reaches
     /// a caller as a missing value where a list was promised.
     #[test]
     fn test_array_agg_over_nothing_is_an_empty_array_not_null() {
@@ -11118,7 +11118,7 @@ mod tests {
         // Regression: `array_agg(a.posts.title)` compiled the path as an
         // expression, where a multi-valued path stands for the array of its
         // elements — so the aggregate wrapped that array and the result came
-        // back one level deep, `[[t1, t2]]` where the upstream engine gives `[t1, t2]`.
+        // back one level deep, `[[t1, t2]]` rather than `[t1, t2]`.
         let schema = make_schema();
         let out = compile_and_emit_with(
             "with a := (select Person limit 1) select { titles := array_agg(a.posts.title) }",
@@ -12416,8 +12416,8 @@ select owner { posts := (select owner.posts.title) };",
         // Every step is a forward single link and the filter pins the id, so
         // the `[is Individual]` narrowing does not make the walk set-valued.
         // Gathered as an array the `??` default became `array_remove(ARRAY[…])`
-        // and the result decoded as a one-element set where the upstream engine gives the
-        // value itself.
+        // and the result decoded as a one-element set rather than as the value
+        // itself.
         let out = compile_and_emit_with(
             "SELECT { s := ((SELECT Installation FILTER .id = <uuid>$0).connector.provider[is Individual].email) ?? 'y' }",
             &two_hop_interface_schema(),
@@ -12805,8 +12805,8 @@ select owner { posts := (select owner.posts.title) };",
 
     #[test]
     fn test_shallow_splat_leaves_object_valued_computeds_to_the_deep_form() {
-        // Regression: `*` expanded every computed, link-valued ones included,
-        // which the upstream engine's `*` does not -- it is properties only, `**` adds links.
+        // Regression: `*` expanded every computed, link-valued ones included.
+        // `*` is properties only; `**` adds links.
         // On jaldis's schema that pulled a computed multi-link
         // (`members := .memberships.member`) into every splat query.
         let mut schema = make_schema();

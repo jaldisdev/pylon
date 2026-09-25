@@ -293,7 +293,7 @@ async fn outer_shape_replaces_the_aliases_own_shape() {
 
 /// A pointer the query itself declares, read back by the *outer* select's
 /// filter — including one whose value is an if/else, which the field access
-/// has to distribute over. the upstream engine accepts both; Pylon used to report the pointer
+/// has to distribute over. Both are legal; Pylon used to report the pointer
 /// as unknown, or as "a computed pointer with no stored column to traverse".
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]

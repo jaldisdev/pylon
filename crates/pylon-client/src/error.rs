@@ -45,8 +45,8 @@ pub enum Error {
     #[error("missing query parameter: {0}")]
     MissingParam(String),
     /// An argument the query cannot mean — today only a NULL inside an array,
-    /// which PyQL has no type for. Carries the upstream engine's own wording so the two
-    /// clients report it the same way.
+    /// which PyQL has no type for. Carries the wording verbatim so every
+    /// client reports it the same way.
     #[error("{0}")]
     InvalidArgument(String),
     /// `query_single`/`query_required_single` (and their `_json` siblings)
