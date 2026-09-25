@@ -3791,7 +3791,7 @@ impl<'a> Compiler<'a> {
                 // types share no ids at all, so the join finds nothing — which
                 // is exactly what an impossible intersection yields. A mixin
                 // has no relation; its columns are already on the current row.
-                let narrowed_has_relation = !narrowed.abstract_ || narrowed.materialized;
+                let narrowed_has_relation = !Self::backs_no_relation(narrowed);
                 if narrowed_has_relation && narrowed.table != current_td.table {
                     let target_alias = self.fresh_alias();
                     let target = IrSource {
@@ -14376,12 +14376,19 @@ impl<'a> Compiler<'a> {
         !td.abstract_ && self.schema.types.iter().any(|t| t.bases.contains(&qname))
     }
 
+    /// A plain `@pylon.abstract` mixin, materialised as nothing at all.
+    /// Unlike an interface it backs no view, so naming its table reaches a
+    /// relation that does not exist.
+    fn backs_no_relation(td: &TypeDescriptor) -> bool {
+        td.abstract_ && !td.materialized
+    }
+
     /// See `IrOutput::subtype_fanouts`.
     fn subtype_fanouts(&self) -> HashMap<(String, String), IrPolyFanout> {
         self.schema
             .types
             .iter()
-            .filter(|t| self.has_subtypes(t))
+            .filter(|t| self.has_subtypes(t) || Self::backs_no_relation(t))
             .filter_map(|t| {
                 let fanout = self.poly_fanout_for(&format!("{}::{}", t.module, t.name))?;
                 Some(((t.module.clone(), t.table.clone()), fanout))

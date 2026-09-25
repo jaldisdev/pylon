@@ -7153,6 +7153,102 @@ mod tests {
         );
     }
 
+    /// The same plain abstract, but keeping `Person`'s `company` link so a
+    /// backlink can be narrowed to it the way jaldis narrows one to
+    /// `default::Creatable`.
+    fn make_schema_with_a_linking_plain_abstract() -> SchemaDescriptor {
+        let mut schema = make_schema_with_a_plain_abstract();
+        let person_links = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Person")
+            .expect("Person is in the test schema")
+            .links
+            .clone();
+        let archivable = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Archivable")
+            .expect("just added");
+        archivable.links = person_links;
+        schema
+    }
+
+    #[test]
+    fn test_a_plain_abstract_in_a_subquery_fans_out() {
+        let schema = make_schema_with_a_plain_abstract();
+        let out = compile_and_emit_with(
+            "SELECT Person FILTER .id IN (SELECT default::Archivable FILTER .age > 1).id",
+            &schema,
+        );
+        assert!(
+            !out.sql.contains("\"Archivable\""),
+            "a plain abstract backs no relation:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_backlink_narrowed_to_a_plain_abstract_fans_out() {
+        let schema = make_schema_with_a_linking_plain_abstract();
+        let out = compile_and_emit_with(
+            "SELECT Company FILTER .<company[is default::Archivable].name = 'a'",
+            &schema,
+        );
+        assert!(
+            !out.sql.contains("\"Archivable\""),
+            "a plain abstract backs no relation:\n{}",
+            out.sql
+        );
+    }
+
+    /// `Account` as a real interface (a view), with a plain abstract only its
+    /// implementor carries — jaldis reads `[is default::Auditable].*` off
+    /// `marketplace::IdentifiableListing` exactly this way.
+    fn make_interface_schema_with_a_plain_abstract() -> SchemaDescriptor {
+        let mut schema = make_interface_schema();
+        let mut archivable = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Individual")
+            .expect("Individual is in the interface schema")
+            .clone();
+        archivable.name = "Archivable".into();
+        archivable.table = "Archivable".into();
+        archivable.abstract_ = true;
+        archivable.materialized = false;
+        archivable.interfaces = vec![];
+        archivable.links = vec![];
+        archivable.multilinks = vec![];
+        archivable.computed = vec![];
+        schema.types.push(archivable);
+        for t in schema.types.iter_mut() {
+            match t.name.as_str() {
+                // A view to read, so the splat cannot fall back to it.
+                "Account" => t.materialized = true,
+                "Individual" => t.parents.push("default::Archivable".into()),
+                _ => {}
+            }
+        }
+        schema
+    }
+
+    #[test]
+    fn test_a_splat_over_a_plain_abstract_fans_out() {
+        let schema = make_interface_schema_with_a_plain_abstract();
+        let out = compile_and_emit_with("SELECT Account { id, [is default::Archivable].* }", &schema);
+        assert!(
+            !out.sql.contains("\"Archivable\""),
+            "a plain abstract backs no relation:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("first_name"),
+            "the splat still reaches the mixin's own pointers:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn test_an_aggregate_over_a_relative_walk_runs_inside_the_subquery() {
         // Compiled as an expression the walk stands for the array of its
