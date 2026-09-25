@@ -189,6 +189,19 @@ class TestUnhydratedLinkSet:
         assert LinkSet().is_hydrated
         assert not LinkSet(unhydrated=True).is_hydrated
 
+    def test_the_refusal_names_the_pointer_and_its_owner(self, models):
+        # The message is the only thing the caller sees, and it surfaces deep
+        # inside whatever iterated the link, so it has to say which one.
+        _Tag, _Author, Post, _schema = models
+        pointer = Post.__pylon_config__.pointers['tags']
+        unfetched = LinkSet(unhydrated=True, pointer=pointer, owner='Post')
+        with pytest.raises(AttributeError, match=r'cannot iterate Post\.tags — it was not fetched'):
+            list(unfetched)
+
+    def test_the_refusal_falls_back_when_there_is_nothing_to_name(self):
+        with pytest.raises(AttributeError, match='cannot iterate a multi-link — it was not fetched'):
+            list(LinkSet(unhydrated=True))
+
 
 # ── Fresh instances ──────────────────────────────────────────────────────────
 

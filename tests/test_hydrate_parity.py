@@ -152,7 +152,14 @@ def _describe(value):
     `list`, because each is a subclass of the next.
     """
     if isinstance(value, LinkSet):
-        return ('LinkSet', value.is_hydrated, [_describe(v) for v in (value if value.is_hydrated else ())])
+        # The label carries the pointer and owner names a refused read reports,
+        # so the two walks have to agree on those too.
+        return (
+            'LinkSet',
+            value.is_hydrated,
+            value._pointer_label(),
+            [_describe(v) for v in (value if value.is_hydrated else ())],
+        )
     if isinstance(value, PylonSet):
         return ('PylonSet', [_describe(v) for v in value])
     if isinstance(value, NamedTupleValue):
@@ -294,6 +301,12 @@ class TestMultiLinks:
         native = assert_parity([('m::Post', _id(1), 'Hello')], compiled)
         assert isinstance(native[0].tags, LinkSet)
         assert not native[0].tags.is_hydrated
+
+    def test_reading_an_unrequested_multilink_names_it(self):
+        compiled = _compile('select m::Post { title }')
+        native = assert_parity([('m::Post', _id(1), 'Hello')], compiled)
+        with pytest.raises(AttributeError, match=r'cannot iterate Post\.tags'):
+            list(native[0].tags)
 
     def test_multilinks_are_excluded_from_the_saved_copy(self):
         compiled = _compile('select m::Post { title, tags: { label } }')

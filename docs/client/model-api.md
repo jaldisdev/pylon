@@ -245,7 +245,7 @@ await client.save(p)
 Reading one that wasn't fetched raises instead of showing an empty list, which would be a lie:
 
 ```python
-len(p.friends)              # AttributeError: cannot take the length of a multi-link that was not fetched
+len(p.friends)              # AttributeError: cannot take the length of Person.friends — it was not fetched
 ```
 
 Code that would rather fall back to a second query than raise can ask first — `is_hydrated` is the only read an unfetched `LinkSet` allows:

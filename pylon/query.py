@@ -193,7 +193,7 @@ def _install_link_sets(obj: Any, cls: type, kwargs: dict) -> None:
         if name in kwargs:
             obj.__dict__[name] = LinkSet(kwargs[name] or (), pointer=meta)
         else:
-            obj.__dict__[name] = LinkSet(unhydrated=True, pointer=meta)
+            obj.__dict__[name] = LinkSet(unhydrated=True, pointer=meta, owner=cls.__name__)
         if saved is not None:
             saved.pop(name, None)
 

@@ -89,6 +89,8 @@ const NULL: DecodedValue = DecodedValue::Null;
 /// resolved here instead.
 struct ClassInfo {
     cls: Py<PyType>,
+    /// The class's `__name__`, so an unfetched multilink can name its owner.
+    owner: Py<PyString>,
     /// `(pointer name, pointer meta object)` for each multilink.
     multilinks: Vec<(Py<PyString>, Py<PyAny>)>,
 }
@@ -153,10 +155,12 @@ impl HydrationRegistry {
                     }
                 }
             }
+            let owner = cls.getattr("__name__")?.cast_into::<PyString>()?.unbind();
             resolved.insert(
                 name,
                 ClassInfo {
                     cls: cls.unbind(),
+                    owner,
                     multilinks,
                 },
             );
@@ -476,6 +480,7 @@ fn decode_object<'py>(
                 let kw = PyDict::new(py);
                 kw.set_item("unhydrated", true)?;
                 kw.set_item("pointer", meta)?;
+                kw.set_item("owner", info.owner.bind(py))?;
                 reg.link_set.bind(py).call((), Some(&kw))?
             }
         };

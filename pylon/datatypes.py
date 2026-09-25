@@ -125,15 +125,26 @@ class LinkSet(PylonSet):
     list that isn't really empty.
     """
 
-    __slots__ = ('_ops', '_pointer', '_unhydrated')
+    __slots__ = ('_ops', '_owner', '_pointer', '_unhydrated')
 
-    def __init__(self, items: Any = (), *, unhydrated: bool = False, pointer: Any = None) -> None:
+    def __init__(
+        self,
+        items: Any = (),
+        *,
+        unhydrated: bool = False,
+        pointer: Any = None,
+        owner: str | None = None,
+    ) -> None:
         super().__init__(() if unhydrated else items)
         self._unhydrated = unhydrated
         #: The owning `PointerMeta`, when known — lets `add()` validate link
         #: property names against the junction as they're written. Absent for
         #: a LinkSet constructed directly.
         self._pointer = pointer
+        #: The name of the class the pointer belongs to, so a refused read can
+        #: say which one it was. Hydration passes it; a directly constructed
+        #: LinkSet has no owner to name.
+        self._owner = owner
         #: Recorded mutations, in order:
         #: ('add' | 'remove' | 'set', [values], {link_prop: value}).
         #: The property dict is empty for everything except `add()`.
@@ -141,12 +152,18 @@ class LinkSet(PylonSet):
 
     # ── Reads ────────────────────────────────────────────────────────────────
 
+    def _pointer_label(self) -> str:
+        name = getattr(self._pointer, 'name', None)
+        if name is None:
+            return 'a multi-link'
+        return f'{self._owner}.{name}' if self._owner else name
+
     def _check_readable(self, action: str) -> None:
         if self._unhydrated:
             raise AttributeError(
-                f'cannot {action} a multi-link that was not fetched — links are not loaded by '
-                'default. Request it in the query shape to read it, or use += / -= to modify it '
-                'without loading it.'
+                f'cannot {action} {self._pointer_label()} — it was not fetched, and multi-links '
+                'are not loaded by default. Request it in the query shape to read it, or use '
+                '+= / -= to modify it without loading it.'
             )
 
     def __iter__(self):
