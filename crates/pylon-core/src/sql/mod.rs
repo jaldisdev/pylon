@@ -6496,6 +6496,120 @@ mod tests {
         );
     }
 
+    /// `make_schema` plus a `Company`-returning function and a `Person.company`
+    /// link defaulting to it — jaldis's `Creatable.created_by :=
+    /// account_of_transaction()` in miniature.
+    fn make_schema_with_an_object_returning_default() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        let company = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("make_schema declares Company");
+        company.properties.push(PropertyDescriptor {
+            name: "id".into(),
+            pg_type: "uuid".into(),
+            nullable: false,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: true,
+            is_pk: true,
+            is_readonly: true,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        });
+        schema.functions.push(crate::schema::FunctionDescriptor {
+            name: "current_company".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Company".into(),
+            return_is_object: true,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Company limit 1".into(),
+        });
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        let company_link = person.links.iter_mut().find(|l| l.name == "company").unwrap();
+        company_link.default_pyql = Some("current_company()".into());
+        schema
+    }
+
+    #[test]
+    fn an_object_returning_link_default_is_applied_by_the_insert() {
+        // A column DEFAULT cannot hold this one — PostgreSQL evaluates it with
+        // no query in scope — so the insert has to carry it, the way the upstream engine's
+        // `_gen_pointers_from_defaults` expands every default into the shape.
+        let schema = make_schema_with_an_object_returning_default();
+        let out = compile_and_emit_with("INSERT Person { name := $n }", &schema);
+        assert!(
+            out.sql.contains("\"company_id\"") && out.sql.contains("current_company"),
+            "the default must supply the foreign key:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn an_explicit_value_wins_over_an_inlined_default() {
+        let schema = make_schema_with_an_object_returning_default();
+        let out = compile_and_emit_with("INSERT Person { name := $n, company := {} }", &schema);
+        assert!(
+            !out.sql.contains("current_company"),
+            "the shape named the pointer, so the default does not apply:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn an_object_returning_link_default_gets_no_column_default() {
+        // Emitting one produces DDL PostgreSQL refuses to run; it used to be
+        // dropped silently here, leaving the pointer with no default at all.
+        let schema = make_schema_with_an_object_returning_default();
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        assert!(
+            !ddl.contains("\"company_id\" uuid DEFAULT"),
+            "the column must carry no default:\n{ddl}"
+        );
+        crate::validate::validate_schema_types(&schema).expect("an inlined default is not an error");
+    }
+
+    #[test]
+    fn a_column_expressible_default_stays_in_the_ddl() {
+        // Only what a column DEFAULT cannot hold moves into the insert.
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        let age = person.properties.iter_mut().find(|p| p.name == "age").unwrap();
+        age.default_pyql = Some("21".into());
+        assert!(
+            crate::ir::inlined_pointer_defaults(schema.types.iter().find(|t| t.name == "Person").unwrap(), &schema)
+                .is_empty()
+        );
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        assert!(ddl.contains("DEFAULT 21"), "{ddl}");
+        let out = compile_and_emit_with("INSERT Person { name := $n }", &schema);
+        assert!(
+            !out.sql.contains("21"),
+            "the column DEFAULT still applies it:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_default_that_compiles_nowhere_is_still_an_error() {
+        // jaldis carried `sequence_next(INTROSPECT marketplace::OrderNo)`, the upstream engine
+        // syntax Pylon cannot parse. Inlining must not turn that into silence.
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        let age = person.properties.iter_mut().find(|p| p.name == "age").unwrap();
+        age.default_pyql = Some("sequence_next(INTROSPECT default::AgeSeq)".into());
+        let errs = crate::validate::validate_schema_types(&schema).unwrap_err();
+        let (_, msg, _) = errs[0].class_name_message_position();
+        assert!(msg.contains("default"), "{msg}");
+    }
+
     #[test]
     fn test_comparing_a_link_with_an_object_returning_function() {
         // Comparing objects compares identity, so the call stands for the id

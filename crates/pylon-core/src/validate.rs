@@ -97,54 +97,6 @@ fn multi_valued(expr: &crate::ir::IrExpr, schema: &SchemaDescriptor) -> Option<S
     }
 }
 
-/// What in `expr` disqualifies it from being a column DEFAULT, if anything.
-///
-/// PostgreSQL evaluates a column default with no row and no query in scope,
-/// so it rejects a sub-select outright ("cannot use subquery in DEFAULT
-/// expression") and has nothing to resolve another column's name against.
-/// Catching it here turns DDL the database refuses to run into an error that
-/// names the pointer that caused it.
-fn default_blocker(expr: &crate::ir::IrExpr) -> Option<&'static str> {
-    use crate::ir::IrExpr as E;
-    match expr {
-        E::Subquery(_)
-        | E::ObjectSubquery(_)
-        | E::ObjectPathSubquery(_)
-        | E::ObjectPathUnion { .. }
-        | E::PathSubquery(_)
-        | E::FnSubquery(_)
-        | E::ArrayFromSelect(_)
-        | E::ScalarSubquery(_)
-        | E::AggOverQuery { .. }
-        | E::AggOverCte { .. }
-        | E::ExistsOverCte { .. }
-        | E::SetOp { .. }
-        | E::AggOverSet { .. }
-        | E::CteRef { .. }
-        | E::CteFieldRef { .. }
-        | E::GlobalRef { .. } => Some("a sub-select"),
-        E::ColumnRef { .. } => Some("a reference to another pointer"),
-        E::Param { .. } | E::GlobalParam { .. } => Some("a query parameter"),
-        E::ForVar { .. } => Some("a for-loop variable"),
-        E::FnParam { .. } => Some("a function parameter"),
-        E::BinOp(b) => default_blocker(&b.left).or_else(|| default_blocker(&b.right)),
-        E::UnaryOp(u) => default_blocker(&u.operand),
-        E::TypeCast(c) => default_blocker(&c.expr),
-        E::IfElse(i) => default_blocker(&i.condition)
-            .or_else(|| default_blocker(&i.if_))
-            .or_else(|| default_blocker(&i.else_)),
-        E::FunctionCall(f) => f.args.iter().find_map(default_blocker),
-        E::Array(items) | E::Tuple(items) => items.iter().find_map(default_blocker),
-        E::NamedTuple { fields, .. } => fields.iter().find_map(|(_, e)| default_blocker(e)),
-        E::Subscript { expr, index, .. } => default_blocker(expr).or_else(|| default_blocker(index)),
-        E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } => default_blocker(expr),
-        E::Slice { expr, lower, upper, .. } => default_blocker(expr)
-            .or_else(|| lower.as_deref().and_then(default_blocker))
-            .or_else(|| upper.as_deref().and_then(default_blocker)),
-        E::Literal(_) | E::Null | E::EnumLiteral { .. } | E::RawSql(_) => None,
-    }
-}
-
 fn mismatch(context: String, message: String) -> PyQLError {
     PyQLError::Fragment(PyQLFragmentError {
         message,
@@ -338,21 +290,14 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         for prop in &td.properties {
             let Some(pyql) = &prop.default_pyql else { continue };
             let context = format!("{}.{} (default)", type_name, prop.name);
-            let ir = match compile_scalar_default_typed(pyql, schema) {
-                Ok((_, ir)) => ir,
-                Err(e) => {
-                    errors.push(mismatch(context.clone(), format!("default for '{context}': {e}")));
-                    continue;
-                }
+            // A default a column DEFAULT cannot hold is expanded into the
+            // insert instead, and checked there — see the loop over
+            // `inlined_pointer_defaults` below, which reports for the
+            // concrete types this abstract one's pointers land on.
+            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
+                continue;
             };
-            if let Some(blocker) = default_blocker(&ir) {
-                errors.push(mismatch(
-                    context.clone(),
-                    format!(
-                        "default for '{context}' is {blocker}, which a column DEFAULT cannot contain — \
-                         PostgreSQL evaluates it with no row and no query in scope."
-                    ),
-                ));
+            if crate::ir::default_blocker(&ir).is_some() {
                 continue;
             }
             let Some(actual) = infer_ir_type(&ir) else { continue };
@@ -370,22 +315,12 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         for link in &td.links {
             let Some(pyql) = &link.default_pyql else { continue };
             let context = format!("{}.{} (default)", type_name, link.name);
-            let ir = match compile_scalar_default_typed(pyql, schema) {
-                Ok((_, ir)) => ir,
-                Err(e) => {
-                    errors.push(mismatch(context.clone(), format!("default for '{context}': {e}")));
-                    continue;
-                }
+            // As for a property above: one a column DEFAULT cannot hold is
+            // the insert's to apply, and the insert's to be checked against.
+            let Ok((_, ir)) = compile_scalar_default_typed(pyql, schema) else {
+                continue;
             };
-            if let Some(blocker) = default_blocker(&ir) {
-                errors.push(mismatch(
-                    context.clone(),
-                    format!(
-                        "default for '{context}' is {blocker}, which a column DEFAULT cannot contain — \
-                         PostgreSQL evaluates it with no row and no query in scope. Assign the link \
-                         explicitly on insert instead."
-                    ),
-                ));
+            if crate::ir::default_blocker(&ir).is_some() {
                 continue;
             }
             let Some(actual) = infer_ir_type(&ir) else { continue };
@@ -397,6 +332,38 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
                         context, actual
                     ),
                 ));
+            }
+        }
+
+        // Defaults a column DEFAULT cannot hold, compiled the way an insert
+        // expands them into its own shape. A default that compiles as neither
+        // is a real error, and this is where it surfaces.
+        if !td.abstract_ && !td.junction {
+            for (pointer, pyql) in crate::ir::inlined_pointer_defaults(td, schema) {
+                let context = format!("{type_name}.{pointer} (default)");
+                let (column, ir) = match crate::ir::compile_inlined_default(&type_name, &pointer, &pyql, schema) {
+                    Ok(assignment) => assignment,
+                    Err(e) => {
+                        errors.push(mismatch(context.clone(), format!("default for '{context}': {e}")));
+                        continue;
+                    }
+                };
+                let Some(actual) = infer_ir_type(&ir) else { continue };
+                let declared = td
+                    .properties
+                    .iter()
+                    .find(|p| p.name == column)
+                    .map(|p| p.pg_type.as_str())
+                    .unwrap_or("uuid");
+                if !types_compatible(actual, declared) {
+                    errors.push(mismatch(
+                        context.clone(),
+                        format!(
+                            "default value type mismatch for '{context}': expected {declared}, \
+                             default produces {actual}"
+                        ),
+                    ));
+                }
             }
         }
 
@@ -985,9 +952,10 @@ mod tests {
     }
 
     #[test]
-    fn link_default_selecting_an_object_is_rejected() {
-        // `DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run; it used to
-        // be emitted anyway (or silently dropped when it failed to compile).
+    fn link_default_selecting_an_object_moves_into_the_insert() {
+        // `DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run, so this one
+        // gets no column DEFAULT — the insert applies it instead, which is
+        // how the upstream engine has always applied every default.
         let mut td = person_type(vec![], vec![base_property("name", "text")]);
         td.links = vec![LinkDescriptor {
             name: "manager".into(),
@@ -1002,10 +970,9 @@ mod tests {
             on_delete: vec![],
         }];
         let schema = minimal_schema(vec![td], vec![]);
-        let errs = validate_schema_types(&schema).unwrap_err();
-        let (_, msg, _) = errs[0].class_name_message_position();
-        assert!(msg.contains("Person.manager"), "{msg}");
-        assert!(msg.contains("sub-select"), "{msg}");
+        validate_schema_types(&schema).expect("an inlined default is not an error");
+        let inlined = crate::ir::inlined_pointer_defaults(&schema.types[0], &schema);
+        assert_eq!(inlined.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["manager"]);
     }
 
     #[test]

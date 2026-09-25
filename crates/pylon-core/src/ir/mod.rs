@@ -26,16 +26,20 @@
 mod compiler;
 pub mod tags;
 
+pub use compiler::column_default_sql;
 pub use compiler::compile;
 pub use compiler::compile_computed_in_type;
 pub use compiler::compile_constraint_expr;
 pub use compiler::compile_expr_in_type;
 pub use compiler::compile_expr_unaliased;
+pub use compiler::compile_inlined_default;
 pub use compiler::compile_scalar_default;
 pub use compiler::compile_scalar_default_typed;
 pub use compiler::compile_trigger_handler;
 pub use compiler::compile_with_config;
+pub use compiler::default_blocker;
 pub(crate) use compiler::infer_ir_type;
+pub use compiler::inlined_pointer_defaults;
 pub use compiler::pg_type_to_pyql;
 pub(crate) use compiler::types_compatible;
 pub use compiler::{GLOBALS_ARG, compile_fn_body, functions_needing_globals};

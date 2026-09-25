@@ -1210,6 +1210,122 @@ pub fn compile_scalar_default_typed(pyql: &str, schema: &SchemaDescriptor) -> Re
     Ok((sql, ir))
 }
 
+/// What in `expr` disqualifies it from being a column DEFAULT, if anything.
+///
+/// PostgreSQL evaluates a column default with no row and no query in scope,
+/// so it rejects a sub-select outright ("cannot use subquery in DEFAULT
+/// expression") and has nothing to resolve another column's name against.
+pub fn default_blocker(expr: &IrExpr) -> Option<&'static str> {
+    use IrExpr as E;
+    match expr {
+        E::Subquery(_)
+        | E::ObjectSubquery(_)
+        | E::ObjectPathSubquery(_)
+        | E::ObjectPathUnion { .. }
+        | E::PathSubquery(_)
+        | E::FnSubquery(_)
+        | E::ArrayFromSelect(_)
+        | E::ScalarSubquery(_)
+        | E::AggOverQuery { .. }
+        | E::AggOverCte { .. }
+        | E::ExistsOverCte { .. }
+        | E::SetOp { .. }
+        | E::AggOverSet { .. }
+        | E::CteRef { .. }
+        | E::CteFieldRef { .. }
+        | E::GlobalRef { .. } => Some("a sub-select"),
+        E::ColumnRef { .. } => Some("a reference to another pointer"),
+        E::Param { .. } | E::GlobalParam { .. } => Some("a query parameter"),
+        E::ForVar { .. } => Some("a for-loop variable"),
+        E::FnParam { .. } => Some("a function parameter"),
+        E::BinOp(b) => default_blocker(&b.left).or_else(|| default_blocker(&b.right)),
+        E::UnaryOp(u) => default_blocker(&u.operand),
+        E::TypeCast(c) => default_blocker(&c.expr),
+        E::IfElse(i) => default_blocker(&i.condition)
+            .or_else(|| default_blocker(&i.if_))
+            .or_else(|| default_blocker(&i.else_)),
+        E::FunctionCall(f) => f.args.iter().find_map(default_blocker),
+        E::Array(items) | E::Tuple(items) => items.iter().find_map(default_blocker),
+        E::NamedTuple { fields, .. } => fields.iter().find_map(|(_, e)| default_blocker(e)),
+        E::Subscript { expr, index, .. } => default_blocker(expr).or_else(|| default_blocker(index)),
+        E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } => default_blocker(expr),
+        E::Slice { expr, lower, upper, .. } => default_blocker(expr)
+            .or_else(|| lower.as_deref().and_then(default_blocker))
+            .or_else(|| upper.as_deref().and_then(default_blocker)),
+        E::Literal(_) | E::Null | E::EnumLiteral { .. } | E::RawSql(_) => None,
+    }
+}
+
+/// The SQL for a pointer's PyQL default as a column DEFAULT clause, or `None`
+/// when a column DEFAULT cannot hold it — it reads a session global, selects
+/// an object, or otherwise needs the query around it. Those are applied by
+/// `compile_insert` instead; see `inlined_pointer_defaults`.
+pub fn column_default_sql(pyql: &str, schema: &SchemaDescriptor) -> Option<String> {
+    let (sql, ir) = compile_scalar_default_typed(pyql, schema).ok()?;
+    default_blocker(&ir).is_none().then_some(sql)
+}
+
+/// The pointers whose PyQL default an insert has to expand into its own shape,
+/// paired with that default, because `column_default_sql` cannot render it.
+///
+/// The upstream engine expands *every* default this way — `_gen_pointers_from_defaults` in its
+/// PyQL compiler adds one shape element per unspecified pointer, which is why
+/// an object-returning default like `created_by := account_of_transaction()` has
+/// always worked there. Here the defaults a column DEFAULT does hold keep using
+/// it, so only the remainder needs the query.
+pub fn inlined_pointer_defaults(td: &TypeDescriptor, schema: &SchemaDescriptor) -> Vec<(String, String)> {
+    let properties = td
+        .properties
+        .iter()
+        .filter(|p| !p.is_pk)
+        .filter_map(|p| p.default_pyql.as_ref().map(|d| (p.name.clone(), d.clone())));
+    let links = td
+        .links
+        .iter()
+        .filter(|l| !l.is_junction_backed())
+        .filter_map(|l| l.default_pyql.as_ref().map(|d| (l.name.clone(), d.clone())));
+    properties
+        .chain(links)
+        .filter(|(_, pyql)| column_default_sql(pyql, schema).is_none())
+        .collect()
+}
+
+/// One inlined default as the insert shape carries it: `pointer := <default>`.
+fn default_shape_element(pointer: &str, value: Expr) -> ShapeElement {
+    ShapeElement {
+        path: ast::Path::relative(pointer),
+        splat: None,
+        nested: None,
+        compexpr: Some(value),
+        op: ShapeOp::Assign,
+        filter: None,
+        order_by: vec![],
+        offset: None,
+        limit: None,
+        marker_offset: None,
+    }
+}
+
+/// One inlined default, compiled the way `compile_insert` expands it into an
+/// insert's shape — so a default that cannot compile there is caught by schema
+/// validation rather than by the first insert that omits the pointer.
+///
+/// One pointer at a time, because the caller reporting the failure has to be
+/// able to name which declaration caused it.
+pub fn compile_inlined_default(
+    type_name: &str,
+    pointer: &str,
+    pyql: &str,
+    schema: &SchemaDescriptor,
+) -> Result<(String, IrExpr), PyQLError> {
+    let mut c = Compiler::new(schema);
+    let td = c.resolve_type(type_name)?;
+    let alias = c.fresh_alias();
+    let element = default_shape_element(pointer, crate::parse::parse_pointer_expr(pyql)?);
+    let mut assignments = c.compile_assignments(&[element], td, &alias)?;
+    Ok(assignments.remove(0))
+}
+
 // ── Compiler context ────────────────────────────────────────────────────────────
 
 struct Compiler<'a> {
@@ -7920,6 +8036,18 @@ impl<'a> Compiler<'a> {
                     });
                 }
             }
+        }
+        // Pointer defaults the shape leaves out. the upstream engine applies every default by
+        // expanding it into the insert's own shape (`_gen_pointers_from_defaults`);
+        // the ones a column DEFAULT can hold are left to it here, so only the
+        // rest — a default reading a session global, or selecting the object to
+        // link to — is expanded.
+        for (pointer, pyql) in inlined_pointer_defaults(td, self.schema) {
+            if shape.iter().any(|el| path_leaf(&el.path).is_ok_and(|n| n == pointer)) {
+                continue;
+            }
+            let value = crate::parse::parse_pointer_expr(&pyql)?;
+            shape.push(default_shape_element(&pointer, value));
         }
         let mut multi_link_appends = vec![];
         let mut scalar_elements: Vec<ShapeElement> = vec![];

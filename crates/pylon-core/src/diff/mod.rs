@@ -3161,13 +3161,14 @@ fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
 // ── Default resolution ────────────────────────────────────────────────────────
 
 /// Return the effective SQL DEFAULT for a property, compiling `default_pyql`
-/// with the schema IR compiler if needed.
+/// with the schema IR compiler if needed. `None` when a column DEFAULT cannot
+/// hold it — `compile_insert` expands that one into the insert instead.
 fn resolve_default(p: &crate::schema::PropertyDescriptor, schema: &SchemaDescriptor) -> Option<String> {
     if let Some(sql) = &p.default_sql {
         return Some(sql.clone());
     }
     if let Some(pyql) = &p.default_pyql {
-        return crate::ir::compile_scalar_default(pyql, schema).ok();
+        return crate::ir::column_default_sql(pyql, schema);
     }
     None
 }
@@ -3184,7 +3185,7 @@ pub(crate) fn resolve_default_for_test(
 
 fn resolve_link_default(l: &crate::schema::LinkDescriptor, schema: &SchemaDescriptor) -> Option<String> {
     if let Some(pyql) = &l.default_pyql {
-        return crate::ir::compile_scalar_default(pyql, schema).ok();
+        return crate::ir::column_default_sql(pyql, schema);
     }
     None
 }
