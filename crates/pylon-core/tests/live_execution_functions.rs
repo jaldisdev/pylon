@@ -651,6 +651,60 @@ async fn an_element_is_named_as_postgres_names_it() {
     assert_eq!(quarters, DecodedValue::Bool(true));
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_date_or_time_renders_as_iso_8601_through_a_cast_and_through_to_str() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    // `::text` would give `2026-01-16 12:34:56+00` — a space, and a
+    // two-digit offset.
+    for expr in [
+        "to_str(<datetime>'2026-01-16T12:34:56Z')",
+        "<str><datetime>'2026-01-16T12:34:56Z'",
+    ] {
+        assert_eq!(
+            eval_scalar(&pool, expr).await,
+            DecodedValue::Str("2026-01-16T12:34:56+00:00".to_string()),
+            "{expr}"
+        );
+    }
+    for (expr, expected) in [
+        (
+            "to_str(<cal::local_datetime>'2026-01-16T12:34:56')",
+            "2026-01-16T12:34:56",
+        ),
+        ("<str><cal::local_datetime>'2026-01-16T12:34:56'", "2026-01-16T12:34:56"),
+        ("to_str(<cal::local_date>'2026-01-16')", "2026-01-16"),
+        ("<str><cal::local_date>'2026-01-16'", "2026-01-16"),
+        ("to_str(<cal::local_time>'12:34:56.5')", "12:34:56.5"),
+        ("<str><cal::local_time>'12:34:56.5'", "12:34:56.5"),
+        // A format still formats, and an empty set for it is the same as
+        // leaving it out.
+        ("to_str(<cal::local_date>'2026-01-16', 'DD/MM/YYYY')", "16/01/2026"),
+        ("to_str(<cal::local_time>'12:34:56', 'HH24:MI')", "12:34"),
+        (
+            "to_str(<datetime>'2026-01-16T12:34:56Z', <optional str>{})",
+            "2026-01-16T12:34:56+00:00",
+        ),
+    ] {
+        assert_eq!(
+            eval_scalar(&pool, expr).await,
+            DecodedValue::Str(expected.to_string()),
+            "{expr}"
+        );
+    }
+
+    for expr in [
+        "to_str(<datetime>'2026-01-16T12:34:56Z', '')",
+        "to_str(<cal::local_datetime>'2026-01-16T12:34:56', '')",
+        "to_str(<cal::local_date>'2026-01-16', '')",
+        "to_str(<cal::local_time>'12:34:56', '')",
+    ] {
+        assert_error_contains(&pool, expr, "\"fmt\" argument must be a non-empty string").await;
+    }
+}
+
 /// Runs `select <expr>` and asserts it fails with a message containing
 /// `needle` — the accept/reject half of stdlib parity, which `eval_scalar`
 /// cannot express because it unwraps.

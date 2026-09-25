@@ -167,7 +167,7 @@ select re_test('^[A-Z]', .name)
 
 | Function | Signature(s) | Returns | Description |
 |---|---|---|---|
-| `to_str` | `(v: datetime, fmt: str)` / `(v: datetime\|int16\|int32\|int64\|float32\|float64\|decimal\|bigint\|bool\|json\|duration\|uuid)` *(cast target)* / `(v: bytes, encoding: str)` | `str` | Stringify a value — with an explicit format for `datetime`, or a text encoding for `bytes`. |
+| `to_str` | `(v: datetime\|cal::local_datetime\|cal::local_date\|cal::local_time, fmt: optional<str>)` / `(v: datetime\|cal::local_datetime\|cal::local_date\|cal::local_time\|int16\|int32\|int64\|float32\|float64\|decimal\|bigint\|bool\|json\|duration\|uuid)` *(cast target)* / `(v: bytes, encoding: str)` | `str` | Stringify a value — with an explicit format for the date/time types, or a text encoding for `bytes`. A date or time with no format renders as ISO 8601, which is also what `<str>` of one gives. |
 | `to_int16` / `to_int32` / `to_int64` | `(s: str)` *(cast target)* / `(b: bool)` | matching int type | Parse from string, or `0`/`1` from a boolean. |
 | `to_float32` / `to_float64` | `(s: str)` *(cast target)* / `(n: int64)` | matching float type | Parse from string, or widen from `int64`. |
 | `to_decimal` | `(s: str)` *(cast target)* / `(n: int64)` | `decimal` | Parse from string, or widen from `int64`. |

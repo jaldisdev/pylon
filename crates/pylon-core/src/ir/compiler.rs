@@ -12072,6 +12072,23 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
+                // `<str>` of a date/time value is `to_str` of it, the way the upstream engine
+                // declares that cast `FROM FUNCTION std::to_str`. `::text`
+                // gives a different answer for the same value — a datetime
+                // renders as `2026-01-16 12:34:56+00` rather than ISO 8601 —
+                // and the two spellings must not disagree. The rest of the
+                // family is routed too, where `to_str` *is* `::text`, so the
+                // rule is about the types rather than about which
+                // implementations happen to differ today.
+                if pg_type == "text"
+                    && matches!(
+                        infer_ir_type(&inner),
+                        Some("timestamptz" | "timestamp" | "date" | "time" | "interval")
+                    )
+                {
+                    return self.resolve_fn_call(Some("std"), "to_str", vec![inner]);
+                }
+
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
                     expr: inner,

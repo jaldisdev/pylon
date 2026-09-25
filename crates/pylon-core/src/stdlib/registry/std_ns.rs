@@ -19,11 +19,12 @@
 
 use super::{
     Any, AnyOrderable, AnyPoint, BigInt, Bool, Bytes, Datetime, Decimal, Duration, Float32, Float64, FnDescriptor,
-    Int16, Int32, Int64, Json, LocalDate, LocalDatetime, Str, Uuid,
+    Int16, Int32, Int64, Json, LocalDate, LocalDatetime, LocalTime, Str, Uuid,
 };
 use super::{
-    B, E, I, NamedDefault, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_stable_nullable, plpgsql_stable_nullable_bool,
-    plpgsql_stable_nullable_elem, plpgsql_stable_returns, pn, pn_as, pv, ro, set_of, sql, sql_returns, tup,
+    B, E, I, NamedDefault, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_nullable, plpgsql_stable_nullable,
+    plpgsql_stable_nullable_bool, plpgsql_stable_nullable_elem, plpgsql_stable_returns, pn, pn_as, pv, ro, set_of, sql,
+    sql_returns, tup,
 };
 use crate::stdlib::FnVolatility::{Modifying, Stable, Volatile};
 
@@ -1246,14 +1247,111 @@ END"#,
             ),
         ),
         // ── std:: type conversion ────────────────────────────────────────────
+        // `to_json` renders a timestamp as ISO 8601 whatever the session's
+        // DateStyle is, which `::text` does not — it would give
+        // `2026-01-16 12:34:56+00`, with a space and a two-digit offset.
+        fc(
+            "std",
+            "to_str",
+            vec![p("v", Datetime)],
+            Str,
+            E("trim(to_json($1)::text, '\"')"),
+        ),
         f(
             "std",
             "to_str",
-            vec![p("v", Datetime), p("fmt", Str)],
+            vec![p("v", Datetime), p("fmt", opt(Str))],
             Str,
-            E("to_char($1, $2)"),
+            plpgsql_nullable(
+                "to_str_datetime",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN trim(to_json($1)::text, '"');
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN to_char($1, $2);
+END"#,
+            ),
         ),
-        fc("std", "to_str", vec![p("v", Datetime)], Str, E("$1::text")),
+        fc(
+            "std",
+            "to_str",
+            vec![p("v", LocalDatetime)],
+            Str,
+            E("trim(to_json($1)::text, '\"')"),
+        ),
+        f(
+            "std",
+            "to_str",
+            vec![p("v", LocalDatetime), p("fmt", opt(Str))],
+            Str,
+            plpgsql_nullable(
+                "to_str_local_datetime",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN trim(to_json($1)::text, '"');
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN to_char($1, $2);
+END"#,
+            ),
+        ),
+        fc(
+            "std",
+            "to_str",
+            vec![p("v", LocalDate)],
+            Str,
+            E("trim(to_json($1)::text, '\"')"),
+        ),
+        f(
+            "std",
+            "to_str",
+            vec![p("v", LocalDate), p("fmt", opt(Str))],
+            Str,
+            plpgsql_nullable(
+                "to_str_local_date",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN trim(to_json($1)::text, '"');
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN to_char($1, $2);
+END"#,
+            ),
+        ),
+        fc("std", "to_str", vec![p("v", LocalTime)], Str, E("$1::text")),
+        // `to_char` has no `time` overload, so the time is composed onto a
+        // date first. the upstream engine uses *today's* date here and calls that a bug in
+        // its own source; a fixed one keeps the result deterministic, and
+        // only a format naming date fields can tell the difference.
+        f(
+            "std",
+            "to_str",
+            vec![p("v", LocalTime), p("fmt", opt(Str))],
+            Str,
+            plpgsql_nullable(
+                "to_str_local_time",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::text;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN to_char(date '2000-01-01' + $1, $2);
+END"#,
+            ),
+        ),
         fc("std", "to_str", vec![p("v", Int16)], Str, E("$1::text")),
         fc("std", "to_str", vec![p("v", Int32)], Str, E("$1::text")),
         fc("std", "to_str", vec![p("v", Int64)], Str, E("$1::text")),
