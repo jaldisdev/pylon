@@ -248,6 +248,16 @@ Reading one that wasn't fetched raises instead of showing an empty list, which w
 len(p.friends)              # AttributeError: cannot take the length of a multi-link that was not fetched
 ```
 
+Code that would rather fall back to a second query than raise can ask first — `is_hydrated` is the only read an unfetched `LinkSet` allows:
+
+```python
+from pylon import LinkSet
+
+friends = p.friends
+if isinstance(friends, LinkSet) and not friends.is_hydrated:
+    friends = await client.query('select Person { name } filter .friends.id = <uuid>$i', i=p.id)
+```
+
 ### Link properties
 
 A `Through[...]` link stores its members in a junction, which can carry properties of its own. `+=` supplies a target and nothing else, so those use `.add()`:
