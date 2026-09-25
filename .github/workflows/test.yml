@@ -39,6 +39,22 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --check
 
+      # One tag releases both the wheels and the crates, so the two version
+      # numbers have to agree; nothing but this step enforces it.
+      - name: Rust and Python versions agree
+        run: |
+          python - <<'PY'
+          import sys, tomllib
+
+          with open("Cargo.toml", "rb") as f:
+              rust = tomllib.load(f)["workspace"]["package"]["version"]
+          with open("pyproject.toml", "rb") as f:
+              python = tomllib.load(f)["project"]["version"]
+
+          if rust != python:
+              sys.exit(f"Cargo.toml has {rust}, pyproject.toml has {python}")
+          PY
+
       - name: Install ruff
         run: pip install ruff
 
