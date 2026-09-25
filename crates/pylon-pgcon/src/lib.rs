@@ -143,7 +143,7 @@ impl PgPool {
     /// raise `ConnectionFailedError`/`ConnectionTimeoutError` immediately
     /// rather than silently deferring the failure to the first query.
     pub async fn connect(dsn: &str, max_size: usize) -> Result<Self> {
-        let pg_config: tokio_postgres::Config = dsn.parse()?;
+        let pg_config = session_config(dsn)?;
         let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
         let pool = deadpool_postgres::Pool::builder(manager)
             .max_size(max_size)
@@ -697,6 +697,27 @@ impl PgTransaction {
 /// direct `row.try_get::<_, RawBytes>(0)` errors on a null column; going
 /// through `Option<RawBytes>` (which `postgres_types` implements generically
 /// for any `T: FromSql`, yielding `None` for SQL NULL) avoids that.
+/// Parses `dsn` and pins the session settings every Pylon connection needs.
+///
+/// `timezone` decides what a `timestamptz` renders as and which day
+/// `date_part('day', …)` reports; `intervalstyle` decides whether an interval
+/// renders as `01:30:00` or `PT1H30M`. Left to the server's configuration,
+/// the same query would give different answers against two databases, and
+/// `<str>` of a datetime or a duration would stop matching the ISO 8601 the
+/// rest of the stack assumes. Sent as startup-packet options rather than a
+/// `SET` after connecting, so a pooled connection cannot be handed out
+/// before they apply.
+fn session_config(dsn: &str) -> Result<tokio_postgres::Config> {
+    let mut config: tokio_postgres::Config = dsn.parse()?;
+    let pinned = "-c timezone=UTC -c intervalstyle=iso_8601";
+    let options = match config.get_options() {
+        Some(existing) => format!("{existing} {pinned}"),
+        None => pinned.to_string(),
+    };
+    config.options(options);
+    Ok(config)
+}
+
 /// Runs `wire::TYPE_DISCOVERY_SQL` on `client` and builds the registry from
 /// it. Shared by `PgPool::connect` and `PgListener::connect` so a pooled
 /// connection and a dedicated listener classify types identically.

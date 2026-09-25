@@ -22,6 +22,14 @@ Four literal kinds: string, integer, float, boolean. There's no separate literal
 
 `<TypeExpr>expr` — casts `expr` to the given type. `TypeExpr` is a named type (a built-in scalar like `str`/`int64`/`uuid`, or a schema-qualified `module::Name` for an enum/named tuple/custom scalar), a structural tuple type, or an array type — the same three shapes described below.
 
+A cast between `str` and a date, time or duration type resolves to the matching
+[stdlib](../stdlib/std.md) function rather than to PostgreSQL's own input and
+output parsers, so it accepts and produces ISO 8601 and nothing else:
+`<cal::local_date>'01/16/2026'` and a `<datetime>` with no time zone are
+errors, and `<str>` of a datetime gives `2026-01-16T12:34:56+00:00`. Use
+`to_datetime`/`cal::to_local_date`/`to_str` with an explicit format for
+anything else.
+
 ## Tuples
 
 **Positional:**

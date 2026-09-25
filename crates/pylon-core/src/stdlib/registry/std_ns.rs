@@ -1181,9 +1181,26 @@ END"#,
         f(
             "std",
             "to_datetime",
-            vec![p("s", Str), p("fmt", Str)],
+            vec![p("s", Str), p("fmt", opt(Str))],
             Datetime,
-            E("to_timestamp($1, $2)"),
+            plpgsql_nullable(
+                "to_datetime",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN _pylon.to_datetime($1);
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_datetime(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF $2 !~ '^(("([^"\\]|\\.)*")|([^"]+))*(TZH).*$' THEN
+        RAISE EXCEPTION 'missing required time zone in format: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Use one or both of the following: TZH, TZM';
+    END IF;
+    RETURN to_timestamp($1, $2);
+END"#,
+            ),
         ),
         f(
             "std",
@@ -1212,13 +1229,25 @@ END"#,
             Datetime,
             E("($1 AT TIME ZONE $2)"),
         ),
-        // Single-arg ISO 8601 parsing; cast target for str → datetime.
+        // Single-arg ISO 8601 parsing; cast target for str → datetime. The
+        // zone is required — without it `::timestamptz` silently reads the
+        // string in whatever zone the session happens to be in.
         fc(
             "std",
             "to_datetime",
             vec![p("s", Str)],
             Datetime,
-            sql("to_datetime", "SELECT $1::timestamptz"),
+            plpgsql(
+                "to_datetime",
+                r#"BEGIN
+    IF $1 !~ '^\s*((\d{4}-\d{2}-\d{2}|\d{8})[ tT](\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?|\d{2,6}(\.\d+)?)([zZ]|[-+](\d{2,4}|\d{2}:\d{2})))\s*$' THEN
+        RAISE EXCEPTION 'invalid input syntax for type datetime: %', quote_literal($1)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Please use ISO8601 format. Example: 2010-12-27T23:59:59-07:00';
+    END IF;
+    RETURN $1::timestamptz;
+END"#,
+            ),
         ),
         f(
             "std",
@@ -1247,6 +1276,12 @@ END"#,
             ),
         ),
         // ── std:: type conversion ────────────────────────────────────────────
+        // ── to_str ───────────────────────────────────────────────────────────
+        // `fmt` is optional on every overload that takes one: left out, or
+        // passed as an empty set, the value renders the way a `<str>` cast
+        // renders it. An empty *string* is refused rather than taken to mean
+        // "no format", which is what `to_char` would otherwise do with it.
+        //
         // `to_json` renders a timestamp as ISO 8601 whatever the session's
         // DateStyle is, which `::text` does not — it would give
         // `2026-01-16 12:34:56+00`, with a space and a two-digit offset.
@@ -1262,18 +1297,8 @@ END"#,
             "to_str",
             vec![p("v", Datetime), p("fmt", opt(Str))],
             Str,
-            plpgsql_nullable(
-                "to_str_datetime",
-                r#"BEGIN
-    IF $2 IS NULL THEN
-        RETURN trim(to_json($1)::text, '"');
-    END IF;
-    IF $2 = '' THEN
-        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    RETURN to_char($1, $2);
-END"#,
+            E(
+                "CASE WHEN $2 IS NULL THEN trim(to_json($1)::text, '\"') WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
             ),
         ),
         fc(
@@ -1288,18 +1313,8 @@ END"#,
             "to_str",
             vec![p("v", LocalDatetime), p("fmt", opt(Str))],
             Str,
-            plpgsql_nullable(
-                "to_str_local_datetime",
-                r#"BEGIN
-    IF $2 IS NULL THEN
-        RETURN trim(to_json($1)::text, '"');
-    END IF;
-    IF $2 = '' THEN
-        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    RETURN to_char($1, $2);
-END"#,
+            E(
+                "CASE WHEN $2 IS NULL THEN trim(to_json($1)::text, '\"') WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
             ),
         ),
         fc(
@@ -1314,18 +1329,8 @@ END"#,
             "to_str",
             vec![p("v", LocalDate), p("fmt", opt(Str))],
             Str,
-            plpgsql_nullable(
-                "to_str_local_date",
-                r#"BEGIN
-    IF $2 IS NULL THEN
-        RETURN trim(to_json($1)::text, '"');
-    END IF;
-    IF $2 = '' THEN
-        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    RETURN to_char($1, $2);
-END"#,
+            E(
+                "CASE WHEN $2 IS NULL THEN trim(to_json($1)::text, '\"') WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
             ),
         ),
         fc("std", "to_str", vec![p("v", LocalTime)], Str, E("$1::text")),
@@ -1338,39 +1343,81 @@ END"#,
             "to_str",
             vec![p("v", LocalTime), p("fmt", opt(Str))],
             Str,
-            plpgsql_nullable(
-                "to_str_local_time",
-                r#"BEGIN
-    IF $2 IS NULL THEN
-        RETURN $1::text;
-    END IF;
-    IF $2 = '' THEN
-        RAISE EXCEPTION 'to_str(): "fmt" argument must be a non-empty string'
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    RETURN to_char(date '2000-01-01' + $1, $2);
-END"#,
+            E(
+                "CASE WHEN $2 IS NULL THEN $1::text WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char(date '2000-01-01' + $1, $2) END",
+            ),
+        ),
+        // An interval renders as ISO 8601 (`PT1H30M`) because every Pylon
+        // connection pins `intervalstyle` — see `pylon_pgcon::session_config`.
+        fc("std", "to_str", vec![p("v", Duration)], Str, E("$1::text")),
+        f(
+            "std",
+            "to_str",
+            vec![p("v", Duration), p("fmt", opt(Str))],
+            Str,
+            E(
+                "CASE WHEN $2 IS NULL THEN $1::text WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
             ),
         ),
         fc("std", "to_str", vec![p("v", Int16)], Str, E("$1::text")),
         fc("std", "to_str", vec![p("v", Int32)], Str, E("$1::text")),
         fc("std", "to_str", vec![p("v", Int64)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", Float32)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", Float64)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", Decimal)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", BigInt)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", Bool)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", Json)], Str, E("$1::text")),
+        // The narrower integers and `float32` reach the formatting overloads
+        // through the same implicit widening the upstream engine resolves them by.
         f(
             "std",
             "to_str",
-            vec![p("v", Bytes), p("encoding", Str)],
+            vec![p("v", Int64), p("fmt", opt(Str))],
             Str,
-            sql("to_str_bytes", "SELECT convert_from($1, $2)"),
+            E(
+                "CASE WHEN $2 IS NULL THEN $1::text WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
+            ),
+        ),
+        fc("std", "to_str", vec![p("v", Float32)], Str, E("$1::text")),
+        fc("std", "to_str", vec![p("v", Float64)], Str, E("$1::text")),
+        f(
+            "std",
+            "to_str",
+            vec![p("v", Float64), p("fmt", opt(Str))],
+            Str,
+            E(
+                "CASE WHEN $2 IS NULL THEN $1::text WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
+            ),
+        ),
+        fc("std", "to_str", vec![p("v", Decimal)], Str, E("$1::text")),
+        fc("std", "to_str", vec![p("v", BigInt)], Str, E("$1::text")),
+        // `bigint` is `numeric` too, so this one overload serves both.
+        f(
+            "std",
+            "to_str",
+            vec![p("v", Decimal), p("fmt", opt(Str))],
+            Str,
+            E(
+                "CASE WHEN $2 IS NULL THEN $1::text WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE to_char($1, $2) END",
+            ),
+        ),
+        fc("std", "to_str", vec![p("v", Json)], Str, E("$1::text")),
+        // `pretty` is the only format json takes; anything else is refused
+        // rather than handed to a formatter it means nothing to.
+        f(
+            "std",
+            "to_str",
+            vec![p("v", Json), p("fmt", opt(Str))],
+            Str,
+            E(
+                "CASE WHEN $2 IS NULL THEN $1::text WHEN $2 = 'pretty' THEN jsonb_pretty($1) WHEN $2 = '' THEN _pylon.raise_invalid_parameter('to_str(): \"fmt\" argument must be a non-empty string') ELSE _pylon.raise_invalid_parameter('to_str(): format ''' || $2 || ''' is invalid') END",
+            ),
         ),
         f("std", "to_str", vec![p("v", Bytes)], Str, E("convert_from($1, 'UTF8')")),
-        fc("std", "to_str", vec![p("v", Duration)], Str, E("$1::text")),
-        fc("std", "to_str", vec![p("v", Uuid)], Str, E("$1::text")),
+        // Superseded by `array_join`, which is what the upstream engine's own deprecation
+        // note points at; kept because the call still resolves there.
+        f(
+            "std",
+            "to_str",
+            vec![p("array", arr(Str)), p("delimiter", Str)],
+            Str,
+            E("array_to_string($1, $2)"),
+        ),
         fc("std", "to_int16", vec![p("s", Str)], Int16, E("$1::int2")),
         f("std", "to_int16", vec![p("b", Bool)], Int16, E("$1::int2")),
         fc("std", "to_int32", vec![p("s", Str)], Int32, E("$1::int4")),

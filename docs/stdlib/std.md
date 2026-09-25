@@ -160,14 +160,14 @@ select re_test('^[A-Z]', .name)
 | `duration_get` | `(d: duration, el: str)` | `float64` | Extract a field — `hour`, `minutes`, `seconds`, `milliseconds`, `microseconds`, or `totalseconds` for the whole duration in seconds. |
 | `duration_to_seconds` | `(d: duration)` | `decimal` | Total duration in seconds. |
 | `duration_truncate` | `(dt: duration, unit: str)` | `duration` | Truncate to a unit boundary — `microseconds`, `milliseconds`, `seconds`, `minutes`, or `hours`. |
-| `to_datetime` | `(s: str, fmt: str)` / `(year, month, day, hour, min: int64, sec: float64, timezone: str)` / `(local: cal::local_datetime, zone: str)` / `(s: str)` *(cast target)* / `(epoch_seconds: decimal)` | `datetime` | Parse/construct a timestamp from a format string, discrete fields, a wall clock reading in a given zone, ISO 8601 text, or a Unix epoch. |
+| `to_datetime` | `(s: str, fmt: optional<str>)` / `(year, month, day, hour, min: int64, sec: float64, timezone: str)` / `(local: cal::local_datetime, zone: str)` / `(s: str)` *(cast target)* / `(epoch_seconds: decimal)` | `datetime` | Parse/construct a timestamp from a format string, discrete fields, a wall clock reading in a given zone, ISO 8601 text, or a Unix epoch. The text must carry a time zone, and `fmt` must name one (`TZH`/`TZM`) — read in the session's zone, the same string would mean different instants on different servers. |
 | `to_duration` | `(hours: int64, minutes: int64, seconds: float64)` | `duration` | Construct a duration from discrete fields. |
 
 ## Type conversion
 
 | Function | Signature(s) | Returns | Description |
 |---|---|---|---|
-| `to_str` | `(v: datetime\|cal::local_datetime\|cal::local_date\|cal::local_time, fmt: optional<str>)` / `(v: datetime\|cal::local_datetime\|cal::local_date\|cal::local_time\|int16\|int32\|int64\|float32\|float64\|decimal\|bigint\|bool\|json\|duration\|uuid)` *(cast target)* / `(v: bytes, encoding: str)` | `str` | Stringify a value — with an explicit format for the date/time types, or a text encoding for `bytes`. A date or time with no format renders as ISO 8601, which is also what `<str>` of one gives. |
+| `to_str` | `(v: datetime\|cal::local_datetime\|cal::local_date\|cal::local_time\|duration\|int64\|float64\|decimal\|json, fmt: optional<str>)` / `(v: … \|int16\|int32\|float32\|bigint\|bytes)` *(cast target)* / `(array: array<str>, delimiter: str)` | `str` | Stringify a value. `fmt` is a `to_char` template, `pretty` for `json`; an empty string is refused. Without it a date, time or duration renders as ISO 8601 — which is what `<str>` of one gives too, since the cast resolves to this function. |
 | `to_int16` / `to_int32` / `to_int64` | `(s: str)` *(cast target)* / `(b: bool)` | matching int type | Parse from string, or `0`/`1` from a boolean. |
 | `to_float32` / `to_float64` | `(s: str)` *(cast target)* / `(n: int64)` | matching float type | Parse from string, or widen from `int64`. |
 | `to_decimal` | `(s: str)` *(cast target)* / `(n: int64)` | `decimal` | Parse from string, or widen from `int64`. |

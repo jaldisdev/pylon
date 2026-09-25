@@ -705,6 +705,128 @@ async fn a_date_or_time_renders_as_iso_8601_through_a_cast_and_through_to_str() 
     }
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_cast_from_a_string_parses_as_strictly_as_the_function_does() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    for expr in [
+        "<datetime>'2026-01-16T12:34:56Z' = to_datetime('2026-01-16T12:34:56Z')",
+        "<cal::local_date>'2026-01-16' = cal::to_local_date(2026, 1, 16)",
+        "<cal::local_time>'12:34:56' = cal::to_local_time(12, 34, 56)",
+        "<cal::local_datetime>'2026-01-16T12:34:56' = cal::to_local_datetime(2026, 1, 16, 12, 34, 56)",
+        "<duration>'90 minutes' = to_duration(minutes := 90)",
+        "<cal::date_duration>'400 days' = cal::to_date_duration(days := 400)",
+        "<cal::relative_duration>'1 year 2 hours' = cal::to_relative_duration(years := 1, hours := 2)",
+    ] {
+        assert_eq!(eval_scalar(&pool, expr).await, DecodedValue::Bool(true), "{expr}");
+    }
+
+    // What PostgreSQL's own input parsers would have taken.
+    for (expr, message) in [
+        // A datetime with no zone would otherwise be read in whatever zone
+        // the session happens to be in.
+        (
+            "<datetime>'2026-01-16T12:34:56'",
+            "invalid input syntax for type datetime",
+        ),
+        (
+            "<datetime>'01/16/2026 12:34:56Z'",
+            "invalid input syntax for type datetime",
+        ),
+        (
+            "<cal::local_date>'01/16/2026'",
+            "invalid input syntax for type cal::local_date",
+        ),
+        (
+            "<cal::local_datetime>'2026-01-16T12:34:56Z'",
+            "invalid input syntax for type cal::local_datetime",
+        ),
+        (
+            "<cal::local_time>'noon'",
+            "invalid input syntax for type cal::local_time",
+        ),
+        // A duration is a fixed length, so calendar units cannot appear.
+        ("<duration>'1 month'", "invalid input syntax for type duration"),
+        ("<duration>'2 days'", "invalid input syntax for type duration"),
+        // And a date duration is whole days, so sub-day units cannot.
+        (
+            "<cal::date_duration>'90 minutes'",
+            "invalid input syntax for type cal::date_duration",
+        ),
+        // A format for a datetime has to name the zone it reads.
+        (
+            "to_datetime('2026-01-16 12:34:56', 'YYYY-MM-DD HH24:MI:SS')",
+            "missing required time zone in format",
+        ),
+    ] {
+        assert_error_contains(&pool, expr, message).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_format_is_optional_everywhere_to_str_takes_one() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    for (expr, expected) in [
+        ("to_str(<int64>1234567, 'FM9,999,999')", "1,234,567"),
+        ("to_str(<float64>3.5, 'FM999.99')", "3.5"),
+        ("to_str(<decimal>3.5, 'FM999.99')", "3.5"),
+        ("to_str(<bigint>12345, 'FM99999')", "12345"),
+        ("to_str(<int64>42, <optional str>{})", "42"),
+        ("to_str(to_json('[1]'), 'pretty')", "[\n    1\n]"),
+        ("to_str(['a', 'b'], '-')", "a-b"),
+    ] {
+        assert_eq!(
+            eval_scalar(&pool, expr).await,
+            DecodedValue::Str(expected.to_string()),
+            "{expr}"
+        );
+    }
+
+    for (expr, message) in [
+        ("to_str(<int64>42, '')", "\"fmt\" argument must be a non-empty string"),
+        (
+            "to_str(to_json('[1]'), '')",
+            "\"fmt\" argument must be a non-empty string",
+        ),
+        // `pretty` is the only format json has.
+        ("to_str(to_json('[1]'), 'ugly')", "format 'ugly' is invalid"),
+    ] {
+        assert_error_contains(&pool, expr, message).await;
+    }
+
+    // An interval renders as ISO 8601, which is what pinning `intervalstyle`
+    // on every connection buys — `01:30:00` otherwise.
+    for expr in ["to_str(<duration>'90 minutes')", "<str><duration>'90 minutes'"] {
+        assert_eq!(
+            eval_scalar(&pool, expr).await,
+            DecodedValue::Str("PT1H30M".to_string()),
+            "{expr}"
+        );
+    }
+
+    // Overloads the upstream engine does not declare are not callable here either, though
+    // the casts they used to back still are.
+    let empty = SchemaDescriptor::default();
+    for expr in [
+        "to_str(<bool>true)",
+        "to_str(<uuid>to_uuid(to_bytes('0123456789abcdef', 'UTF8')))",
+    ] {
+        assert!(
+            query::compile(&format!("select {expr}"), &empty).is_err(),
+            "{expr} should not resolve"
+        );
+    }
+    assert_eq!(
+        eval_scalar(&pool, "<str><bool>true").await,
+        DecodedValue::Str("true".to_string())
+    );
+}
+
 /// Runs `select <expr>` and asserts it fails with a message containing
 /// `needle` — the accept/reject half of stdlib parity, which `eval_scalar`
 /// cannot express because it unwraps.

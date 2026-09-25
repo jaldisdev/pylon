@@ -12072,6 +12072,47 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
+                // The mirror of the `<str>x` routing below: the upstream engine declares every
+                // str → date/time cast `FROM FUNCTION`, and those functions
+                // are stricter than PostgreSQL's own input parsers, which
+                // accept `01/16/2026`, a zone-less datetime, or `1 month` as
+                // a duration. Keyed on the type as written, because
+                // `duration`, `cal::relative_duration` and
+                // `cal::date_duration` are all `interval` and each takes a
+                // different set of units.
+                if infer_ir_type(&inner) == Some("text")
+                    && let Some((module, name)) = tc.ty.as_named()
+                {
+                    let parser = match (module, name) {
+                        (None | Some("std"), "datetime") => Some(("std", "to_datetime")),
+                        (Some("cal"), "local_datetime") => Some(("cal", "to_local_datetime")),
+                        (Some("cal"), "local_date") => Some(("cal", "to_local_date")),
+                        (Some("cal"), "local_time") => Some(("cal", "to_local_time")),
+                        _ => None,
+                    };
+                    if let Some((ns, fn_name)) = parser {
+                        return self.resolve_fn_call(Some(ns), fn_name, vec![inner]);
+                    }
+                    // Neither of these is a function in the upstream engine either, only a
+                    // cast, so they are internal helpers rather than stdlib
+                    // overloads (which would also be indistinguishable, both
+                    // taking one `interval`).
+                    let helper = match (module, name) {
+                        (None | Some("std"), "duration") => Some("duration_in"),
+                        (Some("cal"), "date_duration") => Some("date_duration_in"),
+                        _ => None,
+                    };
+                    if let Some(helper) = helper {
+                        return Ok(IrExpr::FunctionCall(super::IrFunctionCall {
+                            return_pg_type: Some("interval".to_string()),
+                            schema: Some("_pylon".to_string()),
+                            name: helper.to_string(),
+                            args: vec![inner],
+                            sql_template: None,
+                        }));
+                    }
+                }
+
                 // `<str>` of a date/time value is `to_str` of it, the way the upstream engine
                 // declares that cast `FROM FUNCTION std::to_str`. `::text`
                 // gives a different answer for the same value — a datetime

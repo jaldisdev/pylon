@@ -59,7 +59,7 @@ impl PgListener {
     where
         F: Fn(Notification) + Send + 'static,
     {
-        let pg_config: tokio_postgres::Config = dsn.parse()?;
+        let pg_config = crate::session_config(dsn)?;
         let (client, mut connection) = pg_config.connect(tokio_postgres::NoTls).await?;
         tokio::spawn(async move {
             loop {
