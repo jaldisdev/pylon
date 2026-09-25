@@ -68,8 +68,11 @@ class Default(_PointerConstraint):
     Accepts:
 
     * a sentinel — ``Default(Now)``, ``Default(SequenceNext)``
-    * a literal — ``Default(0)``, ``Default('draft')``, ``Default(False)``
-    * a PyQL expression string — ``Default('std::uuid_generate_v7()')``
+    * a literal — ``Default(0)``, ``Default(False)``, ``Default('draft')`` on a
+      text-backed property, an enum member
+    * a PyQL expression string — ``Default('std::uuid_generate_v7()')``. On a
+      text-backed property a ``str`` is the value itself, so an expression
+      there takes the node form below instead.
     * a ``std``/``math``/``cal`` expression —
       ``Default(std.uuid_generate_v7())``
 

@@ -185,16 +185,54 @@ class TestSchemaIntegration:
         meta = model.__pylon_config__.pointers['token']
         assert _make_default_pyql(meta) is None
 
-    def test_a_string_sentinel_is_a_pyql_expression_not_a_string_literal(self):
-        # Long-standing behaviour, unchanged here and easy to trip over:
-        # `Default('draft')` compiles `draft` as PyQL, it does not default the
-        # column to the text "draft". A literal string default needs its own
-        # quotes: `Default("'draft'")`.
+    def test_a_string_sentinel_off_a_text_column_is_a_pyql_expression(self):
+        # What makes `Default('std::uuid_generate_v7()')` an expression rather
+        # than the name of one: off a text-backed property a `str` is PyQL.
         from pylon.schema._walker import _make_default_pyql, _make_default_sql
 
         model = self._pointer('draft')
         meta = model.__pylon_config__.pointers['token']
         assert _make_default_pyql(meta) == 'draft'
+        assert _make_default_sql(meta) is None
+
+    def _text_pointer(self, annotation_default):
+        import pylon
+        from pylon.schema import Default, Property
+
+        @pylon.type
+        class WithTextDefault:
+            name: Property[pylon.Str]
+            timezone: Property[pylon.Str, Default(annotation_default)]
+
+        return WithTextDefault
+
+    def test_a_string_sentinel_on_a_text_column_is_the_string(self):
+        # `Default('Europe/Amsterdam')` means that string, the way
+        # `Default(1)` on an integer means that number. Read as PyQL it
+        # parsed as `Europe / Amsterdam` and the column ended up with no
+        # default at all.
+        from pylon.schema._walker import _make_default_pyql, _make_default_sql
+
+        model = self._text_pointer('Europe/Amsterdam')
+        meta = model.__pylon_config__.pointers['timezone']
+        assert _make_default_sql(meta) == "'Europe/Amsterdam'"
+        assert _make_default_pyql(meta) is None
+
+    def test_a_string_literal_on_a_text_column_is_quoted_safely(self):
+        from pylon.schema._walker import _make_default_sql
+
+        model = self._text_pointer("it's")
+        meta = model.__pylon_config__.pointers['timezone']
+        assert _make_default_sql(meta) == "'it''s'"
+
+    def test_an_expression_on_a_text_column_takes_the_node_form(self):
+        # A `str` there is the value, so the escape hatch for an expression
+        # is the `std`/`math`/`cal` node.
+        from pylon.schema._walker import _make_default_pyql, _make_default_sql
+
+        model = self._text_pointer(std.str_lower('ABC'))
+        meta = model.__pylon_config__.pointers['timezone']
+        assert _make_default_pyql(meta) == "std::str_lower('ABC')"
         assert _make_default_sql(meta) is None
 
 

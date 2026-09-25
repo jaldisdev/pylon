@@ -670,6 +670,25 @@ def _python_value_to_sql(value: Any) -> str | None:
     return None
 
 
+def _default_str_is_a_literal(meta: Any) -> bool:
+    """Whether a `str` passed to `Default(...)` is the value itself.
+
+    On a text-backed property it is: `Default('Europe/Amsterdam')` means that
+    string, the way `Default(1)` on an integer means that number. Anywhere else
+    -- a uuid, a datetime, an array, a link -- a `str` is PyQL source, which is
+    what makes `Default('std::uuid_generate_v7()')` an expression rather than
+    the name of one. A text-backed property that wants an expression writes it
+    as a `std`/`math`/`cal` node: `Default(std.str_lower(...))`.
+    """
+    scalar_type = getattr(meta, 'scalar_type', None)
+    if scalar_type is None:
+        return False
+    try:
+        return _to_pg_type(scalar_type) == 'text'
+    except SchemaError:
+        return False
+
+
 def _make_default_sql(meta: Any) -> str | None:
     """Return a SQL literal/expression for the property's default, or None."""
     import decimal as _decimal
@@ -691,7 +710,11 @@ def _make_default_sql(meta: Any) -> str | None:
             # parse and the column silently ends up with no default at all.
             if isinstance(s, Enum):
                 return "'" + s.value.replace("'", "''") + "'"
-            if isinstance(s, (str, _Node)):
+            if isinstance(s, str):
+                if _default_str_is_a_literal(meta):
+                    return _python_value_to_sql(s)
+                return None  # PyQL expression — handled by _make_default_pyql
+            if isinstance(s, _Node):
                 return None  # PyQL expression — handled by _make_default_pyql
             if s is None:
                 return 'NULL'
@@ -738,7 +761,7 @@ def _make_default_pyql(meta: Any) -> str | None:
         if isinstance(s, Enum):
             return None  # a SQL literal — see `_make_default_sql`
         if isinstance(s, str):
-            return s
+            return None if _default_str_is_a_literal(meta) else s
         if isinstance(s, _Node):
             return render_default_expr(s)
         # Everything `_make_default_sql` handles on the SQL side.
