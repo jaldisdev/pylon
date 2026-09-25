@@ -867,7 +867,8 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
                 return "    SELECT NULL AS \"id\" WHERE FALSE".to_string();
             }
             let (values_from, _) = emit_for_iterator(&f.iterator, &format!("_for_{}", f.var_name));
-            let body = prefix_body_ctes(emit_dml_as_cte_source(&f.body), &f.body_ctes).replace('\n', "\n    ");
+            let body =
+                prefix_body_ctes(emit_dml_as_cte_source(&f.body), &uncorrelated_body_ctes(f)).replace('\n', "\n    ");
             format!(
                 "    SELECT \"_body\".*\n    FROM {}\n    CROSS JOIN LATERAL (\n    {}\n    ) AS \"_body\"",
                 values_from.replace('\n', "\n    "),
@@ -3331,6 +3332,27 @@ fn nested_for_from(inner_alias: &str, outer_alias: &str) -> String {
 
 /// Put the bindings a `for` body declared in front of the body itself: they may
 /// read the loop variable, so they cannot sit in the enclosing WITH clause.
+/// A `for` body's CTEs as they must read inside the LATERAL that runs the body.
+///
+/// `emit_user_cte_parts` keys a binding that reads the loop variable by the
+/// iteration, joining `_for_<slot>` to carry its key — right where the binding
+/// sits in the statement's own WITH beside the iterator CTE, as the DML forms
+/// emit it. Inside the LATERAL there is no such relation: `_for_<slot>` is the
+/// outer FROM item's alias, so `FROM "_for_<slot>"` is SQL PostgreSQL rejects
+/// ("relation does not exist"), and spelling it legally would widen the binding
+/// to every iteration's rows at once. The LATERAL has already pinned the
+/// iteration to one row, and the correlated column reference the body carries
+/// reads it, so the key is neither needed nor correct here.
+fn uncorrelated_body_ctes(f: &IrFor) -> Vec<IrCteDef> {
+    f.body_ctes
+        .iter()
+        .map(|cte| IrCteDef {
+            correlated_to: None,
+            ..cte.clone()
+        })
+        .collect()
+}
+
 fn prefix_body_ctes(sql: String, body_ctes: &[IrCteDef]) -> String {
     if body_ctes.is_empty() {
         return sql;
@@ -3369,7 +3391,7 @@ fn emit_for_stmt(f: &IrFor, user_ctes: &[IrCteDef]) -> SqlOutput {
                 // body kind with a PyQL error before an `IrFor` is built.
                 other => unreachable!("for-loop body should have been rejected at compile time: {other:?}"),
             };
-            let indent_body = prefix_body_ctes(body_out.sql, &f.body_ctes).replace('\n', "\n    ");
+            let indent_body = prefix_body_ctes(body_out.sql, &uncorrelated_body_ctes(f)).replace('\n', "\n    ");
             let cte_prefix = if !user_ctes.is_empty() {
                 emit_cte_prefix(user_ctes)
             } else {
