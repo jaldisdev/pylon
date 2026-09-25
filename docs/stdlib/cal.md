@@ -5,8 +5,8 @@ Local (timezone-naive) date/time construction and arithmetic — the calendar co
 | Function | Signature(s) | Returns | Description |
 |---|---|---|---|
 | `to_local_datetime` | `(dt: datetime, timezone: str)` / `(year, month, day, hour, min: int64, sec: float64)` / `(s: str, fmt: str)` | `local_datetime` | Convert a timezone-aware datetime to local time in a given zone, construct from discrete fields, or parse from a formatted string. |
-| `to_local_date` | `(dt: local_datetime)` / `(year: int64, month: int64, day: int64)` / `(s: str, fmt: str)` | `local_date` | Extract the date part, construct from fields, or parse. |
-| `to_local_time` | `(dt: local_datetime)` / `(hour: int64, min: int64, sec: float64)` / `(s: str, fmt: str)` | `local_time` | Extract the time part, construct from fields, or parse. |
+| `to_local_date` | `(dt: datetime, timezone: str)` / `(dt: local_datetime)` / `(year: int64, month: int64, day: int64)` / `(s: str, fmt: str)` | `local_date` | Take the date a timezone-aware datetime falls on in a given zone, extract the date part, construct from fields, or parse. |
+| `to_local_time` | `(dt: datetime, timezone: str)` / `(dt: local_datetime)` / `(hour: int64, min: int64, sec: float64)` / `(s: str, fmt: str)` | `local_time` | Take the wall-clock time a timezone-aware datetime falls at in a given zone, extract the time part, construct from fields, or parse. |
 | `local_datetime_get` | `(dt: local_datetime, el: str)` | `float64` | Extract a field — `year`, `month`, `day`, `hour`, `minute`, `second`, `microsecond`, `millisecond`, `epoch`, `dow`, `doy`, `week`, `quarter`. |
 | `date_get` | `(d: local_date, el: str)` | `float64` | Extract a field — `year`, `month`, `day`, `dow`, `doy`, `week`, `quarter`. |
 | `time_get` | `(t: local_time, el: str)` | `float64` | Extract a field — `hour`, `minute`, `second`, `microsecond`, `millisecond`. |

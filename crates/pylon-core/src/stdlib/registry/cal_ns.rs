@@ -27,7 +27,7 @@ pub(super) fn build() -> Vec<FnDescriptor> {
             "to_local_datetime",
             vec![p("dt", Datetime), p("timezone", Str)],
             LocalDatetime,
-            E("$1 AT TIME ZONE $2"),
+            E("($1 AT TIME ZONE $2)"),
         ),
         f(
             "cal",
@@ -53,6 +53,13 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f(
             "cal",
             "to_local_date",
+            vec![p("dt", Datetime), p("timezone", Str)],
+            LocalDate,
+            E("($1 AT TIME ZONE $2)::date"),
+        ),
+        f(
+            "cal",
+            "to_local_date",
             vec![p("dt", LocalDatetime)],
             LocalDate,
             E("$1::date"),
@@ -70,6 +77,13 @@ pub(super) fn build() -> Vec<FnDescriptor> {
             vec![p("s", Str), p("fmt", Str)],
             LocalDate,
             E("to_date($1,$2)"),
+        ),
+        f(
+            "cal",
+            "to_local_time",
+            vec![p("dt", Datetime), p("timezone", Str)],
+            LocalTime,
+            E("($1 AT TIME ZONE $2)::time"),
         ),
         f(
             "cal",

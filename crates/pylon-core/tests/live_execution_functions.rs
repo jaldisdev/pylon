@@ -447,6 +447,41 @@ async fn named_only_arguments_default_what_they_leave_out() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_zone_picks_the_datetime_overload_and_a_format_the_string_one() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    // 23:30 UTC is already the next day in Amsterdam (UTC+1 in January).
+    let date = eval_scalar(
+        &pool,
+        "cal::to_local_date(<datetime>'2026-01-15T23:30:00Z', 'Europe/Amsterdam') = cal::to_local_date(2026, 1, 16)",
+    )
+    .await;
+    assert_eq!(date, DecodedValue::Bool(true));
+    let time = eval_scalar(
+        &pool,
+        "cal::to_local_time(<datetime>'2026-01-15T23:30:00Z', 'Europe/Amsterdam') = cal::to_local_time(0, 30, 0)",
+    )
+    .await;
+    assert_eq!(time, DecodedValue::Bool(true));
+    let datetime = eval_scalar(
+        &pool,
+        "cal::to_local_datetime(<datetime>'2026-01-15T23:30:00Z', 'Europe/Amsterdam') = cal::to_local_datetime(2026, 1, 16, 0, 30, 0)",
+    )
+    .await;
+    assert_eq!(datetime, DecodedValue::Bool(true));
+
+    // Two strings still reach the parsing overload, not the zone one.
+    let parsed = eval_scalar(
+        &pool,
+        "cal::to_local_date('2026-01-16', 'YYYY-MM-DD') = cal::to_local_date(2026, 1, 16)",
+    )
+    .await;
+    assert_eq!(parsed, DecodedValue::Bool(true));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn base64_round_trips_without_line_breaks() {
     let pool = test_pool().await;
     pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
