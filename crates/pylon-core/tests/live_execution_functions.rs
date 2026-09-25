@@ -49,7 +49,7 @@ use pylon_core::query;
 use pylon_core::schema::{
     FunctionDescriptor, FunctionParamDescriptor, PropertyDescriptor, SchemaDescriptor, TypeDescriptor,
 };
-use pylon_pgcon::ExtensionOids;
+use pylon_pgcon::{ExtensionOids, PgPool};
 use pylon_value::DecodedValue;
 
 fn ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
@@ -478,6 +478,191 @@ async fn a_zone_picks_the_datetime_overload_and_a_format_the_string_one() {
     )
     .await;
     assert_eq!(parsed, DecodedValue::Bool(true));
+
+    // And the inverse direction, `std::to_datetime(local, zone)`.
+    let back = eval_scalar(
+        &pool,
+        "to_datetime(cal::to_local_datetime(2026, 1, 16, 0, 30, 0), 'Europe/Amsterdam') = <datetime>'2026-01-15T23:30:00Z'",
+    )
+    .await;
+    assert_eq!(back, DecodedValue::Bool(true));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_string_with_no_format_is_read_as_iso_8601() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    for expr in [
+        "cal::to_local_date('2026-01-16') = cal::to_local_date(2026, 1, 16)",
+        // The compact ISO spelling, and surrounding whitespace, are accepted.
+        "cal::to_local_date('20260116') = cal::to_local_date(2026, 1, 16)",
+        "cal::to_local_date('  2026-01-16  ') = cal::to_local_date(2026, 1, 16)",
+        "cal::to_local_time('12:34:56') = cal::to_local_time(12, 34, 56)",
+        "cal::to_local_time('12:34') = cal::to_local_time(12, 34, 0)",
+        "cal::to_local_time('123456') = cal::to_local_time(12, 34, 56)",
+        "cal::to_local_datetime('2026-01-16T12:34:56') = cal::to_local_datetime(2026, 1, 16, 12, 34, 56)",
+        "cal::to_local_datetime('2026-01-16 12:34:56') = cal::to_local_datetime(2026, 1, 16, 12, 34, 56)",
+        // An empty set for `fmt` is the same as leaving it out.
+        "cal::to_local_date('2026-01-16', <optional str>{}) = cal::to_local_date(2026, 1, 16)",
+    ] {
+        assert_eq!(eval_scalar(&pool, expr).await, DecodedValue::Bool(true), "{expr}");
+    }
+
+    // Everything PostgreSQL would otherwise accept but ISO 8601 does not.
+    for (expr, message) in [
+        (
+            "cal::to_local_date('01/16/2026')",
+            "invalid input syntax for type cal::local_date",
+        ),
+        (
+            "cal::to_local_date('Jan 16, 2026')",
+            "invalid input syntax for type cal::local_date",
+        ),
+        (
+            "cal::to_local_date('2026-1-6')",
+            "invalid input syntax for type cal::local_date",
+        ),
+        (
+            "cal::to_local_datetime('2026-01-16T12:34:56Z')",
+            "invalid input syntax for type cal::local_datetime",
+        ),
+        (
+            "cal::to_local_time('noon')",
+            "invalid input syntax for type cal::local_time",
+        ),
+        // A valid PostgreSQL `time`, but not a valid time of day.
+        (
+            "cal::to_local_time('24:00:00')",
+            "cal::local_time field value out of range",
+        ),
+        (
+            "cal::to_local_date('2026-01-16', '')",
+            "\"fmt\" argument must be a non-empty string",
+        ),
+        (
+            "cal::to_local_datetime('2026-01-16 12:34+02', 'YYYY-MM-DD HH24:MITZH')",
+            "unexpected time zone in format",
+        ),
+    ] {
+        assert_error_contains(&pool, expr, message).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_date_duration_is_built_from_years_months_and_days() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    let same = eval_scalar(
+        &pool,
+        "cal::to_date_duration(years := 1, months := 2, days := 3) = <cal::date_duration>'1 year 2 months 3 days'",
+    )
+    .await;
+    assert_eq!(same, DecodedValue::Bool(true));
+    let empty = SchemaDescriptor::default();
+    assert!(
+        query::compile("select cal::to_date_duration(1, 2, 3)", &empty).is_err(),
+        "a named-only parameter cannot be passed by position"
+    );
+    assert!(
+        query::compile("select cal::to_date_duration(hours := 1)", &empty).is_err(),
+        "a date duration has no units below a day"
+    );
+
+    // 30-day chunks become months; hours are left alone rather than rolled
+    // up into days first.
+    let days = eval_scalar(
+        &pool,
+        "cal::duration_normalize_days(<cal::relative_duration>'45 days') = <cal::relative_duration>'1 month 15 days'",
+    )
+    .await;
+    assert_eq!(days, DecodedValue::Bool(true));
+    let hours_untouched = eval_scalar(
+        &pool,
+        "cal::duration_normalize_days(<cal::relative_duration>'720 hours') = <cal::relative_duration>'720 hours'",
+    )
+    .await;
+    assert_eq!(hours_untouched, DecodedValue::Bool(true));
+    let hours = eval_scalar(
+        &pool,
+        "cal::duration_normalize_hours(<cal::relative_duration>'720 hours') = <cal::relative_duration>'30 days'",
+    )
+    .await;
+    assert_eq!(hours, DecodedValue::Bool(true));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_element_is_named_as_postgres_names_it() {
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    for (expr, expected) in [
+        ("cal::date_get(<cal::local_date>'2026-01-16', 'isodow')", 5.0),
+        ("cal::date_get(<cal::local_date>'2026-01-16', 'millennium')", 3.0),
+        ("cal::time_get(<cal::local_time>'12:34:56', 'minutes')", 34.0),
+        ("cal::time_get(<cal::local_time>'12:34:56', 'midnightseconds')", 45296.0),
+        (
+            "datetime_get(<cal::local_datetime>'2026-01-16T12:34:56', 'minutes')",
+            34.0,
+        ),
+        ("datetime_get(<datetime>'2026-01-16T12:34:56Z', 'seconds')", 56.0),
+        ("duration_get(<duration>'90 minutes', 'totalseconds')", 5400.0),
+    ] {
+        assert_eq!(eval_scalar(&pool, expr).await, DecodedValue::F64(expected), "{expr}");
+    }
+
+    // The singular spellings, and the ones PostgreSQL knows but the accepted
+    // vocabulary does not, are rejected by name.
+    for (expr, message) in [
+        (
+            "cal::time_get(<cal::local_time>'12:34:56', 'minute')",
+            "invalid unit for cal::time_get",
+        ),
+        (
+            "cal::date_get(<cal::local_date>'2026-01-16', 'minutes')",
+            "invalid unit for cal::date_get",
+        ),
+        (
+            "datetime_get(<datetime>'2026-01-16T12:34:56Z', 'timezone')",
+            "invalid unit for std::datetime_get",
+        ),
+        (
+            "datetime_truncate(<datetime>'2026-01-16T12:34:56Z', 'quarter')",
+            "invalid unit for std::datetime_truncate",
+        ),
+        (
+            "duration_get(<duration>'90 minutes', 'hours')",
+            "invalid unit for std::duration_get",
+        ),
+    ] {
+        assert_error_contains(&pool, expr, message).await;
+    }
+
+    // `quarters` is the accepted spelling of PostgreSQL's `quarter`.
+    let quarters = eval_scalar(
+        &pool,
+        "datetime_truncate(<datetime>'2026-01-16T12:34:56Z', 'quarters') = <datetime>'2026-01-01T00:00:00Z'",
+    )
+    .await;
+    assert_eq!(quarters, DecodedValue::Bool(true));
+}
+
+/// Runs `select <expr>` and asserts it fails with a message containing
+/// `needle` — the accept/reject half of stdlib parity, which `eval_scalar`
+/// cannot express because it unwraps.
+async fn assert_error_contains(pool: &PgPool, expr: &str, needle: &str) {
+    let schema = SchemaDescriptor::default();
+    let compiled = query::compile(&format!("select {expr}"), &schema).expect("should compile");
+    let error = pool
+        .query_typed(&compiled.sql, &[], &ExtensionOids::default())
+        .await
+        .expect_err(&format!("{expr} should have failed"));
+    let message = error.to_string();
+    assert!(message.contains(needle), "{expr}: {needle:?} not in {message:?}");
 }
 
 #[tokio::test]

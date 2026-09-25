@@ -154,13 +154,13 @@ select re_test('^[A-Z]', .name)
 | `datetime_current` | `()` | `datetime` | Current time, re-evaluated per row (`clock_timestamp()`). |
 | `datetime_of_transaction` | `()` | `datetime` | Current transaction's start time. |
 | `datetime_of_statement` | `()` | `datetime` | Current statement's start time. |
-| `datetime_get` | `(dt: datetime, el: str)` | `float64` | Extract a field — `el` is one of `year`, `month`, `day`, `hour`, `minute`, `second`, `microsecond`, `millisecond`, `epoch`, `timezone`, `dow`, `doy`, `week`, `quarter`. |
-| `datetime_truncate` | `(dt: datetime, unit: str)` | `datetime` | Truncate to the given unit boundary. |
+| `datetime_get` | `(dt: datetime, el: str)` / `(dt: cal::local_datetime, el: str)` | `float64` | Extract a field — `el` is one of `century`, `day`, `decade`, `dow`, `doy`, `hour`, `isodow`, `isoyear`, `microseconds`, `millennium`, `milliseconds`, `minutes`, `month`, `quarter`, `seconds`, `week`, `year`, or `epochseconds`. |
+| `datetime_truncate` | `(dt: datetime, unit: str)` | `datetime` | Truncate to a unit boundary — `microseconds`, `milliseconds`, `seconds`, `minutes`, `hours`, `days`, `weeks`, `months`, `quarters`, `years`, `decades`, or `centuries`. |
 | `datetime_shift` | `(dt: datetime, delta: duration)` | `datetime` | Add a duration. |
-| `duration_get` | `(d: duration, el: str)` | `float64` | Extract a field — `hours`, `minutes`, `seconds`, `microseconds`, `milliseconds`, `epoch`. |
+| `duration_get` | `(d: duration, el: str)` | `float64` | Extract a field — `hour`, `minutes`, `seconds`, `milliseconds`, `microseconds`, or `totalseconds` for the whole duration in seconds. |
 | `duration_to_seconds` | `(d: duration)` | `decimal` | Total duration in seconds. |
 | `duration_truncate` | `(dt: duration, unit: str)` | `duration` | Truncate to a unit boundary — `microseconds`, `milliseconds`, `seconds`, `minutes`, or `hours`. |
-| `to_datetime` | `(s: str, fmt: str)` / `(year, month, day, hour, min: int64, sec: float64, timezone: str)` / `(s: str)` *(cast target)* / `(epoch_seconds: decimal)` | `datetime` | Parse/construct a timestamp from a format string, discrete fields, ISO 8601 text, or a Unix epoch. |
+| `to_datetime` | `(s: str, fmt: str)` / `(year, month, day, hour, min: int64, sec: float64, timezone: str)` / `(local: cal::local_datetime, zone: str)` / `(s: str)` *(cast target)* / `(epoch_seconds: decimal)` | `datetime` | Parse/construct a timestamp from a format string, discrete fields, a wall clock reading in a given zone, ISO 8601 text, or a Unix epoch. |
 | `to_duration` | `(hours: int64, minutes: int64, seconds: float64)` | `duration` | Construct a duration from discrete fields. |
 
 ## Type conversion

@@ -19,7 +19,7 @@
 
 use super::{
     Any, AnyOrderable, AnyPoint, BigInt, Bool, Bytes, Datetime, Decimal, Duration, Float32, Float64, FnDescriptor,
-    Int16, Int32, Int64, Json, LocalDate, Str, Uuid,
+    Int16, Int32, Int64, Json, LocalDate, LocalDatetime, Str, Uuid,
 };
 use super::{
     B, E, I, NamedDefault, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_stable_nullable, plpgsql_stable_nullable_bool,
@@ -1063,36 +1063,70 @@ END"#,
             Float64,
             plpgsql(
                 "datetime_get",
-                r#"DECLARE result float8;
-BEGIN
-    CASE $2
-        WHEN 'year'        THEN result := extract(year         FROM $1);
-        WHEN 'month'       THEN result := extract(month        FROM $1);
-        WHEN 'day'         THEN result := extract(day          FROM $1);
-        WHEN 'hour'        THEN result := extract(hour         FROM $1);
-        WHEN 'minute'      THEN result := extract(minute       FROM $1);
-        WHEN 'second'      THEN result := extract(second       FROM $1);
-        WHEN 'microsecond' THEN result := extract(microseconds FROM $1);
-        WHEN 'millisecond' THEN result := extract(milliseconds FROM $1);
-        WHEN 'epoch'       THEN result := extract(epoch        FROM $1);
-        WHEN 'timezone'    THEN result := extract(timezone     FROM $1);
-        WHEN 'dow'         THEN result := extract(dow          FROM $1);
-        WHEN 'doy'         THEN result := extract(doy          FROM $1);
-        WHEN 'week'        THEN result := extract(week         FROM $1);
-        WHEN 'quarter'     THEN result := extract(quarter      FROM $1);
-        ELSE RAISE EXCEPTION 'datetime_get: unknown field: %', $2;
-    END CASE;
-    RETURN result;
+                r#"BEGIN
+    IF $2 = 'epochseconds' THEN
+        RETURN date_part('epoch', $1);
+    END IF;
+    IF $2 NOT IN ('century', 'day', 'decade', 'dow', 'doy', 'hour', 'isodow', 'isoyear',
+                  'microseconds', 'millennium', 'milliseconds', 'minutes', 'month',
+                  'quarter', 'seconds', 'week', 'year') THEN
+        RAISE EXCEPTION 'invalid unit for std::datetime_get: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: epochseconds, century, day, decade, dow, doy, hour, isodow, isoyear, microseconds, millennium, milliseconds, minutes, month, quarter, seconds, week, year.';
+    END IF;
+    RETURN date_part($2, $1);
+END"#,
+            ),
+        ),
+        // `cal::local_datetime` reads the same units off the same table — the upstream engine
+        // declares this overload alongside the cal:: library rather than in
+        // the cal:: namespace.
+        f(
+            "std",
+            "datetime_get",
+            vec![p("dt", LocalDatetime), p("el", Str)],
+            Float64,
+            plpgsql(
+                "datetime_get",
+                r#"BEGIN
+    IF $2 = 'epochseconds' THEN
+        RETURN date_part('epoch', $1);
+    END IF;
+    IF $2 NOT IN ('century', 'day', 'decade', 'dow', 'doy', 'hour', 'isodow', 'isoyear',
+                  'microseconds', 'millennium', 'milliseconds', 'minutes', 'month',
+                  'quarter', 'seconds', 'week', 'year') THEN
+        RAISE EXCEPTION 'invalid unit for std::datetime_get: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: epochseconds, century, day, decade, dow, doy, hour, isodow, isoyear, microseconds, millennium, milliseconds, minutes, month, quarter, seconds, week, year.';
+    END IF;
+    RETURN date_part($2, $1);
 END"#,
             ),
         ),
         // Note argument swap: PyQL truncate(dt, unit) → date_trunc(unit, dt).
+        // `quarters` is spelled `quarter` by PostgreSQL, and PostgreSQL's own
+        // vocabulary is wider than the accepted one, so the unit is checked
+        // rather than passed straight through.
         f(
             "std",
             "datetime_truncate",
             vec![p("dt", Datetime), p("unit", Str)],
             Datetime,
-            E("date_trunc($2, $1)"),
+            plpgsql(
+                "datetime_truncate",
+                r#"BEGIN
+    IF $2 = 'quarters' THEN
+        RETURN date_trunc('quarter', $1);
+    END IF;
+    IF $2 NOT IN ('microseconds', 'milliseconds', 'seconds', 'minutes', 'hours', 'days',
+                  'weeks', 'months', 'years', 'decades', 'centuries') THEN
+        RAISE EXCEPTION 'invalid unit for std::datetime_truncate: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: microseconds, milliseconds, seconds, minutes, hours, days, weeks, months, quarters, years, decades, centuries.';
+    END IF;
+    RETURN date_trunc($2, $1);
+END"#,
+            ),
         ),
         f(
             "std",
@@ -1108,18 +1142,16 @@ END"#,
             Float64,
             plpgsql(
                 "duration_get",
-                r#"DECLARE result float8;
-BEGIN
-    CASE $2
-        WHEN 'hours'        THEN result := extract(hour         FROM $1);
-        WHEN 'minutes'      THEN result := extract(minute       FROM $1);
-        WHEN 'seconds'      THEN result := extract(second       FROM $1);
-        WHEN 'microseconds' THEN result := extract(microseconds FROM $1);
-        WHEN 'milliseconds' THEN result := extract(milliseconds FROM $1);
-        WHEN 'epoch'        THEN result := extract(epoch        FROM $1);
-        ELSE RAISE EXCEPTION 'duration_get: unknown field: %', $2;
-    END CASE;
-    RETURN result;
+                r#"BEGIN
+    IF $2 = 'totalseconds' THEN
+        RETURN date_part('epoch', $1);
+    END IF;
+    IF $2 NOT IN ('hour', 'minutes', 'seconds', 'milliseconds', 'microseconds') THEN
+        RAISE EXCEPTION 'invalid unit for std::duration_get: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: hour, minutes, seconds, milliseconds, microseconds, and totalseconds.';
+    END IF;
+    RETURN date_part($2, $1);
 END"#,
             ),
         ),
@@ -1169,6 +1201,15 @@ END"#,
                 "to_datetime",
                 "SELECT make_timestamptz($1::int, $2::int, $3::int, $4::int, $5::int, $6, $7)",
             ),
+        ),
+        // The inverse of `cal::to_local_datetime(dt, timezone)`: read a wall
+        // clock reading as an instant in a given zone.
+        f(
+            "std",
+            "to_datetime",
+            vec![p("local", LocalDatetime), p("zone", Str)],
+            Datetime,
+            E("($1 AT TIME ZONE $2)"),
         ),
         // Single-arg ISO 8601 parsing; cast target for str → datetime.
         fc(

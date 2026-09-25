@@ -18,7 +18,7 @@
 //
 
 use super::{Datetime, Float64, FnDescriptor, Int64, LocalDate, LocalDatetime, LocalTime, RelativeDuration, Str};
-use super::{E, NamedDefault, f, p, plpgsql, pn, sql};
+use super::{E, NamedDefault, f, opt, p, plpgsql, plpgsql_nullable, pn, sql};
 
 pub(super) fn build() -> Vec<FnDescriptor> {
     vec![
@@ -43,12 +43,51 @@ pub(super) fn build() -> Vec<FnDescriptor> {
             LocalDatetime,
             E("make_timestamp($1,$2,$3,$4,$5,$6)"),
         ),
+        // A bare string is ISO 8601. PostgreSQL's own `::timestamp` accepts
+        // far more than that — `01/16/2026`, `Jan 16 2026`, a trailing zone,
+        // orderings that depend on the session's DateStyle — so the shape is
+        // checked before the cast.
         f(
             "cal",
             "to_local_datetime",
-            vec![p("s", Str), p("fmt", Str)],
+            vec![p("s", Str)],
             LocalDatetime,
-            E("to_timestamp($1,$2)::timestamp"),
+            plpgsql(
+                "to_local_datetime",
+                r#"BEGIN
+    IF $1 !~ '^\s*((\d{4}-\d{2}-\d{2}|\d{8})[ tT](\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?|\d{2,6}(\.\d+)?))\s*$' THEN
+        RAISE EXCEPTION 'invalid input syntax for type cal::local_datetime: %', quote_literal($1)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Please use ISO8601 format. Example 2010-04-18T09:27:00';
+    END IF;
+    RETURN $1::timestamp;
+END"#,
+            ),
+        ),
+        // `fmt` is optional: left out, or passed as an empty set, the string
+        // is read as ISO 8601 by the overload above.
+        f(
+            "cal",
+            "to_local_datetime",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            LocalDatetime,
+            plpgsql_nullable(
+                "to_local_datetime",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN _pylon.to_local_datetime($1);
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_local_datetime(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF $2 ~ '^(("([^"\\]|\\.)*")|([^"]+))*(TZH|TZM).*$' THEN
+        RAISE EXCEPTION 'unexpected time zone in format: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format';
+    END IF;
+    RETURN to_timestamp($1, $2)::timestamp;
+END"#,
+            ),
         ),
         f(
             "cal",
@@ -74,9 +113,42 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f(
             "cal",
             "to_local_date",
-            vec![p("s", Str), p("fmt", Str)],
+            vec![p("s", Str)],
             LocalDate,
-            E("to_date($1,$2)"),
+            plpgsql(
+                "to_local_date",
+                r#"BEGIN
+    IF $1 !~ '^\s*(\d{4}-\d{2}-\d{2}|\d{8})\s*$' THEN
+        RAISE EXCEPTION 'invalid input syntax for type cal::local_date: %', quote_literal($1)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Please use ISO8601 format. Example 2010-04-18';
+    END IF;
+    RETURN $1::date;
+END"#,
+            ),
+        ),
+        f(
+            "cal",
+            "to_local_date",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            LocalDate,
+            plpgsql_nullable(
+                "to_local_date",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN _pylon.to_local_date($1);
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_local_date(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF $2 ~ '^(("([^"\\]|\\.)*")|([^"]+))*(TZH|TZM).*$' THEN
+        RAISE EXCEPTION 'unexpected time zone in format: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format';
+    END IF;
+    RETURN to_date($1, $2);
+END"#,
+            ),
         ),
         f(
             "cal",
@@ -99,43 +171,57 @@ pub(super) fn build() -> Vec<FnDescriptor> {
             LocalTime,
             E("make_time($1,$2,$3)"),
         ),
+        // `24:00:00` is a valid PostgreSQL `time` but not a valid ISO 8601
+        // time of day, so it is rejected after the cast — the pattern cannot
+        // tell 24 from 23.
         f(
             "cal",
             "to_local_time",
-            vec![p("s", Str), p("fmt", Str)],
+            vec![p("s", Str)],
             LocalTime,
-            E("to_timestamp($1,$2)::time"),
-        ),
-        // PylonFunction: PG extract requires a keyword field, not a text argument.
-        f(
-            "cal",
-            "local_datetime_get",
-            vec![p("dt", LocalDatetime), p("el", Str)],
-            Float64,
             plpgsql(
-                "local_datetime_get",
-                r#"DECLARE result float8;
+                "to_local_time",
+                r#"DECLARE result time;
 BEGIN
-    CASE $2
-        WHEN 'year'        THEN result := extract(year         FROM $1);
-        WHEN 'month'       THEN result := extract(month        FROM $1);
-        WHEN 'day'         THEN result := extract(day          FROM $1);
-        WHEN 'hour'        THEN result := extract(hour         FROM $1);
-        WHEN 'minute'      THEN result := extract(minute       FROM $1);
-        WHEN 'second'      THEN result := extract(second       FROM $1);
-        WHEN 'microsecond' THEN result := extract(microseconds FROM $1);
-        WHEN 'millisecond' THEN result := extract(milliseconds FROM $1);
-        WHEN 'epoch'       THEN result := extract(epoch        FROM $1);
-        WHEN 'dow'         THEN result := extract(dow          FROM $1);
-        WHEN 'doy'         THEN result := extract(doy          FROM $1);
-        WHEN 'week'        THEN result := extract(week         FROM $1);
-        WHEN 'quarter'     THEN result := extract(quarter      FROM $1);
-        ELSE RAISE EXCEPTION 'local_datetime_get: unknown field: %', $2;
-    END CASE;
+    IF $1 !~ '^\s*(\d{2}(:\d{2}(:\d{2}(\.\d+)?)?)?|\d{2,6}(\.\d+)?)\s*$' THEN
+        RAISE EXCEPTION 'invalid input syntax for type cal::local_time: %', quote_literal($1)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Please use ISO8601 format. Examples: 18:43:27 or 18:43';
+    END IF;
+    result := $1::time;
+    IF date_part('hour', result) = 24 THEN
+        RAISE EXCEPTION 'cal::local_time field value out of range: %', quote_literal($1)
+            USING ERRCODE = 'invalid_datetime_format';
+    END IF;
     RETURN result;
 END"#,
             ),
         ),
+        f(
+            "cal",
+            "to_local_time",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            LocalTime,
+            plpgsql_nullable(
+                "to_local_time",
+                r#"BEGIN
+    IF $2 IS NULL THEN
+        RETURN _pylon.to_local_time($1);
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_local_time(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF $2 ~ '^(("([^"\\]|\\.)*")|([^"]+))*(TZH|TZM).*$' THEN
+        RAISE EXCEPTION 'unexpected time zone in format: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format';
+    END IF;
+    RETURN to_timestamp($1, $2)::time;
+END"#,
+            ),
+        ),
+        // PylonFunction: the accepted units are checked before `date_part`
+        // sees them, so an unknown one names this function rather than PG's.
         f(
             "cal",
             "date_get",
@@ -143,19 +229,14 @@ END"#,
             Float64,
             plpgsql(
                 "date_get",
-                r#"DECLARE result float8;
-BEGIN
-    CASE $2
-        WHEN 'year'    THEN result := extract(year    FROM $1);
-        WHEN 'month'   THEN result := extract(month   FROM $1);
-        WHEN 'day'     THEN result := extract(day     FROM $1);
-        WHEN 'dow'     THEN result := extract(dow     FROM $1);
-        WHEN 'doy'     THEN result := extract(doy     FROM $1);
-        WHEN 'week'    THEN result := extract(week    FROM $1);
-        WHEN 'quarter' THEN result := extract(quarter FROM $1);
-        ELSE RAISE EXCEPTION 'date_get: unknown field: %', $2;
-    END CASE;
-    RETURN result;
+                r#"BEGIN
+    IF $2 NOT IN ('century', 'day', 'decade', 'dow', 'doy', 'isodow', 'isoyear',
+                  'millennium', 'month', 'quarter', 'week', 'year') THEN
+        RAISE EXCEPTION 'invalid unit for cal::date_get: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: century, day, decade, dow, doy, isodow, isoyear, millennium, month, quarter, week, year.';
+    END IF;
+    RETURN date_part($2, $1);
 END"#,
             ),
         ),
@@ -166,56 +247,17 @@ END"#,
             Float64,
             plpgsql(
                 "time_get",
-                r#"DECLARE result float8;
-BEGIN
-    CASE $2
-        WHEN 'hour'        THEN result := extract(hour         FROM $1);
-        WHEN 'minute'      THEN result := extract(minute       FROM $1);
-        WHEN 'second'      THEN result := extract(second       FROM $1);
-        WHEN 'microsecond' THEN result := extract(microseconds FROM $1);
-        WHEN 'millisecond' THEN result := extract(milliseconds FROM $1);
-        ELSE RAISE EXCEPTION 'time_get: unknown field: %', $2;
-    END CASE;
-    RETURN result;
+                r#"BEGIN
+    IF $2 = 'midnightseconds' THEN
+        RETURN date_part('epoch', $1);
+    END IF;
+    IF $2 NOT IN ('hour', 'microseconds', 'milliseconds', 'minutes', 'seconds') THEN
+        RAISE EXCEPTION 'invalid unit for cal::time_get: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: hour, microseconds, midnightseconds, milliseconds, minutes, seconds.';
+    END IF;
+    RETURN date_part($2, $1);
 END"#,
-            ),
-        ),
-        f(
-            "cal",
-            "to_duration",
-            vec![
-                p("days", Int64),
-                p("hours", Int64),
-                p("minutes", Int64),
-                p("seconds", Float64),
-            ],
-            RelativeDuration,
-            sql(
-                "to_relative_duration",
-                "SELECT make_interval(days => $1::int, hours => $2::int, mins => $3::int, secs => $4)",
-            ),
-        ),
-        // Fuller positional form of cal::to_relative_duration (whose params
-        // are conventionally NAMED ONLY — Pylon has no named-only
-        // parameter support, so this is positional instead).
-        f(
-            "cal",
-            "to_duration",
-            vec![
-                p("years", Int64),
-                p("months", Int64),
-                p("days", Int64),
-                p("hours", Int64),
-                p("minutes", Int64),
-                p("seconds", Float64),
-                p("microseconds", Int64),
-            ],
-            RelativeDuration,
-            sql(
-                "to_relative_duration_full",
-                "SELECT make_interval(years => $1::int, months => $2::int, days => $3::int, \
-                 hours => $4::int, mins => $5::int, secs => $6) \
-                 + ($7::text || ' microseconds')::interval",
             ),
         ),
         f(
@@ -236,6 +278,20 @@ END"#,
                mins => $5::int, secs => $6) + make_interval(secs => $7 / 1000000.0))",
             ),
         ),
+        // `cal::date_duration` is `interval` as well, so this returns the same
+        // PostgreSQL type as `to_relative_duration` — what separates them is
+        // that the units below a day cannot be given here.
+        f(
+            "cal",
+            "to_date_duration",
+            vec![
+                pn("years", Int64, NamedDefault::Int(0)),
+                pn("months", Int64, NamedDefault::Int(0)),
+                pn("days", Int64, NamedDefault::Int(0)),
+            ],
+            RelativeDuration,
+            E("make_interval(years => $1::int, months => $2::int, days => $3::int)"),
+        ),
         f(
             "cal",
             "duration_normalize_hours",
@@ -243,12 +299,15 @@ END"#,
             RelativeDuration,
             sql("duration_normalize_hours", "SELECT justify_hours($1)"),
         ),
+        // `justify_days` alone: 30-day chunks become months, and hours are
+        // left where they are. Rolling hours up into days first would make
+        // `720 hours` normalize to one month.
         f(
             "cal",
             "duration_normalize_days",
             vec![p("d", RelativeDuration)],
             RelativeDuration,
-            sql("duration_normalize_days", "SELECT justify_days(justify_hours($1))"),
+            sql("duration_normalize_days", "SELECT justify_days($1)"),
         ),
     ]
 }

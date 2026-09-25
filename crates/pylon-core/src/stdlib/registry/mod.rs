@@ -175,6 +175,20 @@ fn plpgsql(name: &'static str, body: &'static str) -> ImplStrategy {
     })
 }
 
+/// PL/pgSQL IMMUTABLE, NOT STRICT — for an overload whose trailing
+/// `optional<…>` parameter is NULL when the caller leaves it out, and whose
+/// body has its own branch for that case.
+fn plpgsql_nullable(name: &'static str, body: &'static str) -> ImplStrategy {
+    ImplStrategy::PylonFunction(PylonFnDef {
+        name,
+        language: SqlLanguage::PlPgSql,
+        volatility: FnVolatility::Immutable,
+        strict: false,
+        returns_override: None,
+        body,
+    })
+}
+
 /// PL/pgSQL STABLE, NOT STRICT — for overloads where an optional `msg` param
 /// may legitimately be NULL when the caller omits it.
 fn plpgsql_stable_nullable(name: &'static str, body: &'static str) -> ImplStrategy {
