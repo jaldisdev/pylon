@@ -167,6 +167,37 @@ class TestCompileAndBind:
         ):
             _compile_and_bind('select $name', {'name': 'Alice', 'other': 1})
 
+    def test_a_none_inside_an_array_argument_is_refused(self):
+        # PyQL has no `array<optional T>`, so a None element is not a value the
+        # query can mean; bound as SQL NULL it silently matches nothing. The
+        # message is the upstream engine's own, observed from the upstream Python client:
+        #   invalid input for query argument $ids: [None]
+        #     (invalid array element at index 0: None is not allowed)
+        from pylon.client import _compile_and_bind
+        from pylon.exceptions import InvalidParameterTypeError
+
+        compiled = self._make_compiled('SELECT $1', param_names=['ids'])
+        expected = (
+            r'invalid input for query argument \$ids: \[None\] '
+            r'\(invalid array element at index 0: None is not allowed\)'
+        )
+        with (
+            patch('pylon.query.compile', return_value=compiled),
+            pytest.raises(InvalidParameterTypeError, match=expected),
+        ):
+            _compile_and_bind('select $ids', {'ids': [None]})
+
+    def test_an_array_argument_without_a_none_still_binds(self):
+        # Including the empty array, and a None for the whole argument — an
+        # absent `<optional …>` is a value the query can mean.
+        from pylon.client import _compile_and_bind
+
+        compiled = self._make_compiled('SELECT $1', param_names=['ids'])
+        with patch('pylon.query.compile', return_value=compiled):
+            assert _compile_and_bind('select $ids', {'ids': ['a']})[1] == [['a']]
+            assert _compile_and_bind('select $ids', {'ids': []})[1] == [[]]
+            assert _compile_and_bind('select $ids', {'ids': None})[1] == [None]
+
     def test_a_query_with_no_parameters_takes_no_arguments(self):
         from pylon.client import _compile_and_bind
         from pylon.exceptions import UnknownParameterError

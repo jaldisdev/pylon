@@ -123,15 +123,52 @@ pub(crate) fn compile_and_bind(
             if let Some(qname) = name.strip_prefix("__global__") {
                 Ok(globals.get(qname).cloned().unwrap_or(DecodedValue::Null))
             } else {
-                params
+                let value = params
                     .iter()
                     .find(|(k, _)| *k == name.as_str())
                     .map(|(_, v)| v.clone())
-                    .ok_or_else(|| Error::MissingParam(name.clone()))
+                    .ok_or_else(|| Error::MissingParam(name.clone()))?;
+                check_array_elements(name, &value)?;
+                Ok(value)
             }
         })
         .collect::<Result<Vec<_>>>()?;
     Ok((compiled, bound))
+}
+
+/// Refuse a NULL inside an array argument.
+///
+/// PyQL has no `array<optional T>`, so a NULL element is never a value the
+/// query can mean — but bound as SQL NULL it compares equal to nothing and the
+/// statement quietly returns no rows rather than failing. the upstream engine rejects it
+/// client-side before execution; the wording is the upstream engine's own, matching what
+/// `pylon/client.py`'s `_check_array_elements` raises on the Python side.
+fn check_array_elements(name: &str, value: &DecodedValue) -> Result<()> {
+    let DecodedValue::Array(items) = value else {
+        return Ok(());
+    };
+    let Some(index) = items.iter().position(|item| matches!(item, DecodedValue::Null)) else {
+        return Ok(());
+    };
+    Err(Error::InvalidArgument(format!(
+        "invalid input for query argument ${name}: {} \
+         (invalid array element at index {index}: None is not allowed)",
+        render_array(items)
+    )))
+}
+
+/// The array as the upstream engine's own message renders it — Python's `repr` of a list,
+/// which is what the message this mirrors was written against.
+fn render_array(items: &[DecodedValue]) -> String {
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            DecodedValue::Null => "None".to_string(),
+            DecodedValue::Str(s) => format!("{s:?}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    format!("[{}]", rendered.join(", "))
 }
 
 /// The session globals as the JSON a database trigger reads them from
@@ -332,4 +369,39 @@ pub(crate) async fn analyze<E: Executor>(
     let raw_json = executor.run_explain(&compiled.sql, &bound).await.map_err(Error::Db)?;
     let tree = pylon_core::analyze::build_coarse_grained(&raw_json, &path_aliases).map_err(Error::Analyze)?;
     serde_json::to_string(&tree).map_err(Error::SchemaJson)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_null_inside_an_array_argument_is_refused_with_the_fixed_wording() {
+        let value = DecodedValue::Array(vec![DecodedValue::Null]);
+        let error = check_array_elements("ids", &value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid input for query argument $ids: [None] \
+             (invalid array element at index 0: None is not allowed)"
+        );
+    }
+
+    #[test]
+    fn the_index_named_is_the_offending_ones() {
+        let value = DecodedValue::Array(vec![DecodedValue::Str("a".into()), DecodedValue::Null]);
+        let error = check_array_elements("ids", &value).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid array element at index 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_array_without_nulls_and_a_null_argument_both_pass() {
+        // A whole argument that is NULL is an absent `<optional …>`, which is
+        // a value the query can mean; only a NULL *element* is not.
+        check_array_elements("ids", &DecodedValue::Array(vec![DecodedValue::Str("a".into())])).unwrap();
+        check_array_elements("ids", &DecodedValue::Array(vec![])).unwrap();
+        check_array_elements("ids", &DecodedValue::Null).unwrap();
+    }
 }

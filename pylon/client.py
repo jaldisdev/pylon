@@ -32,6 +32,7 @@ from pylon.exceptions import (
     ClientConnectionClosedError,
     InterfaceError,
     InternalServerError,
+    InvalidParameterTypeError,
     MissingParameterError,
     NoDataError,
     PylonError,
@@ -1002,6 +1003,28 @@ def _check_arguments(expected: set[str], kwargs: dict[str, Any]) -> None:
         raise MissingParameterError(message) if missed else UnknownParameterError(message)
 
 
+def _check_array_elements(kwargs: dict[str, Any]) -> None:
+    """Refuse a `None` inside an array argument.
+
+    PyQL has no `array<optional T>`, so a `None` element is never a value the
+    query can mean — but bound as SQL NULL it compares equal to nothing and
+    the query quietly returns no rows, which is how an assessment answer once
+    got written with none of its options linked. the upstream engine rejects it client-side,
+    before execution, and the wording here is the upstream engine's own (verified against
+    the upstream Python client, which raises `InvalidArgumentError`) so a message
+    carried over from an older log or test still reads the same.
+    """
+    for name, value in kwargs.items():
+        if not isinstance(value, (list, tuple)):
+            continue
+        for index, element in enumerate(value):
+            if element is None:
+                raise InvalidParameterTypeError(
+                    f'invalid input for query argument ${name}: {value!r} '
+                    f'(invalid array element at index {index}: None is not allowed)'
+                )
+
+
 def _declared_params(compiled: CompiledQuery) -> set[str]:
     """The names `compiled` expects from the caller — globals come from the
     session, so they are not the caller's to supply."""
@@ -1021,6 +1044,7 @@ def _bind_positional(
     call another statement's parameter an extra one.
     """
     _check_arguments(_declared_params(compiled) if declared is None else declared, kwargs)
+    _check_array_elements(kwargs)
     return [
         (globals_ or {}).get(name[len('__global__') :]) if name.startswith('__global__') else kwargs[name]
         for name in compiled.param_names
