@@ -6597,6 +6597,94 @@ mod tests {
         );
     }
 
+    /// `make_schema` plus an `Employee` extending `Person`, where `Person`
+    /// declares a computed naming itself — jaldis's
+    /// `BrandAddon.bundle := (BrandAddon is BrandAddonBundle)` in miniature.
+    fn make_schema_with_an_inherited_self_naming_computed() -> SchemaDescriptor {
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed.push(crate::schema::ComputedDescriptor {
+            name: "own_name".into(),
+            expression: "default::Person.name".into(),
+            return_type: Some("text".into()),
+            link_target: None,
+            link_multi: false,
+        });
+        let mut employee = person.clone();
+        employee.name = "Employee".into();
+        employee.table = "Employee".into();
+        employee.bases = vec!["default::Person".into()];
+        schema.types.push(employee);
+        schema
+    }
+
+    #[test]
+    fn an_inherited_computed_naming_its_declaring_type_still_means_the_row() {
+        // The upstream engine compiles a computed once, against the type that declares it, so
+        // the name reaches the subject on every subtype that inherits it.
+        // Pylon compiles it again per subtype, where the name matched nothing
+        // and the reference read the whole table instead.
+        let schema = make_schema_with_an_inherited_self_naming_computed();
+        let out = compile_and_emit_with("SELECT Employee { own_name }", &schema);
+        assert!(
+            !out.sql.contains("\"Person\""),
+            "the computed must read the Employee row, not Person's table:\n{}",
+            out.sql
+        );
+        crate::validate::validate_schema_types(&schema).expect("an inherited computed is single-valued");
+    }
+
+    #[test]
+    fn an_inherited_type_check_computed_tests_the_row_it_is_read_on() {
+        // jaldis's own: `BrandAddon.bundle := (BrandAddon is BrandAddonBundle)`,
+        // read on `BrandAddonBundle`. `is` had a same-scope check of its own
+        // that only knew the two spellings of the type being compiled, so on
+        // the subtype it read `BrandAddon` as a separate set — many values
+        // behind a declared `bool`.
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.computed.push(crate::schema::ComputedDescriptor {
+            name: "employed".into(),
+            expression: "(default::Person is default::Employee)".into(),
+            return_type: Some("boolean".into()),
+            link_target: None,
+            link_multi: false,
+        });
+        let mut employee = person.clone();
+        employee.name = "Employee".into();
+        employee.table = "Employee".into();
+        employee.bases = vec!["default::Person".into()];
+        schema.types.push(employee);
+
+        crate::validate::validate_schema_types(&schema).expect("the check is single-valued on both types");
+        let out = compile_and_emit_with("SELECT Employee { employed }", &schema);
+        assert!(
+            !out.sql.contains("\"Person\""),
+            "the check must read the Employee row's own type:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_shape_writing_the_computed_out_itself_does_not_get_the_anchor() {
+        // The rule the upstream engine actually has is narrow: only a *declared* computed is
+        // compiled against its declaring type. Naming a supertype anywhere
+        // else is that supertype's own set — confirmed against the upstream engine, where
+        // `select BrandAddonBundle { n := count(BrandAddon) }` is the full
+        // count while the same shape naming `BrandAddonBundle` is 1. So the
+        // same expression written out in a shape keeps resolving on its own,
+        // even where it shadows the inherited computed's name.
+        let schema = make_schema_with_an_inherited_self_naming_computed();
+        let ast = parse::parse("SELECT Employee { own_name := default::Person.name }").expect("parse failed");
+        let Err(error) = ir::compile(&ast, &schema) else {
+            panic!("an absolute path has nothing to anchor to here")
+        };
+        assert!(
+            format!("{error:?}").contains("absolute paths are not valid"),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn a_default_that_compiles_nowhere_is_still_an_error() {
         // jaldis carried `sequence_next(INTROSPECT marketplace::OrderNo)`, the upstream engine

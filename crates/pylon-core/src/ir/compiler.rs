@@ -1501,6 +1501,32 @@ struct SelectAnchor {
     qualified: String,
     alias: String,
     detached: bool,
+    /// The ancestor an inherited computed is declared on, set only for the
+    /// anchor that computed is compiled under.
+    ///
+    /// The upstream engine compiles a computed once, against the type that declares it, so
+    /// `BrandAddon.bundle := (BrandAddon is BrandAddonBundle)` reads its own
+    /// row there and keeps doing so through every subtype that inherits it.
+    /// Pylon materialises an inherited computed onto each subtype and compiles
+    /// it again there, where `BrandAddon` no longer names the subject -- and a
+    /// bare type name that anchors nothing reads the whole table. Naming a
+    /// supertype does *not* otherwise mean the subject (confirmed against the upstream engine:
+    /// `select BrandAddonBundle { n := count(BrandAddon) }` is the full count,
+    /// while the same shape naming `BrandAddonBundle` is 1), so this is scoped
+    /// to the one anchor rather than folded into the general name match.
+    declared_on: Option<(String, String)>,
+}
+
+impl SelectAnchor {
+    /// Whether this anchor answers to `root` as a path root.
+    fn answers_to(&self, root: &str) -> bool {
+        self.type_name == root
+            || self.qualified == root
+            || self
+                .declared_on
+                .as_ref()
+                .is_some_and(|(name, qualified)| name == root || qualified == root)
+    }
 }
 
 /// The synthetic argument carrying session globals into a function body.
@@ -3771,6 +3797,7 @@ impl<'a> Compiler<'a> {
             qualified: format!("{}::{}", td.module, td.name),
             alias: alias.to_string(),
             detached: false,
+            declared_on: None,
         });
         let result = self.compile_shape(elements, td, alias, module);
         self.anchors.pop();
@@ -4767,6 +4794,7 @@ impl<'a> Compiler<'a> {
             qualified: format!("{}::{}", td.module, td.name),
             alias: alias.to_string(),
             detached: std::mem::take(&mut self.pending_detached),
+            declared_on: None,
         });
         let result = self.compile_path_modifiers_inner(sel, td, alias);
         self.anchors.pop();
@@ -6502,6 +6530,7 @@ impl<'a> Compiler<'a> {
             qualified: format!("{}::{}", td.module, td.name),
             alias: alias.clone(),
             detached: std::mem::take(&mut self.pending_detached),
+            declared_on: None,
         });
         let clauses = (|compiler: &mut Self| -> Result<_, PyQLError> {
             let shape = compiler.compile_shape(shape_elements, td, &alias, &td.module)?;
@@ -6639,6 +6668,7 @@ impl<'a> Compiler<'a> {
             qualified: format!("{}::{}", td.module, td.name),
             alias: alias.clone(),
             detached: std::mem::take(&mut self.pending_detached),
+            declared_on: None,
         });
         // A binding read back by name brings whatever its own shape declared
         // (`offering { publisher }`), which is on no type and has to be found
@@ -10124,7 +10154,7 @@ impl<'a> Compiler<'a> {
             } else {
                 el.nested.clone().unwrap_or_default()
             };
-            return self.compile_computed_expr(pointer_name, &expr, td, alias, module, el.marker_offset, &nested);
+            return self.compile_computed_expr(pointer_name, &expr, td, alias, module, el.marker_offset, &nested, None);
         }
 
         Err(self.field_err(pointer_name, &format!("{}::{}", td.module, td.name)))
@@ -10617,7 +10647,29 @@ impl<'a> Compiler<'a> {
         nested: &[ShapeElement],
     ) -> Result<IrShapePointer, PyQLError> {
         let expr_ast = crate::parse::parse_pointer_expr(&cd.expression).map_err(PyQLError::Syntax)?;
-        self.compile_computed_expr(&cd.name, &expr_ast, td, alias, module, marker_offset, nested)
+        let declared_on = self.computed_declared_on(td, &cd.name);
+        self.compile_computed_expr(
+            &cd.name,
+            &expr_ast,
+            td,
+            alias,
+            module,
+            marker_offset,
+            nested,
+            declared_on,
+        )
+    }
+
+    /// The ancestor `td` inherited computed `name` from, nearest first, or
+    /// `None` when `td` declares it itself. See `SelectAnchor::declared_on`.
+    fn computed_declared_on(&self, td: &TypeDescriptor, name: &str) -> Option<(String, String)> {
+        td.bases
+            .iter()
+            .chain(td.parents.iter())
+            .chain(td.interfaces.iter())
+            .filter_map(|qualified| self.resolve_type(qualified).ok())
+            .find(|ancestor| ancestor.computed.iter().any(|c| c.name == name))
+            .map(|ancestor| (ancestor.name.clone(), format!("{}::{}", ancestor.module, ancestor.name)))
     }
 
     /// The body of `compile_declared_computed`, for a pointer whose expression
@@ -10632,6 +10684,7 @@ impl<'a> Compiler<'a> {
         module: &str,
         marker_offset: Option<usize>,
         nested: &[ShapeElement],
+        declared_on: Option<(String, String)>,
     ) -> Result<IrShapePointer, PyQLError> {
         // The object the pointer is computed on stays in scope for the whole
         // expression, including any part of it compiled without a type in
@@ -10641,6 +10694,7 @@ impl<'a> Compiler<'a> {
             qualified: format!("{}::{}", td.module, td.name),
             alias: alias.to_string(),
             detached: false,
+            declared_on,
         });
         let result = (|compiler: &mut Self| -> Result<IrShapePointer, PyQLError> {
             if let Some(ptr) =
@@ -13513,7 +13567,7 @@ impl<'a> Compiler<'a> {
         let (source_qname, cross_scope) = match expr {
             Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
                 if let ast::PathStep::Name(n) = &p.steps[0] {
-                    if n == &td.name || n == &self_qname {
+                    if n == &td.name || n == &self_qname || self.scope_answers_to(n, &self_qname) {
                         (self_qname.clone(), false)
                     } else {
                         // Attempt to resolve as another type.
@@ -13668,15 +13722,24 @@ impl<'a> Compiler<'a> {
     /// means the current row.
     fn enclosing_anchor(&self, root: &str) -> Option<(String, String)> {
         let innermost = self.anchors.last()?;
-        if !innermost.detached || (innermost.type_name != root && innermost.qualified != root) {
+        if !innermost.detached || !innermost.answers_to(root) {
             return None;
         }
         self.anchors
             .iter()
             .rev()
             .skip(1)
-            .find(|a| a.type_name == root || a.qualified == root)
+            .find(|a| a.answers_to(root))
             .map(|a| (a.qualified.clone(), a.alias.clone()))
+    }
+
+    /// Whether `root` names the scope `self_qname` stands for, beyond its own
+    /// two spellings — an inherited computed names its declaring type, which
+    /// is the subject there too. See `SelectAnchor::declared_on`.
+    fn scope_answers_to(&self, root: &str, self_qname: &str) -> bool {
+        self.anchors
+            .last()
+            .is_some_and(|anchor| anchor.qualified == self_qname && anchor.answers_to(root))
     }
 
     /// The innermost enclosing select binding `root` as its subject.
@@ -13684,7 +13747,7 @@ impl<'a> Compiler<'a> {
         self.anchors
             .iter()
             .rev()
-            .find(|a| a.type_name == root || a.qualified == root)
+            .find(|a| a.answers_to(root))
             .map(|a| (a.qualified.clone(), a.alias.clone()))
     }
 
