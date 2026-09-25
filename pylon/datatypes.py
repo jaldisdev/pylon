@@ -56,6 +56,58 @@ def _junction_pointers(through: Any) -> set[str] | None:
     return {name for name, meta in cfg.pointers.items() if meta.kind == 'property' and name != 'id'}
 
 
+class Unfetched:
+    """The class-level default of a field a query's shape may not have selected.
+
+    A non-data descriptor: when hydration wrote the field into the instance's
+    `__dict__` the instance wins and this never runs, so a selected field costs
+    nothing to read and a selected-but-null one still reads as `None`. It runs
+    only when the field is absent — which, for a hydrated row, means the shape
+    did not ask for it.
+
+    Raising there is what the upstream engine does (`'the upstream Object' object has no attribute
+    'order'`), and it matters more than it sounds: a field that reads as `None`
+    whether it was null or never fetched is indistinguishable from a legitimate
+    value, which is how an assessment answer once got written with `[None]` for
+    its options. The same reasoning as `LinkSet`'s unhydrated mode, for the
+    pointers that aren't multi-links.
+
+    `__get__` off the class returns `fallback` rather than raising, because that
+    is what `dataclasses` reads to build `__init__` — so constructing an
+    instance still gives the field its declared default.
+
+    `name` is passed in because `__set_name__` only fires for an attribute set
+    while the class body is executing; these are installed with `setattr` after
+    the fact (see `_prepare_dataclass`), so it never runs for them.
+
+    Only rows a query produced raise. A constructed instance was never given a
+    shape to leave anything out of, and its `init=False` pointers — computeds —
+    have no value yet by construction rather than by omission, so those keep
+    reading as their declared default. Hydration is what marks a row, by
+    writing `__pylon_type__` into its `__dict__`.
+    """
+
+    __slots__ = ('_fallback', '_name')
+
+    def __init__(self, fallback: Any = None, *, name: str = '<unknown>') -> None:
+        self._fallback = fallback
+        self._name = name
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._name = name
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None or '__pylon_type__' not in instance.__dict__:
+            return self._fallback
+        raise AttributeError(
+            f'{type(instance).__name__!r} object has no attribute {self._name!r} — it was not '
+            'selected by the query that produced it. Request it in the query shape to read it.'
+        )
+
+    def __repr__(self) -> str:
+        return f'<Unfetched {self._name}>'
+
+
 class LinkSet(PylonSet):
     """A multi-link's value on a model instance, which also records the
     mutations applied to it so `client.save()` can replay them.

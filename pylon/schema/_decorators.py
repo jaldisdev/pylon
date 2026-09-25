@@ -328,12 +328,23 @@ def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None
 
     @dataclass only understands mutable defaults when expressed as
     field(default_factory=...). This function converts them, and also injects
-    field(default=None) for nullable fields that have no explicit class-level
-    attribute.
+    a default for nullable fields that have no explicit class-level attribute.
+
+    Those defaults are `Unfetched` descriptors rather than the bare value:
+    `__init__` still gives a constructed instance the declared default, but a
+    *hydrated* instance whose shape skipped the field has nothing in its
+    `__dict__`, so reading it raises the way the upstream engine does instead of handing back a
+    `None` that cannot be told apart from a real one. A descriptor only works
+    as a bare class attribute — passed through `dataclasses.field(default=…)`
+    it is stored as the value itself — hence the plain `setattr` below.
     """
+    # Imported here, as `LinkSet` is below: `pylon.datatypes` imports from this
+    # package, so a module-level import would close a cycle.
+    from pylon.datatypes import Unfetched
+
     for name, meta in pointer_metas.items():
         if meta.kind == 'computed':
-            setattr(cls, name, dataclasses.field(init=False, default=None))
+            setattr(cls, name, dataclasses.field(init=False, default=Unfetched(name=name)))
             continue
 
         if meta.kind == 'multilink':
@@ -364,13 +375,20 @@ def _prepare_dataclass(cls: type, pointer_metas: dict[str, PointerMeta]) -> None
         if meta.default is not MISSING and current is MISSING:
             # The meta carries a resolved default (None for nullable fields or
             # Default(Now) constraints) but no class attribute exists yet.
-            setattr(cls, name, dataclasses.field(default=meta.default))
+            setattr(cls, name, Unfetched(meta.default, name=name))
             continue
 
         if meta.nullable and current is MISSING:
             # Optional annotation (e.g. name: str | None) with no explicit
             # default: inject implicit None.
-            setattr(cls, name, dataclasses.field(default=None))
+            setattr(cls, name, Unfetched(None, name=name))
+            continue
+
+        # An explicit class-level default the author wrote. It is still a
+        # value the query may not have fetched, so it gets the same treatment
+        # — unless they wrote a `field()` spec, which has its own semantics.
+        if current is not MISSING and not isinstance(current, (dataclasses.Field, Unfetched)):
+            setattr(cls, name, Unfetched(current, name=name))
 
 
 # ── Module / table inference ───────────────────────────────────────────────────

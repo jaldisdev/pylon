@@ -243,6 +243,48 @@ class TestObjects:
         assert native[0].__dict__['__type__'] == 'm::Tag'
 
 
+class TestUnfetchedPointers:
+    """A pointer the shape skipped must not read as a legitimate value.
+
+    Measured against the upstream Python client on the same kind of shape
+    (`select … { value }`, reading an unselected optional property):
+
+        o.order                    -> AttributeError: 'the upstream Object' object has
+                                      no attribute 'order'
+        hasattr(o, 'order')        -> False
+        getattr(o, 'order', None)  -> None
+
+    All three have to hold here too, or code that ran against the upstream engine changes
+    behaviour on the way over — `getattr(o, x, None)` silently handing back a
+    sentinel would be its own version of the bug this closes.
+    """
+
+    def test_an_unselected_property_raises_rather_than_reading_as_none(self):
+        compiled = _compile('select m::Post { title }')
+        native = assert_parity([('m::Post', _id(1), 'Hello')], compiled)
+        post = native[0]
+
+        assert hasattr(post, 'title')
+        assert not hasattr(post, 'shade')
+        assert getattr(post, 'shade', None) is None
+        with pytest.raises(AttributeError, match="no attribute 'shade'"):
+            getattr(post, 'shade')  # noqa: B009 — the point is that it raises
+
+    def test_a_selected_null_is_still_a_null(self):
+        """The distinction the upstream engine cannot draw and this one can: selected-and-null
+        reads as None, unselected raises."""
+        compiled = _compile('select m::Post { title, shade }')
+        native = assert_parity([('m::Post', _id(1), 'Hello', None)], compiled)
+        assert native[0].shade is None
+        assert hasattr(native[0], 'shade')
+
+    def test_a_constructed_instance_keeps_its_declared_defaults(self):
+        """Nothing left anything out of a shape here — there was no shape."""
+        post = Post(title='Hello', shade=Colour.RED)
+        assert post.palette is None
+        assert post.author is None
+
+
 class TestMultiLinks:
     def test_a_requested_multilink_is_hydrated(self):
         compiled = _compile('select m::Post { title, tags: { label } }')
