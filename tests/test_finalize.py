@@ -775,13 +775,15 @@ class TestWalkIntegration:
         schema = walk(types, enums, scalars, [])
         assert schema.type_count == 2
 
-    def test_link_default_selecting_an_object_is_rejected(self):
+    def test_link_default_selecting_an_object_moves_into_the_insert(self):
         """`DEFAULT (SELECT …)` is DDL PostgreSQL refuses to run.
 
-        It used to be emitted anyway, so the failure surfaced as a raw
-        Postgres error against generated DDL at migration time.
+        So the column gets no default and the insert applies it instead, which
+        is how the upstream engine has always applied every default. Emitting it anyway used to
+        surface as a raw Postgres error against generated DDL at migration
+        time; rejecting the schema outright refused a default the upstream engine accepts.
         """
-        from pylon.exceptions import SchemaError as CoreSchemaError
+        from pylon import _core
         from pylon.schema import Default, Link
         from pylon.schema._walker import walk
 
@@ -794,8 +796,9 @@ class TestWalkIntegration:
             team: Link[Team, Default('(select Team limit 1)')] | None
 
         types, enums, scalars = snapshot()
-        with pytest.raises(CoreSchemaError, match='column DEFAULT cannot contain'):
-            walk(types, enums, scalars, [])
+        schema = walk(types, enums, scalars, [])
+        ddl = _core.export_schema(schema)
+        assert '"team_id" uuid DEFAULT' not in ddl, ddl
 
     def test_pointer_level_expression_lands_on_its_own_type(self):
         import json
