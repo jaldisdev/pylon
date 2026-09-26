@@ -122,7 +122,7 @@ select re_test('^[A-Z]', .name)
 |---|---|---|---|
 | `array_get` | `(a: array<anytype>, i: int64)` | `T?` | 0-based element access; `{}` out of range instead of raising. |
 | `array_unpack` | `(a: array<anytype>)` | `set of anytype` | Each element as its own row. |
-| `array_join` | `(a: array<str>, delim: str)` | `str` | Join elements into a string. |
+| `array_join` | `(a: array<str>, delim: str)` / `(a: array<bytes>, delim: bytes)` | `str` / `bytes` | Join elements with a delimiter between them. |
 | `array_slice` | `(a: array<anytype>, start: int64 [, end: int64])` | `array<anytype>` | 0-based slice. |
 | `array_index_of` | `(a: array<anytype>, el: anytype)` | `int64` | 0-based index of the first match, or `-1`. |
 | `array_fill` | `(el: anytype, n: int64)` | `array<anytype>` | An `n`-length array of `el` repeated. |

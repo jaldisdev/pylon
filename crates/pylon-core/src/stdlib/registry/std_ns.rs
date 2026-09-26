@@ -859,6 +859,18 @@ END"#,
             Str,
             E("array_to_string($1, $2)"),
         ),
+        // `array_to_string` is text-only, so the bytes form aggregates the
+        // unnested elements instead.
+        f(
+            "std",
+            "array_join",
+            vec![p("a", arr(Bytes)), p("delim", Bytes)],
+            Bytes,
+            sql(
+                "array_join_bytes",
+                "SELECT string_agg(elem, $2) FROM unnest($1) AS t(elem)",
+            ),
+        ),
         f(
             "std",
             "array_slice",
