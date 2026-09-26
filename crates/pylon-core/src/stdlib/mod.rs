@@ -368,6 +368,11 @@ pub fn stdlib_enums() -> &'static [crate::schema::EnumDescriptor] {
                     .map(str::to_string)
                     .to_vec(),
             },
+            crate::schema::EnumDescriptor {
+                name: "Base64Alphabet".to_string(),
+                module: "enc".to_string(),
+                members: vec!["standard".to_string(), "urlsafe".to_string()],
+            },
         ]
     })
 }

@@ -393,6 +393,69 @@ async fn re_replace_takes_its_flags_by_name() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn base64_encoding_follows_the_alphabet_and_padding_it_is_given() {
+    let pool = stdlib_pool().await;
+    // `>` and `?` are the two bytes whose standard encoding uses `+` and `/`.
+    let data = "to_bytes('\u{3e}\u{3e}\u{3f}\u{3f}')";
+    assert_eq!(
+        eval_scalar(&pool, &format!("enc::base64_encode({data})")).await,
+        DecodedValue::Str("Pj4/Pw==".to_string())
+    );
+    assert_eq!(
+        eval_scalar(&pool, &format!("enc::base64_encode({data}, padding := false)")).await,
+        DecodedValue::Str("Pj4/Pw".to_string())
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!("enc::base64_encode({data}, alphabet := enc::Base64Alphabet.urlsafe)")
+        )
+        .await,
+        DecodedValue::Str("Pj4_Pw==".to_string())
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!(
+                "enc::base64_encode({data}, alphabet := enc::Base64Alphabet.urlsafe, \
+                 padding := false)"
+            )
+        )
+        .await,
+        DecodedValue::Str("Pj4_Pw".to_string())
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn base64_decoding_reverses_every_alphabet_and_padding_pair() {
+    let pool = stdlib_pool().await;
+    let decoded = DecodedValue::Bytes(b"\x3e\x3e\x3f\x3f".to_vec());
+    assert_eq!(eval_scalar(&pool, "enc::base64_decode('Pj4/Pw==')").await, decoded);
+    assert_eq!(
+        eval_scalar(&pool, "enc::base64_decode('Pj4/Pw', padding := false)").await,
+        decoded
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "enc::base64_decode('Pj4_Pw==', alphabet := enc::Base64Alphabet.urlsafe)"
+        )
+        .await,
+        decoded
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "enc::base64_decode('Pj4_Pw', alphabet := enc::Base64Alphabet.urlsafe, padding := false)"
+        )
+        .await,
+        decoded
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn array_join_concatenates_bytes_with_a_delimiter() {
     let pool = stdlib_pool().await;
     assert_eq!(

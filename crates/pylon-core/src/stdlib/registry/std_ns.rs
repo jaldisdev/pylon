@@ -772,19 +772,48 @@ END"#,
         ),
         f("std", "from_hex", vec![p("s", Str)], Bytes, E("decode($1, 'hex')")),
         // Postgres wraps its base64 output every 76 characters; this must not.
+        // The url-safe alphabet swaps `+/` for `-_`, and unpadded output drops
+        // the trailing `=` that decoding puts back.
         f(
             "enc",
             "base64_encode",
-            vec![p("data", Bytes)],
+            vec![
+                p("data", Bytes),
+                pn("alphabet", Str, NamedDefault::Str("standard")),
+                pn("padding", Bool, NamedDefault::Bool(true)),
+            ],
             Str,
-            E("translate(encode($1, 'base64'), E'\\n', '')"),
+            sql(
+                "base64_encode",
+                r#"SELECT CASE
+    WHEN $2 = 'standard' AND $3 THEN translate(encode($1, 'base64'), E'\n', '')
+    WHEN $2 = 'standard' AND NOT $3 THEN translate(rtrim(encode($1, 'base64'), '='), E'\n', '')
+    WHEN $2 = 'urlsafe' AND $3 THEN translate(encode($1, 'base64'), E'+/\n', '-_')
+    WHEN $2 = 'urlsafe' AND NOT $3 THEN translate(rtrim(encode($1, 'base64'), '='), E'+/\n', '-_')
+    ELSE _pylon.raise_invalid_parameter('base64_encode(): invalid alphabet ' || quote_literal($2))
+    END"#,
+            ),
         ),
         f(
             "enc",
             "base64_decode",
-            vec![p("data", Str)],
+            vec![
+                p("data", Str),
+                pn("alphabet", Str, NamedDefault::Str("standard")),
+                pn("padding", Bool, NamedDefault::Bool(true)),
+            ],
             Bytes,
-            E("decode($1, 'base64')"),
+            sql(
+                "base64_decode",
+                "SELECT CASE \
+                 WHEN $2 = 'standard' AND $3 THEN decode($1, 'base64') \
+                 WHEN $2 = 'standard' AND NOT $3 THEN decode($1 || repeat('=', (4 - length($1) % 4) % 4), 'base64') \
+                 WHEN $2 = 'urlsafe' AND $3 THEN decode(translate($1, '-_', '+/'), 'base64') \
+                 WHEN $2 = 'urlsafe' AND NOT $3 \
+                 THEN decode(translate($1, '-_', '+/') || repeat('=', (4 - length($1) % 4) % 4), 'base64') \
+                 ELSE _pylon.raise_invalid_parameter('base64_decode(): invalid alphabet ' || quote_literal($2))::bytea \
+                 END",
+            ),
         ),
         f("std", "to_bytes", vec![p("s", Str)], Bytes, E("convert_to($1, 'UTF8')")),
         f(
