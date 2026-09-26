@@ -3226,7 +3226,7 @@ fn yields_jsonb(expr: &IrExpr) -> bool {
         IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::NamedTuple { .. } => true,
         IrExpr::TypeCast(c) => c.pg_type == "jsonb",
         IrExpr::ColumnRef { pg_type, .. } | IrExpr::FnParam { pg_type, .. } => pg_type == "jsonb",
-        IrExpr::CteRef { pg_type, .. } => pg_type.as_deref() == Some("jsonb"),
+        IrExpr::CteRef { pg_type, .. } | IrExpr::ForVar { pg_type, .. } => pg_type.as_deref() == Some("jsonb"),
         IrExpr::FunctionCall(f) if f.schema.is_none() => {
             let mut overloads = crate::stdlib::registry().iter().filter(|d| d.name == f.name).peekable();
             overloads.peek().is_some() && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Json))
@@ -13324,6 +13324,21 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("::jsonb AS v"),
             "the loop variable should carry the element type, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// An overload that declares its element type carries it whatever it was
+    /// handed, so the body reads the loop variable as json rather than as the
+    /// text `jsonb_array_elements` would be cast to by default.
+    #[test]
+    fn test_for_over_json_array_unpack_binds_json() {
+        let out = compile_and_emit(
+            "FOR entry IN json_array_unpack(to_json(<str>$rows)) UNION (SELECT <str>json_get(entry, 'k'))",
+        );
+        assert!(
+            out.sql.contains("::jsonb AS v"),
+            "the loop variable should carry json, got:\n{}",
             out.sql
         );
     }

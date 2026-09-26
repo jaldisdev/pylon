@@ -6926,9 +6926,11 @@ impl<'a> Compiler<'a> {
         self.for_vars.get(name.as_str()).is_some_and(|t| t == "jsonb")
     }
 
-    /// The pg type one row of a set-returning call yields — the element type
-    /// of the array it unpacks. `None` when the call is not set-returning or
-    /// its argument's type is not an array.
+    /// The pg type one row of a set-returning call yields. An overload that
+    /// names its element type (`json_array_unpack` yields json) answers for
+    /// itself; one declared `set of any` (`array_unpack`) takes the type from
+    /// the array it unpacks. `None` when the call is not set-returning, or
+    /// when neither the overload nor the argument names a scalar type.
     fn set_returning_element_type(&mut self, expr: &Expr) -> Result<Option<String>, PyQLError> {
         if !expr_returns_set(expr) {
             return Ok(None);
@@ -6936,6 +6938,19 @@ impl<'a> Compiler<'a> {
         let Expr::FunctionCall(call) = expr else {
             return Ok(None);
         };
+        // Overloads that disagree on the element type say nothing between
+        // them, so only one answer shared by all of them counts.
+        let mut declared = crate::stdlib::lookup(call.module.as_deref().unwrap_or("std"), &call.name)
+            .into_iter()
+            .map(|descriptor| match &descriptor.return_type {
+                crate::stdlib::PylonType::Set(element) => element.scalar_pg_type(),
+                _ => None,
+            });
+        if let Some(element) = declared.next().flatten()
+            && declared.all(|other| other == Some(element))
+        {
+            return Ok(Some(element.to_string()));
+        }
         let [argument] = call.args.as_slice() else {
             return Ok(None);
         };
