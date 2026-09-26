@@ -92,7 +92,7 @@ select re_test('^[A-Z]', .name)
 | `to_json` | `(s: str)` *(cast target)* | `json` | Parse a JSON string. Also reachable via `<json>expr`. |
 | `json_typeof` | `(j: json)` | `str` | The JSON value's type name (`"object"`, `"array"`, `"string"`, ...). |
 | `json_get` | `(j: json, *path: str, default: json = {})` | `json?` | Traverse a path of keys/indices; `default` — `{}` unless given — if any step doesn't exist. |
-| `json_set` | `(j: json, path: array<str>, val: json)` | `json` | Return a copy with the value at `path` replaced. |
+| `json_set` | `(target: json, *path: str, value: json, create_if_missing: bool = true, empty_treatment: JsonEmpty = JsonEmpty.ReturnEmpty)` | `json?` | Return a copy with the value at `path` replaced. A missing key is added only when `create_if_missing`; an empty `value` is treated as `empty_treatment` says — `ReturnEmpty`, `ReturnTarget`, `UseNull`, `DeleteKey` or `Error`. |
 | `json_array_unpack` | `(j: json)` | `set of json` | Each element of a JSON array as its own row. |
 | `json_object_unpack` | `(j: json)` | `set of tuple<str, json>` | Each key/value pair of a JSON object. |
 | `json_array_length` | `(j: json)` | `int64?` | Number of elements in a JSON array. |

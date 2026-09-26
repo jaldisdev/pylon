@@ -147,6 +147,12 @@ class TestNamespaceCalls:
         with pytest.raises(InterfaceError, match='does not take named arguments'):
             std.str_lower(_path('name'), locale='de')
 
+    def test_a_named_only_parameter_with_no_default_has_to_be_passed(self):
+        with pytest.raises(InterfaceError, match="requires the named argument 'value'"):
+            std.json_set(_path('data'), 'a')
+        text, _ = render_expr(std.json_set(_path('data'), 'a', value=_path('other')))
+        assert text == 'std::json_set(.data, $__mq_p0, value := .other)'
+
     def test_variadic_and_named_arguments_combine(self):
         text, params = render_expr(std.json_get(_path('data'), 'a', 'b', default=1))
         assert text == 'std::json_get(.data, $__mq_p0, $__mq_p1, default := $__mq_p2)'

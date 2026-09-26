@@ -287,6 +287,84 @@ async fn json_get_falls_back_to_the_default_it_is_given() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn json_set_writes_the_value_at_a_path_of_any_depth() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "json_set(to_json('{\"a\": 1}'), 'a', value := to_json('2'))").await,
+        DecodedValue::Object(vec![("a".to_string(), DecodedValue::I64(2))])
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "json_set(to_json('{\"a\": {\"b\": 1}}'), 'a', 'b', value := to_json('2'))"
+        )
+        .await,
+        DecodedValue::Object(vec![(
+            "a".to_string(),
+            DecodedValue::Object(vec![("b".to_string(), DecodedValue::I64(2))])
+        )])
+    );
+}
+
+/// A missing key is only created when the call says it may be.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn json_set_honours_create_if_missing() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "json_set(to_json('{}'), 'a', value := to_json('2'))").await,
+        DecodedValue::Object(vec![("a".to_string(), DecodedValue::I64(2))])
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "json_set(to_json('{}'), 'a', value := to_json('2'), create_if_missing := false)"
+        )
+        .await,
+        DecodedValue::Object(vec![])
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn json_set_treats_an_empty_value_as_the_call_asks() {
+    let pool = stdlib_pool().await;
+    let target = "to_json('{\"a\": 1}')";
+    assert_eq!(
+        eval_scalar(&pool, &format!("json_set({target}, 'a', value := <json>{{}})")).await,
+        DecodedValue::Null
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!(
+                "json_set({target}, 'a', value := <json>{{}}, \
+                 empty_treatment := JsonEmpty.ReturnTarget)"
+            )
+        )
+        .await,
+        DecodedValue::Object(vec![("a".to_string(), DecodedValue::I64(1))])
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!("json_set({target}, 'a', value := <json>{{}}, empty_treatment := JsonEmpty.UseNull)")
+        )
+        .await,
+        DecodedValue::Object(vec![("a".to_string(), DecodedValue::Null)])
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!("json_set({target}, 'a', value := <json>{{}}, empty_treatment := JsonEmpty.DeleteKey)")
+        )
+        .await,
+        DecodedValue::Object(vec![])
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn array_get_falls_back_to_the_default_it_is_given() {
     let pool = stdlib_pool().await;
     assert_eq!(

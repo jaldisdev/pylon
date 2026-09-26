@@ -562,9 +562,38 @@ END"#,
         f(
             "std",
             "json_set",
-            vec![p("j", Json), pv("path", Str), p("val", Json)],
-            Json,
-            sql("json_set", "SELECT jsonb_set($1, $2, $3)"),
+            vec![
+                p("target", Json),
+                pv("path", Str),
+                pn("value", opt(Json), NamedDefault::Required),
+                pn("create_if_missing", Bool, NamedDefault::Bool(true)),
+                pn("empty_treatment", Str, NamedDefault::Str("ReturnEmpty")),
+            ],
+            opt(Json),
+            // PL/pgSQL rather than SQL: a raise sitting in a `CASE` arm of an
+            // inlined SQL function is evaluated even when another arm is the
+            // one that applies, which turned every `empty_treatment` past
+            // `ReturnTarget` into the error the last arm raises.
+            plpgsql_nullable(
+                "json_set",
+                r#"BEGIN
+    IF $3 IS NOT NULL THEN
+        RETURN jsonb_set($1, $2, $3, $4);
+    END IF;
+    CASE $5
+        WHEN 'ReturnEmpty' THEN RETURN NULL;
+        WHEN 'ReturnTarget' THEN RETURN $1;
+        WHEN 'UseNull' THEN RETURN jsonb_set($1, $2, 'null'::jsonb, $4);
+        WHEN 'DeleteKey' THEN RETURN $1 #- $2;
+        WHEN 'Error' THEN
+            RAISE EXCEPTION 'invalid empty JSON value'
+                USING ERRCODE = 'invalid_parameter_value';
+        ELSE
+            RAISE EXCEPTION 'json_set(): unknown empty_treatment %', quote_literal($5)
+                USING ERRCODE = 'invalid_parameter_value';
+    END CASE;
+END"#,
+            ),
         ),
         f(
             "std",

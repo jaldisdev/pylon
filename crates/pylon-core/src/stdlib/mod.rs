@@ -355,11 +355,20 @@ static STDLIB_ENUMS: OnceLock<Vec<crate::schema::EnumDescriptor>> = OnceLock::ne
 
 pub fn stdlib_enums() -> &'static [crate::schema::EnumDescriptor] {
     STDLIB_ENUMS.get_or_init(|| {
-        vec![crate::schema::EnumDescriptor {
-            name: "Endian".to_string(),
-            module: "std".to_string(),
-            members: vec!["Little".to_string(), "Big".to_string()],
-        }]
+        vec![
+            crate::schema::EnumDescriptor {
+                name: "Endian".to_string(),
+                module: "std".to_string(),
+                members: vec!["Little".to_string(), "Big".to_string()],
+            },
+            crate::schema::EnumDescriptor {
+                name: "JsonEmpty".to_string(),
+                module: "std".to_string(),
+                members: ["ReturnEmpty", "ReturnTarget", "Error", "UseNull", "DeleteKey"]
+                    .map(str::to_string)
+                    .to_vec(),
+            },
+        ]
     })
 }
 
