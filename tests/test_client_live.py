@@ -39,6 +39,7 @@ Run with: `.venv/bin/pytest tests/test_client_live.py -m live_db`
 from __future__ import annotations
 
 import asyncio
+import datetime
 import decimal
 import os
 import types as _types
@@ -499,6 +500,42 @@ def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, uni
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
+def test_a_month_bearing_duration_survives_the_round_trip(live_pool, unique_module):
+    """`cal::date_duration` and `cal::relative_duration` carry months, and a
+    `datetime.timedelta` cannot.
+
+    A month is not a fixed span of time without a date to count it from, so the
+    decoder used to refuse a month-bearing interval outright — which left every
+    `cal::to_date_duration(months := ...)` unreadable from Python even though
+    Postgres had computed it. `RelativeDuration` keeps the three components
+    apart, in both directions.
+    """
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.datatypes import RelativeDuration
+
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        assert await client.query_single('select cal::to_date_duration(years := 1, months := 2, days := 3);') == (
+            RelativeDuration(months=14, days=3)
+        )
+        # Months of 0 stays a timedelta — that is what `std::duration` is.
+        assert await client.query_single('select <duration>$d;', d=datetime.timedelta(hours=2)) == (
+            datetime.timedelta(hours=2)
+        )
+        # And as a parameter, which is the encoder's side of the same value.
+        given = RelativeDuration(months=14, days=3)
+        assert await client.query_single('select <cal::relative_duration>$d;', d=given) == given
+
+        await client.aclose()
 
     asyncio.run(run())
 

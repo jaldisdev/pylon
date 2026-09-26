@@ -2,6 +2,8 @@
 
 Local (timezone-naive) date/time construction and arithmetic — the calendar counterpart to [`std`](std.md#datetime-and-duration)'s timezone-aware `datetime`/`duration` functions, operating on `local_datetime`/`local_date`/`local_time`/`relative_duration` instead.
 
+`relative_duration` and `date_duration` both carry months, which a fixed-length `std::duration` never does and which a `datetime.timedelta` has no room for — a month is not a fixed span of time without a date to count it from. Both read back in Python as `pylon.datatypes.RelativeDuration`, which keeps the months, days and microseconds apart, and both are accepted as a parameter in that form. They travel as one PostgreSQL type, so a value does not say which of the two it was built as: what tells them apart is the function that made it.
+
 | Function | Signature(s) | Returns | Description |
 |---|---|---|---|
 | `to_local_datetime` | `(dt: datetime, timezone: str)` / `(year, month, day, hour, min: int64, sec: float64)` / `(s: str, fmt: optional<str>)` | `local_datetime` | Convert a timezone-aware datetime to local time in a given zone, construct from discrete fields, or parse a string. Without `fmt` the string must be ISO 8601 (`2010-04-18T09:27:00`, `20100418 0927`); `fmt` may not name a time zone field. |

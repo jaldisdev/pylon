@@ -65,6 +65,7 @@ struct PyTypes {
     decimal: Py<PyType>,
     timedelta: Py<PyType>,
     range: Py<PyType>,
+    relative_duration: Py<PyType>,
 }
 
 static PY_TYPES: OnceLock<Option<PyTypes>> = OnceLock::new();
@@ -84,6 +85,7 @@ fn py_types(py: Python<'_>) -> PyResult<&'static PyTypes> {
                 decimal: load("decimal", "Decimal").ok()?,
                 timedelta: load("datetime", "timedelta").ok()?,
                 range: load("pylon.datatypes", "Range").ok()?,
+                relative_duration: load("pylon.datatypes", "RelativeDuration").ok()?,
             })
         })
         .as_ref()
@@ -187,6 +189,13 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
             months: 0,
             days,
             microseconds: seconds * 1_000_000 + microseconds,
+        });
+    }
+    if value.is_instance(types.relative_duration.bind(py))? {
+        return Ok(DecodedValue::Interval {
+            months: value.getattr("months")?.extract()?,
+            days: value.getattr("days")?.extract()?,
+            microseconds: value.getattr("microseconds")?.extract()?,
         });
     }
     // `datetime.datetime` is a subclass of `datetime.date` — must be checked
@@ -345,16 +354,16 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
             microseconds,
         } => {
             if *months != 0 {
-                // `datetime.timedelta` has no month/year component (a
-                // "month" isn't a fixed span without a reference date) —
-                // only `std::duration` (months always 0) and the common
-                // `cal::relative_duration` calls that don't set years/months
-                // decode today; a genuinely month-bearing relative_duration
-                // needs a richer Python type this crate doesn't have yet.
-                return Err(PyValueError::new_err(
-                    "decoding a cal::relative_duration with nonzero years/months \
-                     is not yet supported",
-                ));
+                // `datetime.timedelta` has no month/year component — a month
+                // isn't a fixed span without a date to count it from — so a
+                // month-bearing interval keeps its three components apart in
+                // `RelativeDuration`, which is what `cal::relative_duration`
+                // and `cal::date_duration` both decode into. An interval
+                // without months is a `std::duration` and stays a `timedelta`.
+                return py_types(py)?
+                    .relative_duration
+                    .bind(py)
+                    .call1((*months, *days, *microseconds));
             }
             // Positional form: timedelta(days, seconds, microseconds, ...).
             py_types(py)?.timedelta.bind(py).call1((*days, 0, *microseconds))?

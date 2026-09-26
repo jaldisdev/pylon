@@ -326,6 +326,32 @@ class Range:
         return f'Range({open_b}{lo}, {hi}{close_b})'
 
 
+@dataclasses.dataclass(frozen=True)
+class RelativeDuration:
+    """A duration carrying months — what `cal::relative_duration` and
+    `cal::date_duration` hold and `datetime.timedelta` cannot.
+
+    A month is not a fixed span of time without a date to count it from, so
+    the three components stay apart rather than being summed. A date duration
+    is one of these with `microseconds` at 0; the two travel as the same
+    PostgreSQL `interval` and are not told apart by a value.
+
+    Usage::
+
+        d = RelativeDuration(months=14, days=3)
+        d.months, d.days, d.microseconds      # 14, 3, 0
+    """
+
+    months: int = 0
+    days: int = 0
+    microseconds: int = 0
+
+    def __repr__(self) -> str:
+        parts = [f'{name}={value}' for name, value in
+                 (('months', self.months), ('days', self.days), ('microseconds', self.microseconds)) if value]
+        return f'RelativeDuration({", ".join(parts)})'
+
+
 class Object:
     """Result container for free-form PyQL queries.
 
