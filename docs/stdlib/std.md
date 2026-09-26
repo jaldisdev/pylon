@@ -136,7 +136,7 @@ select re_test('^[A-Z]', .name)
 
 | Function | Signature(s) | Returns | Description |
 |---|---|---|---|
-| `range` | `(lower: anypoint, upper: anypoint [, inc_lower: bool, inc_upper: bool])` / `(empty: bool)` | `range<anypoint>` | Construct a range (default: lower-inclusive, upper-exclusive) or an empty range. |
+| `range` | `(lower: anypoint [, upper: anypoint], *, inc_lower: bool = true, inc_upper: bool = false, empty: bool = false)` | `range<anypoint>` | Construct a range, lower-inclusive and upper-exclusive unless told otherwise. A bound left out or passed as `{}` is unbounded on that side; `empty := true` gives the empty range. |
 | `range_unpack` | `(r: range<anypoint> [, step: anypoint])` | `set of anypoint` | Every discrete point in the range. |
 | `range_get_lower` / `range_get_upper` | `(r: range<anypoint>\|multirange<anypoint>)` | `T?` | The range's bound. |
 | `range_is_empty` | `(r: range<anypoint>\|multirange<anypoint>)` | `bool` | True for an empty range. |

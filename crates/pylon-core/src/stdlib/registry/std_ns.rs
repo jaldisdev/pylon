@@ -1043,10 +1043,20 @@ END"#,
         // ── std:: range ──────────────────────────────────────────────────────
         // TranspilerIntrinsic: the transpiler substitutes type-specific PG
         // constructors (int8range, tstzrange, …) at compile time. No _pylon function.
+        // Which bounds are inclusive, and whether the range is the empty one,
+        // are named so that the positions stay the two endpoints. An endpoint
+        // left out — `range(<int64>1)`, or an empty set in either position —
+        // is unbounded on that side.
         f(
             "std",
             "range",
-            vec![p("lower", AnyPoint), p("upper", AnyPoint)],
+            vec![
+                p("lower", opt(AnyPoint)),
+                p("upper", opt(AnyPoint)),
+                pn("inc_lower", Bool, NamedDefault::Bool(true)),
+                pn("inc_upper", Bool, NamedDefault::Bool(false)),
+                pn("empty", Bool, NamedDefault::Bool(false)),
+            ],
             ro(AnyPoint),
             I("range"),
         ),
@@ -1054,15 +1064,14 @@ END"#,
             "std",
             "range",
             vec![
-                p("lower", AnyPoint),
-                p("upper", AnyPoint),
-                p("inc_lower", Bool),
-                p("inc_upper", Bool),
+                p("lower", opt(AnyPoint)),
+                pn("inc_lower", Bool, NamedDefault::Bool(true)),
+                pn("inc_upper", Bool, NamedDefault::Bool(false)),
+                pn("empty", Bool, NamedDefault::Bool(false)),
             ],
             ro(AnyPoint),
             I("range"),
         ),
-        f("std", "range", vec![p("empty", Bool)], ro(AnyPoint), I("range")),
         f(
             "std",
             "range_unpack",

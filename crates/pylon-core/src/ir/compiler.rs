@@ -16367,9 +16367,12 @@ impl<'a> Compiler<'a> {
     fn compile_range_intrinsic(&self, intrinsic: &str, name: &str, args: Vec<IrExpr>) -> Result<IrExpr, PyQLError> {
         match intrinsic {
             "range" => {
-                let point_ty = args.first().and_then(infer_ir_type).ok_or_else(|| {
+                // Either endpoint names the element type, since a range open
+                // on one side carries it only on the other.
+                let bounds = args.len().saturating_sub(3);
+                let point_ty = args[..bounds].iter().find_map(infer_ir_type).ok_or_else(|| {
                     self.type_err(
-                        "range(): cannot infer the element type of the first argument — \
+                        "range(): cannot infer the element type from either bound — \
                      use an explicit cast, e.g. range(<int64>$lower, <int64>$upper)",
                     )
                 })?;
@@ -16379,19 +16382,37 @@ impl<'a> Compiler<'a> {
                      ranges over int64, decimal, datetime, cal::local_datetime, and cal::local_date"
                     ))
                 })?;
-                let sql_template = match args.len() {
-                    1 => {
-                        return Err(self.type_err(
-                            "range(empty) has no inferable element type in this context — not \
-                         currently supported; use range(lower, upper) instead",
-                        ));
-                    }
-                    2 => format!("{ctor}($1, $2)"),
-                    4 => format!(
-                        "{ctor}($1, $2, \
-                         (CASE WHEN $3 THEN '[' ELSE '(' END) || (CASE WHEN $4 THEN ']' ELSE ')' END))"
-                    ),
+                // `inc_lower`/`inc_upper`/`empty` are named-only and so always
+                // present, defaults included: four arguments is the form that
+                // gave only a lower bound, five the one that gave both.
+                let upper = match args.len() {
+                    4 => "NULL",
+                    5 => "$2",
                     n => return Err(self.type_err(&format!("range(): unexpected argument count {n}"))),
+                };
+                let flags: Vec<Option<bool>> = args[args.len() - 3..].iter().map(bool_literal).collect();
+                // Written out or defaulted, the three are constants at nearly
+                // every call site, and folding them keeps a plain `range(a, b)`
+                // emitting a plain constructor instead of a CASE over literals.
+                let sql_template = match flags[..] {
+                    [Some(_), Some(_), Some(true)] => format!("'empty'::{ctor}"),
+                    [Some(true), Some(false), Some(false)] => format!("{ctor}($1, {upper})"),
+                    [Some(inc_lower), Some(inc_upper), Some(false)] => format!(
+                        "{ctor}($1, {upper}, '{}{}')",
+                        if inc_lower { '[' } else { '(' },
+                        if inc_upper { ']' } else { ')' },
+                    ),
+                    _ => {
+                        let (lower_inc, upper_inc, empty) = match args.len() {
+                            4 => ("$2", "$3", "$4"),
+                            _ => ("$3", "$4", "$5"),
+                        };
+                        format!(
+                            "(CASE WHEN {empty} THEN 'empty'::{ctor} ELSE {ctor}($1, {upper}, \
+                             (CASE WHEN {lower_inc} THEN '[' ELSE '(' END) \
+                             || (CASE WHEN {upper_inc} THEN ']' ELSE ')' END)) END)"
+                        )
+                    }
                 };
                 // `.name` carries the *resolved* constructor (not the
                 // original `range`) so a wrapping `multirange([range(...)])`
@@ -17896,6 +17917,15 @@ fn describe_signatures(overloads: &[&crate::stdlib::FnDescriptor]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" or ")
+}
+
+/// The value of a boolean literal argument, for the call shapes that can be
+/// resolved at compile time rather than left to a runtime `CASE`.
+fn bool_literal(expr: &IrExpr) -> Option<bool> {
+    match expr {
+        IrExpr::Literal(IrLiteral::Bool(b)) => Some(*b),
+        _ => None,
+    }
 }
 
 /// Gather the arguments a variadic parameter absorbed into one array, for the

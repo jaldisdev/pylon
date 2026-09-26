@@ -15192,6 +15192,30 @@ select owner { posts := (select owner.posts.title) };",
         assert!(out.sql.contains("tstzrange("), "got:\n{}", out.sql);
     }
 
+    /// Bounds written out as literals are folded into the constructor's own
+    /// bounds string; only the default `[)` leaves it out entirely.
+    #[test]
+    fn test_range_intrinsic_named_bounds_become_a_bounds_string() {
+        let out = compile_and_emit("SELECT std::range(1, 3, inc_lower := true, inc_upper := true)");
+        assert!(out.sql.contains("int8range(1, 3, '[]')"), "got:\n{}", out.sql);
+        let out = compile_and_emit("SELECT std::range(1, 3, inc_lower := false)");
+        assert!(out.sql.contains("int8range(1, 3, '()')"), "got:\n{}", out.sql);
+    }
+
+    /// A bound flag that is not a literal keeps the decision in the SQL.
+    #[test]
+    fn test_range_intrinsic_computes_a_bounds_string_from_an_expression() {
+        let out = compile_and_emit("SELECT std::range(1, 3, inc_upper := <bool>$closed)");
+        assert!(out.sql.contains("CASE WHEN"), "got:\n{}", out.sql);
+    }
+
+    /// An open-ended range names only the bound it has.
+    #[test]
+    fn test_range_intrinsic_leaves_a_missing_upper_bound_unbounded() {
+        let out = compile_and_emit("SELECT std::range(1)");
+        assert!(out.sql.contains("int8range(1, NULL)"), "got:\n{}", out.sql);
+    }
+
     /// A call that writes a named-only argument by position, one that leaves a
     /// required one out, and one no overload accepts each say which.
     #[test]
@@ -15219,14 +15243,9 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
-    fn test_range_intrinsic_four_arg_form_computes_bounds_string() {
-        let out = compile_and_emit("SELECT std::range(1, 3, true, false)");
-        assert!(out.sql.contains("int8range(1, 3,"), "got:\n{}", out.sql);
-        assert!(
-            out.sql.contains("CASE WHEN"),
-            "expected a dynamic bounds-string CASE, got:\n{}",
-            out.sql
-        );
+    fn test_range_intrinsic_builds_the_empty_range() {
+        let out = compile_and_emit("SELECT std::range(1, 3, empty := true)");
+        assert!(out.sql.contains("'empty'::int8range"), "got:\n{}", out.sql);
     }
 
     #[test]

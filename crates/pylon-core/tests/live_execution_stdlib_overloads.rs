@@ -456,6 +456,52 @@ async fn base64_decoding_reverses_every_alphabet_and_padding_pair() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_range_can_be_unbounded_on_either_side() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "contains(range(<int64>1), <int64>1000000)").await,
+        DecodedValue::Bool(true)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "contains(range(<int64>{}, <int64>5), <int64>-1000000)").await,
+        DecodedValue::Bool(true)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "range_is_empty(range(<int64>1, <int64>5, empty := true))").await,
+        DecodedValue::Bool(true)
+    );
+}
+
+/// Over a decimal, where PostgreSQL keeps the bounds as given — a range over
+/// a discrete type is canonicalized to `[)` whatever the call asked for.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_range_takes_its_bound_inclusivity_by_name() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "range_is_inclusive_upper(range(<decimal>1, <decimal>5))").await,
+        DecodedValue::Bool(false)
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "range_is_inclusive_upper(range(<decimal>1, <decimal>5, inc_upper := true))"
+        )
+        .await,
+        DecodedValue::Bool(true)
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "range_is_inclusive_lower(range(<decimal>1, <decimal>5, inc_lower := false))"
+        )
+        .await,
+        DecodedValue::Bool(false)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn a_logarithm_takes_its_base_by_name() {
     let pool = stdlib_pool().await;
     assert_eq!(
