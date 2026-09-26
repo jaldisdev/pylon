@@ -629,21 +629,59 @@ fn through_coalesce(expr: &IrExpr) -> &IrExpr {
 }
 
 fn ir_value_type_name(expr: &IrExpr) -> String {
+    ir_value_type(expr).unwrap_or_default()
+}
+
+/// The pg type a bound value carries, including the array types
+/// `infer_ir_type` has no spelling for — a `with` binding that loses its
+/// array-ness resolves no overload at all, so `contains(ids, .id)` reports a
+/// call nobody wrote.
+fn ir_value_type(expr: &IrExpr) -> Option<String> {
     let expr = through_coalesce(expr);
-    if let IrExpr::Array(elements) = expr {
-        let element = elements.first().and_then(infer_ir_type).unwrap_or("text");
-        return format!("{}[]", literal_sentinel_to_pg(element));
+    match expr {
+        IrExpr::Array(elements) => {
+            let element = elements.first().and_then(infer_ir_type).unwrap_or("text");
+            Some(format!("{}[]", literal_sentinel_to_pg(element)))
+        }
+        // `ids := array_agg(r.id)` binds an array of what it aggregates, which
+        // is what lets `contains(ids, .id)` pick the array overload over `str`'s.
+        IrExpr::FunctionCall(f) if f.schema.is_none() && f.name == "array_agg" => {
+            let element = f.args.first().and_then(infer_ir_type)?;
+            Some(format!("{}[]", literal_sentinel_to_pg(element)))
+        }
+        // `array_agg((select …))` aggregates inside a correlated select, so
+        // the array is what that select projects rather than the call itself.
+        IrExpr::PathSubquery(ps) => match &ps.result {
+            IrPathResult::Scalar(inner, _) => ir_value_type(inner),
+            IrPathResult::Object { .. } => None,
+        },
+        IrExpr::ArrayFromSelect(source) => array_source_element_type(source).map(|element| format!("{element}[]")),
+        // `xs if cond else ys` is typed by whichever branch can say — the
+        // other is routinely the empty set.
+        IrExpr::IfElse(ie) => ir_value_type(&ie.if_).or_else(|| ir_value_type(&ie.else_)),
+        other => infer_ir_type(other).map(|t| t.to_string()),
     }
-    // `ids := array_agg(r.id)` binds an array of what it aggregates, which
-    // is what lets `contains(ids, .id)` pick the array overload over `str`'s.
-    if let IrExpr::FunctionCall(f) = expr
-        && f.schema.is_none()
-        && f.name == "array_agg"
-        && let Some(element) = f.args.first().and_then(infer_ir_type)
-    {
-        return format!("{}[]", literal_sentinel_to_pg(element));
+}
+
+/// The pg type of one row of an `ARRAY(SELECT …)`. `None` for a source that
+/// aggregates whole objects: those rows are composites with no scalar name.
+fn array_source_element_type(source: &IrArraySource) -> Option<String> {
+    match source {
+        IrArraySource::Select(sel) => match sel.rows.as_slice() {
+            [IrRowSource::Bound { shape, .. }] => match shape.first() {
+                // Mirrors the emitter: the first scalar pointer is the
+                // element, and a shape with none of them projects the id.
+                Some(IrShapePointer::Scalar(scalar)) => Some(scalar.pg_type.clone()),
+                _ => Some("uuid".to_string()),
+            },
+            _ => None,
+        },
+        IrArraySource::PathSelect(ps) => match &ps.result {
+            IrPathResult::Scalar(expr, _) => infer_ir_type(expr).map(|t| literal_sentinel_to_pg(t).to_string()),
+            IrPathResult::Object { .. } => None,
+        },
+        _ => None,
     }
-    infer_ir_type(expr).map(|t| t.to_string()).unwrap_or_default()
 }
 
 /// The computed pointers a `with` binding's own shape declares, if any.

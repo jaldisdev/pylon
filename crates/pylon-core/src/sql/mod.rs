@@ -13332,6 +13332,23 @@ select owner { posts := (select owner.posts.title) };",
         );
     }
 
+    /// A binding that holds an array has to say so, or no overload of
+    /// `contains` accepts it and the call is reported as one nobody wrote.
+    #[test]
+    fn test_a_binding_keeps_its_array_type_through_an_aggregate_and_a_condition() {
+        for query in [
+            "WITH ids := ([<uuid>$a] IF true ELSE [<uuid>$b]) SELECT Person FILTER contains(ids, .id)",
+            "WITH ns := array_agg((SELECT Person.name)) SELECT Person FILTER contains(ns, .name)",
+        ] {
+            let out = compile_and_emit(query);
+            assert!(
+                out.sql.contains("@> ARRAY["),
+                "expected the array overload of contains for `{query}`, got:\n{}",
+                out.sql
+            );
+        }
+    }
+
     /// A sub-select's own filter speaks about its subject however the outer
     /// select is written: ordering the walk must not re-read `.name` off what
     /// the walk lands on, which silently filtered the wrong table.
