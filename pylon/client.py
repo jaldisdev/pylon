@@ -136,18 +136,39 @@ class AsyncTransaction:
         self._evict(compiled)
         return rows
 
-    async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
-        """Execute *pyql* and return all results as a list."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+    async def _run_script(self, pyql: str, kwargs: dict[str, Any]) -> tuple[list[Any], CompiledQuery]:
+        """Run a script's statements in order and return the last one's rows.
+
+        Runs on this transaction rather than opening one, which is what
+        `Client._run_script` has to do: the caller's transaction is already
+        what makes the statements land together or not at all.
+        """
+        statements, declared = _script_statements(pyql, kwargs, self._config_options)
+        rows: list[Any] = []
+        for compiled in statements:
+            rows = await self._run_compiled(
+                compiled, _bind_positional(compiled, kwargs, self._globals, declared=declared)
+            )
+        return rows, statements[-1]
+
+    async def _rows(self, pyql: str, kwargs: dict[str, Any]) -> tuple[list[Any], CompiledQuery]:
+        """The rows *pyql* yields and the statement that produced them — the
+        last one, when several were written together."""
+        if _looks_like_a_script(pyql):
+            return await self._run_script(pyql, kwargs)
+        compiled, params = _compile_and_bind(pyql, kwargs, self._globals, self._config_options)
         rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
+        return rows, compiled
+
+    async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
+        """Execute *pyql* and return all results as a list."""
+        rows, compiled = await self._rows(pyql, _merge_args(args, kwargs))
         return _hydrate(rows, compiled)
 
     async def query_single(self, pyql: str, *args: Any, **kwargs: Any) -> Any | None:
         """Return at most one result, or ``None``."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
-        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
-        self._evict(compiled)
+        rows, compiled = await self._rows(pyql, _merge_args(args, kwargs))
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
         if not rows:
@@ -163,7 +184,11 @@ class AsyncTransaction:
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        merged = _merge_args(args, kwargs)
+        if _looks_like_a_script(pyql):
+            await self._run_script(pyql, merged)
+            return
+        compiled, params = _compile_and_bind(pyql, merged, self._globals, self._config_options)
         await self._tx.execute_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         self._evict(compiled)
 
@@ -172,16 +197,12 @@ class AsyncTransaction:
 
         Returns ``"[]"`` when the result set is empty.
         """
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
-        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
-        self._evict(compiled)
+        rows, compiled = await self._rows(pyql, _merge_args(args, kwargs))
         return _json_array(rows, compiled)
 
     async def query_single_json(self, pyql: str, *args: Any, **kwargs: Any) -> str | None:
         """Return at most one result as a JSON string, or ``None``."""
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
-        rows = await self._tx.query_compiled(compiled, params, _trigger_globals(compiled, self._globals))
-        self._evict(compiled)
+        rows, compiled = await self._rows(pyql, _merge_args(args, kwargs))
         if len(rows) > 1:
             raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
         if not rows:
@@ -423,7 +444,7 @@ class Client:
         c._config_options = {**self._config_options, **options}
         return c
 
-    async def _run_script(self, pyql: str, kwargs: dict[str, Any]) -> list[Any]:
+    async def _run_script(self, pyql: str, kwargs: dict[str, Any]) -> tuple[list[Any], CompiledQuery]:
         """Run a script's statements in order and return the last one's rows.
 
         Postgres cannot take several statements with parameters in one round
@@ -431,38 +452,32 @@ class Client:
         either lands whole or not at all, which is how a reader of the source
         would expect several statements written together to behave.
         """
-        from pylon._core import compile_script as _compile_script
-        from pylon.query import _get_schema
-
-        statements = _compile_script(
-            pyql,
-            _get_schema(),
-            allow_user_specified_id=bool(self._config_options.get('allow_user_specified_id', False)),
-        )
+        statements, declared = _script_statements(pyql, kwargs, self._config_options)
         rows: list[Any] = []
-        last = statements[-1]
-        # The arguments are the script's, not any one statement's — checked
-        # once against every parameter it declares, so a statement does not
-        # report its neighbour's parameter as an extra argument.
-        script_params: set[str] = set()
-        for compiled in statements:
-            script_params |= _declared_params(compiled)
-        _check_arguments(script_params, kwargs)
         async for tx in self.transaction():
             async with tx:
                 for compiled in statements:
                     if self._warnings:
                         _emit_warnings(compiled)
                     rows = await tx._run_compiled(
-                        compiled, _bind_positional(compiled, kwargs, self._globals, declared=script_params)
+                        compiled, _bind_positional(compiled, kwargs, self._globals, declared=declared)
                     )
-        return _hydrate(rows, last)
+        return rows, statements[-1]
+
+    async def _rows(self, pyql: str, kwargs: dict[str, Any]) -> tuple[list[Any], CompiledQuery] | None:
+        """The rows a *script* yields and the statement that produced them, or
+        `None` when *pyql* is a single statement and the caller's own cached,
+        pooled path applies instead."""
+        if not _looks_like_a_script(pyql):
+            return None
+        return await self._run_script(pyql, kwargs)
 
     async def query(self, pyql: str, *args: Any, **kwargs: Any) -> list[Any]:
         """Execute *pyql* and return all matching objects as a list."""
         merged = _merge_args(args, kwargs)
-        if _looks_like_a_script(pyql):
-            return await self._run_script(pyql, merged)
+        if (script := await self._rows(pyql, merged)) is not None:
+            rows, compiled = script
+            return _hydrate(rows, compiled)
         pool = await self._connected_pool()
         compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
@@ -492,6 +507,11 @@ class Client:
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if more
         than one object matches.
         """
+        if (script := await self._rows(pyql, _merge_args(args, kwargs))) is not None:
+            rows, compiled = script
+            if len(rows) > 1:
+                raise ResultCardinalityError(f'query_single expected at most one result, got {len(rows)}.')
+            return _hydrate(rows, compiled)[0] if rows else None
         pool = await self._connected_pool()
         compiled, params = await _compile_and_resolve(
             pyql, _merge_args(args, kwargs), self._config, self._globals, self._config_options
@@ -531,8 +551,11 @@ class Client:
 
     async def execute(self, pyql: str, *args: Any, **kwargs: Any) -> None:
         """Execute a mutation (INSERT / UPDATE / DELETE); discard the result."""
+        merged = _merge_args(args, kwargs)
+        if await self._rows(pyql, merged) is not None:
+            return
         pool = await self._connected_pool()
-        compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
+        compiled, params = _compile_and_bind(pyql, merged, self._globals, self._config_options)
         await pool.execute_compiled(compiled, params, _trigger_globals(compiled, self._globals))
         from pylon import cache as _cache
 
@@ -591,6 +614,8 @@ class Client:
 
         Returns ``"[]"`` when the result set is empty.
         """
+        if (script := await self._rows(pyql, _merge_args(args, kwargs))) is not None:
+            return _json_array(*script)
         pool = await self._connected_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
@@ -612,6 +637,11 @@ class Client:
         Raises :class:`~pylon.exceptions.ResultCardinalityError` if more than one
         object matches.
         """
+        if (script := await self._rows(pyql, _merge_args(args, kwargs))) is not None:
+            rows, compiled = script
+            if len(rows) > 1:
+                raise ResultCardinalityError(f'query_single_json expected at most one result, got {len(rows)}.')
+            return _json_documents(rows, compiled)[0] if rows else None
         pool = await self._connected_pool()
         compiled, params = _compile_and_bind(pyql, _merge_args(args, kwargs), self._globals, self._config_options)
 
@@ -1101,6 +1131,30 @@ def _compile_and_bind(
         raise InternalServerError(str(exc)) from exc
     _record_compile(True)
     return compiled, _bind_positional(compiled, kwargs, globals_)
+
+
+def _script_statements(
+    pyql: str, kwargs: dict[str, Any], config_options: dict[str, Any] | None
+) -> tuple[list[CompiledQuery], set[str]]:
+    """Every statement a script holds, plus the parameters it declares.
+
+    The arguments belong to the script, not to any one statement — checked
+    once against the union, so a statement does not report its neighbour's
+    parameter as an extra argument.
+    """
+    from pylon._core import compile_script as _compile_script
+    from pylon.query import _get_schema
+
+    statements = _compile_script(
+        pyql,
+        _get_schema(),
+        allow_user_specified_id=bool((config_options or {}).get('allow_user_specified_id', False)),
+    )
+    declared: set[str] = set()
+    for compiled in statements:
+        declared |= _declared_params(compiled)
+    _check_arguments(declared, kwargs)
+    return statements, declared
 
 
 def _looks_like_a_script(pyql: str) -> bool:

@@ -501,3 +501,74 @@ def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, uni
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
     asyncio.run(run())
+
+
+def test_several_statements_written_together_run_from_every_entry_point(live_pool, unique_module):
+    """A script is a script whichever method is handed it.
+
+    Only `Client.query` used to take one; `query_single`, `execute`, the JSON
+    variants and *every* method on a transaction rejected the second statement
+    at parse time ("unexpected 'select' after the end of the query"), so
+    freshening two tables before a probe had to be split into separate calls
+    for no reason the caller could see. The value of a script is its last
+    statement's rows, which is what each of these reports.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.exceptions import Rollback
+
+    module = unique_module('live_script_entry_points')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Widget')
+        class Widget:
+            name: str
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        # Two statements, the second one's rows being the script's value.
+        script = (
+            f"insert {module}::Widget {{ name := <str>$name }};\n"
+            f"select {module}::Widget {{ name }} filter .name = <str>$name;"
+        )
+
+        assert [w.name for w in await client.query(script, name='a')] == ['a']
+        assert (await client.query_single(script, name='b')).name == 'b'
+        assert '"name": "c"' in (await client.query_json(script, name='c')).replace("'", '"')
+        assert '"name": "d"' in (await client.query_single_json(script, name='d')).replace("'", '"')
+        await client.execute(script, name='e')
+
+        # Every one of them wrote, so the insert really ran each time.
+        assert len(await client.query(f'select {module}::Widget {{ name }}')) == 5
+
+        # And the same on a transaction, which runs the statements on the
+        # caller's own transaction rather than opening one of its own.
+        async for tx in client.transaction():
+            async with tx:
+                assert [w.name for w in await tx.query(script, name='f')] == ['f']
+                assert (await tx.query_single(script, name='g')).name == 'g'
+                assert '"name": "h"' in (await tx.query_json(script, name='h')).replace("'", '"')
+                assert '"name": "i"' in (await tx.query_single_json(script, name='i')).replace("'", '"')
+                await tx.execute(script, name='j')
+                assert len(await tx.query(f'select {module}::Widget {{ name }}')) == 10
+                raise Rollback
+
+        # The transaction's five are gone; the client's five remain.
+        assert len(await client.query(f'select {module}::Widget {{ name }}')) == 5
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
