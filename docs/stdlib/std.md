@@ -44,7 +44,7 @@ select assert_exists((select Person filter .id = <uuid>$id))
 | `str_len` | `(s: str)` | `int64` | Character length. |
 | `re_match` | `(pattern: str, s: str)` | `array<str>` | First regex match's captured groups (empty array if no match). |
 | `re_match_all` | `(pattern: str, s: str)` | `set of array<str>` | Every match's captured groups. |
-| `re_replace` | `(pattern: str, sub: str, s: str [, flags: str])` | `str` | Regex replace — note the argument order is `(pattern, replacement, subject)`, not PostgreSQL's own `regexp_replace(subject, pattern, replacement)` order. |
+| `re_replace` | `(pattern: str, sub: str, s: str, *, flags: str = '')` | `str` | Regex replace — note the argument order is `(pattern, replacement, subject)`, not PostgreSQL's own `regexp_replace(subject, pattern, replacement)` order. |
 | `re_test` | `(pattern: str, s: str)` | `bool` | True if `s` matches `pattern`. |
 | `find` | `(haystack: str, needle: str)` | `int64` | 0-based index of the first occurrence, or `-1` if not found. |
 | `find` | `(haystack: bytes, needle: bytes)` | `int64` | 0-based index of the first occurrence, or `-1` if not found. |

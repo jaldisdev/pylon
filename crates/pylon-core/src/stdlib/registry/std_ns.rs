@@ -341,7 +341,12 @@ END"#,
         f(
             "std",
             "re_replace",
-            vec![p("pattern", Str), p("sub", Str), p("s", Str), p("flags", Str)],
+            vec![
+                p("pattern", Str),
+                p("sub", Str),
+                p("s", Str),
+                pn("flags", Str, NamedDefault::Str("")),
+            ],
             Str,
             E("regexp_replace($3, $1, $2, $4)"),
         ),

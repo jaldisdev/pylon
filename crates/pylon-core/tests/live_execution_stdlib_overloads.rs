@@ -379,6 +379,20 @@ async fn array_get_falls_back_to_the_default_it_is_given() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn re_replace_takes_its_flags_by_name() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "re_replace('a', 'X', 'aaa')").await,
+        DecodedValue::Str("Xaa".to_string())
+    );
+    assert_eq!(
+        eval_scalar(&pool, "re_replace('a', 'X', 'aaa', flags := 'g')").await,
+        DecodedValue::Str("XXX".to_string())
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn array_join_concatenates_bytes_with_a_delimiter() {
     let pool = stdlib_pool().await;
     assert_eq!(
