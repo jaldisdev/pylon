@@ -13332,6 +13332,24 @@ select owner { posts := (select owner.posts.title) };",
         );
     }
 
+    /// A sub-select's own filter speaks about its subject however the outer
+    /// select is written: ordering the walk must not re-read `.name` off what
+    /// the walk lands on, which silently filtered the wrong table.
+    #[test]
+    fn test_ordering_a_walk_leaves_the_inner_filter_on_its_own_subject() {
+        let out = compile_and_emit("SELECT (SELECT Person FILTER .name = 'x' LIMIT 1).posts { title } ORDER BY .title");
+        assert!(
+            out.sql.contains("WHERE (\"t0\".\"name\" = 'x')"),
+            "the filter belongs to the Person the walk starts from, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("ORDER BY \"t1\".\"title\""),
+            "the ordering belongs to the Post the walk lands on, got:\n{}",
+            out.sql
+        );
+    }
+
     /// An overload that declares its element type carries it whatever it was
     /// handed, so the body reads the loop variable as json rather than as the
     /// text `jsonb_array_elements` would be cast to by default.

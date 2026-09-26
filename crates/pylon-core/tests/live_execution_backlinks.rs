@@ -519,6 +519,41 @@ async fn a_bare_multilink_reads_as_the_set_of_rows_on_its_far_side() {
     );
 }
 
+/// The filter of a select a walk starts from belongs to that select's own
+/// subject, whether or not the walk is ordered. Ordering it re-read the
+/// filter off the type the walk lands on, which quietly matched nothing.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn ordering_a_walk_keeps_the_filter_on_the_subject_it_was_written_for() {
+    let (module, schema, pool) = setup().await;
+
+    for name in ["Alice", "Bob", "Carol"] {
+        let compiled = query::compile(&format!("insert {module}::Person {{ name := '{name}' }}"), &schema).unwrap();
+        pool.execute_typed(&compiled.sql, &[]).await.unwrap();
+    }
+    let update = query::compile(
+        &format!(
+            "update {module}::Person filter .name = 'Alice' \
+             set {{ friends += (select {module}::Person filter .name in {{'Bob', 'Carol'}}) }}"
+        ),
+        &schema,
+    )
+    .unwrap();
+    pool.execute_typed(&update.sql, &[]).await.unwrap();
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!("select (select {module}::Person filter .name = 'Alice').friends {{ name }} order by .name"),
+    )
+    .await;
+    assert_eq!(
+        text_fields(&found, 2),
+        vec![Some("Bob".to_string()), Some("Carol".to_string())],
+        "ordering must not cost the filter its subject, got {found:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn counting_a_computed_set_counts_the_rows_it_selects() {

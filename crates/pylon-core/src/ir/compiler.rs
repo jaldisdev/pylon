@@ -1424,6 +1424,11 @@ struct Compiler<'a> {
     /// 1).plan.tier`: the subject's landing row is what FILTER/ORDER BY/LIMIT
     /// scope to, not the type the whole path ends on.
     modifier_anchor: Option<(String, String)>,
+    /// The `order by` the *outer* select wrote around such a path, which
+    /// speaks about what the path projects rather than about the anchored
+    /// subject — `(select Cart filter .id = $c).applied_promotions order by
+    /// .code` orders applications, having filtered carts.
+    tail_sorts: Vec<ast::SortExpr>,
     /// WITH bindings that name a path off the enclosing object. They read that
     /// object's alias, which a CTE emitted ahead of the FROM clause cannot
     /// see, so they stand in for their value wherever the name is used.
@@ -1604,6 +1609,7 @@ impl<'a> Compiler<'a> {
             for_scope: Vec::new(),
             pending_detached: false,
             modifier_anchor: None,
+            tail_sorts: vec![],
             inline_bindings: std::collections::HashMap::new(),
             in_fn_body: false,
             fns_needing_globals: None,
@@ -2409,13 +2415,26 @@ impl<'a> Compiler<'a> {
         // not about what the field chain projects off it: `(select Individual
         // filter .id = $a).credentials.password` filters Individuals, not
         // Credentials. `tail` is what pins them there. Only safe when the
-        // outer select contributed none of its own — the merge folds both
-        // into one clause, and an outer filter does belong at the end.
-        if outer.filter.is_none() && outer.order_by.is_empty() {
+        // outer select contributed no filter of its own — the merge folds
+        // both into one clause, and an outer filter does belong at the end.
+        // An outer `order by` belongs at the end too, so it rides along
+        // separately rather than costing the inner filter its subject.
+        if outer.filter.is_none() {
+            let merged = ast::SelectStmt {
+                order_by: inner_sel.order_by.clone(),
+                ..merged
+            };
             let Expr::Path(merged_path) = &merged.result else {
                 unreachable!("built as a path just above")
             };
-            let ps = self.compile_path_select_with_tail(&merged, merged_path, trailing_shape, false, field_count)?;
+            let ps = self.compile_path_select_with_tail(
+                &merged,
+                merged_path,
+                trailing_shape,
+                false,
+                field_count,
+                &outer.order_by,
+            )?;
             return Ok(Some(IrStmt::PathSelect(ps)));
         }
 
@@ -3810,7 +3829,7 @@ impl<'a> Compiler<'a> {
         shape_elements: &[ShapeElement],
         distinct: bool,
     ) -> Result<IrPathSelect, PyQLError> {
-        self.compile_path_select_with_tail(sel, path, shape_elements, distinct, 0)
+        self.compile_path_select_with_tail(sel, path, shape_elements, distinct, 0, &[])
     }
 
     /// `compile_path_select` where the last `tail` steps were appended by a
@@ -3824,9 +3843,14 @@ impl<'a> Compiler<'a> {
         shape_elements: &[ShapeElement],
         distinct: bool,
         tail: usize,
+        tail_sorts: &[ast::SortExpr],
     ) -> Result<IrPathSelect, PyQLError> {
         let outer_anchor = self.modifier_anchor.take();
+        // Swapped rather than assigned, so a path select compiled inside this
+        // one gets its own (empty) list and hands these back untouched.
+        let outer_sorts = std::mem::replace(&mut self.tail_sorts, tail_sorts.to_vec());
         let mut result = self.compile_path_select_inner(sel, path, shape_elements, distinct, tail);
+        self.tail_sorts = outer_sorts;
         self.modifier_anchor = outer_anchor;
         if let Ok(path_select) = &mut result {
             self.resolve_join_fanouts(path_select);
@@ -4504,7 +4528,7 @@ impl<'a> Compiler<'a> {
                             lock: None,
                         };
                         let mut inner =
-                            self.compile_path_select_with_tail(&inner_sel, &inner_path, &[], false, field_steps)?;
+                            self.compile_path_select_with_tail(&inner_sel, &inner_path, &[], false, field_steps, &[])?;
                         Self::correlate_path_select(&mut inner, &current_alias);
                         let IrPathResult::Object { type_name, .. } = &inner.result else {
                             return Err(self.type_err(&format!(
@@ -4767,6 +4791,7 @@ impl<'a> Compiler<'a> {
         self.active_declared_pointers
             .extend(shape.iter().filter(|el| el.compexpr.is_some()).cloned());
         let anchored = self.modifier_anchor.take();
+        let tail_sorts = std::mem::take(&mut self.tail_sorts);
         let result = match &anchored {
             Some((qualified, anchor_alias)) => {
                 let anchor_td = self.resolve_type(qualified)?;
@@ -4775,6 +4800,21 @@ impl<'a> Compiler<'a> {
             }
             None => self.compile_path_modifiers(sel, td, alias),
         };
+        let result = result.and_then(|(filter, mut order_by, offset, limit)| {
+            if !tail_sorts.is_empty() {
+                let sorting = ast::SelectStmt {
+                    result: sel.result.clone(),
+                    filter: None,
+                    order_by: tail_sorts,
+                    offset: None,
+                    limit: None,
+                    lock: None,
+                };
+                let (_, sorts, _, _) = self.compile_path_modifiers(&sorting, td, alias)?;
+                order_by = sorts;
+            }
+            Ok((filter, order_by, offset, limit))
+        });
         if pushed {
             self.link_prop_scope.pop();
         }
@@ -10200,7 +10240,7 @@ impl<'a> Compiler<'a> {
             limit: modifiers.and_then(|m| m.limit.clone()),
             lock: None,
         };
-        let mut path_select = self.compile_path_select_with_tail(&synthetic, &full_path, nested, false, tail)?;
+        let mut path_select = self.compile_path_select_with_tail(&synthetic, &full_path, nested, false, tail, &[])?;
         Self::correlate_path_select(&mut path_select, alias);
         // A walk that crosses a multi step stands for a set, so it is
         // aggregated; one that cannot is a single object and is read as one,
@@ -11369,7 +11409,7 @@ impl<'a> Compiler<'a> {
         steps.extend(extra_steps.iter().cloned());
         let full_path = ast::Path { steps, partial: false };
 
-        let mut ps = self.compile_path_select_with_tail(sel, &full_path, outer_shape, false, extra_steps.len())?;
+        let mut ps = self.compile_path_select_with_tail(sel, &full_path, outer_shape, false, extra_steps.len(), &[])?;
         if let Some(outer_alias) = correlate {
             Self::correlate_path_select(&mut ps, &outer_alias);
         }
