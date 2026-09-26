@@ -89,3 +89,68 @@ async fn a_numeric_parser_given_no_format_reads_the_plain_string() {
         DecodedValue::Decimal("12.5".to_string())
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn to_bytes_encodes_a_string_and_a_json_value_as_utf8() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes('ab')").await,
+        DecodedValue::Bytes(b"ab".to_vec())
+    );
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes(to_json('42'))").await,
+        DecodedValue::Bytes(b"42".to_vec())
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn to_bytes_writes_an_integer_in_the_byte_order_it_is_given() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes(<int16>-2, Endian.Big)").await,
+        DecodedValue::Bytes(vec![0xff, 0xfe])
+    );
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes(<int16>-2, Endian.Little)").await,
+        DecodedValue::Bytes(vec![0xfe, 0xff])
+    );
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes(<int32>1, Endian.Big)").await,
+        DecodedValue::Bytes(vec![0x00, 0x00, 0x00, 0x01])
+    );
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes(<int32>1, Endian.Little)").await,
+        DecodedValue::Bytes(vec![0x01, 0x00, 0x00, 0x00])
+    );
+    assert_eq!(
+        eval_scalar(&pool, "to_bytes(<int64>-1, Endian.Big)").await,
+        DecodedValue::Bytes(vec![0xff; 8])
+    );
+}
+
+/// The two directions are each other's inverse, negative values included.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_integer_survives_a_round_trip_through_bytes() {
+    let pool = stdlib_pool().await;
+    for endian in ["Endian.Big", "Endian.Little"] {
+        assert_eq!(
+            eval_scalar(&pool, &format!("to_int16(to_bytes(<int16>-25001, {endian}), {endian})")).await,
+            DecodedValue::I64(-25001)
+        );
+        assert_eq!(
+            eval_scalar(
+                &pool,
+                &format!("to_int32(to_bytes(<int32>-1638451077, {endian}), {endian})")
+            )
+            .await,
+            DecodedValue::I64(-1638451077)
+        );
+        assert_eq!(
+            eval_scalar(&pool, &format!("to_int64(to_bytes(<int64>-7, {endian}), {endian})")).await,
+            DecodedValue::I64(-7)
+        );
+    }
+}

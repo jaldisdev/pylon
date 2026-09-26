@@ -113,7 +113,7 @@ select re_test('^[A-Z]', .name)
 | `bytes_get_bit` | `(b: bytes, n: int64)` | `int64` | The `n`th bit. |
 | `bytes_get` | `(b: bytes, n: int64)` | `int64` | The `n`th byte, as an integer. |
 | `from_hex` | `(s: str)` | `bytes` | Decode a hex string. |
-| `to_bytes` | `(s: str, encoding: str)` | `bytes` | Encode a string as bytes in the given encoding. |
+| `to_bytes` | `(s: str [, encoding: str])` / `(j: json)` / `(val: int16\|int32\|int64, endian: Endian)` | `bytes` | Encode a string or JSON value as UTF-8 (or in the named encoding), or an integer in the given byte order. |
 
 ## Array
 

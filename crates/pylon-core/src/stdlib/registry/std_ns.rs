@@ -721,12 +721,20 @@ END"#,
             Bytes,
             E("decode($1, 'base64')"),
         ),
+        f("std", "to_bytes", vec![p("s", Str)], Bytes, E("convert_to($1, 'UTF8')")),
         f(
             "std",
             "to_bytes",
             vec![p("s", Str), p("encoding", Str)],
             Bytes,
             sql("to_bytes", "SELECT convert_to($1, $2)"),
+        ),
+        f(
+            "std",
+            "to_bytes",
+            vec![p("j", Json)],
+            Bytes,
+            E("convert_to($1::text, 'UTF8')"),
         ),
         // A UUID's 16 bytes, big-endian: `0199a144-…-00049e57387b` gives
         // `AZmhRFRzjCqvmgAEnlc4ew==`.
@@ -748,8 +756,6 @@ END"#,
         // to `int4`/`int8` but not to `int2`: `bit(16)::int4` zero-extends, so
         // 0x9E57 arrives as 40535 rather than -25001, and the `+ 32768 % 65536
         // - 32768` wrap is what restores the sign before narrowing to `int2`.
-        //
-        // `to_bytes(intN, Endian)` in the other direction is still missing.
         f(
             "std",
             "to_int16",
@@ -778,6 +784,45 @@ END"#,
             sql(
                 "to_int64_bytes",
                 "SELECT CASE WHEN $2 = 'Big' THEN ('x' || encode($1, 'hex'))::bit(64)::int8 ELSE ('x' || encode(substr($1, 8, 1) || substr($1, 7, 1) || substr($1, 6, 1) || substr($1, 5, 1) || substr($1, 4, 1) || substr($1, 3, 1) || substr($1, 2, 1) || substr($1, 1, 1), 'hex'))::bit(64)::int8 END",
+            ),
+        ),
+        // The inverse: `to_hex` already renders a negative integer as its two's
+        // complement, and the `& 65535` is what keeps a negative `int2` from
+        // arriving sign-extended to eight digits.
+        f(
+            "std",
+            "to_bytes",
+            vec![p("val", Int16), p("endian", Str)],
+            Bytes,
+            sql(
+                "to_bytes_int16",
+                "SELECT CASE WHEN $2 = 'Big' THEN t.b ELSE substr(t.b, 2, 1) || substr(t.b, 1, 1) END \
+                 FROM (SELECT decode(lpad(to_hex($1::int4 & 65535), 4, '0'), 'hex') AS b) AS t",
+            ),
+        ),
+        f(
+            "std",
+            "to_bytes",
+            vec![p("val", Int32), p("endian", Str)],
+            Bytes,
+            sql(
+                "to_bytes_int32",
+                "SELECT CASE WHEN $2 = 'Big' THEN t.b \
+                 ELSE substr(t.b, 4, 1) || substr(t.b, 3, 1) || substr(t.b, 2, 1) || substr(t.b, 1, 1) END \
+                 FROM (SELECT decode(lpad(to_hex($1), 8, '0'), 'hex') AS b) AS t",
+            ),
+        ),
+        f(
+            "std",
+            "to_bytes",
+            vec![p("val", Int64), p("endian", Str)],
+            Bytes,
+            sql(
+                "to_bytes_int64",
+                "SELECT CASE WHEN $2 = 'Big' THEN t.b \
+                 ELSE substr(t.b, 8, 1) || substr(t.b, 7, 1) || substr(t.b, 6, 1) || substr(t.b, 5, 1) \
+                   || substr(t.b, 4, 1) || substr(t.b, 3, 1) || substr(t.b, 2, 1) || substr(t.b, 1, 1) END \
+                 FROM (SELECT decode(lpad(to_hex($1), 16, '0'), 'hex') AS b) AS t",
             ),
         ),
         // ── std:: array ──────────────────────────────────────────────────────
