@@ -15979,7 +15979,16 @@ impl<'a> Compiler<'a> {
             })
         });
 
-        let stdlib_return = best.and_then(|d| d.return_type.scalar_pg_type()).map(str::to_string);
+        // An `optional<…>` return still travels as its own scalar — a call
+        // that may yield nothing (`json_get`) is typed by what it yields when
+        // it does, or every cast and overload over it reads as untyped.
+        let stdlib_return = best
+            .map(|d| match &d.return_type {
+                crate::stdlib::PylonType::Optional(inner) => inner.as_ref(),
+                other => other,
+            })
+            .and_then(|ty| ty.scalar_pg_type())
+            .map(str::to_string);
         let (schema, resolved_name, sql_template) = if let Some(desc) = best {
             match &desc.impl_strategy {
                 ImplStrategy::SqlBuiltin(sql_name) => (None, sql_name.to_string(), None),

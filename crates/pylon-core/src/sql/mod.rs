@@ -3227,6 +3227,10 @@ fn yields_jsonb(expr: &IrExpr) -> bool {
         IrExpr::TypeCast(c) => c.pg_type == "jsonb",
         IrExpr::ColumnRef { pg_type, .. } | IrExpr::FnParam { pg_type, .. } => pg_type == "jsonb",
         IrExpr::CteRef { pg_type, .. } | IrExpr::ForVar { pg_type, .. } => pg_type.as_deref() == Some("jsonb"),
+        // A call that recorded a return type answers from it, which is the
+        // only thing that speaks for one reached through `_pylon` or a schema
+        // module — the registry scan below only recognises an inline builtin.
+        IrExpr::FunctionCall(f) if f.return_pg_type.is_some() => f.return_pg_type.as_deref() == Some("jsonb"),
         IrExpr::FunctionCall(f) if f.schema.is_none() => {
             let mut overloads = crate::stdlib::registry().iter().filter(|d| d.name == f.name).peekable();
             overloads.peek().is_some() && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Json))
@@ -13339,6 +13343,18 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("::jsonb AS v"),
             "the loop variable should carry json, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// `json_get` yields json, so casting its result to a scalar reads the
+    /// value out of it. `::text` on its own would keep a json string's quotes.
+    #[test]
+    fn test_casting_json_get_reads_the_value_not_its_json_spelling() {
+        let out = compile_and_emit("SELECT <uuid><str>json_get(<json>$p, 'id')");
+        assert!(
+            out.sql.contains("#>> '{}'"),
+            "expected the json value to be read out, got:\n{}",
             out.sql
         );
     }

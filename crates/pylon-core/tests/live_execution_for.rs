@@ -218,6 +218,41 @@ async fn for_loop_select_body_cross_joins_lateral_per_iterator_value() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn for_loop_over_json_array_unpack_reads_each_object() {
+    let module = unique_module("live_for_json");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    // The loop variable holds json, so the body reaches into it — with an
+    // index and with `json_get` — and the values it reads are the json
+    // strings' contents, not their quoted spellings.
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "for entry in json_array_unpack(to_json('[{{\"name\": \"Alice\", \"age\": 30}}, \
+             {{\"name\": \"Bob\", \"age\": 65}}]')) union (insert {module}::Person {{ \
+             name := <str>json_get(entry, 'name'), age := <int64><str>entry['age'] }})"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name, age }} order by .name"),
+    )
+    .await;
+    assert_eq!(rows.len(), 2, "expected one row per json element, got {rows:?}");
+    assert_eq!(as_str(field(&rows[0], 2)), "Alice");
+    assert_eq!(as_i64(field(&rows[0], 3)), 30);
+    assert_eq!(as_str(field(&rows[1], 2)), "Bob");
+    assert_eq!(as_i64(field(&rows[1], 3)), 65);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn for_loop_with_empty_iterator_set_is_a_no_op() {
     let module = unique_module("live_for_empty");
     let sd = person_schema(&module);
