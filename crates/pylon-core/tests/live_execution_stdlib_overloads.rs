@@ -166,3 +166,13 @@ async fn to_datetime_reads_epoch_seconds_as_a_float() {
         DecodedValue::Timestamptz(53_315_200_500_000)
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn the_natural_logarithm_of_a_decimal_stays_a_decimal() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "math::ln(<decimal>1)").await,
+        DecodedValue::Decimal("0.0000000000000000".to_string())
+    );
+}

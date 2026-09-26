@@ -5,7 +5,7 @@
 | `pi` | `()` | `float64` | The constant π. |
 | `e` | `()` | `float64` | Euler's number. |
 | `exp` | `(n: float64)` | `float64` | e^n. |
-| `ln` | `(n: float64)` | `float64` | Natural logarithm. |
+| `ln` | `(n: float64)` / `(n: decimal)` | same type | Natural logarithm. |
 | `log` | `(n: float64 [, base: float64])` | `float64` | Base-10 logarithm (1-arg), or logarithm to an arbitrary `base` (2-arg). |
 | `log2` | `(n: float64)` | `float64` | Base-2 logarithm. |
 | `log10` | `(n: float64)` | `float64` | Base-10 logarithm — the preferred spelling; `lg` (below) is a thin alias kept for familiarity. |

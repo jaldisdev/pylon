@@ -26,6 +26,7 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("math", "e", vec![], Float64, E("exp(1.0)")),
         f("math", "exp", vec![p("n", Float64)], Float64, B("exp")),
         f("math", "ln", vec![p("n", Float64)], Float64, B("ln")),
+        f("math", "ln", vec![p("n", Decimal)], Decimal, B("ln")),
         f("math", "log", vec![p("n", Float64)], Float64, B("log")),
         // Two-arg form: PyQL log(n, base) → PG log(base, n) — arguments are swapped.
         f(
