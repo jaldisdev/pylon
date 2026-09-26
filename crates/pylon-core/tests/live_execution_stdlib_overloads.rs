@@ -176,3 +176,46 @@ async fn the_natural_logarithm_of_a_decimal_stays_a_decimal() {
         DecodedValue::Decimal("0.0000000000000000".to_string())
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn the_range_accessors_read_a_multirange() {
+    let pool = stdlib_pool().await;
+    let one_to_five = "multirange([range(<int64>1, <int64>5)])";
+    assert_eq!(
+        eval_scalar(&pool, &format!("range_get_lower({one_to_five})")).await,
+        DecodedValue::I64(1)
+    );
+    assert_eq!(
+        eval_scalar(&pool, &format!("range_get_upper({one_to_five})")).await,
+        DecodedValue::I64(5)
+    );
+    assert_eq!(
+        eval_scalar(&pool, &format!("range_is_empty({one_to_five})")).await,
+        DecodedValue::Bool(false)
+    );
+    assert_eq!(
+        eval_scalar(&pool, &format!("range_is_inclusive_lower({one_to_five})")).await,
+        DecodedValue::Bool(true)
+    );
+    assert_eq!(
+        eval_scalar(&pool, &format!("range_is_inclusive_upper({one_to_five})")).await,
+        DecodedValue::Bool(false)
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!("overlaps({one_to_five}, multirange([range(<int64>4, <int64>9)]))")
+        )
+        .await,
+        DecodedValue::Bool(true)
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            &format!("overlaps({one_to_five}, multirange([range(<int64>5, <int64>9)]))")
+        )
+        .await,
+        DecodedValue::Bool(false)
+    );
+}

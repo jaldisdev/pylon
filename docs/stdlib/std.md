@@ -137,10 +137,10 @@ select re_test('^[A-Z]', .name)
 |---|---|---|---|
 | `range` | `(lower: anypoint, upper: anypoint [, inc_lower: bool, inc_upper: bool])` / `(empty: bool)` | `range<anypoint>` | Construct a range (default: lower-inclusive, upper-exclusive) or an empty range. |
 | `range_unpack` | `(r: range<anypoint> [, step: anypoint])` | `set of anypoint` | Every discrete point in the range. |
-| `range_get_lower` / `range_get_upper` | `(r: range<anypoint>)` | `T?` | The range's bound. |
-| `range_is_empty` | `(r: range<anypoint>)` | `bool` | True for an empty range. |
-| `range_is_inclusive_lower` / `range_is_inclusive_upper` | `(r: range<anypoint>)` | `bool` | Whether that bound is inclusive. |
-| `overlaps` | `(a: range<anypoint>, b: range<anypoint>)` | `bool` | True if the ranges share any point. |
+| `range_get_lower` / `range_get_upper` | `(r: range<anypoint>\|multirange<anypoint>)` | `T?` | The range's bound. |
+| `range_is_empty` | `(r: range<anypoint>\|multirange<anypoint>)` | `bool` | True for an empty range. |
+| `range_is_inclusive_lower` / `range_is_inclusive_upper` | `(r: range<anypoint>\|multirange<anypoint>)` | `bool` | Whether that bound is inclusive. |
+| `overlaps` | `(a: range<anypoint>, b: range<anypoint>)` / `(a: multirange<anypoint>, b: multirange<anypoint>)` | `bool` | True if the ranges share any point. |
 | `multirange` | `(ranges: array<range<anypoint>>)` | `multirange<anypoint>` | Construct a multirange from a set of ranges. |
 | `strictly_below` / `strictly_above` | `(l: T, r: T)` for `T` in `range<anypoint>`/`multirange<anypoint>` | `bool` | Entirely before/after, with no overlap. |
 | `bounded_above` / `bounded_below` | `(l: T, r: T)` | `bool` | Doesn't extend past the other's upper/lower bound. |
