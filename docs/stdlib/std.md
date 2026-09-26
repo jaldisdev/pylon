@@ -91,7 +91,7 @@ select re_test('^[A-Z]', .name)
 |---|---|---|---|
 | `to_json` | `(s: str)` *(cast target)* | `json` | Parse a JSON string. Also reachable via `<json>expr`. |
 | `json_typeof` | `(j: json)` | `str` | The JSON value's type name (`"object"`, `"array"`, `"string"`, ...). |
-| `json_get` | `(j: json, *path: str)` | `json?` | Traverse a path of keys/indices; `{}` if any step doesn't exist. |
+| `json_get` | `(j: json, *path: str, default: json = {})` | `json?` | Traverse a path of keys/indices; `default` — `{}` unless given — if any step doesn't exist. |
 | `json_set` | `(j: json, path: array<str>, val: json)` | `json` | Return a copy with the value at `path` replaced. |
 | `json_array_unpack` | `(j: json)` | `set of json` | Each element of a JSON array as its own row. |
 | `json_object_unpack` | `(j: json)` | `set of tuple<str, json>` | Each key/value pair of a JSON object. |
@@ -120,7 +120,7 @@ select re_test('^[A-Z]', .name)
 
 | Function | Signature(s) | Returns | Description |
 |---|---|---|---|
-| `array_get` | `(a: array<anytype>, i: int64)` | `T?` | 0-based element access; `{}` out of range instead of raising. |
+| `array_get` | `(a: array<anytype>, i: int64, *, default: T = {})` | `T?` | 0-based element access; `default` — `{}` unless given — out of range instead of raising. |
 | `array_unpack` | `(a: array<anytype>)` | `set of anytype` | Each element as its own row. |
 | `array_join` | `(a: array<str>, delim: str)` / `(a: array<bytes>, delim: bytes)` | `str` / `bytes` | Join elements with a delimiter between them. |
 | `array_slice` | `(a: array<anytype>, start: int64 [, end: int64])` | `array<anytype>` | 0-based slice. |

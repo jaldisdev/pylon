@@ -147,6 +147,11 @@ class TestNamespaceCalls:
         with pytest.raises(InterfaceError, match='does not take named arguments'):
             std.str_lower(_path('name'), locale='de')
 
+    def test_variadic_and_named_arguments_combine(self):
+        text, params = render_expr(std.json_get(_path('data'), 'a', 'b', default=1))
+        assert text == 'std::json_get(.data, $__mq_p0, $__mq_p1, default := $__mq_p2)'
+        assert params == {'__mq_p0': 'a', '__mq_p1': 'b', '__mq_p2': 1}
+
     def test_infix_alias_renders_as_an_operator(self):
         text, params = render_expr(std.ilike(_path('name'), '%bob%'))
         assert text == '.name ilike $__mq_p0'

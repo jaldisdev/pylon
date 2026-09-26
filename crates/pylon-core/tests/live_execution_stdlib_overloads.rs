@@ -261,6 +261,46 @@ async fn bit_count_counts_the_set_bits_in_bytes() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn json_get_falls_back_to_the_default_it_is_given() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "json_get(to_json('{\"a\": 1}'), 'a', default := to_json('7'))").await,
+        DecodedValue::I64(1)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "json_get(to_json('{}'), 'a', default := to_json('7'))").await,
+        DecodedValue::I64(7)
+    );
+    assert_eq!(
+        eval_scalar(
+            &pool,
+            "json_get(to_json('{\"a\": {\"b\": 2}}'), 'a', 'b', default := to_json('7'))"
+        )
+        .await,
+        DecodedValue::I64(2)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "json_get(to_json('{}'), 'a', 'b')").await,
+        DecodedValue::Null
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn array_get_falls_back_to_the_default_it_is_given() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "array_get([1, 2], 1, default := 9)").await,
+        DecodedValue::I64(2)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "array_get([1, 2], 5, default := 9)").await,
+        DecodedValue::I64(9)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn array_join_concatenates_bytes_with_a_delimiter() {
     let pool = stdlib_pool().await;
     assert_eq!(

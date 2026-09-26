@@ -153,6 +153,20 @@ fn sql(name: &'static str, body: &'static str) -> ImplStrategy {
     })
 }
 
+/// SQL IMMUTABLE, NOT STRICT — for an overload whose `optional<…>` parameter
+/// is NULL when the caller leaves it out, and whose body reads that NULL as
+/// the absence it stands for rather than yielding nothing.
+fn sql_nullable(name: &'static str, body: &'static str) -> ImplStrategy {
+    ImplStrategy::PylonFunction(PylonFnDef {
+        name,
+        language: SqlLanguage::Sql,
+        volatility: FnVolatility::Immutable,
+        strict: false,
+        returns_override: None,
+        body,
+    })
+}
+
 fn sql_returns(name: &'static str, returns: &'static str, body: &'static str) -> ImplStrategy {
     ImplStrategy::PylonFunction(PylonFnDef {
         name,

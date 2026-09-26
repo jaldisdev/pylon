@@ -24,7 +24,7 @@ use super::{
 use super::{
     B, E, I, NamedDefault, O, arr, f, fc, mr, opt, p, plpgsql, plpgsql_nullable, plpgsql_stable_nullable,
     plpgsql_stable_nullable_bool, plpgsql_stable_nullable_elem, plpgsql_stable_returns, pn, pn_as, pv, ro, set_of, sql,
-    sql_returns, tup,
+    sql_nullable, sql_returns, tup,
 };
 use crate::stdlib::FnVolatility::{Modifying, Stable, Volatile};
 
@@ -544,7 +544,21 @@ END"#,
             opt(Json),
             sql("json_get", "SELECT $1 #> $2"),
         ),
-        // path is variadic but not last → collected into text[] by the transpiler
+        // `default` is what the call names it; the SQL parameter cannot carry
+        // that name, and past the variadic the path arrives already gathered.
+        f(
+            "std",
+            "json_get",
+            vec![
+                p("j", Json),
+                pv("path", Str),
+                pn_as("fallback", "default", opt(Json), NamedDefault::Empty),
+            ],
+            opt(Json),
+            sql_nullable("json_get", "SELECT coalesce($1 #> $2, $3)"),
+        ),
+        // What an empty `value` means is the caller's to choose: yield nothing,
+        // leave the target alone, write a JSON null, drop the key, or refuse.
         f(
             "std",
             "json_set",
@@ -850,6 +864,17 @@ END"#,
             vec![p("a", arr(Any)), p("i", Int64)],
             opt(Any),
             E("($1)[$2 + 1]"),
+        ),
+        f(
+            "std",
+            "array_get",
+            vec![
+                p("a", arr(Any)),
+                p("i", Int64),
+                pn_as("fallback", "default", opt(Any), NamedDefault::Empty),
+            ],
+            opt(Any),
+            E("coalesce(($1)[$2 + 1], $3)"),
         ),
         f("std", "array_unpack", vec![p("a", arr(Any))], set_of(Any), B("unnest")),
         f(
