@@ -154,3 +154,15 @@ async fn an_integer_survives_a_round_trip_through_bytes() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn to_datetime_reads_epoch_seconds_as_a_float() {
+    let pool = stdlib_pool().await;
+    // 2001-09-09T01:46:40.5Z, half a second past a round unix billion, in
+    // microseconds from the 2000-01-01 epoch the wire counts from.
+    assert_eq!(
+        eval_scalar(&pool, "to_datetime(<float64>1000000000.5)").await,
+        DecodedValue::Timestamptz(53_315_200_500_000)
+    );
+}

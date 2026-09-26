@@ -160,7 +160,7 @@ select re_test('^[A-Z]', .name)
 | `duration_get` | `(d: duration, el: str)` | `float64` | Extract a field — `hour`, `minutes`, `seconds`, `milliseconds`, `microseconds`, or `totalseconds` for the whole duration in seconds. |
 | `duration_to_seconds` | `(d: duration)` | `decimal` | Total duration in seconds. |
 | `duration_truncate` | `(dt: duration, unit: str)` | `duration` | Truncate to a unit boundary — `microseconds`, `milliseconds`, `seconds`, `minutes`, or `hours`. |
-| `to_datetime` | `(s: str, fmt: optional<str>)` / `(year, month, day, hour, min: int64, sec: float64, timezone: str)` / `(local: cal::local_datetime, zone: str)` / `(s: str)` *(cast target)* / `(epoch_seconds: decimal)` | `datetime` | Parse/construct a timestamp from a format string, discrete fields, a wall clock reading in a given zone, ISO 8601 text, or a Unix epoch. The text must carry a time zone, and `fmt` must name one (`TZH`/`TZM`) — read in the session's zone, the same string would mean different instants on different servers. |
+| `to_datetime` | `(s: str, fmt: optional<str>)` / `(year, month, day, hour, min: int64, sec: float64, timezone: str)` / `(local: cal::local_datetime, zone: str)` / `(s: str)` *(cast target)* / `(epoch_seconds: decimal\|float64)` | `datetime` | Parse/construct a timestamp from a format string, discrete fields, a wall clock reading in a given zone, ISO 8601 text, or a Unix epoch. The text must carry a time zone, and `fmt` must name one (`TZH`/`TZM`) — read in the session's zone, the same string would mean different instants on different servers. |
 | `to_duration` | `(hours: int64, minutes: int64, seconds: float64)` | `duration` | Construct a duration from discrete fields. |
 
 ## Type conversion

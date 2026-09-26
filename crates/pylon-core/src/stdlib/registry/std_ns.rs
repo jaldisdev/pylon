@@ -1302,6 +1302,13 @@ END"#,
         ),
         f(
             "std",
+            "to_datetime",
+            vec![p("epoch_seconds", Float64)],
+            Datetime,
+            E("to_timestamp($1)"),
+        ),
+        f(
+            "std",
             "to_duration",
             // Named-only, each defaulting to 0, and `microseconds` alongside
             // the rest, which `to_duration(seconds := …)` relies on. Declared
