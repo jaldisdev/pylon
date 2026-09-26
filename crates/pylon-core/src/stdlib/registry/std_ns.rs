@@ -661,6 +661,7 @@ END"#,
             Int64,
             E("bit_count($1::bit(64))"),
         ),
+        f("std", "bit_count", vec![p("val", Bytes)], Int64, B("bit_count")),
         f(
             "std",
             "bit_lshift",

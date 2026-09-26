@@ -251,3 +251,10 @@ async fn find_from_a_position_skips_the_earlier_occurrences() {
         DecodedValue::I64(-1)
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn bit_count_counts_the_set_bits_in_bytes() {
+    let pool = stdlib_pool().await;
+    assert_eq!(eval_scalar(&pool, "bit_count(<bytes>'ab')").await, DecodedValue::I64(6));
+}

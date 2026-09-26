@@ -103,7 +103,7 @@ select re_test('^[A-Z]', .name)
 |---|---|---|---|
 | `bit_and` / `bit_or` / `bit_xor` | `(l: T, r: T)` for `T` in `int16`/`int32`/`int64` | same type | Bitwise AND/OR/XOR. |
 | `bit_not` | `(r: T)` | same type | Bitwise NOT. |
-| `bit_count` | `(val: int16\|int32\|int64)` | `int64` | Number of set bits. |
+| `bit_count` | `(val: int16\|int32\|int64)` / `(bytes: bytes)` | `int64` | Number of set bits. |
 | `bit_lshift` / `bit_rshift` | `(val: T, n: int64)` | same type as `val` | Bit shift left/right. |
 | `to_hex` | `(n: int16\|int32\|int64)` | `str` | Hexadecimal string representation. |
 
