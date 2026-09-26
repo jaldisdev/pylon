@@ -219,3 +219,35 @@ async fn the_range_accessors_read_a_multirange() {
         DecodedValue::Bool(false)
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn find_locates_a_byte_sequence() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "find(<bytes>'abc', <bytes>'b')").await,
+        DecodedValue::I64(1)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "find(<bytes>'abc', <bytes>'z')").await,
+        DecodedValue::I64(-1)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn find_from_a_position_skips_the_earlier_occurrences() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "find([1, 2, 3, 2], 2, 0)").await,
+        DecodedValue::I64(1)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "find([1, 2, 3, 2], 2, 2)").await,
+        DecodedValue::I64(3)
+    );
+    assert_eq!(
+        eval_scalar(&pool, "find([1, 2, 3, 2], 2, 4)").await,
+        DecodedValue::I64(-1)
+    );
+}

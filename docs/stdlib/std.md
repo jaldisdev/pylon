@@ -47,7 +47,8 @@ select assert_exists((select Person filter .id = <uuid>$id))
 | `re_replace` | `(pattern: str, sub: str, s: str [, flags: str])` | `str` | Regex replace — note the argument order is `(pattern, replacement, subject)`, not PostgreSQL's own `regexp_replace(subject, pattern, replacement)` order. |
 | `re_test` | `(pattern: str, s: str)` | `bool` | True if `s` matches `pattern`. |
 | `find` | `(haystack: str, needle: str)` | `int64` | 0-based index of the first occurrence, or `-1` if not found. |
-| `find` | `(haystack: array<T>, needle: T)` | `int64` | 0-based index of the first matching element, or `-1` if not present. |
+| `find` | `(haystack: bytes, needle: bytes)` | `int64` | 0-based index of the first occurrence, or `-1` if not found. |
+| `find` | `(haystack: array<T>, needle: T [, from_pos: int64])` | `int64` | 0-based index of the first matching element at or after `from_pos`, or `-1` if not present. |
 
 ```pyql
 select str_upper(.name)
