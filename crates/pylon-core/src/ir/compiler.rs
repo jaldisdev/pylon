@@ -927,6 +927,11 @@ pub struct RewriteAssignment {
     pub column: String,
     pub ir: IrExpr,
     pub sql: String,
+    /// True when the expression reads one of the owner's multi-links. Those
+    /// rows live in a junction table the statement writes *after* the row
+    /// itself, so a `BEFORE` trigger reading one sums an empty set — see
+    /// `export::rewrite_trigger_infos`.
+    pub reads_a_multi_link: bool,
 }
 
 /// A type's rewrites for one event (`on_mask`: 1 = insert, 2 = update), each
@@ -978,11 +983,18 @@ pub fn compile_rewrite_assignments(
                 }));
             }
             let sql = crate::sql::emit_expr_with_fanouts(&ir, &fanouts);
+            // Read off the emitted SQL rather than the expression: a walk
+            // reaches a junction through computeds, subtypes and `through`
+            // types, and what it actually joins is the one answer all of
+            // those agree on.
+            let junctions = c.junction_tables_of(owner_td)?;
+            let reads_a_multi_link = junctions.iter().any(|table| sql.contains(table.as_str()));
             out.push(RewriteAssignment {
                 pointer: name.clone(),
                 column: column.clone(),
                 ir,
                 sql,
+                reads_a_multi_link,
             });
         }
     }
@@ -8734,6 +8746,29 @@ impl<'a> Compiler<'a> {
             junction_table
         };
         Ok((junction_table, module, source_col, target_col, through_td))
+    }
+
+    /// Every junction table a read of `td`'s multi-links can name, quoted as
+    /// the emitter spells it. A `through` type brings its own table; an
+    /// owner-derived junction is named after the owner, and a subtype's
+    /// carries that subtype's table, so each implementor contributes one.
+    fn junction_tables_of(&mut self, td: &TypeDescriptor) -> Result<Vec<String>, PyQLError> {
+        let mut tables = vec![];
+        for multilink in &td.multilinks {
+            match &multilink.through {
+                Some(through) => {
+                    let through_td = self.resolve_type(through)?;
+                    tables.push(format!("\"{}\"", through_td.table));
+                }
+                None => {
+                    tables.push(format!("\"{}.{}\"", td.table, multilink.name));
+                    for implementor in self.find_poly_implementors(&format!("{}::{}", td.module, td.name)) {
+                        tables.push(format!("\"{}.{}\"", implementor.table, multilink.name));
+                    }
+                }
+            }
+        }
+        Ok(tables)
     }
 
     /// The junction a read of `td`'s multi-link `name` goes through: its own

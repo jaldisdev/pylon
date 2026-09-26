@@ -1692,8 +1692,10 @@ pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, Str
             ));
         }
         for (on, _) in REWRITE_EVENTS {
-            if let Some(name) = rewrite_trigger_name(t, on, schema) {
-                result.push((t.module.clone(), t.table.clone(), name));
+            for deferred in [false, true] {
+                if let Some(name) = rewrite_trigger_name(t, on, schema, deferred) {
+                    result.push((t.module.clone(), t.table.clone(), name));
+                }
             }
         }
     }
@@ -1706,7 +1708,7 @@ const REWRITE_EVENTS: [(u8, &str); 2] = [(1, "INSERT"), (2, "UPDATE")];
 /// The name of the `BEFORE` trigger applying `t`'s rewrites on `on`, or
 /// `None` when it has none — derived from the rewrites themselves, so
 /// editing one replaces the trigger.
-fn rewrite_trigger_name(t: &TypeDescriptor, on: u8, schema: &SchemaDescriptor) -> Option<String> {
+fn rewrite_trigger_name(t: &TypeDescriptor, on: u8, schema: &SchemaDescriptor, deferred: bool) -> Option<String> {
     let handlers: Vec<String> = t
         .properties
         .iter()
@@ -1724,17 +1726,33 @@ fn rewrite_trigger_name(t: &TypeDescriptor, on: u8, schema: &SchemaDescriptor) -
     }
     let event = if on == 1 { "ins" } else { "upd" };
     // As for `trigger_ddl_name`: the compiled SQL too, when it compiles.
-    let compiled = crate::ir::compile_rewrite_assignments(&format!("{}::{}", t.module, t.name), on, schema)
-        .map(|assignments| assignments.into_iter().map(|a| a.sql).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_default();
+    let assignments =
+        crate::ir::compile_rewrite_assignments(&format!("{}::{}", t.module, t.name), on, schema).unwrap_or_default();
+    let assignments: Vec<&crate::ir::RewriteAssignment> = assignments
+        .iter()
+        .filter(|a| a.reads_a_multi_link == deferred)
+        .collect();
+    if assignments.is_empty() {
+        return None;
+    }
+    let compiled = assignments.iter().map(|a| a.sql.clone()).collect::<Vec<_>>().join("\n");
+    let timing = if deferred { "rwa" } else { "rw" };
     let hash = fnv(&[&t.table, event, &handlers.join("\n"), &compiled]);
-    Some(format!("{}_rw_{event}_{}", t.table, &hash[..12]))
+    Some(format!("{}_{timing}_{event}_{}", t.table, &hash[..12]))
 }
 
 /// The `BEFORE INSERT`/`BEFORE UPDATE` triggers applying each type's
 /// rewrites to the row being written — the row with every value the
 /// statement gave it, which a rewrite compiled into the statement itself
 /// cannot see (an insert has no row yet to walk a link from).
+///
+/// A rewrite that reads one of the type's multi-links cannot run there at
+/// all: those rows land in a junction table the statement writes only after
+/// the row itself, so `BEFORE` sees none of them and the rewrite sums an
+/// empty set. Those run in an `AFTER` trigger instead, which fires once the
+/// statement's writes are all in, and stores what it computes with an
+/// `UPDATE` of its own — guarded on the value actually changing, so the
+/// second pass it triggers is also the last.
 fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTriggerInfo>, PyQLError> {
     let mut result = Vec::new();
     for t in &schema.types {
@@ -1743,57 +1761,89 @@ fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigge
         }
         let type_name = format!("{}::{}", t.module, t.name);
         for (on, event) in REWRITE_EVENTS {
-            let Some(fname) = rewrite_trigger_name(t, on, schema) else {
-                continue;
-            };
-            let assignments = crate::ir::compile_rewrite_assignments(&type_name, on, schema).map_err(|e| {
+            let compiled = crate::ir::compile_rewrite_assignments(&type_name, on, schema).map_err(|e| {
                 PyQLError::Fragment(PyQLFragmentError {
                     message: format!("error in a rewrite of '{type_name}': {e}"),
                     context: type_name.clone(),
                     position: crate::error::Position { line: 0, col: 0 },
                 })
             })?;
-            if assignments.is_empty() {
-                continue;
+            for deferred in [false, true] {
+                let Some(fname) = rewrite_trigger_name(t, on, schema, deferred) else {
+                    continue;
+                };
+                let assignments: Vec<&crate::ir::RewriteAssignment> = compiled
+                    .iter()
+                    .filter(|assignment| assignment.reads_a_multi_link == deferred)
+                    .collect();
+                if assignments.is_empty() {
+                    continue;
+                }
+                let values = assignments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, assignment)| format!("{} AS \"v{i}\"", assignment.sql))
+                    .collect::<Vec<_>>()
+                    .join(",\n\t\t");
+                let fn_qname = qn(&t.module, &fname);
+                let table_qname = qn(&t.module, &t.table);
+                let globals_arg = qi(crate::ir::GLOBALS_ARG);
+                let body = if deferred {
+                    let sets = assignments
+                        .iter()
+                        .enumerate()
+                        .map(|(i, assignment)| format!("\t\t{} = _pylon_rewrites.\"v{i}\"", qi(&assignment.column)))
+                        .collect::<Vec<_>>()
+                        .join(",\n");
+                    let stored = assignments
+                        .iter()
+                        .map(|assignment| qi(&assignment.column))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let computed = (0..assignments.len())
+                        .map(|i| format!("_pylon_rewrites.\"v{i}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "\tSELECT {values} INTO _pylon_rewrites;\n\
+                         \tUPDATE {table_qname} SET\n\
+                         {sets}\n\
+                         \tWHERE \"id\" = NEW.\"id\"\n\
+                         \t  AND ({stored}) IS DISTINCT FROM ({computed});\n\
+                         \tRETURN NULL;"
+                    )
+                } else {
+                    let sets = assignments
+                        .iter()
+                        .enumerate()
+                        .map(|(i, assignment)| format!("\tNEW.{} := _pylon_rewrites.\"v{i}\";", qi(&assignment.column)))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\tSELECT {values} INTO _pylon_rewrites;\n{sets}\n\tRETURN NEW;")
+                };
+                let timing = if deferred { "AFTER" } else { "BEFORE" };
+                let ddl = format!(
+                    "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+                     RETURNS trigger LANGUAGE plpgsql AS $$\n\
+                     DECLARE\n\
+                     \t_pylon_rewrites record;\n\
+                     \t{globals_arg} jsonb := nullif(current_setting('pylon.globals', true), '')::jsonb;\n\
+                     BEGIN\n\
+                     {body}\n\
+                     END;\n\
+                     $$;\n\n\
+                     CREATE OR REPLACE TRIGGER {}\n\
+                     {timing} {event} ON {table_qname}\n\
+                     FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n",
+                    qi(&fname),
+                );
+                result.push(DeletionTriggerInfo {
+                    table_module: t.module.clone(),
+                    table_name: t.table.clone(),
+                    trigger_name: fname,
+                    ddl,
+                });
             }
-            let values = assignments
-                .iter()
-                .enumerate()
-                .map(|(i, assignment)| format!("{} AS \"v{i}\"", assignment.sql))
-                .collect::<Vec<_>>()
-                .join(",\n\t\t");
-            let sets = assignments
-                .iter()
-                .enumerate()
-                .map(|(i, assignment)| format!("\tNEW.{} := _pylon_rewrites.\"v{i}\";", qi(&assignment.column)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let fn_qname = qn(&t.module, &fname);
-            let table_qname = qn(&t.module, &t.table);
-            let globals_arg = qi(crate::ir::GLOBALS_ARG);
-            let ddl = format!(
-                "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
-                 RETURNS trigger LANGUAGE plpgsql AS $$\n\
-                 DECLARE\n\
-                 \t_pylon_rewrites record;\n\
-                 \t{globals_arg} jsonb := nullif(current_setting('pylon.globals', true), '')::jsonb;\n\
-                 BEGIN\n\
-                 \tSELECT {values} INTO _pylon_rewrites;\n\
-                 {sets}\n\
-                 \tRETURN NEW;\n\
-                 END;\n\
-                 $$;\n\n\
-                 CREATE OR REPLACE TRIGGER {}\n\
-                 BEFORE {event} ON {table_qname}\n\
-                 FOR EACH ROW EXECUTE FUNCTION {fn_qname}();\n\n",
-                qi(&fname),
-            );
-            result.push(DeletionTriggerInfo {
-                table_module: t.module.clone(),
-                table_name: t.table.clone(),
-                trigger_name: fname,
-                ddl,
-            });
         }
     }
     Ok(result)

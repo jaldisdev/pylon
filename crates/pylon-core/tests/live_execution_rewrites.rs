@@ -73,6 +73,12 @@ fn ty(name: &str, module: &str, properties: Vec<pylon_core::schema::PropertyDesc
     }
 }
 
+fn amount_prop(name: &str) -> pylon_core::schema::PropertyDescriptor {
+    let mut p = text_prop(name);
+    p.pg_type = "numeric".into();
+    p
+}
+
 /// A `Log { id, new_name }` audit type, for the trigger-interaction test.
 fn log_type(module: &str) -> TypeDescriptor {
     ty("Log", module, vec![id_prop(), text_prop("new_name")])
@@ -132,6 +138,45 @@ async fn insert_rewrite_overrides_assigned_value() {
         field(&rows[0], 2),
         &DecodedValue::Str("inserted".to_string()),
         "insert rewrite should override the assigned value"
+    );
+}
+
+/// A rewrite reading a multi-link the same statement fills. The link's rows
+/// land in a junction table written after the row itself, so a `BEFORE`
+/// trigger sums nothing — the total has to be taken once the statement's
+/// writes are in.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn insert_rewrite_reads_the_multi_link_the_same_statement_sets() {
+    let module = unique_module("live_rw_multilink");
+    let part = ty("Part", &module, vec![id_prop(), amount_prop("amount")]);
+    let mut assembly = ty("Assembly", &module, vec![id_prop(), amount_prop("total")]);
+    assembly.properties[1].rewrites = vec![rewrite(3, "std::sum(.parts.amount)")]; // On.Insert | On.Update
+    assembly.multilinks = vec![multilink("parts", &format!("{module}::Part"))];
+    let schema = SchemaDescriptor {
+        types: vec![part, assembly],
+        ..Default::default()
+    };
+
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    exec(&pool, &schema, &format!("insert {module}::Part {{ amount := 3 }}")).await;
+    exec(&pool, &schema, &format!("insert {module}::Part {{ amount := 4 }}")).await;
+    exec(
+        &pool,
+        &schema,
+        &format!("insert {module}::Assembly {{ total := 0, parts := (select {module}::Part) }}"),
+    )
+    .await;
+
+    let rows = rows_of(&pool, &schema, &format!("select {module}::Assembly {{ total }}")).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        field(&rows[0], 2),
+        &DecodedValue::Decimal("7".to_string()),
+        "the rewrite should have summed both parts the insert linked, got {rows:?}"
     );
 }
 
