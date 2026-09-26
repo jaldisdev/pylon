@@ -1351,10 +1351,11 @@ END"#,
     IF $2 = 'totalseconds' THEN
         RETURN date_part('epoch', $1);
     END IF;
-    IF $2 NOT IN ('hour', 'minutes', 'seconds', 'milliseconds', 'microseconds') THEN
+    IF $2 NOT IN ('millennium', 'century', 'decade', 'year', 'quarter', 'month', 'day',
+                  'hour', 'minutes', 'seconds', 'milliseconds', 'microseconds') THEN
         RAISE EXCEPTION 'invalid unit for std::duration_get: %', quote_literal($2)
             USING ERRCODE = 'invalid_datetime_format',
-                  HINT = 'Supported units: hour, minutes, seconds, milliseconds, microseconds, and totalseconds.';
+                  HINT = 'Supported units: millennium, century, decade, year, quarter, month, day, hour, minutes, seconds, milliseconds, microseconds, and totalseconds.';
     END IF;
     RETURN date_part($2, $1);
 END"#,
@@ -1372,11 +1373,21 @@ END"#,
             "duration_truncate",
             vec![p("dt", Duration), p("unit", Str)],
             Duration,
+            // The calendar units are here because a `cal::relative_duration`
+            // and a `cal::date_duration` are `interval` too, and so reach this
+            // one overload; PostgreSQL spells the quarter in the singular and
+            // has no week at all for an interval.
             plpgsql(
                 "duration_truncate",
                 r#"BEGIN
-    IF $2 NOT IN ('microseconds', 'milliseconds', 'seconds', 'minutes', 'hours') THEN
-        RAISE EXCEPTION 'invalid unit for std::duration_truncate: %', $2;
+    IF $2 = 'quarters' THEN
+        RETURN date_trunc('quarter', $1);
+    END IF;
+    IF $2 NOT IN ('microseconds', 'milliseconds', 'seconds', 'minutes', 'hours',
+                  'days', 'months', 'years', 'decades', 'centuries') THEN
+        RAISE EXCEPTION 'invalid unit for std::duration_truncate: %', quote_literal($2)
+            USING ERRCODE = 'invalid_datetime_format',
+                  HINT = 'Supported units: microseconds, milliseconds, seconds, minutes, hours, days, months, quarters, years, decades, centuries.';
     END IF;
     RETURN date_trunc($2, $1);
 END"#,

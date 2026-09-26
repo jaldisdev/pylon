@@ -573,6 +573,59 @@ async fn a_date_duration_carries_months_and_days() {
     );
 }
 
+/// The calendar units, which only a month-bearing duration has — and which the
+/// one `interval` overload has to accept for a date duration to reach them.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn duration_get_reads_a_date_duration_by_calendar_unit() {
+    let pool = stdlib_pool().await;
+    let dur = "cal::to_date_duration(years := 3, months := 2, days := 400)";
+    for (unit, expected) in [("year", 3.0), ("month", 2.0), ("quarter", 1.0), ("day", 400.0)] {
+        assert_eq!(
+            eval_scalar(&pool, &format!("duration_get({dur}, '{unit}')")).await,
+            DecodedValue::F64(expected),
+            "for {unit}"
+        );
+    }
+    // The time units a plain duration asks for still answer.
+    assert_eq!(
+        eval_scalar(&pool, "duration_get(<duration>'90 minutes', 'hour')").await,
+        DecodedValue::F64(1.0)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn duration_truncate_cuts_a_date_duration_to_a_calendar_unit() {
+    let pool = stdlib_pool().await;
+    let dur = "cal::to_date_duration(years := 3, months := 2, days := 400)";
+    assert_eq!(
+        eval_scalar(&pool, &format!("duration_truncate({dur}, 'months')")).await,
+        DecodedValue::Interval {
+            months: 38,
+            days: 0,
+            microseconds: 0
+        }
+    );
+    assert_eq!(
+        eval_scalar(&pool, &format!("duration_truncate({dur}, 'years')")).await,
+        DecodedValue::Interval {
+            months: 36,
+            days: 0,
+            microseconds: 0
+        }
+    );
+    // `quarter` is the one unit PostgreSQL spells only in the singular.
+    assert_eq!(
+        eval_scalar(&pool, &format!("duration_truncate({dur}, 'quarters')")).await,
+        DecodedValue::Interval {
+            months: 36,
+            days: 0,
+            microseconds: 0
+        }
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn a_date_duration_normalizes_its_days_into_months() {
