@@ -167,15 +167,26 @@ def named_params(entry: dict[str, Any]) -> list[dict[str, Any]]:
     return [p for p in entry['params'] if p.get('named_only')]
 
 
-def _arity_matches(entry: dict[str, Any], argc: int, keywords: tuple[str, ...] = ()) -> bool:
-    if not set(keywords) <= {p['keyword'] for p in named_params(entry)}:
-        return False
+def required_params(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """`value := …` on `json_set` — named, and with no default to fall back on."""
+    return [p for p in entry['params'] if p.get('required')]
+
+
+def _positions_match(entry: dict[str, Any], argc: int) -> bool:
     positional = positional_params(entry)
     if entry['variadic']:
         # The trailing variadic parameter absorbs zero or more arguments, so
         # everything from "all the fixed params" upward is legal.
         return argc >= len(positional) - 1
     return argc == len(positional)
+
+
+def _arity_matches(entry: dict[str, Any], argc: int, keywords: tuple[str, ...] = ()) -> bool:
+    if not set(keywords) <= {p['keyword'] for p in named_params(entry)}:
+        return False
+    if not {p['keyword'] for p in required_params(entry)} <= set(keywords):
+        return False
+    return _positions_match(entry, argc)
 
 
 def _arity_error(namespace: str, name: str, entries: list[dict[str, Any]], argc: int) -> str:
@@ -205,8 +216,25 @@ def check_call(namespace: str, name: str, argc: int, keywords: tuple[str, ...] =
             raise InterfaceError(f'{namespace}.{name}() does not take named arguments, got {unknown[0]!r}')
         raise InterfaceError(f'{namespace}.{name}() has no parameter {unknown[0]!r}')
 
-    if not any(_arity_matches(e, argc, keywords) for e in entries):
-        raise InterfaceError(_arity_error(namespace, name, entries, argc))
+    if any(_arity_matches(e, argc, keywords) for e in entries):
+        return
+
+    # Reached only by a call no overload accepts. A named argument with no
+    # default is not an arity problem, and reporting it as one sent the caller
+    # counting positions instead of naming it.
+    missing = next(
+        (
+            p['keyword']
+            for e in entries
+            if _positions_match(e, argc)
+            for p in required_params(e)
+            if p['keyword'] not in keywords
+        ),
+        None,
+    )
+    if missing:
+        raise InterfaceError(f'{namespace}.{name}() requires the named argument {missing!r} — pass {missing} := …')
+    raise InterfaceError(_arity_error(namespace, name, entries, argc))
 
 
 def check_context(namespace: str, name: str, argc: int, context: str, keywords: tuple[str, ...] = ()) -> None:

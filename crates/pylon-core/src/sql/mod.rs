@@ -15192,6 +15192,32 @@ select owner { posts := (select owner.posts.title) };",
         assert!(out.sql.contains("tstzrange("), "got:\n{}", out.sql);
     }
 
+    /// A call that writes a named-only argument by position, one that leaves a
+    /// required one out, and one no overload accepts each say which.
+    #[test]
+    fn test_a_named_only_parameter_is_reported_as_named_only() {
+        assert!(
+            compile_err("SELECT std::range(1, 5, true, false)").contains("takes 'inc_lower' as a named argument only"),
+            "{}",
+            compile_err("SELECT std::range(1, 5, true, false)")
+        );
+        assert!(
+            compile_err("SELECT std::json_set(std::to_json('{}'), 'a', std::to_json('1'))")
+                .contains("requires the named argument 'value'"),
+            "{}",
+            compile_err("SELECT std::json_set(std::to_json('{}'), 'a', std::to_json('1'))")
+        );
+        // Counted by positions, not by the whole parameter list.
+        assert!(
+            compile_err("SELECT std::range()").contains("takes 1 or 2 argument(s), got 0"),
+            "{}",
+            compile_err("SELECT std::range()")
+        );
+        // And an overload's named-only parameters are spelled as such.
+        let message = compile_err("SELECT std::json_get(std::to_json('{}'), 'a', 1, 2)");
+        assert!(message.contains("default := optional<json>"), "{message}");
+    }
+
     #[test]
     fn test_range_intrinsic_four_arg_form_computes_bounds_string() {
         let out = compile_and_emit("SELECT std::range(1, 3, true, false)");

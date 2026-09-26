@@ -238,6 +238,10 @@ impl Param {
 #[derive(Debug, Clone, Copy)]
 pub enum NamedDefault {
     Int(i64),
+    Bool(bool),
+    Str(&'static str),
+    /// No default at all — the call has to pass it by name.
+    Required,
     /// `<str>{}` — no value.
     Empty,
 }
@@ -309,8 +313,26 @@ impl FnDescriptor {
 
     /// True when the overload accepts a trailing variadic parameter, so any
     /// argument count at or above `params.len() - 1` is legal.
+    ///
+    /// Trailing among the *positional* parameters: `json_set(target, path...,
+    /// value := …)` declares named-only ones after the variadic, and they are
+    /// passed by name rather than counted against it.
     pub fn is_variadic(&self) -> bool {
-        self.params.last().is_some_and(|p| p.variadic)
+        self.params
+            .iter()
+            .rev()
+            .find(|p| p.named_only.is_none())
+            .is_some_and(|p| p.variadic)
+    }
+
+    /// Index of the variadic parameter, when one is declared.
+    pub fn variadic_index(&self) -> Option<usize> {
+        self.params.iter().position(|p| p.variadic)
+    }
+
+    /// Count of parameters a call passes by name rather than by position.
+    pub fn named_count(&self) -> usize {
+        self.params.iter().filter(|p| p.named_only.is_some()).count()
     }
 }
 

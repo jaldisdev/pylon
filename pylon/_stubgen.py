@@ -99,7 +99,7 @@ def _signature(entry: dict, method_name: str) -> str:
     Every parameter is positional-only (`/`): PyQL calls are positional, and
     it frees the stub from having to promise that registry parameter names
     are stable keyword names. The exception is a named-only parameter, which
-    is keyword-only and defaulted, exactly as PyQL takes it.
+    is keyword-only, and defaulted unless the call has to name it.
     """
     params = stdlib.positional_params(entry)
     named = stdlib.named_params(entry)
@@ -125,7 +125,7 @@ def _signature(entry: dict, method_name: str) -> str:
     if named:
         if variadic_at is None:
             parts.append('*')
-        parts.extend(f'{p["keyword"]}: _Arg = ...' for p in named)
+        parts.extend(f'{p["keyword"]}: _Arg' + ('' if p.get('required') else ' = ...') for p in named)
     return f'    def {method_name}({", ".join(parts)}) -> _Node: ...'
 
 

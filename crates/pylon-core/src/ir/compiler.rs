@@ -16039,16 +16039,33 @@ impl<'a> Compiler<'a> {
         let overloads = crate::stdlib::lookup(ns, &f.name);
         let positional = |d: &crate::stdlib::FnDescriptor| d.params.iter().filter(|p| p.named_only.is_none()).count();
         let named = |d: &crate::stdlib::FnDescriptor| d.params.iter().filter(|p| p.named_only.is_some()).count();
+        // A variadic parameter absorbs any number of the positional arguments,
+        // so it fixes only a floor on how many a call may pass.
+        let takes_positionally = |d: &crate::stdlib::FnDescriptor| {
+            if d.is_variadic() {
+                f.args.len() + 1 >= positional(d)
+            } else {
+                positional(d) == f.args.len()
+            }
+        };
         if f.kwargs.is_empty() {
-            if overloads.iter().any(|d| positional(d) == f.args.len() && named(d) == 0) {
+            if overloads.iter().any(|d| takes_positionally(d) && named(d) == 0) {
                 return Ok(None);
             }
-            if !overloads.iter().any(|d| positional(d) == f.args.len()) && overloads.iter().any(|d| named(d) > 0) {
-                let param = overloads
+            // Only when the call passed *more* positionally than an overload's
+            // positions hold, and no more than its whole parameter list: that
+            // is a call writing the named-only ones by position, as opposed to
+            // one whose argument count is simply wrong.
+            let wrote_a_named_one_positionally =
+                |d: &crate::stdlib::FnDescriptor| positional(d) < f.args.len() && f.args.len() <= d.params.len();
+            if !overloads.iter().any(|d| takes_positionally(d))
+                && let Some(param) = overloads
                     .iter()
+                    .filter(|d| wrote_a_named_one_positionally(d))
                     .flat_map(|d| d.params.iter())
                     .find(|p| p.named_only.is_some())
-                    .map_or("", |p| p.keyword());
+                    .map(|p| p.keyword())
+            {
                 return Err(self.type_err(&format!(
                     "function '{ns}::{}' takes '{param}' as a named argument only — e.g. '{param} := …'",
                     f.name
@@ -16056,7 +16073,7 @@ impl<'a> Compiler<'a> {
             }
         }
         let fits = |d: &&&crate::stdlib::FnDescriptor| {
-            positional(d) == f.args.len()
+            takes_positionally(d)
                 && named(d) > 0
                 && f.kwargs
                     .iter()
@@ -16087,7 +16104,16 @@ impl<'a> Compiler<'a> {
                 param.named_only,
             ) {
                 (Some((_, value)), _) => self.compile_expr_ctx(value, ctx)?,
+                (None, Some(NamedDefault::Required)) => {
+                    let keyword = param.keyword();
+                    return Err(self.type_err(&format!(
+                        "function '{ns}::{}' requires the named argument '{keyword}' — e.g. '{keyword} := …'",
+                        f.name
+                    )));
+                }
                 (None, Some(NamedDefault::Int(n))) => IrExpr::Literal(IrLiteral::Int(n)),
+                (None, Some(NamedDefault::Bool(b))) => IrExpr::Literal(IrLiteral::Bool(b)),
+                (None, Some(NamedDefault::Str(s))) => IrExpr::Literal(IrLiteral::Str(s.to_string())),
                 (None, _) => IrExpr::Null,
             };
             args.push(arg);
@@ -16167,6 +16193,10 @@ impl<'a> Compiler<'a> {
                     },
                 )
                 .collect(),
+            None => args,
+        };
+        let args = match best {
+            Some(descriptor) => pack_variadic_args(descriptor, args),
             None => args,
         };
 
@@ -17821,7 +17851,12 @@ fn ir_is_not_null(expr: IrExpr) -> IrExpr {
 /// arities an overload set accepts, worded as `pylon.stdlib._arity_error`
 /// words the same rejection on the Python side.
 fn describe_arities(overloads: &[&crate::stdlib::FnDescriptor]) -> String {
-    let mut arities: Vec<usize> = overloads.iter().map(|d| d.params.len()).collect();
+    // Positions only: a named-only parameter is not one of the arguments the
+    // count is about, so counting it reported `range(…)` as taking four.
+    let mut arities: Vec<usize> = overloads
+        .iter()
+        .map(|d| d.params.iter().filter(|p| p.named_only.is_none()).count())
+        .collect();
     arities.sort_unstable();
     arities.dedup();
     if overloads.iter().any(|d| d.is_variadic()) {
@@ -17846,25 +17881,66 @@ fn describe_signatures(overloads: &[&crate::stdlib::FnDescriptor]) -> String {
     overloads
         .iter()
         .map(|d| {
-            let params = d.params.iter().map(|p| p.ty.pyql_name()).collect::<Vec<_>>().join(", ");
+            let params = d
+                .params
+                .iter()
+                .map(|p| match p.named_only {
+                    // Spelled the way the call has to pass it, so a rejected
+                    // call isn't told to write a named parameter by position.
+                    Some(_) => format!("{} := {}", p.keyword(), p.ty.pyql_name()),
+                    None => p.ty.pyql_name(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("({params})")
         })
         .collect::<Vec<_>>()
         .join(" or ")
 }
 
+/// Gather the arguments a variadic parameter absorbed into one array, for the
+/// overloads that declare named-only parameters after it.
+///
+/// PostgreSQL requires `VARIADIC` to be the last parameter, so an overload
+/// with anything after it declares a plain array instead (see
+/// `ddl::pg_params`) and is handed the elements already gathered. An overload
+/// whose variadic really is last keeps passing them one by one, which is what
+/// `VARIADIC path text[]` expects.
+fn pack_variadic_args(d: &crate::stdlib::FnDescriptor, args: Vec<IrExpr>) -> Vec<IrExpr> {
+    let named = d.named_count();
+    let Some(variadic_at) = d.variadic_index().filter(|v| v + 1 < d.params.len()) else {
+        return args;
+    };
+    let Some(absorbed) = args.len().checked_sub(variadic_at + named) else {
+        return args;
+    };
+    let mut packed: Vec<IrExpr> = Vec::with_capacity(variadic_at + 1 + named);
+    let mut rest = args.into_iter();
+    packed.extend(rest.by_ref().take(variadic_at));
+    packed.push(IrExpr::Array(rest.by_ref().take(absorbed).collect()));
+    packed.extend(rest);
+    packed
+}
+
 /// The parameter each of `argc` arguments is checked against.
 ///
-/// One per declared parameter, except that a trailing variadic one stands in
-/// for every argument past the fixed ones — `json_get(j, 'a', 'b')` checks
-/// both path elements against the single variadic `str` parameter rather
-/// than leaving the third argument unchecked, which a plain `params.iter()`
-/// zipped against the arguments would do.
+/// One per declared parameter, except that a variadic one stands in for every
+/// argument past the fixed ones — `json_get(j, 'a', 'b')` checks both path
+/// elements against the single variadic `str` parameter rather than leaving
+/// the third argument unchecked, which a plain `params.iter()` zipped against
+/// the arguments would do.
+///
+/// The named-only parameters keep their own positions at the tail:
+/// `compile_named_call_args` has already appended one argument per named-only
+/// parameter, in declaration order, so the arguments a variadic absorbs are
+/// only the ones between the fixed parameters and that tail.
 fn params_for_args(d: &crate::stdlib::FnDescriptor, argc: usize) -> impl Iterator<Item = &crate::stdlib::Param> {
-    let last = d.params.len().saturating_sub(1);
-    let repeat_from = d.is_variadic().then_some(last);
-    (0..argc).filter_map(move |i| match repeat_from {
-        Some(v) if i >= v => d.params.get(v),
+    let named = d.named_count();
+    let variadic_at = d.is_variadic().then(|| d.variadic_index()).flatten();
+    let absorbed = variadic_at.map_or(0, |v| argc.saturating_sub(v + named));
+    (0..argc).filter_map(move |i| match variadic_at {
+        Some(v) if i >= v && i < v + absorbed => d.params.get(v),
+        Some(v) if i >= v => d.params.get(i + 1 - absorbed),
         _ => d.params.get(i),
     })
 }
