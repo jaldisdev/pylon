@@ -520,6 +520,24 @@ async fn array_join_concatenates_bytes_with_a_delimiter() {
     );
 }
 
+/// A boolean reaches every integer width, not just the one PostgreSQL casts to
+/// directly.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_boolean_converts_to_an_integer_of_any_width() {
+    let pool = stdlib_pool().await;
+    for call in [
+        "to_int16(true)",
+        "to_int32(true)",
+        "to_int64(true)",
+        "<int16>true",
+        "<int64>true",
+    ] {
+        assert_eq!(eval_scalar(&pool, call).await, DecodedValue::I64(1), "for {call}");
+    }
+    assert_eq!(eval_scalar(&pool, "to_int16(false)").await, DecodedValue::I64(0));
+}
+
 /// The digit count is an `int4` in PostgreSQL, which an `int64` argument only
 /// reaches through a cast.
 #[tokio::test]

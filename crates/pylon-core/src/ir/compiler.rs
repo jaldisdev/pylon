@@ -12331,6 +12331,17 @@ impl<'a> Compiler<'a> {
                     return self.resolve_fn_call(Some("std"), "to_str", vec![inner]);
                 }
 
+                // PostgreSQL casts a boolean to `int4` and to nothing else, so
+                // the narrower and wider integers go through it.
+                let inner = match (pg_type.as_str(), infer_ir_type(&inner)) {
+                    ("int2" | "int8", Some("boolean")) => IrExpr::TypeCast(Box::new(IrTypeCast {
+                        expr: inner,
+                        pg_type: "int4".to_string(),
+                        tuple_shape: None,
+                    })),
+                    _ => inner,
+                };
+
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
                 Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
                     expr: inner,
