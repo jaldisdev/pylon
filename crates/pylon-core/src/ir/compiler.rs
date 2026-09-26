@@ -13284,9 +13284,12 @@ impl<'a> Compiler<'a> {
             }
 
             Expr::Array(elems) => {
+                // Each element is one value: `[<uuid>$p, snippet.id]` is two
+                // uuids, not a uuid beside an array of them — PostgreSQL
+                // refuses to mix the two in one literal.
                 let items = elems
                     .iter()
-                    .map(|e| self.compile_expr_ctx(e, ctx))
+                    .map(|e| self.compile_expr_ctx(e, ctx).map(set_walk_as_scalar))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(IrExpr::Array(items))
             }
@@ -16091,6 +16094,25 @@ impl<'a> Compiler<'a> {
                     .all(|(p, a)| pylon_type_matches(a, &p.ty))
             })
         });
+
+        // A parameter that takes one value takes the walk's value, not the
+        // array its rows were gathered into: `contains(ids, .<menus.id)`
+        // compares uuids. A `set of …`/`array<…>` parameter asked for the
+        // whole set and keeps it.
+        let args_len = args.len();
+        let args: Vec<IrExpr> = match best {
+            Some(descriptor) => args
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(i, arg)| match params_for_args(descriptor, args_len).nth(i).map(|p| &p.ty) {
+                        Some(crate::stdlib::PylonType::Set(_)) | Some(crate::stdlib::PylonType::Array(_)) | None => arg,
+                        Some(_) => set_walk_as_scalar(arg),
+                    },
+                )
+                .collect(),
+            None => args,
+        };
 
         // An `optional<…>` return still travels as its own scalar — a call
         // that may yield nothing (`json_get`) is typed by what it yields when

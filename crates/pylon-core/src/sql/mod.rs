@@ -13349,6 +13349,19 @@ select owner { posts := (select owner.posts.title) };",
         }
     }
 
+    /// Each element of an array literal is one value. A walk gathered into an
+    /// array of its own leaves `ARRAY[uuid, uuid[]]`, which PostgreSQL
+    /// refuses: "ARRAY types uuid and uuid[] cannot be matched".
+    #[test]
+    fn test_an_array_literals_walk_element_is_read_as_one_value() {
+        let out = compile_and_emit("WITH p := (SELECT Person LIMIT 1) SELECT [<uuid>$a, p.id]");
+        assert!(
+            !out.sql.contains("ARRAY(SELECT"),
+            "the element should be a scalar subquery, not an array of its own:\n{}",
+            out.sql
+        );
+    }
+
     /// A sub-select's own filter speaks about its subject however the outer
     /// select is written: ordering the walk must not re-read `.name` off what
     /// the walk lands on, which silently filtered the wrong table.
