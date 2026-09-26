@@ -11571,6 +11571,57 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_an_aggregate_over_a_set_literal_inside_a_shape() {
+        // `min({cap, .age})` is one value read from a two-element set, and the
+        // set is the aggregate's argument wherever the call is written. In a
+        // schema-bound shape it used to report "shapes and set literals are not
+        // valid in expression context" while the same call compiled at the top
+        // level, so a saturating cap had no spelling here at all.
+        let out = compile_and_emit("UPDATE Person FILTER .id = $id SET { age := min({<int64>100, .age}) }");
+        assert!(out.sql.contains("min(v)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("UNION ALL"), "both operands must reach the aggregate:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_an_aggregate_over_a_set_literal_reads_the_subject() {
+        // The operands compile with the shape's own context, so a relative path
+        // among them still resolves to the subject's column.
+        let out = compile_and_emit("SELECT Person { capped := min({<int64>100, .age}) }");
+        assert!(out.sql.contains("min(v)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"age\""), "the relative path must reach the column:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_an_aggregate_over_a_union_inside_a_shape() {
+        // `min((a union b))` says the same thing as `min({a, b})`, and used to
+        // report "union is not valid in expression context".
+        let out = compile_and_emit("SELECT Person { capped := min((<int64>100 union .age)) }");
+        assert!(out.sql.contains("min(v)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("UNION ALL"), "both arms must reach the aggregate:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_an_aggregate_over_a_union_of_three_arms_flattens() {
+        let out = compile_and_emit("SELECT Person { capped := min((<int64>1 union <int64>2 union .age)) }");
+        assert_eq!(out.sql.matches("UNION ALL").count(), 2, "three arms means two joins:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_an_aggregate_over_an_empty_set_emits_no_row_source() {
+        // An empty set has nothing to aggregate, and the row source it would
+        // emit (`FROM () AS _set(v)`) is not valid SQL -- so `{}` must not be
+        // taken for an aggregate's operands, in either context.
+        for query in [
+            "SELECT Person { capped := min({}) }",
+            "SELECT min({})",
+        ] {
+            let ast = parse::parse(query).expect("parse failed");
+            let sql = ir::compile(&ast, &make_schema()).map(|ir| emit(&ir).sql).unwrap_or_default();
+            assert!(!sql.contains("FROM () AS"), "{query} emitted an empty row source:\n{sql}");
+        }
+    }
+
+    #[test]
     fn test_delete_returning() {
         let out = compile_and_emit("DELETE Person FILTER .id = $id");
         assert!(out.sql.contains("DELETE FROM \"public\".\"Person\""));

@@ -11879,6 +11879,27 @@ impl<'a> Compiler<'a> {
 
     // ── Expression compilation ────────────────────────────────────────────────────
 
+    /// The operands an aggregate reads when its argument is spelled as a set:
+    /// the elements of a set literal, or the flattened arms of a `union` chain.
+    /// `min({a, b})` and `min((a union b))` mean the same thing and both read
+    /// two values, which is the shape `AggOverSet` wants either way. `None` for
+    /// anything else, leaving the ordinary single-value routes to it.
+    fn set_operands(expr: &Expr) -> Option<Vec<&Expr>> {
+        match expr {
+            // An empty set has no operands to aggregate over, and the row
+            // source it would emit is not valid SQL -- leave it to the arms
+            // that give `{}` its own meaning.
+            Expr::Set(elems) if elems.is_empty() => None,
+            Expr::Set(elems) => Some(elems.iter().collect()),
+            Expr::Union(left, right) => {
+                let mut operands = Self::set_operands(left).unwrap_or_else(|| vec![left.as_ref()]);
+                operands.extend(Self::set_operands(right).unwrap_or_else(|| vec![right.as_ref()]));
+                Some(operands)
+            }
+            _ => None,
+        }
+    }
+
     /// Single expression compiler for both free and schema-bound contexts.
     /// `ctx = Some((td, alias))` when a schema type + SQL alias are in scope
     /// (enables `.property`/`.link` resolution via `compile_path`); `ctx =
@@ -12926,38 +12947,36 @@ impl<'a> Compiler<'a> {
                     }
                 }
 
-                // Set-literal argument → AggOverSet (free-only; a schema-bound
-                // Set argument would already hard-error via the Set/Shape arm
-                // when compiled below, matching today's behavior — this
-                // special case never existed on the schema side).
-                if ctx.is_none() {
-                    let set_arg_idx = f.args.iter().position(|a| matches!(a, Expr::Set(_)));
-                    if let Some(idx) = set_arg_idx
-                        && let Expr::Set(set_elems) = &f.args[idx]
-                    {
-                        use crate::stdlib::{ImplStrategy, lookup};
-                        let ns = f.module.as_deref().unwrap_or("std");
-                        let overloads = lookup(ns, &f.name);
-                        let best = overloads
-                            .iter()
-                            .find(|d| d.params.len() == f.args.len())
-                            .or_else(|| overloads.first());
-                        let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
-                            Some(ImplStrategy::SqlBuiltin(sql_name)) => (None, sql_name.to_string()),
-                            Some(_) => {
-                                return Err(self.type_err(&format!(
-                                    "function '{}::{}' cannot be called with a set literal in this context",
-                                    ns, f.name
-                                )));
-                            }
-                            None => return Err(self.type_err(&format!("function '{}::{}' does not exist", ns, f.name))),
-                        };
-                        let elems = set_elems
-                            .iter()
-                            .map(|e| self.compile_expr_ctx(e, ctx))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
-                    }
+                // A set-valued argument → AggOverSet. Schema-bound as much as
+                // free: an aggregate's argument is a set wherever it is written,
+                // and each operand is compiled with `ctx` so `.started_at` and
+                // the like still resolve. The set/shape arm below used to reject
+                // this outright once a schema was in scope, so `set { x :=
+                // min({cap, .y}) }` failed where the same call at the top level
+                // compiled.
+                if let Some(operands) = f.args.iter().find_map(Self::set_operands) {
+                    use crate::stdlib::{ImplStrategy, lookup};
+                    let ns = f.module.as_deref().unwrap_or("std");
+                    let overloads = lookup(ns, &f.name);
+                    let best = overloads
+                        .iter()
+                        .find(|d| d.params.len() == f.args.len())
+                        .or_else(|| overloads.first());
+                    let (schema, fn_name) = match best.map(|d| &d.impl_strategy) {
+                        Some(ImplStrategy::SqlBuiltin(sql_name)) => (None, sql_name.to_string()),
+                        Some(_) => {
+                            return Err(self.type_err(&format!(
+                                "function '{}::{}' cannot be called with a set literal in this context",
+                                ns, f.name
+                            )));
+                        }
+                        None => return Err(self.type_err(&format!("function '{}::{}' does not exist", ns, f.name))),
+                    };
+                    let elems = operands
+                        .iter()
+                        .map(|e| self.compile_expr_ctx(e, ctx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(IrExpr::AggOverSet { fn_name, schema, elems });
                 }
 
                 // `any(...)`/`all(...)` say outright that the argument is a
