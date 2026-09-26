@@ -13374,8 +13374,27 @@ select owner { posts := (select owner.posts.title) };",
             out.sql
         );
         assert!(
-            out.sql.contains("ORDER BY \"t1\".\"title\""),
+            out.sql.contains("\"title\" ASC"),
             "the ordering belongs to the Post the walk lands on, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// A sub-select's `limit` counts its own rows. Left on the joined result
+    /// it took one row of the walk instead — one promotion of a cart that has
+    /// two, with nothing to say it had dropped any.
+    #[test]
+    fn test_a_walks_head_keeps_its_own_limit() {
+        let out = compile_and_emit("SELECT (SELECT Person FILTER .name = 'x' LIMIT 1).posts { title }");
+        let (head, walk) = out.sql.split_once(")\nSELECT").expect("expected a bound head");
+        assert!(
+            head.contains("LIMIT 1"),
+            "the head keeps its own row count, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !walk.contains("LIMIT"),
+            "the walk keeps every row it reaches, got:\n{}",
             out.sql
         );
     }

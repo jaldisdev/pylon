@@ -2407,6 +2407,54 @@ impl<'a> Compiler<'a> {
     /// path-select. Mirrors `try_compile_global_select`'s filter/modifier
     /// merge, generalized to a field-access result instead of a bare/shape
     /// global reference.
+    /// `(select T filter … limit 1).a.b { … }` compiled as though it were
+    /// written `with head := (select T filter … limit 1) select head.a.b { … }`:
+    /// the head becomes a binding of its own, so its own row count stays on it
+    /// and the walk off it keeps every row it reaches.
+    fn compile_walk_off_bound_head(
+        &mut self,
+        outer: &ast::SelectStmt,
+        inner_sel: &ast::SelectStmt,
+        fields: &[String],
+        trailing_shape: &[ShapeElement],
+    ) -> Result<Option<IrStmt>, PyQLError> {
+        let head = Expr::SubQuery(Box::new(Stmt::Select(inner_sel.clone())));
+        let inner = compile_cte_binding(self, &head)?;
+        let cte_name = self.fresh_nested_cte_name();
+        let overrides = Self::junction_overrides_for(&inner, &cte_name);
+        let type_name = self.register_cte(&cte_name, &inner);
+        self.hoisted_ctes.push(IrCteDef {
+            name: cte_name.clone(),
+            stmt: inner,
+            type_name,
+            correlated_to: None,
+        });
+        let mut steps = vec![ast::PathStep::Name(cte_name)];
+        steps.extend(fields.iter().cloned().map(ast::PathStep::Name));
+        let walk = Expr::Path(ast::Path { steps, partial: false });
+        let result = if trailing_shape.is_empty() {
+            walk
+        } else {
+            Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: Some(walk),
+                elements: trailing_shape.to_vec(),
+                marker_offset: None,
+            }))
+        };
+        let rerooted = ast::SelectStmt {
+            result,
+            filter: outer.filter.clone(),
+            order_by: outer.order_by.clone(),
+            offset: outer.offset.clone(),
+            limit: outer.limit.clone(),
+            lock: outer.lock.clone(),
+        };
+        let previous = std::mem::replace(&mut self.junction_read_overrides, overrides);
+        let ir = self.compile_stmt(&Stmt::Select(rerooted));
+        self.junction_read_overrides = previous;
+        Ok(Some(ir?))
+    }
+
     fn try_compile_field_access_select(
         &mut self,
         outer: &ast::SelectStmt,
@@ -2433,6 +2481,14 @@ impl<'a> Compiler<'a> {
         let Expr::Path(type_path) = &inner_sel.result else {
             return Ok(None);
         };
+        // A sub-select's own `limit`/`offset` counts its rows, not the walk's:
+        // `(select Cart filter .id = $c limit 1).applied_promotions` is every
+        // promotion of that one cart. Spliced onto the walk the count lands on
+        // the result instead and takes one promotion, so the head is bound on
+        // its own and walked from there — the `with` spelling, which scopes it.
+        if inner_sel.limit.is_some() || inner_sel.offset.is_some() {
+            return self.compile_walk_off_bound_head(outer, &inner_sel, &fields, trailing_shape);
+        }
         let mut steps = type_path.steps.clone();
         let field_count = fields.len();
         steps.extend(fields.into_iter().map(ast::PathStep::Name));
