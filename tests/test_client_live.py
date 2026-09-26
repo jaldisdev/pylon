@@ -39,6 +39,7 @@ Run with: `.venv/bin/pytest tests/test_client_live.py -m live_db`
 from __future__ import annotations
 
 import asyncio
+import decimal
 import os
 import types as _types
 
@@ -427,6 +428,74 @@ def test_rollback_discards_the_transactions_writes(live_pool, unique_module):
 
         assert attempts == 1
         assert await client.query(f'select {module}::Widget {{ name }}') == []
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
+def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, unique_module):
+    """Every digit a `Decimal` carries reaches the column and comes back.
+
+    `numeric` is arbitrary precision, and so is the string `DecodedValue::Decimal`
+    carries it as, but the wire codec used to route both through a 96-bit,
+    28-decimal-place carrier. A value that overflowed that came back rescaled by
+    a power of ten rather than rounded or refused: `Decimal(0.0000004)` — 65
+    significant digits, because a float has no exact decimal form — arrived as
+    3.9999999999999998, ten million times over, silently. Sub-cent costs billed
+    from a float are exactly the shape that hits, so the assertion is on the
+    value, not merely on the query succeeding.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_decimal_precision')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    # Each pairs what a caller holds with what it must still be afterwards.
+    # `Decimal(float)` is spelled out rather than computed so the expectation
+    # cannot drift with it.
+    values = [
+        decimal.Decimal(0.0000004),
+        decimal.Decimal('0.00000039999999999999998189924473035450347424557548947632312774658203125'),
+        decimal.Decimal('1.2222222222222222222222222222222E-7'),
+        decimal.Decimal('1.2222222222222222222222222222222E+40'),
+        decimal.Decimal('1E+29'),
+        decimal.Decimal('12.50'),
+        decimal.Decimal('-9999.001'),
+        decimal.Decimal('0'),
+        decimal.Decimal('-0.0000004'),
+    ]
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Cost')
+        class Cost:
+            amount: pylon.Decimal
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        for value in values:
+            # As a parameter, which is the path the encoder is on.
+            assert await client.query_single('select <decimal>$value;', value=value) == value, value
+
+            # And through a real column, so the scale that reached Postgres is
+            # the scale that comes back out of it.
+            written = await client.query_required_single(
+                f'select (insert {module}::Cost {{ amount := <decimal>$value }}) {{ amount }};',
+                value=value,
+            )
+            assert written.amount == value, value
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')

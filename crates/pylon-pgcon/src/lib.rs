@@ -28,6 +28,7 @@
 
 pub mod error;
 pub mod listener;
+pub mod numeric;
 pub mod wire;
 
 pub use error::{Error, Result};
@@ -1210,6 +1211,39 @@ mod tests {
         assert_eq!(
             round_trip(&pool, "numeric", DecodedValue::Decimal("-9999.001".to_string())).await,
             DecodedValue::Decimal("-9999.001".to_string())
+        );
+
+        // Values a fixed 96-bit/28-place carrier cannot hold. Each of these
+        // used to come back scaled by a power of ten, or refuse to serialize,
+        // with `numeric` itself perfectly able to store them. The first is
+        // what Python's `Decimal(0.0000004)` stringifies to.
+        for text in [
+            "0.00000039999999999999998189924473035450347424557548947632312774658203125",
+            "0.00000012222222222222222222222222222222222222222",
+            "12222222222222222222222222222222000000000",
+            "100000000000000000000000000000",
+            "123456789012345678901234567890.123456789012345678901234567890",
+        ] {
+            assert_eq!(
+                round_trip(&pool, "numeric", DecodedValue::Decimal(text.to_string())).await,
+                DecodedValue::Decimal(text.to_string()),
+                "{text}"
+            );
+        }
+
+        // A JSON request body has no decimal type, so a numeric parameter can
+        // arrive as a number or as text — both reach the same encoder.
+        assert_eq!(
+            round_trip(&pool, "numeric", DecodedValue::Str("0.0000004".to_string())).await,
+            DecodedValue::Decimal("0.0000004".to_string())
+        );
+        assert_eq!(
+            round_trip(&pool, "numeric", DecodedValue::I64(-12345)).await,
+            DecodedValue::Decimal("-12345".to_string())
+        );
+        assert_eq!(
+            round_trip(&pool, "numeric", DecodedValue::F64(0.1)).await,
+            DecodedValue::Decimal("0.1".to_string())
         );
     }
 

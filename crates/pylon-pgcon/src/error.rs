@@ -54,9 +54,6 @@ pub enum Error {
     /// being bound as a jsonb parameter failed to serialize.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    /// A `DecodedValue::Decimal`'s string form wasn't a valid decimal.
-    #[error(transparent)]
-    Decimal(#[from] rust_decimal::Error),
     /// A result column came back with a type OID this decoder has no rule
     /// for and that connect-time discovery didn't classify either. Returned
     /// rather than guessed at: the fallback that used to stand in here
@@ -74,9 +71,8 @@ pub enum Error {
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
-// `postgres_types::{FromSql, ToSql}` (used directly for `rust_decimal`
-// numeric decode/encode) are trait-mandated to return this exact boxed
-// type — a direct `From` lets those sites keep using plain `?`.
+// `postgres_types::{FromSql, ToSql}` are trait-mandated to return this exact
+// boxed type — a direct `From` lets those sites keep using plain `?`.
 impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Error::Other(e)

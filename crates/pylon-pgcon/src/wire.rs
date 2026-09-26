@@ -43,7 +43,8 @@
 //! NULL) + `len` bytes.
 
 use pylon_value::DecodedValue;
-use rust_decimal::Decimal;
+
+use crate::numeric;
 
 pub use crate::error::Error;
 pub type Result<T> = crate::Result<T>;
@@ -268,9 +269,7 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Decode
 }
 
 fn decode_numeric(data: &[u8]) -> Result<DecodedValue> {
-    use postgres_types::{FromSql, Type};
-    let decimal = Decimal::from_sql(&Type::NUMERIC, data)?;
-    Ok(DecodedValue::Decimal(decimal.to_string()))
+    Ok(DecodedValue::Decimal(numeric::decode(data)?))
 }
 
 /// PostgreSQL's binary `interval` wire format: `i64 microseconds, i32 days,
@@ -495,7 +494,7 @@ fn decode_array(data: &[u8], ext: &ExtensionOids) -> Result<DecodedValue> {
 // makes this pluggable into `tokio_postgres::Client::query`.
 
 use bytes::BufMut;
-use postgres_types::{IsNull, Kind, ToSql, Type};
+use postgres_types::{IsNull, Kind, Type};
 
 /// Encodes `value` as `ty`'s binary wire format into `out`. `ty` comes from
 /// `Statement::params()[i]` — Postgres's own analysis of the prepared SQL,
@@ -520,18 +519,17 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
     // as a corrupt header — "invalid sign in external representation" for
     // I64/F64 (garbage sign field), "insufficient data left in message" for
     // Str (too few bytes for the header). Route every numeric-ish variant
-    // through the same `rust_decimal` encoding the `Decimal` arm below uses.
+    // through the same `numeric` encoding the `Decimal` arm below uses.
     if *ty == Type::NUMERIC {
-        let decimal: Decimal = match value {
-            DecodedValue::Decimal(s) => s.parse()?,
-            DecodedValue::Str(s) => s.parse()?,
-            DecodedValue::I64(i) => Decimal::from(*i),
-            DecodedValue::F64(f) => {
-                Decimal::try_from(*f).map_err(|e| Error::message(format!("invalid decimal value: {e}")))?
-            }
+        let text = match value {
+            DecodedValue::Decimal(s) | DecodedValue::Str(s) => s.clone(),
+            DecodedValue::I64(i) => i.to_string(),
+            // `{f}` is the shortest form that reads back as the same f64, so
+            // 0.1 binds as `0.1` rather than the full binary expansion.
+            DecodedValue::F64(f) => format!("{f}"),
             _ => return Err(Error::message("cannot bind this value as a numeric parameter")),
         };
-        decimal.to_sql(&Type::NUMERIC, out)?;
+        numeric::encode(&text, out)?;
         return Ok(IsNull::No);
     }
     match value {
@@ -580,10 +578,7 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
         }
         DecodedValue::Bytes(b) => out.put_slice(b),
         DecodedValue::Uuid(bytes) => out.put_slice(bytes),
-        DecodedValue::Decimal(s) => {
-            let decimal: Decimal = s.parse()?;
-            decimal.to_sql(&Type::NUMERIC, out)?;
-        }
+        DecodedValue::Decimal(s) => numeric::encode(s, out)?,
         DecodedValue::Array(items) if ty.name() == "vector" => {
             // `$n::vector` casts the parameter directly (unlike
             // `vector::search`'s `$n::float8[]::vector`, where the *inner*
