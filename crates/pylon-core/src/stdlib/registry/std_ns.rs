@@ -1430,6 +1430,186 @@ END"#,
         f("std", "to_decimal", vec![p("n", Int64)], Decimal, E("$1::numeric")),
         fc("std", "to_bigint", vec![p("s", Str)], BigInt, E("$1::numeric")),
         f("std", "to_bigint", vec![p("n", Int64)], BigInt, E("$1::numeric")),
+        // The `fmt` form of each numeric parser. Left out, the string parses
+        // the way a cast parses it; an empty format is refused rather than
+        // taken to mean "no format", which is what `to_number` would do with
+        // it; and a format that matches nothing names itself instead of
+        // yielding an empty set.
+        f(
+            "std",
+            "to_int16",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            Int16,
+            plpgsql_nullable(
+                "to_int16",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::int2;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_int16(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_int16(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::int2;
+END"#,
+            ),
+        ),
+        f(
+            "std",
+            "to_int32",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            Int32,
+            plpgsql_nullable(
+                "to_int32",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::int4;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_int32(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_int32(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::int4;
+END"#,
+            ),
+        ),
+        f(
+            "std",
+            "to_int64",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            Int64,
+            plpgsql_nullable(
+                "to_int64",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::int8;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_int64(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_int64(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::int8;
+END"#,
+            ),
+        ),
+        f(
+            "std",
+            "to_float32",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            Float32,
+            plpgsql_nullable(
+                "to_float32",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::float4;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_float32(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_float32(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::float4;
+END"#,
+            ),
+        ),
+        f(
+            "std",
+            "to_float64",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            Float64,
+            plpgsql_nullable(
+                "to_float64",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::float8;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_float64(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_float64(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::float8;
+END"#,
+            ),
+        ),
+        f(
+            "std",
+            "to_decimal",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            Decimal,
+            plpgsql_nullable(
+                "to_decimal",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::numeric;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_decimal(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_decimal(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::numeric;
+END"#,
+            ),
+        ),
+        f(
+            "std",
+            "to_bigint",
+            vec![p("s", Str), p("fmt", opt(Str))],
+            BigInt,
+            plpgsql_nullable(
+                "to_bigint",
+                r#"DECLARE parsed numeric;
+BEGIN
+    IF $2 IS NULL THEN
+        RETURN $1::numeric;
+    END IF;
+    IF $2 = '' THEN
+        RAISE EXCEPTION 'to_bigint(): "fmt" argument must be a non-empty string'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    parsed := to_number($1, $2);
+    IF parsed IS NULL THEN
+        RAISE EXCEPTION 'to_bigint(): format % is invalid', quote_literal($2)
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    RETURN parsed::numeric;
+END"#,
+            ),
+        ),
         fc("std", "to_bool", vec![p("s", Str)], Bool, E("$1::bool")),
         // int → bool: PG has no native int::bool; _pylon.to_bool maps 0 → false, else true.
         fc(
