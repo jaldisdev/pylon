@@ -519,3 +519,15 @@ async fn array_join_concatenates_bytes_with_a_delimiter() {
         DecodedValue::Bytes(b"axb".to_vec())
     );
 }
+
+/// The digit count is an `int4` in PostgreSQL, which an `int64` argument only
+/// reaches through a cast.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn round_takes_its_digit_count_from_a_wider_integer() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "round(<decimal>'1.2345', <int64>2)").await,
+        DecodedValue::Decimal("1.23".to_string())
+    );
+}

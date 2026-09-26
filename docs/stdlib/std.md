@@ -61,7 +61,7 @@ select re_test('^[A-Z]', .name)
 |---|---|---|---|
 | `abs` | `(n: int16\|int32\|int64\|float32\|float64\|decimal)` | same type | Absolute value. |
 | `ceil` / `floor` | `(n: float64\|decimal)` | same type | Round toward +∞ / -∞. |
-| `round` | `(n: float64\|decimal [, d: int64])` | same type | Round to the nearest integer, or to `d` decimal places. |
+| `round` | `(n: float64\|decimal)` / `(n: decimal, d: int64)` | same type | Round to the nearest integer, or a decimal to `d` decimal places. |
 | `sign` | `(n: int64\|float64\|decimal)` | same type | `-1`, `0`, or `1`. |
 | `sqrt` | `(n: float64\|decimal)` | same type | Square root. |
 | `random` | `()` | `float64` | Uniform random value in `[0, 1)`. |

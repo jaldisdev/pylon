@@ -403,20 +403,16 @@ END"#,
         f("std", "floor", vec![p("n", Float64)], Float64, B("floor")),
         f("std", "floor", vec![p("n", Decimal)], Decimal, B("floor")),
         f("std", "round", vec![p("n", Float64)], Float64, B("round")),
-        f(
-            "std",
-            "round",
-            vec![p("n", Float64), p("d", Int64)],
-            Float64,
-            E("round($1, $2)"),
-        ),
         f("std", "round", vec![p("n", Decimal)], Decimal, B("round")),
+        // Rounding to a number of digits is numeric-only in PostgreSQL —
+        // `round(float8, int)` does not exist — and the digit count is an
+        // `int4` there, which an `int64` argument does not reach on its own.
         f(
             "std",
             "round",
             vec![p("n", Decimal), p("d", Int64)],
             Decimal,
-            E("round($1, $2)"),
+            E("round($1, ($2)::int)"),
         ),
         f("std", "sign", vec![p("n", Int64)], Int64, B("sign")),
         f("std", "sign", vec![p("n", Float64)], Float64, B("sign")),
