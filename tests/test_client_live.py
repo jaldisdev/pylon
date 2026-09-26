@@ -572,3 +572,53 @@ def test_several_statements_written_together_run_from_every_entry_point(live_poo
 
     asyncio.run(run())
 
+
+def test_a_string_for_a_non_text_parameter_is_refused_without_losing_the_transaction(live_pool, unique_module):
+    """A wrong-typed argument is the client's to reject, not the server's.
+
+    The raw UTF-8 used to be written into whatever binary slot the parameter
+    had, so Postgres answered "insufficient data left in message" -- from the
+    server, which aborted the open transaction along with it, turning one bad
+    argument into the loss of everything the block had done.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.exceptions import Rollback
+
+    module = unique_module('live_wrong_param_type')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Widget')
+        class Widget:
+            name: str
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        async for tx in client.transaction():
+            async with tx:
+                await tx.execute(f"insert {module}::Widget {{ name := 'kept' }}")
+                with pytest.raises(Exception) as refused:
+                    await tx.query_single(
+                        'select <int32>(duration_to_seconds(<duration>$span) * 1000);', span='25 days'
+                    )
+                assert 'interval' in str(refused.value), refused.value
+                # The write before it is still there, so the transaction was
+                # never aborted by the refusal.
+                assert len(await tx.query(f'select {module}::Widget {{ name }}')) == 1
+                raise Rollback
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())

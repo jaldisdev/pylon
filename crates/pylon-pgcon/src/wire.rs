@@ -496,6 +496,26 @@ fn decode_array(data: &[u8], ext: &ExtensionOids) -> Result<DecodedValue> {
 use bytes::BufMut;
 use postgres_types::{IsNull, Kind, Type};
 
+/// Whether a string's own bytes are `ty`'s binary wire format.
+///
+/// True for the text-like types and for anything Postgres transmits as text:
+/// an enum travels as its label (which is what `decode_value` reads back), and
+/// `json` -- unlike `jsonb`, which carries a version byte first -- is its
+/// document verbatim. `uuid`, `jsonb` and `numeric` accept a string too, but by
+/// conversion rather than by copying, so they are handled at their own arms.
+/// `bytea` is here because a string bound to it has always meant those bytes.
+fn accepts_text_bytes(ty: &Type) -> bool {
+    match ty.kind() {
+        Kind::Enum(_) => true,
+        // A domain is a constrained alias, so it takes whatever its base does.
+        Kind::Domain(base) => accepts_text_bytes(base),
+        _ => matches!(
+            *ty,
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::JSON | Type::BYTEA | Type::UNKNOWN
+        ),
+    }
+}
+
 /// Encodes `value` as `ty`'s binary wire format into `out`. `ty` comes from
 /// `Statement::params()[i]` — Postgres's own analysis of the prepared SQL,
 /// not a guess — so this only needs to pick the right byte width/shape for
@@ -572,8 +592,20 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
                 // framing, which Postgres would reject.
                 out.put_u8(1);
                 out.put_slice(s.as_bytes());
-            } else {
+            } else if accepts_text_bytes(ty) {
                 out.put_slice(s.as_bytes());
+            } else {
+                // Without this the raw UTF-8 went into a binary-format slot of
+                // whatever type the parameter actually has, and Postgres reported
+                // its own reading of the bytes -- "insufficient data left in
+                // message" for an int8 or interval, "incorrect binary data
+                // format" for a bool or timestamptz. That came from the server,
+                // so it also left an open transaction aborted; refusing here
+                // names the type that was wanted and sends nothing.
+                return Err(Error::message(format!(
+                    "cannot bind a string as a parameter of type {:?}",
+                    ty.name()
+                )));
             }
         }
         DecodedValue::Bytes(b) => out.put_slice(b),
@@ -1212,6 +1244,55 @@ mod tests {
             decode_value(OID_NUMERIC, &data, &no_ext()).unwrap(),
             DecodedValue::Decimal("-12.50".to_string())
         );
+    }
+
+    #[test]
+    fn refuses_a_string_for_a_parameter_whose_binary_form_is_not_text() {
+        // The raw UTF-8 used to go straight into the binary slot, leaving
+        // Postgres to report its own reading of the bytes -- and aborting the
+        // caller's transaction, because the complaint came from the server.
+        for ty in [Type::INT8, Type::INT4, Type::BOOL, Type::INTERVAL, Type::TIMESTAMPTZ, Type::DATE] {
+            let mut buffer = bytes::BytesMut::new();
+            let Err(err) = encode_value(&DecodedValue::Str("25 days".into()), &ty, &mut buffer) else {
+                panic!("{} must refuse a string", ty.name());
+            };
+            assert!(
+                err.to_string().contains(ty.name()),
+                "the message must name the type that was wanted: {err}"
+            );
+            assert!(buffer.is_empty(), "nothing may be written for a refused parameter");
+        }
+    }
+
+    #[test]
+    fn a_string_still_reaches_the_types_it_is_the_wire_form_of() {
+        for ty in [Type::TEXT, Type::VARCHAR, Type::BPCHAR, Type::NAME, Type::JSON, Type::BYTEA, Type::UNKNOWN] {
+            let mut buffer = bytes::BytesMut::new();
+            encode_value(&DecodedValue::Str("hello".into()), &ty, &mut buffer)
+                .unwrap_or_else(|e| panic!("{} must take a string: {e}", ty.name()));
+            assert_eq!(&buffer[..], b"hello", "{}", ty.name());
+        }
+    }
+
+    #[test]
+    fn a_string_still_converts_for_uuid_jsonb_and_numeric() {
+        let mut buffer = bytes::BytesMut::new();
+        encode_value(
+            &DecodedValue::Str("00000000-0000-0000-0000-000000000001".into()),
+            &Type::UUID,
+            &mut buffer,
+        )
+        .expect("uuid takes a string");
+        assert_eq!(buffer.len(), 16, "a uuid is converted, not copied");
+
+        let mut buffer = bytes::BytesMut::new();
+        encode_value(&DecodedValue::Str(r#"{"a":1}"#.into()), &Type::JSONB, &mut buffer).expect("jsonb takes a string");
+        assert_eq!(buffer[0], 1, "jsonb needs its version byte");
+
+        let mut buffer = bytes::BytesMut::new();
+        encode_value(&DecodedValue::Str("12.50".into()), &Type::NUMERIC, &mut buffer)
+            .expect("numeric takes a string");
+        assert_eq!(numeric::decode(&buffer).unwrap(), "12.50");
     }
 
     #[test]

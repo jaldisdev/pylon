@@ -83,10 +83,24 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
 /// back to its own `Display` for a client-side failure (connection reset,
 /// encoding, ...) which has no `DbError` behind it.
 fn db_error_message(err: &tokio_postgres::Error) -> String {
-    match err.as_db_error() {
-        Some(db) => db.message().to_string(),
-        None => err.to_string(),
+    if let Some(db) = err.as_db_error() {
+        return db.message().to_string();
     }
+    // A client-side failure's own `Display` is only a summary -- "error
+    // serializing parameter 0" -- and what actually went wrong sits in its
+    // source. Walk the chain so a parameter the encoder refused reports the
+    // type it could not be bound as, rather than just its position.
+    let mut message = err.to_string();
+    let mut cause = std::error::Error::source(err);
+    while let Some(next) = cause {
+        let reason = next.to_string();
+        if !message.contains(&reason) {
+            message.push_str(": ");
+            message.push_str(&reason);
+        }
+        cause = next.source();
+    }
+    message
 }
 
 /// Same, for a pool error whose backend failure is a `tokio_postgres::Error`.
