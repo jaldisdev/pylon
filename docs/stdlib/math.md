@@ -6,7 +6,7 @@
 | `e` | `()` | `float64` | Euler's number. |
 | `exp` | `(n: float64)` | `float64` | e^n. |
 | `ln` | `(n: float64)` / `(n: decimal)` | same type | Natural logarithm. |
-| `log` | `(n: float64 [, base: float64])` | `float64` | Base-10 logarithm (1-arg), or logarithm to an arbitrary `base` (2-arg). |
+| `log` | `(n: float64)` / `(n: decimal, *, base: decimal)` | same type | Base-10 logarithm, or the logarithm to an arbitrary `base` — which PostgreSQL computes for a decimal only. |
 | `log2` | `(n: float64)` | `float64` | Base-2 logarithm. |
 | `log10` | `(n: float64)` | `float64` | Base-10 logarithm — the preferred spelling; `lg` (below) is a thin alias kept for familiarity. |
 | `lg` | `(n: int64\|float64\|decimal)` | matching float/decimal type | Base-10 logarithm — alias for `log10`, but overloaded across more input types. |

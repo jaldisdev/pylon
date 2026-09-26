@@ -456,6 +456,16 @@ async fn base64_decoding_reverses_every_alphabet_and_padding_pair() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_logarithm_takes_its_base_by_name() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "math::log(<decimal>100, base := <decimal>10)").await,
+        DecodedValue::Decimal("2.0000000000000000".to_string())
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
 async fn array_join_concatenates_bytes_with_a_delimiter() {
     let pool = stdlib_pool().await;
     assert_eq!(

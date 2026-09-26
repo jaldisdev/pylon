@@ -17,7 +17,7 @@
 // limitations under the License.
 //
 
-use super::{B, E, f, p, set_of};
+use super::{B, E, NamedDefault, f, p, pn, set_of};
 use super::{Decimal, Float64, FnDescriptor, Int64};
 
 pub(super) fn build() -> Vec<FnDescriptor> {
@@ -28,12 +28,13 @@ pub(super) fn build() -> Vec<FnDescriptor> {
         f("math", "ln", vec![p("n", Float64)], Float64, B("ln")),
         f("math", "ln", vec![p("n", Decimal)], Decimal, B("ln")),
         f("math", "log", vec![p("n", Float64)], Float64, B("log")),
-        // Two-arg form: PyQL log(n, base) → PG log(base, n) — arguments are swapped.
+        // `log(base, x)` in PostgreSQL — the arguments are swapped — and it is
+        // numeric-only, which is why the base has no float64 form.
         f(
             "math",
             "log",
-            vec![p("n", Float64), p("base", Float64)],
-            Float64,
+            vec![p("n", Decimal), pn("base", Decimal, NamedDefault::Required)],
+            Decimal,
             E("log($2, $1)"),
         ),
         f("math", "log2", vec![p("n", Float64)], Float64, E("log(2.0, $1)")),

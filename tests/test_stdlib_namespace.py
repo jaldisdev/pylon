@@ -153,6 +153,12 @@ class TestNamespaceCalls:
         text, _ = render_expr(std.json_set(_path('data'), 'a', value=_path('other')))
         assert text == 'std::json_set(.data, $__mq_p0, value := .other)'
 
+    def test_an_overload_without_the_named_parameter_still_takes_the_call(self):
+        # `math::log(n)` is its own overload; only the two-argument form needs
+        # a base, so the requirement must not leak onto the one-argument one.
+        text, _ = render_expr(math.log(_path('score')))
+        assert text == 'math::log(.score)'
+
     def test_variadic_and_named_arguments_combine(self):
         text, params = render_expr(std.json_get(_path('data'), 'a', 'b', default=1))
         assert text == 'std::json_get(.data, $__mq_p0, $__mq_p1, default := $__mq_p2)'
