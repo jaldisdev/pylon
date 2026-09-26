@@ -549,3 +549,40 @@ async fn round_takes_its_digit_count_from_a_wider_integer() {
         DecodedValue::Decimal("1.23".to_string())
     );
 }
+
+/// Months and days, and nothing below a day.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_date_duration_carries_months_and_days() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "cal::to_date_duration(years := 1, months := 2, days := 3)").await,
+        DecodedValue::Interval {
+            months: 14,
+            days: 3,
+            microseconds: 0
+        }
+    );
+    assert_eq!(
+        eval_scalar(&pool, "cal::to_date_duration(days := 3)").await,
+        DecodedValue::Interval {
+            months: 0,
+            days: 3,
+            microseconds: 0
+        }
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_date_duration_normalizes_its_days_into_months() {
+    let pool = stdlib_pool().await;
+    assert_eq!(
+        eval_scalar(&pool, "cal::duration_normalize_days(cal::to_date_duration(days := 65))").await,
+        DecodedValue::Interval {
+            months: 2,
+            days: 5,
+            microseconds: 0
+        }
+    );
+}

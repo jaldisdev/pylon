@@ -21,9 +21,9 @@ use super::{FnDescriptor, FnVolatility, ImplStrategy, NamedDefault, Param, Pylon
 
 use ImplStrategy::{SqlBuiltin as B, SqlExpression as E, SqlOperator as O, TranspilerIntrinsic as I};
 use PylonType::{
-    Any, AnyOrderable, AnyPoint, Array, BigInt, Bool, Box2D, Box3D, Bytes, Datetime, Decimal, Duration, Float32,
-    Float64, Geography, Geometry, Int16, Int32, Int64, Json, LocalDate, LocalDatetime, LocalTime, Multirange, Optional,
-    Range, RelativeDuration, Set, Str, Tuple, Uuid, Vector,
+    Any, AnyOrderable, AnyPoint, Array, BigInt, Bool, Box2D, Box3D, Bytes, DateDuration, Datetime, Decimal, Duration,
+    Float32, Float64, Geography, Geometry, Int16, Int32, Int64, Json, LocalDate, LocalDatetime, LocalTime, Multirange,
+    Optional, Range, RelativeDuration, Set, Str, Tuple, Uuid, Vector,
 };
 
 mod cal_ns;

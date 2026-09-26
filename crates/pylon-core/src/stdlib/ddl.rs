@@ -36,7 +36,7 @@ fn pg_type(ty: &PylonType) -> String {
         Json => "jsonb".into(),
         Bytes => "bytea".into(),
         Datetime => "timestamptz".into(),
-        Duration | RelativeDuration => "interval".into(),
+        Duration | RelativeDuration | DateDuration => "interval".into(),
         LocalDatetime => "timestamp".into(),
         LocalDate => "date".into(),
         LocalTime => "time".into(),

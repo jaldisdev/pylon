@@ -48,6 +48,11 @@ pub enum PylonType {
     LocalDate,
     LocalTime,
     RelativeDuration,
+    /// Months and days only — the calendar-relative duration that a date
+    /// arithmetic yields. `interval` like the other two, and so not told
+    /// apart from them by a value's PostgreSQL type; what it names is the
+    /// part of the stdlib that is about dates rather than about clocks.
+    DateDuration,
     // pgvector:: types
     Vector,
     // postgis:: types
@@ -86,7 +91,7 @@ impl PylonType {
             Json => "jsonb",
             Bytes => "bytea",
             Datetime => "timestamptz",
-            Duration | RelativeDuration => "interval",
+            Duration | RelativeDuration | DateDuration => "interval",
             LocalDatetime => "timestamp",
             LocalDate => "date",
             LocalTime => "time",
@@ -118,6 +123,7 @@ impl PylonType {
             LocalDate => "cal::local_date".into(),
             LocalTime => "cal::local_time".into(),
             RelativeDuration => "cal::relative_duration".into(),
+            DateDuration => "cal::date_duration".into(),
             Vector => "pgvector::vector".into(),
             Geometry => "postgis::geometry".into(),
             Geography => "postgis::geography".into(),

@@ -17,7 +17,9 @@
 // limitations under the License.
 //
 
-use super::{Datetime, Float64, FnDescriptor, Int64, LocalDate, LocalDatetime, LocalTime, RelativeDuration, Str};
+use super::{
+    DateDuration, Datetime, Float64, FnDescriptor, Int64, LocalDate, LocalDatetime, LocalTime, RelativeDuration, Str,
+};
 use super::{E, NamedDefault, f, opt, p, plpgsql, plpgsql_nullable, pn, sql};
 
 pub(super) fn build() -> Vec<FnDescriptor> {
@@ -278,9 +280,9 @@ END"#,
                mins => $5::int, secs => $6) + make_interval(secs => $7 / 1000000.0))",
             ),
         ),
-        // `cal::date_duration` is `interval` as well, so this returns the same
-        // PostgreSQL type as `to_relative_duration` — what separates them is
-        // that the units below a day cannot be given here.
+        // Months and days only — the units below a day have no spelling here,
+        // which is the whole of what separates a date duration from a relative
+        // one. Both travel as `interval`.
         f(
             "cal",
             "to_date_duration",
@@ -289,7 +291,7 @@ END"#,
                 pn("months", Int64, NamedDefault::Int(0)),
                 pn("days", Int64, NamedDefault::Int(0)),
             ],
-            RelativeDuration,
+            DateDuration,
             E("make_interval(years => $1::int, months => $2::int, days => $3::int)"),
         ),
         f(
