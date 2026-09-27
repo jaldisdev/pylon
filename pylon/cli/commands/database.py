@@ -55,9 +55,6 @@ def _pg_env(db) -> dict[str, str]:
     return env
 
 
-_SYSTEM_SCHEMAS = frozenset({'information_schema', 'public', '_pylon'})
-
-
 async def _user_schemas(pool) -> list[str]:
     return await pool.query(
         """
@@ -69,6 +66,112 @@ async def _user_schemas(pool) -> list[str]:
         """,
         [],
     )
+
+
+async def _public_drops(pool) -> list[str]:
+    """DROP statements for the `default` module's contents.
+
+    Object by object rather than `DROP SCHEMA public`: `public` also holds
+    whatever `CREATE EXTENSION` put there, plus grants belonging to the
+    database itself.
+    """
+    return await pool.query(
+        """
+        SELECT (stmt) AS result
+        FROM (
+            -- A partition, and a sequence owned by an identity column, go
+            -- with their parent table ('a'/'i'); 'e' is extension-owned.
+            SELECT 1 AS phase, c.relname AS name, format(
+                'DROP %s IF EXISTS %s CASCADE;',
+                CASE c.relkind
+                    WHEN 'v' THEN 'VIEW'
+                    WHEN 'm' THEN 'MATERIALIZED VIEW'
+                    WHEN 'S' THEN 'SEQUENCE'
+                    WHEN 'f' THEN 'FOREIGN TABLE'
+                    ELSE 'TABLE'
+                END,
+                format('%I.%I', n.nspname, c.relname)
+            ) AS stmt
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+              AND NOT c.relispartition
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.objid = c.oid
+                    AND d.classid = 'pg_class'::regclass
+                    AND d.objsubid = 0
+                    AND d.deptype IN ('e', 'a', 'i')
+              )
+
+            UNION ALL
+
+            SELECT 2, p.proname, format(
+                'DROP %s IF EXISTS %s CASCADE;',
+                CASE p.prokind
+                    WHEN 'p' THEN 'PROCEDURE'
+                    WHEN 'a' THEN 'AGGREGATE'
+                    ELSE 'FUNCTION'
+                END,
+                format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+            )
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.objid = p.oid
+                    AND d.classid = 'pg_proc'::regclass
+                    AND d.deptype = 'e'
+              )
+
+            UNION ALL
+
+            -- An array type, a multirange and a table's row type are not
+            -- independent objects, so they are skipped.
+            SELECT 3, t.typname, format(
+                'DROP %s IF EXISTS %s CASCADE;',
+                CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+                format('%I.%I', n.nspname, t.typname)
+            )
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = 'public'
+              AND t.typtype IN ('e', 'd', 'r', 'c')
+              AND (
+                  t.typrelid = 0
+                  OR (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c'
+              )
+              AND NOT EXISTS (SELECT 1 FROM pg_type el WHERE el.typarray = t.oid)
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.objid = t.oid
+                    AND d.classid = 'pg_type'::regclass
+                    AND d.deptype IN ('e', 'i')
+              )
+        ) AS drops
+        ORDER BY phase, name
+        """,
+        [],
+    )
+
+
+_INTERNAL_TABLES = ('Migrations', 'Progress', 'Schema', 'IndexOutbox', 'SignalOutbox')
+
+
+async def _internal_tables(pool) -> list[str]:
+    """Which of `_INTERNAL_TABLES` this database actually has."""
+    present = await pool.query(
+        """
+        SELECT (c.relname) AS result
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '_pylon' AND c.relkind = 'r'
+        """,
+        [],
+    )
+    return [name for name in _INTERNAL_TABLES if name in present]
 
 
 # ── initialize ─────────────────────────────────────────────────────────────────
@@ -195,8 +298,8 @@ def restore(ctx: click.Context, file: str) -> None:
 def wipe(ctx: click.Context, force: bool) -> None:
     """Destroy all database contents.
 
-    Drops all user-defined modules and clears migration history.
-    The database itself is NOT dropped.
+    Drops every module (including default), clears migration history and the
+    stored schema. Leaves extension objects and the database itself.
     """
     db = ctx.obj['config'].database
     dbname = db.name or 'pylon'
@@ -212,18 +315,13 @@ def wipe(ctx: click.Context, force: bool) -> None:
 
         pool = await pgcon_connect(_pg_dsn(db), 2)
         schemas = await _user_schemas(pool)
-        # `to_regclass` alone comes back as `regclass`, which has no decoder;
-        # the only thing wanted here is whether the table is there.
-        tracking_rows = await pool.query('SELECT (to_regclass(\'_pylon."Migrations"\') IS NOT NULL) AS result', [])
-        has_tracking = bool(tracking_rows[0]) if tracking_rows else False
 
         # One `batch_execute` call — Postgres's simple query protocol wraps
         # the whole multi-statement blob in an implicit transaction, same
         # atomicity as the old explicit `async with conn.transaction():`.
         statements = [f'DROP SCHEMA "{schema}" CASCADE;' for schema in schemas]
-        if has_tracking:
-            statements.append('DELETE FROM _pylon."Migrations";')
-            statements.append('DELETE FROM _pylon."Progress";')
+        statements.extend(await _public_drops(pool))
+        statements.extend(f'DELETE FROM _pylon."{table}";' for table in await _internal_tables(pool))
         if statements:
             await pool.batch_execute('\n'.join(statements))
 

@@ -167,7 +167,9 @@ Wraps `pg_restore` (for a `custom`-format dump) or `psql` (for a `.sql` file) â€
 
 ### `pylon database wipe`
 
-Drops every user-defined module (as a Postgres schema, `CASCADE`) and clears the migration tracking table. **Does not** drop the database itself.
+Drops every module and clears the migration tracking tables and the stored schema. **Does not** drop the database itself, and leaves objects owned by an installed extension alone.
+
+Modules other than `default` are dropped as Postgres schemas (`CASCADE`); `default` lives in `public`, which is shared, so its objects are dropped individually.
 
 | Flag | Description |
 |---|---|
