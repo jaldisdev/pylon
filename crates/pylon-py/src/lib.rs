@@ -2653,6 +2653,8 @@ fn construct_pylon_error(
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
 
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
     // Exceptions
     m.add("PylonCacheError", PylonCacheError::type_object(py))?;
     m.add("PylonPgconError", PylonPgconError::type_object(py))?;

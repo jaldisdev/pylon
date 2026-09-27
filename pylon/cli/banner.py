@@ -44,7 +44,7 @@ def print_banner(*, info_line: str | None = None) -> None:
     try:
         from importlib.metadata import version as _version
 
-        v = _version('pylon')
+        v = _version('pylon-db')
     except Exception:
         v = '(development)'
 

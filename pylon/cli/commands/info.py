@@ -40,7 +40,7 @@ def info_cmd(ctx: click.Context) -> None:
     try:
         from importlib.metadata import version as _version
 
-        pylon_version = _version('pylon')
+        pylon_version = _version('pylon-db')
     except Exception:
         pylon_version = '(development)'
 
