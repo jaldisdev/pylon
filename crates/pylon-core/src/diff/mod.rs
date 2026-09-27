@@ -1103,6 +1103,11 @@ impl StepBuilder {
         }
     }
 
+    /// Where a key's step currently sits in render order, if it has one yet.
+    fn position(&self, key: &OpKey) -> Option<usize> {
+        self.order.iter().position(|existing| existing == key)
+    }
+
     fn finish(self) -> Vec<MigrationStep> {
         let Self { order, mut drafts } = self;
         order
@@ -2671,8 +2676,6 @@ fn diff_inner(
         // `expected_triggers`'s own doc comment for why this must be one
         // shared computation, not two).
         let expected_trigger_map = expected_triggers(target, &type_map);
-        // Track which trigger functions have been emitted in this diff pass.
-        let mut fn_emitted: HashSet<String> = HashSet::new();
 
         // A physical table's (module, name) -> the type whose step its
         // trigger changes should fold into. Concrete tables own themselves;
@@ -2714,27 +2717,64 @@ fn diff_inner(
             )
         };
 
-        for info in &infos {
-            let cur = cur_trigger_map
-                .get(&(info.impl_module.as_str(), info.impl_table.as_str()))
-                .cloned()
-                .unwrap_or_default();
-            let need_ins = !cur.contains(info.ins_trigger_name.as_str());
-            let need_upd = !cur.contains(info.upd_trigger_name.as_str());
-            if need_ins || need_upd {
-                let mut local: Vec<DiffOp> = Vec::new();
-                if fn_emitted.insert(info.fn_name.clone()) {
-                    push_tx(&mut local, info.fn_ddl.clone());
-                }
-                if need_ins {
-                    push_tx(&mut local, info.ins_ddl.clone());
-                }
-                if need_upd {
-                    push_tx(&mut local, info.upd_ddl.clone());
-                }
-                let (key, verb, desc) = owner_of(&info.impl_module, &info.impl_table);
-                steps.extend(key, verb, desc, local);
+        struct PendingExclTrigger<'a> {
+            info: &'a crate::export::ExclTriggerInfo,
+            need_ins: bool,
+            need_upd: bool,
+            owner: (OpKey, Verb, String),
+        }
+
+        let pending: Vec<PendingExclTrigger<'_>> = infos
+            .iter()
+            .filter_map(|info| {
+                let cur = cur_trigger_map
+                    .get(&(info.impl_module.as_str(), info.impl_table.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                let need_ins = !cur.contains(info.ins_trigger_name.as_str());
+                let need_upd = !cur.contains(info.upd_trigger_name.as_str());
+                (need_ins || need_upd).then(|| PendingExclTrigger {
+                    info,
+                    need_ins,
+                    need_upd,
+                    owner: owner_of(&info.impl_module, &info.impl_table),
+                })
+            })
+            .collect();
+
+        // One guard function is shared by every implementor of the interface,
+        // so it is emitted with a single implementor's step — and that has to
+        // be whichever of them renders *first*, or the others' triggers name a
+        // function that does not exist yet. Steps render in the order their
+        // keys were inserted, so an implementor whose table was created
+        // earlier in the topological order already sits ahead here; one whose
+        // step does not exist yet can only be inserted by this phase, in
+        // `pending` order.
+        let mut fn_carrier: HashMap<String, usize> = HashMap::new();
+        for (index, entry) in pending.iter().enumerate() {
+            let position = steps.position(&entry.owner.0).unwrap_or(usize::MAX);
+            let beats_carrier = match fn_carrier.get(&entry.info.fn_name) {
+                Some(&carrier) => position < steps.position(&pending[carrier].owner.0).unwrap_or(usize::MAX),
+                None => true,
+            };
+            if beats_carrier {
+                fn_carrier.insert(entry.info.fn_name.clone(), index);
             }
+        }
+
+        for (index, entry) in pending.into_iter().enumerate() {
+            let mut local: Vec<DiffOp> = Vec::new();
+            if fn_carrier.get(&entry.info.fn_name) == Some(&index) {
+                push_tx(&mut local, entry.info.fn_ddl.clone());
+            }
+            if entry.need_ins {
+                push_tx(&mut local, entry.info.ins_ddl.clone());
+            }
+            if entry.need_upd {
+                push_tx(&mut local, entry.info.upd_ddl.clone());
+            }
+            let (key, verb, desc) = entry.owner;
+            steps.extend(key, verb, desc, local);
         }
 
         // Deletion-policy triggers (single-link Source-side DeleteTarget/
@@ -5466,6 +5506,53 @@ mod tests {
         assert!(
             !joined.contains("ON \"public\".\"Individual\""),
             "the already-migrated implementor's existing triggers must not be re-emitted; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_the_shared_exclusive_guard_function_precedes_every_implementors_trigger() {
+        // One guard function serves every implementor, so it is emitted with
+        // a single one of them -- and that has to be whichever implementor's
+        // step renders first. `Individual` is declared first but links to
+        // `Organization`, so topological order creates `Organization`'s table
+        // (and its trigger) ahead of it.
+        let mut schema = exclusive_email_account_schema(&["Individual", "Organization"]);
+        let individual = schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Individual")
+            .expect("Individual is in the schema");
+        individual.links.push(LinkDescriptor {
+            name: "employer".into(),
+            target: "default::Organization".into(),
+            nullable: false,
+            through: None,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        });
+
+        let ops = diff_schema_ops(&schema, &DbState::default()).unwrap();
+        let joined = ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n");
+        let function_pos = joined
+            .find("CREATE OR REPLACE FUNCTION \"public\".\"_excl_Account_email\"")
+            .unwrap_or_else(|| panic!("missing the guard function; got:\n{joined}"));
+        let first_trigger_pos = joined
+            .find("CREATE CONSTRAINT TRIGGER \"_excl_Account_email_ins\"")
+            .unwrap_or_else(|| panic!("missing the exclusive triggers; got:\n{joined}"));
+        assert!(
+            function_pos < first_trigger_pos,
+            "the guard function must be defined before the first trigger naming it; got:\n{joined}"
+        );
+        assert_eq!(
+            joined
+                .matches("CREATE OR REPLACE FUNCTION \"public\".\"_excl_Account_email\"")
+                .count(),
+            1,
+            "the guard function must be emitted exactly once; got:\n{joined}"
         );
     }
 
