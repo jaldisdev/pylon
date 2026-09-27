@@ -5,12 +5,12 @@ This walks through installing Pylon, defining a small schema, applying it to a r
 ## Requirements
 
 - Python 3.13+
-- PostgreSQL (any recent version reachable over the network — Pylon connects directly, there's no separate Pylon-specific server process for the database itself)
+- PostgreSQL 18+ (reachable over the network — Pylon connects directly, there's no separate Pylon-specific server process for the database itself). The generated DDL calls `uuidv7()`, which arrived in 18.
 
 ## Install
 
 ```bash
-pip install pylon
+pip install pylon-db
 ```
 
 If you're developing Pylon itself (working in this repository rather than consuming it as a package), the Rust extension is built with [maturin](https://www.maturin.rs/) instead:
