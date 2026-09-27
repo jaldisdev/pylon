@@ -347,8 +347,11 @@ class RelativeDuration:
     microseconds: int = 0
 
     def __repr__(self) -> str:
-        parts = [f'{name}={value}' for name, value in
-                 (('months', self.months), ('days', self.days), ('microseconds', self.microseconds)) if value]
+        parts = [
+            f'{name}={value}'
+            for name, value in (('months', self.months), ('days', self.days), ('microseconds', self.microseconds))
+            if value
+        ]
         return f'RelativeDuration({", ".join(parts)})'
 
 

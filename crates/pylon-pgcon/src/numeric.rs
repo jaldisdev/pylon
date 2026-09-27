@@ -197,7 +197,11 @@ pub fn encode(text: &str, out: &mut bytes::BytesMut) -> Result<()> {
         weight = 0;
     }
 
-    let sign = if parsed.negative && !groups.is_empty() { SIGN_NEGATIVE } else { SIGN_POSITIVE };
+    let sign = if parsed.negative && !groups.is_empty() {
+        SIGN_NEGATIVE
+    } else {
+        SIGN_POSITIVE
+    };
     let ndigits = i16::try_from(groups.len()).map_err(|_| invalid(text, "too many digits"))?;
     let weight = i16::try_from(weight).map_err(|_| invalid(text, "exponent out of range"))?;
 
@@ -219,7 +223,11 @@ fn special_sign(text: &str) -> Option<u16> {
         return Some(SIGN_NAN);
     }
     if bare.eq_ignore_ascii_case("inf") || bare.eq_ignore_ascii_case("infinity") {
-        return Some(if negative { SIGN_NEGATIVE_INFINITY } else { SIGN_POSITIVE_INFINITY });
+        return Some(if negative {
+            SIGN_NEGATIVE_INFINITY
+        } else {
+            SIGN_POSITIVE_INFINITY
+        });
     }
     None
 }
@@ -294,16 +302,27 @@ pub fn decode(data: &[u8]) -> Result<String> {
         // transmitted, so a missing group reads as zero.
         let mut index = weight as i64 + 1;
         while fraction.len() < scale {
-            let group = usize::try_from(index).ok().and_then(|at| groups.get(at).copied()).unwrap_or(0);
+            let group = usize::try_from(index)
+                .ok()
+                .and_then(|at| groups.get(at).copied())
+                .unwrap_or(0);
             fraction.push_str(&format!("{group:04}"));
             index += 1;
         }
         fraction.truncate(scale);
     }
 
-    let magnitude = if scale > 0 { format!("{integer}.{fraction}") } else { integer };
+    let magnitude = if scale > 0 {
+        format!("{integer}.{fraction}")
+    } else {
+        integer
+    };
     let zero = magnitude.bytes().all(|b| b == b'0' || b == b'.');
-    Ok(if sign == SIGN_NEGATIVE && !zero { format!("-{magnitude}") } else { magnitude })
+    Ok(if sign == SIGN_NEGATIVE && !zero {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    })
 }
 
 #[cfg(test)]
@@ -322,14 +341,20 @@ mod tests {
         // as 3.9999999999999998…, having dropped the `E-7` when the mantissa
         // overflowed, and reported no error.
         let text = "3.9999999999999998189924473035450347424557548947632312774658203125E-7";
-        assert_eq!(round_trip(text), "0.00000039999999999999998189924473035450347424557548947632312774658203125");
+        assert_eq!(
+            round_trip(text),
+            "0.00000039999999999999998189924473035450347424557548947632312774658203125"
+        );
     }
 
     #[test]
     fn keeps_a_value_with_a_large_positive_exponent() {
         // `rust_decimal` rejected 29 to 31 outright and silently divided
         // anything above by its own exponent.
-        assert_eq!(round_trip("1.2222222222222222222222222222222E+40"), "12222222222222222222222222222222000000000");
+        assert_eq!(
+            round_trip("1.2222222222222222222222222222222E+40"),
+            "12222222222222222222222222222222000000000"
+        );
         assert_eq!(round_trip("1E+29"), "100000000000000000000000000000");
     }
 

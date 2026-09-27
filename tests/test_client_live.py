@@ -460,7 +460,7 @@ def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, uni
     # `Decimal(float)` is spelled out rather than computed so the expectation
     # cannot drift with it.
     values = [
-        decimal.Decimal(0.0000004),
+        decimal.Decimal(0.0000004),  # noqa: RUF032 — a caller building one from a float is the case under test
         decimal.Decimal('0.00000039999999999999998189924473035450347424557548947632312774658203125'),
         decimal.Decimal('1.2222222222222222222222222222222E-7'),
         decimal.Decimal('1.2222222222222222222222222222222E+40'),
@@ -576,8 +576,8 @@ def test_several_statements_written_together_run_from_every_entry_point(live_poo
 
         # Two statements, the second one's rows being the script's value.
         script = (
-            f"insert {module}::Widget {{ name := <str>$name }};\n"
-            f"select {module}::Widget {{ name }} filter .name = <str>$name;"
+            f'insert {module}::Widget {{ name := <str>$name }};\n'
+            f'select {module}::Widget {{ name }} filter .name = <str>$name;'
         )
 
         assert [w.name for w in await client.query(script, name='a')] == ['a']

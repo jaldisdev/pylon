@@ -1251,7 +1251,14 @@ mod tests {
         // The raw UTF-8 used to go straight into the binary slot, leaving
         // Postgres to report its own reading of the bytes -- and aborting the
         // caller's transaction, because the complaint came from the server.
-        for ty in [Type::INT8, Type::INT4, Type::BOOL, Type::INTERVAL, Type::TIMESTAMPTZ, Type::DATE] {
+        for ty in [
+            Type::INT8,
+            Type::INT4,
+            Type::BOOL,
+            Type::INTERVAL,
+            Type::TIMESTAMPTZ,
+            Type::DATE,
+        ] {
             let mut buffer = bytes::BytesMut::new();
             let Err(err) = encode_value(&DecodedValue::Str("25 days".into()), &ty, &mut buffer) else {
                 panic!("{} must refuse a string", ty.name());
@@ -1266,7 +1273,15 @@ mod tests {
 
     #[test]
     fn a_string_still_reaches_the_types_it_is_the_wire_form_of() {
-        for ty in [Type::TEXT, Type::VARCHAR, Type::BPCHAR, Type::NAME, Type::JSON, Type::BYTEA, Type::UNKNOWN] {
+        for ty in [
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+            Type::JSON,
+            Type::BYTEA,
+            Type::UNKNOWN,
+        ] {
             let mut buffer = bytes::BytesMut::new();
             encode_value(&DecodedValue::Str("hello".into()), &ty, &mut buffer)
                 .unwrap_or_else(|e| panic!("{} must take a string: {e}", ty.name()));
@@ -1290,8 +1305,7 @@ mod tests {
         assert_eq!(buffer[0], 1, "jsonb needs its version byte");
 
         let mut buffer = bytes::BytesMut::new();
-        encode_value(&DecodedValue::Str("12.50".into()), &Type::NUMERIC, &mut buffer)
-            .expect("numeric takes a string");
+        encode_value(&DecodedValue::Str("12.50".into()), &Type::NUMERIC, &mut buffer).expect("numeric takes a string");
         assert_eq!(numeric::decode(&buffer).unwrap(), "12.50");
     }
 
