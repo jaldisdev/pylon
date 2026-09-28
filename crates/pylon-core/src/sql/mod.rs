@@ -3465,8 +3465,10 @@ fn emit_for_update(
     body_ctes: &[IrCteDef],
 ) -> SqlOutput {
     let mut cte_parts: Vec<String> = emit_user_cte_parts(user_ctes);
-    cte_parts.extend(emit_user_cte_parts(body_ctes));
+    // The iterator first: a body CTE may read the loop variable, and a WITH
+    // name is only in scope for the bindings that follow it.
     cte_parts.push(iter_cte.to_string());
+    cte_parts.extend(emit_user_cte_parts(body_ctes));
 
     let alias = &upd.target.alias;
     // With only junction rows to write there is nothing to SET, so the driving
