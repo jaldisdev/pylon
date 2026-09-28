@@ -6167,6 +6167,32 @@ mod tests {
         emit(&ir)
     }
 
+    /// `(insert Outer { link := (insert Inner …) }) if cond else {}` — the
+    /// guard belongs to the insert the conditional names. The nested insert
+    /// compiles first and used to claim it, leaving the outer one to write a
+    /// row whatever the condition said. `compile_update`/`compile_delete`
+    /// take theirs up front for the same reason.
+    #[test]
+    fn test_a_guarded_insert_keeps_its_guard_when_it_nests_another() {
+        let out = compile_and_emit(
+            "WITH existing := (SELECT Company FILTER .name = 'x'), \
+                  made := (INSERT Person { name := 'a', company := (INSERT Company { name := 'b' }) }) \
+                          IF NOT EXISTS existing ELSE {} \
+             SELECT made",
+        );
+        let outer = out
+            .sql
+            .find("INSERT INTO \"public\".\"Person\"")
+            .unwrap_or_else(|| panic!("no Person insert in:\n{}", out.sql));
+        let tail = &out.sql[outer..];
+        let stmt_end = tail.find("RETURNING").unwrap_or(tail.len());
+        assert!(
+            tail[..stmt_end].contains("NOT EXISTS(SELECT 1 FROM \"existing\")"),
+            "the insert the conditional names must carry the condition, got:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn a_nested_read_inside_a_with_opens_no_second_with() {
         let out = compile_and_emit_with(

@@ -8213,6 +8213,10 @@ impl<'a> Compiler<'a> {
     // ── INSERT ────────────────────────────────────────────────────────────────────
 
     fn compile_insert(&mut self, ins: &ast::InsertStmt) -> Result<IrInsert, PyQLError> {
+        // Taken before anything nested is compiled, so a nested statement
+        // cannot pick up a guard meant for this one — `compile_update` and
+        // `compile_delete` take theirs the same way.
+        let pending_guard = self.pending_insert_guard.take();
         // Isolate this insert's own nested-DML discoveries (see
         // `pending_nested_ctes`'s doc comment) from whatever an enclosing
         // compile (e.g. this insert itself being the nested DML inside an
@@ -8364,7 +8368,7 @@ impl<'a> Compiler<'a> {
         let enqueue_search = collect_search_enqueue(td, &type_name, "index");
         let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
 
-        let guard = match self.pending_insert_guard.take() {
+        let guard = match pending_guard {
             Some(condition) => Some(self.compile_expr(&condition, td, &alias)?),
             None => None,
         };
