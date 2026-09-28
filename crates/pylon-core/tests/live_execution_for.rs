@@ -572,7 +572,12 @@ fn item_schema(module: &str) -> SchemaDescriptor {
 }
 
 async fn amounts_by_name(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) -> Vec<(String, i64)> {
-    let rows = rows_of(pool, sd, &format!("select {module}::Item {{ name, amount }} order by .name")).await;
+    let rows = rows_of(
+        pool,
+        sd,
+        &format!("select {module}::Item {{ name, amount }} order by .name"),
+    )
+    .await;
     rows.iter()
         .map(|r| (as_str(field(r, 2)).to_string(), as_i64(field(r, 3))))
         .collect()
@@ -588,9 +593,24 @@ async fn updating_an_interface_loop_variable_reaches_every_implementor() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::BookItem {{ name := 'Atlas', amount := 10 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::ToolItem {{ name := 'Drill', amount := 20 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::BookItem {{ name := 'Zine', amount := 5 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::BookItem {{ name := 'Atlas', amount := 10 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::ToolItem {{ name := 'Drill', amount := 20 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::BookItem {{ name := 'Zine', amount := 5 }}"),
+    )
+    .await;
 
     exec(
         &pool,
@@ -624,8 +644,18 @@ async fn an_interface_for_update_bound_to_a_name_yields_its_rows() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::BookItem {{ name := 'Atlas', amount := 10 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::ToolItem {{ name := 'Drill', amount := 20 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::BookItem {{ name := 'Atlas', amount := 10 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::ToolItem {{ name := 'Drill', amount := 20 }}"),
+    )
+    .await;
 
     let rows = rows_of(
         &pool,
@@ -668,7 +698,12 @@ async fn chained_body_bindings_each_belong_to_their_iteration() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Ann', age := 1 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Ann', age := 1 }}"),
+    )
+    .await;
     exec(
         &pool,
         &sd,
@@ -718,8 +753,18 @@ async fn an_interface_for_update_reads_chained_body_bindings() {
     let pool = test_pool().await;
     bootstrap(&pool, &sd).await;
 
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ label := 'heavy', factor := 100 }}")).await;
-    exec(&pool, &sd, &format!("insert {module}::Tag {{ label := 'light', factor := 7 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ label := 'heavy', factor := 100 }}"),
+    )
+    .await;
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Tag {{ label := 'light', factor := 7 }}"),
+    )
+    .await;
     for (ty_name, name, tag) in [("BookItem", "Atlas", "heavy"), ("ToolItem", "Drill", "light")] {
         exec(
             &pool,

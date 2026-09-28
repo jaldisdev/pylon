@@ -3736,12 +3736,7 @@ fn correlated_append_indices(appends: &[IrMultiLinkMutation], defs: &[&[IrCteDef
 /// `emit_for_update` for an interface target: one UPDATE per implementor,
 /// each driven from the iteration, unioned back under a per-branch type
 /// literal the way a standalone polymorphic update is.
-fn emit_for_poly_update(
-    upd: &IrUpdate,
-    iter_alias: &str,
-    sets: &[String],
-    mut cte_parts: Vec<String>,
-) -> SqlOutput {
+fn emit_for_poly_update(upd: &IrUpdate, iter_alias: &str, sets: &[String], mut cte_parts: Vec<String>) -> SqlOutput {
     let alias = &upd.target.alias;
     let mut union_parts = vec![];
     for (i, imp) in upd.poly_implementors.iter().enumerate() {
@@ -13677,7 +13672,8 @@ select owner { posts := (select owner.posts.title) };",
              )) SELECT count(made)",
         );
         assert!(
-            out.sql.contains("\"mine\" AS (\nSELECT \"_for_p\".\"v\" AS \"_outer__mine\""),
+            out.sql
+                .contains("\"mine\" AS (\nSELECT \"_for_p\".\"v\" AS \"_outer__mine\""),
             "the binding must be evaluated per iteration, got:\n{}",
             out.sql
         );
