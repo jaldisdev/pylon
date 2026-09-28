@@ -1386,6 +1386,45 @@ fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) ->
                         )),
                     }
                 }
+            } else if !upd.poly_implementors.is_empty() {
+                // An interface has no table to update: each implementor is
+                // driven from the iteration on its own, and the rows unioned
+                // back under the interface's common columns.
+                let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
+                let col_list = upd.poly_columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+                // Qualified: the iterated set is in scope here too, so a bare
+                // column name could name either side.
+                let ret_list = upd
+                    .poly_columns
+                    .iter()
+                    .map(|c| format!("{}.{}", qi(alias), qi(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut union_parts = vec![];
+                for (i, imp) in upd.poly_implementors.iter().enumerate() {
+                    let cte_name = format!("{}__u{}", ids_name, i);
+                    let mut upd_sql = format!(
+                        "UPDATE {} AS {}\nSET {}\nFROM {}",
+                        qn(&imp.module, &imp.table),
+                        qi(alias),
+                        sets.join(", "),
+                        qi(&iter_alias),
+                    );
+                    append_filter(&mut upd_sql, &upd.filter);
+                    upd_sql.push_str(&format!("\nRETURNING {}", ret_list));
+                    parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+                    union_parts.push(format!(
+                        "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
+                        sql_str(&imp.type_name),
+                        col_list,
+                        cte_name,
+                    ));
+                }
+                parts.push(format!(
+                    "\"{}\" AS (\n{}\n)",
+                    ids_name,
+                    union_parts.join("\nUNION ALL\n")
+                ));
             } else {
                 let sets = update_set_fragments(&upd.assignments, &upd.rewrites, "");
                 let mut sql = format!(
@@ -3530,6 +3569,9 @@ fn emit_for_update(
                 .map(|rw| format!("{} = {}", qi(&rw.column), emit_expr(&rw.expr))),
         )
         .collect();
+    if !upd.poly_implementors.is_empty() {
+        return emit_for_poly_update(upd, iter_alias, &sets, cte_parts);
+    }
     let mut sql = format!(
         "WITH {}\nUPDATE {} AS {}\nSET {}\nFROM {}",
         cte_parts.join(",\n"),
@@ -3665,6 +3707,48 @@ fn correlated_append_indices(appends: &[IrMultiLinkMutation], defs: &[&[IrCteDef
         })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// `emit_for_update` for an interface target: one UPDATE per implementor,
+/// each driven from the iteration, unioned back under a per-branch type
+/// literal the way a standalone polymorphic update is.
+fn emit_for_poly_update(
+    upd: &IrUpdate,
+    iter_alias: &str,
+    sets: &[String],
+    mut cte_parts: Vec<String>,
+) -> SqlOutput {
+    let alias = &upd.target.alias;
+    let mut union_parts = vec![];
+    for (i, imp) in upd.poly_implementors.iter().enumerate() {
+        let cte_name = format!("_u{}", i);
+        let mut upd_sql = format!(
+            "UPDATE {} AS {}\nSET {}\nFROM {}",
+            qn(&imp.module, &imp.table),
+            qi(alias),
+            sets.join(", "),
+            qi(iter_alias),
+        );
+        append_filter(&mut upd_sql, &upd.filter);
+        upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+
+        let r_alias = format!("_r{}", i);
+        union_parts.push(format!(
+            "SELECT ROW({}::text, {}.\"id\") AS result FROM \"{}\" AS {}",
+            sql_str(&imp.type_name),
+            qi(&r_alias),
+            cte_name,
+            qi(&r_alias),
+        ));
+    }
+    let sql = format!("WITH {}\n{}", cte_parts.join(",\n"), union_parts.join("\nUNION ALL\n"));
+    let (shape, _) = emit_returning_shape(&upd.target, &upd.returning, true);
+    SqlOutput {
+        sql,
+        shape,
+        inference_plan: None,
+    }
 }
 
 fn emit_for_insert(

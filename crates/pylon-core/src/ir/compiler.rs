@@ -7332,12 +7332,13 @@ impl<'a> Compiler<'a> {
             {
                 None
             }
+            // An interface target fans out into one UPDATE per implementor,
+            // each driven from the iteration the same way.
             IrStmt::Update(upd)
                 if upd.multi_link_appends.is_empty()
                     && upd.multi_link_clears.is_empty()
                     && upd.multi_link_replaces.is_empty()
-                    && upd.multi_link_removals.is_empty()
-                    && upd.poly_implementors.is_empty() =>
+                    && upd.multi_link_removals.is_empty() =>
             {
                 None
             }

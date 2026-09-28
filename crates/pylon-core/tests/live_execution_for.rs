@@ -536,3 +536,117 @@ async fn a_nested_insert_in_a_for_body_pairs_with_its_own_iteration() {
         );
     }
 }
+
+fn interface_ty(name: &str, module: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
+    TypeDescriptor {
+        abstract_: true,
+        ..ty(name, module, properties)
+    }
+}
+
+fn implementor_ty(
+    name: &str,
+    module: &str,
+    interface_qname: &str,
+    properties: Vec<PropertyDescriptor>,
+) -> TypeDescriptor {
+    TypeDescriptor {
+        interfaces: vec![interface_qname.into()],
+        ..ty(name, module, properties)
+    }
+}
+
+/// One interface with two implementors — an interface has no table of its
+/// own, so an update against it has to reach both.
+fn item_schema(module: &str) -> SchemaDescriptor {
+    let item_q = format!("{module}::Item");
+    let shared = || vec![id_prop(), text_prop("name"), int_prop("amount")];
+    SchemaDescriptor {
+        types: vec![
+            interface_ty("Item", module, shared()),
+            implementor_ty("BookItem", module, &item_q, shared()),
+            implementor_ty("ToolItem", module, &item_q, shared()),
+        ],
+        ..Default::default()
+    }
+}
+
+async fn amounts_by_name(pool: &pylon_pgcon::PgPool, sd: &SchemaDescriptor, module: &str) -> Vec<(String, i64)> {
+    let rows = rows_of(pool, sd, &format!("select {module}::Item {{ name, amount }} order by .name")).await;
+    rows.iter()
+        .map(|r| (as_str(field(r, 2)).to_string(), as_i64(field(r, 3))))
+        .collect()
+}
+
+/// `for x in <interface set> union (update x set { … })` — the update fans
+/// out into one statement per implementor, each driven from the iteration.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn updating_an_interface_loop_variable_reaches_every_implementor() {
+    let module = unique_module("live_for_poly");
+    let sd = item_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::BookItem {{ name := 'Atlas', amount := 10 }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::ToolItem {{ name := 'Drill', amount := 20 }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::BookItem {{ name := 'Zine', amount := 5 }}")).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with cheap := (select {module}::Item filter .amount < 15) \
+             for i in cheap union (update i set {{ amount := i.amount * 2 }})"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        amounts_by_name(&pool, &sd, &module).await,
+        vec![
+            ("Atlas".to_string(), 20),
+            ("Drill".to_string(), 20),
+            ("Zine".to_string(), 10),
+        ],
+        "both implementors' iterated rows should change, and only those"
+    );
+}
+
+/// The same loop bound to a `with` name and read back by the enclosing
+/// statement: the rows each implementor's update returns have to be unioned
+/// under the interface's common columns for the outer aggregate to see them.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_interface_for_update_bound_to_a_name_yields_its_rows() {
+    let module = unique_module("live_for_poly_cte");
+    let sd = item_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::BookItem {{ name := 'Atlas', amount := 10 }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::ToolItem {{ name := 'Drill', amount := 20 }}")).await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!(
+            "with \
+               items := (select {module}::Item), \
+               updated := (for i in items union (update i set {{ amount := i.amount + 1 }})) \
+             select sum(updated.amount)"
+        ),
+    )
+    .await;
+
+    let total = match field(&rows[0], 0) {
+        DecodedValue::Decimal(d) => d.to_string(),
+        other => panic!("expected Decimal, got {other:?}"),
+    };
+    assert_eq!(total, "32", "the loop's own rows should reach the aggregate");
+    assert_eq!(
+        amounts_by_name(&pool, &sd, &module).await,
+        vec![("Atlas".to_string(), 11), ("Drill".to_string(), 21)],
+        "and both implementors should be written"
+    );
+}
