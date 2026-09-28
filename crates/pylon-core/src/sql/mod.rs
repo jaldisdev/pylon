@@ -1238,6 +1238,15 @@ fn emit_insert_multilink_ctes(ins: &IrInsert, name: &str) -> Vec<String> {
 /// this one writes belong to one iteration of it rather than to all of them. `outer_alias` names
 /// that loop's iteration when this loop reads it, which makes every row this
 /// one writes belong to one iteration of it rather than to all of them.
+/// A guarded insert writes only where its condition holds. The rows it is
+/// driven from are filtered rather than the statement skipped, so an
+/// iteration-driven insert stays one statement.
+fn append_insert_guard(sql: &mut String, ins: &IrInsert) {
+    if let Some(guard) = &ins.guard {
+        sql.push_str(&format!("\nWHERE {}", emit_expr(guard)));
+    }
+}
+
 fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) -> Vec<String> {
     let iter_alias = format!("_for_{}", f.var_name);
     let (_, plain_iter_cte) = emit_for_iterator(&f.iterator, &iter_alias);
@@ -1297,6 +1306,7 @@ fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) ->
                     values.join(", "),
                     qi(&iter_alias),
                 );
+                append_insert_guard(&mut sql, ins);
                 if let Some(conflict) = &ins.unless_conflict {
                     emit_conflict(&mut sql, conflict);
                 }
@@ -1472,6 +1482,7 @@ fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) ->
                 values.join(", "),
                 nested_for_from(&inner_alias, &iter_alias),
             );
+            append_insert_guard(&mut sql, ins);
             if let Some(conflict) = &ins.unless_conflict {
                 emit_conflict(&mut sql, conflict);
             }
@@ -3642,12 +3653,15 @@ fn emit_iteration_rows_cte(ins: &IrInsert, cte_name: &str, iter_alias: &str, out
                     .map(|r| format!("{} AS {}", emit_expr(&r.expr), qi(&r.column))),
             ),
     );
-    format!(
-        "\"{}\" AS (\nSELECT {}\nFROM {}\n)",
+    let mut sql = format!(
+        "\"{}\" AS (\nSELECT {}\nFROM {}",
         cte_name,
         selected.join(", "),
         qi(iter_alias),
-    )
+    );
+    append_insert_guard(&mut sql, ins);
+    sql.push_str("\n)");
+    sql
 }
 
 /// The insert that reads its rows back out of the staging CTE above.
@@ -3803,6 +3817,7 @@ fn emit_for_insert(
         sel_exprs.join(", "),
         qi(iter_alias),
     );
+    append_insert_guard(&mut insert_sql, ins);
     if let Some(conflict) = &ins.unless_conflict {
         emit_conflict(&mut insert_sql, conflict);
     }
@@ -6172,6 +6187,62 @@ mod tests {
     /// compiles first and used to claim it, leaving the outer one to write a
     /// row whatever the condition said. `compile_update`/`compile_delete`
     /// take theirs up front for the same reason.
+    /// A loop's own bindings mutate too — an order line's attributes are
+    /// bound inside the loop that writes the line, two levels under the
+    /// insert the condition is on.
+    #[test]
+    fn test_a_guarded_insert_reaches_a_binding_inside_a_nested_loop() {
+        let out = compile_and_emit(
+            "WITH existing := (SELECT Company FILTER .name = 'x'), \
+                  made := (INSERT Person { name := 'a', \
+                             posts := (FOR s IN {'p','q'} UNION ( \
+                               WITH extra := (INSERT Company { name := s }) \
+                               INSERT Post { title := s })) }) \
+                          IF NOT EXISTS existing ELSE {} \
+             SELECT made",
+        );
+        let at = out
+            .sql
+            .find("INSERT INTO \"public\".\"Company\"")
+            .unwrap_or_else(|| panic!("no Company insert in:\n{}", out.sql));
+        let tail = &out.sql[at..];
+        let stmt_end = tail.find("RETURNING").unwrap_or(tail.len());
+        assert!(
+            tail[..stmt_end].contains("NOT EXISTS(SELECT 1 FROM \"existing\")"),
+            "a binding inside the loop must carry the condition too, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// Everything a guarded insert writes is guarded with it: the row, the
+    /// values nested in it, and a multi-link's rows — which are hoisted
+    /// beside the statement rather than inside it. Otherwise a false
+    /// condition still leaves those behind, owned by nothing.
+    #[test]
+    fn test_a_guarded_insert_carries_its_condition_into_what_it_nests() {
+        let out = compile_and_emit(
+            "WITH existing := (SELECT Company FILTER .name = 'x'), \
+                  made := (INSERT Person { name := 'a', company := (INSERT Company { name := 'b' }), \
+                                           posts := (FOR s IN {'p','q'} UNION (INSERT Post { title := s })) }) \
+                          IF NOT EXISTS existing ELSE {} \
+             SELECT made",
+        );
+        for table in ["\"Person\"", "\"Company\" (", "\"Post\""] {
+            let at = out
+                .sql
+                .find(&format!("INSERT INTO \"public\".{}", table))
+                .unwrap_or_else(|| panic!("no insert into {} in:\n{}", table, out.sql));
+            let tail = &out.sql[at..];
+            let stmt_end = tail.find("RETURNING").unwrap_or(tail.len());
+            assert!(
+                tail[..stmt_end].contains("NOT EXISTS(SELECT 1 FROM \"existing\")"),
+                "insert into {} writes whatever the condition says, got:\n{}",
+                table,
+                out.sql
+            );
+        }
+    }
+
     #[test]
     fn test_a_guarded_insert_keeps_its_guard_when_it_nests_another() {
         let out = compile_and_emit(

@@ -8366,12 +8366,65 @@ impl<'a> Compiler<'a> {
             })
             .collect();
         let enqueue_search = collect_search_enqueue(td, &type_name, "index");
-        let nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
+        let mut nested_ctes = std::mem::replace(&mut self.pending_nested_ctes, outer_pending_nested_ctes);
 
         let guard = match pending_guard {
             Some(condition) => Some(self.compile_expr(&condition, td, &alias)?),
             None => None,
         };
+        // A nested insert exists only to fill this row's values, so it writes
+        // when this one does and not otherwise. Without the condition it would
+        // leave a row behind with nothing pointing at it. Applied to any
+        // depth: a line item's own attributes are two loops down.
+        if let Some(condition) = &guard {
+            fn cte_refs(appends: &[IrMultiLinkMutation], into: &mut Vec<String>) {
+                into.extend(appends.iter().filter_map(|append| match &append.values.source {
+                    IrMultiLinkValueSource::CteRef(name) => Some(name.clone()),
+                    _ => None,
+                }));
+            }
+            fn carry_guard(stmt: &mut IrStmt, condition: &IrExpr, pending: &mut Vec<String>) {
+                // A loop's own bindings can mutate too — a line item's
+                // attributes are bound inside the loop that writes the line.
+                if let IrStmt::For(loop_) = stmt {
+                    for def in &mut loop_.body_ctes {
+                        carry_guard(&mut def.stmt, condition, pending);
+                    }
+                }
+                let nested = match stmt {
+                    IrStmt::Insert(nested) => Some(nested),
+                    IrStmt::For(loop_) => match loop_.body.as_mut() {
+                        IrStmt::Insert(nested) => Some(nested),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(nested) = nested else { return };
+                if nested.guard.is_none() {
+                    nested.guard = Some(condition.clone());
+                }
+                cte_refs(&nested.multi_link_appends, pending);
+                for def in &mut nested.nested_ctes {
+                    carry_guard(&mut def.stmt, condition, pending);
+                }
+            }
+            // A multi-link's rows are hoisted beside this statement rather than
+            // into its own nested CTEs, so they are reached by name instead.
+            let mut pending: Vec<String> = vec![];
+            cte_refs(&multi_link_appends, &mut pending);
+            for def in &mut nested_ctes {
+                carry_guard(&mut def.stmt, condition, &mut pending);
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(name) = pending.pop() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(index) = self.hoisted_ctes.iter().position(|def| def.name == name) {
+                    carry_guard(&mut self.hoisted_ctes[index].stmt, condition, &mut pending);
+                }
+            }
+        }
         // Only a `for` body's nested insert needs to name its own id (see
         // `IrInsert::id_default_sql`); carried here because the schema is in
         // scope, and ignored everywhere else.
