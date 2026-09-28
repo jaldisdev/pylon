@@ -312,7 +312,7 @@ fn source_ref(src: &IrSource) -> String {
                 "(SELECT * FROM {} WHERE {}.{} = {}.\"v\")",
                 qi(cte_name),
                 qi(cte_name),
-                qi(OUTER_KEY),
+                qi(&binding_outer_key(cte_name)),
                 qi(&iterator),
             ),
             None => qi(cte_name),
@@ -1560,7 +1560,7 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
                 "\"{}\" AS (\nSELECT {}.\"v\" AS {}, \"_row\".*\nFROM {}\nCROSS JOIN LATERAL (\n{}\n) AS \"_row\"\n)",
                 c.name,
                 qi(iterator),
-                qi(OUTER_KEY),
+                qi(&binding_outer_key(&c.name)),
                 qi(iterator),
                 body,
             ),
@@ -3608,6 +3608,14 @@ fn emit_for_update(
 /// can only name the inserted row's own columns, so the pairing is computed in
 /// a staging CTE beside the insert rather than read back out of it.
 const OUTER_KEY: &str = "_outer";
+
+/// The iteration key a correlated `with` binding carries, named after the
+/// binding itself. A binding that reads another one re-exports that one's key
+/// alongside its own, so a single shared name would leave two columns under
+/// it and make every read of either ambiguous.
+fn binding_outer_key(cte_name: &str) -> String {
+    format!("_outer__{cte_name}")
+}
 
 /// `SELECT <id> AS "id", <iter>."v" AS "_outer", <value> AS "<column>", …` —
 /// the rows one iteration-driven insert will write, with their ids generated
@@ -13572,12 +13580,12 @@ select owner { posts := (select owner.posts.title) };",
              )) SELECT count(made)",
         );
         assert!(
-            out.sql.contains("\"mine\" AS (\nSELECT \"_for_p\".\"v\" AS \"_outer\""),
+            out.sql.contains("\"mine\" AS (\nSELECT \"_for_p\".\"v\" AS \"_outer__mine\""),
             "the binding must be evaluated per iteration, got:\n{}",
             out.sql
         );
         assert!(
-            out.sql.contains("\"mine\".\"_outer\" = \"_for_p\".\"v\""),
+            out.sql.contains("\"mine\".\"_outer__mine\" = \"_for_p\".\"v\""),
             "a read of it must pin to the iteration in scope, got:\n{}",
             out.sql
         );

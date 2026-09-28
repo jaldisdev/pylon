@@ -1459,6 +1459,13 @@ struct Compiler<'a> {
     /// Loop slots whose variable has been read since the last time this was
     /// cleared — see `for_var_ref`.
     for_vars_read: std::collections::HashSet<String>,
+    /// SQL CTE name → the loop slot its rows belong to one iteration of, for
+    /// every per-iteration binding registered so far.
+    correlated_bindings: HashMap<String, String>,
+    /// Slots of the per-iteration bindings read since this was last cleared.
+    /// Interior mutability because a read is noticed from `&self` name
+    /// resolution — see `cte_sql_name`.
+    correlated_reads: std::cell::RefCell<std::collections::HashSet<String>>,
     /// The loops whose bodies are being compiled, innermost last.
     for_scope: Vec<String>,
     /// `(through type, junction alias)` of the multi-link whose own
@@ -1656,6 +1663,8 @@ impl<'a> Compiler<'a> {
             cte_sql_names: HashMap::new(),
             cte_namespace: std::collections::HashSet::new(),
             for_vars_read: std::collections::HashSet::new(),
+            correlated_bindings: HashMap::new(),
+            correlated_reads: std::cell::RefCell::new(std::collections::HashSet::new()),
             for_scope: Vec::new(),
             pending_detached: false,
             modifier_anchor: None,
@@ -1699,10 +1708,24 @@ impl<'a> Compiler<'a> {
 
     /// The WITH name `name` is emitted under — itself, unless it collided.
     fn cte_sql_name(&self, name: &str) -> String {
-        self.cte_sql_names
+        let sql_name = self
+            .cte_sql_names
             .get(name)
             .cloned()
-            .unwrap_or_else(|| name.to_string())
+            .unwrap_or_else(|| name.to_string());
+        if let Some(slot) = self.correlated_bindings.get(&sql_name) {
+            self.correlated_reads.borrow_mut().insert(slot.clone());
+        }
+        sql_name
+    }
+
+    /// The `@cte:` source sentinel for `cte`, noting the read so that a
+    /// binding compiled around it inherits the iteration `cte` belongs to.
+    fn cte_source_table(&self, cte: &str) -> String {
+        if let Some(slot) = self.correlated_bindings.get(cte) {
+            self.correlated_reads.borrow_mut().insert(slot.clone());
+        }
+        format!("@cte:{cte}")
     }
 
     /// Compile a `with` binding, reporting the loop slot it reads if it reads
@@ -1710,8 +1733,14 @@ impl<'a> Compiler<'a> {
     /// each iteration, which is not something a statement-level CTE can be.
     fn compile_binding_in_scope(&mut self, expr: &Expr) -> Result<(IrStmt, Option<String>), PyQLError> {
         let before = std::mem::take(&mut self.for_vars_read);
+        let before_correlated = std::mem::take(&mut *self.correlated_reads.borrow_mut());
         let ir_stmt = compile_cte_binding(self, expr);
-        let read = std::mem::replace(&mut self.for_vars_read, before);
+        let mut read = std::mem::replace(&mut self.for_vars_read, before);
+        let correlated_read = std::mem::replace(&mut *self.correlated_reads.borrow_mut(), before_correlated);
+        // Reading a per-iteration binding makes this one per-iteration too,
+        // even where it never names the loop variable itself: its rows are
+        // picked by the iteration key the one it reads carries.
+        read.extend(correlated_read.iter().cloned());
         // The innermost loop read is the one it belongs to; an outer loop's
         // variable is reachable from there anyway.
         let correlated_to = self
@@ -1721,6 +1750,7 @@ impl<'a> Compiler<'a> {
             .find(|slot| read.contains(*slot))
             .map(|slot| format!("_for_{slot}"));
         self.for_vars_read.extend(read);
+        self.correlated_reads.borrow_mut().extend(correlated_read);
         Ok((ir_stmt?, correlated_to))
     }
 
@@ -3153,10 +3183,10 @@ impl<'a> Compiler<'a> {
     /// else the type's own table.
     fn row_source_table(&self, name: &str, td: &TypeDescriptor) -> String {
         if let Some(cte) = self.for_var_ctes.get(name) {
-            return format!("@cte:{cte}");
+            return self.cte_source_table(cte);
         }
         if self.cte_object_type(name).is_some() {
-            return format!("@cte:{}", self.cte_sql_name(name));
+            return self.cte_source_table(&self.cte_sql_name(name));
         }
         td.table.clone()
     }
@@ -3836,6 +3866,9 @@ impl<'a> Compiler<'a> {
                     }
                     let (ir_inner, correlated_to) = self.compile_binding_in_scope(&alias.expr)?;
                     let sql_name = self.claim_cte_sql_name(&alias.name);
+                    if let Some(slot) = correlated_to.as_deref().and_then(|i| i.strip_prefix("_for_")) {
+                        self.correlated_bindings.insert(sql_name.clone(), slot.to_string());
+                    }
                     let type_name = self.register_cte(&alias.name, &ir_inner);
                     self.hoisted_binding_sources
                         .insert(sql_name.clone(), alias.expr.clone());
@@ -5335,7 +5368,7 @@ impl<'a> Compiler<'a> {
             poly: None,
             type_name: format!("{}::{}", td.module, td.name),
             table: match &cte_object_type {
-                Some(_) => format!("@cte:{}", root_type_name),
+                Some(_) => self.cte_source_table(root_type_name),
                 None => td.table.clone(),
             },
             alias: alias.clone(),
@@ -5851,7 +5884,7 @@ impl<'a> Compiler<'a> {
         let source = IrSource {
             poly: None,
             type_name,
-            table: format!("@cte:{cte_name}"),
+            table: self.cte_source_table(&cte_name),
             alias: self.fresh_alias(),
         };
         Ok(IrExpr::Subquery(Box::new(IrSelect::schema_bound(
@@ -6263,7 +6296,7 @@ impl<'a> Compiler<'a> {
                 return None;
             };
             match self.cte_object_type(name) {
-                Some(qualified) => branches.push((qualified, format!("@cte:{}", self.cte_sql_name(name)))),
+                Some(qualified) => branches.push((qualified, self.cte_source_table(&self.cte_sql_name(name)))),
                 None => match self.resolve_type(name) {
                     Ok(td) => branches.push((format!("{}::{}", td.module, td.name), td.table.clone())),
                     Err(_) => return None,
@@ -6793,7 +6826,7 @@ impl<'a> Compiler<'a> {
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
         let table = match cte_name {
-            Some(ref cte) => format!("@cte:{}", cte),
+            Some(ref cte) => self.cte_source_table(cte),
             None => Self::subject_name(result_expr)
                 .map(|name| self.row_source_table(&name, td))
                 .unwrap_or_else(|| td.table.clone()),
@@ -7178,7 +7211,7 @@ impl<'a> Compiler<'a> {
                 let source = IrSource {
                     poly: None,
                     type_name: yielded.clone(),
-                    table: format!("@cte:{}", self.cte_sql_name(name)),
+                    table: self.cte_source_table(&self.cte_sql_name(name)),
                     alias: self.fresh_alias(),
                 };
                 (
@@ -7431,7 +7464,7 @@ impl<'a> Compiler<'a> {
         let alias = self.fresh_alias();
         let fq_type_name = format!("{}::{}", td.module, td.name);
         let table = match cte_name {
-            Some(ref cte) => format!("@cte:{}", cte),
+            Some(ref cte) => self.cte_source_table(cte),
             None => td.table.clone(),
         };
         let source = IrSource {
@@ -11232,6 +11265,9 @@ impl<'a> Compiler<'a> {
                 }
                 let (ir_stmt, correlated_to) = self.compile_binding_in_scope(&alias.expr)?;
                 let sql_name = self.claim_cte_sql_name(&alias.name);
+                if let Some(slot) = correlated_to.as_deref().and_then(|i| i.strip_prefix("_for_")) {
+                    self.correlated_bindings.insert(sql_name.clone(), slot.to_string());
+                }
                 let type_name = self.register_cte(&alias.name, &ir_stmt);
                 self.hoisted_binding_sources
                     .insert(alias.name.clone(), alias.expr.clone());
@@ -13018,7 +13054,7 @@ impl<'a> Compiler<'a> {
                                 let source = IrSource {
                                     poly: None,
                                     type_name: format!("{}::{}", td.module, td.name),
-                                    table: format!("@cte:{cte_name}"),
+                                    table: self.cte_source_table(&cte_name),
                                     alias: self.fresh_alias(),
                                 };
                                 let inner = IrSelect::schema_bound(source, Self::pk_returning(td), None);
@@ -15876,6 +15912,9 @@ impl<'a> Compiler<'a> {
             .map(|slot| format!("_for_{slot}"));
         self.for_vars_read.extend(read);
         let cte_name = self.fresh_nested_cte_name();
+        if let Some(slot) = correlated_to.as_deref().and_then(|i| i.strip_prefix("_for_")) {
+            self.correlated_bindings.insert(cte_name.clone(), slot.to_string());
+        }
         self.hoisted_ctes.push(IrCteDef {
             name: cte_name.clone(),
             stmt: inner?,

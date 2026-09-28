@@ -650,3 +650,108 @@ async fn an_interface_for_update_bound_to_a_name_yields_its_rows() {
         "and both implementors should be written"
     );
 }
+
+/// A `for` body whose `with` bindings chain: only the first names the loop
+/// variable, the rest read each other. Every one of them still belongs to a
+/// single iteration, so each has to be driven from the iterator rather than
+/// evaluated once for the statement.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn chained_body_bindings_each_belong_to_their_iteration() {
+    let module = unique_module("live_for_probe");
+    let mut sd = person_schema(&module);
+    let mut note = ty("Note", &module, vec![id_prop(), text_prop("body")]);
+    note.multilinks = vec![];
+    sd.types.push(note);
+    let person = sd.types.iter_mut().find(|t| t.name == "Person").expect("Person");
+    person.multilinks = vec![multilink("notes", &format!("{module}::Note"))];
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::Person {{ name := 'Ann', age := 1 }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!("update {module}::Person filter .name = 'Ann' set {{ notes += (insert {module}::Note {{ body := 'hello' }}) }}"),
+    )
+    .await;
+
+    let pyql = format!(
+        "with ps := (select {module}::Person), \
+              updated := ( \
+                for p in ps union ( \
+                  with ns := p.notes, first := (select ns limit 1) \
+                  update p set {{ name := first.body }} \
+                ) \
+              ) \
+         select count(updated)"
+    );
+    exec(&pool, &sd, &pyql).await;
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert_eq!(as_str(field(&rows[0], 2)), "hello");
+}
+
+/// Both at once, which is the shape a real cart's tax pass takes: an
+/// interface target, a chained `with` in the body, and the loop bound to a
+/// name the enclosing statement aggregates over.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_interface_for_update_reads_chained_body_bindings() {
+    let module = unique_module("live_for_poly_chain");
+    let tag_q = format!("{module}::Tag");
+    let item_q = format!("{module}::Item");
+    let shared = || vec![id_prop(), text_prop("name"), int_prop("amount")];
+    let with_tag = |mut t: TypeDescriptor| {
+        t.links = vec![link("tag", &tag_q)];
+        t
+    };
+    let sd = SchemaDescriptor {
+        types: vec![
+            ty("Tag", &module, vec![id_prop(), text_prop("label"), int_prop("factor")]),
+            with_tag(interface_ty("Item", &module, shared())),
+            with_tag(implementor_ty("BookItem", &module, &item_q, shared())),
+            with_tag(implementor_ty("ToolItem", &module, &item_q, shared())),
+        ],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ label := 'heavy', factor := 100 }}")).await;
+    exec(&pool, &sd, &format!("insert {module}::Tag {{ label := 'light', factor := 7 }}")).await;
+    for (ty_name, name, tag) in [("BookItem", "Atlas", "heavy"), ("ToolItem", "Drill", "light")] {
+        exec(
+            &pool,
+            &sd,
+            &format!(
+                "insert {module}::{ty_name} {{ name := '{name}', amount := 1, \
+                 tag := (select {module}::Tag filter .label = '{tag}' limit 1) }}"
+            ),
+        )
+        .await;
+    }
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "with \
+               items := (select {module}::Item), \
+               updated := ( \
+                 for i in items union ( \
+                   with t := i.tag, chosen := (select t limit 1) \
+                   update i set {{ amount := chosen.factor }} \
+                 ) \
+               ) \
+             select count(updated)"
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        amounts_by_name(&pool, &sd, &module).await,
+        vec![("Atlas".to_string(), 100), ("Drill".to_string(), 7)],
+        "each implementor's row should take the factor its own tag chain resolved to"
+    );
+}
