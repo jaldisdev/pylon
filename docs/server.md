@@ -49,17 +49,19 @@ If your schema has any `@pylon.signal` registrations, you must also run `pylon w
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/metrics` | Prometheus text exposition (only mounted if `[metrics].enabled = true`). Worker/backend counters only — no per-HTTP-request metrics. |
-| `GET` | `/api/schema` | The compiled schema, as JSON. |
-| `GET` | `/api/globals` | Declared `Global`s, as JSON. |
 | `GET` | `/api/connections` | Named connections available (from `[database.<name>]` entries in `pylon.toml`). |
 | `GET` | `/api/models` | Configured `[models.*]` entries. |
 | `GET` | `/api/config-options` | Known `with_config()` session option names. |
+| `GET` | `/api/<connection>/schema` | That connection's compiled schema, as JSON. |
+| `GET` | `/api/<connection>/globals` | That connection's declared `Global`s, as JSON. |
 | `GET` | `/api/<connection>/stats` | Pool stats for that connection. |
 | `POST` | `/api/<connection>/query` | Compile and run a PyQL query. |
 | `POST` | `/api/<connection>/analyze` | `EXPLAIN (ANALYZE)` a PyQL query — same shape as `Client.analyze()`. |
 | `POST` | `/api/<connection>/ai/chat` | AI chat endpoint (see the AI/chat extension, if configured). |
 
-`<connection>` is a named `[database.<name>]` entry — the same concept as the CLI's `-d/--database NAME` (a bare `default` connection always exists, from the base `[database]` block).
+`<connection>` is a named `[database.<name>]` entry — the same concept as the CLI's `-d/--database NAME` (a bare `default` connection always exists, from the base `[database]` block, addressed as `main`).
+
+Schema and globals are per-connection because each connection addresses a database of its own, with its own `_pylon."Schema"` row: two connections agree only when the same migrations have been applied to both. `GET /api/schema` and `GET /api/globals` remain as unprefixed aliases for `main`'s.
 
 `POST /api/<connection>/query` body:
 

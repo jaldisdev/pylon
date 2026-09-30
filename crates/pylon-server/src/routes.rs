@@ -291,34 +291,39 @@ pub fn handle_config_options() -> Response<Full<Bytes>> {
     json_response(StatusCode::OK, &serde_json::json!({"options": options}))
 }
 
-/// Schema/globals are process-level (identical regardless of which named
-/// connection is selected — the same `_pylon."Schema"` snapshot row backs
-/// all of them), so these two routes just need *some* connected `Client` to
-/// read `.schema()` off of; the base/"main" connection always exists in
-/// `config.connections`.
-async fn render_from_any_client(
+/// Reads `connection`'s schema and renders it.
+///
+/// Per-connection, not process-level: each named connection addresses a
+/// database of its own, with its own `_pylon."Schema"` snapshot row and so
+/// its own migration history. Two connections agree on their schema only
+/// when the same migrations have been applied to both — which is exactly
+/// what a connection pointing at a feature branch's database does not do.
+/// Serving one connection's schema for another makes the UI describe types
+/// the selected database doesn't have, and omit the ones it does.
+async fn render_from_connection(
     state: &AppState,
+    connection: &str,
     render: impl FnOnce(&SchemaDescriptor) -> serde_json::Value,
 ) -> Response<Full<Bytes>> {
-    match state.resolve_client("main").await {
+    match state.resolve_client(connection).await {
         Ok(Some(c)) => match c.schema().await {
             Ok(schema) => json_response(StatusCode::OK, &render(&schema)),
             Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
         },
         Ok(None) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": "no [database] connection configured"}),
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": format!("No connection named {connection:?}")}),
         ),
         Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     }
 }
 
-/// `GET /api/schema`.
-pub async fn handle_schema(state: Arc<AppState>) -> Response<Full<Bytes>> {
-    render_from_any_client(&state, crate::schema_json::schema_json).await
+/// `GET /api/<connection>/schema`, and `GET /api/schema` for the base one.
+pub async fn handle_schema(state: Arc<AppState>, connection: &str) -> Response<Full<Bytes>> {
+    render_from_connection(&state, connection, crate::schema_json::schema_json).await
 }
 
-/// `GET /api/globals`.
-pub async fn handle_globals(state: Arc<AppState>) -> Response<Full<Bytes>> {
-    render_from_any_client(&state, crate::schema_json::globals_json).await
+/// `GET /api/<connection>/globals`, and `GET /api/globals` for the base one.
+pub async fn handle_globals(state: Arc<AppState>, connection: &str) -> Response<Full<Bytes>> {
+    render_from_connection(&state, connection, crate::schema_json::globals_json).await
 }

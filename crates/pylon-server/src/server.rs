@@ -173,7 +173,7 @@ async fn serve(
 /// Splits `"/api/<connection>/<rest>"` into `(connection, "/<rest>")`.
 /// `None` for anything that
 /// isn't at least `/api/<segment>/<segment>`, including the bare
-/// process-level routes (`/api/schema`, `/api/connections`, ...), which
+/// process-level routes (`/api/connections`, `/api/models`, ...), which
 /// have no connection segment to split off at all.
 fn split_connection_path(path: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = path.split('/').collect();
@@ -197,11 +197,13 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
             pylon_workers::metrics::render(),
         );
     }
+    // Unprefixed aliases for the base connection's own schema/globals, kept
+    // for callers written before these became per-connection.
     if method == Method::GET && path == "/api/schema" {
-        return crate::routes::handle_schema(state.clone()).await;
+        return crate::routes::handle_schema(state.clone(), "main").await;
     }
     if method == Method::GET && path == "/api/globals" {
-        return crate::routes::handle_globals(state.clone()).await;
+        return crate::routes::handle_globals(state.clone(), "main").await;
     }
     if method == Method::GET && path == "/api/connections" {
         return crate::routes::handle_connections(&state);
@@ -214,6 +216,12 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
     }
 
     if let Some((connection, rest)) = split_connection_path(&path) {
+        if method == Method::GET && rest == "/schema" {
+            return crate::routes::handle_schema(state.clone(), &connection).await;
+        }
+        if method == Method::GET && rest == "/globals" {
+            return crate::routes::handle_globals(state.clone(), &connection).await;
+        }
         if method == Method::GET && rest == "/stats" {
             return crate::routes::handle_stats(state.clone(), &connection).await;
         }
