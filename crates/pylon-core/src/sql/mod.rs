@@ -6177,6 +6177,103 @@ mod tests {
         emit(&ir)
     }
 
+    /// A set literal is the haystack `in` reads, so a walk that crosses a
+    /// multi-link can be tested against one. Compiled as an ordinary operand
+    /// it was refused outright — the walk reaches the EXISTS builder before
+    /// the arm that knows what a set literal on the right of `in` means.
+    #[test]
+    fn a_multilink_walk_can_be_tested_against_a_set_literal() {
+        let out = compile_and_emit("SELECT Person FILTER .posts.title IN {'a', 'b'}");
+        assert!(out.sql.contains("= ANY(ARRAY['a', 'b'])"), "{}", out.sql);
+    }
+
+    /// `all` is not `any`. Both used to fold into the same bare EXISTS over
+    /// the junction, which answers "some element matches" — so `all` silently
+    /// agreed with `any` on every one of these.
+    #[test]
+    fn all_over_a_multilink_is_not_the_same_question_as_any() {
+        for condition in [
+            ".posts.title IN {'a', 'b'}",
+            ".posts IN ps",
+            ".posts = ps",
+            ".posts.title = 'x'",
+        ] {
+            let sql = |quantifier: &str| {
+                compile_and_emit(&format!(
+                    "WITH ps := (SELECT Post) SELECT Person FILTER {quantifier}({condition})"
+                ))
+                .sql
+            };
+            assert_ne!(
+                sql("all"),
+                sql("any"),
+                "all({condition}) must not compile to what any({condition}) does"
+            );
+        }
+    }
+
+    /// The two shapes `all` takes: a walk with a tail negates the test around
+    /// each element inside one EXISTS, and a walk that *is* the link gathers
+    /// the answers and reduces them.
+    #[test]
+    fn all_over_a_multilink_answers_for_every_element() {
+        let out = compile_and_emit("SELECT Person FILTER all(.posts.title IN {'a', 'b'})");
+        assert!(
+            out.sql.contains("NOT EXISTS(") && out.sql.contains("NOT (\"t2\".\"title\" = ANY("),
+            "no element fails the test:\n{}",
+            out.sql
+        );
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person FILTER all(.posts IN ps)");
+        assert!(
+            out.sql
+                .contains("coalesce(bool_and(\"_s\".\"v\"), true) FROM unnest(ARRAY(SELECT ("),
+            "every answer, reduced:\n{}",
+            out.sql
+        );
+    }
+
+    /// `any` keeps the EXISTS fold, which is exactly what it means and reads
+    /// more directly than gathering the answers to reduce them.
+    #[test]
+    fn any_over_a_multilink_keeps_its_exists() {
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person FILTER any(.posts IN ps)");
+        assert!(out.sql.contains("WHERE EXISTS("), "{}", out.sql);
+        assert!(!out.sql.contains("bool_or"), "{}", out.sql);
+    }
+
+    /// Comparing a multi-link to a binding of more than one row is the same
+    /// membership question `in` asks — the reading PyQL gives `=` against a
+    /// set everywhere else. Compared against the binding whole it became
+    /// `= (SELECT id FROM ps)`, which Postgres aborts on as soon as the
+    /// binding holds two rows.
+    #[test]
+    fn comparing_a_multilink_to_a_multi_row_binding_is_membership() {
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person FILTER .posts = ps");
+        assert!(
+            out.sql.contains("\"target\" = ANY((SELECT \"id\" FROM \"ps\"))"),
+            "{}",
+            out.sql
+        );
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person FILTER .posts != ps");
+        assert!(
+            out.sql
+                .contains("NOT (\"t2\".\"target\" = ANY((SELECT \"id\" FROM \"ps\")))"),
+            "{}",
+            out.sql
+        );
+    }
+
+    /// A binding of one row is still one value, so the comparison stays one.
+    #[test]
+    fn comparing_a_multilink_to_a_single_row_binding_stays_an_equality() {
+        let out = compile_and_emit("WITH p := (SELECT Post LIMIT 1) SELECT Person FILTER .posts = p");
+        assert!(
+            out.sql.contains("\"target\" = (SELECT \"id\" FROM \"p\")"),
+            "{}",
+            out.sql
+        );
+    }
+
     /// `select a in b` over two bindings asks the question once per element of
     /// `a`, so `a` is the row source. Read as a plain value the left side
     /// became a scalar subquery over the whole binding, which Postgres aborts

@@ -406,7 +406,9 @@ fn per_element_of_one_multilink(condition: &Expr, td: &TypeDescriptor) -> Option
                 if *link.get_or_insert_with(|| prefix.clone()) != prefix {
                     return None;
                 }
-                // The link itself (`.posts = p`) already compares per element.
+                // A condition on the link itself (`.posts = p`, no tail) has
+                // no element to rebind; `all` over one takes the per-element
+                // route in `try_elementwise_in` instead.
                 let rest = p.steps[split..].to_vec();
                 if rest.is_empty() {
                     return None;
@@ -420,7 +422,15 @@ fn per_element_of_one_multilink(condition: &Expr, td: &TypeDescriptor) -> Option
             Expr::BinOp(b) => Expr::BinOp(Box::new(ast::BinOp {
                 left: rewrite(&b.left, link)?,
                 op: b.op.clone(),
-                right: rewrite(&b.right, link)?,
+                // A set literal on the right of `in` is the haystack the test
+                // reads, not a second set the quantifier ranges over, so it
+                // carries through whole. Rewritten as an ordinary operand it
+                // would be refused below, which is what made `all(.posts.title
+                // in {'a', 'b'})` fall back to the `any` reading.
+                right: match (&b.op, &b.right) {
+                    (ast::BinOpKind::In | ast::BinOpKind::NotIn, set @ Expr::Set(_)) => set.clone(),
+                    (_, other) => rewrite(other, link)?,
+                },
             })),
             Expr::UnaryOp(u) => Expr::UnaryOp(Box::new(ast::UnaryOp {
                 op: u.op.clone(),
@@ -1545,6 +1555,11 @@ struct Compiler<'a> {
     /// set-valued comparison in one of those *is* the explicit intent the
     /// multi-link FILTER warning asks for, so the warning stays quiet inside.
     explicit_set_depth: usize,
+    /// Of those, the `all()` ones. `any()` is what an EXISTS already says, so
+    /// a set-valued comparison may fold into one there; `all()` needs the
+    /// answers one at a time to reduce them, since an EXISTS over a negated
+    /// test is not the same question. See `try_elementwise_in`.
+    universal_set_depth: usize,
     /// User-configurable session options — see `SessionConfig`. Always
     /// `default()` for every entry point except `compile_with_config`.
     config: crate::ir::SessionConfig,
@@ -1661,6 +1676,7 @@ impl<'a> Compiler<'a> {
             nested_cte_counter: 0,
             warnings: vec![],
             explicit_set_depth: 0,
+            universal_set_depth: 0,
             config,
             implicit_id_in_shapes: true,
             value_position: false,
@@ -13490,14 +13506,21 @@ impl<'a> Compiler<'a> {
                 let is_explicit_set = f.module.as_deref().unwrap_or("std") == "std"
                     && matches!(f.name.as_str(), "any" | "all")
                     && f.args.len() == 1;
+                let is_universal = is_explicit_set && f.name == "all";
                 if is_explicit_set {
                     self.explicit_set_depth += 1;
+                }
+                if is_universal {
+                    self.universal_set_depth += 1;
                 }
                 let args = f
                     .args
                     .iter()
                     .map(|a| self.compile_expr_ctx(a, ctx))
                     .collect::<Result<Vec<_>, _>>();
+                if is_universal {
+                    self.universal_set_depth -= 1;
+                }
                 if is_explicit_set {
                     self.explicit_set_depth -= 1;
                 }
@@ -14928,7 +14951,7 @@ impl<'a> Compiler<'a> {
         } else {
             return Ok(None);
         };
-        let value_expr = self.compile_expr(value_ast, td, alias)?;
+        let value_expr = self.compile_comparison_value(value_ast, &b.op, td, alias)?;
         let current_qname = format!("{}::{}", td.module, td.name);
         let exists = self.compile_backlink_as_exists(
             path_steps,
@@ -15405,7 +15428,7 @@ impl<'a> Compiler<'a> {
                     column: prop.name.clone(),
                     pg_type: prop.pg_type.clone(),
                 };
-                return Ok(Some(Self::apply_comparison(col, comparison)));
+                return Ok(Some(self.apply_comparison(col, comparison)));
             }
             if let Some(link) = Self::resolve_link(target_td, pointer_name) {
                 let col = if link.is_junction_backed() {
@@ -15417,7 +15440,7 @@ impl<'a> Compiler<'a> {
                         pg_type: "uuid".to_string(),
                     }
                 };
-                return Ok(Some(Self::apply_comparison(col, comparison)));
+                return Ok(Some(self.apply_comparison(col, comparison)));
             }
             // Not a property or a link: a multi-link has no single column to
             // read, so it falls through to the general tail walk below, which
@@ -15457,7 +15480,7 @@ impl<'a> Compiler<'a> {
                     column: prop.name.clone(),
                     pg_type: prop.pg_type.clone(),
                 };
-                let prop_cond = Self::apply_comparison(col, comparison);
+                let prop_cond = self.apply_comparison(col, comparison);
                 let full = IrExpr::BinOp(Box::new(IrBinOp {
                     left: id_cond,
                     op: ast::BinOpKind::And,
@@ -15488,25 +15511,33 @@ impl<'a> Compiler<'a> {
             partial: true,
         };
         let walked = self.compile_path(&tail, target_td, t_alias)?;
-        Ok(Some(Self::apply_comparison(walked, comparison)))
+        Ok(Some(self.apply_comparison(walked, comparison)))
+    }
+
+    /// Whether `e` stands for a *set* rather than one value: a walk gathered
+    /// as an array, or a `with` binding of more than one row, which arrives as
+    /// a reference to its CTE. Reading only the first of those left `filter
+    /// .posts = ps` comparing against `(SELECT id FROM ps)` — one value, and
+    /// an error from Postgres as soon as the binding held two.
+    fn is_set_expr(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::ArrayFromSelect(_) => true,
+            IrExpr::CteRef { name, .. } => self.multi_row_ctes.contains(name),
+            _ => false,
+        }
     }
 
     /// Apply an optional comparison to a column ref, defaulting to IS NOT NULL.
-    fn apply_comparison(col: IrExpr, comparison: Option<(ast::BinOpKind, IrExpr, bool)>) -> IrExpr {
+    fn apply_comparison(&self, col: IrExpr, comparison: Option<(ast::BinOpKind, IrExpr, bool)>) -> IrExpr {
+        let is_set = |e: &IrExpr| self.is_set_expr(e);
         match comparison {
             Some((op, val, flip)) => {
                 let (l, r) = if flip { (val, col) } else { (col, val) };
                 // A walk that crosses a multi-link stands for a *set*, which
                 // an equality holds against when any element matches — the
                 // same reading `compile_expr_ctx` gives one anywhere else.
-                if matches!(op, ast::BinOpKind::Eq | ast::BinOpKind::Ne)
-                    && matches!(l, IrExpr::ArrayFromSelect(_)) != matches!(r, IrExpr::ArrayFromSelect(_))
-                {
-                    let (value, set) = if matches!(r, IrExpr::ArrayFromSelect(_)) {
-                        (l, r)
-                    } else {
-                        (r, l)
-                    };
+                if matches!(op, ast::BinOpKind::Eq | ast::BinOpKind::Ne) && is_set(&l) != is_set(&r) {
+                    let (value, set) = if is_set(&r) { (l, r) } else { (r, l) };
                     let membership = IrExpr::BinOp(Box::new(IrBinOp {
                         left: value,
                         op: ast::BinOpKind::In,
@@ -15527,6 +15558,33 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The other side of a comparison whose path crosses a multi-link or a
+    /// backlink, ready to sit inside the EXISTS that walk becomes.
+    ///
+    /// A set literal is meaningless as an expression anywhere else, so the
+    /// general compiler hard-errors on one — but on the right of `in` it is
+    /// exactly the array `= ANY(…)` wants, the same reading the `In`/`NotIn`
+    /// arm of `compile_expr_ctx` gives it. Without this, `filter .posts.title
+    /// in {'a', 'b'}` failed to compile at all: the walk reaches this builder
+    /// before that arm is ever tried.
+    fn compile_comparison_value(
+        &mut self,
+        value: &Expr,
+        op: &ast::BinOpKind,
+        td: &TypeDescriptor,
+        alias: &str,
+    ) -> Result<IrExpr, PyQLError> {
+        match value {
+            Expr::Set(elems) if matches!(op, ast::BinOpKind::In | ast::BinOpKind::NotIn) => Ok(IrExpr::Array(
+                elems
+                    .iter()
+                    .map(|e| self.compile_expr(e, td, alias))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            other => self.compile_expr(other, td, alias),
+        }
+    }
+
     /// `X in Y` where `X` is a set and a *value* is what the position wants:
     /// one boolean per element of `X`, gathered as the array every other
     /// multi-valued expression comes back as. `Y` is the set membership is
@@ -15542,7 +15600,13 @@ impl<'a> Compiler<'a> {
         b: &ast::BinOp,
         ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<Option<IrExpr>, PyQLError> {
-        if !matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn) {
+        // `=`/`!=` against a *set* is the same membership question spelled
+        // differently — the reading `apply_comparison` already gives it — so
+        // `all(.posts = ps)` has to answer per element too. Whether the other
+        // side really is a set is only known once compiled, which the walk arm
+        // below checks; the bare-binding arm takes `in` alone.
+        let membership = matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn);
+        if !membership && !matches!(b.op, ast::BinOpKind::Eq | ast::BinOpKind::Ne) {
             return Ok(None);
         }
         // `individuals in accounts` — the left operand is the whole set a
@@ -15556,7 +15620,8 @@ impl<'a> Compiler<'a> {
         // reduced back to one, and it has the same set to reduce either way.
         // A walk (below) has an EXISTS to fold into instead, which says the
         // same thing more directly, so only this arm needs the quantifier.
-        if (self.value_position || self.explicit_set_depth > 0)
+        if membership
+            && (self.value_position || self.explicit_set_depth > 0)
             && let Some(root) = self.object_set_name(&b.left)
         {
             let rewritten = Expr::BinOp(Box::new(ast::BinOp {
@@ -15580,7 +15645,11 @@ impl<'a> Compiler<'a> {
                 Box::new(ps),
             )))));
         }
-        if !self.value_position {
+        // A walk answers `any` with an EXISTS over its junction, which says
+        // the same thing more directly, so outside a value position it only
+        // takes the per-element route for `all` — where an EXISTS is the
+        // wrong question and the answers have to be reduced one at a time.
+        if !self.value_position && self.universal_set_depth == 0 {
             return Ok(None);
         }
         let Some((td, _)) = ctx else { return Ok(None) };
@@ -15626,6 +15695,13 @@ impl<'a> Compiler<'a> {
             ),
             other => self.compile_expr_ctx(other, ctx)?,
         };
+        // An equality earns this route only by really being a membership
+        // test; against a single value it is an ordinary comparison, which
+        // the EXISTS fold below already reads correctly.
+        if !membership && !self.is_set_expr(&right) {
+            self.hoisted_ctes.truncate(hoisted);
+            return Ok(None);
+        }
         // Objects are compared by identity, which is the id the walk's last
         // step lands on — the same reading `in` gives them anywhere else.
         let element = match &ps.result {
@@ -15636,14 +15712,10 @@ impl<'a> Compiler<'a> {
                 pg_type: "uuid".to_string(),
             },
         };
-        ps.result = IrPathResult::Scalar(
-            IrExpr::BinOp(Box::new(IrBinOp {
-                left: element,
-                op: b.op.clone(),
-                right,
-            })),
-            None,
-        );
+        // `apply_comparison` turns the equality into the membership it stands
+        // for; `in` it leaves alone.
+        let per_element = self.apply_comparison(element, Some((b.op.clone(), right, false)));
+        ps.result = IrPathResult::Scalar(per_element, None);
         Ok(Some(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(ps)))))
     }
 
@@ -15696,7 +15768,7 @@ impl<'a> Compiler<'a> {
             return Ok(None);
         };
 
-        let value_expr = self.compile_expr(value_ast, td, alias)?;
+        let value_expr = self.compile_comparison_value(value_ast, &b.op, td, alias)?;
         let ml_name = match &path_steps[0] {
             ast::PathStep::Name(n) => n.clone(),
             _ => return Ok(None),
@@ -15875,12 +15947,11 @@ impl<'a> Compiler<'a> {
                 column: jt_tgt_col.to_string(),
                 pg_type: "uuid".to_string(),
             };
-            let (left, right) = if flip {
-                (value_expr, col_ref)
-            } else {
-                (col_ref, value_expr)
-            };
-            return Ok(IrExpr::BinOp(Box::new(IrBinOp { left, op, right })));
+            // Through `apply_comparison` rather than built here, so an
+            // equality against a *set* — a binding of more than one row —
+            // reads as membership instead of comparing against the one value
+            // a scalar subquery can return.
+            return Ok(self.apply_comparison(col_ref, Some((op, value_expr, flip))));
         }
 
         // `.emails[is account::Email].email` — an intersection narrows what the

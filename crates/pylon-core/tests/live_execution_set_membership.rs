@@ -352,3 +352,107 @@ async fn a_multilinks_membership_in_a_filter_keeps_its_single_verdict() {
     .await;
     assert_eq!(field(&found, 2), vec![DecodedValue::Str("pro".into())]);
 }
+
+/// A quantifier in a FILTER has to ask its own question: `all` used to fold
+/// into the same bare EXISTS over the junction as `any`, which answers "some
+/// element matches" — so `all` silently agreed with `any` on every row. Only
+/// `basic` requires nothing but licensed addons; both licences require at
+/// least one.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn all_and_any_in_a_filter_select_different_rows() {
+    let (module, schema, pool) = setup().await;
+    seed(&pool, &schema, &module).await;
+
+    let names = |found: &[DecodedValue]| {
+        let mut names: Vec<String> = field(found, 2)
+            .into_iter()
+            .map(|v| match v {
+                DecodedValue::Str(s) => s,
+                other => panic!("expected a name, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Spelled with `in`, and with the `=` that means the same membership.
+    for condition in ["in licensed", "= licensed"] {
+        let query = |quantifier: &str| {
+            format!(
+                "with licensed := (select {module}::Addon filter .name in {{'backup', 'audit'}}) \
+                 select {module}::Licence {{ name }} filter {quantifier}(.required_addons {condition})"
+            )
+        };
+        assert_eq!(
+            names(&rows(&pool, &schema, &query("all")).await),
+            vec!["basic"],
+            "{condition}"
+        );
+        assert_eq!(
+            names(&rows(&pool, &schema, &query("any")).await),
+            vec!["basic", "pro"],
+            "{condition}"
+        );
+    }
+}
+
+/// A walk with a tail takes the other `all` shape — one EXISTS with the test
+/// negated around each element — and a set literal is a haystack it can be
+/// tested against at all, which used to fail to compile outright.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn all_over_a_walk_with_a_tail_tests_every_element() {
+    let (module, schema, pool) = setup().await;
+    seed(&pool, &schema, &module).await;
+
+    let names = |found: &[DecodedValue]| {
+        let mut names: Vec<String> = field(found, 2)
+            .into_iter()
+            .map(|v| match v {
+                DecodedValue::Str(s) => s,
+                other => panic!("expected a name, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!("select {module}::Licence {{ name }} filter all(.required_addons.name in {{'backup', 'audit'}})"),
+    )
+    .await;
+    assert_eq!(names(&found), vec!["basic"]);
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!("select {module}::Licence {{ name }} filter any(.required_addons.name in {{'backup', 'audit'}})"),
+    )
+    .await;
+    assert_eq!(names(&found), vec!["basic", "pro"]);
+}
+
+/// Comparing the link to a binding of more than one row is membership, not a
+/// comparison against the one value a scalar subquery can return — which
+/// Postgres aborted on ("more than one row returned by a subquery used as an
+/// expression") the moment the binding held two.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn comparing_a_multilink_to_a_multi_row_binding_runs() {
+    let (module, schema, pool) = setup().await;
+    seed(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "with licensed := (select {module}::Addon filter .name in {{'sso', 'audit'}}) \
+             select {module}::Licence {{ name }} filter .required_addons = licensed"
+        ),
+    )
+    .await;
+    assert_eq!(field(&found, 2), vec![DecodedValue::Str("pro".into())]);
+}
