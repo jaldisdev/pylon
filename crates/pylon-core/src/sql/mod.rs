@@ -6177,6 +6177,133 @@ mod tests {
         emit(&ir)
     }
 
+    /// `select a in b` over two bindings asks the question once per element of
+    /// `a`, so `a` is the row source. Read as a plain value the left side
+    /// became a scalar subquery over the whole binding, which Postgres aborts
+    /// on the moment it holds more than one row ("more than one row returned
+    /// by a subquery used as an expression").
+    #[test]
+    fn membership_of_one_set_in_another_answers_per_element() {
+        let out = compile_and_emit("WITH a := (SELECT Person), b := (SELECT Person) SELECT a IN b");
+        assert!(
+            out.sql.contains("FROM \"a\""),
+            "the left set is the source:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"id\" = ANY((SELECT \"id\" FROM \"b\"))"),
+            "each row tests its own id:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("(SELECT \"id\" FROM \"a\") = ANY"),
+            "the left set must not collapse to one value:\n{}",
+            out.sql
+        );
+    }
+
+    /// The same question asked of a type rather than a binding.
+    #[test]
+    fn membership_of_a_type_in_a_set_answers_per_row() {
+        let out = compile_and_emit("WITH b := (SELECT Person) SELECT Person NOT IN b");
+        assert!(
+            out.sql.contains("FROM \"public\".\"Person\""),
+            "the type is the source:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"id\" <> ALL((SELECT \"id\" FROM \"b\"))"),
+            "{}",
+            out.sql
+        );
+    }
+
+    /// A quantifier reduces those per-element answers to one, so the set it
+    /// reduces still has to be built per element: the left binding must not
+    /// collapse into the one value a scalar subquery reads.
+    #[test]
+    fn quantifying_membership_of_one_set_in_another_aggregates_the_elements() {
+        for (query, aggregate) in [("SELECT all(a IN b)", "bool_and"), ("SELECT any(a IN b)", "bool_or")] {
+            let out = compile_and_emit(&format!("WITH a := (SELECT Person), b := (SELECT Person) {query}"));
+            assert!(
+                out.sql.contains(&format!("{aggregate}(\"_s\".\"v\")")),
+                "{query}:\n{}",
+                out.sql
+            );
+            assert!(
+                out.sql.contains("FROM unnest(ARRAY(SELECT ("),
+                "one answer per element, then reduced — {query}:\n{}",
+                out.sql
+            );
+            assert!(
+                !out.sql.contains("(SELECT \"id\" FROM \"a\") = ANY"),
+                "the left set must not collapse to one value — {query}:\n{}",
+                out.sql
+            );
+        }
+    }
+
+    /// `t := .posts in ps` is a set of booleans, one per post — the same array
+    /// any other multi-valued computed comes back as. Collapsed to an EXISTS it
+    /// answered once for the whole link, which is what `any(…)` spells.
+    #[test]
+    fn membership_of_a_multilink_is_a_boolean_per_element() {
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person { t := .posts IN ps }");
+        assert!(
+            out.sql
+                .contains("ARRAY(SELECT (\"t3\".\"id\" = ANY((SELECT \"id\" FROM \"ps\")))"),
+            "one answer per post:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("EXISTS("),
+            "not one answer for the link:\n{}",
+            out.sql
+        );
+    }
+
+    /// A FILTER wants a single boolean out of the whole set, which is the
+    /// EXISTS the element-wise reading above must not take away.
+    #[test]
+    fn membership_of_a_multilink_in_a_filter_stays_one_answer() {
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person FILTER .posts IN ps");
+        assert!(out.sql.contains("WHERE EXISTS("), "{}", out.sql);
+    }
+
+    /// And `all(…)`/`any(…)` are how a computed asks for that single boolean:
+    /// the quantifier ranges over the set's elements, not over the rows of the
+    /// query the array was built in.
+    #[test]
+    fn quantifying_membership_of_a_multilink_aggregates_its_elements() {
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person { t := all(.posts IN ps) }");
+        assert!(
+            out.sql
+                .contains("coalesce(bool_and(\"_s\".\"v\"), true) FROM unnest(ARRAY(SELECT ("),
+            "{}",
+            out.sql
+        );
+        let out = compile_and_emit("WITH ps := (SELECT Post) SELECT Person { t := any(.posts IN ps) }");
+        assert!(
+            out.sql
+                .contains("coalesce(bool_or(\"_s\".\"v\"), false) FROM unnest(ARRAY(SELECT ("),
+            "{}",
+            out.sql
+        );
+    }
+
+    /// A set *literal* on the right is still the array `= ANY(…)` wants, even
+    /// once the left is walked element by element.
+    #[test]
+    fn membership_in_a_set_literal_answers_per_element() {
+        let out = compile_and_emit("SELECT Person { t := .posts.title IN {'a', 'b'} }");
+        assert!(
+            out.sql
+                .contains("ARRAY(SELECT (\"t2\".\"title\" = ANY(ARRAY['a', 'b']))"),
+            "{}",
+            out.sql
+        );
+    }
+
     /// `select (for x in S union (insert T { … })) { … }` — a shape, or any
     /// clause of the select's own, stops the loop from simply *being* the
     /// statement, so the loop becomes this select's source. Emitted as one it

@@ -1555,6 +1555,13 @@ struct Compiler<'a> {
     /// would break, and under a cast to `json`, which is an output sink whose
     /// text an added key would change.
     implicit_id_in_shapes: bool,
+    /// Whether the expression being compiled stands where a *value* is
+    /// expected — a computed pointer's right-hand side, say — rather than
+    /// where a condition is. `in` asks its question once per element of its
+    /// left operand, so over a set it yields a set of booleans; only a
+    /// condition collapses that set to the single "any of them" answer an
+    /// EXISTS gives. Set by `in_value_position`, cleared by `as_condition`.
+    value_position: bool,
 }
 
 /// One schema-bound select in the enclosing chain — see `Compiler::anchors`.
@@ -1656,6 +1663,7 @@ impl<'a> Compiler<'a> {
             explicit_set_depth: 0,
             config,
             implicit_id_in_shapes: true,
+            value_position: false,
             anchors: Vec::new(),
             link_prop_scope: Vec::new(),
             hoisted_ctes: Vec::new(),
@@ -3669,6 +3677,29 @@ impl<'a> Compiler<'a> {
                         lock: None,
                     }));
                 }
+                // `select individuals in accounts` — `in` answers once per
+                // element of the set on its left, so that set is this
+                // select's row source and the membership test is what each
+                // row carries. Read as a plain value the left side collapses
+                // into a single scalar subquery, which Postgres rejects the
+                // moment the binding holds more than one row. The comparison
+                // is on identity, so the walk the source needs is `.id`.
+                if let Expr::BinOp(b) = result
+                    && matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn)
+                    && let Some(root) = self.object_set_name(&b.left)
+                {
+                    let rewritten = Expr::BinOp(Box::new(ast::BinOp {
+                        left: Expr::Path(ast::Path {
+                            steps: vec![ast::PathStep::Name(root.clone()), ast::PathStep::Name("id".into())],
+                            partial: false,
+                        }),
+                        op: b.op.clone(),
+                        right: b.right.clone(),
+                    }));
+                    return self
+                        .compile_expr_as_path_select(s, &rewritten, &root, distinct)
+                        .map(IrStmt::PathSelect);
+                }
                 // Expression containing a type-rooted path: `select fn(TypeName.link.prop, ...)`.
                 if let Some(root) = self.find_path_root_in_expr(result) {
                     return self
@@ -4080,7 +4111,7 @@ impl<'a> Compiler<'a> {
             // on, which is the one just processed.
             while let Some(pos) = pending_filters.iter().position(|(i, _)| *i + 1 == idx) {
                 let (_, f) = pending_filters.remove(pos);
-                let cond = self.compile_expr(&f, current_td, &current_alias)?;
+                let cond = self.as_condition(|c| c.compile_expr(&f, current_td, &current_alias))?;
                 extra_conditions.push(cond);
             }
 
@@ -4791,7 +4822,7 @@ impl<'a> Compiler<'a> {
                         target,
                     });
                     if let Some(f) = modifiers.and_then(|m| m.filter.clone()) {
-                        let cond = self.compile_expr(&f, target_td, &target_alias)?;
+                        let cond = self.as_condition(|c| c.compile_expr(&f, target_td, &target_alias))?;
                         extra_conditions.push(cond);
                     }
                     if is_last(0) {
@@ -4989,7 +5020,7 @@ impl<'a> Compiler<'a> {
         let filter = sel
             .filter
             .as_ref()
-            .map(|f| self.compile_expr(f, td, alias))
+            .map(|f| self.as_condition(|c| c.compile_expr(f, td, alias)))
             .transpose()?;
         let order_by = sel
             .order_by
@@ -5010,6 +5041,35 @@ impl<'a> Compiler<'a> {
     }
 
     // ── Expression-over-type dispatch ─────────────────────────────────────────────
+
+    /// The name of the set of objects `expr` stands for, when it is nothing
+    /// but that name: a `with` binding of objects, or a type. Anything that
+    /// walks off one (`accounts.owner`) is a path, not the set itself, and
+    /// `find_path_root_in_expr` is what reads those.
+    fn object_set_name(&self, expr: &Expr) -> Option<String> {
+        let Expr::Path(p) = expr else { return None };
+        if p.partial || p.steps.len() != 1 {
+            return None;
+        }
+        let ast::PathStep::Name(name) = &p.steps[0] else {
+            return None;
+        };
+        if self.cte_object_type(name).is_some() {
+            return Some(name.clone());
+        }
+        // A bare name is a type only when nothing nearer claims it — the same
+        // precedence `resolve_name_ref` gives for-vars, bindings and function
+        // parameters over a schema type of the same name.
+        let bound = self.for_vars.contains_key(name)
+            || self.cte_free_items.contains_key(name)
+            || self.inline_bindings.contains_key(name)
+            || self.cte_types.contains_key(name)
+            || self.fn_params.contains_key(name);
+        if !bound && self.resolve_type(name).is_ok() {
+            return Some(name.clone());
+        }
+        None
+    }
 
     /// Recursively find the first absolute path (non-partial, multi-step) in an expression
     /// and return its root type name if it resolves to a known schema type.
@@ -6211,6 +6271,10 @@ impl<'a> Compiler<'a> {
     /// reading PyQL gives it, and the reason for the warning: a filter is
     /// meant to be one boolean, and `any()` says so outright.
     fn compile_free_filter(&mut self, filter: &Expr) -> Result<IrExpr, PyQLError> {
+        self.as_condition(|c| c.compile_free_filter_inner(filter))
+    }
+
+    fn compile_free_filter_inner(&mut self, filter: &Expr) -> Result<IrExpr, PyQLError> {
         let Some(root) = self.find_path_root_in_expr(filter) else {
             return self.compile_free_expr(filter);
         };
@@ -6917,7 +6981,7 @@ impl<'a> Compiler<'a> {
             let filter = sel
                 .filter
                 .as_ref()
-                .map(|f| compiler.compile_expr(f, td, &alias))
+                .map(|f| compiler.as_condition(|c| c.compile_expr(f, td, &alias)))
                 .transpose()?;
             let order_by = sel
                 .order_by
@@ -8684,7 +8748,7 @@ impl<'a> Compiler<'a> {
         let declared_filter = upd
             .filter
             .as_ref()
-            .map(|f| self.compile_expr(f, td, &alias))
+            .map(|f| self.as_condition(|c| c.compile_expr(f, td, &alias)))
             .transpose()?;
         let filter = match bound_rows {
             Some(_) => {
@@ -9504,7 +9568,7 @@ impl<'a> Compiler<'a> {
         let declared_filter = del
             .filter
             .as_ref()
-            .map(|f| self.compile_expr(f, td, &alias))
+            .map(|f| self.as_condition(|c| c.compile_expr(f, td, &alias)))
             .transpose()?;
         let filter = match bound_rows {
             Some(_) => {
@@ -10303,7 +10367,7 @@ impl<'a> Compiler<'a> {
             // form rather than the single value a boolean position takes.
             let ir = match compexpr {
                 Expr::TypeIs { expr, ty } => self.compile_type_is_set(expr, ty, Some((td, alias)))?,
-                _ => self.compile_expr(compexpr, td, alias)?,
+                _ => self.in_value_position(|c| c.compile_expr(compexpr, td, alias))?,
             };
             // Cross-scope TypeIs: promote to set-valued shape pointer.
             if let IrExpr::ArrayFromSelect(src) = ir {
@@ -10996,7 +11060,7 @@ impl<'a> Compiler<'a> {
                     expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectFunction(Box::new(fs)))),
                 }));
             }
-            let ir = compiler.compile_expr(expr_ast, td, alias)?;
+            let ir = compiler.in_value_position(|c| c.compile_expr(expr_ast, td, alias))?;
             Ok(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset,
                 alias: name.to_string(),
@@ -12188,6 +12252,27 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Run `f` with `value_position` set — the expression it compiles stands
+    /// where a value is expected, so a set-valued `in` keeps its one answer
+    /// per element instead of collapsing to an EXISTS.
+    fn in_value_position<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.value_position, true);
+        let result = f(self);
+        self.value_position = previous;
+        result
+    }
+
+    /// Run `f` with `value_position` cleared — a FILTER, or any other place
+    /// that wants a single boolean out of the whole set. A computed pointer's
+    /// expression may carry a sub-select with a filter of its own, so the flag
+    /// has to be taken back off on the way down, not just put on at the top.
+    fn as_condition<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.value_position, false);
+        let result = f(self);
+        self.value_position = previous;
+        result
+    }
+
     /// Single expression compiler for both free and schema-bound contexts.
     /// `ctx = Some((td, alias))` when a schema type + SQL alias are in scope
     /// (enables `.property`/`.link` resolution via `compile_path`); `ctx =
@@ -12492,6 +12577,15 @@ impl<'a> Compiler<'a> {
                         | ast::BinOpKind::Coalesce
                         | ast::BinOpKind::Concat
                 );
+                // `addons := .required_addons in licensed_addons` — `in` is
+                // asked once per element of the set on its left, so where a
+                // value is wanted it answers with a set of booleans, not with
+                // the single "any of them" the EXISTS below would give. That
+                // one is still what a FILTER means, and `all(…)`/`any(…)` are
+                // how a query asks for it here.
+                if let Some(elementwise) = self.try_elementwise_in(b, ctx)? {
+                    return Ok(elementwise);
+                }
                 if let Some((td, alias)) = ctx
                     && !yields_values
                 {
@@ -13407,7 +13501,32 @@ impl<'a> Compiler<'a> {
                 if is_explicit_set {
                     self.explicit_set_depth -= 1;
                 }
-                self.resolve_fn_call(f.module.as_deref(), &f.name, args?)
+                let args = args?;
+                // `all(.required_addons in licensed_addons)` — the argument is
+                // a set of booleans, gathered as an array the way every other
+                // multi-valued expression is, and the quantifier ranges over
+                // its elements. Handed the array itself, `bool_and` would
+                // aggregate the enclosing query's rows instead.
+                if is_explicit_set
+                    && let [values] = args.as_slice()
+                    && yields_array(values)
+                {
+                    let (aggregate, over_nothing) = if f.name == "all" {
+                        ("bool_and", "true")
+                    } else {
+                        ("bool_or", "false")
+                    };
+                    return Ok(IrExpr::FunctionCall(IrFunctionCall {
+                        return_pg_type: None,
+                        schema: None,
+                        name: aggregate.to_string(),
+                        args: vec![values.clone()],
+                        sql_template: Some(format!(
+                            "(SELECT coalesce({aggregate}(\"_s\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_s\"(\"v\"))"
+                        )),
+                    }));
+                }
+                self.resolve_fn_call(f.module.as_deref(), &f.name, args)
             }
 
             Expr::UnaryOp(u) if u.op == ast::UnaryOpKind::Exists => self.compile_exists_ctx(&u.operand, ctx),
@@ -15408,6 +15527,126 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// `X in Y` where `X` is a set and a *value* is what the position wants:
+    /// one boolean per element of `X`, gathered as the array every other
+    /// multi-valued expression comes back as. `Y` is the set membership is
+    /// tested against, so it stays whole.
+    ///
+    /// Only the left operand's walk is rebuilt — it already compiles to
+    /// `ARRAY(SELECT <element> FROM <walk>)`, and what this does is move the
+    /// comparison inside that select, where it is made once per row rather
+    /// than once for the array. `Ok(None)` for anything else, including every
+    /// condition position, which still collapses to the EXISTS below.
+    fn try_elementwise_in(
+        &mut self,
+        b: &ast::BinOp,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<Option<IrExpr>, PyQLError> {
+        if !matches!(b.op, ast::BinOpKind::In | ast::BinOpKind::NotIn) {
+            return Ok(None);
+        }
+        // `individuals in accounts` — the left operand is the whole set a
+        // binding or a type names, so what answers per element is a select
+        // over that set. Available with or without a schema type in scope,
+        // since neither operand needs one.
+        //
+        // A quantifier's argument is a set position by definition, so this
+        // holds inside one whether or not the surrounding position asked for
+        // a value: `any(individuals in accounts)` is how those answers are
+        // reduced back to one, and it has the same set to reduce either way.
+        // A walk (below) has an EXISTS to fold into instead, which says the
+        // same thing more directly, so only this arm needs the quantifier.
+        if (self.value_position || self.explicit_set_depth > 0)
+            && let Some(root) = self.object_set_name(&b.left)
+        {
+            let rewritten = Expr::BinOp(Box::new(ast::BinOp {
+                left: Expr::Path(ast::Path {
+                    steps: vec![ast::PathStep::Name(root.clone()), ast::PathStep::Name("id".into())],
+                    partial: false,
+                }),
+                op: b.op.clone(),
+                right: b.right.clone(),
+            }));
+            let over_the_set = ast::SelectStmt {
+                result: rewritten.clone(),
+                filter: None,
+                order_by: vec![],
+                offset: None,
+                limit: None,
+                lock: None,
+            };
+            let ps = self.compile_expr_as_path_select(&over_the_set, &rewritten, &root, false)?;
+            return Ok(Some(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(
+                Box::new(ps),
+            )))));
+        }
+        if !self.value_position {
+            return Ok(None);
+        }
+        let Some((td, _)) = ctx else { return Ok(None) };
+        // Checked before compiling anything: a walk that turns out to be
+        // single-valued has to reach the ordinary path below, and compiling it
+        // twice would burn aliases and re-hoist whatever it bound.
+        let Expr::Path(p) = &b.left else { return Ok(None) };
+        if !p.partial || !self.path_crosses_multi(td, &p.steps) {
+            return Ok(None);
+        }
+        // The walk is compiled speculatively — whether it can be rebuilt this
+        // way is only visible once it has been — so anything it bound on the
+        // way is rolled back when it turns out it cannot.
+        let hoisted = self.hoisted_ctes.len();
+        let left = self.compile_expr_ctx(&b.left, ctx)?;
+        // A walk onto objects arrives as the bare correlated subquery its rows
+        // are; one onto values arrives already gathered into an array. Either
+        // way what comes back from here is a set of booleans, so both leave as
+        // an array.
+        let mut ps = match left {
+            IrExpr::PathSubquery(ps) | IrExpr::ObjectPathSubquery(ps) => ps,
+            IrExpr::ArrayFromSelect(source) => match *source {
+                IrArraySource::PathSelect(ps) => ps,
+                _ => {
+                    self.hoisted_ctes.truncate(hoisted);
+                    return Ok(None);
+                }
+            },
+            _ => {
+                self.hoisted_ctes.truncate(hoisted);
+                return Ok(None);
+            }
+        };
+        // A set literal on the right is the one expression position one is
+        // meaningful in — see the `In`/`NotIn` arm of `compile_expr_ctx`,
+        // which reads it as the array `= ANY(…)` wants.
+        let right = match &b.right {
+            Expr::Set(elems) => IrExpr::Array(
+                elems
+                    .iter()
+                    .map(|e| self.compile_expr_ctx(e, ctx))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            other => self.compile_expr_ctx(other, ctx)?,
+        };
+        // Objects are compared by identity, which is the id the walk's last
+        // step lands on — the same reading `in` gives them anywhere else.
+        let element = match &ps.result {
+            IrPathResult::Scalar(expr, _) => expr.clone(),
+            IrPathResult::Object { alias, .. } => IrExpr::ColumnRef {
+                alias: alias.clone(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            },
+        };
+        ps.result = IrPathResult::Scalar(
+            IrExpr::BinOp(Box::new(IrBinOp {
+                left: element,
+                op: b.op.clone(),
+                right,
+            })),
+            None,
+        );
+        Ok(Some(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(ps)))))
+    }
+
     /// If `b` has a multi-link path (any depth) on either side, compile as EXISTS over the junction.
     fn try_multilink_exists(
         &mut self,
@@ -16007,7 +16246,7 @@ impl<'a> Compiler<'a> {
         let do_update_where = upd
             .filter
             .as_ref()
-            .map(|f| self.compile_expr(f, upd_td, &table))
+            .map(|f| self.as_condition(|c| c.compile_expr(f, upd_td, &table)))
             .transpose()?;
         // A multi-link cannot be written by `DO UPDATE SET` — junction rows
         // are separate DML. Appending them to the enclosing insert instead
@@ -17574,7 +17813,7 @@ impl<'a> Compiler<'a> {
         // Compile inner_filter_ast (from subquery first arg) now that we have the alias,
         // so property column refs (e.g. `.price`) use the correct table alias.
         let pre_filter: Option<IrExpr> = match inner_filter_ast {
-            Some(ref f) => Some(self.compile_expr(f, &td, &alias)?),
+            Some(ref f) => Some(self.as_condition(|c| c.compile_expr(f, &td, &alias))?),
             None => None,
         };
 
