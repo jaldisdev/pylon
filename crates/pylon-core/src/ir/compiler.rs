@@ -10294,7 +10294,13 @@ impl<'a> Compiler<'a> {
                     expr: IrExpr::ArrayFromSelect(Box::new(IrArraySource::ObjectFunction(Box::new(fs)))),
                 }));
             }
-            let ir = self.compile_expr(compexpr, td, alias)?;
+            // A `T is U` naming a type other than this scope's answers once
+            // per row of `T`; a shape keeps all of them, so ask for the set
+            // form rather than the single value a boolean position takes.
+            let ir = match compexpr {
+                Expr::TypeIs { expr, ty } => self.compile_type_is_set(expr, ty, Some((td, alias)))?,
+                _ => self.compile_expr(compexpr, td, alias)?,
+            };
             // Cross-scope TypeIs: promote to set-valued shape pointer.
             if let IrExpr::ArrayFromSelect(src) = ir {
                 if let IrArraySource::RawExpr {
@@ -13321,8 +13327,8 @@ impl<'a> Compiler<'a> {
                 if f.module.as_deref().unwrap_or("std") == "std"
                     && matches!(f.name.as_str(), "any" | "all")
                     && f.kwargs.is_empty()
-                    && let [arg @ Expr::TypeIs { .. }] = f.args.as_slice()
-                    && let answers @ IrExpr::ArrayFromSelect(_) = self.compile_expr_ctx(arg, ctx)?
+                    && let [Expr::TypeIs { expr: subject, ty }] = f.args.as_slice()
+                    && let answers @ IrExpr::ArrayFromSelect(_) = self.compile_type_is_set(subject, ty, ctx)?
                 {
                     let (aggregate, over_nothing) = if f.name == "all" {
                         ("bool_and", "true")
@@ -13908,6 +13914,37 @@ impl<'a> Compiler<'a> {
         td: &TypeDescriptor,
         alias: &str,
     ) -> Result<IrExpr, PyQLError> {
+        self.compile_type_is_inner(expr, ty, td, alias, false)
+    }
+
+    /// `expr is T` read as every answer it gives rather than as one value:
+    /// naming a type other than the scope's asks the question once per row
+    /// of that type. A shape pointer keeps that whole set and `any()`/`all()`
+    /// fold it, where a boolean position — a FILTER, an `if` condition — can
+    /// only take a single value and goes through `compile_type_is`.
+    fn compile_type_is_set(
+        &mut self,
+        expr: &Expr,
+        ty: &ast::TypeExpr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<IrExpr, PyQLError> {
+        match ctx {
+            Some((td, alias)) => self.compile_type_is_inner(expr, ty, td, alias, true),
+            None => match expr {
+                Expr::Path(p) => self.compile_path_type_is(p, ty, None),
+                _ => Err(self.type_err("'is' type check is not valid in free SELECT context")),
+            },
+        }
+    }
+
+    fn compile_type_is_inner(
+        &mut self,
+        expr: &Expr,
+        ty: &ast::TypeExpr,
+        td: &TypeDescriptor,
+        alias: &str,
+        set_valued: bool,
+    ) -> Result<IrExpr, PyQLError> {
         let self_qname = format!("{}::{}", td.module, td.name);
 
         // `.listing is T`, `x is T`: the objects the path reaches are tested,
@@ -13975,19 +14012,52 @@ impl<'a> Compiler<'a> {
         };
         let bool_expr = self.type_check_bool_expr(&source_qname, &check_qname, src_td, &src_alias);
 
+        // Whenever the answer is the same for every row of the source,
+        // `type_check_bool_expr` settles it with a literal. There is nothing
+        // to iterate then, and a constant is what a boolean position can
+        // consume: `ARRAY(SELECT FALSE FROM "Brand")` is a `boolean[]`, which
+        // Postgres refuses outright as a CASE/WHEN condition or a WHERE
+        // clause.
+        if !set_valued && matches!(bool_expr, IrExpr::Literal(IrLiteral::Bool(_))) {
+            return Ok(bool_expr);
+        }
+
         let source = IrSource {
             poly: None,
-            type_name: source_qname,
+            type_name: source_qname.clone(),
             table: source_table,
             alias: src_alias,
         };
 
-        Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::RawExpr {
+        let answers = IrExpr::ArrayFromSelect(Box::new(IrArraySource::RawExpr {
             source,
             poly_implementors,
             poly_columns,
             expr: bool_expr,
-        })))
+        }));
+        if set_valued {
+            return Ok(answers);
+        }
+        // What is left really does differ per row of the source, so it still
+        // has to collapse to one value here — empty answers nothing, more
+        // than one row aborts. The message says which check asked and over
+        // what, since `assert_single` appears nowhere in the query that
+        // triggers it and its own wording sends the reader looking for a call
+        // they never wrote.
+        Ok(IrExpr::FunctionCall(IrFunctionCall {
+            return_pg_type: None,
+            schema: Some("_pylon".to_string()),
+            name: "assert_single".to_string(),
+            args: vec![
+                answers,
+                IrExpr::Literal(IrLiteral::Str(format!(
+                    "'{source_qname} is {check_qname}' is asked once for every {source_qname} object, \
+                     so it is not the single value a filter or an 'if' condition needs — narrow it to \
+                     one object, or name the type being selected"
+                ))),
+            ],
+            sql_template: None,
+        }))
     }
 
     /// Build the boolean `IrExpr` for `source_qname is check_qname` in the current row's scope.
@@ -13999,10 +14069,36 @@ impl<'a> Compiler<'a> {
             return IrExpr::Literal(IrLiteral::Bool(false));
         }
         // A row is of the checked type when its own type is that type or one
-        // of its subtypes.
-        self.find_poly_implementors(check_qname)
+        // of its subtypes — but only the ones this source can actually hold
+        // are worth asking about, since its rows carry one of *its* own
+        // implementors in `__type__` and nothing else. Across two disjoint
+        // hierarchies (`brand::Brand is brand::CustomBrief`) nothing is left
+        // and the answer is false for every row; where nothing is ruled out
+        // it is true for every row. Both are decided here rather than per
+        // row, which is what keeps a check over another type out of the
+        // per-row machinery in `compile_type_is_inner` — asking it once per
+        // row of a three-row table is what made a filter fail the
+        // single-value check it has to pass.
+        let reachable: Vec<String> = self
+            .find_poly_implementors(source_qname)
             .into_iter()
-            .map(|implementor| {
+            .map(|implementor| implementor.type_name)
+            .collect();
+        let matching: Vec<String> = self
+            .find_poly_implementors(check_qname)
+            .into_iter()
+            .map(|implementor| implementor.type_name)
+            .filter(|type_name| reachable.contains(type_name))
+            .collect();
+        if matching.is_empty() {
+            return IrExpr::Literal(IrLiteral::Bool(false));
+        }
+        if matching.len() == reachable.len() {
+            return IrExpr::Literal(IrLiteral::Bool(true));
+        }
+        matching
+            .into_iter()
+            .map(|type_name| {
                 IrExpr::BinOp(Box::new(IrBinOp {
                     left: IrExpr::ColumnRef {
                         alias: alias.to_string(),
@@ -14010,7 +14106,7 @@ impl<'a> Compiler<'a> {
                         pg_type: "text".into(),
                     },
                     op: crate::parse::ast::BinOpKind::Eq,
-                    right: IrExpr::Literal(IrLiteral::Str(implementor.type_name)),
+                    right: IrExpr::Literal(IrLiteral::Str(type_name)),
                 }))
             })
             .reduce(|left, right| {

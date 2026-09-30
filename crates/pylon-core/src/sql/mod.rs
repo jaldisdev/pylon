@@ -6877,6 +6877,142 @@ mod tests {
         );
     }
 
+    /// The interface schema plus a type outside its hierarchy, so a query
+    /// over that type can name the interface and get one answer per row of
+    /// it rather than a same-scope check. `Account` also gains a second
+    /// implementor: with only `Individual` under it, `Account is Individual`
+    /// holds for every row and is settled without reading any, which is the
+    /// answer but not the case these tests are about.
+    fn make_interface_schema_with_an_outsider() -> SchemaDescriptor {
+        let mut schema = make_interface_schema();
+        let individual = schema
+            .types
+            .iter()
+            .find(|t| t.name == "Individual")
+            .expect("Individual is in the interface schema")
+            .clone();
+        let mut company = individual.clone();
+        company.name = "Company".into();
+        company.table = "Company".into();
+        company.interfaces = vec![];
+        company.computed = vec![];
+        schema.types.push(company);
+        let mut organisation = individual;
+        organisation.name = "Organisation".into();
+        organisation.table = "Organisation".into();
+        organisation.computed = vec![];
+        schema.types.push(organisation);
+        schema
+    }
+
+    #[test]
+    fn a_type_check_naming_another_type_reads_as_one_value_in_a_filter() {
+        // jaldis's own: `filter (… if brand::Brand is brand::CustomBrief else
+        // true)` inside `select brand::Brief`. Naming a type other than the
+        // one being selected asks the question once per row of that type,
+        // which came out as `ARRAY(SELECT …)` — a `boolean[]`, which Postgres
+        // refuses outright as a CASE/WHEN condition. `Company` is not
+        // polymorphic, so every row answers the same and the check is the
+        // constant it reads as.
+        let out = compile_and_emit(
+            "SELECT Person { name } FILTER (.name = 'a' if default::Company is default::Post else FALSE)",
+        );
+        assert!(
+            !out.sql.contains("ARRAY(SELECT"),
+            "an answer that is the same for every row has nothing to iterate:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("CASE WHEN FALSE"),
+            "a Company is never a Post:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_polymorphic_type_is_never_one_from_a_hierarchy_it_shares_nothing_with() {
+        // jaldis's own again, and the half the first fix missed: their
+        // `brand::Brand` is itself an interface, so it is polymorphic and the
+        // check did *not* fold — it became one answer per Brand row, and with
+        // three of them the filter failed the single-value check at runtime.
+        // No row of one hierarchy can ever carry a `__type__` from a disjoint
+        // one, so the answer is false without reading any.
+        let schema = make_interface_schema_with_an_outsider();
+        let out = compile_and_emit_with(
+            "SELECT Company { id } FILTER (.first_name = 'a' if default::Account is default::Company else FALSE)",
+            &schema,
+        );
+        assert!(
+            !out.sql.contains("assert_single") && !out.sql.contains("ARRAY(SELECT"),
+            "nothing to ask per row when the hierarchies are disjoint:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("CASE WHEN FALSE"),
+            "an Account is never a Company:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_check_covering_every_implementor_holds_without_reading_a_row() {
+        // The mirror of the disjoint case: `Individual` and `Organisation`
+        // are all there is under `Account`, so naming both leaves nothing
+        // that could answer differently.
+        let mut schema = make_interface_schema_with_an_outsider();
+        schema.types.retain(|t| t.name != "Organisation");
+        let out = compile_and_emit_with(
+            "SELECT Company { id } FILTER (default::Account is default::Individual)",
+            &schema,
+        );
+        assert!(
+            !out.sql.contains("assert_single"),
+            "every Account is an Individual when it is the only implementor:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("WHERE TRUE"), "{}", out.sql);
+    }
+
+    #[test]
+    fn a_type_check_over_a_polymorphic_outsider_collapses_to_one_value() {
+        // What is left after both folds: `Account` has two implementors, so
+        // `is Individual` really does differ per row. A filter still takes one
+        // value, and the message names the check rather than the internal
+        // helper enforcing it.
+        let schema = make_interface_schema_with_an_outsider();
+        let out = compile_and_emit_with(
+            "SELECT Company { id } FILTER (default::Account is default::Individual)",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("\"_pylon\".\"assert_single\"(ARRAY(SELECT"),
+            "one answer per Account row, read as a single value:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("is default::Individual'' is asked once for every default::Account object"),
+            "the error has to name the check, not assert_single:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn a_type_check_naming_another_type_keeps_its_whole_set_in_a_shape() {
+        // The other half of the same rule: a shape pointer holds a set, so
+        // there the per-row answers stay a set rather than collapsing.
+        let schema = make_interface_schema_with_an_outsider();
+        let out = compile_and_emit_with(
+            "SELECT Company { id, each := default::Account is default::Individual }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("array_agg") && !out.sql.contains("assert_single"),
+            "a shape keeps every answer:\n{}",
+            out.sql
+        );
+    }
+
     #[test]
     fn a_shape_writing_the_computed_out_itself_does_not_get_the_anchor() {
         // The rule is narrow: only a *declared* computed is compiled against
