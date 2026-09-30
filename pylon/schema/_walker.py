@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import types
 import typing
 from typing import Any
 
@@ -1412,11 +1413,10 @@ def _parse_return_annotation(
 
     # Unwrap Optional (T | None): strip None from union
     origin = _typing.get_origin(annotation)
-    if origin is _typing.Union:
-        args = [a for a in _typing.get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            annotation = args[0]
-            origin = _typing.get_origin(annotation)
+    args = _union_args(annotation)
+    if args is not None and len(args) == 1:
+        annotation = args[0]
+        origin = _typing.get_origin(annotation)
 
     # Unwrap set[T]
     if origin is set:
@@ -1424,11 +1424,9 @@ def _parse_return_annotation(
         args = _typing.get_args(annotation)
         annotation = args[0] if args else annotation
         # Re-check for Optional inside set[T | None]
-        inner_origin = _typing.get_origin(annotation)
-        if inner_origin is _typing.Union:
-            inner_args = [a for a in _typing.get_args(annotation) if a is not type(None)]
-            if len(inner_args) == 1:
-                annotation = inner_args[0]
+        inner_args = _union_args(annotation)
+        if inner_args is not None and len(inner_args) == 1:
+            annotation = inner_args[0]
 
     # Unwrap Annotated[T, lazy(...)].
     #
@@ -1479,16 +1477,27 @@ def _parse_return_annotation(
     return pg_type, False, is_set, False
 
 
+def _union_args(annotation: Any) -> list[Any] | None:
+    """The non-`None` members of *annotation* if it is a union, else `None`.
+
+    `X | None` is a `types.UnionType` up to Python 3.13 and a `typing.Union`
+    from 3.14 on, where the two were unified. Testing only the latter left an
+    optional return or parameter type unwrapped below 3.14, and `_to_pg_type`
+    resolves a union it does not recognise to `text`.
+    """
+    if isinstance(annotation, types.UnionType) or typing.get_origin(annotation) is typing.Union:
+        return [argument for argument in typing.get_args(annotation) if argument is not type(None)]
+    return None
+
+
 def _param_pg_type(annotation: Any) -> str:
     """Resolve a parameter type annotation to a PostgreSQL type string."""
     import typing as _typing
 
     # Unwrap Optional
-    origin = _typing.get_origin(annotation)
-    if origin is _typing.Union:
-        args = [a for a in _typing.get_args(annotation) if a is not type(None)]
-        if args:
-            annotation = args[0]
+    args = _union_args(annotation)
+    if args:
+        annotation = args[0]
     # Unwrap Annotated
     if _typing.get_origin(annotation) is _typing.Annotated:
         annotation = _typing.get_args(annotation)[0]

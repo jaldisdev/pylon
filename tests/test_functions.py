@@ -24,6 +24,8 @@ that annotations inside test-local functions evaluate eagerly, matching
 test_finalize.py's rationale for the same omission.
 """
 
+import json
+
 import pytest
 
 import pylon.exceptions as pylon_exceptions
@@ -110,6 +112,32 @@ class TestReturnTypeConsistency:
 
         with pytest.raises(pylon_exceptions.SchemaError, match='return type mismatch in function'):
             walk([], [], [], [], functions=functions_snapshot())
+
+    def test_an_optional_return_keeps_its_declared_type(self):
+        """`X | None` is a `types.UnionType` below Python 3.14, which the
+        signature parser did not count as a union -- so the `None` was never
+        stripped, the declared type resolved to `text`, and a body returning
+        exactly what was declared was rejected as a mismatch.
+        """
+
+        @pylon.function_decorator(module='t', name='optional_fn')
+        def optional_fn(a: pylon.Int64) -> pylon.Int64 | None:
+            """select a"""
+
+        schema = walk([], [], [], [], functions=functions_snapshot())
+        declared = next(f for f in json.loads(schema.to_json())['functions'] if f['name'] == 'optional_fn')
+        assert declared['return_pg_type'] == 'int8'
+
+    def test_an_optional_parameter_keeps_its_declared_type(self):
+        """The parameter parser tested for the same union spelling."""
+
+        @pylon.function_decorator(module='t', name='optional_param_fn')
+        def optional_param_fn(a: pylon.Int64 | None) -> pylon.Int64:
+            """select a ?? 0"""
+
+        schema = walk([], [], [], [], functions=functions_snapshot())
+        declared = next(f for f in json.loads(schema.to_json())['functions'] if f['name'] == 'optional_param_fn')
+        assert [p['pg_type'] for p in declared['params']] == ['int8']
 
     def test_type_check_can_be_left_to_the_migration_commands(self):
         @pylon.function_decorator(module='t', name='bad_fn')
