@@ -800,3 +800,104 @@ async fn an_interface_for_update_reads_chained_body_bindings() {
         "each implementor's row should take the factor its own tag chain resolved to"
     );
 }
+
+/// `select (for x in S union (insert T { … })) { … }` — the loop as the
+/// select's source rather than the statement itself. Emitted as a source it
+/// became a `CROSS JOIN LATERAL` holding the insert, which Postgres rejects
+/// outright ("syntax error at or near INSERT") even though the query
+/// compiled; the equivalent `with created := (for …) select created { … }`
+/// worked. The loop is bound to a CTE now, so both spellings run and return
+/// the same rows.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_mutating_loop_reads_back_through_a_shape_on_the_select() {
+    let module = unique_module("live_for_select_source");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for (name, age) in [("Ann", 10), ("Bo", 20)] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := {age} }}"),
+        )
+        .await;
+    }
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!(
+            "with olds := (select {module}::Person filter .age > 15) \
+             select (for p in olds union ( \
+               insert {module}::Person {{ name := p.name ++ '-copy', age := p.age }} \
+             )) {{ name }}"
+        ),
+    )
+    .await;
+    let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 2)).to_string()).collect();
+    assert_eq!(names, vec!["Bo-copy".to_string()], "the shape reads the written rows");
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Person {{ name }} order by .name"),
+    )
+    .await;
+    let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 2)).to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["Ann".to_string(), "Bo".to_string(), "Bo-copy".to_string()],
+        "the loop wrote exactly one row, for the one person it iterated"
+    );
+}
+
+/// The same binding is what puts the loop variable in scope before the body's
+/// subject is resolved — `update p` inside a select's source used to fail to
+/// compile at all ("unknown type 'p'") while the `with` spelling worked.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_loop_updating_its_variable_reads_back_through_a_shape_on_the_select() {
+    let module = unique_module("live_for_select_upd");
+    let sd = person_schema(&module);
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    for (name, age) in [("Ann", 10), ("Bo", 20), ("Cy", 30)] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {module}::Person {{ name := '{name}', age := {age} }}"),
+        )
+        .await;
+    }
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!(
+            "with young := (select {module}::Person filter .age < 25) \
+             select (for p in young union (update p set {{ name := 'TOUCHED' }})) {{ name, age }} \
+             order by .age"
+        ),
+    )
+    .await;
+    let touched: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| (as_str(field(r, 2)).to_string(), as_i64(field(r, 3))))
+        .collect();
+    assert_eq!(
+        touched,
+        vec![("TOUCHED".to_string(), 10), ("TOUCHED".to_string(), 20)],
+        "the select reads back exactly the rows the loop updated"
+    );
+
+    let rows = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }} order by .age")).await;
+    let names: Vec<String> = rows.iter().map(|r| as_str(field(r, 2)).to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["TOUCHED".to_string(), "TOUCHED".to_string(), "Cy".to_string()],
+        "only the iterated rows should change"
+    );
+}

@@ -6177,6 +6177,50 @@ mod tests {
         emit(&ir)
     }
 
+    /// `select (for x in S union (insert T { … })) { … }` — a shape, or any
+    /// clause of the select's own, stops the loop from simply *being* the
+    /// statement, so the loop becomes this select's source. Emitted as one it
+    /// landed in a `CROSS JOIN LATERAL`, where Postgres rejects a
+    /// data-modifying statement outright ("syntax error at or near INSERT").
+    /// It is bound to a CTE instead, exactly as the `with c := (for … union
+    /// (insert …)) select c { … }` spelling of the same query already was.
+    #[test]
+    fn test_a_mutating_loop_as_a_select_source_is_bound_to_a_cte() {
+        let out =
+            compile_and_emit("SELECT (FOR p IN (SELECT Person) UNION (INSERT Post { title := p.name })) { title }");
+        assert!(
+            !out.sql.contains("LATERAL"),
+            "the insert must not sit in a LATERAL, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("\"_nested_dml_0__ids\" AS (\nINSERT INTO \"public\".\"Post\""),
+            "the loop's insert belongs in a top-level CTE, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("FROM \"_nested_dml_0\" AS "),
+            "the select must read the bound loop back, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// The same binding also puts the loop variable in scope before the body's
+    /// subject is resolved — `update p` named no type until then, so this
+    /// spelling used to fail to compile at all while its `with` form worked.
+    #[test]
+    fn test_a_loop_updating_its_own_variable_compiles_as_a_select_source() {
+        let out = compile_and_emit("SELECT (FOR p IN (SELECT Person) UNION (UPDATE p SET { age := 1 })) { name }");
+        assert!(
+            out.sql
+                .contains("\"_nested_dml_0__ids\" AS (\nUPDATE \"public\".\"Person\""),
+            "got:\n{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("LATERAL"), "got:\n{}", out.sql);
+    }
+
     /// `(insert Outer { link := (insert Inner …) }) if cond else {}` — the
     /// guard belongs to the insert the conditional names. The nested insert
     /// compiles first and used to claim it, leaving the outer one to write a

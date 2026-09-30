@@ -3829,9 +3829,10 @@ impl<'a> Compiler<'a> {
                     return self.compile_stmt(&Stmt::Select(rerooted));
                 }
                 // `select (for … union …)` — the select adds nothing the loop has
-                // not already produced, so it *is* the loop. Written with
-                // modifiers of its own it would need the loop bound in a CTE
-                // first, which nothing supports yet, so that still errors.
+                // not already produced, so it *is* the loop. Written with a
+                // shape or modifiers of its own the loop is this select's
+                // source instead, and a mutating one has to be bound to a CTE
+                // first — see `bind_mutating_loop_source`.
                 if let Expr::SubQuery(inner) = result
                     && matches!(inner.as_ref(), Stmt::For(_))
                     && !distinct
@@ -6821,6 +6822,9 @@ impl<'a> Compiler<'a> {
     ) -> Result<IrSelect, PyQLError> {
         if let Some(union_select) = self.try_compile_object_union_select(sel, result_expr, distinct)? {
             return Ok(union_select);
+        }
+        if let Some(rerooted) = self.bind_mutating_loop_source(result_expr)? {
+            return self.compile_select(sel, &rerooted, distinct);
         }
         let (type_name, shape_elements, inner_stmt, cte_name) = self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
@@ -16075,6 +16079,77 @@ impl<'a> Compiler<'a> {
             correlated_to,
         });
         Ok((cte_name, type_name))
+    }
+
+    /// True when a `for`'s body ultimately mutates, through however many
+    /// nested loops. A loop over loops over a `select` mutates nothing.
+    fn for_body_mutates(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => true,
+            Stmt::For(inner) => Self::for_body_mutates(&inner.body),
+            _ => false,
+        }
+    }
+
+    /// `select (for x in S union (insert T { … })) { id }` — a loop whose body
+    /// mutates cannot be a select's source as written: the source is emitted as
+    /// a `CROSS JOIN LATERAL`, and Postgres allows a data-modifying statement
+    /// only at the top level of a `WITH`. So the loop is bound to a CTE of its
+    /// own and the select re-rooted at that name, which is the `with c := (for
+    /// … union (insert …)) select c { id }` spelling the binding path already
+    /// builds. Compiling the loop up front also puts its variable in scope
+    /// before the body's subject is resolved, which an `update x` body needs.
+    /// Returns the re-rooted result expression, or `None` when the select's
+    /// source is not such a loop.
+    fn bind_mutating_loop_source(&mut self, result_expr: &Expr) -> Result<Option<Expr>, PyQLError> {
+        let (subject, shape) = match result_expr {
+            Expr::SubQuery(stmt) => (stmt.as_ref(), None),
+            Expr::Shape(sh) => match sh.expr.as_ref() {
+                Some(Expr::SubQuery(stmt)) => (stmt.as_ref(), Some(sh.as_ref())),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        if !matches!(subject, Stmt::For(f) if Self::for_body_mutates(&f.body)) {
+            return Ok(None);
+        }
+        // An enclosing loop's variable read from inside this one makes the CTE
+        // correlated to that iteration, the same bookkeeping `hoist_dml_as_cte`
+        // does for a mutation hoisted out of a loop.
+        let before = std::mem::take(&mut self.for_vars_read);
+        let inner = self.compile_stmt(subject);
+        let read = std::mem::replace(&mut self.for_vars_read, before);
+        let correlated_to = self
+            .for_scope
+            .iter()
+            .rev()
+            .find(|slot| read.contains(*slot))
+            .map(|slot| format!("_for_{slot}"));
+        self.for_vars_read.extend(read);
+        let inner = inner?;
+        let cte_name = self.fresh_nested_cte_name();
+        if let Some(slot) = correlated_to.as_deref().and_then(|i| i.strip_prefix("_for_")) {
+            self.correlated_bindings.insert(cte_name.clone(), slot.to_string());
+        }
+        let type_name = self.register_cte(&cte_name, &inner);
+        self.hoisted_ctes.push(IrCteDef {
+            name: cte_name.clone(),
+            stmt: inner,
+            type_name,
+            correlated_to,
+        });
+        let bound = Expr::Path(ast::Path {
+            steps: vec![ast::PathStep::Name(cte_name)],
+            partial: false,
+        });
+        Ok(Some(match shape {
+            Some(sh) => Expr::Shape(Box::new(ast::ShapeExpr {
+                expr: Some(bound),
+                elements: sh.elements.clone(),
+                marker_offset: sh.marker_offset,
+            })),
+            None => bound,
+        }))
     }
 
     fn hoist_nested_dml(&mut self, stmt: &Stmt) -> Result<String, PyQLError> {
