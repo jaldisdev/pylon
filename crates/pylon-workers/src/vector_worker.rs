@@ -167,7 +167,7 @@ impl BatchProcessor for VectorIndexWorker {
                 continue;
             }
             let raw_records = listener
-                .query_typed_named(fetch_sql, &[DecodedValue::Array(ids)], listener.types())
+                .query_typed_named(fetch_sql, &[DecodedValue::Array(ids)], &listener.types())
                 .await?;
             if raw_records.is_empty() {
                 continue;

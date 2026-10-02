@@ -153,7 +153,7 @@ impl AppState {
             return;
         };
         let rows = match pool
-            .query_typed_named(pylon_workers::metrics::OUTBOX_DEPTH_SQL, &[], pool.types())
+            .query_typed_named(pylon_workers::metrics::OUTBOX_DEPTH_SQL, &[], &pool.types())
             .await
         {
             Ok(rows) => rows,

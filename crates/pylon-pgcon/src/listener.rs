@@ -44,7 +44,9 @@ pub use tokio_postgres::Notification;
 /// they're constructed with today.
 pub struct PgListener {
     client: tokio_postgres::Client,
-    types: ExtensionOids,
+    /// Interior-mutable as in `PgPool::types`: a listener lives as long as
+    /// the worker holding it, which only ever has `&self`.
+    types: std::sync::RwLock<std::sync::Arc<ExtensionOids>>,
 }
 
 impl PgListener {
@@ -71,13 +73,32 @@ impl PgListener {
             }
         });
         let types = crate::discover_types(&client).await?;
-        Ok(Self { client, types })
+        Ok(Self {
+            client,
+            types: std::sync::RwLock::new(std::sync::Arc::new(types)),
+        })
     }
 
-    /// The type OIDs discovered for this database when the listener
-    /// connected — see `PgPool::types`.
-    pub fn types(&self) -> &ExtensionOids {
-        &self.types
+    /// The type OIDs currently discovered for this database — see
+    /// `PgPool::types`.
+    pub fn types(&self) -> std::sync::Arc<ExtensionOids> {
+        self.types.read().unwrap().clone()
+    }
+
+    /// Re-runs type discovery on this listener's own connection — see
+    /// `PgPool::refresh_types`. Nothing to invalidate alongside it: this
+    /// connection is unpooled and `prepare`s each statement afresh.
+    pub async fn refresh_types(&self) -> Result<()> {
+        let fresh = crate::discover_types(&self.client).await?;
+        *self.types.write().unwrap() = std::sync::Arc::new(fresh);
+        Ok(())
+    }
+
+    /// See `PgPool::heal_types`.
+    async fn heal_types(&self) -> Result<std::sync::Arc<ExtensionOids>> {
+        let fresh = std::sync::Arc::new(crate::discover_types(&self.client).await?);
+        *self.types.write().unwrap() = fresh.clone();
+        Ok(fresh)
     }
 
     pub async fn listen(&self, channel: &str) -> Result<()> {
@@ -100,7 +121,13 @@ impl PgListener {
         params: &[DecodedValue],
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
-        query_typed_on_raw(&self.client, sql, params, ext).await
+        match query_typed_on_raw(&self.client, sql, params, ext).await {
+            Err(e) if crate::is_unknown_oid(&e) => {
+                let healed = self.heal_types().await?;
+                query_typed_on_raw(&self.client, sql, params, &healed).await
+            }
+            other => other,
+        }
     }
 
     /// Like `query_typed`, but decodes every column of every row by name
@@ -113,7 +140,13 @@ impl PgListener {
         params: &[DecodedValue],
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
-        query_typed_named_on_raw(&self.client, sql, params, ext).await
+        match query_typed_named_on_raw(&self.client, sql, params, ext).await {
+            Err(e) if crate::is_unknown_oid(&e) => {
+                let healed = self.heal_types().await?;
+                query_typed_named_on_raw(&self.client, sql, params, &healed).await
+            }
+            other => other,
+        }
     }
 
     /// Runs `sql` via the simple query protocol — no bind parameters, but

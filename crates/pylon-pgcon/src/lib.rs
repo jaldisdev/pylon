@@ -36,6 +36,7 @@ pub use listener::PgListener;
 pub use wire::{ExtensionOids, decode_value};
 
 use pylon_value::DecodedValue;
+use std::sync::{Arc, RwLock};
 
 /// Captures a column's raw wire bytes regardless of its declared Postgres
 /// type. `tokio_postgres`'s own `&[u8]` `FromSql` impl only accepts
@@ -89,10 +90,20 @@ impl postgres_types::ToSql for BoundParam<'_> {
 #[derive(Clone, Debug)]
 pub struct PgPool {
     pool: deadpool_postgres::Pool,
-    types: ExtensionOids,
+    /// Shared with every clone of this pool, so a refresh reaches all of
+    /// them — consumers hold the pool behind an `Arc`, with only `&self`
+    /// available at the moments the registry needs replacing.
+    types: Arc<RwLock<Arc<ExtensionOids>>>,
     /// Label for this pool in observability output. Set via
     /// `PgPool::set_name`; `"default"` until then.
     name: String,
+}
+
+/// The one failure a stale type registry causes, and so the only one worth
+/// re-discovering types for and retrying. Any other error would survive a
+/// retry, which would also run the statement twice.
+pub(crate) fn is_unknown_oid(err: &Error) -> bool {
+    matches!(err, Error::UnknownTypeOid { .. })
 }
 
 /// Notified with `(pool name, time spent waiting)` every time a caller
@@ -159,32 +170,55 @@ impl PgPool {
         drop(client);
         Ok(Self {
             pool,
-            types,
+            types: Arc::new(RwLock::new(Arc::new(types))),
             name: "default".to_string(),
         })
     }
 
-    /// The type OIDs discovered for this database when the pool connected.
-    /// Pass this to `query_typed`/`query_composite` rather than
-    /// `ExtensionOids::default()` — without it, a `vector`, enum, or domain
-    /// column has no decoder.
-    pub fn types(&self) -> &ExtensionOids {
-        &self.types
+    /// The type OIDs currently discovered for this database. Pass this to
+    /// `query_typed`/`query_composite` rather than `ExtensionOids::default()`
+    /// — without it, a `vector`, enum, or domain column has no decoder.
+    /// Owned rather than borrowed because `refresh_types` can replace it;
+    /// `&pool.types()` coerces to the `&ExtensionOids` those methods take.
+    pub fn types(&self) -> Arc<ExtensionOids> {
+        self.types.read().unwrap().clone()
     }
 
     /// Re-runs type discovery. Needed after a migration creates an enum,
-    /// domain, or extension type, since the registry is a connect-time
-    /// snapshot and a pool normally outlives a migration.
-    pub async fn refresh_types(&mut self) -> Result<()> {
+    /// domain or extension type, and after a restore re-assigns every local
+    /// OID underneath a running pool — the registry is a connect-time
+    /// snapshot and a pool outlives both.
+    ///
+    /// Clears the prepared-statement caches unconditionally, since DDL also
+    /// invalidates a cached plan on its own (`0A000 cached plan must not
+    /// change result type`).
+    pub async fn refresh_types(&self) -> Result<()> {
         let client = self.checkout().await?;
-        self.types = discover_types(&client).await?;
-        // A migration is also exactly when a cached prepared statement can
-        // go stale: Postgres invalidates a server-side plan whose result
-        // type changed, and re-executing one raises `0A000 cached plan must
-        // not change result type`. The two always need clearing together.
+        let fresh = discover_types(&client).await?;
+        *self.types.write().unwrap() = Arc::new(fresh);
         drop(client);
         self.clear_statement_caches();
         Ok(())
+    }
+
+    /// Re-runs discovery on a held connection after a decode hit an unknown
+    /// OID. Clears the statement caches only when the registry really
+    /// changed: a type nothing can decode reaches this on every query, and
+    /// emptying every connection's cache that often is its own problem.
+    async fn heal_types(&self, client: &tokio_postgres::Client) -> Result<Arc<ExtensionOids>> {
+        let fresh = Arc::new(discover_types(client).await?);
+        let changed = {
+            let mut slot = self.types.write().unwrap();
+            let changed = *slot != fresh;
+            if changed {
+                *slot = fresh.clone();
+            }
+            changed
+        };
+        if changed {
+            self.clear_statement_caches();
+        }
+        Ok(fresh)
     }
 
     /// Drops every pooled connection's prepared-statement cache.
@@ -244,8 +278,18 @@ impl PgPool {
     /// declared Postgres type (not assumed to be `record` — a bare scalar
     /// `result` column decodes just as well through the same path).
     pub async fn query_composite(&self, sql: &str, ext: &ExtensionOids) -> Result<Vec<DecodedValue>> {
-        let rows = self.query_raw(sql).await?;
-        rows.iter().map(|row| decode_result_column(row, ext)).collect()
+        let client = self.checkout().await?;
+        let rows = client.query(sql, &[]).await?;
+        let decode = |ext: &ExtensionOids| -> Result<Vec<DecodedValue>> {
+            rows.iter().map(|r| decode_result_column(r, ext)).collect()
+        };
+        match decode(ext) {
+            Err(e) if is_unknown_oid(&e) => {
+                let healed = self.heal_types(&client).await?;
+                decode(&healed)
+            }
+            other => other,
+        }
     }
 
     /// Runs `sql` with bound `params`, matched positionally to `$1, $2, ...`
@@ -262,7 +306,13 @@ impl PgPool {
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
         let client = self.checkout().await?;
-        query_typed_on(&client, sql, params, ext).await
+        match query_typed_on(&client, sql, params, ext).await {
+            Err(e) if is_unknown_oid(&e) => {
+                let healed = self.heal_types(&client).await?;
+                query_typed_on(&client, sql, params, &healed).await
+            }
+            other => other,
+        }
     }
 
     /// Like `query_typed`, but decodes every column of every row by name
@@ -276,7 +326,13 @@ impl PgPool {
         ext: &ExtensionOids,
     ) -> Result<Vec<DecodedValue>> {
         let client = self.checkout().await?;
-        query_typed_named_on(&client, sql, params, ext).await
+        match query_typed_named_on(&client, sql, params, ext).await {
+            Err(e) if is_unknown_oid(&e) => {
+                let healed = self.heal_types(&client).await?;
+                query_typed_named_on(&client, sql, params, &healed).await
+            }
+            other => other,
+        }
     }
 
     /// `query_typed`, with the session globals database triggers read
@@ -292,7 +348,13 @@ impl PgPool {
     ) -> Result<Vec<DecodedValue>> {
         let client = self.checkout().await?;
         set_globals_on(&client, globals, false).await?;
-        query_typed_on(&client, sql, params, ext).await
+        match query_typed_on(&client, sql, params, ext).await {
+            Err(e) if is_unknown_oid(&e) => {
+                let healed = self.heal_types(&client).await?;
+                query_typed_on(&client, sql, params, &healed).await
+            }
+            other => other,
+        }
     }
 
     /// `execute_typed`, with `pylon.globals` set — see `query_typed_with_globals`.
@@ -341,7 +403,7 @@ impl PgPool {
         client.batch_execute(&format!("BEGIN ISOLATION LEVEL {level}")).await?;
         Ok(PgTransaction {
             client,
-            types: self.types.clone(),
+            types: self.types(),
         })
     }
 
@@ -355,7 +417,7 @@ impl PgPool {
         client.batch_execute("BEGIN").await?;
         Ok(PgTransaction {
             client,
-            types: self.types.clone(),
+            types: self.types(),
         })
     }
 
@@ -385,7 +447,7 @@ impl PgPool {
         let client = self.checkout().await?;
         Ok(PgConnection {
             client,
-            types: self.types.clone(),
+            types: self.types(),
         })
     }
 }
@@ -395,11 +457,12 @@ impl PgPool {
 #[derive(Debug)]
 pub struct PgConnection {
     client: deadpool_postgres::Object,
-    types: ExtensionOids,
+    types: Arc<ExtensionOids>,
 }
 
 impl PgConnection {
-    /// The type OIDs discovered when the owning pool connected.
+    /// The registry the owning pool held at checkout — a snapshot, since a
+    /// held connection lives for one unit of work.
     pub fn types(&self) -> &ExtensionOids {
         &self.types
     }
@@ -596,11 +659,12 @@ pub(crate) async fn query_explain_on(
 #[derive(Debug)]
 pub struct PgTransaction {
     client: deadpool_postgres::Object,
-    types: ExtensionOids,
+    types: Arc<ExtensionOids>,
 }
 
 impl PgTransaction {
-    /// The type OIDs discovered when the owning pool connected.
+    /// The registry the owning pool held when this transaction began — a
+    /// snapshot, as in `PgConnection::types`.
     pub fn types(&self) -> &ExtensionOids {
         &self.types
     }
@@ -973,7 +1037,6 @@ mod tests {
             return;
         }
         // The extension may have been created after this pool connected.
-        let mut pool = pool;
         pool.refresh_types().await.unwrap();
         assert!(
             pool.types().vector.is_some(),
@@ -982,7 +1045,7 @@ mod tests {
 
         // Nested in a record, exactly as pylon-core emits every result.
         let rows = pool
-            .query_composite("SELECT ('doc', '[1.5,2.5]'::vector) AS result", pool.types())
+            .query_composite("SELECT ('doc', '[1.5,2.5]'::vector) AS result", &pool.types())
             .await
             .unwrap();
 
@@ -1014,7 +1077,6 @@ mod tests {
         .await
         .ok();
 
-        let mut pool = pool;
         pool.refresh_types().await.unwrap();
 
         // Neither is ::text-cast here, so both arrive with their real
@@ -1022,7 +1084,7 @@ mod tests {
         let rows = pool
             .query_composite(
                 "SELECT ('x'::pgcon_disc_enum, 42::pgcon_disc_domain) AS result",
-                pool.types(),
+                &pool.types(),
             )
             .await
             .unwrap();
@@ -1036,6 +1098,104 @@ mod tests {
             DecodedValue::I64(42),
             "a domain must decode as its base type, not as text"
         );
+    }
+
+    // ── a registry that goes stale underneath a running pool ────────────
+
+    /// Read as `int8`, so this needs no registry of its own.
+    async fn live_type_oid(pool: &PgPool, typname: &str) -> u32 {
+        let rows = pool
+            .query_typed(
+                "SELECT (oid::int8) AS result FROM pg_type WHERE typname = $1",
+                &[DecodedValue::Str(typname.to_string())],
+                &ExtensionOids::default(),
+            )
+            .await
+            .unwrap();
+        match rows.first() {
+            Some(DecodedValue::I64(oid)) => *oid as u32,
+            other => panic!("expected one int8 oid for {typname}, got {other:?}"),
+        }
+    }
+
+    /// Recreating a type reproduces what a restore does to every OID at
+    /// once: Postgres never reissues the one it just freed.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_type_whose_oid_moved_under_a_live_pool_still_decodes() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.batch_execute(
+            "DROP TYPE IF EXISTS pgcon_moved_enum; \
+             CREATE TYPE pgcon_moved_enum AS ENUM ('a', 'b')",
+        )
+        .await
+        .unwrap();
+        // Stand in for a pool that connected while this type existed.
+        pool.refresh_types().await.unwrap();
+        let stale = pool.types();
+        let before = live_type_oid(&pool, "pgcon_moved_enum").await;
+        assert!(
+            stale.enums.contains(&before),
+            "the pool must start out knowing the pre-move OID, or this test proves nothing"
+        );
+
+        pool.batch_execute(
+            "DROP TYPE pgcon_moved_enum; \
+             CREATE TYPE pgcon_moved_enum AS ENUM ('a', 'b')",
+        )
+        .await
+        .unwrap();
+        let after = live_type_oid(&pool, "pgcon_moved_enum").await;
+        assert_ne!(before, after, "recreating a type must assign it a fresh OID");
+
+        // Before: the registry the pool is holding can't decode the new OID.
+        let err = decode_value(after, b"a", &stale).unwrap_err();
+        assert!(
+            matches!(err, Error::UnknownTypeOid { oid } if oid == after),
+            "expected UnknownTypeOid for the moved OID, got {err}"
+        );
+
+        // After: `pool.types()` is still that stale registry when it's
+        // passed, and the query succeeds anyway.
+        let rows = pool
+            .query_composite("SELECT ('a'::pgcon_moved_enum) AS result", &pool.types())
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![DecodedValue::Str("a".to_string())]);
+        assert!(
+            pool.types().enums.contains(&after),
+            "the heal must leave the new OID in the pool's registry, not just decode one query"
+        );
+    }
+
+    /// Consumers hold clones, so a refresh that reached only the handle it
+    /// was called on would leave the clone serving queries stale.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_refresh_through_one_handle_is_visible_through_every_clone() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.batch_execute("DROP TYPE IF EXISTS pgcon_clone_enum")
+            .await
+            .unwrap();
+        pool.refresh_types().await.unwrap();
+
+        let clone = pool.clone();
+        pool.batch_execute("CREATE TYPE pgcon_clone_enum AS ENUM ('a')")
+            .await
+            .unwrap();
+        let oid = live_type_oid(&pool, "pgcon_clone_enum").await;
+        assert!(!clone.types().enums.contains(&oid), "the clone must start out stale");
+
+        clone.refresh_types().await.unwrap();
+
+        assert!(pool.types().enums.contains(&oid), "the original must see the refresh");
+        let tx = pool.begin_default().await.unwrap();
+        assert!(
+            tx.types().enums.contains(&oid),
+            "a transaction opened after the refresh must inherit the refreshed registry"
+        );
+        tx.rollback().await.unwrap();
+        pool.batch_execute("DROP TYPE pgcon_clone_enum").await.unwrap();
     }
 
     // ── query_typed: bound-parameter round trips against real Postgres ──
@@ -1808,7 +1968,7 @@ mod error_message_tests {
         // server-side error on any database, so this cannot rot when some
         // other test's table comes or goes.
         let err = pool
-            .query_typed("SELECT 1 FROM pylon_no_such_table", &[], pool.types())
+            .query_typed("SELECT 1 FROM pylon_no_such_table", &[], &pool.types())
             .await
             .unwrap_err();
         let rendered = err.to_string();

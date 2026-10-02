@@ -233,7 +233,7 @@ impl<C: SearchSink + 'static> BatchProcessor for SearchIndexWorker<C> {
 
             let ids: Vec<DecodedValue> = upserts.iter().map(|r| DecodedValue::Uuid(r.object_id)).collect();
             let raw_records = listener
-                .query_typed_named(&fetch_sql, &[DecodedValue::Array(ids)], listener.types())
+                .query_typed_named(&fetch_sql, &[DecodedValue::Array(ids)], &listener.types())
                 .await?;
             if raw_records.is_empty() {
                 continue;

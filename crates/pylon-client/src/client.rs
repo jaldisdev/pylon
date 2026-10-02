@@ -247,6 +247,10 @@ impl Client {
     /// singleton.
     pub async fn reload_schema(&self) -> Result<()> {
         let conn = self.connected().await?;
+        // Whatever moved the snapshot on can equally have moved this
+        // database's enum/domain/`vector` OIDs, which the pool read once at
+        // connect time.
+        conn.pool.refresh_types().await?;
         let fresh = schema::fetch(&conn.pool).await?;
         *conn.schema.write().unwrap() = fresh;
         pylon_core::query::clear_query_cache();
@@ -638,5 +642,66 @@ mod tests {
         let view = client.with_globals([]);
 
         assert!(Arc::ptr_eq(&client.connected, &view.connected));
+    }
+
+    /// A client that reloaded only the schema would compile against the new
+    /// one and then fail to decode its enum columns.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn reload_schema_also_refreshes_the_type_registry() {
+        let dsn = std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set for live tests");
+        let setup = pylon_pgcon::PgPool::connect(&dsn, 2).await.unwrap();
+        setup.batch_execute("CREATE SCHEMA IF NOT EXISTS _pylon").await.unwrap();
+        pylon_core::migrate::ensure_internal_schema(&setup).await.unwrap();
+        // One shared row for this whole DSN — put back what was there.
+        let previous = pylon_core::migrate::read_schema_snapshot(&setup).await.unwrap();
+        let placeholder = serde_json::to_string(&SchemaDescriptor::default()).unwrap();
+        pylon_core::migrate::write_schema_snapshot(&setup, &placeholder)
+            .await
+            .unwrap();
+        setup
+            .batch_execute("DROP TYPE IF EXISTS pylon_client_reload_enum")
+            .await
+            .unwrap();
+
+        let client = Client::builder(&dsn).build().unwrap();
+        client.ensure_connected().await.unwrap();
+
+        // Created after the client's pool connected.
+        setup
+            .batch_execute("CREATE TYPE pylon_client_reload_enum AS ENUM ('a')")
+            .await
+            .unwrap();
+        let oid = match setup
+            .query_typed(
+                "SELECT (oid::int8) AS result FROM pg_type WHERE typname = 'pylon_client_reload_enum'",
+                &[],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await
+            .unwrap()
+            .first()
+        {
+            Some(pylon_value::DecodedValue::I64(oid)) => *oid as u32,
+            other => panic!("expected the new enum's oid, got {other:?}"),
+        };
+        assert!(
+            !client.pool_if_connected().unwrap().types().enums.contains(&oid),
+            "the connect-time snapshot must not know a type created after it"
+        );
+
+        client.reload_schema().await.unwrap();
+
+        assert!(
+            client.pool_if_connected().unwrap().types().enums.contains(&oid),
+            "reload_schema must re-discover type OIDs, not just re-fetch the schema"
+        );
+
+        setup.batch_execute("DROP TYPE pylon_client_reload_enum").await.unwrap();
+        if let Some(previous) = previous {
+            pylon_core::migrate::write_schema_snapshot(&setup, &previous)
+                .await
+                .unwrap();
+        }
     }
 }

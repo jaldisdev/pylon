@@ -150,7 +150,7 @@ pub async fn read_internal_version(pool: &PgPool) -> Result<Option<i32>> {
         .query_typed(
             r#"SELECT (version) AS result FROM _pylon."Internal" WHERE singleton"#,
             &[],
-            pool.types(),
+            &pool.types(),
         )
         .await
     {
@@ -215,7 +215,7 @@ pub async fn read_schema_snapshot(pool: &PgPool) -> Result<Option<String>> {
         .query_typed(
             r#"SELECT (snapshot::text) AS result FROM _pylon."Schema" WHERE singleton"#,
             &[],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     Ok(match rows.into_iter().next() {
@@ -257,7 +257,7 @@ pub async fn read_tracking(pool: &PgPool) -> Result<Vec<TrackingRow>> {
         .query_typed(
             r#"SELECT (id, onto, (db_state::text), (schema_state::text), (applied_at IS NOT NULL)) AS result FROM _pylon."Migrations""#,
             &[],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     Ok(rows
@@ -347,7 +347,7 @@ pub async fn try_advisory_lock(pool: &PgPool) -> Result<Option<pylon_pgcon::PgCo
         .query_typed(
             &format!("SELECT (pg_try_advisory_lock({ADVISORY_LOCK_KEY})) AS result"),
             &[],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     Ok(if matches!(rows.first(), Some(DecodedValue::Bool(true))) {
@@ -393,7 +393,7 @@ async fn check_no_id_collision(pool: &PgPool, id: &str, onto: &str) -> Result<()
         .query_typed(
             r#"SELECT (onto) AS result FROM _pylon."Migrations" WHERE id = $1"#,
             &[DecodedValue::Str(id.to_string())],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     if let Some(DecodedValue::Str(existing_onto)) = rows.into_iter().next()
@@ -439,7 +439,7 @@ async fn read_progress(pool: &PgPool, id: &str) -> Result<Option<i64>> {
         .query_typed(
             r#"SELECT (step_index) AS result FROM _pylon."Progress" WHERE id = $1"#,
             &[DecodedValue::Str(id.to_string())],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     Ok(match rows.into_iter().next() {
@@ -502,7 +502,7 @@ async fn drop_invalid_concurrent_index(pool: &PgPool, sql: &str) -> Result<()> {
             "SELECT (1) AS result FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
              WHERE c.relname = $1 AND NOT i.indisvalid",
             &[DecodedValue::Str(index_name.clone())],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     if !rows.is_empty() {
@@ -629,6 +629,12 @@ pub async fn apply_one(pool: &PgPool, m: &MigrationFile, dev_mode: bool) -> Resu
         }
     }
 
+    // This DDL may have created a type whose OID the pool has never seen,
+    // or invalidated a cached plan. Both outlive the migration: `apply`
+    // applies every pending migration over one pool, `watch` keeps one for
+    // the life of the process.
+    pool.refresh_types().await?;
+
     Ok(())
 }
 
@@ -744,6 +750,54 @@ mod tests {
         .unwrap();
     }
 
+    /// A migration that creates an enum must leave the pool that applied it
+    /// able to decode one.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn apply_one_leaves_the_pool_able_to_decode_a_type_it_just_created() {
+        let pool = test_pool().await;
+        let enum_type = unique_table_name("migrate_apply_enum");
+        pool.batch_execute(&format!("DROP TYPE IF EXISTS {enum_type}"))
+            .await
+            .unwrap();
+        let m = make_migration(
+            "initial",
+            &body(&format!("CREATE TYPE {enum_type} AS ENUM ('ok', 'nope');")),
+        );
+
+        apply_one(&pool, &m, false).await.unwrap();
+
+        // Asserted on the registry, before anything decodes an enum: the
+        // query path heals itself too (`PgPool::heal_types`), so a decode
+        // assertion alone would pass either way.
+        let oid = match pool
+            .query_typed(
+                "SELECT (oid::int8) AS result FROM pg_type WHERE typname = $1",
+                &[DecodedValue::Str(enum_type.clone())],
+                &pylon_pgcon::ExtensionOids::default(),
+            )
+            .await
+            .unwrap()
+            .first()
+        {
+            Some(DecodedValue::I64(oid)) => *oid as u32,
+            other => panic!("expected the new enum's oid, got {other:?}"),
+        };
+        assert!(
+            pool.types().enums.contains(&oid),
+            "apply_one must leave the registry knowing the type its DDL created"
+        );
+
+        let rows = pool
+            .query_composite(&format!("SELECT ('ok'::{enum_type}) AS result"), &pool.types())
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![DecodedValue::Str("ok".to_string())]);
+
+        cleanup_migration_row(&pool, &m.id).await;
+        pool.batch_execute(&format!("DROP TYPE {enum_type}")).await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn ensure_internal_schema_is_idempotent() {
@@ -840,7 +894,7 @@ mod tests {
                  WHERE table_schema = '_pylon' AND table_name = 'IndexOutbox' \
                  AND column_name = 'claimed_at'",
                 &[],
-                pool.types(),
+                &pool.types(),
             )
             .await
             .unwrap();

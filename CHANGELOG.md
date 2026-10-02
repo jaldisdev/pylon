@@ -4,6 +4,21 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.4.0
+
+### Connections
+
+A connection pool's type registry — the enum, domain and `vector` OIDs a
+database assigns locally — is no longer read only once, when the pool connects.
+
+* A result carrying an OID the registry doesn't know re-reads `pg_type` and
+  decodes again, so a database whose contents were replaced underneath a
+  running process recovers on its own rather than failing every query that
+  touches an enum column until a restart.
+* `migration apply` refreshes the registry after each migration, and
+  `reload_schema()` (Python and Rust clients) refreshes it alongside the schema
+  snapshot.
+
 ## 0.3.0 — 2026-10-02
 
 ### Loops

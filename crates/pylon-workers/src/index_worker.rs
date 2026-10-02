@@ -264,7 +264,7 @@ async fn claim_batch(listener: &PgListener, index_kind: &str, limit: i64) -> Res
                 // written into a text slot arrives as raw binary bytes.
                 DecodedValue::Str(PROCESSING_LEASE.as_secs().to_string()),
             ],
-            listener.types(),
+            &listener.types(),
         )
         .await?;
     rows.iter().map(decode_claimed_row).collect()
@@ -277,7 +277,7 @@ async fn mark_failed(listener: &PgListener, ids: Vec<DecodedValue>, index_kind: 
         .query_typed_named(
             MARK_FAILED_SQL,
             &[DecodedValue::Array(ids), DecodedValue::I64(MAX_ATTEMPTS)],
-            listener.types(),
+            &listener.types(),
         )
         .await?;
     let _ = index_kind;

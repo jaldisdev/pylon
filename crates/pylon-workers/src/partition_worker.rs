@@ -56,7 +56,7 @@ pub async fn partman_installed(pool: &PgPool) -> Result<bool> {
         .query_typed(
             "SELECT (EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_partman')) AS result",
             &[],
-            pool.types(),
+            &pool.types(),
         )
         .await?;
     Ok(matches!(rows.first(), Some(pylon_value::DecodedValue::Bool(true))))

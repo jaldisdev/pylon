@@ -59,8 +59,8 @@ impl Executor for pylon_pgcon::PgPool {
         globals: Option<&str>,
     ) -> pylon_pgcon::Result<Vec<DecodedValue>> {
         match globals {
-            Some(globals) => self.query_typed_with_globals(sql, params, self.types(), globals).await,
-            None => self.query_typed(sql, params, self.types()).await,
+            Some(globals) => self.query_typed_with_globals(sql, params, &self.types(), globals).await,
+            None => self.query_typed(sql, params, &self.types()).await,
         }
     }
     async fn run_execute(&self, sql: &str, params: &[DecodedValue], globals: Option<&str>) -> pylon_pgcon::Result<u64> {

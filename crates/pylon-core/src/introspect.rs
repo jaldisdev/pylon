@@ -64,7 +64,7 @@ fn ddl_hash(text: &str) -> String {
 }
 
 async fn query(pool: &PgPool, sql: &str, params: &[DecodedValue]) -> Result<Vec<DecodedValue>> {
-    pool.query_typed(sql, params, pool.types()).await
+    pool.query_typed(sql, params, &pool.types()).await
 }
 
 /// Destructures a `DecodedValue::Composite`'s fields into a fixed-size

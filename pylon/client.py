@@ -351,6 +351,18 @@ class Client:
             _cache.init(self._config.cache)
             await _install_migrated_schema(self._ref.pool)
 
+    async def reload_schema(self) -> None:
+        """Re-read the stored schema snapshot and this database's type OIDs.
+
+        For a process that knows the database changed underneath it (a
+        migration, a restore). A no-op if this client never connected.
+        """
+        if self._ref.pool is None:
+            return
+        pool = self._require_pool()
+        await pool.refresh_types()
+        await _install_migrated_schema(pool)
+
     async def aclose(self) -> None:
         """Close the connection pool and release all resources."""
         async with self._ref.lock:

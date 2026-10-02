@@ -142,7 +142,8 @@ fn range_element_oid(oid: u32) -> Option<u32> {
 /// `Default` means "nothing discovered yet", under which any OID not in the
 /// built-in set is an `Error::UnknownTypeOid` rather than a guess — see
 /// `decode_value`.
-#[derive(Debug, Clone, Default)]
+/// `PartialEq` so `PgPool::heal_types` can tell whether anything moved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionOids {
     /// pgvector's `vector` type, if the extension is installed.
     pub vector: Option<u32>,

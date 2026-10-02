@@ -277,7 +277,7 @@ impl PgconPool {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = pool
-                .query_typed(&sql, &cached_params, pool.types())
+                .query_typed(&sql, &cached_params, &pool.types())
                 .await
                 .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
@@ -298,7 +298,7 @@ impl PgconPool {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = pool
-                .query_typed_named(&sql, &cached_params, pool.types())
+                .query_typed_named(&sql, &cached_params, &pool.types())
                 .await
                 .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
@@ -330,10 +330,10 @@ impl PgconPool {
             let started = std::time::Instant::now();
             let result = match &globals {
                 Some(globals) => {
-                    pool.query_typed_with_globals(&sql, &cached_params, pool.types(), globals)
+                    pool.query_typed_with_globals(&sql, &cached_params, &pool.types(), globals)
                         .await
                 }
-                None => pool.query_typed(&sql, &cached_params, pool.types()).await,
+                None => pool.query_typed(&sql, &cached_params, &pool.types()).await,
             };
             pylon_workers::metrics::record_query_execution(&shape_id, &result, started.elapsed());
             let rows = result.map_err(pgcon_err)?;
@@ -438,6 +438,14 @@ impl PgconPool {
     fn batch_execute<'py>(&self, py: Python<'py>, sql: String) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { pool.batch_execute(&sql).await.map_err(pgcon_err) })
+    }
+
+    /// See `PgPool::refresh_types`. Exposed for `Client.reload_schema`,
+    /// the Python client's only way to recover a pool whose database
+    /// changed underneath it.
+    fn refresh_types<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { pool.refresh_types().await.map_err(pgcon_err) })
     }
 }
 
@@ -651,7 +659,7 @@ impl PgconListener {
         let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rows = inner
-                .query_typed_named(&sql, &cached_params, inner.types())
+                .query_typed_named(&sql, &cached_params, &inner.types())
                 .await
                 .map_err(pgcon_err)?;
             Ok(rows.into_iter().map(PyDecodedValue).collect::<Vec<_>>())
