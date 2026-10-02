@@ -4,6 +4,73 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.3.0 — 2026-10-02
+
+### Loops
+
+A `for` body that mutates now compiles in the positions it could already be
+written in — each of these was accepted by the parser and then failed, either
+in compilation or in the database.
+
+* A loop whose body mutates can be a `select`'s source: `select (for x in S
+  union (insert T { … })) { id }`. A source is emitted as a `CROSS JOIN
+  LATERAL` and PostgreSQL takes a data-modifying statement only at the top
+  level of a `WITH`, so the loop is bound to a name of its own and the select
+  re-rooted there.
+* A loop body that updates an interface fans out into one statement per
+  implementor, each driven from the iteration and unioned back under the
+  interface's common columns.
+* `with` bindings in a loop body that read *each other* are driven from the
+  iteration too, not just the ones naming the loop variable directly. Each
+  carries an iteration key named after itself, so chained reads stay
+  unambiguous.
+* A for-update's iterator is defined ahead of the bindings that read it, since
+  a `WITH` name is only in scope for what follows it.
+
+### Conditional writes
+
+A guarded insert — `(insert T { … }) if cond else {}` — writes nothing at all
+when its condition is false.
+
+* The condition reaches everything the insert writes: the row, the values
+  nested inside it, and a multi-link's rows, which are hoisted beside the
+  statement rather than inside it. Those were previously left behind, owned by
+  nothing.
+* A nested insert no longer claims the guard belonging to the one that
+  encloses it. The condition is taken before anything nested compiles, the way
+  a guarded update or delete already took it.
+
+### Query compilation
+
+* `expr is Type` reads as a single value where a single value is required — a
+  FILTER, or an `if … else` condition. Naming a type other than the one being
+  selected asked the question once per row of that type and produced a
+  `boolean[]`, which PostgreSQL rejects as a WHERE clause or a CASE/WHEN
+  condition, so the whole query failed.
+* `in` answers once per element of the set on its left, rather than collapsing
+  that set into one scalar subquery — which aborted with "more than one row
+  returned by a subquery used as an expression". This holds for a multi-link on
+  the left as well, where a single verdict over the whole link cannot express
+  that some linked objects match and others don't.
+* `any(…)` and `all(…)` reduce those per-element answers back to one, over the
+  set's own elements rather than over the rows of the query.
+
+### Server
+
+* Schema and globals are served per connection: `GET /api/<connection>/schema`
+  and `GET /api/<connection>/globals`. Each connection addresses a database of
+  its own, with its own `_pylon."Schema"` row, so two connections agree only
+  when the same migrations have been applied to both. `GET /api/schema` and
+  `GET /api/globals` remain as unprefixed aliases for `main`'s.
+
+### Schema declaration
+
+* An optional in a function signature is recognised on Python 3.13, where
+  `X | None` is a `types.UnionType`. The signature parser did not count that as
+  a union, so the `None` was never stripped, the declared type resolved to
+  `text`, and a body returning exactly what it declared was rejected as a
+  mismatch. Parameters were read the same way.
+
 ## 0.2.0 — 2026-09-27
 
 ### Dates, times and durations
