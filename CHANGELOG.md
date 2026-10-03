@@ -60,6 +60,20 @@ nothing at all.
 * A required property adds no condition, so its queries are emitted exactly
   as before.
 
+### Sets of arrays
+
+A computed pointer reaching an array-valued property through a multi-link
+(`Crew { tag_sets := .<crew[is Hand].tags }`) accumulated one row's array
+beside another's, which PostgreSQL has no type for: "cannot accumulate arrays
+of different dimensionality". Every such pointer failed at execution.
+
+* Each element now travels as a record of one field — the same way a set of
+  objects already does — so a set of arrays is readable at all.
+* Every element keeps its own column type rather than being flattened through
+  jsonb: a `uuid` array reads back as `UUID`s, a `decimal` array as
+  `Decimal`s, an enum array as its members, and an `array<tuple<…>>` as the
+  named tuples it declares.
+
 ### Writing
 
 A tuple-typed parameter now binds from every shape a caller holds the value

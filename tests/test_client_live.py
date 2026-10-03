@@ -43,6 +43,7 @@ import datetime
 import decimal
 import os
 import types as _types
+import uuid as _uuid
 
 import pytest
 
@@ -667,6 +668,106 @@ def test_a_path_to_an_optional_property_yields_only_the_rows_that_have_one(live_
         )
         assert list(team.nicknames) == ['nick']
         assert sorted(team.names) == ['with', 'without']
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
+def test_a_set_of_array_valued_properties_reads_back_as_the_arrays_it_holds(live_pool, unique_module):
+    """`Team { tag_sets := .<team[is Member].tags }` — a set of arrays.
+
+    PostgreSQL has no array of arrays, so accumulating one member's `text[]`
+    beside another's failed outright: "cannot accumulate arrays of different
+    dimensionality" (and "cannot accumulate null arrays" where one was
+    unset). Each element travels as a record of one field now, which keeps
+    every element's own column type — a `uuid` stays a `UUID`, a tuple stays
+    a named tuple — rather than flattening the whole thing through jsonb.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_array_sets')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.enum('RED', 'BLUE')
+        class Colour(pylon.Enum):
+            pass
+
+        Colour.__pylon_module__ = module
+
+        @pylon.type(module=module, name='Crew')
+        class Crew:
+            name: pylon.Str
+
+        @pylon.type(module=module, name='Hand')
+        class Hand:
+            name: pylon.Str
+            tags: pylon.Array[pylon.Str] | None
+            colours: pylon.Array[Colour] | None
+            keys: pylon.Array[pylon.UUID] | None
+            headers: pylon.Array[pylon.Tuple[('name', pylon.Str), ('value', pylon.Str)]] | None
+            crew: Link[Crew]
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        await client.execute(f"insert {module}::Crew {{ name := 'red' }};")
+        key = _uuid.UUID(int=7)
+        # Arrays of different lengths, and one row with none at all: the
+        # three shapes that each failed differently before.
+        for name, tags, headers in (
+            ('one', ['a'], [('X-One', '1')]),
+            ('two', ['b', 'c'], [('X-Two', '2'), ('X-Three', '3')]),
+            ('none', None, None),
+        ):
+            await client.execute(
+                f"""insert {module}::Hand {{
+                      name := <str>$name,
+                      tags := <optional array<str>>$tags,
+                      colours := <optional array<{module}::Colour>>$colours,
+                      keys := <optional array<uuid>>$keys,
+                      headers := <optional array<tuple<name: str, value: str>>>$headers,
+                      crew := (select {module}::Crew filter .name = 'red' limit 1)
+                    }};""",
+                name=name,
+                tags=tags,
+                colours=['RED', 'BLUE'] if tags else None,
+                keys=[key] if tags else None,
+                headers=headers,
+            )
+
+        crew = await client.query_required_single(
+            f"""select {module}::Crew {{
+                  tag_sets := .<crew[is {module}::Hand].tags,
+                  colour_sets := .<crew[is {module}::Hand].colours,
+                  key_sets := .<crew[is {module}::Hand].keys,
+                  header_sets := .<crew[is {module}::Hand].headers
+                }} limit 1;"""
+        )
+
+        assert sorted(list(entry) for entry in crew.tag_sets) == [['a'], ['b', 'c']]
+        # An enum array keeps its members, not their labels.
+        assert [list(entry) for entry in crew.colour_sets] == [[Colour.RED, Colour.BLUE]] * 2
+        # And a uuid array keeps `UUID`s — what a flattening through jsonb
+        # would have turned into strings.
+        assert [list(entry) for entry in crew.key_sets] == [[key], [key]]
+        header_sets = sorted(
+            [[(header.name, header.value) for header in entry] for entry in crew.header_sets],
+            key=len,
+        )
+        assert header_sets == [[('X-One', '1')], [('X-Two', '2'), ('X-Three', '3')]]
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')

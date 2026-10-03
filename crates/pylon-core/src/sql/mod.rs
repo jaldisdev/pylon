@@ -2553,6 +2553,11 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                         }),
                     }
                 }
+                IrPathResult::Scalar(e, tuple_shape) if yields_array(e) => ShapeNode::Array {
+                    name: name.to_string(),
+                    position,
+                    element: Box::new(aggregated_array_element(e, tuple_shape.as_ref())),
+                },
                 IrPathResult::Scalar(..) => ShapeNode::Scalar {
                     name: name.to_string(),
                     position,
@@ -2852,6 +2857,25 @@ fn emit_array_source(src: &IrArraySource) -> String {
         ),
         IrArraySource::PathSelect(ps) => {
             let scalar = match &ps.result {
+                // PostgreSQL has no array of arrays, so a set of
+                // array-valued properties cannot be accumulated into one
+                // ("cannot accumulate arrays of different dimensionality").
+                // Each element travels as a record of one field instead —
+                // the same way a set of objects already does, and with every
+                // element keeping its own column type rather than being
+                // flattened through jsonb.
+                IrPathResult::Scalar(e, _) if yields_array(e) => {
+                    // Same reason `emit_scalar` casts one: a custom type's
+                    // OID is assigned by the database and means nothing to a
+                    // static record decode.
+                    let cast = match e {
+                        IrExpr::ColumnRef { pg_type, .. } => {
+                            QualifiedPgType::of(pg_type).map(|qualified| qualified.text_cast())
+                        }
+                        _ => None,
+                    };
+                    format!("ROW({}{})", emit_expr(e), cast.unwrap_or(""))
+                }
                 IrPathResult::Scalar(e, _) => emit_expr(e),
                 // Aggregating objects keeps the whole row, not the id: this is
                 // how a computed pointer that walks through a multi-link comes
@@ -3309,6 +3333,51 @@ fn yields_jsonb(expr: &IrExpr) -> bool {
             overloads.peek().is_some() && overloads.all(|d| matches!(d.return_type, crate::stdlib::PylonType::Json))
         }
         _ => false,
+    }
+}
+
+/// True for an expression whose value is a PostgreSQL array — mirrors
+/// `yields_jsonb` for the other type the emitter has to know by sight.
+fn yields_array(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::Array(_) | IrExpr::ArrayFromSelect(_) => true,
+        IrExpr::ColumnRef { pg_type, .. } | IrExpr::FnParam { pg_type, .. } => pg_type.ends_with("[]"),
+        IrExpr::CteRef { pg_type, .. } | IrExpr::ForVar { pg_type, .. } => {
+            pg_type.as_deref().is_some_and(|ty| ty.ends_with("[]"))
+        }
+        IrExpr::TypeCast(cast) => cast.pg_type.ends_with("[]"),
+        _ => false,
+    }
+}
+
+/// One element of an aggregated set of array-valued properties: the array
+/// sits at position 0 of the one-field record it travels in (see
+/// `IrArraySource::PathSelect`'s emission), described the same way the
+/// property is inside an object's own row — a named tuple per element where
+/// the declaration says so, an enum label per element for an enum array,
+/// else the array as the driver decodes it.
+fn aggregated_array_element(expr: &IrExpr, tuple_shape: Option<&crate::ir::TupleCastShape>) -> ShapeNode {
+    if let Some(shape) = tuple_shape {
+        return ShapeNode::Array {
+            name: String::new(),
+            position: 0,
+            element: Box::new(ShapeNode::NamedTuple {
+                name: String::new(),
+                position: 0,
+                type_name: shape.type_name.clone(),
+                members: Some(shape.members.clone()),
+                is_free_object: false,
+            }),
+        };
+    }
+    if let IrExpr::ColumnRef { pg_type, .. } = expr
+        && let Some(qualified) = QualifiedPgType::of(pg_type)
+    {
+        return qualified.shape_node(String::new(), 0);
+    }
+    ShapeNode::Scalar {
+        name: String::new(),
+        position: 0,
     }
 }
 
@@ -15697,6 +15766,105 @@ select owner { posts := (select owner.posts.title) };",
             "got:\n{}",
             out.sql
         );
+    }
+
+    #[test]
+    fn test_a_set_of_array_valued_properties_aggregates_as_records() {
+        // PostgreSQL has no array of arrays, so accumulating one row's
+        // `text[]` beside another's failed outright ("cannot accumulate
+        // arrays of different dimensionality"). Each element travels as a
+        // record of one field instead, the way a set of objects does.
+        let out = compile_and_emit_with(
+            "SELECT Company { permissions := .<company[is Person].perms }",
+            &schema_with_array_property(),
+        );
+        assert!(out.sql.contains(r#"ROW("t2"."perms")"#), "got:\n{}", out.sql);
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Object, got {:?}", out.shape.root)
+        };
+        let permissions = pointers
+            .iter()
+            .find(|p| matches!(p, crate::query::ShapeNode::Array { name, .. } if name == "permissions"))
+            .expect("expected the permissions pointer");
+        let crate::query::ShapeNode::Array { element, .. } = permissions else {
+            unreachable!("matched as an array just above")
+        };
+        // One element is the array itself, at position 0 of its record.
+        match element.as_ref() {
+            crate::query::ShapeNode::Scalar { position, .. } => assert_eq!(*position, 0),
+            other => panic!("expected the array at position 0 of its record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_set_of_array_of_tuples_properties_keeps_the_member_shape() {
+        let mut schema = make_schema_with_an_array_of_tuples_property();
+        // The same `Person`, reached from a `Company` it links to.
+        schema.types.push(TypeDescriptor {
+            name: "Company".into(),
+            module: "default".into(),
+            table: "Company".into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+        schema.types[0].links.push(crate::schema::LinkDescriptor {
+            name: "company".into(),
+            target: "default::Company".into(),
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+            through: None,
+        });
+        let out = compile_and_emit_with(
+            "SELECT Company { addresses := .<company[is Person].addresses }",
+            &schema,
+        );
+        assert!(out.sql.contains(r#"ROW("t2"."addresses")"#), "got:\n{}", out.sql);
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Object, got {:?}", out.shape.root)
+        };
+        let addresses = pointers
+            .iter()
+            .find(|p| matches!(p, crate::query::ShapeNode::Array { name, .. } if name == "addresses"))
+            .expect("expected the addresses pointer");
+        let crate::query::ShapeNode::Array { element, .. } = addresses else {
+            unreachable!("matched as an array just above")
+        };
+        // Each element is itself an array, of the named tuples the property
+        // declares — not the opaque jsonb a flattening would hand back.
+        match element.as_ref() {
+            crate::query::ShapeNode::Array { element, position, .. } => {
+                assert_eq!(*position, 0);
+                assert!(
+                    matches!(
+                        element.as_ref(),
+                        crate::query::ShapeNode::NamedTuple { members: Some(_), .. }
+                    ),
+                    "expected named-tuple elements, got {element:?}"
+                );
+            }
+            other => panic!("expected an array per element, got {other:?}"),
+        }
     }
 
     #[test]
