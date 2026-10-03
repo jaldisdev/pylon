@@ -632,13 +632,21 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             };
             encode_array(items, &element_ty, out)?;
         }
+        DecodedValue::Composite(items) if *ty == Type::JSONB => {
+            // An all-unnamed `tuple<str, bool>` is a jsonb *array* — the
+            // positional form `_decode`'s named-tuple case reads back by
+            // index. JSON needs no per-field Postgres type, which is what
+            // makes this encodable where the composite below is not.
+            out.put_u8(1); // jsonb binary format version prefix
+            out.put_slice(cached_to_json(value).to_string().as_bytes());
+        }
         DecodedValue::Composite(_) => {
-            // Composites only ever arise from *decoding* a query result
-            // (see `decode_record`) — PyQL never binds a raw composite as
-            // a query parameter, and encoding one correctly would need a
-            // per-field Postgres type that isn't available here (only the
-            // original compiled query's shape carries that). Erroring is
-            // safer than guessing wrong field types.
+            // Outside jsonb, a composite only arises from *decoding* a query
+            // result (see `decode_record`): PyQL binds no raw record as a
+            // parameter, and encoding one correctly would need a per-field
+            // Postgres type that isn't available here (only the original
+            // compiled query's shape carries that). Erroring is safer than
+            // guessing wrong field types.
             return Err(Error::message("cannot bind a composite value as a query parameter"));
         }
         DecodedValue::Object(fields) => {
@@ -1602,6 +1610,24 @@ mod tests {
         assert_eq!(
             decode_value(OID_JSONB, &out, &no_ext()).unwrap(),
             DecodedValue::Object(vec![("a".into(), DecodedValue::I64(1))])
+        );
+    }
+
+    #[test]
+    fn encodes_a_composite_as_a_jsonb_array_but_refuses_it_elsewhere() {
+        // An all-unnamed `tuple<str, bool>` parameter is a jsonb array, and
+        // JSON needs no per-field Postgres type — unlike a real record,
+        // which stays refused.
+        let value = DecodedValue::Composite(vec![DecodedValue::Str("left".into()), DecodedValue::Bool(true)]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::JSONB, &mut out).unwrap();
+        assert_eq!(out.as_ref(), [&[1u8][..], br#"["left",true]"#].concat());
+
+        let mut out = bytes::BytesMut::new();
+        let refused = encode_value(&value, &postgres_types::Type::RECORD, &mut out);
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("cannot bind a composite value")),
+            "a record parameter has no per-field type to encode against"
         );
     }
 }

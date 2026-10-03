@@ -222,6 +222,7 @@ mod tests {
         CompiledQuery {
             sql: sql.to_string(),
             param_names: vec![],
+            param_tuple_types: vec![],
             params: vec![],
             shape,
             warnings: vec![],

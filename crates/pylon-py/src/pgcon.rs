@@ -35,7 +35,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use pylon_pgcon::{PgListener, PgPool, PgTransaction};
 use pylon_value::DecodedValue;
 
-use crate::pgvalue::{cached_to_py, py_to_cached};
+use crate::pgvalue::{cached_to_py, py_params_to_cached, py_to_cached};
 use crate::rowset::RowSet;
 use crate::{CompiledQuery, PylonPgconError};
 
@@ -322,7 +322,8 @@ impl PgconPool {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        let cached_params =
+            py_params_to_cached(&params, &compiled.inner.param_names, &compiled.inner.param_tuple_types)?;
         // Read before the async block: `compiled` is borrowed, and the
         // future below outlives this call.
         let shape_id = compiled.inner.shape_id();
@@ -359,7 +360,8 @@ impl PgconPool {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
         let path_aliases = compiled.inner.analyze_paths.clone().unwrap_or_default();
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        let cached_params =
+            py_params_to_cached(&params, &compiled.inner.param_names, &compiled.inner.param_tuple_types)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = pool.query_explain(&sql, &cached_params).await;
             pylon_workers::metrics::record_query_result(&result);
@@ -398,7 +400,8 @@ impl PgconPool {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.inner.clone();
         let sql = compiled.inner.sql.clone();
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        let cached_params =
+            py_params_to_cached(&params, &compiled.inner.param_names, &compiled.inner.param_tuple_types)?;
         // Read before the async block: `compiled` is borrowed, and the
         // future below outlives this call.
         let shape_id = compiled.inner.shape_id();
@@ -519,7 +522,8 @@ impl PgconTransaction {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        let cached_params =
+            py_params_to_cached(&params, &compiled.inner.param_names, &compiled.inner.param_tuple_types)?;
         // Read before the async block: `compiled` is borrowed, and the
         // future below outlives this call.
         let shape_id = compiled.inner.shape_id();
@@ -551,7 +555,8 @@ impl PgconTransaction {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let sql = compiled.inner.sql.clone();
-        let cached_params = params.iter().map(py_to_cached).collect::<PyResult<Vec<_>>>()?;
+        let cached_params =
+            py_params_to_cached(&params, &compiled.inner.param_names, &compiled.inner.param_tuple_types)?;
         // Read before the async block: `compiled` is borrowed, and the
         // future below outlives this call.
         let shape_id = compiled.inner.shape_id();

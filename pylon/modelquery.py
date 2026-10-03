@@ -695,6 +695,30 @@ def _junction_class(through: Any) -> type | None:
     return None
 
 
+def _tuple_property_cast(scalar_type: Any) -> str:
+    """`<default::Point>` / `<array<tuple<name: str, value: str>>>` for a
+    tuple-typed property, else `''`.
+
+    A tuple travels as jsonb, whose named members are keyed, and the names
+    come from the cast — without one a `Point` instance or a plain
+    `("X-Foo", "bar")` reaches the binding layer with nothing to be matched
+    against (see `ParamTupleType` on the Rust side). Same reason the
+    junction-property casts above exist, for the same kind of column.
+    """
+    from pylon.schema._named_tuples import NamedTuple as PylonNamedTuple
+    from pylon.schema._pointers import ArrayAnnotation, TupleAnnotation
+    from pylon.schema._walker import _pyql_type_name
+
+    element = scalar_type.element if isinstance(scalar_type, ArrayAnnotation) else scalar_type
+    is_tuple = isinstance(element, TupleAnnotation) or (
+        isinstance(element, type) and issubclass(element, PylonNamedTuple)
+    )
+    if not is_tuple:
+        return ''
+    type_name = _pyql_type_name(scalar_type)
+    return f'<{type_name}>' if type_name is not None else ''
+
+
 def _junction_property_types(through: Any) -> dict[str, str]:
     """`{link_property: pyql_type_name}` for a junction, for building casts."""
     junction = _junction_class(through)
@@ -976,7 +1000,7 @@ def prepare_save(obj: Any) -> tuple[str, dict[str, Any]] | None:
                 # the column is simply omitted and stays NULL either way.
                 if value is None:
                     continue
-                assignments.append(f'{name} := {_param(value)}')
+                assignments.append(f'{name} := {_tuple_property_cast(meta.scalar_type)}{_param(value)}')
             elif meta.kind == 'link':
                 if value is None:
                     continue
@@ -1006,7 +1030,7 @@ def prepare_save(obj: Any) -> tuple[str, dict[str, Any]] | None:
         if meta.kind == 'property':
             if current == saved.get(name, _UNSET):
                 continue
-            assignments.append(f'{name} := {_param(current)}')
+            assignments.append(f'{name} := {_tuple_property_cast(meta.scalar_type)}{_param(current)}')
         elif meta.kind == 'link':
             previous = saved.get(name, _UNSET)
             if _same_link(current, previous):

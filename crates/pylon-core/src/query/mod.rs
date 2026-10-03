@@ -281,6 +281,24 @@ pub enum InferencePlan {
     },
 }
 
+/// The tuple type a parameter is cast to — `<tuple<…>>$p`, a nominal
+/// `<module::Point>$p`, or an array of either.
+///
+/// A tuple value travels as jsonb, and a named member is a *key* in it, so a
+/// client holding the value positionally (a Python tuple, a named-tuple
+/// instance) needs the member names to build what the cast asks for. The
+/// cast is the only place those names exist, so compilation records them
+/// here rather than leaving the client to guess from the value's own shape.
+#[derive(Debug, Clone)]
+pub struct ParamTupleType {
+    /// `<array<tuple<…>>>` — `members` then describes one element.
+    pub is_array: bool,
+    /// The registered name for a nominal named tuple; `None` for a
+    /// structural `tuple<…>`.
+    pub type_name: Option<String>,
+    pub members: Vec<JsonMember>,
+}
+
 /// The output of a successful PyQL compilation.
 /// Immutable and safe to cache and reuse across requests.
 #[derive(Debug, Clone)]
@@ -290,6 +308,9 @@ pub struct CompiledQuery {
     /// Ordered parameter names matching $1, $2, … in the SQL.
     /// The client uses this to map kwargs to positional arguments.
     pub param_names: Vec<String>,
+    /// Positionally matching `param_names`: the tuple type each parameter is
+    /// cast to, where it is cast to one (see `ParamTupleType`).
+    pub param_tuple_types: Vec<Option<ParamTupleType>>,
     /// Typed bound parameters — populated at execution time, empty after compilation.
     pub params: Vec<QueryParam>,
     /// Opaque shape handle — consumed by the Rust deserializer.
@@ -604,6 +625,7 @@ fn compile_ast(
     Ok(CompiledQuery {
         sql: sql_out.sql,
         param_names: ir_out.params,
+        param_tuple_types: ir_out.param_tuple_types,
         params: Vec::new(),
         shape: sql_out.shape,
         warnings: ir_out.warnings,

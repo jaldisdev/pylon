@@ -1381,6 +1381,9 @@ pub struct IrOutput {
     /// Ordered parameter names, positionally matching `$1`, `$2`, … in the SQL.
     /// Global params use the `__global__module::name` prefix; user params use bare names.
     pub params: Vec<String>,
+    /// Positionally matching `params`: the tuple type each one is cast to,
+    /// where it is cast to one (see `crate::query::ParamTupleType`).
+    pub param_tuple_types: Vec<Option<crate::query::ParamTupleType>>,
     /// User-defined CTE bindings from a WITH block, in declaration order.
     pub ctes: Vec<IrCteDef>,
     /// Global variable CTEs (session-injected or computed), in dependency order.
@@ -2964,5 +2967,117 @@ mod tests {
         let ast = parse::parse("SELECT Person FILTER .name = $0 OR .name = $0").unwrap();
         let ir = super::compile(&ast, &schema).expect("compile failed");
         assert_eq!(ir.params, vec!["0"], "repeated $0 must occupy a single slot");
+    }
+
+    /// What a parameter's tuple cast recorded: whether it is an array, the
+    /// nominal type name, and the member names the value is keyed by. A
+    /// client holding `("X-Foo", "bar")` cannot know those names; the cast
+    /// does.
+    #[derive(Debug, PartialEq)]
+    struct ParamTupleKeys {
+        is_array: bool,
+        type_name: Option<String>,
+        keys: Vec<String>,
+    }
+
+    fn param_tuple_keys(query: &str, schema: &SchemaDescriptor) -> Vec<Option<ParamTupleKeys>> {
+        let ast = parse::parse(query).unwrap();
+        let ir = super::compile(&ast, schema).expect("compile failed");
+        ir.param_tuple_types
+            .iter()
+            .map(|plan| {
+                plan.as_ref().map(|plan| ParamTupleKeys {
+                    is_array: plan.is_array,
+                    type_name: plan.type_name.clone(),
+                    keys: plan.members.iter().map(|m| m.key.clone().unwrap_or_default()).collect(),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_a_tuple_cast_records_its_member_names_against_the_parameter() {
+        let schema = make_schema();
+        assert_eq!(
+            param_tuple_keys("SELECT <tuple<street: str, zip: str>>$address", &schema),
+            vec![Some(ParamTupleKeys {
+                is_array: false,
+                type_name: None,
+                keys: vec!["street".to_string(), "zip".to_string()],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_an_array_of_tuples_cast_records_one_element_s_member_names() {
+        let schema = make_schema();
+        assert_eq!(
+            param_tuple_keys("SELECT <array<tuple<name: str, value: str>>>$headers", &schema),
+            vec![Some(ParamTupleKeys {
+                is_array: true,
+                type_name: None,
+                keys: vec!["name".to_string(), "value".to_string()],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_a_nominal_named_tuple_cast_records_its_type_name_too() {
+        use crate::schema::{NamedTupleDescriptor, TupleMemberDescriptor, TupleMemberKind};
+        let mut schema = make_schema();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+            members: vec![
+                TupleMemberDescriptor {
+                    name: Some("x".into()),
+                    kind: TupleMemberKind::Scalar {
+                        pg_type: "float8".into(),
+                    },
+                },
+                TupleMemberDescriptor {
+                    name: Some("y".into()),
+                    kind: TupleMemberKind::Scalar {
+                        pg_type: "float8".into(),
+                    },
+                },
+            ],
+        });
+        assert_eq!(
+            param_tuple_keys("SELECT <array<default::Point>>$points", &schema),
+            vec![Some(ParamTupleKeys {
+                is_array: true,
+                type_name: Some("default::Point".to_string()),
+                keys: vec!["x".to_string(), "y".to_string()],
+            })]
+        );
+    }
+
+    #[test]
+    fn test_a_parameter_cast_to_a_plain_scalar_records_no_tuple_plan() {
+        let schema = make_schema();
+        assert_eq!(param_tuple_keys("SELECT <str>$name", &schema), vec![None]);
+    }
+
+    #[test]
+    fn test_a_tuple_cast_in_expression_position_records_its_member_names() {
+        // The write that matters — `set { headers := <array<tuple<…>>>$headers }`
+        // — compiles its cast in expression position rather than as the free
+        // select the cases above take.
+        let schema = make_schema();
+        assert_eq!(
+            param_tuple_keys(
+                "SELECT { name := <str>$name, address := <tuple<street: str, zip: str>>$address }",
+                &schema
+            ),
+            vec![
+                None,
+                Some(ParamTupleKeys {
+                    is_array: false,
+                    type_name: None,
+                    keys: vec!["street".to_string(), "zip".to_string()],
+                })
+            ]
+        );
     }
 }

@@ -88,6 +88,7 @@ pub fn compile_with_config(
                 subtype_fanouts: c.subtype_fanouts(),
                 stmt: ir,
                 params: c.params,
+                param_tuple_types: c.param_tuple_types,
                 ctes: vec![],
                 global_ctes: c.global_ctes,
                 warnings: c.warnings,
@@ -100,6 +101,7 @@ pub fn compile_with_config(
                 subtype_fanouts: c.subtype_fanouts(),
                 stmt: ir,
                 params: c.params,
+                param_tuple_types: c.param_tuple_types,
                 ctes: vec![],
                 global_ctes: c.global_ctes,
                 warnings: c.warnings,
@@ -140,6 +142,7 @@ pub fn compile_with_config(
         subtype_fanouts: c.subtype_fanouts(),
         stmt: ir,
         params: c.params,
+        param_tuple_types: c.param_tuple_types,
         ctes,
         global_ctes: c.global_ctes,
         warnings: c.warnings,
@@ -949,6 +952,7 @@ pub fn compile_fn_body_with(
         subtype_fanouts: c.subtype_fanouts(),
         stmt: ir,
         params: c.params,
+        param_tuple_types: c.param_tuple_types,
         ctes,
         global_ctes: c.global_ctes,
         warnings: c.warnings,
@@ -1129,6 +1133,7 @@ pub fn compile_trigger_handler(
         subtype_fanouts: c.subtype_fanouts(),
         stmt: ir,
         params: c.params,
+        param_tuple_types: c.param_tuple_types,
         ctes,
         global_ctes: c.global_ctes,
         warnings: c.warnings,
@@ -1392,6 +1397,9 @@ struct Compiler<'a> {
     schema: &'a SchemaDescriptor,
     /// Ordered parameter names — index + 1 is the $N position in SQL.
     params: Vec<String>,
+    /// Positionally matching `params`, grown with it: the tuple type a
+    /// parameter is cast to, recorded by `tuple_cast`.
+    param_tuple_types: Vec<Option<crate::query::ParamTupleType>>,
     alias_counter: usize,
     /// CTE names registered in the enclosing WITH block → qualified type name.
     cte_types: HashMap<String, String>,
@@ -1653,6 +1661,7 @@ impl<'a> Compiler<'a> {
         Compiler {
             schema,
             params: vec![],
+            param_tuple_types: vec![],
             alias_counter: 0,
             cte_types: HashMap::new(),
             group_bindings: HashMap::new(),
@@ -2026,7 +2035,34 @@ impl<'a> Compiler<'a> {
         }
         let i = self.params.len();
         self.params.push(name.to_string());
+        self.param_tuple_types.push(None);
         i
+    }
+
+    /// Build a cast to a tuple type, remembering the member names when what
+    /// is being cast is a parameter.
+    ///
+    /// A client holds such a value positionally as often as by name — a
+    /// Python tuple, a named-tuple instance — and jsonb keys its named
+    /// members, so the names have to travel out of compilation with the
+    /// parameter (see `crate::query::ParamTupleType`). Taking the *compiled*
+    /// inner expression is what makes this reliable: a parameter is the only
+    /// thing that reaches `IrExpr::Param`, however the cast was written.
+    fn tuple_cast(&mut self, expr: IrExpr, pg_type: String, tuple_shape: Option<TupleCastShape>) -> IrExpr {
+        if let IrExpr::Param { index } = &expr
+            && let Some(shape) = &tuple_shape
+        {
+            self.param_tuple_types[*index] = Some(crate::query::ParamTupleType {
+                is_array: pg_type.ends_with("[]"),
+                type_name: shape.type_name.clone(),
+                members: shape.members.clone(),
+            });
+        }
+        IrExpr::TypeCast(Box::new(IrTypeCast {
+            expr,
+            pg_type,
+            tuple_shape,
+        }))
     }
 
     // ── Global variable resolution ────────────────────────────────────────────────
@@ -3028,22 +3064,14 @@ impl<'a> Compiler<'a> {
                     })),
                     None => {
                         let inner = self.compile_expr_ctx(&tc.expr, None)?;
-                        IrExpr::TypeCast(Box::new(IrTypeCast {
-                            expr: inner,
-                            pg_type,
-                            tuple_shape,
-                        }))
+                        self.tuple_cast(inner, pg_type, tuple_shape)
                     }
                 }
             }
             _ => {
                 let inner = self.compile_expr_ctx(&tc.expr, None)?;
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                IrExpr::TypeCast(Box::new(IrTypeCast {
-                    expr: inner,
-                    pg_type,
-                    tuple_shape,
-                }))
+                self.tuple_cast(inner, pg_type, tuple_shape)
             }
         };
         Ok(IrStmt::Select(IrSelect {
@@ -12560,11 +12588,7 @@ impl<'a> Compiler<'a> {
                 };
 
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
-                    expr: inner,
-                    pg_type,
-                    tuple_shape,
-                })))
+                Ok(self.tuple_cast(inner, pg_type, tuple_shape))
             }
 
             // The same coalesce with no shape after it — `(… ?? …)` standing

@@ -34,8 +34,10 @@ from pylon.modelquery import ModelSet, cal, math, render, render_expr, std
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
-def _pointer(kind: str, is_readonly: bool = False):
-    return SimpleNamespace(kind=kind, is_readonly=is_readonly)
+def _pointer(kind: str, is_readonly: bool = False, scalar_type: object = str):
+    # `scalar_type` carries the declared type a real PointerMeta has — read by
+    # `prepare_save` to cast a tuple-typed property it writes.
+    return SimpleNamespace(kind=kind, is_readonly=is_readonly, scalar_type=scalar_type)
 
 
 class Person:

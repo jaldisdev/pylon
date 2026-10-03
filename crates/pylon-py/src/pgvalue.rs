@@ -38,6 +38,7 @@ use pyo3::types::{
     PyTuple, PyType, PyTzInfo, PyTzInfoAccess,
 };
 
+use pylon_core::query::{JsonMember, JsonMemberKind, ParamTupleType};
 use pylon_value::DecodedValue;
 
 /// Days between the Unix epoch (1970-01-01) and the PostgreSQL/Pylon epoch
@@ -292,6 +293,229 @@ pub(crate) fn py_to_cached(value: &Bound<'_, PyAny>) -> PyResult<DecodedValue> {
         "cannot convert a value of type {} to DecodedValue",
         value.get_type().name()?
     )))
+}
+
+/// Converts a query's bound parameters, reading each one that is cast to a
+/// tuple type against that type's own member names.
+///
+/// A tuple value travels as jsonb, where a named member is a *key* — but a
+/// caller holds one positionally as naturally as by name: a plain
+/// `("X-Foo", "bar")`, a `@pylon.named_tuple` instance, a `NamedTupleValue`
+/// read back from an earlier query, a dict. Only the cast knows the names
+/// (see `ParamTupleType`), so matching the value to them happens here and
+/// not in `py_to_cached`, which sees one value at a time with no idea what
+/// it is being bound to.
+pub(crate) fn py_params_to_cached(
+    params: &[Bound<'_, PyAny>],
+    param_names: &[String],
+    param_tuple_types: &[Option<ParamTupleType>],
+) -> PyResult<Vec<DecodedValue>> {
+    params
+        .iter()
+        .enumerate()
+        .map(
+            |(i, value)| match param_tuple_types.get(i).and_then(|plan| plan.as_ref()) {
+                None => py_to_cached(value),
+                Some(plan) => {
+                    let argument = Argument {
+                        name: param_names.get(i).map(String::as_str).unwrap_or_default(),
+                        value,
+                    };
+                    if plan.is_array {
+                        tuple_array_to_cached(value, plan, &argument)
+                    } else {
+                        tuple_to_cached(value, &plan.members, plan.type_name.as_deref(), &argument)
+                    }
+                }
+            },
+        )
+        .collect()
+}
+
+/// The argument a conversion is working inside, for an error that names it
+/// the way the Python-side argument checks do (see `_check_array_elements`
+/// in `client.py`).
+struct Argument<'a, 'py> {
+    name: &'a str,
+    value: &'a Bound<'py, PyAny>,
+}
+
+impl Argument<'_, '_> {
+    fn refuse(&self, detail: String) -> PyErr {
+        let rendered = self
+            .value
+            .repr()
+            .and_then(|r| r.extract::<String>())
+            .unwrap_or_else(|_| "<unrepresentable>".to_string());
+        invalid_parameter_type(format!(
+            "invalid input for query argument ${}: {rendered} ({detail})",
+            self.name
+        ))
+    }
+}
+
+/// `pylon.exceptions.InvalidParameterTypeError` — the error a value the
+/// query cannot mean already raises on the Python side, rather than the
+/// bare `ValueError` a conversion failure would otherwise surface as.
+fn invalid_parameter_type(message: String) -> PyErr {
+    Python::attach(|py| {
+        let cls = py
+            .import("pylon.exceptions")
+            .and_then(|m| m.getattr("InvalidParameterTypeError"))
+            .expect("pylon.exceptions must define the core exception hierarchy");
+        match cls.call1((message,)) {
+            Ok(instance) => PyErr::from_value(instance),
+            Err(construct_err) => construct_err,
+        }
+    })
+}
+
+/// `<array<tuple<…>>>$p` — one tuple per element, so the member names apply
+/// element-wise.
+fn tuple_array_to_cached(
+    value: &Bound<'_, PyAny>,
+    plan: &ParamTupleType,
+    argument: &Argument<'_, '_>,
+) -> PyResult<DecodedValue> {
+    if value.is_none() {
+        return Ok(DecodedValue::Null);
+    }
+    let Ok(items) = value.try_iter() else {
+        return Err(argument.refuse(format!(
+            "a sequence of {} expected (got type '{}')",
+            describe_tuple_type(&plan.members, plan.type_name.as_deref()),
+            value.get_type().name()?,
+        )));
+    };
+    let elements = items
+        .map(|item| tuple_to_cached(&item?, &plan.members, plan.type_name.as_deref(), argument))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(DecodedValue::Array(elements))
+}
+
+/// One tuple value as the jsonb it travels as: an object keyed by the member
+/// names, or — for an all-unnamed `tuple<str, bool>` — a positional
+/// `Composite`, which `wire.rs` writes as a jsonb array.
+fn tuple_to_cached(
+    value: &Bound<'_, PyAny>,
+    members: &[JsonMember],
+    type_name: Option<&str>,
+    argument: &Argument<'_, '_>,
+) -> PyResult<DecodedValue> {
+    if value.is_none() {
+        return Ok(DecodedValue::Null);
+    }
+    let keys: Vec<&str> = members.iter().filter_map(|m| m.key.as_deref()).collect();
+    if keys.is_empty() {
+        return Ok(DecodedValue::Composite(positional_members(
+            value, members, type_name, argument,
+        )?));
+    }
+
+    // A mapping reads by key; so does anything carrying an attribute per
+    // member — an instance of a `@pylon.named_tuple` class, or a
+    // `NamedTupleValue` from an earlier result. A plain tuple has neither
+    // and is read by position.
+    if let Ok(dict) = value.cast::<PyDict>() {
+        return Ok(DecodedValue::Object(
+            members
+                .iter()
+                .map(|member| {
+                    let key = member.key.clone().unwrap_or_default();
+                    let item = match dict.get_item(&key)? {
+                        Some(item) => member_to_cached(&item, member, argument)?,
+                        None => DecodedValue::Null,
+                    };
+                    Ok((key, item))
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        ));
+    }
+    if keys.iter().all(|key| value.hasattr(*key).unwrap_or(false)) {
+        return Ok(DecodedValue::Object(
+            members
+                .iter()
+                .map(|member| {
+                    let key = member.key.clone().unwrap_or_default();
+                    let item = member_to_cached(&value.getattr(&key)?, member, argument)?;
+                    Ok((key, item))
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        ));
+    }
+    Ok(DecodedValue::Object(
+        members
+            .iter()
+            .zip(positional_members(value, members, type_name, argument)?)
+            .map(|(member, item)| (member.key.clone().unwrap_or_default(), item))
+            .collect(),
+    ))
+}
+
+/// The members read off a sequence by position — the form a plain Python
+/// tuple arrives in. Arity is checked here rather than left to the database,
+/// which sees only the jsonb that came out of it.
+fn positional_members(
+    value: &Bound<'_, PyAny>,
+    members: &[JsonMember],
+    type_name: Option<&str>,
+    argument: &Argument<'_, '_>,
+) -> PyResult<Vec<DecodedValue>> {
+    let described = describe_tuple_type(members, type_name);
+    let items: Vec<Bound<'_, PyAny>> = match value.try_iter() {
+        Ok(iter) => iter.collect::<PyResult<Vec<_>>>()?,
+        Err(_) => {
+            return Err(argument.refuse(format!(
+                "a mapping, a sized iterable container, or an object carrying {described}'s members \
+                 expected (got type '{}')",
+                value.get_type().name()?,
+            )));
+        }
+    };
+    if items.len() != members.len() {
+        return Err(argument.refuse(format!(
+            "expected {} elements in {described}, got {}",
+            members.len(),
+            items.len(),
+        )));
+    }
+    items
+        .iter()
+        .zip(members)
+        .map(|(item, member)| member_to_cached(item, member, argument))
+        .collect()
+}
+
+/// One member's own value — recursing for a nested tuple member, so
+/// `tuple<a: str, inner: tuple<x: int64, y: int64>>` takes a nested tuple
+/// too, and converting anything else the ordinary way.
+fn member_to_cached(
+    value: &Bound<'_, PyAny>,
+    member: &JsonMember,
+    argument: &Argument<'_, '_>,
+) -> PyResult<DecodedValue> {
+    match &member.kind {
+        JsonMemberKind::Tuple { type_name, members } => tuple_to_cached(value, members, type_name.as_deref(), argument),
+        _ => py_to_cached(value),
+    }
+}
+
+/// The cast as it was written, for an error message: `default::Point` for a
+/// nominal named tuple, `tuple<name: str, value: str>`-ish for a structural
+/// one (member types aren't carried this far, so they read as `…`).
+fn describe_tuple_type(members: &[JsonMember], type_name: Option<&str>) -> String {
+    if let Some(type_name) = type_name {
+        return type_name.to_string();
+    }
+    let members = members
+        .iter()
+        .map(|m| match &m.key {
+            Some(key) => format!("{key}: …"),
+            None => "…".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("tuple<{members}>")
 }
 
 /// Reconstructs a Python value from `DecodedValue`, structurally equivalent

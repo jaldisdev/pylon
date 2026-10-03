@@ -586,6 +586,115 @@ def test_an_array_of_named_tuples_round_trips_as_the_type_it_declares(live_pool,
     asyncio.run(run())
 
 
+def test_a_tuple_parameter_takes_the_shapes_a_caller_holds_it_in(live_pool, unique_module):
+    """A tuple-typed parameter binds from a tuple, a class instance or a dict.
+
+    jsonb keys a tuple's named members, and a caller holds the value
+    positionally as often as by name — a plain `("X-Foo", "bar")`, an
+    instance of the `@pylon.named_tuple` class, a `NamedTupleValue` read back
+    from an earlier query. Only the cast knows the member names, so all of
+    those used to be refused outright (`cannot bind a composite value as a
+    query parameter`) and a dict was the only form that worked, which is what
+    made saving a webhook's headers impossible.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.exceptions import InvalidParameterTypeError
+
+    module = unique_module('live_tuple_params')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.named_tuple
+        class Point(pylon.NamedTuple):
+            x: pylon.Float64
+            y: pylon.Float64
+
+        Point.__pylon_module__ = module
+
+        @pylon.type(module=module, name='Route')
+        class Route:
+            label: pylon.Str
+            origin: Point | None
+            waypoints: pylon.Array[Point] | None
+            headers: pylon.Array[pylon.Tuple[('name', pylon.Str), ('value', pylon.Str)]] | None
+
+        schema = _build_schema(*snapshot(), named_tuples=[Point])
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        # Every form of the same value, read back as the one thing it means.
+        for origin, waypoints, headers in (
+            ({'x': 1.0, 'y': 2.0}, [{'x': 1.0, 'y': 2.0}], [{'name': 'X-Foo', 'value': 'bar'}]),
+            ((1.0, 2.0), [(1.0, 2.0)], [('X-Foo', 'bar')]),
+            (Point(x=1.0, y=2.0), [Point(x=1.0, y=2.0)], [NamedTupleValue(name='X-Foo', value='bar')]),
+        ):
+            written = await client.query_required_single(
+                f"""select (insert {module}::Route {{
+                      label := <str>$label,
+                      origin := <{module}::Point>$origin,
+                      waypoints := <array<{module}::Point>>$waypoints,
+                      headers := <array<tuple<name: str, value: str>>>$headers
+                    }}) {{ origin, waypoints, headers }};""",
+                label='home',
+                origin=origin,
+                waypoints=waypoints,
+                headers=headers,
+            )
+            assert written.origin == Point(x=1.0, y=2.0)
+            assert [(p.x, p.y) for p in written.waypoints] == [(1.0, 2.0)]
+            assert [(h.name, h.value) for h in written.headers] == [('X-Foo', 'bar')]
+
+        # `save()` writes the same columns with no hand-written cast, so it
+        # has to supply one itself.
+        route = Route(label='saved', origin=Point(x=7.0, y=7.5), waypoints=[(8.0, 8.5)], headers=None)
+        await client.save(route)
+        saved = await client.query_required_single(
+            f"select {module}::Route {{ origin, waypoints }} filter .label = 'saved' limit 1;"
+        )
+        assert saved.origin == Point(x=7.0, y=7.5)
+        assert [(p.x, p.y) for p in saved.waypoints] == [(8.0, 8.5)]
+
+        route.origin = (3.5, 4.5)
+        await client.save(route)
+        updated = await client.query_required_single(
+            f"select {module}::Route {{ origin }} filter .label = 'saved' limit 1;"
+        )
+        assert updated.origin == Point(x=3.5, y=4.5)
+
+        # An all-unnamed tuple is a jsonb *array*, not an object — the one
+        # tuple shape that has no keys to be read by.
+        assert await client.query_single('select <tuple<str, bool>>$pair;', pair=('left', True)) == ('left', True)
+
+        # Arity and type are reported against the argument, before execution,
+        # rather than left to come back as a jsonb the database can't read.
+        with pytest.raises(InvalidParameterTypeError, match='expected 2 elements'):
+            await client.query_single(
+                'select <array<tuple<name: str, value: str>>>$headers;',
+                headers=[('X-Foo', 'bar', 'extra')],
+            )
+        with pytest.raises(InvalidParameterTypeError, match="got type 'int'"):
+            await client.query_single(
+                'select <array<tuple<name: str, value: str>>>$headers;',
+                headers=[42],
+            )
+        # The refusal must leave the connection usable, not poison it.
+        assert await client.query_single('select 1;') == 1
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
 def test_a_month_bearing_duration_survives_the_round_trip(live_pool, unique_module):
     """`cal::date_duration` and `cal::relative_duration` carry months, and a
     `datetime.timedelta` cannot.

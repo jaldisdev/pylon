@@ -1693,6 +1693,44 @@ impl CompiledQuery {
         shape_node_to_py(py, &self.inner.shape.root)
     }
 
+    /// Positionally matching `param_names`: for each parameter cast to a
+    /// tuple type, ``{"is_array": bool, "type_name": str | None, "members":
+    /// [...]}`` — else ``None``. The binding layer reads this to match a
+    /// positional value (a tuple, a named-tuple instance) to the member
+    /// names the jsonb it travels as is keyed by; exposed because a caller
+    /// debugging a refused parameter has no other way to see what the cast
+    /// asked for.
+    #[getter]
+    fn param_tuple_types<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::{PyDict, PyList};
+
+        let entries = self
+            .inner
+            .param_tuple_types
+            .iter()
+            .map(|plan| match plan {
+                None => Ok(py.None().into_bound(py)),
+                Some(plan) => {
+                    let d = PyDict::new(py);
+                    d.set_item("is_array", plan.is_array)?;
+                    d.set_item("type_name", plan.type_name.as_deref())?;
+                    d.set_item(
+                        "members",
+                        PyList::new(
+                            py,
+                            plan.members
+                                .iter()
+                                .map(|m| json_member_to_py(py, m))
+                                .collect::<PyResult<Vec<_>>>()?,
+                        )?,
+                    )?;
+                    Ok(d.into_any())
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        PyList::new(py, entries)
+    }
+
     fn warnings<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyList> {
         pyo3::types::PyList::new(py, &self.inner.warnings).unwrap()
     }

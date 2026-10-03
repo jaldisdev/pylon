@@ -549,6 +549,7 @@ mod tests {
         IrOutput {
             stmt,
             params: vec![],
+            param_tuple_types: vec![],
             ctes: vec![],
             global_ctes: vec![],
             warnings: vec![],

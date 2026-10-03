@@ -37,6 +37,26 @@ A database carries the schema its last migration stored, so a client only sees
 this once `migration apply` (or a dev-mode sync) has written the schema
 snapshot again.
 
+### Writing
+
+A tuple-typed parameter now binds from every shape a caller holds the value
+in. Only a dict used to work: jsonb keys a tuple's named members, and nothing
+below the cast knew those names, so a positional `("X-Foo", "bar")` was
+refused with `cannot bind a composite value as a query parameter` — which is
+what made a webhook's headers unsavable.
+
+* `<tuple<…>>$p` / `<array<tuple<…>>>$p` take a tuple, a `NamedTupleValue`
+  read back from an earlier query, a `@pylon.named_tuple` class instance, or a
+  mapping — including nested tuple members.
+* An all-unnamed `tuple<str, bool>` binds too; it is a jsonb array rather than
+  an object, and had no encoding at all before.
+* `Client.save()` casts a tuple-typed property it writes, so a property
+  holding one saves from an instance or a tuple the same way.
+* Arity and type are reported against the argument that carries them
+  (`invalid input for query argument $headers: … (expected 2 elements in
+  tuple<name: …, value: …>, got 3)`) before the statement is sent, leaving the
+  connection usable.
+
 ## 0.3.0 — 2026-10-02
 
 ### Loops
