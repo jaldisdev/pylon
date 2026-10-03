@@ -2822,6 +2822,59 @@ impl<'a> Compiler<'a> {
         self.cte_types.get(name).filter(|t| t.contains("::")).cloned()
     }
 
+    /// A path reaching a property stands for the values it finds, and a row
+    /// whose property is unset finds none — so that row contributes nothing
+    /// rather than a NULL of its own: `select Webhook.headers`, over two
+    /// webhooks one of which has none, is *one* result.
+    ///
+    /// Every path select, not only the statement's own: aggregated into an
+    /// array (`.<account[is Webhook].headers`) the same empty used to be a
+    /// NULL element, which Postgres refuses outright for an array-typed one
+    /// ("cannot accumulate null arrays"). A link step already behaves this
+    /// way — its join drops the row — and a shape is the opposite case by
+    /// design: there the object is the result, so `Webhook { headers }` still
+    /// reads the unset one as `None`.
+    fn drop_empty_results(&self, path_select: &mut IrPathSelect) {
+        let IrPathResult::Scalar(expr, _) = &path_select.result else {
+            return;
+        };
+        if !self.result_can_be_empty(path_select, expr) {
+            return;
+        }
+        let guard = ir_is_not_null(expr.clone());
+        path_select.filter = and_conditions(path_select.filter.take(), vec![guard]);
+    }
+
+    /// Whether a path's scalar result can be an empty set at all: a jsonb
+    /// member of a tuple property and a computed pointer always can, a
+    /// stored property only when its own declaration is optional — guarding
+    /// a required one would add a condition to every path select that can
+    /// never be false. A value computed from the row (an aggregate, a
+    /// literal, a test) is not a set the path reaches and is never empty.
+    fn result_can_be_empty(&self, path_select: &IrPathSelect, expr: &IrExpr) -> bool {
+        match expr {
+            IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Subquery(_) => true,
+            IrExpr::TypeCast(cast) => self.result_can_be_empty(path_select, &cast.expr),
+            IrExpr::ColumnRef { alias, column, .. } => self
+                .path_step_type(path_select, alias)
+                .and_then(|td| td.properties.iter().find(|p| p.name == *column))
+                // An alias this doesn't resolve (a CTE-rooted path) keeps the
+                // set semantics rather than the column's: dropping an empty
+                // is the rule, and the guard is what expresses it.
+                .is_none_or(|property| property.nullable),
+            _ => false,
+        }
+    }
+
+    /// The type an alias inside a path stands for — the root, or whatever a
+    /// join step reached.
+    fn path_step_type(&self, path_select: &IrPathSelect, alias: &str) -> Option<&'a TypeDescriptor> {
+        let source = std::iter::once(&path_select.root)
+            .chain(path_select.joins.iter().map(IrPathJoin::target))
+            .find(|source| source.alias == alias)?;
+        self.resolve_type(&source.type_name).ok()
+    }
+
     fn resolve_type(&self, name: &str) -> Result<&'a TypeDescriptor, PyQLError> {
         // Accept both "TypeName" and "module::TypeName"
         self.schema
@@ -4079,6 +4132,7 @@ impl<'a> Compiler<'a> {
         self.modifier_anchor = outer_anchor;
         if let Ok(path_select) = &mut result {
             self.resolve_join_fanouts(path_select);
+            self.drop_empty_results(path_select);
         }
         result
     }

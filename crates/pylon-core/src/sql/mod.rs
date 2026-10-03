@@ -446,19 +446,8 @@ fn terminal_source<'a>(path: &'a IrPathSelect, alias: &str) -> Option<&'a IrSour
     }
     path.joins
         .iter()
-        .map(path_join_target)
+        .map(IrPathJoin::target)
         .find(|target| target.alias == alias)
-}
-
-fn path_join_target(join: &IrPathJoin) -> &IrSource {
-    match join {
-        IrPathJoin::Single { target, .. }
-        | IrPathJoin::Multi { target, .. }
-        | IrPathJoin::BacklinkSingle { target, .. }
-        | IrPathJoin::BacklinkMulti { target, .. }
-        | IrPathJoin::Function { target, .. }
-        | IrPathJoin::Lateral { target, .. } => target,
-    }
 }
 
 /// The type discriminator for a row from `src`: the fanned-out column when the
@@ -2636,6 +2625,11 @@ fn free_item_shape(item: &IrFreeExpr, ctes: &[IrCteDef]) -> crate::query::ShapeN
                     Some(IrRowSource::Free(inner)) => Some(free_item_shape(inner, ctes)),
                     _ => None,
                 },
+                // `with entries := Webhook.headers select entries` reads the
+                // CTE's own `result` column, so it decodes exactly as the
+                // path select itself does — which for an enum or a tuple is
+                // not the plain scalar the fallback below assumes.
+                IrStmt::PathSelect(ps) => Some(emit_path_select(ps).shape.root),
                 _ => None,
             })
             .unwrap_or(ShapeNode::Scalar {
@@ -9664,7 +9658,7 @@ mod tests {
         assert!(!out.sql.contains("array_agg(unnest("), "got:\n{}", out.sql);
         assert!(
             out.sql.contains(
-                r#"coalesce(array_agg("_s"."v"), '{}') FROM unnest(ARRAY(SELECT unnest("t1"."perms") FROM "teams" AS "t1"))"#
+                r#"coalesce(array_agg("_s"."v"), '{}') FROM unnest(ARRAY(SELECT unnest("t1"."perms") FROM "teams" AS "t1"#
             ),
             "got:\n{}",
             out.sql
@@ -9680,7 +9674,7 @@ mod tests {
         assert!(!out.sql.contains("count(unnest("), "got:\n{}", out.sql);
         assert!(
             out.sql
-                .contains(r#"FROM unnest(ARRAY(SELECT unnest("t0"."perms") FROM "public"."Person" AS "t0"))"#),
+                .contains(r#"FROM unnest(ARRAY(SELECT unnest("t0"."perms") FROM "public"."Person" AS "t0"#),
             "got:\n{}",
             out.sql
         );
@@ -15678,6 +15672,43 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_a_path_to_an_optional_property_drops_the_rows_without_one() {
+        // `select Webhook.headers` over two webhooks, one of them without
+        // headers, is one result — the row that has none reaches no value,
+        // rather than contributing a NULL of its own.
+        let out = compile_and_emit("SELECT Person.age");
+        assert!(out.sql.contains(r#"("t0"."age" IS NOT NULL)"#), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_path_to_a_required_property_needs_no_guard() {
+        // A required column is never NULL, so the condition could only ever
+        // be true — every path select would carry it for nothing.
+        let out = compile_and_emit("SELECT Person.name");
+        assert!(!out.sql.contains("IS NOT NULL"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_path_to_an_optional_property_keeps_its_own_filter_too() {
+        let out = compile_and_emit("SELECT Person.age FILTER Person.name = $n");
+        assert!(
+            out.sql
+                .contains(r#"WHERE (("t0"."name" = $1) AND ("t0"."age" IS NOT NULL))"#),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_an_optional_property_aggregated_into_an_array_drops_its_empties() {
+        // The same rule inside an array: a NULL element is not an empty set,
+        // and for an array-typed property Postgres refuses it outright
+        // ("cannot accumulate null arrays").
+        let out = compile_and_emit("SELECT Company { ages := .<company[is Person].age }");
+        assert!(out.sql.contains(r#"("t2"."age" IS NOT NULL)"#), "got:\n{}", out.sql);
+    }
+
+    #[test]
     fn test_bare_path_select_array_of_tuples_property_shape() {
         // Unlike a single tuple property, this one keeps the ROW() wrapper:
         // the array is read at a position inside the row, and only its
@@ -15697,6 +15728,25 @@ select owner { posts := (select owner.posts.title) };",
                     other => panic!("expected NamedTuple element, got {other:?}"),
                 }
             }
+            other => panic!("expected ShapeNode::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_with_bound_path_select_keeps_the_shape_the_path_itself_has() {
+        // `with entries := Person.addresses select entries` reads the CTE's
+        // own result column, so it has to decode as the path select does —
+        // it used to fall back to a plain scalar, handing back raw jsonb.
+        let schema = make_schema_with_an_array_of_tuples_property();
+        let out = compile_and_emit_with("WITH entries := Person.addresses SELECT entries", &schema);
+        match &out.shape.root {
+            crate::query::ShapeNode::Array { element, .. } => assert!(
+                matches!(
+                    element.as_ref(),
+                    crate::query::ShapeNode::NamedTuple { members: Some(_), .. }
+                ),
+                "expected a named-tuple element, got {element:?}"
+            ),
             other => panic!("expected ShapeNode::Array, got {other:?}"),
         }
     }

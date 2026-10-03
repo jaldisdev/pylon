@@ -48,7 +48,7 @@ import pytest
 
 import pylon.schema as pylon
 from pylon.datatypes import NamedTupleValue
-from pylon.schema import Property, Readonly
+from pylon.schema import Link, Property, Readonly
 from pylon.schema._registry import clear as clear_registry
 from pylon.schema._registry import snapshot
 from pylon.schema._walker import walk
@@ -579,6 +579,94 @@ def test_an_array_of_named_tuples_round_trips_as_the_type_it_declares(live_pool,
         # A bare path select reads the same property without a shape around it.
         [bare] = await client.query(f'select {module}::Route.headers;')
         assert [(header.name, header.value) for header in bare] == [('X-Foo', 'bar')]
+
+        # And so does one bound in a `with`, which reads the same column.
+        [bound] = await client.query(f'with entries := {module}::Route.headers select entries;')
+        assert [(header.name, header.value) for header in bound] == [('X-Foo', 'bar')]
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
+def test_a_path_to_an_optional_property_yields_only_the_rows_that_have_one(live_pool, unique_module):
+    """An empty is nothing, not a NULL — a path reaching one yields no value.
+
+    `select Webhook.headers` over two webhooks, one of them without headers,
+    used to be two results, the second `None`. A shape is the opposite case
+    and still reads the unset one as `None`: there the object is the result.
+    Aggregated into an array the same empty was a NULL element, which
+    Postgres refuses outright for an array-typed one ("cannot accumulate null
+    arrays"), so that form failed rather than merely differing.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_empty_results')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Team')
+        class Team:
+            name: pylon.Str
+
+        @pylon.type(module=module, name='Member')
+        class Member:
+            name: pylon.Str
+            nickname: pylon.Str | None
+            tags: pylon.Array[pylon.Str] | None
+            team: Link[Team]
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        await client.execute(f"insert {module}::Team {{ name := 'red' }};")
+        await client.execute(
+            f"""insert {module}::Member {{
+                  name := 'with', nickname := 'nick', tags := ['a'],
+                  team := (select {module}::Team filter .name = 'red' limit 1)
+                }};"""
+        )
+        await client.execute(
+            f"""insert {module}::Member {{
+                  name := 'without',
+                  team := (select {module}::Team filter .name = 'red' limit 1)
+                }};"""
+        )
+
+        # The property the second row leaves unset yields one value, not two.
+        assert await client.query(f'select {module}::Member.nickname;') == ['nick']
+        assert await client.query(f'select {module}::Member.tags;') == [['a']]
+        # A required one still yields every row.
+        assert sorted(await client.query(f'select {module}::Member.name;')) == ['with', 'without']
+        # Bound in a `with`, the set is the same set.
+        assert await client.query(f'with names := {module}::Member.nickname select names;') == ['nick']
+
+        # A shape keeps it: the object is the result there, and it has no
+        # nickname — which is what `None` says.
+        rows = await client.query(f'select {module}::Member {{ name, nickname }} order by .name;')
+        assert [(row.name, row.nickname) for row in rows] == [('with', 'nick'), ('without', None)]
+
+        # Aggregated into an array, an empty contributes no element — and for
+        # the array-typed property, Postgres would refuse a NULL one.
+        team = await client.query_required_single(
+            f"""select {module}::Team {{
+                  nicknames := .<team[is {module}::Member].nickname,
+                  names := .<team[is {module}::Member].name
+                }} limit 1;"""
+        )
+        assert list(team.nicknames) == ['nick']
+        assert sorted(team.names) == ['with', 'without']
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')

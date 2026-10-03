@@ -32,10 +32,33 @@ elements came back as the raw decoded jsonb — `headers[0]["value"]`, with
   nominal-tuple marker used to lose the array on the way to DDL.
 * A field access through such a property (`.headers.name`) is reported as the
   error it always was, rather than compiling to a jsonb lookup on an array.
+* A path select bound in a `with` (`with entries := Webhook.headers select
+  entries`) decodes as the path itself does. It read the CTE's own result
+  column as a plain scalar, so a tuple came back as raw jsonb and an enum as
+  its bare label.
 
 A database carries the schema its last migration stored, so a client only sees
 this once `migration apply` (or a dev-mode sync) has written the schema
 snapshot again.
+
+### Empty results
+
+A path reaching a property yielded one result per row it crossed, including
+the rows where that property is unset — a `None` standing in for a value that
+isn't there. An empty set is nothing, not a NULL, so those rows now contribute
+nothing at all.
+
+* `select Webhook.headers`, over two webhooks one of which has none, is one
+  result rather than one and a `None`; the same holds for the set bound in a
+  `with`.
+* Aggregated into an array (`.<account[is Webhook].description`) the empty was
+  a NULL element, and for an array-typed property Postgres refused it outright
+  — "cannot accumulate null arrays" — so that shape failed rather than merely
+  differing.
+* A link step already behaved this way, and a shape still reads an unset
+  property as `None`: there the object is the result, not the property.
+* A required property adds no condition, so its queries are emitted exactly
+  as before.
 
 ### Writing
 

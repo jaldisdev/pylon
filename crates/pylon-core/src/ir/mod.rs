@@ -242,6 +242,20 @@ pub enum IrPathJoin {
     },
 }
 
+impl IrPathJoin {
+    /// The row source this step reaches — every join kind has exactly one.
+    pub fn target(&self) -> &IrSource {
+        match self {
+            IrPathJoin::Single { target, .. }
+            | IrPathJoin::Multi { target, .. }
+            | IrPathJoin::BacklinkSingle { target, .. }
+            | IrPathJoin::BacklinkMulti { target, .. }
+            | IrPathJoin::Function { target, .. }
+            | IrPathJoin::Lateral { target, .. } => target,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum IrPathResult {
     /// Final result is a scalar expression (column ref or computed expr like EXISTS).
