@@ -94,6 +94,21 @@ what made a webhook's headers unsavable.
   tuple<name: …, value: …>, got 3)`) before the statement is sent, leaving the
   connection usable.
 
+### Running a server
+
+`pylon-server` is published as a container image, `ghcr.io/jaldisdev/pylon-server`,
+for linux/amd64 and linux/arm64. It was the one part of a release with no
+distribution at all before: not on crates.io, not in the Python package, so
+running it meant a source checkout and a local build.
+
+* The image carries the web UI compiled in and nothing else — no Python, no
+  separate assets to ship. Mount a `pylon.toml` at `/etc/pylon/pylon.toml`
+  and the database password arrives through the environment variable its
+  `password_env` names.
+* The same image runs as a worker-only container with `--no-http`.
+* New `/health` route, liveness only and with no database round trip, for an
+  orchestrator's probes; the image declares a healthcheck against it.
+
 ## 0.3.0 — 2026-10-02
 
 ### Loops

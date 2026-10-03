@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+__pycache__
+target
+docs
+editor
+pylon
+tests
+dist
+build
+*.egg-info
+crates/pylon-server/static

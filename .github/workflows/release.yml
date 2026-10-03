@@ -20,6 +20,14 @@ on:
         description: "Which crates to publish, e.g. '-p pylon-db-core -p pylon-db-client'. Empty publishes the whole workspace."
         type: string
         default: ""
+      publish_image:
+        description: "Publish the pylon-server image to GHCR"
+        type: boolean
+        default: false
+      pylon_ui_ref:
+        description: "Ref of jaldisdev/pylon-ui to embed in the image"
+        type: string
+        default: canary
 
 permissions:
   contents: read
@@ -172,3 +180,120 @@ jobs:
           else
             cargo publish --workspace --locked
           fi
+
+  image:
+    name: pylon-server image (${{ matrix.platform.arch }})
+    # No `needs`, same as `crates` above: nothing is shared but the tag.
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_image
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-26.04
+            arch: amd64
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      # The UI is embedded into the binary at compile time and lives in its
+      # own repository, so it is checked out here and handed to the build as
+      # the named context the Dockerfile copies from. It carries no tags of
+      # its own, hence a branch rather than this release's tag.
+      - uses: actions/checkout@v7
+        with:
+          repository: jaldisdev/pylon-ui
+          ref: ${{ inputs.pylon_ui_ref || 'canary' }}
+          path: pylon-ui
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/pylon-server
+
+      - name: Record which UI went in
+        id: ui
+        run: echo "sha=$(git -C pylon-ui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # One architecture per runner, built natively. Pushed by digest only;
+      # the manifest list that gives these images their tags is assembled
+      # once both are up.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/pylon-server/Dockerfile
+          build-contexts: pylon-ui=./pylon-ui
+          platforms: linux/${{ matrix.platform.arch }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            dev.pylon.ui.revision=${{ steps.ui.outputs.sha }}
+          cache-from: type=gha,scope=server-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=server-${{ matrix.platform.arch }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/pylon-server,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-digest-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-manifest:
+    name: Publish the pylon-server image
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: image-digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/pylon-server
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=edge,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Create the manifest list
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/pylon-server
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.target."docker.metadata-action".tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"

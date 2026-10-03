@@ -188,6 +188,15 @@ async fn route(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<By
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
+    // Liveness only, no database round trip, so a failed probe means
+    // something a restart can fix. Whether the database is reachable is
+    // `/metrics`' pool gauges.
+    if (method == Method::GET || method == Method::HEAD) && path == "/health" {
+        return crate::json::json_response(
+            StatusCode::OK,
+            &serde_json::json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}),
+        );
+    }
     if method == Method::GET && path == "/metrics" && state.config.metrics.enabled {
         state.record_pool_metrics();
         state.record_outbox_metrics().await;

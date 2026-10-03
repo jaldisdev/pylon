@@ -48,6 +48,7 @@ If your schema has any `@pylon.signal` registrations, you must also run `pylon w
 
 | Method | Path | Description |
 |---|---|---|
+| `GET`, `HEAD` | `/health` | `{"status": "ok", "version": "…"}`, always mounted. Liveness only: it makes no database round trip, so it answers for as long as the process is serving at all. Whether the database is reachable is `/metrics`' pool gauges. |
 | `GET` | `/metrics` | Prometheus text exposition (only mounted if `[metrics].enabled = true`). Worker/backend counters only — no per-HTTP-request metrics. |
 | `GET` | `/api/connections` | Named connections available (from `[database.<name>]` entries in `pylon.toml`). |
 | `GET` | `/api/models` | Configured `[models.*]` entries. |
@@ -77,6 +78,30 @@ Schema and globals are per-connection because each connection addresses a databa
 `params`/`globals`/`config` mirror `Client.query()`'s positional/keyword args, `with_globals()`, and `with_config()` respectively (see [Client libraries](client/index.md)).
 
 If `[ui].enabled = true` (the default), anything not matching an API route falls through to serving the frontend SPA — embedded into the binary at compile time via `include_dir!`, or from `--static-dir` if given.
+
+## Container image
+
+Each release publishes `ghcr.io/jaldisdev/pylon-server` for `linux/amd64` and `linux/arm64`, tagged `0.4.0`, `0.4`, and `latest`. The image is the binary and nothing else — the UI compiled in, no Python, no separate assets directory:
+
+```bash
+docker run -p 5656:5656 \
+  -v ./pylon.toml:/etc/pylon/pylon.toml:ro \
+  -e PYLON_DB_PASSWORD=… \
+  ghcr.io/jaldisdev/pylon-server:0.4.0
+```
+
+No configuration is baked in. The working directory is `/etc/pylon`, so a `pylon.toml` mounted there is found by the usual upward search without passing `--config`, and the database password arrives through whichever environment variable that file's [`password_env`](config.md#database) names.
+
+The default command is `--host 0.0.0.0`, since `[webserver].host` otherwise defaults to `localhost` and the port would be unreachable from outside the container. Passing your own arguments replaces that default, so set `[webserver].host` in `pylon.toml` if you do.
+
+The image declares a healthcheck against `/health`. A worker-only container (`--no-http`) serves nothing and should run with `--no-healthcheck`.
+
+To build it yourself, the frontend comes from its own repository and is handed to the build as a named context, because it has to be in place before `cargo` runs:
+
+```bash
+docker buildx build -f crates/pylon-server/Dockerfile \
+  --build-context pylon-ui=../pylon-ui -t pylon-server .
+```
 
 ## Deployment shape
 
