@@ -96,6 +96,8 @@ pub struct PropertyDescriptor {
     /// element shape, for decode-time `ShapeNode` building. A *nominal*
     /// `@pylon.named_tuple`-typed property instead carries its shape via the
     /// `__nt__:module::Name` `pg_type` marker + `NamedTupleDescriptor.members`.
+    /// An `Array[Tuple[...]]` property carries its *element's* member shape
+    /// here, with the array-ness left to `pg_type`'s own `[]` suffix.
     pub tuple_members: Option<Vec<TupleMemberDescriptor>>,
     /// `Some("\"schema\".\"Name\"")` only when this property's scalar type is
     /// a *registered* custom scalar (see `pylon.scalar(..., name=...)` /
@@ -108,6 +110,18 @@ pub struct PropertyDescriptor {
     /// like its base type — Postgres enforces the domain's CHECK on writes
     /// regardless of which type name the read/write path itself uses.
     pub column_type: Option<String>,
+}
+
+/// A property's `pg_type` with the `__nt__:module::Name` nominal-tuple
+/// marker resolved to the type that column really has — `jsonb`, or
+/// `jsonb[]` for an `Array[SomeNamedTuple]`, which stores one jsonb tuple
+/// per element. Every other `pg_type` passes through untouched.
+pub fn resolved_pg_type(pg_type: &str) -> &str {
+    match pg_type.strip_prefix("__nt__:") {
+        Some(marker) if marker.ends_with("[]") => "jsonb[]",
+        Some(_) => "jsonb",
+        None => pg_type,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

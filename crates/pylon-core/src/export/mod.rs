@@ -20,6 +20,7 @@
 use crate::error::{PyQLError, PyQLFragmentError};
 use crate::schema::{
     DeleteAction, DeleteSide, FunctionDescriptor, OnDeletePolicy, SchemaDescriptor, TypeConstraint, TypeDescriptor,
+    resolved_pg_type,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -284,10 +285,7 @@ fn emit_one_table(t: &TypeDescriptor, schema: Option<&SchemaDescriptor>, out: &m
         let default = column_default(p, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        let col_type = p
-            .column_type
-            .as_deref()
-            .unwrap_or_else(|| p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type));
+        let col_type = p.column_type.as_deref().unwrap_or_else(|| resolved_pg_type(&p.pg_type));
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type, not_null, default));
     }
 
@@ -2591,8 +2589,7 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
         cols.push("__type__ text".to_string());
     }
     for p in &td.properties {
-        let pg_type = p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type);
-        cols.push(format!("{} {}", qi(&p.name), pg_type));
+        cols.push(format!("{} {}", qi(&p.name), resolved_pg_type(&p.pg_type)));
     }
     for l in &td.links {
         if l.is_junction_backed() {

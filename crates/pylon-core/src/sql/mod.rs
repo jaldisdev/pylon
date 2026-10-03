@@ -2467,12 +2467,24 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
         }
         IrExpr::TypeCast(c) if c.tuple_shape.is_some() => {
             let shape = c.tuple_shape.as_ref().unwrap();
-            ShapeNode::NamedTuple {
-                name: name.to_string(),
-                position,
+            // `<array<tuple<…>>>`: the shape resolved above is one element's,
+            // each sitting at position 0 of its own jsonb value.
+            let is_array = c.pg_type.ends_with("[]");
+            let tuple = ShapeNode::NamedTuple {
+                name: if is_array { String::new() } else { name.to_string() },
+                position: if is_array { 0 } else { position },
                 type_name: shape.type_name.clone(),
                 members: Some(shape.members.clone()),
                 is_free_object: false,
+            };
+            if is_array {
+                ShapeNode::Array {
+                    name: name.to_string(),
+                    position,
+                    element: Box::new(tuple),
+                }
+            } else {
+                tuple
             }
         }
         // A `<json>` cast at a shape position is an ordinary column of the row
@@ -3168,7 +3180,24 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 || matches!(ir_expr, IrExpr::JsonbIndex { .. })
                 || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"))
                 || tuple_shape.is_some();
-            if is_nt {
+            // An `array<tuple<…>>` property is the one tuple-shaped value that
+            // keeps the ROW() wrapper: the array itself is read at a position
+            // inside the row, and only then is each element a jsonb tuple.
+            let array_of_tuples = matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.ends_with("[]"));
+            if let Some(shape) = tuple_shape.as_ref().filter(|_| array_of_tuples) {
+                let node = ShapeNode::Array {
+                    name: String::new(),
+                    position: 0,
+                    element: Box::new(ShapeNode::NamedTuple {
+                        name: String::new(),
+                        position: 0,
+                        type_name: shape.type_name.clone(),
+                        members: Some(shape.members.clone()),
+                        is_free_object: false,
+                    }),
+                };
+                (format!("ROW({}) AS result", emit_expr(ir_expr)), node)
+            } else if is_nt {
                 let expr_sql = format!("{} AS result", emit_expr(ir_expr));
                 let shape = if matches!(
                     ir_expr,
@@ -4686,22 +4715,45 @@ impl QualifiedPgType {
 }
 
 fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, ShapeNode) {
-    if let Some(nt_name) = f.pg_type.strip_prefix("__nt__:") {
+    // A tuple-typed property — nominal (the `__nt__:module::Name` marker,
+    // hydrating to the registered dataclass) or structural (`tuple_shape`,
+    // with no registered type to name). Either way a jsonb column, or a
+    // `jsonb[]` one holding a tuple per element for `array<tuple<…>>`.
+    let nominal_tuple = f
+        .pg_type
+        .strip_suffix("[]")
+        .unwrap_or(&f.pg_type)
+        .strip_prefix("__nt__:");
+    if nominal_tuple.is_some() || f.tuple_shape.is_some() {
+        let is_array = f.pg_type.ends_with("[]");
+        let cast = if is_array { "::jsonb[]" } else { "::jsonb" };
         let sql = if table_alias.is_empty() {
-            format!("{}::jsonb", qi(&f.column))
+            format!("{}{}", qi(&f.column), cast)
         } else {
-            format!("{}.{}::jsonb", qi(table_alias), qi(&f.column))
+            format!("{}.{}{}", qi(table_alias), qi(&f.column), cast)
         };
-        return (
-            sql,
-            ShapeNode::NamedTuple {
+        let tuple = ShapeNode::NamedTuple {
+            // Inside an array the element is read at position 0 of its own
+            // jsonb value and carries no name of its own, the way an array
+            // of objects does.
+            name: if is_array { String::new() } else { f.alias.clone() },
+            position: if is_array { 0 } else { pos },
+            type_name: nominal_tuple
+                .map(str::to_string)
+                .or_else(|| f.tuple_shape.as_ref().and_then(|s| s.type_name.clone())),
+            members: f.tuple_shape.as_ref().map(|s| s.members.clone()),
+            is_free_object: false,
+        };
+        let node = if is_array {
+            ShapeNode::Array {
                 name: f.alias.clone(),
                 position: pos,
-                type_name: Some(nt_name.to_string()),
-                members: f.tuple_shape.as_ref().map(|s| s.members.clone()),
-                is_free_object: false,
-            },
-        );
+                element: Box::new(tuple),
+            }
+        } else {
+            tuple
+        };
+        return (sql, node);
     }
     // Schema-qualified custom types (enums, domains) have runtime OIDs unknown to a static
     // anonymous_record_decode. Cast to text — the string label is all the decoder needs.
@@ -4713,26 +4765,6 @@ fn emit_scalar(f: &IrScalarPointer, table_alias: &str, pos: usize) -> (String, S
             format!("{}.{}{}", qi(table_alias), qi(&f.column), cast)
         };
         return (sql, qualified.shape_node(f.alias.clone(), pos));
-    }
-    // A structural pylon.Tuple[...]-typed property — same jsonb column shape
-    // as the nominal `__nt__:` case above, just with no registered dataclass
-    // to hydrate (type_name stays None).
-    if let Some(shape) = &f.tuple_shape {
-        let sql = if table_alias.is_empty() {
-            format!("{}::jsonb", qi(&f.column))
-        } else {
-            format!("{}.{}::jsonb", qi(table_alias), qi(&f.column))
-        };
-        return (
-            sql,
-            ShapeNode::NamedTuple {
-                name: f.alias.clone(),
-                position: pos,
-                type_name: shape.type_name.clone(),
-                members: Some(shape.members.clone()),
-                is_free_object: false,
-            },
-        );
     }
     let sql = if table_alias.is_empty() {
         format!("{}::{}", qi(&f.column), f.pg_type)
@@ -15544,6 +15576,148 @@ select owner { posts := (select owner.posts.title) };",
         assert!(out.sql.contains("\"address\"->'street'"), "got:\n{}", out.sql);
     }
 
+    /// A `Person` with one `array<tuple<street: str, zip: str>>` property —
+    /// a `jsonb[]` column carrying the *element's* members (see
+    /// `PropertyDescriptor::tuple_members`).
+    fn make_schema_with_an_array_of_tuples_property() -> SchemaDescriptor {
+        use crate::schema::{TupleMemberDescriptor, TupleMemberKind};
+        SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: "Person".into(),
+                module: "default".into(),
+                table: "Person".into(),
+                abstract_: false,
+                materialized: false,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
+                bases: vec![],
+                properties: vec![PropertyDescriptor {
+                    name: "addresses".into(),
+                    pg_type: "jsonb[]".into(),
+                    nullable: true,
+                    default_sql: None,
+                    default_pyql: None,
+                    description: None,
+                    check_constraints: vec![],
+                    is_exclusive: false,
+                    is_pk: false,
+                    is_readonly: false,
+                    rewrites: vec![],
+                    tuple_members: Some(vec![
+                        TupleMemberDescriptor {
+                            name: Some("street".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                        TupleMemberDescriptor {
+                            name: Some("zip".into()),
+                            kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+                        },
+                    ]),
+                    column_type: None,
+                }],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                partition: None,
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+                signals: vec![],
+            }],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_array_of_tuples_property_read_shape_is_an_array_of_named_tuples() {
+        // Regression: an `array<tuple<…>>` property described itself as a
+        // plain `Scalar`, so each element stayed the raw decoded jsonb dict
+        // instead of hydrating into a named-tuple value with its members
+        // reachable by name (reported as `headers[0].value` raising
+        // "'dict' object has no attribute 'value'").
+        let schema = make_schema_with_an_array_of_tuples_property();
+        let out = compile_and_emit_with("SELECT Person { addresses }", &schema);
+        assert!(out.sql.contains("::jsonb[]"), "got:\n{}", out.sql);
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Object, got {:?}", out.shape.root)
+        };
+        let addresses = pointers
+            .iter()
+            .find(|p| matches!(p, crate::query::ShapeNode::Array { name, .. } if name == "addresses"))
+            .expect("expected addresses pointer in shape");
+        let crate::query::ShapeNode::Array { element, .. } = addresses else {
+            unreachable!("matched as an array just above")
+        };
+        match element.as_ref() {
+            crate::query::ShapeNode::NamedTuple {
+                type_name,
+                members,
+                position,
+                ..
+            } => {
+                assert_eq!(*type_name, None);
+                assert_eq!(*position, 0);
+                let members = members.as_ref().expect("expected resolved members");
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].key.as_deref(), Some("street"));
+                assert_eq!(members[1].key.as_deref(), Some("zip"));
+            }
+            other => panic!("expected NamedTuple element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bare_path_select_array_of_tuples_property_shape() {
+        // Unlike a single tuple property, this one keeps the ROW() wrapper:
+        // the array is read at a position inside the row, and only its
+        // elements are jsonb tuples.
+        let schema = make_schema_with_an_array_of_tuples_property();
+        let out = compile_and_emit_with("SELECT Person.addresses", &schema);
+        assert!(out.sql.contains("ROW("), "got:\n{}", out.sql);
+        match &out.shape.root {
+            crate::query::ShapeNode::Array { element, position, .. } => {
+                assert_eq!(*position, 0);
+                match element.as_ref() {
+                    crate::query::ShapeNode::NamedTuple { members, .. } => {
+                        let members = members.as_ref().expect("expected resolved members");
+                        assert_eq!(members.len(), 2);
+                        assert_eq!(members[0].key.as_deref(), Some("street"));
+                    }
+                    other => panic!("expected NamedTuple element, got {other:?}"),
+                }
+            }
+            other => panic!("expected ShapeNode::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_path_traversal_into_array_of_tuples_property_rejected() {
+        // A single tuple property allows `.address.street`; an array of them
+        // has no one tuple to read a field out of.
+        let schema = make_schema_with_an_array_of_tuples_property();
+        let ast = parse::parse("SELECT default::Person.addresses.street").unwrap();
+        match ir::compile(&ast, &schema) {
+            Ok(_) => panic!("expected error for a field access on an array of tuples"),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("'addresses' is a scalar property, not a link — cannot traverse further"),
+                "got: {}",
+                e
+            ),
+        }
+    }
+
     #[test]
     fn test_structural_tuple_cast_shape_carries_real_members() {
         let out = compile_and_emit("SELECT <tuple<street: str, zip: str>>$p");
@@ -15556,6 +15730,31 @@ select owner { posts := (select owner.posts.title) };",
                 assert_eq!(members[1].key.as_deref(), Some("zip"));
             }
             other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_of_tuples_cast_shape_is_an_array_of_named_tuples() {
+        // The cast target's members describe one *element* of the array, so
+        // the value decodes as named tuples rather than as the raw jsonb each
+        // slot of the `jsonb[]` holds.
+        let out = compile_and_emit("SELECT <array<tuple<street: str, zip: str>>>$p");
+        assert!(out.sql.contains("::jsonb[]"), "got:\n{}", out.sql);
+        match &out.shape.root {
+            crate::query::ShapeNode::Array { element, position, .. } => {
+                assert_eq!(*position, 0);
+                match element.as_ref() {
+                    crate::query::ShapeNode::NamedTuple { members, position, .. } => {
+                        assert_eq!(*position, 0);
+                        let members = members.as_ref().expect("expected resolved members");
+                        assert_eq!(members.len(), 2);
+                        assert_eq!(members[0].key.as_deref(), Some("street"));
+                        assert_eq!(members[1].key.as_deref(), Some("zip"));
+                    }
+                    other => panic!("expected NamedTuple element, got {other:?}"),
+                }
+            }
+            other => panic!("expected ShapeNode::Array, got {other:?}"),
         }
     }
 

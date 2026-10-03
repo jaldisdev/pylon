@@ -116,14 +116,23 @@ fn named_tuple_json(nt: &NamedTupleDescriptor) -> Json {
 }
 
 fn property_json(p: &PropertyDescriptor) -> Json {
-    let mut obj = if let Some(nt_name) = p.pg_type.strip_prefix("__nt__:") {
+    let is_array = p.pg_type.ends_with("[]");
+    let mut obj = if let Some(nt_name) = p.pg_type.strip_prefix("__nt__:").filter(|_| !is_array) {
         json!({"kind": "namedTuple", "target": nt_name})
     } else if p.pg_type.starts_with('"') {
         json!({"kind": "enum", "target": pg_quoted_to_qualified(&p.pg_type)})
-    } else if let Some(members) = &p.tuple_members {
+    } else if let Some(members) = p.tuple_members.as_ref().filter(|_| !is_array) {
         json!({"kind": "namedTuple", "members": members.iter().map(tuple_member_json).collect::<Vec<_>>()})
     } else if let Some(elem_pg) = p.pg_type.strip_suffix("[]") {
-        let mut element = classify_pg_type_as_member(elem_pg);
+        // An `array<tuple<…>>` element's own members hang off the property
+        // itself (see PropertyDescriptor::tuple_members) rather than off a
+        // member descriptor the way every other element type's do.
+        let mut element = match &p.tuple_members {
+            Some(members) => {
+                json!({"kind": "namedTuple", "members": members.iter().map(tuple_member_json).collect::<Vec<_>>()})
+            }
+            None => classify_pg_type_as_member(elem_pg),
+        };
         element["name"] = Json::Null;
         json!({"kind": "array", "element": element})
     } else {
@@ -296,5 +305,60 @@ mod tests {
         assert_eq!(json["kind"], "computed");
         assert_eq!(json["name"], "mystery");
         assert!(json.get("typeName").is_none() && json.get("target").is_none());
+    }
+
+    fn property(name: &str, pg_type: &str, tuple_members: Option<Vec<TupleMemberDescriptor>>) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.to_string(),
+            pg_type: pg_type.to_string(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members,
+            column_type: None,
+        }
+    }
+
+    #[test]
+    fn a_tuple_property_reports_its_members() {
+        let json = property_json(&property(
+            "address",
+            "jsonb",
+            Some(vec![TupleMemberDescriptor {
+                name: Some("street".into()),
+                kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+            }]),
+        ));
+        assert_eq!(json["kind"], "namedTuple");
+        assert_eq!(json["members"][0]["name"], "street");
+    }
+
+    #[test]
+    fn an_array_of_tuples_property_reports_an_array_of_named_tuples() {
+        let json = property_json(&property(
+            "headers",
+            "jsonb[]",
+            Some(vec![TupleMemberDescriptor {
+                name: Some("value".into()),
+                kind: TupleMemberKind::Scalar { pg_type: "text".into() },
+            }]),
+        ));
+        assert_eq!(json["kind"], "array");
+        assert_eq!(json["element"]["kind"], "namedTuple");
+        assert_eq!(json["element"]["members"][0]["name"], "value");
+    }
+
+    #[test]
+    fn an_array_of_nominal_named_tuples_property_names_the_element_type() {
+        let json = property_json(&property("points", "__nt__:default::Point[]", None));
+        assert_eq!(json["kind"], "array");
+        assert_eq!(json["element"]["kind"], "namedTuple");
+        assert_eq!(json["element"]["target"], "default::Point");
     }
 }

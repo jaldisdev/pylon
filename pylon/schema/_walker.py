@@ -896,11 +896,15 @@ def _make_property_desc(name: str, meta: Any, _core: Any) -> Any:
 
     rewrites = [_core.RewriteEntry(on=int(r.on), handler=r.handler) for r in meta.rewrites]
 
-    from ._pointers import TupleAnnotation
+    from ._pointers import ArrayAnnotation, TupleAnnotation
 
+    # An `Array[Tuple[...]]` is a `jsonb[]` column holding one jsonb tuple per
+    # element, so the *element's* members are what decoding needs; the `[]` on
+    # `pg_type` is what tells that form from a plain `Tuple[...]`.
+    tuple_type = meta.scalar_type.element if isinstance(meta.scalar_type, ArrayAnnotation) else meta.scalar_type
     tuple_members = (
-        [_build_tuple_member(e.name, e.type_, _core) for e in meta.scalar_type.elements]
-        if isinstance(meta.scalar_type, TupleAnnotation)
+        [_build_tuple_member(e.name, e.type_, _core) for e in tuple_type.elements]
+        if isinstance(tuple_type, TupleAnnotation)
         else None
     )
 

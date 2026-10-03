@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
+use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor, resolved_pg_type};
 
 // ── Live database state ────────────────────────────────────────────────────────
 
@@ -1806,9 +1806,7 @@ fn topo_sort_types(types: &[TypeDescriptor], polymorphic: &HashSet<String>) -> V
 /// name when it has one (`column_type`), else its plain `pg_type` (with the
 /// `__nt__:` nominal-tuple marker resolved to `jsonb`).
 fn col_type_str(p: &crate::schema::PropertyDescriptor) -> &str {
-    p.column_type
-        .as_deref()
-        .unwrap_or_else(|| p.pg_type.strip_prefix("__nt__:").map(|_| "jsonb").unwrap_or(&p.pg_type))
+    p.column_type.as_deref().unwrap_or_else(|| resolved_pg_type(&p.pg_type))
 }
 
 /// Maps a Pylon-internal base `pg_type` spelling to PostgreSQL's own

@@ -50,8 +50,11 @@ from pylon.datatypes import LinkSet, NamedTupleValue, Object, PylonSet
 from pylon.query import _decode, hydration_registry
 from pylon.schema import Link, MultiLink
 from pylon.schema._registry import clear as clear_registry
-from pylon.schema._registry import snapshot
+from pylon.schema._registry import named_tuples_snapshot, snapshot
 from pylon.schema._walker import walk
+
+# `@pylon.named_tuple` reads the module off the module that defines the class.
+__pylon_module__ = 'm'
 
 # ── Schema under test ───────────────────────────────────────────────────────
 # Registered once at import; `_ensure_registered` re-registers after any test
@@ -61,6 +64,12 @@ from pylon.schema._walker import walk
 @pylon.enum('RED', 'BLUE')
 class Colour(pylon.Enum):
     pass
+
+
+@pylon.named_tuple
+class Point(pylon.NamedTuple):
+    x: pylon.Float64
+    y: pylon.Float64
 
 
 @pylon.type(module='m', name='Tag')
@@ -78,6 +87,9 @@ class Post:
     title: str
     shade: Colour
     palette: pylon.Array[Colour] | None
+    headers: pylon.Array[pylon.Tuple[('name', pylon.Str), ('value', pylon.Str)]] | None
+    origin: Point | None
+    route: pylon.Array[Point] | None
     author: Link[Author] | None
     tags: MultiLink[Tag]
 
@@ -107,6 +119,7 @@ def _ensure_registered():
     }
     clear_registry()
     _registry.register_enum(Colour)
+    _registry.register_named_tuple(Point)
     for cls in (Tag, Author, Post):
         _registry.register_type(cls)
     try:
@@ -120,7 +133,7 @@ def _ensure_registered():
 def _compile(pyql: str):
     from pylon.query import compile as pyql_compile
 
-    return pyql_compile(pyql, schema=walk(*snapshot(), []))
+    return pyql_compile(pyql, schema=walk(*snapshot(), [], named_tuples=named_tuples_snapshot()))
 
 
 def _python_registry() -> dict[str, type]:
@@ -339,6 +352,35 @@ class TestEnums:
         compiled = _compile('select m::Post { palette }')
         native = assert_parity([('m::Post', _id(1), None)], compiled)
         assert native[0].palette is None
+
+
+class TestTupleProperties:
+    def test_a_nominal_named_tuple_property_hydrates_to_its_class(self):
+        compiled = _compile('select m::Post { origin }')
+        native = assert_parity([('m::Post', _id(1), {'x': 1.0, 'y': 2.0})], compiled)
+        assert isinstance(native[0].origin, Point)
+        assert (native[0].origin.x, native[0].origin.y) == (1.0, 2.0)
+
+    def test_an_array_of_nominal_named_tuples_hydrates_each_element(self):
+        compiled = _compile('select m::Post { route }')
+        rows = [('m::Post', _id(1), [{'x': 1.0, 'y': 2.0}, {'x': 3.0, 'y': 4.0}])]
+        native = assert_parity(rows, compiled)
+        route = list(native[0].route)
+        assert all(isinstance(point, Point) for point in route)
+        assert [(point.x, point.y) for point in route] == [(1.0, 2.0), (3.0, 4.0)]
+
+    def test_an_array_of_named_tuples_property(self):
+        compiled = _compile('select m::Post { headers }')
+        rows = [('m::Post', _id(1), [{'name': 'X-Foo', 'value': 'bar'}, {'name': 'X-Baz', 'value': 'qux'}])]
+        native = assert_parity(rows, compiled)
+        headers = list(native[0].headers)
+        assert all(isinstance(h, NamedTupleValue) for h in headers)
+        assert [(h.name, h.value) for h in headers] == [('X-Foo', 'bar'), ('X-Baz', 'qux')]
+
+    def test_an_unset_array_of_named_tuples_property(self):
+        compiled = _compile('select m::Post { headers }')
+        native = assert_parity([('m::Post', _id(1), None)], compiled)
+        assert native[0].headers is None
 
 
 class TestFreeObjectsAndScalars:

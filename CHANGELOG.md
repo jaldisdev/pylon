@@ -19,6 +19,24 @@ database assigns locally — is no longer read only once, when the pool connects
   `reload_schema()` (Python and Rust clients) refreshes it alongside the schema
   snapshot.
 
+### Reading
+
+An `array<tuple<…>>` property described itself as a plain scalar, so its
+elements came back as the raw decoded jsonb — `headers[0]["value"]`, with
+`headers[0].value` raising `AttributeError`.
+
+* Each element now hydrates to the named-tuple value its declaration asks for,
+  with its members reachable by name, in a `Type { property }` shape and in a
+  bare `select Type.property` alike.
+* `Array[SomeNamedTuple]` gets the `jsonb[]` column its values need; the
+  nominal-tuple marker used to lose the array on the way to DDL.
+* A field access through such a property (`.headers.name`) is reported as the
+  error it always was, rather than compiling to a jsonb lookup on an array.
+
+A database carries the schema its last migration stored, so a client only sees
+this once `migration apply` (or a dev-mode sync) has written the schema
+snapshot again.
+
 ## 0.3.0 — 2026-10-02
 
 ### Loops

@@ -47,6 +47,7 @@ import types as _types
 import pytest
 
 import pylon.schema as pylon
+from pylon.datatypes import NamedTupleValue
 from pylon.schema import Property, Readonly
 from pylon.schema._registry import clear as clear_registry
 from pylon.schema._registry import snapshot
@@ -62,8 +63,8 @@ def _dsn() -> str:
     return dsn
 
 
-def _build_schema(types, enums, scalars, channels=None):
-    return walk(types, enums, scalars, [], channels=channels)
+def _build_schema(types, enums, scalars, channels=None, named_tuples=None):
+    return walk(types, enums, scalars, [], channels=channels, named_tuples=named_tuples)
 
 
 def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, unique_module):
@@ -497,6 +498,87 @@ def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, uni
                 value=value,
             )
             assert written.amount == value, value
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
+def test_an_array_of_named_tuples_round_trips_as_the_type_it_declares(live_pool, unique_module):
+    """A `tuple<…>` inside an `array<…>` keeps its member shape end to end.
+
+    Both halves used to be lost. The column for an `Array[SomeNamedTuple]`
+    came out `jsonb` rather than `jsonb[]`, because resolving the nominal
+    marker to jsonb dropped the array with it; and the read described the
+    property as a plain scalar, so every element came back as the raw decoded
+    jsonb — `headers[0]["value"]` worked and `headers[0].value` raised. Both
+    the nominal form (hydrates to its registered class) and the structural one
+    (hydrates to a named-tuple value) are checked, since they travel through
+    different halves of the shape resolution.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_array_of_tuples')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.named_tuple
+        class Point(pylon.NamedTuple):
+            x: pylon.Float64
+            y: pylon.Float64
+
+        # The decorator reads the module off the file that defines the class,
+        # which would put every run's Point in the same one.
+        Point.__pylon_module__ = module
+
+        @pylon.type(module=module, name='Route')
+        class Route:
+            label: pylon.Str
+            waypoints: pylon.Array[Point] | None
+            headers: pylon.Array[pylon.Tuple[('name', pylon.Str), ('value', pylon.Str)]] | None
+
+        schema = _build_schema(*snapshot(), named_tuples=[Point])
+        ddl = export_schema(schema)
+        assert '"waypoints" jsonb[]' in ddl, ddl
+        assert '"headers" jsonb[]' in ddl, ddl
+
+        await live_pool.batch_execute(ddl)
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        written = await client.query_required_single(
+            f"""select (insert {module}::Route {{
+                  label := <str>$label,
+                  waypoints := <array<{module}::Point>>$waypoints,
+                  headers := <array<tuple<name: str, value: str>>>$headers
+                }}) {{ label, waypoints, headers }};""",
+            label='home',
+            waypoints=[{'x': 1.0, 'y': 2.0}, {'x': 3.0, 'y': 4.0}],
+            headers=[{'name': 'X-Foo', 'value': 'bar'}],
+        )
+
+        waypoints = list(written.waypoints)
+        assert all(isinstance(point, Point) for point in waypoints), waypoints
+        assert [(point.x, point.y) for point in waypoints] == [(1.0, 2.0), (3.0, 4.0)]
+
+        headers = list(written.headers)
+        assert all(isinstance(header, NamedTupleValue) for header in headers), headers
+        # A named tuple is a tuple: reachable by name *and* by position.
+        assert [(header.name, header.value) for header in headers] == [('X-Foo', 'bar')]
+        assert tuple(headers[0]) == ('X-Foo', 'bar')
+
+        # A bare path select reads the same property without a shape around it.
+        [bare] = await client.query(f'select {module}::Route.headers;')
+        assert [(header.name, header.value) for header in bare] == [('X-Foo', 'bar')]
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')

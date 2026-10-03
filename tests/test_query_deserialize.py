@@ -196,6 +196,25 @@ class TestDecodeArray:
         outer = ('default::Person', None)
         assert _decode(outer, shape, {}) is None
 
+    def test_decodes_elements_of_an_array_of_named_tuples(self):
+        from pylon.datatypes import NamedTupleValue
+
+        shape = _array(
+            'headers',
+            position=1,
+            element={
+                'kind': 'named_tuple',
+                'name': '',
+                'position': 0,
+                'type_name': None,
+                'members': [{'key': 'name', 'kind': 'scalar'}, {'key': 'value', 'kind': 'scalar'}],
+            },
+        )
+        outer = ('default::Webhook', [{'name': 'X-Foo', 'value': 'bar'}])
+        result = _decode(outer, shape, {})
+        assert all(isinstance(header, NamedTupleValue) for header in result)
+        assert [(header.name, header.value) for header in result] == [('X-Foo', 'bar')]
+
 
 # ── _decode named_tuple / _decode_json_tuple ───────────────────────────────────
 

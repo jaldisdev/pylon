@@ -2923,8 +2923,13 @@ impl<'a> Compiler<'a> {
     /// directly; a nominal `<module::Name>` cast resolves via the registered
     /// `NamedTupleDescriptor`'s members. `None` for a plain scalar/enum
     /// cast target.
+    ///
+    /// An `array<tuple<…>>` cast resolves to its *element's* shape, the way a
+    /// property of that type does (see `resolve_property_tuple_shape`): the
+    /// array-ness lives on the cast's `pg_type`.
     fn resolve_tuple_cast_shape(&self, ty: &ast::TypeExpr) -> Option<TupleCastShape> {
         match ty {
+            ast::TypeExpr::Array { element } => self.resolve_tuple_cast_shape(element),
             ast::TypeExpr::Tuple { elements } => Some(TupleCastShape {
                 type_name: None,
                 members: elements
@@ -2977,8 +2982,13 @@ impl<'a> Compiler<'a> {
     /// building — a nominal `__nt__:module::Name` `pg_type` marker resolves
     /// via the registered `NamedTupleDescriptor`'s own members; a structural
     /// `pylon.Tuple[...]` property carries its own `tuple_members` directly.
+    ///
+    /// An `array<tuple<…>>` property resolves to its *element's* shape, since
+    /// that is what one value of its `jsonb[]` column holds; the array-ness
+    /// stays on `pg_type`, which every caller already has.
     fn resolve_property_tuple_shape(&self, prop: &PropertyDescriptor) -> Option<TupleCastShape> {
-        if let Some(qname) = prop.pg_type.strip_prefix("__nt__:") {
+        let marker = prop.pg_type.strip_suffix("[]").unwrap_or(&prop.pg_type);
+        if let Some(qname) = marker.strip_prefix("__nt__:") {
             let nt = self.resolve_named_tuple(qname)?;
             return Some(TupleCastShape {
                 type_name: Some(qname.to_string()),
@@ -4389,8 +4399,10 @@ impl<'a> Compiler<'a> {
                 if !is_last(0) {
                     // Named tuple properties (nominal `__nt__:` marker) and structural
                     // tuple properties (`tuple_members`) both allow further field
-                    // access via jsonb operators.
-                    if p.pg_type.starts_with("__nt__:") || p.tuple_members.is_some() {
+                    // access via jsonb operators. An `array<tuple<…>>` property does
+                    // not: there is no single tuple for `.headers.name` to read a
+                    // field out of, so it falls through to the error below.
+                    if (p.pg_type.starts_with("__nt__:") || p.tuple_members.is_some()) && !p.pg_type.ends_with("[]") {
                         let base = IrExpr::ColumnRef {
                             alias: current_alias.clone(),
                             column: p.name.clone(),

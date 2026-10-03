@@ -57,10 +57,11 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 # labels as undefined names (F821) and the PyQL fragment as a syntax error
 # (F722). UP037 is the dangerous one: it "removes redundant quotes" from those
 # labels, silently turning the string `"r"` into the name `r` and changing what
-# the DSL builds. Scoped to the three test modules that exercise that syntax
-# rather than disabled globally, so a genuine undefined name elsewhere still
-# fails.
+# the DSL builds. Scoped to the test modules that exercise that syntax rather
+# than disabled globally, so a genuine undefined name elsewhere still fails.
 "tests/test_finalize.py" = ["F722", "F821", "UP037"]
+"tests/test_hydrate_parity.py" = ["F821", "UP037"]
+"tests/test_client_live.py" = ["F821", "UP037"]
 "tests/test_functions.py" = ["F722", "UP037"]
 # RUF012: a Pylon schema class declares its default *in* the class body
 # (`tags_list: list[str] = []`), which is the DSL's own syntax for a default,
