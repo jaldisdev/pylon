@@ -4,7 +4,7 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
-## 0.5.0
+## 0.5.0 — 2026-10-04
 
 ### Tuples
 

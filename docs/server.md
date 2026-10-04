@@ -81,13 +81,13 @@ If `[ui].enabled = true` (the default), anything not matching an API route falls
 
 ## Container image
 
-Each release publishes `ghcr.io/jaldisdev/pylon-server` for `linux/amd64` and `linux/arm64`, tagged `0.4.0`, `0.4`, and `latest`. The image is the binary and nothing else — the UI compiled in, no Python, no separate assets directory:
+Each release publishes `ghcr.io/jaldisdev/pylon-server` for `linux/amd64` and `linux/arm64`, tagged `0.5.0`, `0.5`, and `latest`. The image is the binary and nothing else — the UI compiled in, no Python, no separate assets directory:
 
 ```bash
 docker run -p 5656:5656 \
   -v ./pylon.toml:/etc/pylon/pylon.toml:ro \
   -e PYLON_DB_PASSWORD=… \
-  ghcr.io/jaldisdev/pylon-server:0.4.0
+  ghcr.io/jaldisdev/pylon-server:0.5.0
 ```
 
 No configuration is baked in. The working directory is `/etc/pylon`, so a `pylon.toml` mounted there is found by the usual upward search without passing `--config`, and the database password arrives through whichever environment variable that file's [`password_env`](config.md#database) names.
