@@ -36,6 +36,11 @@ elements came back as the raw decoded jsonb — `headers[0]["value"]`, with
   entries`) decodes as the path itself does. It read the CTE's own result
   column as a plain scalar, so a tuple came back as raw jsonb and an enum as
   its bare label.
+* `/api/schema` describes an array-typed property by its element: an
+  `array<tuple<…>>` as the named tuple it holds, rather than `array<std::json>`
+  — which is what left the web UI editing one as `[object Object]`. An enum
+  array was worse than imprecise: the enum branch answered for it too, leaving
+  the `[]` inside the name (`integration::WebhookEvent"[]`).
 
 A database carries the schema its last migration stored, so a client only sees
 this once `migration apply` (or a dev-mode sync) has written the schema

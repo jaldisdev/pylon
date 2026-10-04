@@ -119,7 +119,7 @@ fn property_json(p: &PropertyDescriptor) -> Json {
     let is_array = p.pg_type.ends_with("[]");
     let mut obj = if let Some(nt_name) = p.pg_type.strip_prefix("__nt__:").filter(|_| !is_array) {
         json!({"kind": "namedTuple", "target": nt_name})
-    } else if p.pg_type.starts_with('"') {
+    } else if p.pg_type.starts_with('"') && !is_array {
         json!({"kind": "enum", "target": pg_quoted_to_qualified(&p.pg_type)})
     } else if let Some(members) = p.tuple_members.as_ref().filter(|_| !is_array) {
         json!({"kind": "namedTuple", "members": members.iter().map(tuple_member_json).collect::<Vec<_>>()})
@@ -352,6 +352,16 @@ mod tests {
         assert_eq!(json["kind"], "array");
         assert_eq!(json["element"]["kind"], "namedTuple");
         assert_eq!(json["element"]["members"][0]["name"], "value");
+    }
+
+    #[test]
+    fn an_array_of_enums_property_reports_an_array_of_enum_elements() {
+        // The enum branch used to answer for the array form too, leaving the
+        // `[]` inside the name: `integration::WebhookEvent"[]`.
+        let json = property_json(&property("events", "\"integration\".\"WebhookEvent\"[]", None));
+        assert_eq!(json["kind"], "array");
+        assert_eq!(json["element"]["kind"], "enum");
+        assert_eq!(json["element"]["target"], "integration::WebhookEvent");
     }
 
     #[test]
