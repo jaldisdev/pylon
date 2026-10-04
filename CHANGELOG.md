@@ -71,9 +71,18 @@ now — one PostgreSQL type per member, all the way down.
 
 A database that stored tuples as jsonb is converted by its next migration:
 each column is retyped and its rows read into the composite, positional
-tuples (stored as json arrays) included. A named tuple whose members change
-has its type replaced rather than altered — PostgreSQL can append an
-attribute but not insert one, and a tuple's members are read by position.
+tuples (stored as json arrays) included. An `array<tuple<…>>` column holding
+an empty array keeps one, rather than becoming an absent value. A named
+tuple whose members change has its type replaced rather than altered —
+PostgreSQL can append an attribute but not insert one, and a tuple's members
+are read by position.
+
+The conversion fills a tuple's members by name, so a stored object carrying
+a key the tuple does not declare loses it silently and the member it was
+meant for arrives unset. Check the keys actually stored
+(`jsonb_object_keys`, per element for an array column) against the declared
+member names *before* migrating a database whose history you don't know —
+afterwards the original json is gone.
 
 ### Command line
 

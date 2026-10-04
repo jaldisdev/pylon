@@ -7005,4 +7005,54 @@ mod tuple_type_live_tests {
             .await
             .unwrap();
     }
+
+    /// An array-of-tuples column holding `[]` must stay an empty array
+    /// rather than becoming an absent one — `[]` is a value, and the two are
+    /// told apart everywhere else.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn an_empty_array_of_tuples_converts_to_an_empty_array() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        crate::migrate::ensure_internal_schema(&pool).await.unwrap();
+
+        let tuple = unique_name("Header");
+        pool.batch_execute(&format!(
+            "CREATE TYPE \"{tuple}_t\" AS (\"name\" text, \"value\" text);"
+        ))
+        .await
+        .unwrap();
+
+        let rows = pool
+            .query_typed(
+                &format!(
+                    "SELECT (
+                         COALESCE(cardinality(_pylon.populate_tuples(NULL::\"{tuple}_t\", '[]'::jsonb))::text, 'absent'),
+                         COALESCE(cardinality(_pylon.populate_tuples(NULL::\"{tuple}_t\", NULL::jsonb))::text, 'absent'),
+                         COALESCE(cardinality(_pylon.populate_tuples(NULL::\"{tuple}_t\", 'null'::jsonb))::text, 'absent'),
+                         COALESCE(cardinality(_pylon.populate_tuples(
+                             NULL::\"{tuple}_t\",
+                             '[{{\"name\": \"a\", \"value\": \"1\"}}]'::jsonb))::text, 'absent')
+                     ) AS result"
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        let [pylon_value::DecodedValue::Composite(fields)] = rows.as_slice() else {
+            panic!("expected one row of four members, got {rows:?}")
+        };
+        assert_eq!(
+            fields,
+            &vec![
+                pylon_value::DecodedValue::Str("0".into()),
+                pylon_value::DecodedValue::Str("absent".into()),
+                pylon_value::DecodedValue::Str("absent".into()),
+                pylon_value::DecodedValue::Str("1".into()),
+            ],
+            "an empty array stays empty; only a genuinely absent value stays absent"
+        );
+
+        pool.batch_execute(&format!("DROP TYPE \"{tuple}_t\";")).await.unwrap();
+    }
 }

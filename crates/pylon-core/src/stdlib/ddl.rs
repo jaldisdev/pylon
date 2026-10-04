@@ -291,8 +291,17 @@ pub const TUPLE_CONVERSION_DDL: &str = concat!(
     "\tRETURNS anyarray\n",
     "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
     "AS $$\n",
-    "    SELECT array_agg(_pylon.populate_tuple(base, e) ORDER BY ord)\n",
-    "    FROM jsonb_array_elements(src) WITH ORDINALITY AS u(e, ord)\n",
+    // An empty array is a value, and a different one from an absent array —
+    // so the two have to be told apart here rather than both collapsing to
+    // NULL, which is what `array_agg` over no rows gives on its own.
+    // `(ARRAY[base])[1:0]` is how a polymorphic function spells "the empty
+    // array of base's type", there being no way to write the cast.
+    "    SELECT CASE WHEN src IS NULL OR jsonb_typeof(src) = 'null' THEN NULL\n",
+    "                ELSE COALESCE(\n",
+    "                    (SELECT array_agg(_pylon.populate_tuple(base, e) ORDER BY ord)\n",
+    "                     FROM jsonb_array_elements(src) WITH ORDINALITY AS u(e, ord)),\n",
+    "                    (ARRAY[base])[1:0])\n",
+    "           END\n",
     "$$;\n",
 );
 
