@@ -27,6 +27,7 @@ use crate::analyze::ShapePathAlias;
 use crate::error::PyQLError;
 use crate::schema::SchemaDescriptor;
 use crate::{analyze, ir, parse, sql};
+use pylon_value::DecodedValue;
 
 const CACHE_CAPACITY: usize = 1024;
 
@@ -327,6 +328,200 @@ pub struct ParamTupleType {
     /// type has a composite to bind against, so a structural `tuple<…>`
     /// whose shape nothing declares still travels as jsonb.
     pub as_composite: bool,
+}
+
+/// A bound parameter in the shape the cast it feeds asks for.
+///
+/// A tuple parameter bound as its own composite type travels as a
+/// *positional* row in member order (see `ParamTupleType::as_composite`),
+/// but a caller holds one however is natural for them — a JSON object from
+/// the web UI, a map from the Rust client. Reshaping it is the step between
+/// the two, and every client needs it: without it the value is written as
+/// jsonb into a composite slot, which PostgreSQL reads as a corrupt row
+/// header ("wrong number of columns: 24846958, expected 2").
+///
+/// `pylon-py` does this same job directly from Python objects, where the
+/// value has no `DecodedValue` form yet (see `pgvalue::tuple_to_cached`);
+/// the two have to agree on member order.
+pub fn bind_tuple_param(value: DecodedValue, plan: &ParamTupleType) -> DecodedValue {
+    if !plan.as_composite {
+        // A tuple travelling as jsonb is already in the shape it needs.
+        return value;
+    }
+    if plan.is_array {
+        let DecodedValue::Array(elements) = value else {
+            return value;
+        };
+        return DecodedValue::Array(
+            elements
+                .into_iter()
+                .map(|element| tuple_row(element, &plan.members))
+                .collect(),
+        );
+    }
+    tuple_row(value, &plan.members)
+}
+
+/// One tuple as the positional row its composite type expects, reading a
+/// named value by key and an unnamed one by position. Recurses, since a
+/// member that is itself a tuple is a row inside the row.
+fn tuple_row(value: DecodedValue, members: &[JsonMember]) -> DecodedValue {
+    let nested = |value: DecodedValue, member: &JsonMember| match &member.kind {
+        JsonMemberKind::Tuple { members, .. } => tuple_row(value, members),
+        _ => value,
+    };
+    match value {
+        DecodedValue::Null => DecodedValue::Null,
+        DecodedValue::Object(entries) => DecodedValue::Composite(
+            members
+                .iter()
+                .map(|member| {
+                    let key = member.key.as_deref().unwrap_or_default();
+                    let found = entries
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(DecodedValue::Null);
+                    nested(found, member)
+                })
+                .collect(),
+        ),
+        // Already positional — a row read back from an earlier query, or a
+        // caller who held the members in order.
+        DecodedValue::Composite(items) | DecodedValue::Array(items) => DecodedValue::Composite(
+            members
+                .iter()
+                .zip(items.into_iter().chain(std::iter::repeat(DecodedValue::Null)))
+                .map(|(member, item)| nested(item, member))
+                .collect(),
+        ),
+        // Not a tuple-shaped value at all; leave it for the encoder to
+        // refuse with its own message rather than inventing a row here.
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod bind_tuple_param_tests {
+    use super::*;
+
+    fn member(key: &str) -> JsonMember {
+        JsonMember {
+            key: Some(key.to_string()),
+            kind: JsonMemberKind::Scalar,
+        }
+    }
+
+    fn plan(members: Vec<JsonMember>, is_array: bool, as_composite: bool) -> ParamTupleType {
+        ParamTupleType {
+            is_array,
+            type_name: Some("default::HttpHeader".to_string()),
+            members,
+            as_composite,
+        }
+    }
+
+    fn object(pairs: &[(&str, &str)]) -> DecodedValue {
+        DecodedValue::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), DecodedValue::Str((*v).to_string())))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn an_object_becomes_a_row_in_member_order() {
+        // The web UI sends a JSON object, so the members arrive keyed and in
+        // whatever order the caller wrote them.
+        let plan = plan(vec![member("name"), member("value")], false, true);
+        let bound = bind_tuple_param(object(&[("value", "Bar"), ("name", "X-Foo")]), &plan);
+        assert_eq!(
+            bound,
+            DecodedValue::Composite(vec![DecodedValue::Str("X-Foo".into()), DecodedValue::Str("Bar".into())])
+        );
+    }
+
+    #[test]
+    fn an_array_parameter_is_reshaped_element_wise() {
+        let plan = plan(vec![member("name"), member("value")], true, true);
+        let bound = bind_tuple_param(
+            DecodedValue::Array(vec![object(&[("name", "a"), ("value", "b")])]),
+            &plan,
+        );
+        assert_eq!(
+            bound,
+            DecodedValue::Array(vec![DecodedValue::Composite(vec![
+                DecodedValue::Str("a".into()),
+                DecodedValue::Str("b".into())
+            ])])
+        );
+    }
+
+    #[test]
+    fn a_member_the_caller_left_out_is_absent_not_shifted() {
+        let plan = plan(vec![member("name"), member("value")], false, true);
+        let bound = bind_tuple_param(object(&[("value", "Bar")]), &plan);
+        assert_eq!(
+            bound,
+            DecodedValue::Composite(vec![DecodedValue::Null, DecodedValue::Str("Bar".into())])
+        );
+    }
+
+    #[test]
+    fn a_value_already_held_positionally_keeps_its_order() {
+        let plan = plan(vec![member("name"), member("value")], false, true);
+        let positional =
+            DecodedValue::Composite(vec![DecodedValue::Str("X-Foo".into()), DecodedValue::Str("Bar".into())]);
+        assert_eq!(bind_tuple_param(positional.clone(), &plan), positional);
+    }
+
+    #[test]
+    fn a_nested_tuple_member_is_a_row_inside_the_row() {
+        let plan = plan(
+            vec![
+                JsonMember {
+                    key: Some("at".into()),
+                    kind: JsonMemberKind::Tuple {
+                        type_name: None,
+                        members: vec![member("x"), member("y")],
+                    },
+                },
+                member("label"),
+            ],
+            false,
+            true,
+        );
+        let bound = bind_tuple_param(
+            DecodedValue::Object(vec![
+                ("at".into(), object(&[("y", "2"), ("x", "1")])),
+                ("label".into(), DecodedValue::Str("l".into())),
+            ]),
+            &plan,
+        );
+        assert_eq!(
+            bound,
+            DecodedValue::Composite(vec![
+                DecodedValue::Composite(vec![DecodedValue::Str("1".into()), DecodedValue::Str("2".into())]),
+                DecodedValue::Str("l".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tuple_travelling_as_jsonb_is_left_alone() {
+        // An undeclared structural shape has no composite to bind against,
+        // and its jsonb form is already what the encoder wants.
+        let plan = plan(vec![member("name"), member("value")], false, false);
+        let value = object(&[("name", "a"), ("value", "b")]);
+        assert_eq!(bind_tuple_param(value.clone(), &plan), value);
+    }
+
+    #[test]
+    fn an_absent_value_stays_absent() {
+        let plan = plan(vec![member("name")], false, true);
+        assert_eq!(bind_tuple_param(DecodedValue::Null, &plan), DecodedValue::Null);
+    }
 }
 
 /// The output of a successful PyQL compilation.

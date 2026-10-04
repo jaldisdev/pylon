@@ -42,6 +42,8 @@ now — one PostgreSQL type per member, all the way down.
   A structural `tuple<…>` binds against whatever property declares that
   shape; where nothing does and a member is one json cannot carry, the query
   is refused with what to declare rather than arriving as the wrong thing.
+  Every caller binds it that way — the Rust client and the web UI, which
+  hands its arguments over as plain JSON, included.
 * A free object (`{ a := 1 }`) is the same composite row, so a nested one's
   fields keep their own types too — `{ nested := { amount :=
   <decimal>'1.2300' } }` read back as a plain mapping of json-parsed values,

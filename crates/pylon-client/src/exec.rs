@@ -119,7 +119,8 @@ pub(crate) fn compile_and_bind(
     let bound = compiled
         .param_names
         .iter()
-        .map(|name| {
+        .enumerate()
+        .map(|(i, name)| {
             if let Some(qname) = name.strip_prefix("__global__") {
                 Ok(globals.get(qname).cloned().unwrap_or(DecodedValue::Null))
             } else {
@@ -129,7 +130,13 @@ pub(crate) fn compile_and_bind(
                     .map(|(_, v)| v.clone())
                     .ok_or_else(|| Error::MissingParam(name.clone()))?;
                 check_array_elements(name, &value)?;
-                Ok(value)
+                // A tuple parameter is bound as its own composite type, which
+                // wants the members as a positional row — see
+                // `query::bind_tuple_param`.
+                Ok(match compiled.param_tuple_types.get(i).and_then(Option::as_ref) {
+                    Some(plan) => pylon_core::query::bind_tuple_param(value, plan),
+                    None => value,
+                })
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -394,6 +401,153 @@ mod tests {
             error.to_string().contains("invalid array element at index 1"),
             "{error}"
         );
+    }
+
+    /// The web UI hands a tuple parameter over as plain JSON — an object
+    /// per tuple — so the bind step, not just the Python layer, has to turn
+    /// it into a row of the composite type the column has. Binding it as
+    /// jsonb instead made Postgres read the json as a row header
+    /// ("wrong number of columns: 24846943, expected 2").
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_tuple_parameter_given_as_json_is_stored_as_the_type_it_declares() {
+        use pylon_core::schema::{
+            NamedTupleDescriptor, PropertyDescriptor, TupleMemberDescriptor, TupleMemberKind, TypeDescriptor,
+        };
+
+        let dsn = std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set for live tests");
+        let pool = pylon_pgcon::PgPool::connect(&dsn, 2).await.unwrap();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let point = format!("Point_{suffix}");
+        let table = format!("hook_{suffix}");
+        pool.batch_execute(&format!(
+            "CREATE TYPE \"{point}_t\" AS (\"x\" int8, \"y\" numeric);
+             CREATE TABLE \"{table}\" (
+                 \"id\" uuid PRIMARY KEY DEFAULT uuidv7(),
+                 \"at\" \"{point}_t\",
+                 \"legs\" \"{point}_t\"[]
+             );
+             INSERT INTO \"{table}\" (\"id\") VALUES ('019b4191-ece3-7e0d-86b3-d6d966b90ff7');"
+        ))
+        .await
+        .unwrap();
+        // The composite is new, so the pool's connect-time OID discovery
+        // has not seen it — exactly the position a long-lived server is in
+        // after a migration, and what `reload_schema` exists for.
+        let pool = pylon_pgcon::PgPool::connect(&dsn, 2).await.unwrap();
+
+        let scalar = |name: &str, pg_type: &str| TupleMemberDescriptor {
+            name: Some(name.to_string()),
+            kind: TupleMemberKind::Scalar {
+                pg_type: pg_type.to_string(),
+            },
+        };
+        let members = vec![scalar("x", "int8"), scalar("y", "numeric")];
+        let prop = |name: &str, pg_type: &str| PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: name != "id",
+            default_sql: (name == "id").then(|| "uuidv7()".into()),
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: name == "id",
+            is_pk: name == "id",
+            is_readonly: name == "id",
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        };
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: point.clone(),
+            module: "default".into(),
+            members,
+        });
+        schema.types.push(TypeDescriptor {
+            name: table.clone(),
+            module: "default".into(),
+            table: table.clone(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![
+                prop("id", "uuid"),
+                prop("at", &format!("__nt__:default::{point}")),
+                prop("legs", &format!("__nt__:default::{point}[]")),
+            ],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+
+        let json_point = |x: i64, y: &str| {
+            DecodedValue::Object(vec![
+                ("x".to_string(), DecodedValue::I64(x)),
+                ("y".to_string(), DecodedValue::Str(y.to_string())),
+            ])
+        };
+        let args = [
+            ("p0", DecodedValue::Array(vec![json_point(3, "4.5000")])),
+            ("p1", json_point(1, "2.5000")),
+        ];
+        execute(
+            &pool,
+            &format!(
+                "update default::{table} filter .id = <uuid>'019b4191-ece3-7e0d-86b3-d6d966b90ff7' \
+                 set {{ legs := <array<default::{point}>>$p0, at := <default::{point}>$p1 }}"
+            ),
+            &args,
+            &schema,
+            &SessionConfig::default(),
+            &HashMap::new(),
+            crate::cache::CacheAccess::default(),
+        )
+        .await
+        .unwrap();
+
+        // Read back as text, so an exact decimal scale is visible rather
+        // than rounded away by a float decode.
+        let rows = pool
+            .query_typed(
+                &format!(
+                    "SELECT ((\"at\").\"y\"::text, (\"legs\")[1].\"x\"::text, (\"legs\")[1].\"y\"::text) \
+                     AS result FROM \"{table}\""
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        let [DecodedValue::Composite(fields)] = rows.as_slice() else {
+            panic!("expected one row of three members, got {rows:?}")
+        };
+        assert_eq!(
+            fields,
+            &vec![
+                DecodedValue::Str("2.5000".into()),
+                DecodedValue::Str("3".into()),
+                DecodedValue::Str("4.5000".into()),
+            ]
+        );
+
+        pool.batch_execute(&format!("DROP TABLE \"{table}\"; DROP TYPE \"{point}_t\";"))
+            .await
+            .unwrap();
     }
 
     #[test]
