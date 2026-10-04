@@ -6,7 +6,7 @@ The crate is published as `pylon-db-client` and imported as `pylon_client`.
 
 ```toml
 [dependencies]
-pylon-db-client = "0.3"
+pylon-db-client = "0.4"
 ```
 
 ```rust

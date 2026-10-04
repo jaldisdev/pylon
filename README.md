@@ -18,7 +18,7 @@ involved — add the `pylon-db-client` crate instead:
 
 ```toml
 [dependencies]
-pylon-db-client = "0.3"
+pylon-db-client = "0.4"
 ```
 
 It is published as `pylon-db-client` and imported as `pylon_client`; see the
