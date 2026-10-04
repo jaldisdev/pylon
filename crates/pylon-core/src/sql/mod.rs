@@ -2106,7 +2106,10 @@ fn is_integer_expr(expr: &IrExpr) -> bool {
 }
 
 fn is_raw_scalar(expr: &IrExpr) -> bool {
-    matches!(expr, IrExpr::Array(_))
+    // An array of tuples is the exception: it is described element-wise (see
+    // `tuple_array_shape_node`), and a described array is read *at a
+    // position* in the row — returned bare there is nothing to index.
+    matches!(expr, IrExpr::Array(items) if !matches!(items.first(), Some(IrExpr::Row { .. })))
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
         || matches!(expr, IrExpr::NamedTuple { .. })
         || matches!(expr, IrExpr::Tuple(_))
@@ -2438,6 +2441,25 @@ fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
     }
 }
 
+/// The shape of an array literal whose elements are tuples — `None` for
+/// every other array, which decodes as the value it already did.
+///
+/// An array's elements all have one type, so the first describes them all.
+/// Without this the array is read as a plain scalar and its elements come
+/// back as bare tuples, their members' names gone.
+fn tuple_array_shape_node(name: &str, position: usize, items: &[IrExpr]) -> Option<crate::query::ShapeNode> {
+    let IrExpr::Row { elements, names } = items.first()? else {
+        return None;
+    };
+    Some(crate::query::ShapeNode::Array {
+        name: name.to_string(),
+        position,
+        // Each element is the whole of its own value, the way an array of
+        // objects reads.
+        element: Box::new(row_shape_node("", 0, elements, names)),
+    })
+}
+
 /// The shape of a tuple literal — the composite row it compiles to, one
 /// element per member at the position the row holds it.
 ///
@@ -2478,6 +2500,11 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
     use crate::query::{Cardinality, ShapeNode};
     if let IrExpr::Row { elements, names } = expr {
         return row_shape_node(name, position, elements, names);
+    }
+    if let IrExpr::Array(items) = expr
+        && let Some(node) = tuple_array_shape_node(name, position, items)
+    {
+        return node;
     }
     if let IrExpr::ObjectSubquery(sel) = expr {
         let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
@@ -2529,6 +2556,9 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
     use crate::query::{Cardinality, ShapeNode};
     match expr {
         IrExpr::Row { elements, names } => row_shape_node(name, position, elements, names),
+        IrExpr::Array(items) if matches!(items.first(), Some(IrExpr::Row { .. })) => {
+            tuple_array_shape_node(name, position, items).expect("matched as an array of rows just above")
+        }
         IrExpr::ObjectPathUnion { branches, multi, .. } => {
             let first = branches.first().expect("a union has at least one branch");
             let IrPathResult::Object {
@@ -16257,6 +16287,32 @@ select owner { posts := (select owner.posts.title) };",
                 e
             ),
         }
+    }
+
+    #[test]
+    fn test_an_array_literal_of_tuples_is_described_by_its_elements() {
+        // Read as a plain array, its elements come back as bare tuples with
+        // their members' names gone — and the array has to be read at a
+        // position in the row for the element shape to reach them.
+        let out = compile_and_emit("SELECT [(a := 1), (a := 2)]");
+        let crate::query::ShapeNode::Array { element, position, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Array, got {:?}", out.shape.root)
+        };
+        assert_eq!(*position, 0);
+        match element.as_ref() {
+            crate::query::ShapeNode::Tuple { names, position, .. } => {
+                assert_eq!(*position, 0, "an element is the whole of its own value");
+                assert_eq!(names.as_ref().unwrap(), &vec!["a".to_string()]);
+            }
+            other => panic!("expected a tuple element, got {other:?}"),
+        }
+        // Every other array literal keeps the bare top-level column it had.
+        let scalars = compile_and_emit("SELECT [1, 2]");
+        assert!(
+            matches!(scalars.shape.root, crate::query::ShapeNode::RawScalar),
+            "got {:?}",
+            scalars.shape.root
+        );
     }
 
     #[test]

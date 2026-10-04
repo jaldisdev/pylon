@@ -439,6 +439,22 @@ class TestFreeObjectsAndScalars:
         assert isinstance(native[0], NamedTupleValue)
         assert (native[0].x, native[0].y) == (1, 2)
 
+    def test_an_array_literal_of_tuples_keeps_its_members(self):
+        """`[(a := 1), (a := 2)]` is an array of composites, and each element
+        keeps the members its literal named — read as a plain array its
+        elements come back as bare tuples instead."""
+
+        compiled = _compile('select [(a := 1), (a := 2)]')
+        native = assert_parity([([(1,), (2,)],)], compiled)
+        elements = list(native[0])
+        assert all(isinstance(e, NamedTupleValue) for e in elements), elements
+        assert [e.a for e in elements] == [1, 2]
+
+    def test_an_array_literal_of_positional_tuples_stays_positional(self):
+        compiled = _compile("select [(1, 'x')]")
+        native = assert_parity([([(1, 'x')],)], compiled)
+        assert [tuple(e) for e in native[0]] == [(1, 'x')]
+
     def test_a_positional_tuple_of_scalars_is_a_plain_tuple(self):
         compiled = _compile('select (1, 2)')
         assert compiled.shape['names'] is None

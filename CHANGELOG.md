@@ -36,6 +36,8 @@ now — one PostgreSQL type per member, all the way down.
   a dissimilar type and the parameter as a `std::json`.
 * A tuple property under another name (`Line { p := .price }`) keeps its
   members reachable by name, rather than hydrating as a bare tuple.
+* An array literal of tuples (`select [(a := 1), (a := 2)]`) keeps each
+  element's members, where they used to come back as bare tuples.
 * A member of a tuple that is unset — or of a tuple that is itself unset —
   contributes nothing to a path's results, matching every other empty. A
   tuple with one empty member is still a value, where `IS NOT NULL` on a
