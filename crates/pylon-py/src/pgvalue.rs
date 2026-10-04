@@ -528,6 +528,9 @@ pub(crate) fn cached_to_py<'py>(py: Python<'py>, value: &DecodedValue) -> PyResu
         DecodedValue::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
         DecodedValue::I64(i) => PyInt::new(py, *i).into_any(),
         DecodedValue::F64(f) => PyFloat::new(py, *f).into_any(),
+        // A jsonb number with nothing to say it is a decimal reads as the
+        // float it always has (`JsonMemberKind::Decimal` is the other half).
+        DecodedValue::JsonNumber(digits) => PyFloat::new(py, digits.parse().unwrap_or(f64::NAN)).into_any(),
         DecodedValue::Str(s) => PyString::new(py, s).into_any(),
         DecodedValue::Bytes(b) => PyBytes::new(py, b).into_any(),
         DecodedValue::Uuid(bytes) => {

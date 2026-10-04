@@ -775,6 +775,76 @@ def test_a_set_of_array_valued_properties_reads_back_as_the_arrays_it_holds(live
     asyncio.run(run())
 
 
+def test_a_decimal_inside_a_tuple_keeps_every_digit(live_pool, unique_module):
+    """A tuple travels as jsonb, which has one number type and no scale.
+
+    `12.3400` came back as `12.34` and a value wider than a float as the
+    nearest one, because the number was parsed into an `f64` on its way out
+    of jsonb. The digits survive now, and the member's own declaration is
+    what says to build a decimal from them — a `float64` member beside it
+    still reads as a float.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_decimal_members')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+    exact = decimal.Decimal('0.00000039999999999999998189924473035450347424557548947632312774658203125')
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Line')
+        class Line:
+            label: pylon.Str
+            price: pylon.Tuple[('amount', pylon.Decimal), ('rate', pylon.Float64)] | None
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        for amount in (decimal.Decimal('12.3400'), exact):
+            written = await client.query_required_single(
+                f"""select (insert {module}::Line {{
+                      label := 'l',
+                      price := (amount := <decimal>$amount, rate := <float64>$rate)
+                    }}) {{ price }};""",
+                amount=amount,
+                rate=0.5,
+            )
+            # The scale is part of the value: `12.3400` is not `12.34`.
+            assert written.price.amount == amount
+            assert str(written.price.amount) == str(amount)
+            assert isinstance(written.price.amount, decimal.Decimal)
+            # The float member beside it is still a float.
+            assert written.price.rate == 0.5
+            assert isinstance(written.price.rate, float)
+            await client.execute(f'delete {module}::Line;')
+
+        # And read back out of the column, not just off the insert.
+        await client.execute(
+            f"""insert {module}::Line {{
+                  label := 'l', price := (amount := <decimal>$amount, rate := 1.0)
+                }};""",
+            amount=exact,
+        )
+        [row] = await client.query(f'select {module}::Line {{ price }};')
+        assert row.price.amount == exact
+        [bare] = await client.query(f'select {module}::Line.price;')
+        assert bare.amount == exact
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
 def test_a_tuple_parameter_takes_the_shapes_a_caller_holds_it_in(live_pool, unique_module):
     """A tuple-typed parameter binds from a tuple, a class instance or a dict.
 

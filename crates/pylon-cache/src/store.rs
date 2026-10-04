@@ -55,7 +55,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 /// mid-enum should be avoided going forward (append new variants at the
 /// end instead) — but bumping this version is the safety net for whenever
 /// that isn't possible or gets missed.
-const CACHE_FORMAT_VERSION: &[u8] = b"2";
+const CACHE_FORMAT_VERSION: &[u8] = b"3";
 
 /// `sha256(sql) + bound parameter values`, hex-encoded — see the cache
 /// layer plan's key-simplification note: `compiled.sql` is already a

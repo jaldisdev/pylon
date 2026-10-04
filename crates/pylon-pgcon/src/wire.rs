@@ -369,27 +369,47 @@ fn decode_multirange(data: &[u8], element_oid: u32, ext: &ExtensionOids) -> Resu
 /// the same way a composite field would.
 fn decode_jsonb(data: &[u8]) -> Result<DecodedValue> {
     let text = std::str::from_utf8(&data[1..])?;
-    let value: serde_json::Value = serde_json::from_str(text)?;
-    Ok(json_to_cached(value))
+    let raw: &serde_json::value::RawValue = serde_json::from_str(text)?;
+    json_to_cached(raw)
 }
 
-fn json_to_cached(value: serde_json::Value) -> DecodedValue {
-    match value {
-        serde_json::Value::Null => DecodedValue::Null,
-        serde_json::Value::Bool(b) => DecodedValue::Bool(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                DecodedValue::I64(i)
-            } else {
-                DecodedValue::F64(n.as_f64().unwrap_or(f64::NAN))
-            }
+/// jsonb, with every number's own digits intact.
+///
+/// `serde_json::Value` cannot carry them: it parses `12.3400` into an `f64`,
+/// which keeps neither the scale a money value is written in nor anything
+/// past float precision, and the text is gone before this sees the value at
+/// all. Walking `RawValue`s instead leaves each number as it was written
+/// (see `DecodedValue::JsonNumber`).
+fn json_to_cached(raw: &serde_json::value::RawValue) -> Result<DecodedValue> {
+    let text = raw.get().trim();
+    Ok(match text.as_bytes().first() {
+        None | Some(b'n') => DecodedValue::Null,
+        Some(b't') => DecodedValue::Bool(true),
+        Some(b'f') => DecodedValue::Bool(false),
+        Some(b'"') => DecodedValue::Str(serde_json::from_str(text)?),
+        Some(b'[') => {
+            let items: Vec<&serde_json::value::RawValue> = serde_json::from_str(text)?;
+            DecodedValue::Array(items.into_iter().map(json_to_cached).collect::<Result<Vec<_>>>()?)
         }
-        serde_json::Value::String(s) => DecodedValue::Str(s),
-        serde_json::Value::Array(items) => DecodedValue::Array(items.into_iter().map(json_to_cached).collect()),
-        serde_json::Value::Object(map) => {
-            DecodedValue::Object(map.into_iter().map(|(k, v)| (k, json_to_cached(v))).collect())
+        Some(b'{') => {
+            // A `BTreeMap` keeps the key order this has always produced —
+            // `serde_json::Value::Object` is one too, when its own
+            // `preserve_order` feature is off.
+            let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> = serde_json::from_str(text)?;
+            DecodedValue::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, json_to_cached(value)?)))
+                    .collect::<Result<Vec<_>>>()?,
+            )
         }
-    }
+        // An integer still reads as one, the way every jsonb integer always
+        // has; everything else keeps its digits for its reader to place.
+        _ => match text.parse::<i64>() {
+            Ok(integer) => DecodedValue::I64(integer),
+            Err(_) => DecodedValue::JsonNumber(text.to_string()),
+        },
+    })
 }
 
 /// `pgvector`'s binary format: `u16 ndim`, `u16 reserved` (always 0), then
@@ -638,7 +658,9 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             // index. JSON needs no per-field Postgres type, which is what
             // makes this encodable where the composite below is not.
             out.put_u8(1); // jsonb binary format version prefix
-            out.put_slice(cached_to_json(value).to_string().as_bytes());
+            let mut json = String::new();
+            write_cached_json(value, &mut json);
+            out.put_slice(json.as_bytes());
         }
         DecodedValue::Composite(_) => {
             // Outside jsonb, a composite only arises from *decoding* a query
@@ -650,10 +672,29 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             return Err(Error::message("cannot bind a composite value as a query parameter"));
         }
         DecodedValue::Object(fields) => {
-            let json = cached_object_to_json(fields);
             out.put_u8(1); // jsonb binary format version prefix
-            out.put_slice(json.to_string().as_bytes());
+            let mut json = String::new();
+            write_cached_object_json(fields, &mut json);
+            out.put_slice(json.as_bytes());
         }
+        // Its own digits, wherever they are going: a jsonb number keeps them
+        // (that is why it is carried as text at all), `numeric` parses them
+        // exactly, and a text column takes them as written.
+        DecodedValue::JsonNumber(digits) if *ty == Type::JSONB => {
+            out.put_u8(1);
+            out.put_slice(digits.as_bytes());
+        }
+        DecodedValue::JsonNumber(digits) if *ty == Type::NUMERIC => numeric::encode(digits, out)?,
+        DecodedValue::JsonNumber(digits) if accepts_text_bytes(ty) => out.put_slice(digits.as_bytes()),
+        DecodedValue::JsonNumber(digits) => match digits.parse::<f64>() {
+            Ok(number) => encode_value(&DecodedValue::F64(number), ty, out).map(|_| ())?,
+            Err(_) => {
+                return Err(Error::message(format!(
+                    "cannot bind the JSON number {digits} as a parameter of type {:?}",
+                    ty.name()
+                )));
+            }
+        },
         DecodedValue::Interval {
             months,
             days,
@@ -712,8 +753,39 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
     Ok(IsNull::No)
 }
 
-fn cached_object_to_json(fields: &[(String, DecodedValue)]) -> serde_json::Value {
-    serde_json::Value::Object(fields.iter().map(|(k, v)| (k.clone(), cached_to_json(v))).collect())
+fn write_cached_object_json(fields: &[(String, DecodedValue)], out: &mut String) {
+    out.push('{');
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::Value::String(key.clone()).to_string());
+        out.push(':');
+        write_cached_json(value, out);
+    }
+    out.push('}');
+}
+
+/// A value as jsonb text. Written rather than built as a
+/// `serde_json::Value` for one reason: a number that kept its own digits
+/// (`DecodedValue::JsonNumber`) cannot be held by one without rounding it
+/// back through an `f64` — see `json_to_cached`.
+fn write_cached_json(value: &DecodedValue, out: &mut String) {
+    match value {
+        DecodedValue::JsonNumber(digits) => out.push_str(digits),
+        DecodedValue::Object(fields) => write_cached_object_json(fields, out),
+        DecodedValue::Array(items) | DecodedValue::Composite(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_cached_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&cached_to_json(other).to_string()),
+    }
 }
 
 fn cached_to_json(value: &DecodedValue) -> serde_json::Value {
@@ -731,7 +803,16 @@ fn cached_to_json(value: &DecodedValue) -> serde_json::Value {
         DecodedValue::Array(items) | DecodedValue::Composite(items) => {
             serde_json::Value::Array(items.iter().map(cached_to_json).collect())
         }
-        DecodedValue::Object(fields) => cached_object_to_json(fields),
+        DecodedValue::Object(fields) => {
+            serde_json::Value::Object(fields.iter().map(|(k, v)| (k.clone(), cached_to_json(v))).collect())
+        }
+        // Only reachable for a value nested inside one of the containers
+        // `cached_to_json` still answers for; `write_cached_json` takes the
+        // lossless path for every container that can hold one.
+        DecodedValue::JsonNumber(digits) => digits
+            .parse::<serde_json::Number>()
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         // No natural JSON scalar for an interval; only reachable if an
         // Interval value ends up nested inside an Object being sent as a
         // jsonb parameter — represented as its raw components so it's at
@@ -1346,11 +1427,60 @@ mod tests {
             DecodedValue::I64(42)
         );
 
+        // A number that is not an integer keeps its own digits: jsonb has
+        // one number type, and only the shape that reads it knows whether
+        // it was written as a float or a decimal.
         let mut data2 = vec![1u8];
         data2.extend_from_slice(b"[1.5, 2.5]");
         assert_eq!(
             decode_value(OID_JSONB, &data2, &no_ext()).unwrap(),
-            DecodedValue::Array(vec![DecodedValue::F64(1.5), DecodedValue::F64(2.5)])
+            DecodedValue::Array(vec![
+                DecodedValue::JsonNumber("1.5".to_string()),
+                DecodedValue::JsonNumber("2.5".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn decodes_a_jsonb_number_as_the_digits_it_was_written_with() {
+        // The two a float64 would have cost: the scale `12.3400` carries,
+        // and a value wider than a float can hold.
+        for digits in [
+            "12.3400",
+            "0.00000039999999999999998189924473035450347424557548947632312774658203125",
+            "1e3",
+        ] {
+            let mut data = vec![1u8];
+            data.extend_from_slice(format!(r#"{{"n": {digits}}}"#).as_bytes());
+            assert_eq!(
+                decode_value(OID_JSONB, &data, &no_ext()).unwrap(),
+                DecodedValue::Object(vec![("n".to_string(), DecodedValue::JsonNumber(digits.to_string()))])
+            );
+        }
+    }
+
+    #[test]
+    fn a_jsonb_number_that_kept_its_digits_goes_back_out_as_a_number() {
+        // Binding a decoded value back must not quote it or round it.
+        let value = DecodedValue::Object(vec![("n".to_string(), DecodedValue::JsonNumber("12.3400".to_string()))]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &postgres_types::Type::JSONB, &mut out).unwrap();
+        assert_eq!(out.as_ref(), [&[1u8][..], br#"{"n":12.3400}"#].concat());
+    }
+
+    #[test]
+    fn decodes_jsonb_object_keys_in_the_order_it_always_has() {
+        // `serde_json::Value::Object` is a `BTreeMap` with its own
+        // `preserve_order` feature off, which is the order every reader of
+        // these values has seen so far.
+        let mut data = vec![1u8];
+        data.extend_from_slice(br#"{"b": 1, "aa": 2}"#);
+        let DecodedValue::Object(fields) = decode_value(OID_JSONB, &data, &no_ext()).unwrap() else {
+            panic!("expected an object")
+        };
+        assert_eq!(
+            fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["aa", "b"]
         );
     }
 

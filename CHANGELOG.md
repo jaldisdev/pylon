@@ -124,6 +124,16 @@ what made a webhook's headers unsavable.
   quoted string. The tag comes from the values, since a shape says only
   "scalar" for both `numeric` and `float64`.
 
+* A decimal inside a tuple keeps its digits too. A tuple travels as jsonb,
+  whose numbers were parsed into an `f64` on the way out, so `12.3400` came
+  back as `12.34` and a wider value as the nearest float. A jsonb number now
+  carries the digits it was written with (`DecodedValue::JsonNumber`), and
+  the member's own declaration decides what to build from them: a `decimal`
+  member hydrates to one, a `float64` member beside it still reads as a
+  float, and a json value with no declaration behind it reads as the float
+  it always has. The web UI tags such a member `decimal` and renders it
+  accordingly.
+
 ### Running a server
 
 `pylon-server` is published as a container image, `ghcr.io/jaldisdev/pylon-server`,

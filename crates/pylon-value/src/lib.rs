@@ -146,6 +146,17 @@ pub enum DecodedValue {
         inc_upper: bool,
         empty: bool,
     },
+    /// A jsonb number, as the digits it was written with.
+    ///
+    /// JSON has one number type, so the value alone cannot say whether it
+    /// was a `float64` or a `decimal` — but `12.3400` reaching here through
+    /// an `f64` has already lost its scale, and a value wider than a float
+    /// has lost more than that. The text survives instead, and what reads
+    /// it decides: a tuple member declared `decimal` hydrates to one, and
+    /// everything else to the float it has always been.
+    ///
+    /// Appended at the end on purpose — see `CACHE_FORMAT_VERSION`.
+    JsonNumber(String),
 }
 
 // ── Native-type conversions ──────────────────────────────────────────────────

@@ -2936,6 +2936,7 @@ impl<'a> Compiler<'a> {
     fn tuple_member_to_json_member(&self, m: &crate::schema::TupleMemberDescriptor) -> crate::query::JsonMember {
         use crate::schema::TupleMemberKind;
         let kind = match &m.kind {
+            TupleMemberKind::Scalar { pg_type } if pg_type == "numeric" => crate::query::JsonMemberKind::Decimal,
             TupleMemberKind::Scalar { .. } => crate::query::JsonMemberKind::Scalar,
             TupleMemberKind::Enum { module, name } => crate::query::JsonMemberKind::Enum {
                 enum_type: format!("{}::{}", module, name),
@@ -3003,6 +3004,9 @@ impl<'a> Compiler<'a> {
                 type_name: Some(format!("{}::{}", nt.module, nt.name)),
                 members: nt.members.iter().map(|m| self.tuple_member_to_json_member(m)).collect(),
             };
+        }
+        if matches!(type_expr_to_pg(ty).as_deref(), Ok("numeric")) {
+            return crate::query::JsonMemberKind::Decimal;
         }
         crate::query::JsonMemberKind::Scalar
     }

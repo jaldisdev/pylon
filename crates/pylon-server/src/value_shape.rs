@@ -168,6 +168,7 @@ fn member_shape_tag(member: &JsonMember) -> Json {
     match &member.kind {
         // Already Pylon-qualified, unlike `ShapeNode::Enum`'s.
         JsonMemberKind::Enum { enum_type } => json!({"kind": "enum", "enumType": enum_type}),
+        JsonMemberKind::Decimal => json!({"kind": "decimal"}),
         JsonMemberKind::Tuple { type_name, members } => json!({
             "kind": "namedTuple",
             "typeName": type_name.as_deref(),
@@ -288,6 +289,23 @@ mod tests {
             value_shape_tags(&node),
             json!({"kind": "namedTuple", "typeName": "default::Point", "members": Json::Null})
         );
+    }
+
+    #[test]
+    fn a_decimal_member_is_tagged_from_its_declaration() {
+        // The values cannot say it — jsonb has one number type — so the
+        // member kind the shape carries is what the UI renders `9.99n` from.
+        let node = named_tuple(
+            "price",
+            Some(vec![
+                member(Some("amount"), JsonMemberKind::Decimal),
+                member(Some("currency"), JsonMemberKind::Scalar),
+            ]),
+            None,
+        );
+        let tags = value_shape_tags(&node);
+        assert_eq!(tags["members"][0]["shape"], json!({"kind": "decimal"}));
+        assert_eq!(tags["members"][1]["shape"], Json::Null);
     }
 
     #[test]

@@ -2369,6 +2369,7 @@ fn literal_tuple_member(key: &str, value: &IrExpr) -> crate::query::JsonMember {
                 // `ShapeNode::Enum`'s own Postgres-schema-qualified one.
                 enum_type: pg_schema_qualified_to_pylon(&qualified.name),
             },
+            None if crate::ir::infer_ir_type(value) == Some("numeric") => JsonMemberKind::Decimal,
             None => JsonMemberKind::Scalar,
         },
     };

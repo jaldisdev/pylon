@@ -214,6 +214,12 @@ pub enum JsonMemberKind {
     /// Plain scalar — the jsonb value's own native JSON type is already
     /// correct (number/string/bool), used as-is.
     Scalar,
+    /// A `decimal` member. jsonb has one number type and cannot say which
+    /// of its numbers were written as decimals, so the declaration does:
+    /// the digits travel as they were written (see
+    /// `DecodedValue::JsonNumber`) and this is what tells a reader to build
+    /// a decimal from them rather than a float.
+    Decimal,
     /// Value arrived as a jsonb string; hydrate to the Python enum class
     /// keyed by `enum_type` (Pylon-qualified name, e.g. `default::Gender`).
     Enum { enum_type: String },

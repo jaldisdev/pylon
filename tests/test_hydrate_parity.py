@@ -36,6 +36,7 @@ schema with no multilink at all — which both implementations would then agree
 on, passing the test while testing nothing.
 """
 
+import decimal as _decimal
 import enum as _enum
 import sys
 import uuid as _uuid
@@ -88,6 +89,7 @@ class Post:
     shade: Colour
     palette: pylon.Array[Colour] | None
     headers: pylon.Array[pylon.Tuple[('name', pylon.Str), ('value', pylon.Str)]] | None
+    price: pylon.Tuple[('amount', pylon.Decimal), ('currency', pylon.Str)] | None
     origin: Point | None
     route: pylon.Array[Point] | None
     author: Link[Author] | None
@@ -355,6 +357,21 @@ class TestEnums:
 
 
 class TestTupleProperties:
+    def test_a_decimal_tuple_member_hydrates_as_one(self):
+        # jsonb has one number type, so only the member's own declaration
+        # says this is a decimal rather than a float.
+        compiled = _compile('select m::Post { price }')
+        price = {'amount': _decimal.Decimal('12.3400'), 'currency': 'EUR'}
+        native = assert_parity([('m::Post', _id(1), price)], compiled)
+        assert native[0].price.amount == _decimal.Decimal('12.3400')
+        assert isinstance(native[0].price.amount, _decimal.Decimal)
+        assert native[0].price.currency == 'EUR'
+
+    def test_an_empty_decimal_member_stays_empty(self):
+        compiled = _compile('select m::Post { price }')
+        native = assert_parity([('m::Post', _id(1), {'amount': None, 'currency': 'EUR'})], compiled)
+        assert native[0].price.amount is None
+
     def test_a_nominal_named_tuple_property_hydrates_to_its_class(self):
         compiled = _compile('select m::Post { origin }')
         native = assert_parity([('m::Post', _id(1), {'x': 1.0, 'y': 2.0})], compiled)

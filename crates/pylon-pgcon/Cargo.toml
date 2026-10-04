@@ -19,7 +19,9 @@ tokio-postgres = "0.7"
 postgres-types = "0.2"
 deadpool-postgres = "0.14"
 pylon-db-value = { workspace = true }
-serde_json = "1"
+# `raw_value` keeps a jsonb number's own digits through parsing — see
+# `decode_jsonb`; `serde_json::Value` would round it through an `f64`.
+serde_json = { version = "1", features = ["raw_value"] }
 bytes = "1"
 hex = "0.4"
 thiserror = "2.0"

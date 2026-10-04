@@ -121,6 +121,9 @@ pub struct HydrationRegistry {
     object_new: Py<PyAny>,
     /// `pylon.datatypes.Object`, the dataclass a free object decodes into.
     free_object: Py<PyAny>,
+    /// `decimal.Decimal`, for a tuple member whose declaration says its
+    /// jsonb number is one (see `JsonMemberKind::Decimal`).
+    decimal: Py<PyAny>,
 }
 
 #[pymethods]
@@ -179,6 +182,7 @@ impl HydrationRegistry {
             named_tuple_value: datatypes.getattr("NamedTupleValue")?.unbind(),
             object_new: py.import("builtins")?.getattr("object")?.getattr("__new__")?.unbind(),
             free_object: datatypes.getattr("Object")?.unbind(),
+            decimal: py.import("decimal")?.getattr("Decimal")?.unbind(),
         })
     }
 }
@@ -548,6 +552,18 @@ fn decode_json_member<'py>(
     match &member.kind {
         // "scalar" — jsonb's own native JSON type is already correct.
         JsonMemberKind::Scalar => cached_to_py(py, value),
+        // jsonb has one number type, so only the declaration knows this one
+        // is a decimal — the digits arrived as written for exactly this.
+        JsonMemberKind::Decimal => match value {
+            DecodedValue::Null => Ok(py.None().into_bound(py)),
+            DecodedValue::JsonNumber(digits) | DecodedValue::Str(digits) => {
+                reg.decimal.bind(py).call1((digits.as_str(),))
+            }
+            other => {
+                let raw = cached_to_py(py, other)?;
+                reg.decimal.bind(py).call1((raw.str()?,))
+            }
+        },
         JsonMemberKind::Enum { enum_type } => {
             if matches!(value, DecodedValue::Null) {
                 return Ok(py.None().into_bound(py));

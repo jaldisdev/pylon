@@ -285,6 +285,14 @@ fn decode_json_tuple(value: &DecodedValue, type_name: Option<&str>, members: Opt
 fn decode_json_member(value: &DecodedValue, member: &JsonMember) -> Value {
     match &member.kind {
         JsonMemberKind::Scalar => cached_to_value(value),
+        // The declaration is the only thing that knows: jsonb has one
+        // number type, and the digits reached here as written precisely so
+        // this could build the decimal they spell.
+        JsonMemberKind::Decimal => match value {
+            DecodedValue::JsonNumber(digits) | DecodedValue::Str(digits) => Value::Decimal(digits.clone()),
+            DecodedValue::I64(integer) => Value::Decimal(integer.to_string()),
+            other => cached_to_value(other),
+        },
         JsonMemberKind::Enum { enum_type } => match value {
             DecodedValue::Null => Value::Null,
             DecodedValue::Str(s) => Value::Enum {
@@ -406,6 +414,10 @@ pub(crate) fn cached_to_value(value: &DecodedValue) -> Value {
         DecodedValue::Bytes(b) => Value::Bytes(b.clone()),
         DecodedValue::Uuid(bytes) => Value::Uuid(uuid::Uuid::from_bytes(*bytes)),
         DecodedValue::Decimal(s) => Value::Decimal(s.clone()),
+        // A jsonb number with nothing to say it is a decimal reads as the
+        // float it always has (see `JsonMemberKind::Decimal` for the other
+        // half).
+        DecodedValue::JsonNumber(digits) => Value::Float64(digits.parse().unwrap_or(f64::NAN)),
         DecodedValue::Interval {
             months,
             days,

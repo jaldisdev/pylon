@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import decimal
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -125,6 +126,11 @@ def _decode_json_member(value: Any, node: dict, registry: dict[str, type]) -> An
         return cls(value) if cls is not None else value
     if kind == 'tuple':
         return _decode_json_tuple(value, node, registry)
+    if kind == 'decimal':
+        # jsonb has one number type and cannot say which of its numbers were
+        # written as decimals, so the declaration does — and the digits
+        # reached here as written (see `DecodedValue::JsonNumber`) for this.
+        return None if value is None else decimal.Decimal(str(value))
     return value  # "scalar" — jsonb's own native JSON type is already correct
 
 

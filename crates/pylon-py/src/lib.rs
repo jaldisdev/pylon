@@ -2421,6 +2421,9 @@ fn json_member_to_py<'py>(
     let d = PyDict::new(py);
     d.set_item("key", member.key.as_deref())?;
     match &member.kind {
+        JsonMemberKind::Decimal => {
+            d.set_item("kind", "decimal")?;
+        }
         JsonMemberKind::Scalar => {
             d.set_item("kind", "scalar")?;
         }
