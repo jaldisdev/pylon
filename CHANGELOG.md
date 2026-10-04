@@ -42,6 +42,14 @@ elements came back as the raw decoded jsonb — `headers[0]["value"]`, with
   array was worse than imprecise: the enum branch answered for it too, leaving
   the `[]` inside the name (`integration::WebhookEvent"[]`).
 
+* A tuple literal carries the members it names. `select (amount := 9.99,
+  note := 'x')` described none, so the value hydrated as a plain mapping
+  rather than a named tuple, and the web UI — which renders `(key := value,
+  …)` from that list — had nothing to render and showed `()`. A nested
+  literal recurses and an enum member keeps the type its labels decode
+  against. A free object (`{ a := 1 }`) is deliberately left without one: it
+  is not a tuple to its reader.
+
 A database carries the schema its last migration stored, so a client only sees
 this once `migration apply` (or a dev-mode sync) has written the schema
 snapshot again.

@@ -2349,6 +2349,44 @@ fn emit_free_field_expr(expr: &IrExpr) -> String {
     }
 }
 
+/// One member of a tuple literal: its own name, plus what that member
+/// holds — a nested literal recurses, an enum keeps the type its labels
+/// decode against, and anything else is read as the jsonb scalar it is.
+fn literal_tuple_member(key: &str, value: &IrExpr) -> crate::query::JsonMember {
+    use crate::query::{JsonMember, JsonMemberKind};
+
+    let kind = match value {
+        IrExpr::NamedTuple { fields, .. } => JsonMemberKind::Tuple {
+            type_name: None,
+            members: fields
+                .iter()
+                .map(|(key, value)| literal_tuple_member(key, value))
+                .collect(),
+        },
+        _ => match enum_type_of_expr(value) {
+            Some(qualified) => JsonMemberKind::Enum {
+                // A member's enum type is Pylon-qualified, unlike
+                // `ShapeNode::Enum`'s own Postgres-schema-qualified one.
+                enum_type: pg_schema_qualified_to_pylon(&qualified.name),
+            },
+            None => JsonMemberKind::Scalar,
+        },
+    };
+    JsonMember {
+        key: Some(key.to_string()),
+        kind,
+    }
+}
+
+/// `public::Gender` -> `default::Gender` — only the `default` module is ever
+/// renamed on the way into Postgres, so it is the only one to undo.
+fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
+    match qualified.split_once("::") {
+        Some(("public", name)) => format!("default::{name}"),
+        _ => qualified.to_string(),
+    }
+}
+
 /// Shape node for one free scalar/object/tuple field — `Enum` when the
 /// value is enum-typed (see `enum_type_of_expr`), else a plain `Scalar`.
 fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
@@ -2485,11 +2523,26 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
             name: name.to_string(),
             position,
         },
-        IrExpr::NamedTuple { is_free_object, .. } => ShapeNode::NamedTuple {
+        IrExpr::NamedTuple { fields, is_free_object } => ShapeNode::NamedTuple {
             name: name.to_string(),
             position,
             type_name: None,
-            members: None,
+            // A literal names its own members — `(amount := 9.99, note :=
+            // 'x')` says what they are called and what each one holds. With
+            // no member plan a reader has only the raw jsonb to go on, so
+            // the value hydrated as a plain dict rather than a named tuple,
+            // and the web UI, which renders `(key := value, …)` from this
+            // list, had nothing to render and showed `()`.
+            //
+            // A free object (`{ a := 1 }`) is left without one: it is not a
+            // tuple to its reader, and a member plan would hydrate it as a
+            // named-tuple value instead of the mapping it reads as today.
+            members: (!*is_free_object).then(|| {
+                fields
+                    .iter()
+                    .map(|(key, value)| literal_tuple_member(key, value))
+                    .collect()
+            }),
             is_free_object: *is_free_object,
         },
         // A path select aggregated into an array keeps its rows' own shape, so
@@ -15933,6 +15986,87 @@ select owner { posts := (select owner.posts.title) };",
                 "got: {}",
                 e
             ),
+        }
+    }
+
+    #[test]
+    fn test_a_tuple_literal_carries_the_members_it_names() {
+        // `(amount := 9.99, note := 'x')` says what its members are called,
+        // but the shape used to carry none — so the value hydrated as a
+        // plain mapping rather than a named tuple, and the web UI, which
+        // renders `(key := value, …)` from this list, showed `()`.
+        let out = compile_and_emit("SELECT (amount := 9.99, note := 'x')");
+        match &out.shape.root {
+            crate::query::ShapeNode::NamedTuple { members, .. } => {
+                let members = members.as_ref().expect("a literal names its own members");
+                let keys: Vec<_> = members.iter().map(|m| m.key.as_deref()).collect();
+                assert_eq!(keys, vec![Some("amount"), Some("note")]);
+            }
+            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_tuple_literal_member_that_is_itself_a_tuple_recurses() {
+        let out = compile_and_emit("SELECT (origin := (x := 1, y := 2), label := 'a')");
+        let crate::query::ShapeNode::NamedTuple { members, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::NamedTuple, got {:?}", out.shape.root)
+        };
+        let members = members.as_ref().expect("a literal names its own members");
+        match &members[0].kind {
+            crate::query::JsonMemberKind::Tuple { members, .. } => {
+                let keys: Vec<_> = members.iter().map(|m| m.key.as_deref()).collect();
+                assert_eq!(keys, vec![Some("x"), Some("y")]);
+            }
+            other => panic!("expected a nested tuple member, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_tuple_literal_member_holding_an_enum_keeps_its_type() {
+        // `make_schema` declares no enums of its own.
+        let mut schema = make_schema();
+        schema.enums.push(crate::schema::EnumDescriptor {
+            name: "Gender".into(),
+            module: "default".into(),
+            members: vec!["Male".into(), "Female".into()],
+        });
+        let out = compile_and_emit_with("SELECT (shade := default::Gender.Male, label := 'a')", &schema);
+        let crate::query::ShapeNode::NamedTuple { members, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::NamedTuple, got {:?}", out.shape.root)
+        };
+        let members = members.as_ref().expect("a literal names its own members");
+        match &members[0].kind {
+            // Pylon-qualified, the way a member's enum type always is.
+            crate::query::JsonMemberKind::Enum { enum_type } => assert_eq!(enum_type, "default::Gender"),
+            other => panic!("expected an enum member, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_free_object_literal_carries_no_member_plan() {
+        // `{ foo := 'bar' }` as a computed compiles to the same node a tuple
+        // literal does, but it is not a tuple to its reader: a member plan
+        // would hydrate it as a named-tuple value instead of the mapping it
+        // reads as.
+        let out = compile_and_emit("SELECT Person { meta := { foo := 'bar' } }");
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Object, got {:?}", out.shape.root)
+        };
+        let meta = pointers
+            .iter()
+            .find(|p| matches!(p, crate::query::ShapeNode::NamedTuple { name, .. } if name == "meta"))
+            .expect("expected the meta pointer");
+        match meta {
+            crate::query::ShapeNode::NamedTuple {
+                members,
+                is_free_object,
+                ..
+            } => {
+                assert!(is_free_object);
+                assert!(members.is_none(), "got {members:?}");
+            }
+            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
         }
     }
 
