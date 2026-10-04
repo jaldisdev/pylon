@@ -493,7 +493,9 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
             collect_expr(expr, tags);
             collect_expr(index, tags);
         }
-        IrExpr::JsonbField { expr, .. } | IrExpr::JsonbIndex { expr, .. } => collect_expr(expr, tags),
+        IrExpr::JsonbField { expr, .. } | IrExpr::JsonbIndex { expr, .. } | IrExpr::CompositeField { expr, .. } => {
+            collect_expr(expr, tags)
+        }
         IrExpr::Slice { expr, lower, upper, .. } => {
             collect_expr(expr, tags);
             if let Some(l) = lower {

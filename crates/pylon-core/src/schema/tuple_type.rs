@@ -148,6 +148,20 @@ fn member_signature_type(kind: &TupleMemberKind) -> String {
     }
 }
 
+/// The composite type a member that is itself a tuple has — `None` for a
+/// member that is a plain scalar or an enum.
+///
+/// A tuple literal nested inside another has to name this type: PostgreSQL
+/// will not cast the inner anonymous `record` to it on the way into the
+/// outer row ("cannot cast type record to …").
+pub fn member_type_ref(kind: &TupleMemberKind, declaring_module: &str) -> Option<String> {
+    match kind {
+        TupleMemberKind::NamedTuple { module, name } => Some(type_ref(module, &nominal_name(name))),
+        TupleMemberKind::Tuple { members } => Some(type_ref(declaring_module, &structural_name(members))),
+        TupleMemberKind::Scalar { .. } | TupleMemberKind::Enum { .. } => None,
+    }
+}
+
 /// The PostgreSQL type one member gets as a composite attribute.
 ///
 /// `declaring_module` is the module whose schema holds the *enclosing* type,
@@ -193,11 +207,7 @@ pub fn property_column_type(prop: &PropertyDescriptor, owner_module: &str) -> Op
         let members = prop.tuple_members.as_ref()?;
         type_ref(owner_module, &structural_name(members))
     };
-    Some(if is_array {
-        format!("{}[]", type_ref)
-    } else {
-        type_ref
-    })
+    Some(if is_array { format!("{}[]", type_ref) } else { type_ref })
 }
 
 /// Every composite type the schema needs, each one after the types it refers
@@ -484,7 +494,6 @@ mod tests {
 
     #[test]
     fn a_structural_tuple_is_named_for_its_content() {
-
         let members = vec![scalar(Some("name"), "text"), scalar(Some("value"), "numeric")];
 
         let name = structural_name(&members);
@@ -496,7 +505,6 @@ mod tests {
 
     #[test]
     fn a_different_member_type_is_a_different_structural_type() {
-
         let decimal = vec![scalar(Some("amount"), "numeric")];
         let float = vec![scalar(Some("amount"), "float8")];
         assert_ne!(
@@ -508,7 +516,6 @@ mod tests {
 
     #[test]
     fn naming_the_members_makes_it_a_different_type_from_the_positional_one() {
-
         let named = vec![scalar(Some("name"), "text"), scalar(Some("value"), "numeric")];
         let positional = vec![scalar(None, "text"), scalar(None, "numeric")];
         assert_ne!(structural_name(&named), structural_name(&positional));
@@ -516,7 +523,6 @@ mod tests {
 
     #[test]
     fn a_positional_members_attribute_is_named_for_its_index() {
-
         let members = vec![scalar(None, "numeric"), scalar(None, "text")];
 
         let attrs = attributes(&members, "default");
@@ -537,7 +543,6 @@ mod tests {
 
     #[test]
     fn the_signature_reads_as_the_tuple_was_written() {
-
         assert_eq!(
             signature(&[scalar(Some("name"), "text"), scalar(Some("value"), "numeric")]),
             "tuple<name: text, value: numeric>"
@@ -550,7 +555,6 @@ mod tests {
 
     #[test]
     fn an_enum_member_takes_the_enums_own_type() {
-
         let members = vec![member(
             Some("gender"),
             TupleMemberKind::Enum {
@@ -559,10 +563,7 @@ mod tests {
             },
         )];
 
-        assert_eq!(
-            attributes(&members, "default")[0].pg_type,
-            "\"public\".\"Gender\""
-        );
+        assert_eq!(attributes(&members, "default")[0].pg_type, "\"public\".\"Gender\"");
         assert_eq!(signature(&members), "tuple<gender: default::Gender>");
     }
 
@@ -571,17 +572,14 @@ mod tests {
         let mut schema = SchemaDescriptor::default();
         let inner = vec![scalar(Some("amount"), "numeric")];
         let outer = vec![
-            member(
-                Some("deep"),
-                TupleMemberKind::Tuple {
-                    members: inner.clone(),
-                },
-            ),
+            member(Some("deep"), TupleMemberKind::Tuple { members: inner.clone() }),
             scalar(Some("note"), "text"),
         ];
-        schema
-            .types
-            .push(type_with("default", "Order", vec![property("t", "jsonb", Some(outer.clone()))]));
+        schema.types.push(type_with(
+            "default",
+            "Order",
+            vec![property("t", "jsonb", Some(outer.clone()))],
+        ));
 
         let types = collect(&schema).unwrap();
         let names: Vec<&str> = types.iter().map(|t| t.name.as_str()).collect();
@@ -589,10 +587,7 @@ mod tests {
         let outer_name = structural_name(&outer);
         assert_eq!(names, vec![inner_name.as_str(), outer_name.as_str()], "nested first");
         // The parent's attribute refers to the nested type, not to jsonb.
-        assert_eq!(
-            types[1].attributes[0].pg_type,
-            format!("\"public\".\"{}\"", inner_name)
-        );
+        assert_eq!(types[1].attributes[0].pg_type, format!("\"public\".\"{}\"", inner_name));
         assert_eq!(types[1].signature, "tuple<deep: tuple<amount: numeric>, note: text>");
     }
 
@@ -717,12 +712,8 @@ mod tests {
 
     #[test]
     fn a_property_that_is_not_a_tuple_has_no_composite_type() {
-
         assert_eq!(property_column_type(&property("name", "text", None), "default"), None);
-        assert_eq!(
-            property_column_type(&property("tags", "text[]", None), "default"),
-            None
-        );
+        assert_eq!(property_column_type(&property("tags", "text[]", None), "default"), None);
         // A plain json column is not a tuple either, despite the type it shares.
         assert_eq!(
             property_column_type(&property("payload", "jsonb", None), "default"),

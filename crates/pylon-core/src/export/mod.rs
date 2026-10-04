@@ -4763,7 +4763,10 @@ mod tuple_type_tests {
         schema.named_tuples.push(NamedTupleDescriptor {
             name: "Money".into(),
             module: "default".into(),
-            members: vec![scalar_member(Some("amount"), "numeric"), scalar_member(Some("ccy"), "text")],
+            members: vec![
+                scalar_member(Some("amount"), "numeric"),
+                scalar_member(Some("ccy"), "text"),
+            ],
         });
 
         let ddl = export_schema(&schema).unwrap();
@@ -4779,7 +4782,10 @@ mod tuple_type_tests {
         schema.named_tuples.push(NamedTupleDescriptor {
             name: "Header".into(),
             module: "integration".into(),
-            members: vec![scalar_member(Some("name"), "text"), scalar_member(Some("value"), "text")],
+            members: vec![
+                scalar_member(Some("name"), "text"),
+                scalar_member(Some("value"), "text"),
+            ],
         });
         schema.types.push(type_with(
             "integration",
@@ -4796,7 +4802,10 @@ mod tuple_type_tests {
 
     #[test]
     fn a_structural_tuple_property_gets_a_type_named_for_its_content() {
-        let members = vec![scalar_member(Some("name"), "text"), scalar_member(Some("value"), "numeric")];
+        let members = vec![
+            scalar_member(Some("name"), "text"),
+            scalar_member(Some("value"), "numeric"),
+        ];
         let mut schema = SchemaDescriptor::default();
         schema.types.push(type_with(
             "default",
@@ -4812,7 +4821,10 @@ mod tuple_type_tests {
             )),
             "got:\n{ddl}"
         );
-        assert!(ddl.contains(&format!("\"headers\" \"public\".\"{name}\"")), "got:\n{ddl}");
+        assert!(
+            ddl.contains(&format!("\"headers\" \"public\".\"{name}\"")),
+            "got:\n{ddl}"
+        );
     }
 
     #[test]
@@ -4828,11 +4840,15 @@ mod tuple_type_tests {
         let ddl = export_schema(&schema).unwrap();
         let name = tuple_type::structural_name(&members);
         assert!(
-            ddl.contains(&format!("CREATE TYPE \"public\".\"{name}\" AS (\"0\" numeric, \"1\" text)")),
+            ddl.contains(&format!(
+                "CREATE TYPE \"public\".\"{name}\" AS (\"0\" numeric, \"1\" text)"
+            )),
             "a composite attribute must have a name, so a positional member is named for its index, got:\n{ddl}"
         );
         assert!(
-            ddl.contains(&format!("COMMENT ON TYPE \"public\".\"{name}\" IS 'tuple<numeric, text>';")),
+            ddl.contains(&format!(
+                "COMMENT ON TYPE \"public\".\"{name}\" IS 'tuple<numeric, text>';"
+            )),
             "got:\n{ddl}"
         );
     }

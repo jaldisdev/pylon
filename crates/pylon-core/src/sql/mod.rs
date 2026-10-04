@@ -2390,9 +2390,7 @@ fn composite_member_shape(position: usize, member: &crate::query::JsonMember) ->
             position,
             enum_type: enum_type.clone(),
         },
-        JsonMemberKind::Tuple { type_name, members } => {
-            composite_tuple_shape("", position, type_name.clone(), members)
-        }
+        JsonMemberKind::Tuple { type_name, members } => composite_tuple_shape("", position, type_name.clone(), members),
     }
 }
 
@@ -3313,12 +3311,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 let node = ShapeNode::Array {
                     name: String::new(),
                     position: 0,
-                    element: Box::new(composite_tuple_shape(
-                        "",
-                        0,
-                        shape.type_name.clone(),
-                        &shape.members,
-                    )),
+                    element: Box::new(composite_tuple_shape("", 0, shape.type_name.clone(), &shape.members)),
                 };
                 (format!("ROW({}) AS result", emit_expr(ir_expr)), node)
             } else if is_nt {
@@ -5614,6 +5607,12 @@ pub fn emit_expr(expr: &IrExpr) -> String {
 
         IrExpr::JsonbField { expr, field } => {
             format!("({}->{})", emit_expr(expr), sql_str(field))
+        }
+
+        // The parentheses are required, not defensive: `a.b.c` without them
+        // reads as a schema-qualified name.
+        IrExpr::CompositeField { expr, field, .. } => {
+            format!("({}).{}", emit_expr(expr), qi(field))
         }
 
         IrExpr::JsonbIndex { expr, index } => {
@@ -15748,7 +15747,15 @@ select owner { posts := (select owner.posts.title) };",
         // further traversal for the nominal `__nt__:` named-tuple marker,
         // ignoring `tuple_members` on plain jsonb-typed properties.
         let out = compile_and_emit_with("SELECT default::Person.address.street", &schema);
-        assert!(out.sql.contains("\"address\"->'street'"), "got:\n{}", out.sql);
+        // The column is a composite row, so the member is a field of it —
+        // a jsonb `->` here would be an operator the type does not have.
+        assert!(out.sql.contains(r#"("t0"."address")."street""#), "got:\n{}", out.sql);
+        // And it arrives as the text it is declared as, not as raw jsonb.
+        assert!(
+            matches!(out.shape.root, crate::query::ShapeNode::Scalar { .. }),
+            "got {:?}",
+            out.shape.root
+        );
     }
 
     /// A `Person` with one `array<tuple<street: str, zip: str>>` property —
@@ -15823,9 +15830,8 @@ select owner { posts := (select owner.posts.title) };",
             "INSERT Person { address := (street := 'Main', zip := '1000') }",
             &schema,
         );
-        let name = crate::schema::tuple_type::structural_name(
-            schema.types[0].properties[0].tuple_members.as_ref().unwrap(),
-        );
+        let name =
+            crate::schema::tuple_type::structural_name(schema.types[0].properties[0].tuple_members.as_ref().unwrap());
         assert!(
             out.sql.contains("ROW('Main', '1000')") && out.sql.contains(&format!("::\"public\".\"{name}\"")),
             "got:\n{}",
@@ -15844,10 +15850,7 @@ select owner { posts := (select owner.posts.title) };",
         // composite — `_pylon.populate_tuple` is how one is read, taking the
         // value as the object its member names describe.
         let schema = make_schema_with_a_structural_tuple_property();
-        let out = compile_and_emit_with(
-            "INSERT Person { address := <tuple<street: str, zip: str>>$a }",
-            &schema,
-        );
+        let out = compile_and_emit_with("INSERT Person { address := <tuple<street: str, zip: str>>$a }", &schema);
         assert!(
             out.sql.contains("\"_pylon\".\"populate_tuple\"") && out.sql.contains("to_jsonb("),
             "got:\n{}",
@@ -16083,10 +16086,7 @@ select owner { posts := (select owner.posts.title) };",
             crate::query::ShapeNode::Array { element, position, .. } => {
                 assert_eq!(*position, 0);
                 assert!(
-                    matches!(
-                        element.as_ref(),
-                        crate::query::ShapeNode::Tuple { names: Some(_), .. }
-                    ),
+                    matches!(element.as_ref(), crate::query::ShapeNode::Tuple { names: Some(_), .. }),
                     "expected named-tuple elements, got {element:?}"
                 );
             }
@@ -16135,10 +16135,7 @@ select owner { posts := (select owner.posts.title) };",
         let out = compile_and_emit_with("WITH entries := Person.addresses SELECT entries", &schema);
         match &out.shape.root {
             crate::query::ShapeNode::Array { element, .. } => assert!(
-                matches!(
-                    element.as_ref(),
-                    crate::query::ShapeNode::Tuple { names: Some(_), .. }
-                ),
+                matches!(element.as_ref(), crate::query::ShapeNode::Tuple { names: Some(_), .. }),
                 "expected a named-tuple element, got {element:?}"
             ),
             other => panic!("expected ShapeNode::Array, got {other:?}"),

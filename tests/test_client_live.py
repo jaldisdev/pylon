@@ -1112,3 +1112,91 @@ def test_a_string_for_a_non_text_parameter_is_refused_without_losing_the_transac
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
     asyncio.run(run())
+
+
+@pytest.mark.live_db
+def test_a_member_read_out_of_a_stored_tuple_is_the_type_it_declares(live_pool, unique_module):
+    """A tuple's column is a composite type, so `.price.amount` is a field of
+    that row — a jsonb `->` would be an operator the type does not have.
+
+    The member arrives as the type it was declared with, which is what makes
+    a `decimal` member a `Decimal` with its scale rather than whatever a
+    number parsed out of jsonb became. Reaching a member that isn't declared
+    is a compile error now: a composite has no absent key to hand back.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.exceptions import InvalidQueryError
+
+    module = unique_module('live_tuple_members')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.named_tuple
+        class Money(pylon.NamedTuple):
+            amount: pylon.Decimal
+            currency: pylon.Str
+
+        Money.__pylon_module__ = module
+
+        @pylon.type(module=module, name='Line')
+        class Line:
+            label: pylon.Str
+            price: Money | None
+            nested: pylon.Tuple[('deep', pylon.Tuple[('amount', pylon.Decimal)]), ('note', pylon.Str)] | None
+
+        schema = _build_schema(*snapshot(), named_tuples=[Money])
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        await client.execute(
+            f"""insert {module}::Line {{
+                  label := 'a',
+                  price := (amount := <decimal>'12.3400', currency := 'EUR'),
+                  nested := (deep := (amount := <decimal>'9.9900'), note := 'n')
+                }};"""
+        )
+        # One member empty, and `nested` absent altogether.
+        await client.execute(
+            f"""insert {module}::Line {{
+                  label := 'b', price := (amount := <decimal>'1.0000', currency := {{}})
+                }};"""
+        )
+
+        amounts = await client.query(f'select {module}::Line.price.amount order by {module}::Line.label;')
+        assert amounts == [decimal.Decimal('12.3400'), decimal.Decimal('1.0000')]
+        assert all(isinstance(a, decimal.Decimal) for a in amounts)
+        # Every digit, which is the whole reason the column has a type.
+        assert [str(a) for a in amounts] == ['12.3400', '1.0000']
+
+        # An empty member is nothing, not a None standing in for one.
+        assert await client.query(f'select {module}::Line.price.currency;') == ['EUR']
+        # And a member of a tuple that is itself unset is nothing either.
+        assert await client.query(f'select {module}::Line.nested.deep.amount;') == [decimal.Decimal('9.9900')]
+
+        # The tuple itself is still there, though — `IS NOT NULL` on a
+        # composite asks whether *every* member is set, which would have
+        # dropped this row for having one empty member.
+        prices = await client.query(f'select {module}::Line.price order by {module}::Line.label;')
+        assert [(p.amount, p.currency) for p in prices] == [
+            (decimal.Decimal('12.3400'), 'EUR'),
+            (decimal.Decimal('1.0000'), None),
+        ]
+
+        with pytest.raises(InvalidQueryError) as refused:
+            await client.query(f'select {module}::Line.price.nope;')
+        assert "'nope' is not a member" in str(refused.value), refused.value
+        assert 'amount, currency' in str(refused.value), refused.value
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())

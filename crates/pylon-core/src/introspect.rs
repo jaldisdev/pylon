@@ -32,8 +32,8 @@
 //! "decode every column" path for this one caller.
 
 use crate::diff::{
-    DbColumn, DbComposite, DbCompositeAttr, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence,
-    DbState, DbTable, DbView,
+    DbColumn, DbComposite, DbCompositeAttr, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence, DbState,
+    DbTable, DbView,
 };
 use pylon_pgcon::PgPool;
 use pylon_value::DecodedValue;

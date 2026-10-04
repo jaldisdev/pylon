@@ -1313,7 +1313,9 @@ pub fn default_blocker(expr: &IrExpr) -> Option<&'static str> {
         E::Array(items) | E::Tuple(items) | E::Row(items) => items.iter().find_map(default_blocker),
         E::NamedTuple { fields, .. } => fields.iter().find_map(|(_, e)| default_blocker(e)),
         E::Subscript { expr, index, .. } => default_blocker(expr).or_else(|| default_blocker(index)),
-        E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } => default_blocker(expr),
+        E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } | E::CompositeField { expr, .. } => {
+            default_blocker(expr)
+        }
         E::Slice { expr, lower, upper, .. } => default_blocker(expr)
             .or_else(|| lower.as_deref().and_then(default_blocker))
             .or_else(|| upper.as_deref().and_then(default_blocker)),
@@ -2835,13 +2837,22 @@ impl<'a> Compiler<'a> {
     /// design: there the object is the result, so `Webhook { headers }` still
     /// reads the unset one as `None`.
     fn drop_empty_results(&self, path_select: &mut IrPathSelect) {
-        let IrPathResult::Scalar(expr, _) = &path_select.result else {
+        let IrPathResult::Scalar(expr, tuple_shape) = &path_select.result else {
             return;
         };
         if !self.result_can_be_empty(path_select, expr) {
             return;
         }
-        let guard = ir_is_not_null(expr.clone());
+        // A tuple's value is a composite row, for which `IS NOT NULL` asks
+        // whether *every* member is set — so a tuple with one empty member
+        // would be dropped as if the whole value were absent. `IS DISTINCT
+        // FROM NULL` asks about the value itself. Every other type keeps
+        // `IS NOT NULL`, which means the same thing for it and is what an
+        // index can be used for.
+        let guard = match tuple_shape {
+            Some(_) => ir_is_distinct_from_null(expr.clone()),
+            None => ir_is_not_null(expr.clone()),
+        };
         path_select.filter = and_conditions(path_select.filter.take(), vec![guard]);
     }
 
@@ -2854,6 +2865,9 @@ impl<'a> Compiler<'a> {
     fn result_can_be_empty(&self, path_select: &IrPathSelect, expr: &IrExpr) -> bool {
         match expr {
             IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Subquery(_) => true,
+            // A member of a tuple can be unset whether or not the tuple
+            // itself is, and every member of an unset tuple is.
+            IrExpr::CompositeField { .. } => true,
             IrExpr::TypeCast(cast) => self.result_can_be_empty(path_select, &cast.expr),
             IrExpr::ColumnRef { alias, column, .. } => self
                 .path_step_type(path_select, alias)
@@ -2930,7 +2944,7 @@ impl<'a> Compiler<'a> {
             .find(|nt| nt.name == name || format!("{}::{}", nt.module, nt.name) == name)
     }
 
-    /// Convert a schema-level `TupleMemberDescriptor` into a decode-time
+    /// Convert a schema-level `crate::schema::TupleMemberDescriptor` into a decode-time
     /// `JsonMember` — recurses for a nested tuple member, resolving a nested
     /// *nominal* member's own registered members too.
     fn tuple_member_to_json_member(&self, m: &crate::schema::TupleMemberDescriptor) -> crate::query::JsonMember {
@@ -3084,7 +3098,7 @@ impl<'a> Compiler<'a> {
     /// object its member names describe. `to_jsonb` is the identity on the
     /// jsonb a parameter arrives as and turns a composite into that same
     /// object, so one expression covers every way a tuple can be handed in.
-    fn into_column_tuple(expr: IrExpr, prop: &PropertyDescriptor, module: &str) -> IrExpr {
+    fn column_tuple_value(&self, expr: IrExpr, prop: &PropertyDescriptor, module: &str) -> IrExpr {
         let Some(column_type) = crate::schema::tuple_type::property_column_type(prop, module) else {
             return expr;
         };
@@ -3094,19 +3108,13 @@ impl<'a> Compiler<'a> {
         // An array property's value is a set of tuples, not one tuple, so the
         // row form does not apply to it element-wise here.
         let is_array = column_type.ends_with("[]");
-        let row = match (&expr, is_array) {
-            (IrExpr::NamedTuple { fields, .. }, false) => {
-                Some(IrExpr::Row(fields.iter().map(|(_, e)| e.clone()).collect()))
-            }
-            (IrExpr::Tuple(elements), false) => Some(IrExpr::Row(elements.clone())),
-            _ => None,
+        let members = self.property_tuple_members(prop).unwrap_or_default();
+        let row = match is_array {
+            false => self.tuple_literal_as_row(&expr, &members, &column_type, module),
+            true => None,
         };
         match row {
-            Some(row) => IrExpr::TypeCast(Box::new(crate::ir::IrTypeCast {
-                expr: row,
-                pg_type: column_type,
-                tuple_shape: None,
-            })),
+            Some(row) => row,
             None => {
                 let element = column_type.strip_suffix("[]").unwrap_or(&column_type).to_string();
                 let call = |schema: Option<&str>, name: &str, args: Vec<IrExpr>| {
@@ -3127,6 +3135,92 @@ impl<'a> Compiler<'a> {
                 let helper = if is_array { "populate_tuples" } else { "populate_tuple" };
                 call(Some("_pylon"), helper, vec![typed_null, as_json])
             }
+        }
+    }
+
+    /// A tuple literal as the composite row of type `type_ref`, recursing
+    /// so a nested tuple names its own type too — `None` when the value is
+    /// not a literal at all (a parameter, a cast, another row's column),
+    /// which is read through `_pylon.populate_tuple` instead.
+    fn tuple_literal_as_row(
+        &self,
+        expr: &IrExpr,
+        members: &[crate::schema::TupleMemberDescriptor],
+        type_ref: &str,
+        module: &str,
+    ) -> Option<IrExpr> {
+        let elements: Vec<IrExpr> = match expr {
+            IrExpr::NamedTuple { fields, .. } => fields.iter().map(|(_, e)| e.clone()).collect(),
+            IrExpr::Tuple(elements) => elements.clone(),
+            _ => return None,
+        };
+        let cast = |expr: IrExpr, pg_type: String| {
+            IrExpr::TypeCast(Box::new(crate::ir::IrTypeCast {
+                expr,
+                pg_type,
+                tuple_shape: None,
+            }))
+        };
+        let elements = elements
+            .into_iter()
+            .enumerate()
+            .map(|(i, element)| {
+                // A member that is itself a tuple carries its own type; one
+                // that is a scalar is already written as the type it is.
+                let Some(member) = members.get(i) else {
+                    return element;
+                };
+                let Some(member_ref) = crate::schema::tuple_type::member_type_ref(&member.kind, module) else {
+                    return element;
+                };
+                // A nominal member's own declaration says what it holds,
+                // exactly as a structural one carries it inline.
+                let nested = self.tuple_member_members(&member.kind).unwrap_or_default();
+                match self.tuple_literal_as_row(&element, &nested, &member_ref, module) {
+                    Some(row) => row,
+                    None => cast(element, member_ref),
+                }
+            })
+            .collect();
+        Some(cast(IrExpr::Row(elements), type_ref.to_string()))
+    }
+
+    /// A tuple property's members, nominal or structural — `None` for a
+    /// property that is not a tuple, or a nominal one whose declaration is
+    /// not in the schema.
+    fn property_tuple_members(&self, prop: &PropertyDescriptor) -> Option<Vec<crate::schema::TupleMemberDescriptor>> {
+        let marker = prop.pg_type.strip_suffix("[]").unwrap_or(&prop.pg_type);
+        match marker.strip_prefix("__nt__:") {
+            Some(qname) => self.resolve_named_tuple(qname).map(|nt| nt.members.clone()),
+            None => prop.tuple_members.clone(),
+        }
+    }
+
+    /// The PostgreSQL type one tuple member's value has — `None` for a
+    /// member that is itself a tuple, whose value is a composite row rather
+    /// than a scalar.
+    fn tuple_member_pg_type(&self, kind: &crate::schema::TupleMemberKind) -> Option<String> {
+        match kind {
+            crate::schema::TupleMemberKind::Scalar { pg_type } => Some(pg_type.clone()),
+            crate::schema::TupleMemberKind::Enum { module, name } => {
+                Some(format!("{}.\"{}\"", crate::sql::pg_schema_str(module), name))
+            }
+            crate::schema::TupleMemberKind::NamedTuple { .. } | crate::schema::TupleMemberKind::Tuple { .. } => None,
+        }
+    }
+
+    /// The members of a member that is itself a tuple, so a path can keep
+    /// walking (`.address.deep.amount`).
+    fn tuple_member_members(
+        &self,
+        kind: &crate::schema::TupleMemberKind,
+    ) -> Option<Vec<crate::schema::TupleMemberDescriptor>> {
+        match kind {
+            crate::schema::TupleMemberKind::Tuple { members } => Some(members.clone()),
+            crate::schema::TupleMemberKind::NamedTuple { module, name } => self
+                .resolve_named_tuple(&format!("{module}::{name}"))
+                .map(|nt| nt.members.clone()),
+            crate::schema::TupleMemberKind::Scalar { .. } | crate::schema::TupleMemberKind::Enum { .. } => None,
         }
     }
 
@@ -4544,9 +4638,10 @@ impl<'a> Compiler<'a> {
                 if !is_last(0) {
                     // Named tuple properties (nominal `__nt__:` marker) and structural
                     // tuple properties (`tuple_members`) both allow further field
-                    // access via jsonb operators. An `array<tuple<…>>` property does
-                    // not: there is no single tuple for `.headers.name` to read a
-                    // field out of, so it falls through to the error below.
+                    // access, reading the member out of the composite row the
+                    // column holds. An `array<tuple<…>>` property does not: there
+                    // is no single tuple for `.headers.name` to read a field out
+                    // of, so it falls through to the error below.
                     if (p.pg_type.starts_with("__nt__:") || p.tuple_members.is_some()) && !p.pg_type.ends_with("[]") {
                         let base = IrExpr::ColumnRef {
                             alias: current_alias.clone(),
@@ -4555,14 +4650,44 @@ impl<'a> Compiler<'a> {
                         };
                         let remaining = &steps[idx + 1..];
                         let mut ir: IrExpr = base;
+                        // Walked alongside the path so each step reads a member
+                        // that is really there, with the type it is declared
+                        // with — a composite has no "absent member" to hand
+                        // back as NULL the way a jsonb lookup did.
+                        let mut members = self.property_tuple_members(p);
                         for step in remaining {
                             let field = match step {
                                 ast::PathStep::Name(n) => n.clone(),
                                 _ => return Err(self.type_err("only field name steps are valid inside a named tuple")),
                             };
-                            ir = IrExpr::JsonbField {
+                            let member = members
+                                .as_ref()
+                                .and_then(|ms| ms.iter().find(|m| m.name.as_deref() == Some(field.as_str())).cloned());
+                            let pg_type = match &member {
+                                Some(m) => self.tuple_member_pg_type(&m.kind),
+                                // Nothing to check it against — a nominal member
+                                // whose own declaration is missing is reported
+                                // where that declaration is resolved.
+                                None if members.is_none() => None,
+                                None => {
+                                    let known: Vec<String> = members
+                                        .as_ref()
+                                        .map(|ms| ms.iter().filter_map(|m| m.name.clone()).collect())
+                                        .unwrap_or_default();
+                                    return Err(self.type_err(&format!(
+                                        "'{field}' is not a member of tuple property '{}' on {}::{} (it has {})",
+                                        p.name,
+                                        current_td.module,
+                                        current_td.name,
+                                        known.join(", ")
+                                    )));
+                                }
+                            };
+                            members = member.as_ref().and_then(|m| self.tuple_member_members(&m.kind));
+                            ir = IrExpr::CompositeField {
                                 expr: Box::new(ir),
                                 field,
+                                pg_type,
                             };
                         }
                         let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
@@ -8823,7 +8948,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     let compiled = self.compile_expr(expr, td, alias)?;
                     match Self::resolve_property(td, pointer_name) {
-                        Some(p) => Self::into_column_tuple(compiled, p, &td.module),
+                        Some(p) => self.column_tuple_value(compiled, p, &td.module),
                         None => compiled,
                     }
                 };
@@ -18603,6 +18728,19 @@ fn type_expr_to_pg(ty: &ast::TypeExpr) -> Result<String, PyQLError> {
 
 /// Check whether a compiled expression is compatible with a PylonType parameter.
 /// Used for overload selection when multiple overloads share the same name.
+/// Emit `($1 IS DISTINCT FROM NULL)` — "this value is not absent", for a
+/// composite row, where `IS NOT NULL` instead asks whether every one of its
+/// members is set.
+fn ir_is_distinct_from_null(expr: IrExpr) -> IrExpr {
+    IrExpr::FunctionCall(IrFunctionCall {
+        return_pg_type: None,
+        schema: None,
+        name: String::new(),
+        args: vec![expr],
+        sql_template: Some("($1 IS DISTINCT FROM NULL)".to_string()),
+    })
+}
+
 /// Emit `($1 IS NOT NULL)` for a given IR expression.
 fn ir_is_not_null(expr: IrExpr) -> IrExpr {
     IrExpr::FunctionCall(IrFunctionCall {

@@ -2408,7 +2408,10 @@ fn diff_inner(
         // 1. the replacements, in dependency order, each referring to the
         //    replacements of anything it holds.
         for (_, t) in &rebuilt {
-            push_tx(&mut ops, create_composite_sql(t, &new_type_ref(t), &rebuild, &tuple_refs));
+            push_tx(
+                &mut ops,
+                create_composite_sql(t, &new_type_ref(t), &rebuild, &tuple_refs),
+            );
         }
         // 2. every column that holds one of them.
         for (module, table, column, col_type) in tuple_columns(target) {
@@ -2446,11 +2449,7 @@ fn diff_inner(
         for (_, t) in &rebuilt {
             push_tx(
                 &mut ops,
-                format!(
-                    "ALTER TYPE {} RENAME TO {};",
-                    new_type_ref(t),
-                    qi(&t.name)
-                ),
+                format!("ALTER TYPE {} RENAME TO {};", new_type_ref(t), qi(&t.name)),
             );
         }
         let described: Vec<String> = rebuilt.iter().map(|(_, t)| verbosename_tuple_type(t)).collect();
@@ -4095,7 +4094,12 @@ fn emit_junction_table(
                 continue;
             }
             let not_null = if p.nullable { "" } else { " NOT NULL" };
-            col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), col_type_str(p, &through_td.module), not_null));
+            col_lines.push_str(&format!(
+                ",\n    {} {}{}",
+                qi(&p.name),
+                col_type_str(p, &through_td.module),
+                not_null
+            ));
         }
     }
 
@@ -4209,10 +4213,7 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
         // Same sequence Phase 3.6 emits, and for the same reason: every
         // replacement before every column, every column before every drop.
         for c in &replaced {
-            push_tx(
-                &mut ops,
-                create_db_composite_sql(c, &new_db_type_ref(c)),
-            );
+            push_tx(&mut ops, create_db_composite_sql(c, &new_db_type_ref(c)));
         }
         for c in &replaced {
             for (schema, table, column, is_array) in db_columns_of_composite(after, c) {
@@ -6723,11 +6724,7 @@ mod tuple_type_tests {
         let schema = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point");
         let current = schema_to_db_state(&schema);
         let ops = diff_schema(&schema, &current).unwrap();
-        assert!(
-            !ops.iter().any(|o| o.contains("Point_t")),
-            "got:\n{}",
-            ops.join("\n")
-        );
+        assert!(!ops.iter().any(|o| o.contains("Point_t")), "got:\n{}", ops.join("\n"));
     }
 
     #[test]
@@ -6778,9 +6775,11 @@ mod tuple_type_tests {
                     },
                 }],
             });
-            schema
-                .types
-                .push(type_with("default", "Marker", vec![prop("pin", "__nt__:default::Pin", None)]));
+            schema.types.push(type_with(
+                "default",
+                "Marker",
+                vec![prop("pin", "__nt__:default::Pin", None)],
+            ));
             schema
         }
         let before = schema_with(vec![scalar_member("x", "int8")]);
@@ -7002,10 +7001,8 @@ mod tuple_type_live_tests {
             "every digit a decimal member was written with has to survive the conversion"
         );
 
-        pool.batch_execute(&format!(
-            "DROP TABLE \"{table}\"; DROP TYPE \"{point}_t\";"
-        ))
-        .await
-        .unwrap();
+        pool.batch_execute(&format!("DROP TABLE \"{table}\"; DROP TYPE \"{point}_t\";"))
+            .await
+            .unwrap();
     }
 }

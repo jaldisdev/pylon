@@ -1063,6 +1063,18 @@ pub enum IrExpr {
     ObjectSubquery(Box<IrSelect>),
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
     Tuple(Vec<IrExpr>),
+    /// One member of a composite row: `(expr)."name"`.
+    ///
+    /// A tuple's column is a composite type, so reading a member out of it
+    /// is a field access on that row — not the jsonb lookup
+    /// (`IrExpr::JsonbField`) that a tuple stored as jsonb needed. Unlike
+    /// jsonb's, this value arrives as the member's own declared type, which
+    /// `pg_type` carries for the sites that need to know it.
+    CompositeField {
+        expr: Box<IrExpr>,
+        field: String,
+        pg_type: Option<String>,
+    },
     /// A tuple as the composite row a column of one holds — `ROW(1, 'x')`,
     /// cast to that column's own type by the `TypeCast` wrapped around it.
     ///
