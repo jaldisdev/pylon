@@ -2119,8 +2119,6 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
     // position* in the row — returned bare there is nothing to index.
     matches!(expr, IrExpr::Array(items) if !matches!(items.first(), Some(IrExpr::Row { .. })))
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
-        || matches!(expr, IrExpr::NamedTuple { .. })
-        || matches!(expr, IrExpr::Tuple(_))
         // A row *is* the composite the result column holds; wrapping it in
         // another would bury its members one level down from the shape. The
         // same holds once it is cast to a declared tuple type.
@@ -2414,45 +2412,6 @@ fn composite_member_shape(position: usize, member: &crate::query::JsonMember) ->
     }
 }
 
-/// One member of a tuple literal: its own name, plus what that member
-/// holds — a nested literal recurses, an enum keeps the type its labels
-/// decode against, and anything else is read as the jsonb scalar it is.
-fn literal_tuple_member(key: &str, value: &IrExpr) -> crate::query::JsonMember {
-    use crate::query::{JsonMember, JsonMemberKind};
-
-    let kind = match value {
-        IrExpr::NamedTuple { fields, .. } => JsonMemberKind::Tuple {
-            type_name: None,
-            members: fields
-                .iter()
-                .map(|(key, value)| literal_tuple_member(key, value))
-                .collect(),
-        },
-        _ => match enum_type_of_expr(value) {
-            Some(qualified) => JsonMemberKind::Enum {
-                // A member's enum type is Pylon-qualified, unlike
-                // `ShapeNode::Enum`'s own Postgres-schema-qualified one.
-                enum_type: pg_schema_qualified_to_pylon(&qualified.name),
-            },
-            None if crate::ir::infer_ir_type(value) == Some("numeric") => JsonMemberKind::Decimal,
-            None => JsonMemberKind::Scalar,
-        },
-    };
-    JsonMember {
-        key: Some(key.to_string()),
-        kind,
-    }
-}
-
-/// `public::Gender` -> `default::Gender` — only the `default` module is ever
-/// renamed on the way into Postgres, so it is the only one to undo.
-fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
-    match qualified.split_once("::") {
-        Some(("public", name)) => format!("default::{name}"),
-        _ => qualified.to_string(),
-    }
-}
-
 /// The shape of an array literal whose elements are tuples — `None` for
 /// every other array, which decodes as the value it already did.
 ///
@@ -2706,28 +2665,6 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
         IrExpr::TypeCast(c) if c.pg_type == "jsonb" => ShapeNode::Scalar {
             name: name.to_string(),
             position,
-        },
-        IrExpr::NamedTuple { fields, is_free_object } => ShapeNode::NamedTuple {
-            name: name.to_string(),
-            position,
-            type_name: None,
-            // A literal names its own members — `(amount := 9.99, note :=
-            // 'x')` says what they are called and what each one holds. With
-            // no member plan a reader has only the raw jsonb to go on, so
-            // the value hydrated as a plain dict rather than a named tuple,
-            // and the web UI, which renders `(key := value, …)` from this
-            // list, had nothing to render and showed `()`.
-            //
-            // A free object (`{ a := 1 }`) is left without one: it is not a
-            // tuple to its reader, and a member plan would hydrate it as a
-            // named-tuple value instead of the mapping it reads as today.
-            members: (!*is_free_object).then(|| {
-                fields
-                    .iter()
-                    .map(|(key, value)| literal_tuple_member(key, value))
-                    .collect()
-            }),
-            is_free_object: *is_free_object,
         },
         // A path select aggregated into an array keeps its rows' own shape, so
         // the elements hydrate as objects rather than as opaque scalars.
@@ -3434,10 +3371,9 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
 
     let (result_expr, shape_root) = match &sel.result {
         IrPathResult::Scalar(ir_expr, tuple_shape) => {
-            // Named tuples / jsonb field accesses can't be decoded inside ROW() — emit raw.
-            let is_nt = matches!(ir_expr, IrExpr::NamedTuple { .. })
-                || matches!(ir_expr, IrExpr::Tuple(_))
-                || matches!(ir_expr, IrExpr::JsonbField { .. })
+            // A jsonb field access can't be decoded inside ROW() — emit raw.
+            // (A tuple can: it is a composite row, and a record nests.)
+            let is_nt = matches!(ir_expr, IrExpr::JsonbField { .. })
                 || matches!(ir_expr, IrExpr::JsonbIndex { .. })
                 || matches!(ir_expr, IrExpr::ColumnRef { pg_type, .. } if pg_type.starts_with("__nt__:"))
                 || tuple_shape.is_some();
@@ -3454,10 +3390,7 @@ fn emit_path_select(sel: &IrPathSelect) -> SqlOutput {
                 (format!("ROW({}) AS result", emit_expr(ir_expr)), node)
             } else if is_nt {
                 let expr_sql = format!("{} AS result", emit_expr(ir_expr));
-                let shape = if matches!(
-                    ir_expr,
-                    IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. } | IrExpr::Tuple(_)
-                ) {
+                let shape = if matches!(ir_expr, IrExpr::JsonbField { .. } | IrExpr::JsonbIndex { .. }) {
                     ShapeNode::RawScalar
                 } else if let Some(shape) = tuple_shape {
                     // A bare tuple-typed property reference (nominal or
